@@ -1544,7 +1544,20 @@ def test_collect_400_carries_the_code_for_each_typed_cause(exc, expected_code):
     assert err.value.detail["error"]
 
 
-def test_the_non_streaming_400_carries_the_code_on_the_wire():
+@pytest.mark.parametrize(
+    ("exc", "expected_status", "expected_code", "expected_error"),
+    [
+        pytest.param(
+            Exception(_TOKEN_LIMIT_MESSAGE), 400,
+            te.TOKEN_LIMIT_CODE, te.TOKEN_LIMIT_USER_MESSAGE, id="mapped-400",
+        ),
+        pytest.param(
+            Exception("kaboom: secret-token-xyz"), 500,
+            te.GENERIC_TURN_ERROR_CODE, te.GENERIC_TURN_ERROR_MESSAGE, id="unmapped-500",
+        ),
+    ],
+)
+def test_the_non_streaming_failure_body_on_the_wire(exc, expected_status, expected_code, expected_error):
     """Pins the serialized body, not just the raised exception.
 
     Every assertion above reads ``HTTPException.detail`` in process, so they
@@ -1557,26 +1570,16 @@ def test_the_non_streaming_400_carries_the_code_on_the_wire():
 
     from cowork.server import create_app
 
-    class _FailingHarness:
-        id = "stub"
-
-        def stream_response(self, **kwargs):
-            return None
-
-        async def formatter(self, stream, model, event_sink):
-            if False:
-                yield
-            raise Exception(_TOKEN_LIMIT_MESSAGE)
-
-    with patch("cowork.handlers.responses.get_harness", return_value=_FailingHarness()):
+    harness = _handler_with_raising_formatter(exc).harness
+    with patch("cowork.handlers.responses.get_harness", return_value=harness):
         client = TestClient(create_app())
         res = client.post("/api/v1/responses/", json={"input": "hi", "stream": False})
 
-    assert res.status_code == 400, res.text
+    assert res.status_code == expected_status, res.text
     assert res.json()["detail"] == {
         "type": "response.failed",
-        "code": te.TOKEN_LIMIT_CODE,
-        "error": te.TOKEN_LIMIT_USER_MESSAGE,
+        "code": expected_code,
+        "error": expected_error,
     }
 
 
