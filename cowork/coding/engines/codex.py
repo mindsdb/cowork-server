@@ -226,6 +226,9 @@ class CodexEngineSession:
         self._cancel_lock = threading.Lock()
         self._terminal_handlers: dict[str, TerminalOutputHandler] = {}
         self._terminal_lock = threading.Lock()
+        # The exact argv of every interactive shell this session has started;
+        # a turn-completion reap recognises terminal tabs by it.
+        self._terminal_commands: set[tuple[str, ...]] = set()
         self._goal_states: dict[str, Any] = {}
         self._client.start()
         try:
@@ -379,6 +382,10 @@ class CodexEngineSession:
         except (psutil.Error, OSError):
             return True  # Cannot inspect it, so leave it alone.
         if name in self._CODEX_HELPERS or TERMINAL_ENV_MARKER in environment:
+            return True
+        # macOS hides a PTY shell's environment from psutil, so terminal tabs
+        # are also recognised by the exact argv this session launched them with.
+        if tuple(cmdline) in self._terminal_commands:
             return True
         if any("cowork.coding.integration_mcp" in part for part in cmdline):
             return True
@@ -751,6 +758,7 @@ class CodexEngineSession:
         error: str | None = None
         try:
             command = codex_config.interactive_shell(shell)
+            self._terminal_commands.add(tuple(command))
             response = self._client.request(
                 "command/exec",
                 {
