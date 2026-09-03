@@ -127,6 +127,27 @@ def surface() -> str | None:
         return None
 
 
+def supported_kwargs(config_cls, **candidates) -> dict:
+    """Only those `candidates` the installed dataclass actually declares.
+
+    Same hazard as `surface_kwarg`: this server pins anton to a rev, so a
+    field it knows about can be absent from the installed copy, and passing an
+    unexpected keyword raises on **every turn**. A dropped field degrades that
+    feature; raising takes the whole turn down.
+    """
+    import dataclasses
+
+    try:
+        declared = {f.name for f in dataclasses.fields(config_cls)}
+    except Exception:  # pragma: no cover - defensive: never fail a turn over this
+        logger.warning("could not inspect %s for optional kwargs", config_cls, exc_info=True)
+        return {}
+    dropped = [k for k in candidates if k not in declared]
+    if dropped:
+        logger.debug("installed anton has no %s; not passing it", ", ".join(dropped))
+    return {k: v for k, v in candidates.items() if k in declared}
+
+
 def surface_kwarg(config_cls) -> dict[str, str]:
     """``{"surface": ...}`` for ``ChatSessionConfig``, or ``{}`` — never raises.
 

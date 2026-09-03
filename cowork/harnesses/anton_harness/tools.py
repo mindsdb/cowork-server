@@ -108,13 +108,15 @@ COWORK_PUBLISH_PROMPT = (
     "ACCESS MODE:\n"
     "- Before publishing you MUST know the access mode. If the user stated it\n"
     "  (e.g. 'publish with password', 'share only with a@x.com', 'make it public'), use it:\n"
-    "  set access_mode (+ password/emails/org_allowed) accordingly.\n"
+    "  set access_mode (+ password/emails/org_allowed/owner_only) accordingly.\n"
     "- If the user did NOT specify an access mode, ASK them in chat which one they want —\n"
-    "  public (anyone with the link), password-protected, or restricted to specific emails /\n"
-    "  the whole organization — and wait for their answer before calling this tool with\n"
-    "  action='publish'. Do NOT silently default to public.\n"
+    "  public (anyone with the link), password-protected, restricted to specific emails /\n"
+    "  the whole organization, or private to themselves — and wait for their answer before\n"
+    "  calling this tool with action='publish'. Do NOT silently default to public.\n"
     "- NEVER invent a password. If the user chooses password, get the value from them in chat\n"
     "  or point them to the publish panel (Access → Password).\n"
+    "- For 'only me' / 'just for myself' / 'private to me', set access_mode='restricted' with\n"
+    "  owner_only=true and no emails. Leaving emails empty WITHOUT owner_only publishes PUBLICLY.\n"
     "- Exception: when re-publishing an artifact that already has access on record and the user\n"
     "  says nothing new about access, omit these fields to keep its previous access (no need to\n"
     "  ask again)."
@@ -195,9 +197,19 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             )
         access = {"mode": "password", "password": pw}
     elif access_mode == "restricted":
+        from anton.publish_access import parse_emails
+        valid, invalid = parse_emails(tc_input.get("emails") or [])
+        if invalid:
+            # Parity with anton.tools: dropping these would collapse the
+            # selection and publish PUBLICLY behind the user's back.
+            return (
+                "INVALID: these are not valid email addresses: "
+                f"{', '.join(invalid)}. Fix them or omit them, then call the tool again."
+            )
         access = {"mode": "restricted",
-                  "emails": tc_input.get("emails") or [],
-                  "org_allowed": bool(tc_input.get("org_allowed"))}
+                  "emails": valid,
+                  "org_allowed": bool(tc_input.get("org_allowed")),
+                  "owner_only": bool(tc_input.get("owner_only"))}
     elif access_mode == "public":
         access = {"mode": "public"}
     else:

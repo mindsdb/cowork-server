@@ -139,6 +139,12 @@ def shell_environment(command: list[str], working_directory: Path | None = None)
         # as the process cwd. That lets the normal user prompt show our human
         # workspace alias without replacing the user's PS1/PROMPT.
         environment["PWD"] = str(working_directory)
+    # The sidecar is launched by the desktop app, whose environment carries no
+    # terminal type, so the PTY would otherwise start without one.
+    if not os.environ.get("TERM"):
+        environment["TERM"] = "xterm-256color"
+    if not os.environ.get("COLORTERM"):
+        environment["COLORTERM"] = "truecolor"
     return environment
 
 

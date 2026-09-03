@@ -20,7 +20,7 @@ from cowork.services.providers import minds_chat_base_url
 from cowork.turnqueue.auth_keys import list_active_connections, mint_turn_key
 from cowork.turnqueue.models import TurnJob, TurnReply
 from cowork.streaming.turn_index import record_turn
-from cowork.turnqueue.redis_client import get_redis
+from cowork.turnqueue.redis_client import cancel_flag_key, get_redis
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host
 
 logger = logging.getLogger(__name__)
@@ -163,8 +163,18 @@ async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
         connections = [c for c in connections if (c.get("engine"), c.get("name")) not in disabled_keys]
     if not connections:
         return None
+    # No base_url here (ENG-2128): it used to carry
+    # settings.auth_internal_base_url, but anton's TurnKeyDataVault
+    # constructs it positionally and never bound the keyword-only base_url
+    # override, so the value was dead on the wire — anyone changing
+    # auth_internal_base_url would see it flow into the payload and
+    # reasonably conclude it took effect, when the pod was always resolving
+    # the auth host from its own ANTON_CLOUD_AUTH_BASE_URL env var instead
+    # (set per environment by scratchpad-controller). Decided to drop it
+    # rather than wire it up: ANTON_CLOUD_AUTH_BASE_URL is already the
+    # correct, working, per-environment source, and nothing today needs
+    # cowork-server to steer the auth host per-request.
     return {
-        "base_url": settings.auth_internal_base_url,
         "connections": connections,
     }
 
@@ -258,7 +268,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     r = get_redis()
     corr = correlation_id or _new_correlation_id()
     # A flag left by an earlier turn would cancel this one on its first line.
-    await r.delete(f"cowork:cancel:{corr}")
+    await r.delete(cancel_flag_key(corr))
     reply_stream = f"scratchpad:reply:{conversation_id}"
 
     # No client-picked model → the deployment's resolved default (org mode: the

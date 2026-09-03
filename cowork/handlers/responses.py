@@ -35,6 +35,7 @@ from cowork.streaming import TurnLifecycle, new_buffer, registry, sse_frame
 from cowork.streaming.backend import get_backend
 from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
+from cowork.turnqueue.redis_client import cancel_flag_key, get_redis
 from cowork.schemas.responses import (
     Content,
     ContentType,
@@ -55,6 +56,8 @@ from cowork.handlers.turn_errors import (
     ALLOWANCE_EXHAUSTED_CODE,
     PROVIDER_OVERLOADED_CODE,
     RATE_LIMITED_CODE,
+    REMOTE_CANCEL_LITERAL,
+    REMOTE_CANCEL_VIA_FAIL_JOB,
     auth_error_detail,
     friendly_turn_error,
     model_unavailable_info,
@@ -133,7 +136,40 @@ def cancelled_ask_user_retirements(events: list[dict]) -> list[dict]:
     return synthesized
 
 
-async def _seal_unterminated_buffer(buffer, lifecycle: "TurnLifecycle", conv_id) -> None:
+async def _remote_cancel_confirmed(error: str | None, correlation_id: str) -> bool:
+    """Whether a remote ``turn_failed`` is the user's own Stop, not a failure.
+
+    ``REMOTE_CANCEL_LITERAL`` is proof on its own. ``REMOTE_CANCEL_VIA_FAIL_JOB``
+    is not: a controller replica taking SIGTERM mid-turn unwinds through the
+    same handler that a keepalive-driven cancel does, so the string cannot tell
+    a Stop from a rolling deploy killing the turn.
+
+    The cancel flag separates them. ``/cancel`` writes it, the producer clears
+    a stale one before each turn, and the keepalive-driven path never clears
+    it — so its presence means a user asked for this turn to stop. A shutdown
+    abort leaves no flag and stays a failure, which is the outcome that earns
+    an error frame and a lookup id.
+    """
+    if error == REMOTE_CANCEL_LITERAL:
+        return True
+    if error != REMOTE_CANCEL_VIA_FAIL_JOB:
+        return False
+    try:
+        return bool(await get_redis().exists(cancel_flag_key(correlation_id)))
+    except Exception:
+        # Redis is how the reply being classified arrived, so this is close to
+        # unreachable. Read as a failure rather than a cancel: a visible error
+        # carrying an id is the recoverable way to be wrong here.
+        logger.exception(
+            "[responses] could not read the cancel flag for correlation_id=%s; "
+            "treating the turn as failed", correlation_id,
+        )
+        return False
+
+
+async def _seal_unterminated_buffer(
+    buffer, lifecycle: "TurnLifecycle", conv_id, *, request_id: str | None = None,
+) -> None:
     """Guarantee a terminal record so a producer that ended WITHOUT closing its
     buffer can't leave the client's tail (and its shared stream slot) hanging
     forever.
@@ -153,16 +189,23 @@ async def _seal_unterminated_buffer(buffer, lifecycle: "TurnLifecycle", conv_id)
     abstract on ``StreamBuffer`` but a minimal test double may lack it — treat an
     absent flag as already-terminated so a stub can't trigger a spurious second
     terminal.
+
+    ``request_id`` is the remote producer's own correlation id, passed by
+    ``_produce_remote`` only — this is the hardest-failing turn (one that
+    escaped every named ``except``), so it's exactly the one a user is most
+    likely to report; omitted (``None``) by the in-process/direct producers,
+    which have no such id to offer.
     """
     if lifecycle.discarded or getattr(buffer, "is_closed", True):
         return
     logger.error(
-        "[responses] turn for conversation %s ended without a terminal record; "
-        "sealing the buffer so the client releases its stream slot", conv_id,
+        "[responses] turn for conversation %s (correlation_id=%s) ended without a "
+        "terminal record; sealing the buffer so the client releases its stream slot",
+        conv_id, request_id,
     )
     try:
         await buffer.append("sse", {"sse": response_failed_sse(
-            GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
+            GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)})
     except Exception:
         logger.exception("[responses] could not emit terminal error frame while sealing")
     try:
@@ -976,6 +1019,16 @@ class ResponsesHandler:
         persisted = False
         pending_message_id: UUID | None = None
         failure: dict = {}
+        # Resolved once, up front — not left for stream_remote_replies to mint
+        # internally on a None — so every failure branch below (classified or
+        # not) can attach the SAME id a support/log lookup would use. Each of
+        # those branches logs the id at WARNING or above, which is the floor
+        # the deployed environments run at; this INFO line is only the
+        # per-turn breadcrumb that ties a successful turn to its id in dev.
+        corr = (turn_llm or {}).get("correlation_id") or str(uuid4())
+        logger.info(
+            "[responses] remote turn conversation=%s correlation_id=%s", conv_id, corr,
+        )
 
         def event_sink(event_type: str, data: dict) -> None:
             # Same event log the in-process path records, so the client
@@ -1035,7 +1088,7 @@ class ResponsesHandler:
                     # travels as a bounded, sheddable wire block.
                     memory=memory,
                     **self._remote_workspace(producer_session, conv_id),
-                    correlation_id=(turn_llm or {}).get("correlation_id"),
+                    correlation_id=corr,
                     llm=(turn_llm or {}).get("llm"),
                     disabled=disabled,
                 ):
@@ -1080,6 +1133,18 @@ class ResponsesHandler:
                         # try must still run on a clean finish.
                         break
                     elif kind == "turn_failed":
+                        if await _remote_cancel_confirmed(data.get("error"), corr):
+                            # A /cancel that reached a replica which doesn't
+                            # own the producer sets the Redis flag only, so
+                            # the controller is what discards the pod and it
+                            # reports the stop as a turn_failed. Neither of
+                            # its cancel literals reaches remote_turn_error,
+                            # which would collapse them to anton_error.
+                            # Route them through the same path a locally
+                            # aborted turn takes: partial text persists, no
+                            # response.failed frame, no error bubble on
+                            # reload.
+                            raise asyncio.CancelledError()
                         failure.update(data)
                         raise _RemoteTurnFailed()
             finally:
@@ -1181,8 +1246,16 @@ class ResponsesHandler:
         except _RemoteTurnFailed:
             message = failure.get("message") or GENERIC_TURN_ERROR_MESSAGE
             code = failure.get("code") or GENERIC_TURN_ERROR_CODE
-            collected_events.append(response_failed_payload(message, code))
-            await buffer.append("sse", {"sse": response_failed_sse(message, code)})
+            # At WARNING because that is the floor the deployed environments
+            # run at: the id below is what the client shows the user as a
+            # Reference, so a line carrying it has to survive prod's log level
+            # or support has nothing to search for.
+            logger.warning(
+                "[responses] remote turn reported a failure for conversation %s "
+                "correlation_id=%s code=%s", conv_id, corr, code,
+            )
+            collected_events.append(response_failed_payload(message, code, request_id=corr))
+            await buffer.append("sse", {"sse": response_failed_sse(message, code, request_id=corr)})
             if code == CONTENT_RECOVERY_CODE:
                 # ENG-1992: the remote/org path's twin of the streaming
                 # handler's repair — producer.py already classified this via
@@ -1211,15 +1284,23 @@ class ResponsesHandler:
             persist()
             await buffer.close("cancelled")
         except Exception:
-            logger.exception("[responses] remote turn failed for conversation %s", conv_id)
+            logger.exception(
+                "[responses] remote turn failed for conversation %s correlation_id=%s",
+                conv_id, corr,
+            )
             collected_events.append(response_failed_payload(
-                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE))
+                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr))
             await buffer.append("sse", {"sse": response_failed_sse(
-                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
+                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr)})
             persist()
             await buffer.close("error")
         finally:
-            await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
+            await _seal_unterminated_buffer(
+                buffer, lifecycle, conv_id, request_id=corr
+            )
+            # The session is only bound part-way into the try above, so a
+            # failure before that point leaves it None. Closing unguarded would
+            # raise here and mask the exception that actually ended the turn.
             if producer_session is not None:
                 producer_session.close()
 
@@ -1547,9 +1628,19 @@ class ResponsesHandler:
                             "[responses] failed to repair conversation %s after content validation error",
                             conversation_id,
                         )
-                raise HTTPException(status_code=400, detail=message)
+                # The ladder already produced a code; carry it instead of dropping
+                # it here. Same wire shape the streaming twin emits.
+                raise HTTPException(
+                    status_code=400,
+                    detail=response_failed_payload(message, code),
+                )
             logger.exception("[responses] turn failed")
-            raise HTTPException(status_code=500, detail=GENERIC_TURN_ERROR_MESSAGE)
+            # Same shape as the 400 above: one body for every turn failure, so a
+            # caller never has to branch on status to know how to read `detail`.
+            raise HTTPException(
+                status_code=500,
+                detail=response_failed_payload(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE),
+            )
 
         assistant_text = "".join(collected_text)
         # Persist the user message now — after the harness has read history for
