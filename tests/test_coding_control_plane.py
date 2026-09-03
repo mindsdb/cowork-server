@@ -600,6 +600,61 @@ def test_recovery_plan_describes_reopening_not_resuming_the_turn(tmp_path: Path)
     assert "Resume" not in plan.options[0].detail
 
 
+def test_a_named_computer_is_listed_as_pending_until_its_runtime_connects(tmp_path: Path) -> None:
+    # "Connect a computer" names the computer up front; the entry must survive
+    # closing the dialog and turn into the real computer when the code is used.
+    service = ControlPlaneService(tmp_path, capabilities())
+
+    token, pending = service.invite_computer("Build box", "linux")
+    assert pending.name == "Build box"
+    assert pending.platform == "linux"
+    assert pending.expired is False
+    page = service.list_computers()
+    assert [item.name for item in page.pending] == ["Build box"]
+    assert all(item.is_local for item in page.items)
+
+    computer, _runtime_token = service.register_runtime(token, "runtime-host-name", capabilities())
+
+    assert computer.name == "Build box"  # the typed name wins over the runtime's host name
+    page = service.list_computers()
+    assert page.pending == []
+    assert computer.id in {item.id for item in page.items}
+
+
+def test_a_pending_computer_can_get_a_fresh_code_or_be_removed(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    first_token, first = service.invite_computer("Laptop", "darwin")
+
+    second_token, second = service.invite_computer("Laptop", "darwin", replaces_id=first.id)
+    assert second.id != first.id
+    assert [item.id for item in service.list_computers().pending] == [second.id]
+    with pytest.raises(RuntimeAuthenticationError):
+        service.register_runtime(first_token, "Laptop", capabilities())  # the replaced code is dead
+
+    service.remove_pending_computer(second.id)
+    assert service.list_computers().pending == []
+    with pytest.raises(RuntimeAuthenticationError):
+        service.register_runtime(second_token, "Laptop", capabilities())
+    with pytest.raises(KeyError):
+        service.remove_pending_computer(second.id)
+
+
+def test_an_expired_pending_computer_is_flagged_not_hidden(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    monkeypatch.setattr("cowork.coding.control_service.REGISTRATION_CODE_LIFETIME", timedelta(seconds=-1))
+    _token, pending = service.invite_computer("Old code", "windows")
+
+    listed = service.list_computers().pending
+    assert [item.id for item in listed] == [pending.id]
+    assert listed[0].expired is True
+
+
+def test_anonymous_registration_tokens_do_not_show_as_pending_computers(tmp_path: Path) -> None:
+    service = ControlPlaneService(tmp_path, capabilities())
+    service.issue_registration_token()
+    assert service.list_computers().pending == []
+
+
 def test_cross_computer_recovery_recreates_only_portable_scoped_resources(tmp_path: Path) -> None:
     service = ControlPlaneService(tmp_path, capabilities())
     first_computer, _ = register(service, "First")
