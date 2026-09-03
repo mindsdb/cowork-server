@@ -252,19 +252,24 @@ async def test_produce_remote_request_id_matches_the_turns_own_correlation_id(mo
 
 
 @pytest.mark.asyncio
-async def test_produce_remote_treats_a_controller_cancel_as_a_real_cancel_not_a_failure(monkeypatch):
-    # scratchpad-controller publishes the literal string "cancelled" (no type
-    # prefix at all) when a /cancel reaches the wrong replica and it discards
-    # the pod after the fact. Without this, remote_turn_error("cancelled")
-    # falls to the fully generic anton_error and a routine Stop persists as a
-    # red error row that survives reload — the opposite of the live path,
-    # which silently swallows a cancel.
+@pytest.mark.parametrize("wire_error", ["cancelled", "RuntimeError: cancelled"])
+async def test_produce_remote_treats_a_controller_cancel_as_a_real_cancel_not_a_failure(
+    monkeypatch, wire_error,
+):
+    # scratchpad-controller publishes a cancel two ways when a /cancel reaches
+    # the wrong replica and it discards the pod after the fact: the bare
+    # literal from its own cancel branch, and the _fail_job-shaped one a
+    # keepalive-driven cancel unwinds into — the only shape reachable while
+    # the pod is still starting. Neither carries a type prefix this classifier
+    # maps, so without this both fall to the fully generic anton_error and a
+    # routine Stop persists as a red error row that survives reload — the
+    # opposite of the live path, which silently swallows a cancel.
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
 
     async def fake_replies(**kwargs):
         yield "turn_delta", {"text": "partial"}
-        yield "turn_failed", {"error": "cancelled"}
+        yield "turn_failed", {"error": wire_error}
 
     monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
 

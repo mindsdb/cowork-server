@@ -282,6 +282,20 @@ MISSING_ORGANIZATION_USER_MESSAGE = (
     "This task's workspace couldn't be set up. Please try again — if it "
     "keeps happening, contact support."
 )
+# scratchpad-controller publishes a cancel two ways. main.py's own cancel
+# branch sends the bare literal; a keepalive-driven cancel instead unwinds
+# through _run_job's CancelledError handler into _fail_job, which shapes it
+# as "ExceptionType: message". The second is the only shape reachable while
+# the pod is still starting, because the per-stream-line cancel check needs
+# stream lines to run and none exist before the pod is Running.
+#
+# Deliberate: a controller shutdown abort unwinds through that same handler
+# and so is read as a cancel here — such a turn ends with its partial text
+# and no error frame. That is the better failure mode than the alternative,
+# a persisted red "An unexpected error occurred." row on every Stop pressed
+# during the pod-startup window.
+REMOTE_CANCEL_ERRORS = frozenset({"cancelled", "RuntimeError: cancelled"})
+
 # live_pod.py: "live pod {pod_name} reached terminal phase {phase!r} before
 # Running" — a RuntimeError raised when the pod never reaches Running (a
 # scheduling/startup failure), caught by _handle_anton_turn_k8s's own

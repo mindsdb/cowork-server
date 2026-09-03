@@ -55,6 +55,7 @@ from cowork.handlers.turn_errors import (
     ALLOWANCE_EXHAUSTED_CODE,
     PROVIDER_OVERLOADED_CODE,
     RATE_LIMITED_CODE,
+    REMOTE_CANCEL_ERRORS,
     auth_error_detail,
     friendly_turn_error,
     model_unavailable_info,
@@ -984,18 +985,18 @@ class ResponsesHandler:
                         # try must still run on a clean finish.
                         break
                     elif kind == "turn_failed":
-                        if data.get("error") == "cancelled":
-                            # The controller's own cancel path — a /cancel
+                        if data.get("error") in REMOTE_CANCEL_ERRORS:
+                            # The controller's own cancel paths — a /cancel
                             # that reached a replica which doesn't own the
                             # producer sets the Redis flag only, so the
                             # controller discards the pod and reports it as
-                            # a turn_failed with this exact literal string
-                            # (no type prefix; never passes through
-                            # remote_turn_error, which would otherwise
-                            # collapse it to anton_error). Route it through
-                            # the same path a locally-aborted turn takes:
-                            # partial text persists, no response.failed
-                            # frame, no error bubble on reload.
+                            # a turn_failed carrying one of two literals
+                            # (see REMOTE_CANCEL_ERRORS; neither reaches
+                            # remote_turn_error, which would collapse them
+                            # to anton_error). Route them through the same
+                            # path a locally-aborted turn takes: partial
+                            # text persists, no response.failed frame, no
+                            # error bubble on reload.
                             raise asyncio.CancelledError()
                         failure.update(data)
                         raise _RemoteTurnFailed()
