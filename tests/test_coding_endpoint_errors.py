@@ -10,7 +10,7 @@ from cowork.api.v1.endpoints import coding
 from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, StateConflict
 from cowork.coding.run_recovery import NoEligibleComputer
 from cowork.coding.run_state import InvalidRunTransition
-from cowork.coding.workspace import WorkspaceError
+from cowork.coding.workspace import GitIdentityMissingError, WorkspaceError
 
 
 @pytest.mark.parametrize(
@@ -126,3 +126,25 @@ def test_task_controls_check_the_effort_against_the_model_they_switch_to(monkeyp
 
     coding.update_session("s1", SessionUpdateRequest(model="gemini", reasoning_effort="low"), session=None, scope=None)
     assert applied == [("s1", "low")]
+
+def test_a_missing_git_identity_is_a_409_with_a_stable_code_the_desktop_can_act_on() -> None:
+    error = coding._http_error(GitIdentityMissingError(["user.name", "user.email"], detail="Author identity unknown"))
+
+    assert error.status_code == 409
+    assert error.headers == {"X-MindsHub-Error-Code": "git_identity_missing"}
+    assert error.detail.startswith("Git needs your name and email before it can commit on this computer.")
+
+
+def test_git_identity_routes_read_and_fill_the_global_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    from cowork.coding.contracts import GitIdentity, GitIdentityRequest
+
+    calls: list = []
+    workspaces = SimpleNamespace(
+        git_identity=lambda: GitIdentity(name=None, email="ian@example.invalid"),
+        set_git_identity=lambda name, email: calls.append((name, email)) or GitIdentity(name=name, email="ian@example.invalid"),
+    )
+    monkeypatch.setattr(coding, "_service", lambda: SimpleNamespace(workspaces=workspaces))
+
+    assert coding.git_identity().missing == ["user.name"]
+    assert coding.set_git_identity(GitIdentityRequest(name="  Ian Unsworth ", email="new@example.invalid")).name == "Ian Unsworth"
+    assert calls == [("Ian Unsworth", "new@example.invalid")]
