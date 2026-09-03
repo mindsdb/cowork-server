@@ -1410,18 +1410,40 @@ def test_remote_error_missing_organization_gets_curated_copy():
     assert "corr-123" not in msg
 
 
-def test_remote_error_live_pod_terminal_before_running_gets_curated_copy():
-    # scratchpad-controller's live_pod.py — a pod that reached Failed (or any
-    # other terminal phase) before ever reaching Running, i.e. it never
-    # scheduled/started. Raised as a bare RuntimeError with no type prefix,
-    # caught by _handle_anton_turn_k8s's own generic `except Exception`. The
-    # pod name and phase are both k8s-controlled (safe), but a fixed message
-    # is still returned rather than echoing them to the user.
+@pytest.mark.parametrize("wire_error", [
+    # scratchpad-controller's live_pod.py raises a bare RuntimeError from two
+    # places when the pod never reaches Running: a terminal phase reached
+    # first (kubelet rejected or evicted it), and the poll deadline expiring
+    # (no gVisor capacity, a quota block, a cold node still pulling the
+    # image). Only the first was recognised; the second is the class that
+    # clusters, which is the shape a "1 in 10 turns" report is made of.
+    "live pod sp-abc123 reached terminal phase 'Failed' before Running",
+    "live pod sp-abc123 did not reach Running within 120s",
+])
+def test_remote_error_live_pod_never_reached_running_gets_curated_copy(wire_error):
+    # Both are caught by _handle_anton_turn_k8s's own generic `except
+    # Exception`, so neither carries a type prefix. The pod name is
+    # k8s-controlled (safe), but a fixed message is still returned rather
+    # than echoing it to the user.
     from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
-    code, msg = remote_turn_error(
-        "live pod sp-abc123 reached terminal phase 'Failed' before Running")
+    code, msg = remote_turn_error(wire_error)
     assert code == GENERIC_TURN_ERROR_CODE
     assert "sandbox" in msg
+    assert "sp-abc123" not in msg
+
+
+def test_remote_error_pod_identity_mismatch_gets_curated_copy():
+    # live_pod.py's PodIdentityMismatch — a pod holding our name belongs to a
+    # different scratchpad, so the turn is refused rather than run in someone
+    # else's workspace. The squatting pod is not discarded, so the copy
+    # steers to support instead of promising a retry will clear it, and the
+    # two scratchpad ids in the raw message must not reach the user.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error(
+        "pod sp-abc123 belongs to scratchpad 'conv-other', not 'conv-mine'")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "support" in msg
+    assert "conv-other" not in msg
     assert "sp-abc123" not in msg
 
 

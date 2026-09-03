@@ -296,16 +296,31 @@ MISSING_ORGANIZATION_USER_MESSAGE = (
 # during the pod-startup window.
 REMOTE_CANCEL_ERRORS = frozenset({"cancelled", "RuntimeError: cancelled"})
 
-# live_pod.py: "live pod {pod_name} reached terminal phase {phase!r} before
-# Running" — a RuntimeError raised when the pod never reaches Running (a
-# scheduling/startup failure), caught by _handle_anton_turn_k8s's own
-# generic except Exception, so it carries no type prefix. pod_name/phase are
-# both k8s-controlled (safe), but returned as a fixed message anyway rather
-# than echoing internal names to the user.
-LIVE_POD_TERMINAL_BEFORE_RUNNING_MARKER = "reached terminal phase"
-LIVE_POD_TERMINAL_BEFORE_RUNNING_SUFFIX = "before Running"
-LIVE_POD_TERMINAL_BEFORE_RUNNING_USER_MESSAGE = (
+# live_pod.py raises a bare RuntimeError from two places when the pod never
+# reaches Running: a terminal phase before Running (kubelet rejected or
+# evicted it) and the poll deadline expiring (no gVisor capacity, a quota
+# block, a cold node still pulling the image). Both are caught by
+# _handle_anton_turn_k8s's own generic except Exception, so neither carries a
+# type prefix. The deadline one is the capacity/image-pull class, which is
+# the one that clusters — matched on the family rather than one raise site,
+# and on markers rather than the interpolated timeout, which can be retuned.
+# pod_name/phase are k8s-controlled (safe), but a fixed message is returned
+# anyway rather than echoing internal names to the user.
+LIVE_POD_PREFIX = "live pod "
+LIVE_POD_NEVER_RAN_MARKERS = ("before Running", "did not reach Running within")
+LIVE_POD_NEVER_RAN_USER_MESSAGE = (
     "This task's sandbox failed to start. Please try again."
+)
+# live_pod.py's PodIdentityMismatch: "pod {name} belongs to scratchpad {a!r},
+# not {b!r}" — a refusal to run in another scratchpad's workspace. The
+# squatting pod is not discarded, so a plain retry hits it again until the
+# reaper clears it; the copy steers to support rather than promising a retry
+# will work, and never echoes the two scratchpad ids the message carries.
+POD_IDENTITY_MISMATCH_PREFIX = "pod "
+POD_IDENTITY_MISMATCH_MARKER = "belongs to scratchpad"
+POD_IDENTITY_MISMATCH_USER_MESSAGE = (
+    "This task's sandbox couldn't be started safely. Please try again — if it "
+    "keeps happening, contact support."
 )
 
 # The exception-shaped type name the remote producer sends when no reply
@@ -1008,9 +1023,12 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
         return GENERIC_TURN_ERROR_CODE, TURN_ABORTED_STALL_USER_MESSAGE
     if text.endswith(MISSING_ORGANIZATION_SUFFIX):
         return GENERIC_TURN_ERROR_CODE, MISSING_ORGANIZATION_USER_MESSAGE
-    if (LIVE_POD_TERMINAL_BEFORE_RUNNING_MARKER in text
-            and text.endswith(LIVE_POD_TERMINAL_BEFORE_RUNNING_SUFFIX)):
-        return GENERIC_TURN_ERROR_CODE, LIVE_POD_TERMINAL_BEFORE_RUNNING_USER_MESSAGE
+    if text.startswith(LIVE_POD_PREFIX) and any(
+        marker in text for marker in LIVE_POD_NEVER_RAN_MARKERS
+    ):
+        return GENERIC_TURN_ERROR_CODE, LIVE_POD_NEVER_RAN_USER_MESSAGE
+    if text.startswith(POD_IDENTITY_MISMATCH_PREFIX) and POD_IDENTITY_MISMATCH_MARKER in text:
+        return GENERIC_TURN_ERROR_CODE, POD_IDENTITY_MISMATCH_USER_MESSAGE
     type_name, _, message = text.partition(":")
     message = message.strip()
     if type_name == WORKER_UNRESPONSIVE_TYPE_NAME:
