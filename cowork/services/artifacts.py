@@ -578,7 +578,7 @@ def _published_access_for(
     Returns ``accessMode`` (public|password|restricted) plus the mode-specific
     state needed to pre-fill the publish dialog on re-publish:
     ``accessProtected``/``accessPassword`` (password) and
-    ``accessEmails``/``orgAllowed`` (restricted). The plaintext password and
+    ``accessEmails``/``orgAllowed``/``ownerOnly`` (restricted). The plaintext password and
     the email list are owner-only — `.published.json` never enters the
     published bundle — so callers must only return this to the artifact's owner
     (the local/authenticated session).
@@ -589,6 +589,7 @@ def _published_access_for(
         "accessPassword": "",
         "accessEmails": [],
         "orgAllowed": False,
+        "ownerOnly": False,
         # Composite comments scope {user_dir}/{report_id} (Plan 5); "" when
         # unpublished or published before the key was persisted.
         "artifactKey": "",
@@ -613,6 +614,7 @@ def _published_access_for(
             elif mode == "restricted":
                 out["accessEmails"] = entry.get("emails", []) or []
                 out["orgAllowed"] = bool(entry.get("org_allowed"))
+                out["ownerOnly"] = bool(entry.get("owner_only"))
     except Exception:
         pass
     return out
@@ -1318,6 +1320,7 @@ def _blank_artifact_status() -> dict:
     return {
         "publishedUrl": "", "modified": False, "accessMode": "public",
         "accessProtected": False, "accessEmails": [], "orgAllowed": False,
+        "ownerOnly": False,
     }
 
 
@@ -1362,6 +1365,7 @@ def artifact_status_for_resolved(artifact: Path) -> dict:
         "accessProtected": bool(card.get("accessProtected")),
         "accessEmails": card.get("accessEmails", []),
         "orgAllowed": bool(card.get("orgAllowed")),
+        "ownerOnly": bool(card.get("ownerOnly")),
         "artifactKey": card.get("artifactKey", ""),
     }
 
