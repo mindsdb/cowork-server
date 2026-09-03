@@ -69,6 +69,26 @@ def test_new_code_projects_default_to_the_live_gpt_5_6_sol_catalog_id(tmp_path: 
     assert project.default_model == "gpt"
 
 
+def test_saving_a_project_stores_the_canonical_model_id(tmp_path: Path) -> None:
+    folder = tmp_path / "project"
+    folder.mkdir()
+    projects = CodeProjectService(tmp_path / "coding")
+
+    created = projects.create(ProjectCreateRequest(
+        name="Legacy",
+        folders=[ProjectFolder(id="project", name="Project", path=str(folder))],
+        default_model="gpt-5.6-sol",
+    ))
+    assert created.default_model == "gpt"
+    assert projects.get(created.id).default_model == "gpt"
+
+    updated = projects.update(created.id, ProjectUpdateRequest(default_model="gpt-5.6-sol"))
+    assert updated.default_model == "gpt"
+
+    passthrough = projects.update(created.id, ProjectUpdateRequest(default_model="fable"))
+    assert passthrough.default_model == "fable"
+
+
 def test_legacy_project_folders_migrate_once_without_losing_paths(tmp_path: Path) -> None:
     repo = repository(tmp_path, "legacy-repo")
     notes = tmp_path / "legacy-notes"
