@@ -276,7 +276,11 @@ def test_collect_raises_400_with_curated_message_for_image_error():
     with pytest.raises(HTTPException) as err:
         asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", original_content="hi"))
     assert err.value.status_code == 400
-    assert "PNG or JPEG" in err.value.detail
+    # detail is the response.failed payload, not bare prose: the ladder's code
+    # has to reach the caller or no card can be drawn from it.
+    assert err.value.detail["type"] == "response.failed"
+    assert err.value.detail["code"] == te.IMAGE_FORMAT_CODE
+    assert "PNG or JPEG" in err.value.detail["error"]
 
 
 def test_collect_raises_500_generic_for_unmapped_error():
@@ -284,8 +288,11 @@ def test_collect_raises_500_generic_for_unmapped_error():
     with pytest.raises(HTTPException) as err:
         asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", original_content="hi"))
     assert err.value.status_code == 500
-    assert err.value.detail == te.GENERIC_TURN_ERROR_MESSAGE
-    assert "secret-token" not in err.value.detail
+    assert err.value.detail["code"] == te.GENERIC_TURN_ERROR_CODE
+    assert err.value.detail["error"] == te.GENERIC_TURN_ERROR_MESSAGE
+    # Targets the message, not the mapping: `not in` on a dict tests keys and
+    # would pass vacuously, retiring the leak guard without failing.
+    assert "secret-token" not in err.value.detail["error"]
 
 
 # ── Conversation repair on content validation error (ENG-1992) ────
@@ -369,6 +376,7 @@ def test_collect_repairs_conversation_on_content_validation_error():
         with pytest.raises(HTTPException) as err:
             asyncio.run(handler._collect(stream=None, conversation_id=conv_id, model="anton", original_content="hi"))
         assert err.value.status_code == 400
+        assert err.value.detail["code"] == te.CONTENT_RECOVERY_CODE
         conv_svc.return_value.repair_image_content.assert_called_once_with(conv_id)
 
 
@@ -439,7 +447,8 @@ def test_collect_raises_400_with_curated_message_for_token_limit():
     with pytest.raises(HTTPException) as err:
         asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", original_content="hi"))
     assert err.value.status_code == 400
-    assert err.value.detail == te.TOKEN_LIMIT_USER_MESSAGE
+    assert err.value.detail["code"] == te.TOKEN_LIMIT_CODE
+    assert err.value.detail["error"] == te.TOKEN_LIMIT_USER_MESSAGE
 
 
 # ── Provider auth (401) → provider_auth ──────────────────────────────
@@ -709,7 +718,8 @@ def test_collect_raises_400_with_plan_message_for_model_403():
     with pytest.raises(HTTPException) as err:
         asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", original_content="hi"))
     assert err.value.status_code == 400
-    assert err.value.detail == _PLAN_MSG
+    assert err.value.detail["code"] == "model_access_denied"
+    assert err.value.detail["error"] == _PLAN_MSG
 
 
 # ── Wallet-model gateway mapping (402/429/404/503 + X-MindsHub-Reason) ─
@@ -1568,6 +1578,126 @@ def test_no_return_emits_a_literal_code():
         and isinstance(node.value.elts[0].value, str)
     ]
     assert offenders == []
+
+
+# ── The non-streaming path carries the code too ───────────────────────────
+# The streaming twin has a per-code test each. These sweep them through
+# _collect so its raise cannot drop one while those per-code tests stay green.
+#
+# Split by rung on purpose. The gateway rows must build their exception INSIDE
+# the test: the request URL comes from `minds_url` in settings, so a URL baked
+# in at collection time stops matching once another test changes that setting,
+# and the ladder then silently declines to map it.
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "expected_code"),
+    [
+        # The rung the ticket's headline case takes.
+        (402, "wallet_empty", te.TOKEN_LIMIT_CODE),
+        (429, "included_allowance_exhausted", te.ALLOWANCE_EXHAUSTED_CODE),
+        (429, "rate_limited", te.RATE_LIMITED_CODE),
+        (503, "policy_unavailable", te.POLICY_UNAVAILABLE_CODE),
+        (404, "unknown_model", te.MODEL_NOT_FOUND_CODE),
+    ],
+)
+def test_collect_400_carries_the_code_for_each_gateway_reason(status, reason, expected_code):
+    handler = _handler_with_raising_formatter(_gateway_failure(status, reason=reason))
+    with pytest.raises(HTTPException) as err:
+        asyncio.run(
+            handler._collect(
+                stream=None, conversation_id=uuid4(), model="anton", original_content="hi"
+            )
+        )
+    assert err.value.status_code == 400
+    assert err.value.detail["type"] == "response.failed"
+    assert err.value.detail["code"] == expected_code
+    assert err.value.detail["error"]
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected_code"),
+    [
+        pytest.param(Exception(_TOKEN_LIMIT_MESSAGE), te.TOKEN_LIMIT_CODE, id="token_limit"),
+        pytest.param(ProviderAuthError("provider rejected the credential"), te.AUTH_ERROR_CODE, id="auth"),
+        pytest.param(
+            _FakeModelErr(_PLAN_MSG, "model_access_denied", "sonnet"),
+            te.MODEL_ACCESS_DENIED_CODE, id="model_access_denied",
+        ),
+        pytest.param(
+            _FakeModelErr("", "model_disabled", "sonnet"),
+            te.MODEL_DISABLED_CODE, id="model_disabled",
+        ),
+        pytest.param(
+            _FakeOverloadedErr(_OVERLOAD_MSG, model="sonnet"),
+            te.PROVIDER_OVERLOADED_CODE, id="provider_overloaded",
+        ),
+        pytest.param(
+            Exception("'image_url' does not match the expected tags: 'image'"),
+            te.IMAGE_FORMAT_CODE, id="image_format",
+        ),
+    ],
+)
+def test_collect_400_carries_the_code_for_each_typed_cause(exc, expected_code):
+    """The rungs below the gateway header, asserted on the 400 it raises.
+
+    Three of the inventory's codes are absent from both sweeps, each pinned
+    elsewhere or unreachable. ``content_recovery`` runs the conversation-repair
+    branch and is pinned by its own test above. ``anton_error`` is the
+    unmapped fallback, pinned by the 500 test above and by the wire test's
+    ``unmapped-500`` row. ``worker_unresponsive`` comes from
+    ``remote_turn_error``, a different mapper that this path never calls.
+    """
+    handler = _handler_with_raising_formatter(exc)
+    with pytest.raises(HTTPException) as err:
+        asyncio.run(
+            handler._collect(
+                stream=None, conversation_id=uuid4(), model="anton", original_content="hi"
+            )
+        )
+    assert err.value.status_code == 400
+    assert err.value.detail["type"] == "response.failed"
+    assert err.value.detail["code"] == expected_code
+    assert err.value.detail["error"]
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected_status", "expected_code", "expected_error"),
+    [
+        pytest.param(
+            Exception(_TOKEN_LIMIT_MESSAGE), 400,
+            te.TOKEN_LIMIT_CODE, te.TOKEN_LIMIT_USER_MESSAGE, id="mapped-400",
+        ),
+        pytest.param(
+            Exception("kaboom: secret-token-xyz"), 500,
+            te.GENERIC_TURN_ERROR_CODE, te.GENERIC_TURN_ERROR_MESSAGE, id="unmapped-500",
+        ),
+    ],
+)
+def test_the_non_streaming_failure_body_on_the_wire(exc, expected_status, expected_code, expected_error):
+    """Pins the serialized body, not just the raised exception.
+
+    Every assertion above reads ``HTTPException.detail`` in process, so they
+    would all stay green if FastAPI stopped rendering a mapping ``detail`` as
+    JSON — and the body is the contract this change actually altered.
+    """
+    from unittest.mock import patch
+
+    from fastapi.testclient import TestClient
+
+    from cowork.server import create_app
+
+    harness = _handler_with_raising_formatter(exc).harness
+    with patch("cowork.handlers.responses.get_harness", return_value=harness):
+        client = TestClient(create_app())
+        res = client.post("/api/v1/responses/", json={"input": "hi", "stream": False})
+
+    assert res.status_code == expected_status, res.text
+    assert res.json()["detail"] == {
+        "type": "response.failed",
+        "code": expected_code,
+        "error": expected_error,
+    }
 
 
 # ── Wiring coverage (ENG-1537 review finding 3) ────────────────────────────
