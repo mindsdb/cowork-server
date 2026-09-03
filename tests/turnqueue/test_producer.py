@@ -176,9 +176,11 @@ async def test_stream_remote_replies_attaches_oauth_block_with_the_llm_turn_key(
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
     # Reuses the same turn key minted for the llm block — never a second mint.
+    # No base_url (ENG-2128): anton's TurnKeyDataVault only ever resolves the
+    # auth host from its own ANTON_CLOUD_AUTH_BASE_URL env var, so a wire
+    # value here was dead — see _mint_oauth_block.
     assert params["oauth"] == {
         "turn_key": "mdb_turnkey",
-        "base_url": prod.TurnQueueSettings().auth_internal_base_url,
         "connections": [{"engine": "google_drive", "name": "work"}],
     }
 
