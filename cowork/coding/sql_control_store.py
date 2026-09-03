@@ -145,21 +145,33 @@ class SqlControlPlaneStore:
     def save_registration_credential(self, credential: RuntimeRegistrationCredential) -> RuntimeRegistrationCredential:
         return self._save("registration_credentials", credential)
 
-    def consume_registration_credential(self, token_hash: str, now: datetime) -> bool:
+    def consume_registration_credential(self, token_hash: str, now: datetime) -> RuntimeRegistrationCredential | None:
         with self._session(write=True) as session:
             try:
                 row = self._locked_row(session, "registration_credentials", token_hash)
             except KeyError:
-                return False
+                return None
             credential = RuntimeRegistrationCredential.model_validate(row.payload)
             if credential.consumed_at is not None or credential.expires_at <= now:
-                return False
+                return None
             credential.consumed_at = now
             row.payload = credential.model_dump(mode="json")
             row.revision += 1
             row.updated_at = now
             session.add(row)
-            return True
+            return credential
+
+    def list_registration_credentials(self) -> list[RuntimeRegistrationCredential]:
+        return self._list("registration_credentials", RuntimeRegistrationCredential)
+
+    def delete_registration_credential(self, credential_id: str) -> None:
+        with self._session(write=True) as session:
+            session.exec(
+                delete(CodeControlRecord)
+                .where(CodeControlRecord.namespace_id == self.namespace_id)
+                .where(CodeControlRecord.collection == "registration_credentials")
+                .where(CodeControlRecord.document_id == credential_id)
+            )
 
     def save_run_credential(self, credential: TaskRunCredential) -> TaskRunCredential:
         return self._save("run_credentials", credential)

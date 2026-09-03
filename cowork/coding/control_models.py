@@ -105,13 +105,31 @@ class RuntimeCredential(BaseModel):
 
 
 class RuntimeRegistrationCredential(BaseModel):
-    """One-use registration authority stored centrally as a digest."""
+    """One-use registration authority stored centrally as a digest.
+
+    When issued from the desktop's "Connect a computer" form it also carries
+    the name and platform the user typed, so the computer exists as a pending
+    entry before its runtime ever calls back.
+    """
 
     id: str = Field(min_length=64, max_length=64, pattern=r"^[a-f0-9]+$")
     token_hash: str = Field(min_length=64, max_length=64)
     expires_at: datetime
     consumed_at: datetime | None = None
     created_at: datetime = Field(default_factory=utc_now)
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    platform: Literal["darwin", "windows", "linux"] | None = None
+
+
+class PendingComputer(BaseModel):
+    """A computer the user has named but whose runtime has not connected yet."""
+
+    id: str
+    name: str
+    platform: Literal["darwin", "windows", "linux"]
+    created_at: datetime
+    expires_at: datetime
+    expired: bool
 
 
 class TaskRunCredential(BaseModel):
@@ -295,6 +313,7 @@ class RuntimeEvent(BaseModel):
 
 class ComputerPage(BaseModel):
     items: list[Computer]
+    pending: list[PendingComputer] = Field(default_factory=list)
 
 
 class ResourceAvailability(BaseModel):
