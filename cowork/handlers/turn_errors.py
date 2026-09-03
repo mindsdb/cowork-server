@@ -282,8 +282,14 @@ MISSING_ORGANIZATION_SUFFIX = (
 # match here that a scrubbed "TypeName: message" could satisfy: an exception
 # whose message merely ENDS with the controller's phrasing would take this
 # branch ahead of its own, trading (say) the provider-auth card for workspace
-# copy. Both arrival shapes are allowed — bare from _handle_anton_turn_k8s's
-# own handler, or type-prefixed when it escapes to _fail_job.
+# copy.
+#
+# "job " is what the live path sends: _run_job catches MissingOrganization
+# while resolving the scratchpad id and publishes the message verbatim, then
+# returns before dispatching, so the exception never reaches _fail_job and
+# _handle_anton_turn_k8s's own guard never fires. The typed shape is kept as
+# defensive cover for a controller change that lets it through, not because
+# anything emits it today.
 MISSING_ORGANIZATION_PREFIXES = ("job ", "MissingOrganization:")
 MISSING_ORGANIZATION_USER_MESSAGE = (
     "This task's workspace couldn't be set up. Please try again — if it "
