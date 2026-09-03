@@ -23,12 +23,14 @@ from cowork.coding.contracts import (
     RuntimePlatformStatus,
     TerminalShellPreference,
 )
+from cowork.coding.control_errors import ModelDiscoveryAuthenticationError
 from cowork.coding.engines import codex_config, codex_events
 from cowork.coding.engines.base import (
     ApprovalHandler,
     EngineCredentials,
     EngineInputReference,
     EngineSessionConfig,
+    SteerOutcome,
     TerminalExitHandler,
     TerminalOutputHandler,
 )
@@ -44,6 +46,7 @@ _TERMINAL_NOT_READY = "no active command/exec for process id"
 _TERMINAL_WRITE_READY_TIMEOUT_SECONDS = 5.0
 _TERMINAL_WRITE_RETRY_SECONDS = 0.02
 _CANCEL_WATCHDOG_TIMEOUT_SECONDS = 5.0
+_STEER_TIMEOUT_SECONDS = 15.0
 _CANCEL_WIND_DOWN_TIMEOUT_SECONDS = 60.0
 
 
@@ -129,7 +132,15 @@ class CodexEngine:
                 f"{endpoint}/models",
                 headers={"Authorization": f"Bearer {credentials.minds_api_key}"},
             )
-            response.raise_for_status()
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if response.status_code in {401, 403}:
+                    raise ModelDiscoveryAuthenticationError(
+                        "Your sign-in does not match this server. Sign in again, "
+                        "or switch back to the environment you signed into."
+                    ) from exc
+                raise
             payload = response.json()
         models: list[str] = []
         for row in payload.get("data", []) if isinstance(payload, dict) else []:
@@ -348,20 +359,19 @@ class CodexEngineSession:
         turn_id: str,
         prompt: str,
         attachments: tuple[EngineInputReference, ...] = (),
-    ) -> None:
+    ) -> SteerOutcome | None:
         goal_state = self._goal_states.get(turn_id)
         expected_turn_id = goal_state.current_turn() if goal_state is not None else turn_id
         if not expected_turn_id:
             raise RuntimeError("The goal is between turns; queue this guidance for the next turn")
         turn_input = codex_config.turn_input(prompt, attachments)
         if goal_state is None:
-            self._client.turn_steer(self._session_id, expected_turn_id, turn_input)
-            return
+            return self._steer_bounded(expected_turn_id, turn_input)
 
         from openai_codex.errors import InvalidRequestError
 
         try:
-            self._client.turn_steer(self._session_id, expected_turn_id, turn_input)
+            return self._steer_bounded(expected_turn_id, turn_input)
         except InvalidRequestError as exc:
             # A goal can roll into its next physical turn between reading the
             # routed state and sending guidance. Adopt the server's canonical
@@ -371,8 +381,7 @@ class CodexEngineSession:
             if active_turn_id and active_turn_id != expected_turn_id:
                 goal_state.resolve_active_turn(expected_turn_id, active_turn_id)
                 try:
-                    self._client.turn_steer(self._session_id, active_turn_id, turn_input)
-                    return
+                    return self._steer_bounded(active_turn_id, turn_input)
                 except InvalidRequestError as retry_exc:
                     raise RuntimeError(
                         "The goal advanced again before guidance arrived. Queue this instruction for the next turn."
@@ -380,6 +389,60 @@ class CodexEngineSession:
             raise RuntimeError(
                 "The active goal could not accept guidance. Queue this instruction for the next turn."
             ) from exc
+
+    def _steer_bounded(self, turn_id: str, turn_input: Any) -> SteerOutcome | None:
+        """Send turn/steer without pinning the caller past the steer deadline.
+
+        The SDK waits on the response without a deadline, and app-server does
+        not answer while the turn is parked on an approval. When the deadline
+        passes the request is still in flight and may yet succeed, so the
+        caller gets a SteerOutcome to follow rather than a rejection; a second
+        steer for the same turn is refused until that one has settled, so an
+        instruction is never delivered twice.
+        """
+        registry: dict[str, SteerOutcome] = self.__dict__.setdefault("_pending_steers", {})
+        registry_lock: threading.Lock = self.__dict__.setdefault("_pending_steers_lock", threading.Lock())
+        with registry_lock:
+            pending = registry.get(turn_id)
+            if pending is not None and pending.settled is None:
+                raise RuntimeError(
+                    "A previous instruction is still being delivered to Codex; wait for it to be confirmed before sending another"
+                )
+            registry.pop(turn_id, None)
+
+        state_lock = threading.Lock()
+        state: dict[str, Any] = {"result": None, "outcome": None}
+
+        def send() -> None:
+            try:
+                self._client.turn_steer(self._session_id, turn_id, turn_input)
+                result: tuple[bool, str, BaseException | None] = (True, "", None)
+            except BaseException as exc:  # noqa: BLE001 - relayed to the waiting caller or the outcome.
+                result = (False, str(exc), exc)
+            with state_lock:
+                state["result"] = result
+                outcome = state["outcome"]
+            if outcome is not None:
+                with registry_lock:
+                    if registry.get(turn_id) is outcome:
+                        registry.pop(turn_id, None)
+                outcome.settle(result[0], result[1])
+
+        worker = threading.Thread(target=send, name=f"codex-steer-{turn_id[:8]}", daemon=True)
+        worker.start()
+        worker.join(_STEER_TIMEOUT_SECONDS)
+        with state_lock:
+            result = state["result"]
+            if result is None:
+                outcome = SteerOutcome()
+                state["outcome"] = outcome
+                with registry_lock:
+                    registry[turn_id] = outcome
+                return outcome
+        ok, _detail, exc = result
+        if not ok and exc is not None:
+            raise exc
+        return None
 
     def cancel(self, turn_id: str) -> None:
         # Arm the process-tree watchdog before the cooperative RPC. If the

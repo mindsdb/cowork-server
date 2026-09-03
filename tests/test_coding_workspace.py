@@ -8,7 +8,7 @@ import pytest
 
 from cowork.coding import workspace as workspace_module
 from cowork.coding.contracts import WorkspaceKind
-from cowork.coding.workspace import GitRunner, WorkspaceError, WorkspaceManager
+from cowork.coding.workspace import GitRunner, GitUnavailableError, WorkspaceError, WorkspaceManager
 from cowork.common.settings.app_settings import get_app_settings
 
 
@@ -30,6 +30,10 @@ def repository(tmp_path: Path) -> Path:
     git(repo, "add", ".")
     git(repo, "commit", "-m", "base")
     return repo
+
+
+def missing_git(*_args, **_kwargs):
+    raise FileNotFoundError(2, "not found", "git")
 
 
 def test_prepare_uses_detached_worktree_and_preserves_dirty_source(tmp_path: Path) -> None:
@@ -366,6 +370,32 @@ def test_git_runner_rejects_an_unavailable_working_directory_before_spawning(
         GitRunner().run(tmp_path / "missing", "status")
 
 
+def test_local_folder_does_not_require_git_to_be_installed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "hello.txt").write_text("hello\n", encoding="utf-8")
+    monkeypatch.setattr(subprocess, "run", missing_git)
+    manager = WorkspaceManager(tmp_path / "coding")
+
+    inspection = manager.inspect(str(source))
+    prepared = manager.prepare("session-without-git", str(source), allow_direct_folder=True)
+
+    assert inspection.is_git is False
+    assert prepared.kind == WorkspaceKind.local_copy
+    assert (prepared.workspace_path / "hello.txt").read_text(encoding="utf-8") == "hello\n"
+
+
+def test_explicit_git_operations_still_report_when_git_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(subprocess, "run", missing_git)
+
+    with pytest.raises(GitUnavailableError, match="not installed"):
+        GitRunner().run(tmp_path, "status")
+
+
 @pytest.mark.parametrize(
     ("method", "command_output"),
     [
@@ -388,3 +418,27 @@ def test_git_reported_paths_are_revalidated_before_file_operations(
             manager._changes_since(tmp_path, "base")
         else:
             manager._status_entries(tmp_path)
+
+
+def test_a_local_copy_is_reviewable_and_applies_back_without_git(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "notes.txt").write_text("v1\n", encoding="utf-8")
+    monkeypatch.setattr(subprocess, "run", missing_git)
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare("session-review-without-git", str(source), allow_direct_folder=True)
+
+    (prepared.workspace_path / "notes.txt").write_text("v2\n", encoding="utf-8")
+    (prepared.workspace_path / "added.txt").write_text("new\n", encoding="utf-8")
+
+    state = manager.git_state(str(source), str(prepared.workspace_path))
+    changed = {item.path: item.status for item in manager.diff(str(prepared.workspace_path), base_revision=None)}
+    applied = manager.local_copies.apply(source, prepared.workspace_path)
+
+    assert state.is_git is False
+    assert changed == {"notes.txt": "M", "added.txt": "A"}
+    assert sorted(applied) == ["added.txt", "notes.txt"]
+    assert (source / "notes.txt").read_text(encoding="utf-8") == "v2\n"
+    assert (source / "added.txt").read_text(encoding="utf-8") == "new\n"

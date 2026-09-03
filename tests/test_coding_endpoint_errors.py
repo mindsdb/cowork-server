@@ -2,11 +2,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi import HTTPException
 
 from cowork.api.v1.endpoints import coding
-from cowork.coding.control_errors import StateConflict
+from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, StateConflict
 from cowork.coding.run_recovery import NoEligibleComputer
 from cowork.coding.run_state import InvalidRunTransition
 from cowork.coding.workspace import WorkspaceError
@@ -40,3 +41,23 @@ def test_workspace_inspection_translates_typed_failures(monkeypatch: pytest.Monk
 
     assert raised.value.status_code == 409
     assert raised.value.detail == "The selected folder cannot be inspected"
+
+
+def test_model_authentication_failure_has_actionable_copy_and_stable_code() -> None:
+    error = coding._http_error(ModelDiscoveryAuthenticationError("Sign in again"))
+
+    assert error.status_code == 401
+    assert error.detail == "Sign in again"
+    assert error.headers == {"X-MindsHub-Error-Code": "coding_model_authentication_failed"}
+
+
+def test_unknown_upstream_failure_remains_a_safe_500() -> None:
+    request = httpx.Request("GET", "https://api.mindshub.ai/v1/models")
+    response = httpx.Response(503, request=request)
+
+    error = coding._http_error(
+        httpx.HTTPStatusError("unavailable", request=request, response=response)
+    )
+
+    assert error.status_code == 500
+    assert error.detail == "Coding operation failed"

@@ -12,7 +12,7 @@ from typing import Any
 
 import httpx
 
-from cowork.coding.context import goal_status_text
+from cowork.coding.context import classify_engine_failure, goal_status_text
 from cowork.coding.contracts import CodingEvent, EventType
 from cowork.coding.control_models import RuntimeCommand
 from cowork.coding.engines.base import (
@@ -87,8 +87,13 @@ class CodeOnlyRuntime:
         try:
             self._execute(lease)
         except BaseException as exc:
+            failure = classify_engine_failure(str(exc), model=lease.execution.model)
             try:
-                self.client.event(lease, "error", {"detail": str(exc)[:4_000]})
+                self.client.event(lease, "error", {
+                    "detail": (failure.detail or failure.message)[:4_000],
+                    "message": failure.message[:4_000],
+                    **failure.event_data(),
+                })
             except RuntimeClientError:
                 pass
             raise
@@ -367,6 +372,7 @@ class CodeOnlyRuntime:
                 lease,
                 "Compaction started",
                 "Codex compacted this task's context for future turns.",
+                {"command": "compact"},
             )
             return True
         if command == "status":
@@ -381,7 +387,7 @@ class CodeOnlyRuntime:
                     f"Network: {'on' if lease.execution.network_access else 'off'}",
                     goal_line,
                 )),
-                {"goal": goal or {}},
+                {"command": "status", "goal": goal or {}},
             )
             return True
         if command == "goal" and goal_action in {"view", "edit", "pause", "clear"}:
@@ -400,7 +406,7 @@ class CodeOnlyRuntime:
                 if goal_action == "view"
                 else "The task goal has been cleared."
             )
-            self._emit_session_event(lease, labels[goal_action], text, {"goal": goal or {}})
+            self._emit_session_event(lease, labels[goal_action], text, {"command": "goal", "goal": goal or {}})
             return True
         return False
 
