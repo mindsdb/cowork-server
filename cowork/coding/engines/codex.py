@@ -37,7 +37,13 @@ from cowork.coding.engines.base import (
     TerminalOutputHandler,
 )
 from cowork.coding.engines.codex_extensions import add_extension_response
-from cowork.coding.processes import executable_name, runs_command, terminate_command_trees, terminate_descendants
+from cowork.coding.processes import (
+    TERMINAL_ENV_MARKER,
+    executable_name,
+    runs_command,
+    terminate_command_trees,
+    terminate_descendants,
+)
 from cowork.coding.redaction import redact_text, sanitize
 from cowork.common.settings.app_settings import get_app_settings
 
@@ -369,9 +375,10 @@ class CodexEngineSession:
         try:
             name = executable_name(process.name())
             cmdline = list(process.cmdline())
+            environment = process.environ()
         except (psutil.Error, OSError):
             return True  # Cannot inspect it, so leave it alone.
-        if name in self._CODEX_HELPERS:
+        if name in self._CODEX_HELPERS or TERMINAL_ENV_MARKER in environment:
             return True
         if any("cowork.coding.integration_mcp" in part for part in cmdline):
             return True
@@ -384,8 +391,9 @@ class CodexEngineSession:
         follow-ups and terminals, so without this a dev server or test watcher
         the agent started would keep running for as long as the task exists.
         Codex's helpers under the app-server (the MCP servers, the code-mode
-        host) stay for the next turn. Managed Run processes and terminal tabs
-        are not children of the app-server and are untouched.
+        host) stay for the next turn, and so do the user's terminal tabs and
+        Run actions, which run through the same app-server and carry
+        TERMINAL_ENV_MARKER in their environment.
         """
         if self._closed.is_set():
             return
@@ -748,7 +756,13 @@ class CodexEngineSession:
                 {
                     "command": command,
                     "cwd": str(self._terminal_workspace),
-                    "env": codex_config.interactive_shell_environment(command, self._terminal_workspace),
+                    "env": {
+                        **codex_config.interactive_shell_environment(command, self._terminal_workspace),
+                        # Marks the shell (and everything started in it) as the
+                        # user's, so finishing a turn never reaps a terminal tab
+                        # or a Run action.
+                        TERMINAL_ENV_MARKER: process_id,
+                    },
                     "processId": process_id,
                     # This is a user-controlled shell (and the execution path
                     # for an explicitly clicked project action), not an agent

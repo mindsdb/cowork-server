@@ -976,11 +976,30 @@ def test_a_finished_turn_reaps_its_command_trees_but_keeps_codex_helpers(monkeyp
     assert session._client.unregistered == ["turn-1"]
     assert [pid for pid, _ in reaped] == [4242]
     protected = reaped[0][1]
-    assert protected(SimpleNamespace(name=lambda: "codex-code-mode-host.exe", cmdline=lambda: ["codex-code-mode-host.exe"]))
-    assert protected(SimpleNamespace(name=lambda: "python", cmdline=lambda: ["python", "-m", "cowork.coding.integration_mcp", "/root", "task"]))
-    assert protected(SimpleNamespace(name=lambda: "node", cmdline=lambda: ["/usr/bin/node", "mcp.js"]))
-    assert not protected(SimpleNamespace(name=lambda: "node", cmdline=lambda: ["node", "server.js"]))
-    assert not protected(SimpleNamespace(name=lambda: "cmd.exe", cmdline=lambda: ["cmd.exe", "/c", "npm test"]))
+
+    def proc(name, cmdline, environ=None):
+        return SimpleNamespace(name=lambda: name, cmdline=lambda: cmdline, environ=lambda: environ or {})
+
+    assert protected(proc("codex-code-mode-host.exe", ["codex-code-mode-host.exe"]))
+    assert protected(proc("python", ["python", "-m", "cowork.coding.integration_mcp", "/root", "task"]))
+    assert protected(proc("node", ["/usr/bin/node", "mcp.js"]))
+    # A terminal tab or Run action: the sidecar marks its environment.
+    assert protected(proc("zsh", ["/bin/zsh", "-il"], {"COWORK_CODE_TERMINAL": "terminal-1", "TERM": "xterm-256color"}))
+    assert not protected(proc("node", ["node", "server.js"]))
+    assert not protected(proc("cmd.exe", ["cmd.exe", "/c", "npm test"]))
+    assert not protected(proc("zsh", ["/bin/zsh", "-lc", "npm run dev"], {"TERM": "xterm-256color"}))
+
+    class Opaque:
+        def name(self):
+            raise PermissionError("no access")
+
+        def cmdline(self):
+            return []
+
+        def environ(self):
+            return {}
+
+    assert protected(Opaque())
 
     # Once the session is closed, close() has already torn everything down.
     session._closed.set()
@@ -988,3 +1007,36 @@ def test_a_finished_turn_reaps_its_command_trees_but_keeps_codex_helpers(monkeyp
     session._client = FakeClient()
     list(session.events("turn-2"))
     assert len(reaped) == 1
+
+
+def test_terminal_tabs_are_marked_so_a_finished_turn_leaves_them_running(tmp_path: Path) -> None:
+    import threading
+    from types import SimpleNamespace
+
+    from cowork.coding.contracts import TerminalShellPreference
+    from cowork.coding.engines.codex import CodexEngineSession
+    from cowork.coding.processes import TERMINAL_ENV_MARKER
+
+    requests: list[tuple[str, dict]] = []
+
+    class FakeClient:
+        def request(self, method, params, response_model=None):
+            requests.append((method, params))
+            return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    session = object.__new__(CodexEngineSession)
+    session._client = FakeClient()
+    session._terminal_workspace = tmp_path
+    session._terminal_handlers = {}
+    session._terminal_lock = threading.Lock()
+    session._secrets = ()
+    session._closed = threading.Event()
+    exits: list[tuple[int | None, str | None]] = []
+
+    session._run_terminal("terminal-7", 120, 40, TerminalShellPreference.bash, lambda code, error: exits.append((code, error)))
+
+    (method, params), = requests
+    assert method == "command/exec"
+    assert params["processId"] == "terminal-7"
+    assert params["env"][TERMINAL_ENV_MARKER] == "terminal-7"
+    assert exits == [(0, None)]
