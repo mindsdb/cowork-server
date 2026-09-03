@@ -297,6 +297,8 @@ class CodingSessionFactory:
         contexts: list[SourceContext],
     ) -> CodingSession:
         project = preparation.project
+        # A task chooses its own effort; otherwise it inherits the project's.
+        reasoning_effort = request.reasoning_effort or (project.default_reasoning_effort if project else None)
         instructions = project_instructions(
             project,
             list(preparation.task_workspaces),
@@ -313,7 +315,7 @@ class CodingSessionFactory:
             engine_adapter_version=adapter_version,
             model=model,
             permission_mode=preparation.permission_mode,
-            reasoning_effort=request.reasoning_effort,
+            reasoning_effort=reasoning_effort,
             service_tier=request.service_tier,
             personality=request.personality,
             network_access=request.network_access or preparation.permission_mode.value == "full_access",

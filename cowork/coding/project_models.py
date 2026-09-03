@@ -14,6 +14,7 @@ from cowork.coding.contracts import (  # noqa: F401
     SourceContext,
     TerminalShellPreference,
     utc_now,
+    ReasoningEffort,
 )
 from cowork.coding.git_transport import validate_git_source
 from cowork.coding.skill_models import ProjectSkillSource
@@ -240,6 +241,8 @@ class CodeProject(BaseModel):
     environment: ProjectEnvironment = Field(default_factory=ProjectEnvironment)
     default_engine_id: str = "codex"
     default_model: str = "gpt"
+    # None means "use the model's own default"; tasks may still override it.
+    default_reasoning_effort: ReasoningEffort | None = None
     permission_mode: PermissionMode = PermissionMode.supervised
     created_at: datetime = Field(default_factory=utc_now)
     updated_at: datetime = Field(default_factory=utc_now)
@@ -326,6 +329,8 @@ class ProjectCreateRequest(BaseModel):
     skill_sources: list[ProjectSkillSource] = Field(default_factory=list, max_length=24)
     default_engine_id: str = "codex"
     default_model: str = "gpt"
+    # None means "use the model's own default"; tasks may still override it.
+    default_reasoning_effort: ReasoningEffort | None = None
     permission_mode: PermissionMode = PermissionMode.supervised
 
     @model_validator(mode="after")
@@ -345,6 +350,7 @@ class ProjectUpdateRequest(BaseModel):
     skill_sources: list[ProjectSkillSource] | None = Field(default=None, max_length=24)
     default_engine_id: str | None = None
     default_model: str | None = None
+    default_reasoning_effort: ReasoningEffort | None = None
     permission_mode: PermissionMode | None = None
 
     @model_validator(mode="after")
