@@ -626,7 +626,16 @@ def _project_artifacts_base(project_name: str) -> Path | None:
             or "/" in project_name or "\\" in project_name
             or project_name in (".", "..")):
         return None
-    registered = set(_registered_project_dirs())
+    # Compare canonical paths on both sides. On macOS, temporary and user
+    # paths commonly cross aliases such as /var -> /private/var; comparing a
+    # resolved candidate with raw registry entries incorrectly rejects a
+    # genuinely registered project in that case.
+    registered: set[Path] = set()
+    for project_dir in _registered_project_dirs():
+        try:
+            registered.add(project_dir.resolve(strict=False))
+        except (OSError, ValueError):
+            continue
     root = _projects_root().resolve(strict=False)
     try:
         candidate = (root / project_name).resolve(strict=False)
@@ -1209,8 +1218,11 @@ def card_for_folder(
                 return None
             artifact_id, meta = ensure_full_id(folder, meta)
             published_map = _load_published_map(folder)
-    except (OSError, ValueError):
-        logger.warning("Skipping artifact with invalid identity: %s", folder, exc_info=True)
+    except (OSError, ValueError) as exc:
+        # No stack: this is a handled skip, and it runs on a polled list
+        # endpoint. A full traceback per occurrence per poll is what buried
+        # the real signal during the 2026-08-31 incident.
+        logger.warning("Skipping artifact with invalid identity: %s (%s)", folder, exc)
         return None
 
     prepared = _prepare_artifact_card(
@@ -1252,8 +1264,11 @@ def _listed_card_for_pinned_folder(
     try:
         artifact_id, meta = read_full_id(pinned_folder)
         published_map = _load_published_map_pinned(pinned_folder)
-    except (OSError, ValueError):
-        logger.warning("Skipping artifact with invalid identity: %s", folder, exc_info=True)
+    except (OSError, ValueError) as exc:
+        # No stack: this is a handled skip, and it runs on a polled list
+        # endpoint. A full traceback per occurrence per poll is what buried
+        # the real signal during the 2026-08-31 incident.
+        logger.warning("Skipping artifact with invalid identity: %s (%s)", folder, exc)
         return None
 
     prepared = _prepare_artifact_card(
@@ -1382,6 +1397,15 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                 with dir_scandir(root) as entries:
                     child_names = []
                     for entry in entries:
+                        # An artifact folder never starts with a dot, while the
+                        # root also holds housekeeping directories that do:
+                        # `.locks` from cowork.services.artifact_locks, and the
+                        # `.{name}.{uuid}.tmp` scratch directories atomic writes
+                        # mint. Skipping them here costs nothing. Admitting them
+                        # means opening each one and discovering the missing
+                        # metadata.json by exception, once per root per request.
+                        if entry.name.startswith("."):
+                            continue
                         try:
                             if (
                                 not entry.is_symlink()

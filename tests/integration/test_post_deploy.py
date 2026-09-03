@@ -11,8 +11,13 @@ provisioning secret; PR envs POST to /dev/mint-test-user/, which is mounted
 only where `ephemeral` is on and needs no secret. Either way the response
 carries the user_id and organization_id these tests send as headers.
 
+Cloudflare Access fronts /v1/internal* on auth's public host, so the
+provisioning call goes to auth's Service instead. CI uses cluster DNS from a
+runner in the cluster; by hand, forward the port first with
+`kubectl port-forward -n staging svc/auth 8080:80`.
+
     COWORK_BASE_URL=https://cowork.staging.example.com \\
-    TEST_USER_PROVISION_URL=https://auth.staging.example.com/v1/internal/test-users/ \\
+    TEST_USER_PROVISION_URL=http://localhost:8080/v1/internal/test-users/ \\
     TEST_USER_PROVISION_SECRET=... \\
     uv run pytest tests/integration/test_post_deploy.py -v
 

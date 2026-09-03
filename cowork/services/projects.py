@@ -115,11 +115,14 @@ class ProjectService:
         # NOT EXISTS narrows the race; `uq_projects_default_per_org` settles it —
         # on Postgres both replicas can pass the check at READ COMMITTED (only
         # SQLite serialises writes). The caller re-reads, so the loser adopts the
-        # winner's row. Core insert, not session.add, so the flush hook can't stamp
-        # created_by: this project is the org's, not the first member's.
+        # winner's row. Core insert, not session.add, so created_by is written
+        # explicitly rather than stamped by the flush hook: the member who first
+        # reaches the org provisions General and becomes its recorded creator,
+        # which is what makes its instructions editable without an admin. Rename
+        # and delete stay refused for every role, creator included.
         raw = unsafe_unscoped_session(self.session)  # bootstrap op, not query path
         try:
-            self._execute_general_insert(raw, path, scope.org_id)
+            self._execute_general_insert(raw, path, scope.org_id, scope.user_id)
         except sa.exc.IntegrityError:
             raw.rollback()
 
@@ -141,9 +144,11 @@ class ProjectService:
             return sa.insert(Project)
         return dialect_insert(Project)
 
-    def _execute_general_insert(self, raw, path: Path, org_id: str | None) -> None:
+    def _execute_general_insert(
+        self, raw, path: Path, org_id: str | None, created_by: str | None
+    ) -> None:
         stmt = self._insert_stmt(raw).from_select(
-            ["id", "name", "path", "is_active", "org_id"],
+            ["id", "name", "path", "is_active", "org_id", "created_by"],
             sa.select(
                 # type_ is required: a bare literal binds as String and skips
                 # the Uuid column's bind processor, so the id is stored in a
@@ -155,6 +160,7 @@ class ProjectService:
                 # get_active_project raises when nothing is active.
                 sa.literal(True),
                 sa.literal(org_id),
+                sa.literal(created_by),
             ).where(
                 ~sa.exists().where(
                     Project.name == GENERAL_PROJECT,  # type: ignore[arg-type]
@@ -724,7 +730,13 @@ class ProjectService:
                 conv = self.session.get(Conversation, cid)
                 if conv is None:
                     continue
-                conversation_stages.append(conv_svc.stage_delete_conversation_row(conv))
+                conversation_stages.append(
+                    # A project delete is the org-wide cascade, so it is the one
+                    # caller allowed to drop every member's attachment rows.
+                    conv_svc.stage_delete_conversation_row(
+                        conv, include_org_attachments=True
+                    )
+                )
         except Exception:
             # Atomicity is stricter than the old skip-on-error behavior. A
             # failed child stage rolls back every earlier child and aborts the

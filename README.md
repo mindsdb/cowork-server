@@ -120,7 +120,7 @@ Key tables:
 | `settings` | Key-value user settings; sensitive values Fernet-encrypted |
 | `pins` | User-pinned items (conversations, artifacts, etc.) |
 | `channel_*` | Channel installations, bindings, sessions, and events |
-| `shared_resource_attributions` | Immutable creator and latest-editor snapshots for org-shared filesystem resources |
+| `shared_resource_attributions` | Creator and latest-editor user IDs for org-shared filesystem resources |
 | `shared_resource_mutations` | Append-only actor trail for allowed org-shared mutations, including deletes |
 
 All models use UUID primary keys with auto-tracked `created_at`/`modified_at` timestamps.
@@ -175,6 +175,22 @@ travels the same way, which is what keeps a long-lived `mdb_` key out of both
 `.env` and the settings table. The route is loopback-only and refuses in org
 mode: an org deployment mints a per-turn credential in the turn producer and its
 pods are never handed one.
+
+**A live turn re-reads it per request, with one exception.** The overlay alone
+was not enough: a turn copied the credential into its provider once, so a turn
+running across a hand-over kept sending the token it started with and took a
+gateway 401 that looked like a dead account. `build_llm_client` now passes an
+`api_key_provider` into MindsHub-backed providers, so each outbound model call
+reads the current in-memory value. Two limits are deliberate. Static
+organization-mode and user-supplied keys keep their construction-time value,
+because nothing rotates them. And the **scratchpad subprocess keeps the token it
+was started with** — `export_connection_info()` hands it a string once and it
+has no supplier, so a pad-side model call still runs on that value. Refreshing
+it needs a pad IPC contract, which ENG-2116 scoped out.
+
+`build_llm_client` capability-gates the kwarg on `inspect.signature`, so an
+older Anton keeps the static key and logs the degradation rather than failing
+every turn.
 
 ## API
 
@@ -343,8 +359,13 @@ depends on the resource:
   tasks, personal memory, uploaded files, and everything under a conversation's
   own workspace at `conversations/<conversation_id>/`. Live artifacts are in
   that last group, because the agent writes them into the conversation it is
-  running in. Cloud OAuth connections are also user-private in auth's Data
-  Vault; cowork-server only proxies the caller's own catalogue and disconnect.
+  running in. Cloud OAuth connections are also user-private, held in auth's
+  Data Vault rather than here. cowork-server stores none of it and relays the
+  caller's own credential to auth for the whole lifecycle: the connect
+  handshake and its status poll, the connection catalogue, one connection's
+  detail, the Google Picker file grant, a short-lived picker access token, and
+  disconnect. auth resolves the caller from that credential, so each route only
+  ever reaches that user's own connections.
 
 Shared visibility does not imply shared destructive access. Project creators
 and organization admins can rename or delete a project; the General project is
@@ -358,9 +379,11 @@ project files remain member-writeable.
 
 The API derives these decisions from the trusted principal and returns typed
 `attribution` and `capabilities` objects for the client. Stable user IDs drive
-authorization; email is only a display snapshot. File-backed resource ownership
-lives in `shared_resource_attributions`, outside the agent-writeable project
-tree, and every allowed protected mutation appends a
+authorization, and they are the only identity these rows keep: no email address
+is stored, and the API fills one in only when the actor is the viewer
+themselves, so an attribution never discloses another member's address.
+File-backed resource ownership lives in `shared_resource_attributions`, outside
+the agent-writeable project tree, and every allowed protected mutation appends a
 `shared_resource_mutations` row. A delete removes the current attribution but
 keeps its mutation event. Unattributed legacy resources fail closed to
 admin-only mutation.

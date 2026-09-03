@@ -69,11 +69,13 @@ class ChannelLifecycleService:
         def persist(values: dict[str, str]) -> None:
             self.config.set_config(channel_type, values)
 
+        org_id = self.session.scope.org_id
+
         async def refresh() -> bool:
-            return await self.adapters.refresh(channel_type, session=self.session)
+            return await self.adapters.refresh(channel_type, org_id, session=self.session)
 
         async def remove() -> None:
-            await self.adapters.remove(channel_type)
+            await self.adapters.remove(channel_type, org_id)
 
         return LifecycleContext(
             channel_type=channel_type,

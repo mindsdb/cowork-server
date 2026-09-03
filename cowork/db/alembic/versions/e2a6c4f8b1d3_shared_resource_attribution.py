@@ -43,9 +43,7 @@ def upgrade() -> None:
             sa.Column("resource_kind", sa.String(length=32), nullable=False),
             sa.Column("resource_key", sa.String(length=255), nullable=False),
             sa.Column("created_by_id", sa.String(length=36), nullable=True),
-            sa.Column("created_by_email", sa.String(length=320), nullable=True),
             sa.Column("updated_by_id", sa.String(length=36), nullable=True),
-            sa.Column("updated_by_email", sa.String(length=320), nullable=True),
             sa.Column("pending_claim_token", sa.String(length=36), nullable=True),
             sa.Column(
                 "pending_claim_expires_at",
@@ -92,7 +90,6 @@ def upgrade() -> None:
             sa.Column("resource_key", sa.String(length=255), nullable=False),
             sa.Column("action", sa.String(length=32), nullable=False),
             sa.Column("actor_id", sa.String(length=36), nullable=False),
-            sa.Column("actor_email", sa.String(length=320), nullable=True),
             sa.PrimaryKeyConstraint("id"),
         )
         op.create_index(

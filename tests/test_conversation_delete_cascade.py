@@ -151,6 +151,43 @@ def test_delete_conversation_leaves_other_conversations_and_purposes(session):
     assert Path(other.path).exists()
 
 
+def test_direct_conversation_delete_never_takes_the_org_wide_attachment_path(
+    session,
+    monkeypatch,
+):
+    """A member deleting their own chat must not reach a peer's file row.
+
+    The owner-agnostic sweep selects on File.purpose alone, so a direct delete
+    that ever reached it would take every org-visible attachment on that
+    conversation with it. Only the project cascade may ask for that path.
+    """
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
+    conv = svc.create_conversation("owned", project_id=GENERAL_PROJECT_ID)
+    attachment = _attach(session, conv.id)
+
+    def forbidden(self, purpose):
+        raise AssertionError("a direct conversation delete used the org-wide sweep")
+
+    monkeypatch.setattr(
+        FileService,
+        "delete_by_purpose_for_parent_cascade",
+        forbidden,
+    )
+
+    assert svc.delete_conversation(conv.id) is True
+    assert _attachment_rows(session, conv.id) == []
+    assert not Path(attachment.path).exists()
+
+
+def test_staging_a_conversation_delete_demands_an_explicit_attachment_scope(session):
+    """The owner-agnostic sweep cannot be inherited by leaving the flag off."""
+    svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
+    conv = svc.create_conversation("explicit", project_id=GENERAL_PROJECT_ID)
+
+    with pytest.raises(TypeError, match="include_org_attachments"):
+        svc.stage_delete_conversation_row(conv)
+
+
 def test_delete_project_cascades_conversations_and_attachments(session):
     proj = ProjectService(ScopedSession(session, LOCAL_SCOPE)).create_project(
         "eng701-cascade-test"
@@ -188,10 +225,10 @@ def test_delete_project_aborts_all_conversation_stages_on_one_failure(
 
     real = ConversationService.stage_delete_conversation_row
 
-    def flaky(self, conversation):
+    def flaky(self, conversation, **kwargs):
         if str(conversation.id) == str(bad.id):
             raise RuntimeError("boom")
-        return real(self, conversation)
+        return real(self, conversation, **kwargs)
 
     monkeypatch.setattr(
         ConversationService,

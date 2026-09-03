@@ -15,7 +15,7 @@ import time
 import uuid
 
 from cowork.build_info import KEY_ANTON_VERSION, build_trace_metadata, surface
-from cowork.handlers.turn_errors import remote_turn_error
+from cowork.handlers.turn_errors import WORKER_UNRESPONSIVE_TYPE_NAME, remote_turn_error
 from cowork.services.providers import minds_chat_base_url
 from cowork.turnqueue.auth_keys import list_active_connections, mint_turn_key
 from cowork.turnqueue.models import TurnJob, TurnReply
@@ -171,8 +171,12 @@ async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
 
 # What the reply loop reports when the worker stops answering. Shaped like the
 # pod's own scrubbed "ExceptionType: message" errors so remote_turn_error can
-# classify it (today: the generic redacted message and the generic error card).
-UNRESPONSIVE_WORKER_ERROR = "TurnWorkerUnresponsive: the turn worker stopped responding"
+# classify it, and built from the type name that function branches on so the two
+# cannot drift. It maps to WORKER_UNRESPONSIVE_CODE, which the client renders
+# differently from anton_error because nothing ran.
+UNRESPONSIVE_WORKER_ERROR = (
+    f"{WORKER_UNRESPONSIVE_TYPE_NAME}: the turn worker stopped responding"
+)
 
 
 def step_stream_events(data: dict) -> list:

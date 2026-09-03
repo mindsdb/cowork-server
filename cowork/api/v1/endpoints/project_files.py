@@ -475,6 +475,22 @@ def _instructions_fields_from_access(
     }
 
 
+def _instructions_file_exists(scoped: ScopedSession, project_id: UUID) -> bool:
+    """Whether `.anton/anton.md` exists, resolved from the project's live row.
+
+    `recover_stale_claim` calls this while holding the instructions coordination
+    lock, which is the same lock a rename holds across its directory move, so
+    reading the row here sees either the pre-rename or the post-rename path and
+    never a half-applied one.
+    """
+    current = scoped.get(Project, project_id)
+    if current is None:
+        return False
+    if scoped.scope.org_mode:
+        scoped.refresh(current)
+    return _anton_md_path(Path(current.path)).is_file()
+
+
 def _instructions_fields(
     project: Project,
     scoped: ScopedSession,
@@ -482,21 +498,21 @@ def _instructions_fields(
     *,
     modified: float | None,
 ) -> dict[str, Any]:
+    """Instruction metadata for a read.
+
+    This runs once per listed file and once per instructions read, so it takes
+    no lock of its own: `recover_stale_claim` decides lock-free that there is
+    nothing to recover, and only takes the coordination lock (and with it a
+    dedicated unpooled connection) when a claim really may have expired.
+    """
     access = SharedResourceAccess(scoped, principal)
     key = project_resource_key(project.id)
     if access.org_mode and access.has_trusted_actor:
-        with access.coordination_lock(PROJECT, project_resource_key(project.id)):
-            current = scoped.get(Project, project.id)
-            if current is not None:
-                scoped.refresh(current)
-                project = current
-            instructions_path = Path(project.path) / ".anton" / ANTON_INSTRUCTIONS_FILENAME
-            with access.coordination_lock(PROJECT_INSTRUCTIONS, key):
-                access.recover_stale_claim(
-                    PROJECT_INSTRUCTIONS,
-                    key,
-                    resource_exists=lambda: instructions_path.is_file(),
-                )
+        access.recover_stale_claim(
+            PROJECT_INSTRUCTIONS,
+            key,
+            resource_exists=lambda: _instructions_file_exists(scoped, project.id),
+        )
     return _instructions_fields_from_access(
         project,
         access,
@@ -861,6 +877,15 @@ def _compensate_instruction_write(
     path: _ValidatedProjectPath,
     scoped: ScopedSession,
 ) -> None:
+    # Roll back first. A failed audit commit leaves the session in a pending
+    # rollback, and the restore below reaches ProjectService.list_projects() on
+    # that same session, so every query would raise and the swallowed exception
+    # would leave the instructions overwritten. skills.py rolls back the same
+    # way before its restore.
+    try:
+        context.access.session.rollback()
+    except Exception:
+        logger.exception("Could not roll back the session before restoring bytes")
     try:
         _restore_project_bytes(project_name, path, context.previous, scoped)
     except Exception:
@@ -869,7 +894,6 @@ def _compensate_instruction_write(
         )
     if context.claim is not None and context.claim_token is not None:
         try:
-            context.access.session.rollback()
             context.access.release_claim(
                 context.claim,
                 claim_token=context.claim_token,
@@ -1407,6 +1431,14 @@ def delete_project_file(
                 project_resource_key(project.id),
             )
         except Exception:
+            # Same ordering as _compensate_instruction_write: the failed audit
+            # commit poisons the session the restore has to read through.
+            try:
+                access.session.rollback()
+            except Exception:
+                logger.exception(
+                    "Could not roll back the session before restoring bytes"
+                )
             try:
                 _restore_project_bytes(
                     project_name,

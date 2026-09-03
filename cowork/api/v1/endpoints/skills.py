@@ -3,6 +3,7 @@ from contextlib import ExitStack, nullcontext
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
+from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
 from cowork.db.scoped import (
@@ -28,18 +29,18 @@ from cowork.services.shared_resources import (
     SKILL_PROJECT_REFERENCES,
     SharedResourceAccess,
 )
-from cowork.services.skills import SkillService, is_builtin_skill
+from cowork.services.skills import (
+    SkillService,
+    builtin_skill_refusal,
+    is_builtin_skill,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-def _project_reference_lock(
-    access: SharedResourceAccess,
-    *,
-    needed: bool,
-):
-    if access.org_mode and needed:
+def _project_reference_lock(access: SharedResourceAccess):
+    if access.org_mode:
         return access.coordination_lock(SKILL_PROJECT_REFERENCES, "all")
     return nullcontext()
 
@@ -76,9 +77,6 @@ def _skill_response(skill: Skill, access: SharedResourceAccess) -> dict:
         and not (builtin and access.org_mode)
         and access.can_change(creator_id)
     )
-    creator_email = (
-        access.actor_email if creator_id and creator_id == access.actor_id else None
-    )
     return SkillResponse(
         id=skill.id,
         label=skill.label,
@@ -93,7 +91,6 @@ def _skill_response(skill: Skill, access: SharedResourceAccess) -> dict:
             SKILL,
             skill.name,
             fallback_creator_id=creator_id,
-            fallback_creator_email=creator_email,
             fallback_modified_at=skill.updated_at,
         ),
         is_builtin=builtin,
@@ -173,6 +170,27 @@ def _recover_stale_skill_claim(
             service.discard_incomplete_skill(slug)
 
 
+def _reserve_free_slug(
+    access: SharedResourceAccess,
+    service: SkillService,
+    slug: str,
+) -> tuple[SharedResourceAttribution, str]:
+    """Reserve ``slug`` for a create, refusing one that is already occupied.
+
+    The caller holds ``slug``'s coordination lock. The directory is checked
+    before the claim because a claim reserved over existing bytes survives a
+    crash, and recovery would then hand a skill this request never wrote to
+    whoever reserved it.
+    """
+    _recover_stale_skill_claim(access, service, slug)
+    if service._skill_dir(slug).exists():
+        raise FileExistsError(f"A skill named '{slug}' already exists.")
+    claim, claim_token = access.reserve_claim(SKILL, slug)
+    if claim is None or claim_token is None:
+        raise FileExistsError(f"A skill named '{slug}' already exists.")
+    return claim, claim_token
+
+
 @router.get("/", response_model=SkillListResponse)
 def list_skills(
     scoped: ScopedSessionDep,
@@ -203,10 +221,7 @@ def create_skill(
     service = SkillService(scoped.scope)
     claim = None
     claim_token = None
-    with _project_reference_lock(
-        access,
-        needed=True,
-    ):
+    with _project_reference_lock(access):
         with ExitStack() as resource_locks:
             try:
                 if scoped.scope.org_mode and body.projects is not None:
@@ -214,10 +229,7 @@ def create_skill(
                 slug = service._slug_from_label(body.label)
                 if scoped.scope.org_mode:
                     resource_locks.enter_context(access.coordination_lock(SKILL, slug))
-                    _recover_stale_skill_claim(access, service, slug)
-                    claim, claim_token = access.reserve_claim(SKILL, slug)
-                    if claim is None or claim_token is None:
-                        raise FileExistsError(f"A skill named '{slug}' already exists.")
+                    claim, claim_token = _reserve_free_slug(access, service, slug)
                 skill = service.create_skill(
                     label=body.label,
                     name=body.name,
@@ -260,16 +272,13 @@ def _upload_skill_bytes(
     claim = None
     claim_token = None
 
-    with _project_reference_lock(access, needed=True):
+    with _project_reference_lock(access):
         with ExitStack() as resource_locks:
 
             def reserve_import(slug: str) -> None:
                 nonlocal claim, claim_token
                 resource_locks.enter_context(access.coordination_lock(SKILL, slug))
-                _recover_stale_skill_claim(access, service, slug)
-                claim, claim_token = access.reserve_claim(SKILL, slug)
-                if claim is None or claim_token is None:
-                    raise FileExistsError(f"A skill named '{slug}' already exists.")
+                claim, claim_token = _reserve_free_slug(access, service, slug)
 
             try:
                 skill = service.import_skill(
@@ -361,10 +370,7 @@ def update_skill(
 ):
     service = SkillService(scoped.scope)
     access = SharedResourceAccess(scoped, principal)
-    with _project_reference_lock(
-        access,
-        needed=True,
-    ):
+    with _project_reference_lock(access):
         resource_coordination = ExitStack()
         try:
             if scoped.scope.org_mode and body.projects is not None:
@@ -383,16 +389,14 @@ def update_skill(
                 _recover_stale_skill_claim(access, service, current.name)
             creator_id = access.creator_id(SKILL, current.name)
             if scoped.scope.org_mode and is_builtin_skill(current.name):
-                raise PermissionError(f"Built-in skill {current.name!r} is immutable.")
+                raise PermissionError(builtin_skill_refusal(current.name))
             access.require_change(
                 creator_id,
                 detail="Only the skill creator or an organization admin can edit this skill",
             )
             if scoped.scope.org_mode and target_slug != current.name:
                 if is_builtin_skill(target_slug):
-                    raise PermissionError(
-                        f"Built-in skill {target_slug!r} is immutable."
-                    )
+                    raise PermissionError(builtin_skill_refusal(target_slug))
                 _recover_stale_skill_claim(access, service, target_slug)
                 if access.has_attribution(
                     SKILL,
@@ -412,12 +416,15 @@ def update_skill(
                         attribution.created_by_id,
                         detail="Only the skill creator or an organization admin can edit this skill",
                     )
-                current = service.get_skill(skill_id)
+                # Re-read by the locked identity: resolving the request
+                # segment again could land on a different directory than the
+                # one this mutation lock covers.
+                current = service.get_skill(current.name)
                 original_skill_bytes = (
                     service._skill_dir(current.name) / "SKILL.md"
                 ).read_bytes()
                 skill = service.update_skill(
-                    skill_id,
+                    current.name,
                     label=body.label,
                     name=body.name,
                     description=body.description,
@@ -447,14 +454,22 @@ def update_skill(
                 if enabled_changed:
                     actions.append("enable" if skill.enabled else "disable")
                 try:
+                    if renamed and access.has_attribution(SKILL, skill.name):
+                        # The destination slug gained attribution after this
+                        # request cleared it. Name the taken slug rather than
+                        # letting its unique key fail the commit.
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=f"A skill named '{skill.name}' already exists.",
+                        )
                     access.record_updates(
                         SKILL,
-                        skill_id,
+                        current.name,
                         actions=actions,
                         fallback_creator_id=creator_id,
                         new_key=skill.name if renamed else None,
                     )
-                except Exception:
+                except Exception as audit_failure:
                     access.session.rollback()
                     try:
                         if renamed:
@@ -466,6 +481,13 @@ def update_skill(
                     except Exception:
                         logger.exception(
                             "Could not restore a skill after an audit failure"
+                        )
+                    if renamed and isinstance(audit_failure, IntegrityError):
+                        # Another writer took the destination slug between the
+                        # check above and this commit.
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=f"A skill named '{skill.name}' already exists.",
                         )
                     raise
         except PermissionError as e:
@@ -485,7 +507,7 @@ def delete_skill(
 ):
     service = SkillService(scoped.scope)
     access = SharedResourceAccess(scoped, principal)
-    reference_coordination = _project_reference_lock(access, needed=True)
+    reference_coordination = _project_reference_lock(access)
     reference_coordination.__enter__()
     resource_coordination = None
     try:
@@ -495,7 +517,7 @@ def delete_skill(
             resource_coordination.__enter__()
             _recover_stale_skill_claim(access, service, skill.name)
         if scoped.scope.org_mode and is_builtin_skill(skill.name):
-            raise PermissionError(f"Built-in skill {skill.name!r} is immutable.")
+            raise PermissionError(builtin_skill_refusal(skill.name))
         creator_id = access.creator_id(SKILL, skill.name)
         access.require_change(
             creator_id,
@@ -513,18 +535,18 @@ def delete_skill(
                     attribution.created_by_id,
                     detail="Only the skill creator or an organization admin can delete this skill",
                 )
-                staged = service.stage_delete(skill_id)
+                staged = service.stage_delete(skill.name)
                 found = staged is not None
                 if found:
                     try:
-                        access.record_delete(SKILL, skill_id)
+                        access.record_delete(SKILL, skill.name)
                     except Exception:
                         access.session.rollback()
-                        service.restore_staged_delete(skill_id, staged)
+                        service.restore_staged_delete(skill.name, staged)
                         raise
                     service.finalize_staged_delete(staged)
         else:
-            found = service.delete_skill(skill_id)
+            found = service.delete_skill(skill.name)
     except PermissionError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except ValueError as e:

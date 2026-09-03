@@ -519,31 +519,21 @@ class ConversationService:
             return False
         return self._delete_conversation(conversation)
 
-    def delete_conversation_row(self, conversation: Conversation) -> bool:
-        """Owner-AGNOSTIC cascade delete, given an already-authorized row.
-
-        Used by ProjectService.delete_project, which is an intentional org-wide
-        cleanup: the project's conversations may belong to several members, and
-        skipping the foreign ones would orphan their messages/events/task
-        objects/attachment bytes (the ENG-701 orphaning the cascade exists to
-        prevent). The caller has already scoped the fetch to the org."""
-        return self._delete_conversation(
-            conversation,
-            include_org_attachments=True,
-        )
-
     def stage_delete_conversation_row(
         self,
         conversation: Conversation,
         *,
-        include_org_attachments: bool = True,
+        include_org_attachments: bool,
     ) -> ConversationDeleteStage:
         """Stage every conversation-owned DB delete without external cleanup.
 
-        The project cascade passes an already-authorized conversation row and
-        intentionally cleans every org member's attachment row for that
-        purpose. A direct conversation delete must opt out so the actor-owned
-        request cannot delete a peer's independently owned file row.
+        ``include_org_attachments`` has no default because its two values are
+        two different authorization decisions. True cleans every org member's
+        attachment row for this conversation's purpose, which only an
+        already-authorized org-wide cascade such as a project delete may do.
+        False keeps the delete inside the actor's own file rows, which is what
+        a direct conversation delete must ask for. A caller has to say which
+        one it is rather than inherit the owner-agnostic path by omission.
         """
         conversation_id = conversation.id
         messages = self.session.exec(
@@ -634,16 +624,13 @@ class ConversationService:
                 stage.conversation_id,
             )
 
-    def _delete_conversation(
-        self,
-        conversation: Conversation,
-        *,
-        include_org_attachments: bool = False,
-    ) -> bool:
+    def _delete_conversation(self, conversation: Conversation) -> bool:
         try:
+            # A direct delete is the actor's own: never reach past their file
+            # rows into a peer's attachment on the same conversation.
             stage = self.stage_delete_conversation_row(
                 conversation,
-                include_org_attachments=include_org_attachments,
+                include_org_attachments=False,
             )
             self.session.commit()
         except Exception:

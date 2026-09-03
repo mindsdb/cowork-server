@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from cowork.common.settings.app_settings import AppSettings
+from cowork.common.settings.app_settings import AppSettings, TurnQueueSettings
 
 
 def test_app_settings_ignores_generic_server_port(monkeypatch):
@@ -155,11 +155,30 @@ def test_app_settings_identity_enforce_defaults_to_enforce(monkeypatch):
     assert settings.identity_enforce == "enforce"
 
 
+def test_app_settings_identity_enforce_can_opt_into_audit(monkeypatch):
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "audit")
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.identity_enforce == "audit"
+
+
 def test_app_settings_rejects_invalid_identity_enforce(monkeypatch):
     monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "strict")
 
     with pytest.raises(ValidationError):
         AppSettings(_env_file=None)
+
+
+def test_turn_queue_settings_is_remote(monkeypatch):
+    monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")
+    assert TurnQueueSettings().is_remote is True
+
+    monkeypatch.setenv("COWORK_TURN_BACKEND", "inprocess")
+    assert TurnQueueSettings().is_remote is False
+
+    monkeypatch.delenv("COWORK_TURN_BACKEND", raising=False)
+    assert TurnQueueSettings().is_remote is False  # default is "inprocess"
 
 
 def test_app_settings_organization_boundary_defaults_to_enforce(monkeypatch):
