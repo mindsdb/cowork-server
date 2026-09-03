@@ -393,12 +393,12 @@ class TestOverlayFallbackAtAnOldPin:
 
     def test_the_turn_builder_routes_through_the_fallback(self):
         """The helper is only useful if the turn builder actually calls it."""
-        import inspect
-
         from cowork.harnesses.anton_harness.harness import AntonHarness
 
-        src = inspect.getsource(AntonHarness._build_chat_session)
-        assert "_apply_overlay_fallback(" in src
+        # Compiled names rather than source text: a commented-out call still
+        # reads as present in the source, and renames are not the risk here.
+        names = AntonHarness._build_chat_session.__code__.co_names
+        assert "_apply_overlay_fallback" in names
 
     def test_the_fallback_applies_only_when_the_kwarg_was_dropped(self):
         from unittest.mock import Mock
