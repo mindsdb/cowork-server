@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import importlib.util
 import os
 import re
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import psutil
 
 from cowork.coding.contracts import (
     CodingEvent,
@@ -35,7 +37,13 @@ from cowork.coding.engines.base import (
     TerminalOutputHandler,
 )
 from cowork.coding.engines.codex_extensions import add_extension_response
-from cowork.coding.processes import terminate_descendants
+from cowork.coding.processes import (
+    TERMINAL_ENV_MARKER,
+    executable_name,
+    runs_command,
+    terminate_command_trees,
+    terminate_descendants,
+)
 from cowork.coding.redaction import redact_text, sanitize
 from cowork.common.settings.app_settings import get_app_settings
 
@@ -210,11 +218,17 @@ class CodexEngineSession:
         self._approval_policy = launch.approval_policy
         self._sandbox_policy = launch.sandbox_policy
         self._secrets = tuple(value for value in (credentials.minds_api_key,) if value)
+        # The MCP servers Codex runs for this thread; they live under the
+        # app-server next to the turn's commands and must outlive the turn.
+        self._mcp_servers = tuple((server.command, tuple(server.args)) for server in (config.mcp_servers or ()))
         self._closed = threading.Event()
         self._cancel_watchdogs: dict[str, _CancelWatch] = {}
         self._cancel_lock = threading.Lock()
         self._terminal_handlers: dict[str, TerminalOutputHandler] = {}
         self._terminal_lock = threading.Lock()
+        # The exact argv of every interactive shell this session has started;
+        # a turn-completion reap recognises terminal tabs by it.
+        self._terminal_commands: set[tuple[str, ...]] = set()
         self._goal_states: dict[str, Any] = {}
         self._client.start()
         try:
@@ -339,6 +353,7 @@ class CodexEngineSession:
                 yield from self._goal_events(turn_id, goal_state)
             finally:
                 self._finish_cancel_watchdog(turn_id)
+                self._reap_turn_commands()
             return
         try:
             while True:
@@ -353,6 +368,44 @@ class CodexEngineSession:
         finally:
             self._client.unregister_turn_notifications(turn_id)
             self._finish_cancel_watchdog(turn_id)
+            self._reap_turn_commands()
+
+    # Codex's own long-lived children of the app-server. Everything else under
+    # it after a turn is a command the turn left running.
+    _CODEX_HELPERS = frozenset({"codex-code-mode-host"})
+
+    def _is_persistent_helper(self, process: Any) -> bool:
+        try:
+            name = executable_name(process.name())
+            cmdline = list(process.cmdline())
+            environment = process.environ()
+        except (psutil.Error, OSError):
+            return True  # Cannot inspect it, so leave it alone.
+        if name in self._CODEX_HELPERS or TERMINAL_ENV_MARKER in environment:
+            return True
+        # macOS hides a PTY shell's environment from psutil, so terminal tabs
+        # are also recognised by the exact argv this session launched them with.
+        if tuple(cmdline) in self._terminal_commands:
+            return True
+        if any("cowork.coding.integration_mcp" in part for part in cmdline):
+            return True
+        return any(runs_command(cmdline, command, args) for command, args in self._mcp_servers)
+
+    def _reap_turn_commands(self) -> None:
+        """End the command trees a finished turn left running.
+
+        The thread, and so the app-server, stays open between turns for
+        follow-ups and terminals, so without this a dev server or test watcher
+        the agent started would keep running for as long as the task exists.
+        Codex's helpers under the app-server (the MCP servers, the code-mode
+        host) stay for the next turn, and so do the user's terminal tabs and
+        Run actions, which run through the same app-server and carry
+        TERMINAL_ENV_MARKER in their environment.
+        """
+        if self._closed.is_set():
+            return
+        with contextlib.suppress(Exception):
+            terminate_command_trees(self._app_server_pid(), protected=self._is_persistent_helper)
 
     def steer(
         self,
@@ -705,12 +758,19 @@ class CodexEngineSession:
         error: str | None = None
         try:
             command = codex_config.interactive_shell(shell)
+            self._terminal_commands.add(tuple(command))
             response = self._client.request(
                 "command/exec",
                 {
                     "command": command,
                     "cwd": str(self._terminal_workspace),
-                    "env": codex_config.interactive_shell_environment(command, self._terminal_workspace),
+                    "env": {
+                        **codex_config.interactive_shell_environment(command, self._terminal_workspace),
+                        # Marks the shell (and everything started in it) as the
+                        # user's, so finishing a turn never reaps a terminal tab
+                        # or a Run action.
+                        TERMINAL_ENV_MARKER: process_id,
+                    },
                     "processId": process_id,
                     # This is a user-controlled shell (and the execution path
                     # for an explicitly clicked project action), not an agent
