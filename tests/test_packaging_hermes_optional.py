@@ -71,3 +71,15 @@ def test_the_unit_job_installs_the_hermes_extra() -> None:
     removing the flag fails loudly instead of matching something adjacent.
     """
     assert "run: uv sync --group dev --extra hermes" in _stripped_lines(_UNIT_WORKFLOW)
+
+
+def test_the_shipped_set_job_asserts_hermes_is_unregistered() -> None:
+    """The hermes gate is only observable on a base install.
+
+    The unit job installs the extra, and test_channel_context, test_app_settings,
+    test_hermes_turn_failure and test_trace_tags_forwarding all import the harness
+    module directly, which registers hermes whatever the package gate decided. So
+    no `make test/unit` assertion can cover it, and this pins the one step that
+    can.
+    """
+    assert "'hermes' not in ids" in "\n".join(_stripped_lines(_UNIT_WORKFLOW))
