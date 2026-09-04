@@ -335,11 +335,8 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
     web page). The original ``.md`` is never modified — the registry and
     publish history still key off it, not this temp file.
     """
-    # `markdown` ships transitively via hermes-agent (a pinned core
-    # dependency), so it's always present in the resolved environment. The
-    # guard stays defensive in case that ever changes; promote markdown to a
-    # direct dependency in pyproject.toml when the lockfile is next
-    # regenerated with the canonical uv version.
+    # markdown is a direct dependency, so this should not fail. The guard turns
+    # a broken install into PublisherUnavailable rather than a bare ImportError.
     try:
         import markdown
     except Exception as exc:  # pragma: no cover - dependency guard
