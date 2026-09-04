@@ -953,6 +953,16 @@ class ProjectService:
                 except Exception:
                     self.session.rollback()
                     raise
+            elif self.directory_is_external(project):
+                # The expected outcome for a folder the user chose, not an
+                # anomaly: it is theirs, so the project row goes and the
+                # directory stays. `directoryIsExternal` tells the client to
+                # say so before it asks for confirmation.
+                logger.info(
+                    "delete_project: %r points at a folder outside the projects "
+                    "root; leaving it in place",
+                    project.name,
+                )
             else:
                 logger.warning(
                     "delete_project: stored path %s does not match the derived "
