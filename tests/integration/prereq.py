@@ -8,7 +8,7 @@ the same green.
 
 `COWORK_REQUIRE_INTEGRATION` says which of the two the suite is in.
 `.github/workflows/tests-integration.yml` sets it to `true` for the namespaces
-that must have every prerequisite, and to `false` for best-effort PR runs.
+that have everything the suite needs, and leaves it unset everywhere else.
 """
 
 from __future__ import annotations
