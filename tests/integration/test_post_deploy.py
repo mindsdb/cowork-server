@@ -6,14 +6,15 @@ Redis, the scratchpad controller and a real scratchpad pod together.
 Skipped unless COWORK_BASE_URL is set, so a normal `pytest` run ignores them.
 
 The identity comes from auth, which provisions throwaway test users for CI.
-Permanent envs (dev/staging/prod) POST to its internal endpoint with the
-provisioning secret; PR envs POST to /dev/mint-test-user/, which is mounted
-only where `ephemeral` is on and needs no secret. Either way the response
-carries the user_id and organization_id these tests send as headers.
+Permanent dev/staging POST to its internal endpoint with the provisioning
+secret; PR envs POST to /dev/mint-test-user/, which is mounted only where
+`ephemeral` is on and needs no secret. Prod uses a dedicated standing identity
+until ENG-1420 makes the fixed test-user provisioner safe there. Every source
+provides the user_id and organization_id these tests send as headers.
 
-Cloudflare Access fronts /v1/internal* on auth's public host, so the
-provisioning call goes to auth's Service instead. CI uses cluster DNS from a
-runner in the cluster; by hand, forward the port first with
+The provisioning call uses auth's Service so it works both before and after
+Cloudflare Access protects /v1/internal* on the public host. CI uses cluster
+DNS from a runner in the target cluster; by hand, forward the port first with
 `kubectl port-forward -n staging svc/auth 8080:80`.
 
     COWORK_BASE_URL=https://cowork.staging.example.com \\
@@ -86,6 +87,8 @@ BROWSER_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
+PROD_AUTHENTICATE_URL = "https://auth.mindshub.ai/v1/authenticate/"
+CONTROLLED_TEST_EMAIL_SUFFIX = "@mindshub.ai"
 
 
 class _Identity(dict[str, str]):
@@ -105,6 +108,63 @@ def _base_url() -> str:
     return url.rstrip("/")
 
 
+def _verified_prod_standing_identity() -> _Identity:
+    """Resolve the dedicated prod API key through auth without mutating a user."""
+    api_key = os.environ.get("COWORK_TEST_API_KEY")
+    expected_email = os.environ.get("COWORK_TEST_USER_EMAIL")
+    if not (api_key and expected_email):
+        missing_prerequisite(
+            "COWORK_TEST_IDENTITY_MODE=standing requires COWORK_TEST_API_KEY and "
+            "COWORK_TEST_USER_EMAIL"
+        )
+    if not expected_email.lower().endswith(CONTROLLED_TEST_EMAIL_SUFFIX):
+        missing_prerequisite(
+            "COWORK_TEST_USER_EMAIL must use a controlled, non-staff "
+            "@mindshub.ai account; @emailsink.dev and the staff @mindsdb.com "
+            "domain are not permitted in prod"
+        )
+
+    response = httpx.get(
+        PROD_AUTHENTICATE_URL,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "X-MindsDB-Product": "hub",
+            "User-Agent": BROWSER_UA,
+        },
+        timeout=30.0,
+        follow_redirects=False,
+    )
+    if response.status_code != 200:
+        pytest.fail(
+            "auth rejected the dedicated prod Cowork test identity: "
+            f"HTTP {response.status_code}"
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        pytest.fail("auth returned non-JSON for the dedicated prod Cowork test identity")
+    if not isinstance(payload, dict) or payload.get("valid") is not True:
+        pytest.fail("auth did not validate the dedicated prod Cowork test identity")
+    if str(payload.get("email", "")).lower() != expected_email.lower():
+        pytest.fail("auth returned a different email for the dedicated prod Cowork test identity")
+    if not payload.get("user_id") or not payload.get("organization_id"):
+        pytest.fail("auth returned no user or organization id for the dedicated prod Cowork test identity")
+    try:
+        hub_admin = payload["entitlements"]["permissions"]["admin"]["hub"]
+    except (KeyError, TypeError):
+        pytest.fail("auth returned no Hub admin entitlement for the dedicated prod Cowork test identity")
+    if hub_admin is not False:
+        pytest.fail("the dedicated prod Cowork test identity has Hub admin access")
+    if response.headers.get("X-Billing-Segment", "").lower() not in {"free", "paid"}:
+        pytest.fail("auth did not classify the dedicated prod Cowork test identity as non-employee")
+    return _Identity({
+        "api_key": api_key,
+        "user_id": str(payload["user_id"]),
+        "organization_id": str(payload["organization_id"]),
+        "email": str(payload["email"]),
+    })
+
+
 def _provision_identity() -> _Identity:
     """A user_id, organization_id and email for a throwaway tenant.
 
@@ -115,10 +175,19 @@ def _provision_identity() -> _Identity:
     2. TEST_USER_MINT_URL, auth's /dev/mint-test-user/. Mounted only in
        ephemeral PR envs, needs no secret, mints a fresh user per call.
     3. TEST_USER_PROVISION_URL + TEST_USER_PROVISION_SECRET, auth's internal
-       endpoint. Used for dev/staging/prod, where the dev route is not mounted.
+       endpoint. Used for dev/staging, where the dev route is not mounted.
        Provisions the fixed `cowork` suite: one @emailsink.dev tenant, reused
        across runs, with a fresh key each time.
+
+    Production sets COWORK_TEST_IDENTITY_MODE=standing. In that mode a dedicated
+    controlled-domain API key and its expected email are mandatory. Auth
+    resolves the trusted ids live, and this function never falls back to the
+    mutating internal provisioner, even if its URL is also present.
     """
+    identity_mode = os.environ.get("COWORK_TEST_IDENTITY_MODE")
+    if identity_mode == "standing":
+        return _verified_prod_standing_identity()
+
     api_key = os.environ.get("COWORK_TEST_API_KEY")
     user_id = os.environ.get("COWORK_TEST_USER_ID")
     org_id = os.environ.get("COWORK_TEST_ORG_ID")
@@ -133,9 +202,14 @@ def _provision_identity() -> _Identity:
     mint_url = os.environ.get("TEST_USER_MINT_URL")
     if mint_url:
         resp = httpx.post(
-            mint_url, json={}, headers={"User-Agent": BROWSER_UA}, timeout=60.0)
+            mint_url,
+            json={},
+            headers={"User-Agent": BROWSER_UA},
+            timeout=60.0,
+            follow_redirects=False,
+        )
         if resp.status_code != 201:
-            pytest.fail(f"minting a PR-env test user failed: {resp.status_code} {resp.text}")
+            pytest.fail(f"minting a PR-env test user failed: HTTP {resp.status_code}")
         user = resp.json()
     else:
         provision_url = os.environ.get("TEST_USER_PROVISION_URL")
@@ -151,12 +225,13 @@ def _provision_identity() -> _Identity:
             json={"suite": "cowork"},
             headers={"X-Internal-Auth": secret, "User-Agent": BROWSER_UA},
             timeout=60.0,
+            follow_redirects=False,
         )
         if resp.status_code != 201:
-            pytest.fail(f"provisioning the cowork test user failed: {resp.status_code} {resp.text}")
+            pytest.fail(f"provisioning the cowork test user failed: HTTP {resp.status_code}")
         users = resp.json()["users"]
         if not users:
-            pytest.fail(f"the cowork suite provisioned no users: {resp.text}")
+            pytest.fail("the cowork suite provisioned no users")
         user = users[0]
 
     if not user.get("organization_id"):
