@@ -86,6 +86,46 @@ def test_org_mode_refuses_a_chosen_folder(engine, monkeypatch, tmp_path):
         svc.create_project("notes", path=tmp_path / "definitely-absent")
 
 
+def test_a_server_bound_off_loopback_refuses_a_chosen_folder(
+    engine, monkeypatch, tmp_path
+):
+    """The peer address cannot carry this decision. The container runs uvicorn
+    with `--forwarded-allow-ips "*"`, so X-Forwarded-For rewrites
+    request.client and a remote caller can present 127.0.0.1. What it cannot
+    present is the address the server was told to bind."""
+    monkeypatch.setenv("COWORK_SERVER_HOST", "0.0.0.0")
+    from cowork.common.settings.app_settings import get_app_settings
+
+    get_app_settings.cache_clear()
+    folder = _folder(tmp_path, "notes")
+    with pytest.raises(ProjectPathNotAllowedError, match="listening only on"):
+        _svc(engine).create_project("notes", path=folder)
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1", "127.0.1.1"])
+def test_a_loopback_bound_server_allows_a_chosen_folder(
+    engine, monkeypatch, tmp_path, host
+):
+    monkeypatch.setenv("COWORK_SERVER_HOST", host)
+    from cowork.common.settings.app_settings import get_app_settings
+
+    get_app_settings.cache_clear()
+    folder = _folder(tmp_path, f"notes-{host.replace(':', '-')}")
+    svc = _svc(engine)
+    project = svc.create_project(f"notes-{host.replace(':', '-')}", path=folder)
+    assert Path(project.path) == folder.resolve()
+
+
+def test_a_server_on_a_routable_address_refuses_it(engine, monkeypatch, tmp_path):
+    monkeypatch.setenv("COWORK_SERVER_HOST", "10.0.0.5")
+    from cowork.common.settings.app_settings import get_app_settings
+
+    get_app_settings.cache_clear()
+    folder = _folder(tmp_path, "notes")
+    with pytest.raises(ProjectPathNotAllowedError, match="listening only on"):
+        _svc(engine).create_project("notes", path=folder)
+
+
 # -- what counts as a folder -------------------------------------------------
 
 
