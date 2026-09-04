@@ -98,6 +98,14 @@ def run_dev_setup() -> None:
     # org-first under the shared root and created on demand.
     import cowork.harnesses  # noqa: F401 — registers memory adapters
 
+    # Needs the registry above, so it cannot sit with the migrations further up.
+    # Not desktop-only: a stored harness the install cannot build breaks every
+    # settings read in either mode.
+    from cowork.migrations import reset_unbuildable_harness
+
+    with SQLSession(engine) as session:
+        reset_unbuildable_harness(session)
+
     if settings.tenancy_mode != "org":
         from cowork.harnesses.memory.migration import migrate_harness_memory_to_shared
         from cowork.harnesses.memory.runtime import ensure_all_layouts

@@ -94,6 +94,16 @@ def get_harness(name: str) -> HarnessProvider:
     return cls()
 
 
+def registered_harness_ids() -> list[str]:
+    """Harness ids this install can actually build, ignoring org visibility.
+
+    Deliberately distinct from available_harness_ids: a harness hidden by
+    supports_org_mode is still installed and buildable, so a caller asking
+    "is this a real harness here?" must not consult the offered list.
+    """
+    return list(_registry)
+
+
 def available_harness_ids() -> list[str]:
     """Registered harness ids offered to users. In org mode, harnesses that
     don't support multi-tenancy are hidden (Anton-only for now); the getattr
