@@ -12,6 +12,7 @@ import os
 import secrets
 import stat
 import time
+from collections import deque
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -575,6 +576,48 @@ def _safe_relpath(rel: str | _ValidatedProjectPath, base: Path) -> Path:
     return candidate
 
 
+#: A project directory Cowork allocated holds the agent's own output, so its
+#: size is bounded by what the agent wrote. A folder the user chose can be a
+#: repository or a home directory, and one request used to materialise every
+#: path beneath it with a stat and a resolve each before returning anything.
+_MAX_LISTED_FILES = 2000
+
+
+def _walk_project_files(base: Path) -> tuple[list[Path], bool]:
+    """Files under `base`, capped. Second value is whether the cap cut it short.
+
+    Breadth-first, so a truncated listing shows the user's own top-level files
+    instead of whatever a depth-first walk reached inside the first large
+    subdirectory it happened to enter.
+
+    Directories are visited once by resolved path: a folder the user chose can
+    contain a symlink loop, which the previous recursive glob would have
+    followed until the cap.
+    """
+    found: list[Path] = []
+    queue: deque[Path] = deque([base])
+    seen: set[Path] = set()
+    while queue:
+        try:
+            entries = sorted(queue.popleft().iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if entry.is_dir():
+                    real = entry.resolve(strict=False)
+                    if real not in seen:
+                        seen.add(real)
+                        queue.append(entry)
+                    continue
+            except (OSError, RuntimeError):
+                continue
+            if len(found) >= _MAX_LISTED_FILES:
+                return found, True
+            found.append(entry)
+    return found, False
+
+
 def _file_meta(p: Path, base: Path) -> dict[str, Any] | None:
     try:
         st = p.stat()
@@ -1006,12 +1049,14 @@ def list_project_files(
     base = _project_dir(project_name, scoped)
     files: list[dict[str, Any]] = []
     _conv_cache: dict = {}
-    for p in sorted(base.rglob("*")):
-        if p.is_dir():
-            continue
+    candidates, truncated = _walk_project_files(base)
+    for p in candidates:
         meta = _file_meta(p, base)
         if meta and _conversation_workspace_ok(meta["path"], scoped, _conv_cache):
             files.append(meta)
+    # The walk yields shallowest first; the response stays path-ordered as it
+    # was when it came from one recursive glob.
+    files.sort(key=lambda f: f["path"])
 
     anton_rel = _anton_md_path(base).relative_to(base).as_posix()
     if not any(f["path"] == anton_rel for f in files):
@@ -1039,7 +1084,10 @@ def list_project_files(
         )
     )
 
-    return {"files": files}
+    response: dict[str, Any] = {"files": files}
+    if truncated:
+        response["truncated"] = True
+    return response
 
 
 @router.get(
