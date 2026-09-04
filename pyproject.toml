@@ -62,11 +62,7 @@ cowork-dev-setup = "cowork.cli:dev_setup_main"
 cowork-code-runtime = "cowork.coding.runtime_worker:main"
 
 [project.optional-dependencies]
-# Not a base dependency: hermes-agent pins openai==2.24.0 exactly (every
-# release through upstream HEAD) while anton-agent>=2.26.9.3.1rc2 needs
-# openai>=3, so the two cannot share a venv and a wheel requiring both is
-# unresolvable. cowork.harnesses tolerates the missing import; the hermes
-# harness is available only where this extra is installed.
+# Optional: hermes-agent pins openai==2.24.0, anton needs openai>=3 (see override below).
 hermes = ["hermes-agent>=0.15.2,<0.18"]
 channels = [
     "slack-sdk>=3.27.0",
@@ -89,7 +85,8 @@ packages = ["cowork"]
 # hermes-agent pins Pillow==12.2.0 exactly (still true as of its latest
 # upstream commit), which blocks picking up Pillow security fixes. Override
 # it project-wide so the resolver isn't held back by that inner pin.
-override-dependencies = ["pillow>=12.3.0"]
+# hermes-agent also pins openai==2.24.0; anton needs openai>=3 and hermes runs on it.
+override-dependencies = ["pillow>=12.3.0", "openai>=3.0"]
 
 [tool.uv.sources]
 # cowork-server imports the artifact-identity derivation
