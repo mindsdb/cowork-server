@@ -403,6 +403,13 @@ def cards_for_slugs(
             card = card_for_folder(
                 base / slug, len(cards),
                 project_id=project_id, project_name=project_name,
+                # Without this the inline card's serveUrl is rediscovered by
+                # scanning the projects root, which cannot find a project
+                # pointed at a folder the user chose: the artifacts panel
+                # would offer "open in browser" and the turn card would not.
+                # Identical for an allocated project, whose directory name and
+                # project name are the same string.
+                artifacts_base=base,
             )
         except Exception:
             logger.warning("Could not build inline card for artifact %r", slug, exc_info=True)

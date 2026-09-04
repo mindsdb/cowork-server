@@ -22,7 +22,11 @@ class ProjectCreateRequest(CamelRequest):
         # filesystem check here would precede the service's tenancy refusal.
         if path is None or not path.strip():
             return None
-        raw = path.strip()
+        # Not stripped. A directory name may legally end in a space on POSIX
+        # and the picker returns it verbatim, so trimming would refuse a
+        # folder that exists. Leading whitespace fails the absolute check
+        # below rather than being silently repaired.
+        raw = path
         # `~` is deliberately not expanded. expanduser consults the passwd
         # database, so over HTTP it separates a real account from a missing one
         # before the request has been refused at all. The picker sends an

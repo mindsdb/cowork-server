@@ -588,7 +588,14 @@ _MAX_LISTED_FILES = 2000
 _MAX_EXAMINED_ENTRIES = 50_000
 
 
-def _iter_project_files(base: Path) -> Iterator[Path]:
+@dataclass
+class _WalkBudget:
+    """Whether the entry ceiling, rather than the file cap, stopped the walk."""
+
+    exhausted: bool = False
+
+
+def _iter_project_files(base: Path, budget: _WalkBudget) -> Iterator[Path]:
     """Candidate files under `base`, breadth-first, bounded by entries seen.
 
     Breadth-first so a truncated listing shows the user's own top-level files
@@ -611,6 +618,7 @@ def _iter_project_files(base: Path) -> Iterator[Path]:
         for entry in entries:
             examined += 1
             if examined > _MAX_EXAMINED_ENTRIES:
+                budget.exhausted = True
                 return
             try:
                 if entry.is_symlink():
@@ -1055,8 +1063,9 @@ def list_project_files(
     base = _project_dir(project_name, scoped)
     files: list[dict[str, Any]] = []
     _conv_cache: dict = {}
+    budget = _WalkBudget()
     truncated = False
-    for p in _iter_project_files(base):
+    for p in _iter_project_files(base, budget):
         meta = _file_meta(p, base)
         if not (meta and _conversation_workspace_ok(meta["path"], scoped, _conv_cache)):
             continue
@@ -1067,11 +1076,19 @@ def list_project_files(
             truncated = True
             break
         files.append(meta)
-    # The walk yields shallowest first; the response stays path-ordered as it
-    # was when it came from one recursive glob.
+    truncated = truncated or budget.exhausted
+    # The walk yields shallowest first, so the response is re-sorted by path.
+    # Sibling prefixes order slightly differently from the old `sorted()` over
+    # Path objects, which compared parts rather than the joined string.
     files.sort(key=lambda f: f["path"])
 
     anton_rel = _anton_md_path(base).relative_to(base).as_posix()
+    # Resolved from disk, not from the capped walk: a truncated listing would
+    # otherwise report a real anton.md as synthetic with size 0.
+    if truncated and not any(f["path"] == anton_rel for f in files):
+        instructions_meta = _file_meta(_anton_md_path(base), base)
+        if instructions_meta:
+            files.append(instructions_meta)
     if not any(f["path"] == anton_rel for f in files):
         files.insert(
             0,

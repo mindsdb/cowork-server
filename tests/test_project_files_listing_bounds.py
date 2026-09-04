@@ -18,10 +18,12 @@ import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
+import cowork.api.v1.endpoints.project_files as pf
 from cowork.api.v1.endpoints.project_files import (
     _MAX_EXAMINED_ENTRIES,
     _MAX_LISTED_FILES,
     _iter_project_files,
+    _WalkBudget,
 )
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.models.project import Project
@@ -33,7 +35,10 @@ from cowork.services.projects import (
 
 
 def _names(base: Path) -> list[str]:
-    return sorted(p.relative_to(base).as_posix() for p in _iter_project_files(base))
+    return sorted(
+        p.relative_to(base).as_posix()
+        for p in _iter_project_files(base, _WalkBudget())
+    )
 
 
 # -- what the walk yields ----------------------------------------------------
@@ -121,15 +126,28 @@ def test_a_symlink_loop_terminates(tmp_path):
 # -- the bounds --------------------------------------------------------------
 
 
-def test_the_examined_ceiling_stops_the_walk(tmp_path):
-    for i in range(20):
-        d = tmp_path / f"d{i:02d}"
-        d.mkdir()
-        for j in range(50):
-            (d / f"f{j:03d}.txt").write_text("x")
+def test_the_examined_ceiling_stops_the_walk_and_says_so(tmp_path, monkeypatch):
+    """A stopped walk must not report a complete listing. Only the file cap
+    used to set the flag, so hitting this ceiling looked like "that is all
+    the files there are"."""
+    monkeypatch.setattr(pf, "_MAX_EXAMINED_ENTRIES", 10)
+    for i in range(40):
+        (tmp_path / f"f{i:03d}.txt").write_text("x")
 
-    assert len(_names(tmp_path)) == 1000
-    assert 1000 < _MAX_EXAMINED_ENTRIES
+    budget = _WalkBudget()
+    found = list(_iter_project_files(tmp_path, budget))
+
+    assert budget.exhausted is True
+    assert len(found) <= 10
+
+
+def test_a_completed_walk_does_not_report_exhaustion(tmp_path):
+    (tmp_path / "a.txt").write_text("x")
+
+    budget = _WalkBudget()
+    list(_iter_project_files(tmp_path, budget))
+
+    assert budget.exhausted is False
 
 
 def test_an_unreadable_directory_is_skipped_not_fatal(tmp_path):
