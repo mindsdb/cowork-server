@@ -155,14 +155,6 @@ def _repair_records(folder: Path) -> list[dict]:
     return records
 
 
-def _queued_repairs_for_path(folder: Path, rel_path: str) -> list[dict]:
-    return [
-        repair
-        for repair in _repair_records(folder)
-        if repair.get("status") == "queued" and repair.get("path") == rel_path
-    ]
-
-
 def _actionable_repairs_for_path(folder: Path, rel_path: str) -> list[dict]:
     return [
         repair
@@ -664,11 +656,22 @@ def capture_agent_revision(folder: Path, *, conversation_id: str | None = None) 
                 None,
             )
             latest_id = latest.get("id") if latest else None
-            queued = [
+            turn_repairs = [
                 repair
-                for repair in _queued_repairs_for_path(folder, relative)
-                if repair.get("conversationId") == conversation_id
+                for repair in _repair_records(folder)
+                if repair.get("status") == "queued"
+                and repair.get("conversationId") == conversation_id
             ]
+            queued = [r for r in turn_repairs if r.get("path") == relative]
+            # The primary can move between minting a handoff and this capture
+            # (metadata["primary"] rewritten, or resolve_source's sorted
+            # fallback picking a file the turn created). A handoff left on the
+            # old path would never be finished by any later turn either, so it
+            # ends here rather than gating that path forever.
+            for repair in (r for r in turn_repairs if r.get("path") != relative):
+                repair["status"] = "conflict"
+                repair["updatedAt"] = _now()
+                _write_repair(folder, repair)
             if latest is not None and latest.get("contentHash") == _sha(content):
                 _finish_queued_repairs(
                     folder,

@@ -573,6 +573,38 @@ def test_superseded_ready_repair_stops_blocking_but_stays_decidable(artifact):
     assert agent_repair_detail(folder, requested["repair"]["id"])["repair"]["status"] == "ready"
 
 
+def test_repair_whose_primary_drifted_is_finished_not_stranded(artifact):
+    """capture_agent_revision reconciles against the primary it resolves now.
+    If metadata["primary"] moved after the handoff was minted, the repair sits
+    on a path this capture will never look at, and nothing else can finish it."""
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
+    requested = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=initial["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "Please change this"}],
+        conversation_id="conversation-1",
+    )
+    assert requested["repair"]["path"] == "brief.md"
+
+    # The turn repoints the artifact at a different editable file.
+    (folder / "summary.md").write_text("# Summary\n", encoding="utf-8")
+    moved = {**metadata, "primary": "summary.md"}
+    (folder / "metadata.json").write_text(json.dumps(moved), encoding="utf-8")
+
+    capture_agent_revision(folder, conversation_id="conversation-1")
+
+    stranded = json.loads(
+        (folder / ".revisions" / "repairs" / f"{requested['repair']['id']}.json")
+        .read_text(encoding="utf-8")
+    )
+    assert stranded["status"] == "conflict"
+
+
 def test_stale_queued_repair_stops_blocking_and_is_finished(artifact):
     """A turn killed between minting the handoff and starting the agent used to
     gate the path forever, because only capture_agent_revision could finish a
