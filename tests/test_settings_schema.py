@@ -43,7 +43,16 @@ def test_show_dots_default_is_true():
 def test_coding_agent_defaults_are_codex_over_mindshub() -> None:
     settings = UserSettings.model_validate({})
     assert settings.coding_agent_engine == "codex"
-    assert settings.coding_agent_model == "gpt-5.6-sol"
+    assert settings.coding_agent_model == "gpt"
+
+
+def test_a_stored_legacy_coding_model_id_reads_back_as_the_catalogue_id() -> None:
+    # Changing the default does not migrate rows saved before the rename; the
+    # settings row from an upgraded install must still resolve to a model that
+    # exists in the catalogue.
+    settings = UserSettings.model_validate({"coding_agent_model": "gpt-5.6-sol"})
+    assert settings.coding_agent_model == "gpt"
+    assert UserSettings.model_validate({"coding_agent_model": "sonnet"}).coding_agent_model == "sonnet"
 
 
 def test_unknown_coding_agent_engine_is_rejected() -> None:

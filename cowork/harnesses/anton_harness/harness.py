@@ -17,6 +17,7 @@ from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
+from cowork.services.projects import display_label
 
 
 logger = get_logger(__name__)
@@ -493,7 +494,9 @@ class AntonHarness:
         conv_project_id = conversation.project_id
         # Same reason: the card carries the project name to the client, and reading
         # the relation after the turn could hit an expired session.
-        conv_project_name = conversation.project.name
+        # The artifact card's label, sent beside project_id which carries the
+        # identity - so this is a display value (ENG-1676).
+        conv_project_name = display_label(conversation.project)
         # Skill drafts surface as cards (never auto-saved). Anton has no
         # skill-draft tool (it runs anton-core's own registry), so routing is
         # prompt + dir-diff only — consistent with its artifact flow. The
@@ -917,7 +920,9 @@ class AntonHarness:
         attachment_context = _conversation_attachment_context(conversation)
 
         project_context = (
-            f"You are operating in the project {conversation.project.name}."
+            # Conversational only. The next line hands the agent the real path,
+            # so the name here never has to resolve to anything (ENG-1676).
+            f"You are operating in the project {display_label(conversation.project)}."
             f"You have access to all of the files in the project at {str(base)} except for the .anton/ directory."
             "They are off limits. Do not mention the .anton/ directory in your responses."
             "You can perform operations on these files via the scratchpad."

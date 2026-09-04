@@ -151,11 +151,13 @@ def test_runs_scoped_action_in_named_terminal(tmp_path: Path) -> None:
         get_computer=lambda _id: computer(),
         local_computer_id="local",
         execution_project=lambda _session: configured,
+        port_open=lambda port: port == 4173,
     )
 
     page = service.list(session.id)
     assert [(item.label, item.resource_name) for item in page.items] == [("Dev server", "Web")]
     assert page.preview_url is None
+    assert page.preview_pending is False
 
     result = service.run(
         session.id,
@@ -166,7 +168,7 @@ def test_runs_scoped_action_in_named_terminal(tmp_path: Path) -> None:
     assert result.terminal_id == "terminal-1"
     assert result.label == "Dev server"
     assert result.preview_url == "http://127.0.0.1:4173"
-    assert terminals.written == f"cd {tmp_path} && npm run dev\n"
+    assert terminals.written == f"cd {tmp_path} && PORT=4173 npm run dev\n"
     assert terminals.tabs[0].project_action_id == "web-run"
     assert terminals.tabs[0].project_resource_id == "web"
 
@@ -190,4 +192,85 @@ def test_rejects_actions_outside_task_scope(tmp_path: Path) -> None:
             session.id,
             ProjectActionRunRequest(resource_id="web", command_id="web-run"),
             EngineCredentials("https://example.test", "secret"),
+        )
+
+
+def test_preview_waits_until_the_run_command_actually_listens(tmp_path: Path) -> None:
+    # The action runs in an interactive shell, so the terminal stays "running"
+    # after `npm run dev` has died; the preview must follow the port, not the tab.
+    session = coding_session(tmp_path)
+    configured = project(tmp_path)
+    terminals = Terminals()
+    listening = {"open": False}
+    service = ProjectActionService(
+        get_session=lambda _id: session,
+        projects=object(),  # type: ignore[arg-type]
+        terminals=terminals,  # type: ignore[arg-type]
+        get_computer=lambda _id: computer(),
+        local_computer_id="local",
+        execution_project=lambda _session: configured,
+        port_open=lambda _port: listening["open"],
+    )
+
+    result = service.run(
+        session.id,
+        ProjectActionRunRequest(resource_id="web", command_id="web-run"),
+        EngineCredentials("https://example.test", "secret"),
+    )
+    assert result.preview_url is None
+    assert result.preview_pending is True
+
+    listening["open"] = True
+    page = service.list(session.id)
+    assert page.preview_url == "http://127.0.0.1:4173"
+    assert page.preview_pending is False
+
+    listening["open"] = False  # the dev server exited; the shell is still open
+    page = service.list(session.id)
+    assert page.preview_url is None
+    assert page.preview_pending is True
+
+
+def test_default_port_probe_reports_a_real_listener() -> None:
+    import socket
+
+    from cowork.coding.project_actions import port_is_listening
+
+    with socket.socket() as server:
+        server.bind(("127.0.0.1", 0))
+        server.listen(1)
+        port = server.getsockname()[1]
+        assert port_is_listening(port) is True
+    assert port_is_listening(port) is False
+
+
+def test_run_actions_receive_the_project_variables_and_allocated_ports() -> None:
+    # The preview opens the task's allocated port, so the dev server must be
+    # told about it; project variables travel with it, scoped to the command.
+    environment = {"PORT": "4173", "API_URL": "http://127.0.0.1:9000/a b"}
+    assert terminal_command_line(
+        argv=["npm", "run", "dev"],
+        cwd="/tmp/My App",
+        computer=computer(),
+        shell=TerminalShellPreference.auto,
+        environment=environment,
+    ) == "cd '/tmp/My App' && PORT=4173 API_URL='http://127.0.0.1:9000/a b' npm run dev\n"
+    assert terminal_command_line(
+        argv=["npm", "run", "dev"],
+        cwd=r"C:\Code\My App",
+        computer=computer("windows", ["auto", "pwsh"]),
+        shell=TerminalShellPreference.auto,
+        environment={"PORT": "4173"},
+    ) == "Set-Location -LiteralPath 'C:\\Code\\My App'; $env:PORT = '4173'; & 'npm' 'run' 'dev'\r\n"
+    assert terminal_command_line(
+        argv=["npm", "run", "dev"],
+        cwd=r"C:\Code\My App",
+        computer=computer("windows", ["auto", "cmd"]),
+        shell=TerminalShellPreference.auto,
+        environment={"PORT": "4173"},
+    ) == 'cd /d "C:\\Code\\My App" && set "PORT=4173" && npm run dev\r\n'
+    with pytest.raises(WorkspaceError):
+        terminal_command_line(
+            argv=["npm"], cwd="/tmp", computer=computer(), shell=TerminalShellPreference.auto,
+            environment={"BAD NAME": "x"},
         )

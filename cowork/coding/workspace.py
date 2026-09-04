@@ -12,6 +12,7 @@ from typing import IO
 
 from cowork.coding.contracts import (
     DiffFile,
+    GitIdentity,
     GitState,
     WorkspaceInspection,
     WorkspaceKind,
@@ -24,6 +25,29 @@ from cowork.common.settings.app_settings import get_app_settings
 
 class WorkspaceError(RuntimeError):
     pass
+
+
+class GitUnavailableError(WorkspaceError):
+    """Git is not installed or cannot be found by this runtime."""
+
+
+class GitIdentityMissingError(WorkspaceError):
+    """Git has no author identity for commits on this computer.
+
+    Raised before a commit is attempted so the caller can ask for a name and
+    email instead of surfacing Git's rejection after a rolled-back attempt.
+    """
+
+    code = "git_identity_missing"
+
+    def __init__(self, missing: list[str], detail: str = "") -> None:
+        fields = " and ".join(field.removeprefix("user.") for field in missing) or "identity"
+        super().__init__(
+            f"Git needs your {fields} before it can commit on this computer. "
+            "Set them once and the commit can be retried; nothing in the task is lost."
+        )
+        self.missing = list(missing)
+        self.detail = detail
 
 
 MAX_DIFF_FILES = 250
@@ -136,6 +160,8 @@ class GitRunner:
                 timeout=120,
                 shell=False,
             )
+        except FileNotFoundError as exc:
+            raise GitUnavailableError("Git is not installed or is not available on PATH") from exc
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise WorkspaceError(f"Git could not run: {exc}") from exc
         if check and result.returncode != 0:
@@ -505,9 +531,60 @@ class WorkspaceManager:
             root = Path(workspace_path)
             if not message.strip():
                 raise WorkspaceError("Commit message cannot be empty")
+            # Before staging anything: a direct-folder task commits through
+            # here without the project-level preflight.
+            self.check_git_identity(str(root))
             self.git.run(root, "add", "--all")
             self.git.run(root, "commit", "-m", message.strip())
             return self.git_state(str(root), str(root))
+
+    def check_git_identity(self, workspace_path: str) -> None:
+        """Raise GitIdentityMissingError unless Git can name an author for this repository.
+
+        ``git var GIT_AUTHOR_IDENT`` and ``GIT_COMMITTER_IDENT`` apply exactly
+        the rules ``git commit`` would (environment, repository, global and
+        system configuration, and Git's own guess where it allows one), so this
+        never blocks a commit Git would accept and never lets one through that
+        Git would reject.
+        """
+        root = Path(workspace_path)
+        # Git needs both identities; an environment that supplies only the
+        # author's would pass an author-only probe and still fail the commit.
+        for ident in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
+            probe = self.git.run(root, "var", ident, check=False)
+            if probe.returncode != 0 or not probe.stdout.strip():
+                break
+        else:
+            return
+        missing = [
+            field
+            for field in ("user.name", "user.email")
+            if not self.git.run(root, "config", "--get", field, check=False).stdout.strip()
+        ]
+        raise GitIdentityMissingError(missing, detail=(probe.stderr or probe.stdout).strip()[:1_000])
+
+    def git_identity(self) -> GitIdentity:
+        """The globally configured author identity, unset fields as None."""
+        home = Path.home()
+        values: dict[str, str | None] = {}
+        for field in ("name", "email"):
+            result = self.git.run(home, "config", "--global", "--get", f"user.{field}", check=False)
+            values[field] = result.stdout.strip() or None
+        return GitIdentity(**values)
+
+    def set_git_identity(self, name: str, email: str) -> GitIdentity:
+        """Write the global author identity for whichever fields are still unset.
+
+        Values already configured are kept, so a wrong guess can never
+        overwrite an identity the user set up themselves.
+        """
+        current = self.git_identity()
+        home = Path.home()
+        if not current.name:
+            self.git.run(home, "config", "--global", "user.name", name.strip())
+        if not current.email:
+            self.git.run(home, "config", "--global", "user.email", email.strip())
+        return self.git_identity()
 
     def commit_checkpoint(self, workspace_path: str) -> str:
         root = Path(workspace_path)
@@ -742,7 +819,12 @@ class WorkspaceManager:
         return entries
 
     def _git_root(self, path: Path) -> Path | None:
-        result = self.git.run(path, "rev-parse", "--show-toplevel", check=False)
+        try:
+            result = self.git.run(path, "rev-parse", "--show-toplevel", check=False)
+        except GitUnavailableError:
+            # Git is an enhancement for repository-backed folders, not a
+            # prerequisite for using an ordinary local folder.
+            return None
         if result.returncode != 0:
             return None
         return Path(result.stdout.strip()).resolve()

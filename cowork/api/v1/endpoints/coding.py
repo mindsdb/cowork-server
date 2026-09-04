@@ -42,8 +42,10 @@ from cowork.coding.contracts import (
     TerminalTabPage,
     TerminalTabState,
     TurnRequest,
+    GitIdentity,
+    GitIdentityRequest,
 )
-from cowork.coding.control_errors import StateConflict
+from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, StateConflict
 from cowork.coding.control_models import TaskResourceScope
 from cowork.coding.delivery_automation import DeliveryAutomationService
 from cowork.coding.engines.base import EngineCredentials
@@ -65,20 +67,22 @@ from cowork.coding.project_models import (
     DraftPullRequestRequest,
     PlaybookConfigureRequest,
     PlaybookItemsRequest,
+    ProjectActionPage,
+    ProjectActionRunRequest,
+    ProjectActionRunResponse,
     ProjectCreateRequest,
     ProjectFolder,
     ProjectPage,
-    ProjectActionRunRequest,
-    ProjectActionRunResponse,
-    ProjectActionPage,
-    ReviewFileActionRequest,
     ProjectUpdateRequest,
     PublishRequest,
     PullRequestActionRequest,
+    ReviewFileActionRequest,
     SourceActionRequest,
     SourceContextRequest,
     WorkItemSearchRequest,
+    canonical_model_id,
 )
+from cowork.coding.reasoning import check_reasoning_effort
 from cowork.coding.redaction import redact_text
 from cowork.coding.runtime_protocol import (
     ComputerUpdateRequest,
@@ -94,7 +98,7 @@ from cowork.coding.skill_models import (
     SkillSourceCreateRequest,
     SkillSourceItemsRequest,
 )
-from cowork.coding.workspace import WorkspaceError
+from cowork.coding.workspace import GitIdentityMissingError, WorkspaceError
 from cowork.coding.workspace_models import (
     WorkspaceEntryPage,
     WorkspaceFileContent,
@@ -104,6 +108,7 @@ from cowork.coding.workspace_models import (
 from cowork.common.settings.user_settings import Provider, provider_api_key_str
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
+from cowork.services.providers import cached_minds_models
 from cowork.services.settings import SettingService
 from cowork.services.skills import CodeSkillService
 
@@ -149,6 +154,18 @@ IntegrationsDep = Annotated[DeveloperIntegrationService, Depends(_integration_se
 def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, KeyError):
         return HTTPException(status_code=404, detail=str(exc).strip("'"))
+    if isinstance(exc, ModelDiscoveryAuthenticationError):
+        return HTTPException(
+            status_code=401,
+            detail=str(exc),
+            headers={"X-MindsHub-Error-Code": exc.code},
+        )
+    if isinstance(exc, GitIdentityMissingError):
+        return HTTPException(
+            status_code=409,
+            detail=str(exc),
+            headers={"X-MindsHub-Error-Code": exc.code},
+        )
     if isinstance(exc, (StateConflict, WorkspaceError, RuntimeError)):
         return HTTPException(status_code=409, detail=redact_text(str(exc))[:4_000])
     if isinstance(exc, ValueError):
@@ -314,7 +331,11 @@ def list_code_projects():
 
 
 @router.post("/projects")
-def create_code_project(body: ProjectCreateRequest):
+def create_code_project(body: ProjectCreateRequest, session: SessionDep, scope: ScopeDep):
+    if body.default_reasoning_effort is not None:
+        settings = _settings(session, scope)
+        model = canonical_model_id(body.default_model or settings.coding_agent_model)
+        _call(check_reasoning_effort, model, body.default_reasoning_effort, cached_minds_models(settings.minds_url))
     return _call(_service().projects.create, body)
 
 
@@ -324,7 +345,11 @@ def get_code_project(project_id: str):
 
 
 @router.patch("/projects/{project_id}")
-def update_code_project(project_id: str, body: ProjectUpdateRequest):
+def update_code_project(project_id: str, body: ProjectUpdateRequest, session: SessionDep, scope: ScopeDep):
+    if body.default_reasoning_effort is not None:
+        current = _call(_service().projects.get, project_id)
+        model = canonical_model_id(body.default_model) if body.default_model else current.default_model
+        _call(check_reasoning_effort, model, body.default_reasoning_effort, cached_minds_models(_settings(session, scope).minds_url))
     return _call(_service().projects.update, project_id, body)
 
 
@@ -433,6 +458,7 @@ def create_session(body: SessionCreateRequest, session: SessionDep, scope: Scope
         default_engine=settings.coding_agent_engine,
         default_model=settings.coding_agent_model,
         code_skills=CodeSkillService(scope),
+        model_levels=cached_minds_models(settings.minds_url),
     )
 
 
@@ -532,7 +558,11 @@ def setup_windows_sandbox(session_id: str, session: SessionDep, scope: ScopeDep)
 
 
 @router.patch("/sessions/{session_id}")
-def update_session(session_id: str, body: SessionUpdateRequest):
+def update_session(session_id: str, body: SessionUpdateRequest, session: SessionDep, scope: ScopeDep):
+    if body.reasoning_effort is not None:
+        current = _call(_service().get_session, session_id)
+        model = canonical_model_id(body.model) if body.model else current.model
+        _call(check_reasoning_effort, model, body.reasoning_effort, cached_minds_models(_settings(session, scope).minds_url))
     return _call(_service().update_session_config, session_id, body)
 
 
@@ -898,6 +928,18 @@ def create_branch(session_id: str, body: BranchRequest):
 @router.post("/sessions/{session_id}/commit")
 def commit(session_id: str, body: CommitRequest):
     return _call(_service().commit, session_id, body.message)
+
+
+@router.get("/git/identity", response_model=GitIdentity)
+def git_identity():
+    """The author identity Git would use for commits on this computer."""
+    return _call(_service().workspaces.git_identity)
+
+
+@router.put("/git/identity", response_model=GitIdentity)
+def set_git_identity(body: GitIdentityRequest):
+    """Fill in whichever of user.name / user.email is unset; configured values are kept."""
+    return _call(_service().workspaces.set_git_identity, body.name, body.email)
 
 
 @router.post("/sessions/{session_id}/apply")

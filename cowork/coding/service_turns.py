@@ -19,6 +19,7 @@ from cowork.coding.contracts import (
 from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_models import TERMINAL_RUN_STATUSES, RunStatus, RuntimeCommand, RuntimeEvent, TaskRun
 from cowork.coding.engines.base import EngineCredentials, EngineSession
+from cowork.coding.reasoning import ModelLevels
 from cowork.coding.turns import RunningTurn, fail_turn, mark_running
 from cowork.services.skills import CodeSkillService
 
@@ -33,6 +34,7 @@ class CodingTurnOperations:
         default_engine: str,
         default_model: str,
         code_skills: CodeSkillService | None = None,
+        model_levels: ModelLevels | None = None,
     ) -> CodingSession:
         session = self.session_factory.create(
             request,
@@ -40,6 +42,7 @@ class CodingTurnOperations:
             default_engine,
             default_model,
             code_skills,
+            model_levels=model_levels,
         )
         if self._is_remote(session):
             intent = self._validated_command_intent(session, request.prompt, request.attachments)
@@ -59,9 +62,13 @@ class CodingTurnOperations:
         credentials: EngineCredentials,
         attachments: list[InputReference] | tuple[InputReference, ...] = (),
     ) -> CodingSession:
-        session = self._continue_completed_task(self.get_session(session_id))
+        session = self.get_session(session_id)
+        intent = self._validated_command_intent(session, prompt, attachments)
+        if not intent.runs_immediately:
+            # A read-only command such as /status must not roll a finished task
+            # into a fresh run; only real turns continue the task.
+            session = self._continue_completed_task(session)
         if self._is_remote(session):
-            intent = self._validated_command_intent(session, prompt, attachments)
             return self.remote.queue_turn(session, prompt, attachments, intent)
         return self._submit_turn(session_id, prompt, credentials, attachments)
 
@@ -190,6 +197,10 @@ class CodingTurnOperations:
         attachments: list[InputReference] | tuple[InputReference, ...] = (),
     ) -> CodingSession:
         session = self.get_session(session_id)
+        if session.pending_approval is not None:
+            # Codex does not accept turn/steer while the turn waits on an
+            # approval, so the request would hang until the decision arrives.
+            raise StateConflict("Resolve the pending approval first; the instruction can be queued meanwhile")
         if self._is_remote(session):
             if not session.run_id:
                 raise RuntimeError("Remote task is missing its Task Run")
@@ -253,13 +264,51 @@ class CodingTurnOperations:
                     intent.goal_objective,
                 )
             return self.get_session(session_id)
-        if engine is not None:
-            engine.steer(turn_id, prompt, engine_attachments)
+        outcome = engine.steer(turn_id, prompt, engine_attachments) if engine is not None else None
+        if outcome is None:
+            self._emit(
+                session.id,
+                CodingEvent(type=EventType.user_message, title="Follow-up", text=prompt, phase="completed"),
+            )
+            return self.get_session(session_id)
+        # Codex has not answered within its deadline. The instruction is in
+        # flight and may still land, so record it as unconfirmed rather than
+        # rejecting it (which would invite the user to send it twice), and
+        # report the result when the engine finally answers.
         self._emit(
             session.id,
-            CodingEvent(type=EventType.user_message, title="Follow-up", text=prompt, phase="completed"),
+            CodingEvent(
+                type=EventType.user_message,
+                title="Follow-up (unconfirmed)",
+                text=prompt,
+                phase="pending",
+                data={"delivery": "unconfirmed"},
+            ),
         )
+        outcome.on_settled(lambda ok, detail: self._record_late_steer(session_id, prompt, ok, detail))
         return self.get_session(session_id)
+
+    def _record_late_steer(self, session_id: str, prompt: str, ok: bool, detail: str) -> None:
+        if ok:
+            event = CodingEvent(
+                type=EventType.command_result,
+                title="Follow-up delivered",
+                text="Codex accepted the instruction after the deadline; it is now guiding the turn.",
+                phase="completed",
+                data={"delivery": "confirmed", "prompt": prompt[:200]},
+            )
+        else:
+            event = CodingEvent(
+                type=EventType.error,
+                title="Follow-up not delivered",
+                text=f"Codex did not accept the instruction ({detail or 'no reason given'}). Send it again.",
+                phase="failed",
+                data={"delivery": "failed", "prompt": prompt[:200]},
+            )
+        try:
+            self._emit(session_id, event)
+        except Exception:  # noqa: BLE001 - a settled steer must never take the worker thread down.
+            pass
 
     def queue_turn(
         self,
@@ -376,12 +425,17 @@ class CodingTurnOperations:
         ):
             expected_instruction_id = instruction_id
             while True:
-                session = self._continue_completed_task(self.get_session(session_id))
+                session = self.get_session(session_id)
                 self._require_queue_head(session, expected_instruction_id)
                 expected_instruction_id = None
                 if not session.queued_instructions:
                     return session
                 instruction = session.queued_instructions[0]
+                intent = self._validated_command_intent(session, instruction.prompt, instruction.attachments)
+                if not intent.runs_immediately:
+                    # Same rule as submit_turn: a queued /status or /compact
+                    # must not roll a finished task into a fresh run.
+                    session = self._continue_completed_task(session)
                 target_id = instruction.id
                 self.store.update_session(
                     session_id,
