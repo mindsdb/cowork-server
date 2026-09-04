@@ -113,6 +113,10 @@ class ConnectorMetadataResponse(BaseModel):
     logo_color: str | None = None
     aliases: list[str] = []
     featured: bool = False
+    # Org (cloud) mode only: False marks a connector the hosted build can't
+    # run yet, so the directory can list it under a desktop-only group instead
+    # of hiding it. Always True on desktop, where the whole registry works.
+    cloud_available: bool = True
 
 
 class ConnectorSpecResponse(ConnectorMetadataResponse):
