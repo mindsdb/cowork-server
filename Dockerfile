@@ -23,7 +23,7 @@ WORKDIR /app
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=uv.lock,target=uv.lock \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
-    uv sync --frozen --no-install-project --no-dev
+    uv sync --frozen --no-install-project --no-dev --extra hermes
 
 # Then the project source and a full sync (installs cowork-server into the venv).
 #
@@ -45,7 +45,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Order matters: the sync must resolve the version before .git is gone.
 COPY . /app
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev \
+    uv sync --frozen --no-dev --extra hermes \
     && v="$(.venv/bin/python -c 'from importlib.metadata import version; print(version("cowork-server"))')" \
     && echo "cowork-server version: $v" \
     && case "$v" in 0.0.0*) \
