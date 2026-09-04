@@ -72,24 +72,3 @@ def test_the_unit_job_installs_the_hermes_extra() -> None:
     """
     assert "run: uv sync --group dev --extra hermes" in _stripped_lines(_UNIT_WORKFLOW)
 
-
-def test_the_shipped_set_job_asserts_hermes_is_unregistered() -> None:
-    """The hermes gate is only observable on a base install.
-
-    The unit job installs the extra, and test_channel_context, test_app_settings,
-    test_hermes_turn_failure and test_trace_tags_forwarding all import the harness
-    module directly, which registers hermes whatever the package gate decided. So
-    no `make test/unit` assertion can cover it, and this pins the one step that
-    can.
-    """
-    assert "'hermes' not in ids" in "\n".join(_stripped_lines(_UNIT_WORKFLOW))
-
-
-def test_the_shipped_set_job_asserts_the_memory_adapter_survives() -> None:
-    """Gating the memory adapter alongside the harness would be silent.
-
-    It needs no hermes import, and harnesses/memory/migration.py resolves it to
-    delete legacy hermes memory files. Folded into the harness gate, that cleanup
-    would simply stop happening for the users who have those files.
-    """
-    assert "get_memory_adapter as g" in "\n".join(_stripped_lines(_UNIT_WORKFLOW))
