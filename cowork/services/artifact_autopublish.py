@@ -24,16 +24,20 @@ from cowork.services.publish import publish_artifact
 
 logger = logging.getLogger(__name__)
 
-# Owner-side publish access for every auto-published artifact.
+# Owner-side publish access for a FIRST auto-publish. A re-publish preserves
+# whatever the owner has since chosen — see `_access_for`.
 #
-# `org_allowed` is NOT decoration. `anton.publish_access.resolve_access` treats
-# "restricted with neither emails nor an org" as a caller mistake and degrades it
-# to `public`, so `{"mode": "restricted", "emails": []}` would make every
-# auto-published artifact world-readable. With the flag set, access is granted by
-# two independent conditions in auth — owner-by-FK and org membership — which also
-# removes the dependency on the never-live-verified "empty emails still grants the
-# owner" behavior.
-AUTOPUBLISH_ACCESS: dict = {"mode": "restricted", "emails": [], "org_allowed": True}
+# `owner_only` is NOT decoration. `anton.publish_access.resolve_access` treats
+# "restricted with neither emails, nor an org, nor owner_only" as a caller
+# mistake and degrades it to `public`, so `{"mode": "restricted", "emails": []}`
+# would make every auto-published artifact world-readable. The flag is what
+# makes "only the owner" expressible instead of collapsing into that hole.
+#
+# This used to be `org_allowed: True` — every auto-published artifact readable by
+# the whole organization. An artifact is now private until its owner shares it
+# (ENG-2316), which is the behaviour the Share control in the viewer exists to
+# change.
+AUTOPUBLISH_ACCESS: dict = {"mode": "restricted", "emails": [], "owner_only": True}
 
 # Below this much remaining budget a publish is not started at all: entering
 # `wait_for` with a sliver of time only guarantees a timeout, an abandoned upload
@@ -55,6 +59,29 @@ class PublishDecision:
     reason: str | None = None
     is_fullstack: bool = False
     content_mtime: int = 0
+    # The stored `.published.json` entry this decision was made against, so a
+    # re-publish can reconstruct the access the owner chose rather than
+    # reapplying the first-publish default. None for a first publish.
+    published_entry: dict | None = None
+
+
+def _access_for(decision: PublishDecision) -> dict:
+    """The access to publish this artifact with.
+
+    A first publish gets the owner-only default. A re-publish MUST preserve what
+    the owner has since chosen — reapplying the default here would silently
+    revoke a share every time the agent touched the artifact, which is the whole
+    reason the Share control would otherwise be untrustworthy (ENG-2316).
+
+    `access_from_owner_side` is the canonical reconstruction, and it carries
+    `owner_only` for exactly this reason: without that key an owner-only entry
+    rebuilds as an empty selection and degrades to public.
+    """
+    from anton.publish_access import access_from_owner_side
+
+    if not decision.published_entry:
+        return dict(AUTOPUBLISH_ACCESS)
+    return access_from_owner_side(decision.published_entry)
 
 
 def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
@@ -108,7 +135,8 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
     if digest is None or digest == entry.get("last_md5"):
         # None means "can't tell" — never republish on a guess.
         return PublishDecision(None, REASON_UNCHANGED, is_fullstack, current_mtime)
-    return PublishDecision("changed", None, is_fullstack, current_mtime)
+    # `entry` rides along so the re-publish keeps the owner's access choice.
+    return PublishDecision("changed", None, is_fullstack, current_mtime, entry)
 
 
 # ── reconciliation ────────────────────────────────────────────────────────
@@ -193,9 +221,19 @@ def _plan(artifacts_base: Path, slugs: list[str]) -> list[tuple[str, PublishDeci
 
 
 async def _publish_one(
-    artifacts_base: Path, slug: str, api_key: str, publish_url: str, timeout_s: float, scope
+    artifacts_base: Path,
+    slug: str,
+    api_key: str,
+    publish_url: str,
+    timeout_s: float,
+    scope,
+    access: dict | None = None,
 ) -> bool:
-    """Publish one artifact. True when it landed. Never raises."""
+    """Publish one artifact. True when it landed. Never raises.
+
+    `access` defaults to the first-publish owner-only access; callers pass
+    `_access_for(decision)` so a re-publish keeps the owner's own choice.
+    """
     folder = Path(artifacts_base) / slug
     try:
         await asyncio.wait_for(
@@ -205,7 +243,7 @@ async def _publish_one(
                 artifacts_base=Path(artifacts_base),
                 api_key=api_key,
                 publish_url=publish_url,
-                access=dict(AUTOPUBLISH_ACCESS),
+                access=dict(access) if access else dict(AUTOPUBLISH_ACCESS),
                 # Required, not optional, on this path: the publisher reads
                 # datasource secrets from the org-keyed connector vault, and
                 # `vault_for_scope(None)` raises on an org deployment rather
@@ -299,7 +337,7 @@ async def autopublish_project_artifacts(
             if (started + budget_s) - time.monotonic() < _MIN_START_BUDGET_S:
                 _record("deferred", reason="budget", slugs=len(phase_slugs))
                 continue
-            for slug, _decision in _plan(base, phase_slugs):
+            for slug, decision in _plan(base, phase_slugs):
                 if len(published) >= limit:
                     _record("deferred", slug=slug, reason="limit")
                     continue
@@ -315,7 +353,10 @@ async def autopublish_project_artifacts(
                     release(base, slug)
                     _record("no_key", slug=slug)
                     return published
-                if await _publish_one(base, slug, api_key, publish_url, min(timeout_s, remaining), scope):
+                if await _publish_one(
+                    base, slug, api_key, publish_url, min(timeout_s, remaining), scope,
+                    _access_for(decision),
+                ):
                     published.add(slug)
     except asyncio.CancelledError:
         raise

@@ -14,14 +14,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+from types import ModuleType
 from uuid import uuid4
 
 import pytest
+from anton.core.llm.provider import ProviderAuthError
 from fastapi import HTTPException
 
 from cowork.handlers import turn_errors as te
 from cowork.handlers.responses import ResponsesHandler
-
 
 # ── Detection / mapping policy ────────────────────────────────────
 
@@ -274,7 +276,11 @@ def test_collect_raises_400_with_curated_message_for_image_error():
     with pytest.raises(HTTPException) as err:
         asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", original_content="hi"))
     assert err.value.status_code == 400
-    assert "PNG or JPEG" in err.value.detail
+    # detail is the response.failed payload, not bare prose: the ladder's code
+    # has to reach the caller or no card can be drawn from it.
+    assert err.value.detail["type"] == "response.failed"
+    assert err.value.detail["code"] == te.IMAGE_FORMAT_CODE
+    assert "PNG or JPEG" in err.value.detail["error"]
 
 
 def test_collect_raises_500_generic_for_unmapped_error():
@@ -282,8 +288,11 @@ def test_collect_raises_500_generic_for_unmapped_error():
     with pytest.raises(HTTPException) as err:
         asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", original_content="hi"))
     assert err.value.status_code == 500
-    assert err.value.detail == te.GENERIC_TURN_ERROR_MESSAGE
-    assert "secret-token" not in err.value.detail
+    assert err.value.detail["code"] == te.GENERIC_TURN_ERROR_CODE
+    assert err.value.detail["error"] == te.GENERIC_TURN_ERROR_MESSAGE
+    # Targets the message, not the mapping: `not in` on a dict tests keys and
+    # would pass vacuously, retiring the leak guard without failing.
+    assert "secret-token" not in err.value.detail["error"]
 
 
 # ── Conversation repair on content validation error (ENG-1992) ────
@@ -367,6 +376,7 @@ def test_collect_repairs_conversation_on_content_validation_error():
         with pytest.raises(HTTPException) as err:
             asyncio.run(handler._collect(stream=None, conversation_id=conv_id, model="anton", original_content="hi"))
         assert err.value.status_code == 400
+        assert err.value.detail["code"] == te.CONTENT_RECOVERY_CODE
         conv_svc.return_value.repair_image_content.assert_called_once_with(conv_id)
 
 
@@ -437,21 +447,40 @@ def test_collect_raises_400_with_curated_message_for_token_limit():
     with pytest.raises(HTTPException) as err:
         asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", original_content="hi"))
     assert err.value.status_code == 400
-    assert err.value.detail == te.TOKEN_LIMIT_USER_MESSAGE
+    assert err.value.detail["code"] == te.TOKEN_LIMIT_CODE
+    assert err.value.detail["error"] == te.TOKEN_LIMIT_USER_MESSAGE
 
 
 # ── Provider auth (401) → provider_auth ──────────────────────────────
 
 
-def test_detects_auth_error_from_openai_401_message():
-    # anton's openai provider maps a gateway 401 to this ConnectionError message.
-    exc = ConnectionError("Invalid API key — check your OpenAI API key configuration.")
+def test_detects_canonical_provider_auth_error():
+    exc = ProviderAuthError("provider rejected the credential")
     assert te.is_auth_error(exc) is True
 
 
-def test_detects_auth_error_from_anthropic_401_message():
-    exc = ConnectionError("Invalid API key — check your ANTHROPIC_API_KEY environment variable.")
+def test_legacy_auth_fallback_when_anton_lacks_typed_error(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules, "anton.core.llm.provider", ModuleType("anton.core.llm.provider")
+    )
+    exc = ConnectionError(
+        "Invalid API key — check your OpenAI API key configuration."
+    )
+
     assert te.is_auth_error(exc) is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Invalid API key — check your OpenAI API key configuration.",
+        "Invalid API key — check your ANTHROPIC_API_KEY environment variable.",
+    ],
+)
+def test_connection_error_auth_lookalikes_are_not_provider_auth(message):
+    exc = ConnectionError(message)
+    assert te.is_auth_error(exc) is False
+    assert te.friendly_turn_error(exc) is None
 
 
 def test_bare_401_not_flagged():
@@ -463,7 +492,7 @@ def test_bare_401_not_flagged():
 
 def test_auth_error_maps_to_provider_auth_code():
     code, message = te.friendly_turn_error(
-        ConnectionError("Invalid API key — check your OpenAI API key configuration.")
+        ProviderAuthError("provider rejected the credential")
     )
     assert code == te.AUTH_ERROR_CODE == "provider_auth"
     assert "reconnect" in message.lower()
@@ -489,6 +518,105 @@ def test_response_failed_payload_carries_auth_fields():
     assert p["reconnectable"] is True and p["provider_label"] == "MindsHub"
     # Unrelated failures keep the original shape (no extra keys).
     assert "reconnectable" not in te.response_failed_payload("boom", "anton_error")
+
+
+async def test_auth_reconnectable_keys_on_the_failing_role_not_planning():
+    from unittest.mock import patch
+    from cowork.common.settings.user_settings import Provider
+
+    class _FakeSettings:
+        resolved_planning_provider = Provider.MINDS_CLOUD
+        resolved_coding_provider = Provider.ANTHROPIC
+        resolved_router_provider = Provider.OPENAI
+
+    exc = ProviderAuthError("provider rejected the credential")
+    exc.role = "coding"
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+        frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+
+    payload = json.loads(
+        [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
+    )
+    assert payload["code"] == te.AUTH_ERROR_CODE
+    assert payload["reconnectable"] is False
+    assert payload["provider_label"] == Provider.ANTHROPIC.label
+
+
+async def test_auth_reconnectable_uses_planning_role_in_a_mixed_config():
+    from unittest.mock import patch
+
+    from cowork.common.settings.user_settings import Provider
+
+    class _MixedSettings:
+        resolved_planning_provider = Provider.MINDS_CLOUD
+        resolved_coding_provider = Provider.ANTHROPIC
+        resolved_router_provider = Provider.OPENAI
+
+    exc = ProviderAuthError("provider rejected the credential")
+    exc.role = "planning"
+    with patch(
+        "cowork.handlers.responses.get_user_settings",
+        return_value=_MixedSettings(),
+    ):
+        frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+
+    failed = next(f for f in frames if "response.failed" in f)
+    payload = json.loads(failed.split("data: ", 1)[1].strip())
+    assert payload["code"] == te.AUTH_ERROR_CODE
+    assert payload["reconnectable"] is True
+    assert payload["provider_label"] == Provider.MINDS_CLOUD.label
+
+
+async def test_auth_without_a_role_does_not_name_a_provider_in_a_mixed_config():
+    """An auth error can reach the handler without a role stamped on it.
+
+    Defaulting to planning would show a MindsHub "Reconnect" card for a failure
+    that may have been the BYOK Anthropic key, so an unattributable auth error
+    keeps the generic copy and no provider fields.
+    """
+    from unittest.mock import patch
+    from cowork.common.settings.user_settings import Provider
+
+    class _MixedSettings:
+        resolved_planning_provider = Provider.MINDS_CLOUD
+        resolved_coding_provider = Provider.ANTHROPIC
+        resolved_router_provider = Provider.OPENAI
+
+    # role is never stamped: ProviderAuthError defaults it to None, and only
+    # LLMClient's confirmation wrappers set it.
+    exc = ProviderAuthError("provider rejected the credential")
+    assert exc.role is None
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_MixedSettings()):
+        frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+
+    payload = json.loads(
+        [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
+    )
+    assert payload["code"] == te.AUTH_ERROR_CODE
+    assert "reconnectable" not in payload
+    assert "provider_label" not in payload
+
+
+async def test_auth_without_a_role_still_names_an_unambiguous_provider():
+    """Both required roles agree, so there is nothing to attribute wrongly."""
+    from unittest.mock import patch
+    from cowork.common.settings.user_settings import Provider
+
+    class _MindsSettings:
+        resolved_planning_provider = Provider.MINDS_CLOUD
+        resolved_coding_provider = Provider.MINDS_CLOUD
+        resolved_router_provider = Provider.OPENAI
+
+    exc = ProviderAuthError("provider rejected the credential")
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_MindsSettings()):
+        frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+
+    payload = json.loads(
+        [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
+    )
+    assert payload["code"] == te.AUTH_ERROR_CODE
+    assert payload["reconnectable"] is True
+    assert payload["provider_label"] == Provider.MINDS_CLOUD.label
 
 
 # ── Model-403 (model_access_denied / model_disabled), legacy back-compat ─
@@ -555,7 +683,7 @@ def test_token_limit_wins_over_model_403():
 
 
 def test_auth_error_not_shadowed_by_model_mapping():
-    exc = ConnectionError("Invalid API key — check your OpenAI API key configuration.")
+    exc = ProviderAuthError("provider rejected the credential")
     code, _ = te.friendly_turn_error(exc)
     assert code == te.AUTH_ERROR_CODE
 
@@ -590,7 +718,8 @@ def test_collect_raises_400_with_plan_message_for_model_403():
     with pytest.raises(HTTPException) as err:
         asyncio.run(handler._collect(stream=None, conversation_id=uuid4(), model="anton", original_content="hi"))
     assert err.value.status_code == 400
-    assert err.value.detail == _PLAN_MSG
+    assert err.value.detail["code"] == "model_access_denied"
+    assert err.value.detail["error"] == _PLAN_MSG
 
 
 # ── Wallet-model gateway mapping (402/429/404/503 + X-MindsHub-Reason) ─
@@ -655,6 +784,23 @@ def _gateway_failure(status_code, reason=None, message="Server returned an upstr
 def _byok_failure(status_code, message="Server returned an upstream error"):
     """A failure from the user's own provider (BYOK), not the gateway."""
     return _failure(status_code, message=message, url="https://api.openai.com/v1/chat/completions")
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "expected_code"),
+    [
+        (402, "wallet_empty", te.TOKEN_LIMIT_CODE),
+        (429, "included_allowance_exhausted", te.ALLOWANCE_EXHAUSTED_CODE),
+        (429, "rate_limited", te.RATE_LIMITED_CODE),
+        (503, "policy_unavailable", te.POLICY_UNAVAILABLE_CODE),
+        (404, "unknown_model", te.MODEL_NOT_FOUND_CODE),
+    ],
+)
+def test_typed_auth_narrowing_preserves_gateway_reason_mapping(
+    status, reason, expected_code
+):
+    code, _ = te.friendly_turn_error(_gateway_failure(status, reason=reason))
+    assert code == expected_code
 
 
 def test_http_error_context_walks_cause_chain():
@@ -1019,12 +1165,18 @@ def test_reason_header_wins_over_status():
     assert code == te.TOKEN_LIMIT_CODE
 
 
-def test_401_status_not_captured_by_wallet_branches():
-    # A gateway 401 (bad credential) still falls to the auth mapping — the new
-    # status-based branches only fire for 402/429/503.
+def test_untyped_gateway_401_stays_generic():
+    # A status and familiar copy cannot prove that the active LLM credential is
+    # invalid. Only Anton's canonical typed exception selects provider_auth.
     exc = _gateway_failure(
         401, message="Invalid API key — check your OpenAI API key configuration."
     )
+    assert te.friendly_turn_error(exc) is None
+
+
+def test_typed_gateway_401_maps_to_provider_auth():
+    exc = ProviderAuthError("provider rejected the credential")
+    exc.__cause__ = _FakeAPIStatusError(401, url=_minds_gateway_url())
     code, _ = te.friendly_turn_error(exc)
     assert code == te.AUTH_ERROR_CODE
 
@@ -1187,8 +1339,197 @@ def test_remote_error_overloaded_passes_curated_copy():
 
 def test_remote_error_auth():
     from cowork.handlers.turn_errors import remote_turn_error, AUTH_ERROR_CODE
-    code, _ = remote_turn_error("ConnectionError: Invalid API key - check your configuration.")
+    code, _ = remote_turn_error("ProviderAuthError: provider rejected the credential")
     assert code == AUTH_ERROR_CODE
+
+
+def test_remote_error_turn_interrupted_keeps_its_curated_copy():
+    # The pod's own no-terminal-event fallback (a pod torn down mid-turn).
+    # Same generic code as any unmapped failure — no dedicated card exists
+    # for this — but the curated sentence must survive instead of being
+    # discarded for the fully generic message.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error(
+        "TurnInterrupted: The turn ended unexpectedly. Please try again.")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert msg == "The turn ended unexpectedly. Please try again."
+
+
+def test_remote_error_self_authored_lookalike_is_still_redacted():
+    # The two curated sentences are matched whole, not on their type name, so
+    # a future exception class of the same name wrapping provider text cannot
+    # ride the prefix through to the user.
+    from cowork.handlers.turn_errors import (
+        remote_turn_error, GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE)
+    code, msg = remote_turn_error(
+        "TurnInterrupted: upstream said sk-live-abc is not authorized for gpt-9")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert msg == GENERIC_TURN_ERROR_MESSAGE
+    assert "sk-live" not in msg
+
+
+def test_remote_error_turn_worker_lost_keeps_its_curated_copy():
+    # pel_reclaim.py's ORPHANED_ERROR — a worker died mid-turn and the entry
+    # was reclaimed from Redis's PEL rather than retried (retrying would bill
+    # the tenant's tokens twice). Already correctly shaped; just missing from
+    # the allowlist.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error(
+        "TurnWorkerLost: the worker running this turn stopped before it "
+        "finished; the turn was not retried")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "the turn was not retried" in msg
+
+
+def test_remote_error_pod_stream_ended_without_terminal_gets_curated_copy():
+    # scratchpad-controller's own literal (main.py) — an OOM-killed pod or a
+    # dropped exec channel. No "TypeName:" prefix at all, so the generic
+    # type_name parse below would never match it; matched directly instead.
+    # The optional stderr tail must never reach the user verbatim.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error("pod stream ended without a terminal event")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert msg == "The turn ended unexpectedly. Please try again."
+
+    code, msg = remote_turn_error(
+        "pod stream ended without a terminal event; stderr tail: Traceback ...")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert msg == "The turn ended unexpectedly. Please try again."
+    assert "Traceback" not in msg
+
+
+def test_remote_error_turn_aborted_on_hard_timeout_gets_curated_copy():
+    # scratchpad-controller's with_limits() hard wall-clock deadline.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error("turn aborted: hard turn timeout")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "too long" in msg
+
+
+def test_remote_error_turn_aborted_on_stall_gets_curated_copy():
+    # scratchpad-controller's with_limits() no-output stall detector.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error(
+        "turn aborted: no output within stall window; stderr tail: boom")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "stopped producing output" in msg
+    assert "boom" not in msg
+
+
+@pytest.mark.parametrize("wire_error", [
+    # What _run_job's own MissingOrganization handler publishes: the message
+    # verbatim, no type prefix.
+    "job corr-123 has no organization_id; refusing to run a turn "
+    "without an organization-scoped workspace",
+    # Defensive only. Nothing emits this today (see the constant's comment),
+    # but the classifier accepts it so a controller change that lets the
+    # exception reach _fail_job does not silently lose the curated copy.
+    "MissingOrganization: job corr-123 has no organization_id; refusing to "
+    "run a turn without an organization-scoped workspace",
+])
+def test_remote_error_missing_organization_gets_curated_copy(wire_error):
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error(wire_error)
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "workspace" in msg
+    # A data-integrity condition a plain retry is not guaranteed to fix, so
+    # the copy has to steer to support rather than promise a retry works.
+    assert "support" in msg
+    # The raw correlation_id in the source message must not leak — request_id
+    # already carries it, separately and reliably, on the payload.
+    assert "corr-123" not in msg
+
+
+def test_remote_error_mapped_type_is_not_shadowed_by_the_organization_suffix():
+    # Every other pre-parse branch is front-anchored on a lowercase literal
+    # containing a space ("pod ", "live pod ", "turn aborted: ", "pod stream
+    # ended ..."), which any "TypeName: " prefix defeats. This one tested the
+    # tail alone, so without the front anchor an exception whose message
+    # merely ENDS with the controller's phrasing takes the workspace branch
+    # ahead of its own — costing this one its Reconnect card.
+    from cowork.handlers.turn_errors import remote_turn_error, AUTH_ERROR_CODE
+    code, _ = remote_turn_error(
+        "ProviderAuthError: job corr-123 has no organization_id; refusing to "
+        "run a turn without an organization-scoped workspace")
+    assert code == AUTH_ERROR_CODE
+
+
+@pytest.mark.parametrize("wire_error", [
+    # scratchpad-controller's live_pod.py raises a bare RuntimeError from two
+    # places when the pod never reaches Running: a terminal phase reached
+    # first (kubelet rejected or evicted it), and the poll deadline expiring
+    # (no gVisor capacity, a quota block, a cold node still pulling the
+    # image). Only the first was recognised; the second is the class that
+    # clusters, which is the shape a "1 in 10 turns" report is made of.
+    "live pod sp-abc123 reached terminal phase 'Failed' before Running",
+    "live pod sp-abc123 did not reach Running within 120s",
+])
+def test_remote_error_live_pod_never_reached_running_gets_curated_copy(wire_error):
+    # Both are caught by _handle_anton_turn_k8s's own generic `except
+    # Exception`, so neither carries a type prefix. The pod name is
+    # k8s-controlled (safe), but a fixed message is still returned rather
+    # than echoing it to the user.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error(wire_error)
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "sandbox" in msg
+    assert "sp-abc123" not in msg
+
+
+def test_remote_error_pod_identity_mismatch_gets_curated_copy():
+    # live_pod.py's PodIdentityMismatch — a pod holding our name belongs to a
+    # different scratchpad, so the turn is refused rather than run in someone
+    # else's workspace. The squatting pod is not discarded, so the copy
+    # steers to support instead of promising a retry will clear it, and the
+    # two scratchpad ids in the raw message must not reach the user.
+    from cowork.handlers.turn_errors import remote_turn_error, GENERIC_TURN_ERROR_CODE
+    code, msg = remote_turn_error(
+        "pod sp-abc123 belongs to scratchpad 'conv-other', not 'conv-mine'")
+    assert code == GENERIC_TURN_ERROR_CODE
+    assert "support" in msg
+    assert "conv-other" not in msg
+    assert "sp-abc123" not in msg
+
+
+def test_remote_legacy_connection_error_still_maps_to_provider_auth():
+    """The remote worker pods still emit anton's pre-typed 401 copy.
+
+    They run the `minds-anton-scratchpad` image, pinned in scratchpad-controller
+    at anton `61ec5db6` (staging/dev) and `d4f1db2c` (prod). Neither carries
+    `ProviderAuthError`, and no PR in this ENG-2116 set bumps that image, so
+    keying only on the typed name would strip the Reconnect card from every
+    hosted 401.
+    """
+    code, message = te.remote_turn_error(
+        "ConnectionError: Invalid API key — check your OpenAI API key configuration."
+    )
+    assert code == te.AUTH_ERROR_CODE
+    assert message == te.AUTH_ERROR_USER_MESSAGE
+
+
+def test_remote_unanchored_invalid_key_text_stays_generic():
+    """A tool's own 'invalid api key' mid-message must not select the auth card.
+
+    The classifier anchors with ``startswith`` precisely so an arbitrary tool
+    exception cannot borrow the Reconnect card. A substring check would map this
+    to ``provider_auth`` and tell the user to reconnect MindsHub over a failure
+    that has nothing to do with their session.
+    """
+    code, message = te.remote_turn_error(
+        "ConnectionError: Stripe rejected the request: invalid api key for account acct_1"
+    )
+    assert code == te.GENERIC_TURN_ERROR_CODE
+    assert message == te.GENERIC_TURN_ERROR_MESSAGE
+
+
+def test_remote_untyped_auth_lookalikes_are_redacted():
+    """A 401 that is not anton's anchored invalid-key copy stays generic."""
+    code, message = te.remote_turn_error(
+        "ConnectionError: Server returned 401 - Unauthorized"
+    )
+    assert code == te.GENERIC_TURN_ERROR_CODE
+    assert message == te.GENERIC_TURN_ERROR_MESSAGE
+    assert "api key" not in message.lower()
 
 
 def test_remote_error_unknown_is_redacted():
@@ -1271,6 +1612,126 @@ def test_no_return_emits_a_literal_code():
         and isinstance(node.value.elts[0].value, str)
     ]
     assert offenders == []
+
+
+# ── The non-streaming path carries the code too ───────────────────────────
+# The streaming twin has a per-code test each. These sweep them through
+# _collect so its raise cannot drop one while those per-code tests stay green.
+#
+# Split by rung on purpose. The gateway rows must build their exception INSIDE
+# the test: the request URL comes from `minds_url` in settings, so a URL baked
+# in at collection time stops matching once another test changes that setting,
+# and the ladder then silently declines to map it.
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "expected_code"),
+    [
+        # The rung the ticket's headline case takes.
+        (402, "wallet_empty", te.TOKEN_LIMIT_CODE),
+        (429, "included_allowance_exhausted", te.ALLOWANCE_EXHAUSTED_CODE),
+        (429, "rate_limited", te.RATE_LIMITED_CODE),
+        (503, "policy_unavailable", te.POLICY_UNAVAILABLE_CODE),
+        (404, "unknown_model", te.MODEL_NOT_FOUND_CODE),
+    ],
+)
+def test_collect_400_carries_the_code_for_each_gateway_reason(status, reason, expected_code):
+    handler = _handler_with_raising_formatter(_gateway_failure(status, reason=reason))
+    with pytest.raises(HTTPException) as err:
+        asyncio.run(
+            handler._collect(
+                stream=None, conversation_id=uuid4(), model="anton", original_content="hi"
+            )
+        )
+    assert err.value.status_code == 400
+    assert err.value.detail["type"] == "response.failed"
+    assert err.value.detail["code"] == expected_code
+    assert err.value.detail["error"]
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected_code"),
+    [
+        pytest.param(Exception(_TOKEN_LIMIT_MESSAGE), te.TOKEN_LIMIT_CODE, id="token_limit"),
+        pytest.param(ProviderAuthError("provider rejected the credential"), te.AUTH_ERROR_CODE, id="auth"),
+        pytest.param(
+            _FakeModelErr(_PLAN_MSG, "model_access_denied", "sonnet"),
+            te.MODEL_ACCESS_DENIED_CODE, id="model_access_denied",
+        ),
+        pytest.param(
+            _FakeModelErr("", "model_disabled", "sonnet"),
+            te.MODEL_DISABLED_CODE, id="model_disabled",
+        ),
+        pytest.param(
+            _FakeOverloadedErr(_OVERLOAD_MSG, model="sonnet"),
+            te.PROVIDER_OVERLOADED_CODE, id="provider_overloaded",
+        ),
+        pytest.param(
+            Exception("'image_url' does not match the expected tags: 'image'"),
+            te.IMAGE_FORMAT_CODE, id="image_format",
+        ),
+    ],
+)
+def test_collect_400_carries_the_code_for_each_typed_cause(exc, expected_code):
+    """The rungs below the gateway header, asserted on the 400 it raises.
+
+    Three of the inventory's codes are absent from both sweeps, each pinned
+    elsewhere or unreachable. ``content_recovery`` runs the conversation-repair
+    branch and is pinned by its own test above. ``anton_error`` is the
+    unmapped fallback, pinned by the 500 test above and by the wire test's
+    ``unmapped-500`` row. ``worker_unresponsive`` comes from
+    ``remote_turn_error``, a different mapper that this path never calls.
+    """
+    handler = _handler_with_raising_formatter(exc)
+    with pytest.raises(HTTPException) as err:
+        asyncio.run(
+            handler._collect(
+                stream=None, conversation_id=uuid4(), model="anton", original_content="hi"
+            )
+        )
+    assert err.value.status_code == 400
+    assert err.value.detail["type"] == "response.failed"
+    assert err.value.detail["code"] == expected_code
+    assert err.value.detail["error"]
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected_status", "expected_code", "expected_error"),
+    [
+        pytest.param(
+            Exception(_TOKEN_LIMIT_MESSAGE), 400,
+            te.TOKEN_LIMIT_CODE, te.TOKEN_LIMIT_USER_MESSAGE, id="mapped-400",
+        ),
+        pytest.param(
+            Exception("kaboom: secret-token-xyz"), 500,
+            te.GENERIC_TURN_ERROR_CODE, te.GENERIC_TURN_ERROR_MESSAGE, id="unmapped-500",
+        ),
+    ],
+)
+def test_the_non_streaming_failure_body_on_the_wire(exc, expected_status, expected_code, expected_error):
+    """Pins the serialized body, not just the raised exception.
+
+    Every assertion above reads ``HTTPException.detail`` in process, so they
+    would all stay green if FastAPI stopped rendering a mapping ``detail`` as
+    JSON — and the body is the contract this change actually altered.
+    """
+    from unittest.mock import patch
+
+    from fastapi.testclient import TestClient
+
+    from cowork.server import create_app
+
+    harness = _handler_with_raising_formatter(exc).harness
+    with patch("cowork.handlers.responses.get_harness", return_value=harness):
+        client = TestClient(create_app())
+        res = client.post("/api/v1/responses/", json={"input": "hi", "stream": False})
+
+    assert res.status_code == expected_status, res.text
+    assert res.json()["detail"] == {
+        "type": "response.failed",
+        "code": expected_code,
+        "error": expected_error,
+    }
 
 
 # ── Wiring coverage (ENG-1537 review finding 3) ────────────────────────────

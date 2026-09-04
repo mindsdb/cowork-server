@@ -32,6 +32,7 @@ from cowork.services.artifact_permissions import (
 )
 from cowork.services.comments_layer import inject_layer
 from cowork.services.artifact_revisions import (
+    RepairAlreadyPending,
     RevisionConflict,
     RevisionValidationError,
     active_agent_repair,
@@ -42,6 +43,7 @@ from cowork.services.artifact_revisions import (
     current_workspace,
     finalize_agent_repair,
     list_revisions,
+    release_repairs_for_comment,
     revision_with_content,
     save_source,
 )
@@ -310,6 +312,18 @@ class _AgentRepairBody(BaseModel):
 
 class _RepairDecisionBody(BaseModel):
     status: Literal["accepted", "rejected"]
+    # The head the user confirmed against. Rejecting restores over it, so a
+    # head that moved between the confirm and this request must not be written.
+    expectedHeadRevisionId: str | None = Field(default=None, max_length=80)
+
+
+class _RepairCancelBody(BaseModel):
+    # An older client posts `{}`, which must keep the queued-only behaviour.
+    discardReady: bool = False
+
+
+class _RepairReleaseBody(BaseModel):
+    commentThreadId: str = Field(min_length=1, max_length=100)
 
 
 def _owner_workspace(session, project_ref: str, artifact_id: str):
@@ -340,7 +354,7 @@ async def artifact_source(
     )
     try:
         result = await run_in_threadpool(current_workspace, folder, metadata, artifact_id, path)
-        repair = await run_in_threadpool(active_agent_repair, folder)
+        repair = await run_in_threadpool(active_agent_repair, folder, result.get("path"))
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -430,6 +444,121 @@ async def artifact_review_entry(
         "capabilities": capabilities,
         "currentRevision": current_revision,
     }
+
+
+# A share is a re-publish, so it inherits the upload's cost. Generous enough for
+# a fullstack bundle, bounded so a wedged target can't hold the request open.
+_ACCESS_PUBLISH_TIMEOUT_S = 60.0
+
+
+class _AccessBody(BaseModel):
+    """The access selection, in `anton.publish_access.resolve_access` shape.
+
+    Passed through rather than re-modelled per mode: the publisher owns the
+    schema (`{"mode": "public"}`, `{"mode": "password", "password": ...}`,
+    `{"mode": "restricted", "emails": [...], "org_allowed": bool,
+    "owner_only": bool}`) and validates it, so a second definition here could
+    only drift away from it.
+    """
+
+    access: dict
+
+
+def _owner_publish_context(session, folder: Path):
+    """The (artifacts_base, publish_url, key) an org-mode publish needs.
+
+    The same three `autopublish_project_artifacts` resolves, and deliberately
+    not `publish.py`'s `_desktop_context`: that one wants an absolute path from
+    the request plus a credential out of stored provider settings, neither of
+    which exists on an org deployment — which is why the whole `/publish` router
+    is local-only.
+    """
+    from cowork.services.artifact_autopublish import _publish_url
+    from cowork.services.artifact_publish_key import PublishKey
+
+    scope = session.scope
+    return (
+        folder.parent,
+        _publish_url(scope),
+        PublishKey(str(scope.user_id), str(scope.org_id), min_ttl_s=_ACCESS_PUBLISH_TIMEOUT_S + 60.0),
+    )
+
+
+def _artifact_primary(folder: Path, metadata: dict | None):
+    from cowork.services.artifacts import _pick_primary, _user_files
+
+    return _pick_primary(folder, _user_files(folder), primary_hint=(metadata or {}).get("primary"))
+
+
+@router.get("/workspace/{project_ref}/{artifact_id}/access")
+async def artifact_access(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    session: ScopedSessionDep,
+):
+    """The owner's full access state for the Share control.
+
+    Owner-only, and that is the point. The artifact CARD drops `accessEmails`
+    and `accessPassword` in org mode because one artifacts root is shared by the
+    whole organization, so the card cannot tell owner from co-member. This route
+    can: `_owner_workspace` refuses anyone else, so the owner gets back what they
+    need to pre-fill the dialog without widening what a card exposes.
+    """
+    from cowork.services.artifacts import _published_access_for
+
+    _source, folder, metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
+    primary = await run_in_threadpool(_artifact_primary, folder, metadata)
+    if primary is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This artifact has no publishable file.",
+        )
+    return await run_in_threadpool(_published_access_for, folder, primary)
+
+
+@router.put("/workspace/{project_ref}/{artifact_id}/access")
+async def set_artifact_access(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    body: _AccessBody,
+    session: ScopedSessionDep,
+):
+    """Re-publish this artifact with a new audience. Owner-only.
+
+    A publish, not a separate access API, because the publish target stores
+    access alongside the bundle and reuses the existing `report_id` — so the
+    shared URL survives the change. This is the same call autopublish makes on
+    every turn, with the owner's selection in place of the first-publish default.
+    """
+    from cowork.services.publish import publish_artifact as _publish_bundle
+
+    _source, folder, metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
+    if _artifact_primary(folder, metadata) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This artifact has no publishable file.",
+        )
+    artifacts_base, publish_url, key = _owner_publish_context(session, folder)
+    api_key = await key.get()
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Publishing is unavailable right now. Try again in a moment.",
+        )
+    try:
+        return await run_in_threadpool(
+            _publish_bundle,
+            folder,
+            artifacts_base=artifacts_base,
+            api_key=api_key,
+            publish_url=publish_url,
+            access=dict(body.access or {}),
+            scope=session.scope,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @router.post("/workspace/{project_ref}/{artifact_id}/comments-access")
@@ -571,6 +700,15 @@ async def request_agent_repair(
             status_code=status.HTTP_409_CONFLICT,
             detail={"message": str(exc), "currentRevision": exc.current},
         ) from exc
+    except RepairAlreadyPending as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(exc),
+                "repairId": exc.repair.get("id"),
+                "commentThreadId": exc.repair.get("commentThreadId"),
+            },
+        ) from exc
     except (RevisionValidationError, TimeoutError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -593,19 +731,52 @@ async def get_agent_repair(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs/release")
+async def release_agent_repairs_for_comment(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    body: _RepairReleaseBody,
+    session: ScopedSessionDep,
+):
+    """Release the repairs waiting on a comment thread the owner resolved.
+
+    This lives on the workspace router rather than the comments one because
+    the comments route forwards to inference in org mode and carries no tenant
+    scope, so only here can one call serve both desktop and cloud.
+    """
+    _source, folder, _metadata, _capabilities = _owner_workspace(
+        session, project_ref, artifact_id
+    )
+    try:
+        released = await run_in_threadpool(
+            release_repairs_for_comment, folder, body.commentThreadId
+        )
+        return {"released": released}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except (RevisionValidationError, TimeoutError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs/{repair_id}/cancel")
 async def cancel_queued_agent_repair(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     repair_id: str,
     session: ScopedSessionDep,
+    body: _RepairCancelBody | None = None,
 ):
-    """Release a queued repair when its agent turn could not be started."""
+    """Release a queued repair, or discard a ready one the owner is done with."""
     _source, folder, _metadata, _capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
     try:
-        return await run_in_threadpool(cancel_agent_repair, folder, repair_id)
+        return await run_in_threadpool(
+            cancel_agent_repair,
+            folder,
+            repair_id,
+            discard_ready=bool(body and body.discardReady),
+        )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except RevisionValidationError as exc:
@@ -634,6 +805,7 @@ async def decide_agent_repair(
             repair_id,
             body.status,
             actor_id=actor_id,
+            expected_head_revision_id=body.expectedHeadRevisionId,
         )
     except RevisionConflict as exc:
         raise HTTPException(

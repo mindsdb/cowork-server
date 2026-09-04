@@ -47,7 +47,8 @@
             "comments:create"
           ],
           "extra_auth_params": {
-            "actor": "user"
+            "actor": "user",
+            "prompt": "consent"
           },
           "service_id": "linear",
           "supports_refresh": true,
@@ -98,7 +99,8 @@
             "comments:create"
           ],
           "extra_auth_params": {
-            "actor": "user"
+            "actor": "user",
+            "prompt": "consent"
           },
           "revoke_url": "https://api.linear.app/oauth/revoke",
           "supports_refresh": true,

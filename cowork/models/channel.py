@@ -11,7 +11,35 @@ from cowork.models.base import BaseSQLModel
 
 class ChannelInstallation(BaseSQLModel, table=True):
     __tablename__ = "channel_installations"
-    __table_args__ = (sa.UniqueConstraint("channel_type", name="uq_channel_installations_type"),)
+    # One per channel_type per org (or global if org_id is NULL).
+    # Mirrors settings' org/global partial-index split (models/setting.py).
+    __table_args__ = (
+        sa.Index(
+            "uq_channel_installations_type_global",
+            "channel_type",
+            unique=True,
+            sqlite_where=sa.text("org_id IS NULL"),
+            postgresql_where=sa.text("org_id IS NULL"),
+        ),
+        sa.Index(
+            "uq_channel_installations_type_org",
+            "channel_type",
+            "org_id",
+            unique=True,
+            sqlite_where=sa.text("org_id IS NOT NULL"),
+            postgresql_where=sa.text("org_id IS NOT NULL"),
+        ),
+        # Pre-scope webhook-routing key (Slack team_id, etc.), looked up before
+        # any org exists — unique on its own, not per-org. NULL until discovered.
+        sa.Index(
+            "uq_channel_installations_external_account",
+            "channel_type",
+            "external_account_id",
+            unique=True,
+            sqlite_where=sa.text("external_account_id IS NOT NULL"),
+            postgresql_where=sa.text("external_account_id IS NOT NULL"),
+        ),
+    )
 
     channel_type: str = Field(description="Stable adapter name: telegram | slack | discord | whatsapp")
     display_name: str = Field(description="Human-facing channel label for the UI")
@@ -21,6 +49,13 @@ class ChannelInstallation(BaseSQLModel, table=True):
         description="Last known adapter state: disconnected | active | error",
     )
     org_id: str | None = Field(default=None, index=True, max_length=36, description="Owning organization; NULL on local/desktop rows")
+    external_account_id: str | None = Field(
+        default=None,
+        max_length=255,
+        description="Platform account id used to route an inbound webhook to its "
+        "installation before any org scope exists (Slack team_id, Discord application_id, "
+        "WhatsApp phone_number_id, ...); NULL until setup discovers it",
+    )
 
 
 class ChannelBinding(BaseSQLModel, table=True):
@@ -89,14 +124,25 @@ class ChannelSession(BaseSQLModel, table=True):
 
 class ChannelEvent(BaseSQLModel, table=True):
     __tablename__ = "channel_events"
+    # Dedupe key per installation (org_id anchors the index).
+    # Prevents org A's redelivered event from deduping against org B's.
     __table_args__ = (
         sa.Index(
-            "uq_channel_events_inbound_dedupe",
+            "uq_channel_events_inbound_dedupe_global",
             "channel_type",
             "dedupe_key",
             unique=True,
-            sqlite_where=sa.text("direction = 'inbound' AND dedupe_key IS NOT NULL"),
-            postgresql_where=sa.text("direction = 'inbound' AND dedupe_key IS NOT NULL"),
+            sqlite_where=sa.text("direction = 'inbound' AND dedupe_key IS NOT NULL AND org_id IS NULL"),
+            postgresql_where=sa.text("direction = 'inbound' AND dedupe_key IS NOT NULL AND org_id IS NULL"),
+        ),
+        sa.Index(
+            "uq_channel_events_inbound_dedupe_org",
+            "channel_type",
+            "org_id",
+            "dedupe_key",
+            unique=True,
+            sqlite_where=sa.text("direction = 'inbound' AND dedupe_key IS NOT NULL AND org_id IS NOT NULL"),
+            postgresql_where=sa.text("direction = 'inbound' AND dedupe_key IS NOT NULL AND org_id IS NOT NULL"),
         ),
     )
 
@@ -110,3 +156,4 @@ class ChannelEvent(BaseSQLModel, table=True):
     # Bounded de-dup key (platforms redeliver webhooks); looked up before routing.
     dedupe_key: str | None = Field(default=None, index=True, description="Key used to drop redeliveries")
     error: str | None = Field(default=None, description="Failure detail; never contains secrets")
+    org_id: str | None = Field(default=None, index=True, max_length=36, description="Owning organization; NULL on local/desktop rows")

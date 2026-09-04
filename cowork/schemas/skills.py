@@ -1,8 +1,9 @@
 from datetime import datetime
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 from cowork.schemas.base import CamelRequest, CamelResponse
+from cowork.schemas.shared_resources import ResourceAttribution, SkillCapabilities
 
 
 class SkillCreateRequest(CamelRequest):
@@ -29,9 +30,18 @@ class SkillResponse(CamelResponse):
     # get "name" (is the human-readable display name) from skill.display_name
     name: str = Field(validation_alias=AliasChoices("display_name", "name"))
     description: str | None
-    instructions: str = Field(serialization_alias="declarative")
+    instructions: str = Field(
+        validation_alias=AliasChoices("instructions", "declarative"),
+        serialization_alias="declarative",
+    )
     created_at: datetime | None
     updated_at: datetime | None
     enabled: bool
     projects: list[str]
+    attribution: ResourceAttribution
+    is_builtin: bool
+    capabilities: SkillCapabilities
 
+
+class SkillListResponse(BaseModel):
+    skills: list[SkillResponse]

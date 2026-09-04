@@ -21,9 +21,10 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 from pathlib import Path
 
-from cowork.common.paths import safe_join_lexical
+from cowork.common.paths import dir_rmdir, dir_unlink, pinned_dir, safe_join_lexical
 from cowork.common.settings import get_app_settings
 from cowork.models.skill import Skill
 
@@ -87,13 +88,23 @@ def _unlink_dir_link(link: Path) -> None:
     On Windows a directory reparse point (symlink-to-dir or junction) is
     removed with ``rmdir``, not ``unlink``.
     """
-    if _IS_WINDOWS:
-        try:
-            os.rmdir(link)
-            return
-        except OSError:
-            pass
-    link.unlink()
+    name = link.name
+    safe_name = os.path.basename(name)
+    if (
+        safe_name != name
+        or safe_name in {"", ".", ".."}
+        or "\\" in safe_name
+        or "\0" in safe_name
+    ):
+        raise ValueError("Skill link must be a direct-child name")
+    with pinned_dir(link.parent, nofollow_base=True) as parent:
+        if _IS_WINDOWS:
+            try:
+                dir_rmdir(parent, safe_name)
+                return
+            except OSError:
+                pass
+        dir_unlink(parent, safe_name)
 
 
 def _ensure_symlink(link: Path, target: Path) -> None:
@@ -143,15 +154,45 @@ def remove_skill_links(slug: str) -> None:
 
 def reconcile_project(project_dir: Path, skills: list[Skill]) -> None:
     """Link all applicable skills into a single newly-created project."""
+    requested_name = project_dir.name
+    safe_project_name = os.path.basename(requested_name)
+    if (
+        safe_project_name != requested_name
+        or safe_project_name in {"", ".", ".."}
+        or "\\" in safe_project_name
+        or "\0" in safe_project_name
+    ):
+        raise ValueError("Project link target must be a direct-child name")
+    selected_project = next(
+        (
+            candidate
+            for candidate in _project_dirs()
+            if secrets.compare_digest(candidate.name, safe_project_name)
+        ),
+        None,
+    )
+    if selected_project is None:
+        return
     canon_root = _canon_root()
     for skill in skills:
         if not skill.enabled:
             continue
-        if skill.projects and project_dir.name not in skill.projects:
+        if skill.projects and selected_project.name not in skill.projects:
             continue
-        canon = safe_join_lexical(canon_root, skill.name)
+        safe_skill_name = os.path.basename(skill.name)
+        if (
+            safe_skill_name != skill.name
+            or safe_skill_name in {"", ".", ".."}
+            or "\\" in safe_skill_name
+            or "\0" in safe_skill_name
+        ):
+            raise ValueError("Skill link target must be a direct-child name")
+        canon = safe_join_lexical(canon_root, safe_skill_name)
         if canon.exists():
-            _ensure_symlink(safe_join_lexical(project_dir / "skills", skill.name), canon)
+            _ensure_symlink(
+                safe_join_lexical(selected_project / "skills", safe_skill_name),
+                canon,
+            )
 
 
 def reconcile_all(skills: list[Skill]) -> None:
