@@ -83,7 +83,7 @@ def _external_project_dirs() -> dict[str, Path]:
                 if service.directory_is_external(project)
             }
     except Exception:
-        logger.debug("Could not read adopted project folders", exc_info=True)
+        logger.warning("Could not read adopted project folders", exc_info=True)
         return {}
 
 
