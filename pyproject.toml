@@ -23,9 +23,6 @@ dependencies = [
     "cryptography>=48.0.0,<49",
     "fastapi>=0.136.1",
     "httpx>=0.27",
-    # Structured app-server integration with a pinned, bundled Codex runtime;
-    # users do not need to install a separate CLI.
-    "openai-codex==0.147.0",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.14.1",
     "python-dotenv>=1.2.2",
@@ -62,6 +59,15 @@ cowork-dev-setup = "cowork.cli:dev_setup_main"
 cowork-code-runtime = "cowork.coding.runtime_worker:main"
 
 [project.optional-dependencies]
+# Code Mode's engine: the pinned Codex app-server runtime and its native
+# binary (over 100 MB per platform). Not a core dependency, so a first install
+# stays small and never fetches the binary; the desktop adds `cowork-server[code]`
+# when Code Mode is switched on. Without it the Codex engine reports itself
+# unavailable and everything else runs as before. Remote runtimes
+# (`cowork-code-runtime`) need this extra too.
+code = [
+    "openai-codex==0.147.0",
+]
 # Optional: hermes-agent pins openai==2.24.0, anton needs openai>=3 (see override below).
 hermes = ["hermes-agent>=0.15.2,<0.18"]
 channels = [
@@ -87,6 +93,10 @@ packages = ["cowork"]
 # it project-wide so the resolver isn't held back by that inner pin.
 # hermes-agent also pins openai==2.24.0; anton needs openai>=3 and hermes runs on it.
 override-dependencies = ["pillow>=12.3.0", "openai>=3.0"]
+# Source checkouts keep the Codex runtime: `uv run` / `uv sync` install the
+# default groups but never an extra, so the `code` group below mirrors the
+# `code` extra for developers and the desktop's dev mode.
+default-groups = ["dev", "code"]
 
 [tool.uv.sources]
 # cowork-server imports the artifact-identity derivation
@@ -108,6 +118,10 @@ anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
 hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "44ddc552f5e054759a6970af8997ea588a9d81c9" }
 
 [dependency-groups]
+# Same pin as the `code` extra; keep the two in step.
+code = [
+    "openai-codex==0.147.0",
+]
 dev = [
     "alembic>=1.18.4",
     "fakeredis>=2.37.0",

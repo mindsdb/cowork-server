@@ -16,6 +16,8 @@ cowork-server
 
 The Hermes harness is an optional extra: `uv tool install 'cowork-server[hermes]'`. It cannot be installed alongside anton-agent 2.26.9.3.1rc2 or later because hermes-agent pins openai 2.x and anton needs openai 3.x.
 
+Code Mode's engine (the Codex runtime and its native binary, over 100 MB) is the `code` extra: `uv tool install 'cowork-server[code]'`. The desktop app adds it the first time Code Mode is switched on; without it the Codex engine reports itself unavailable and everything else runs as before. Source checkouts get it through the default `code` dependency group, so `uv run` needs no extra.
+
 The server starts on `http://127.0.0.1:26866`. Confirm with:
 
 ```sh
@@ -29,6 +31,8 @@ curl http://127.0.0.1:26866/api/v1/health/
 uv run cowork-server
 # With the Hermes harness
 uv run --extra hermes cowork-server
+# Without Code Mode's engine (what a plain `pip install cowork-server` gets)
+uv run --no-group code cowork-server
 ```
 
 When running alongside the Electron app in dev mode, the app spawns the server automatically — no manual start needed. The Electron app looks for a sibling `cowork-server/` directory by convention (override with `COWORK_SERVER_DIR`).
