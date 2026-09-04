@@ -9,7 +9,7 @@ The identity comes from auth, which provisions throwaway test users for CI.
 Permanent dev/staging POST to its internal endpoint with the provisioning
 secret; PR envs POST to /dev/mint-test-user/, which is mounted only where
 `ephemeral` is on and needs no secret. Prod uses a dedicated standing identity
-until ENG-1420 makes the fixed test-user provisioner safe there. Every source
+while its fixture password remains committed. Every source
 provides the user_id and organization_id these tests send as headers.
 
 The provisioning call uses auth's Service so it works both before and after

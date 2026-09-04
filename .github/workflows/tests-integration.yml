@@ -52,12 +52,13 @@ jobs:
       # identity comes from auth's internal provisioning endpoint with the
       # dedicated secret. It provisions the fixed `cowork` suite. Prod uses a
       # separately managed standing identity: mutating the shared emailsink
-      # account there is disabled until ENG-1420. Hostnames come from a committed
+      # account there is disabled while its fixture password remains committed.
+      # Hostnames come from a committed
       # env file rather than GitHub Environment variables, so a change is a
       # reviewable diff (same as mindshub_inference).
       #
       # That provisioning call goes to auth's Service over cluster DNS, not to
-      # the public host. After ENG-1577 cuts an environment over, Cloudflare
+      # the public host. After the internal-edge cutover, Cloudflare
       # Access rejects that public POST before it reaches Django. The caller
       # passes a runner in the deployment's cluster, so the Service's fully
       # qualified name needs no Cloudflare credential and no extra Kubernetes
