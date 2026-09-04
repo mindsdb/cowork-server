@@ -48,14 +48,47 @@ Tests use an isolated in-memory database and temporary directories — no side e
 Post-deploy integration runs use the target cluster's self-hosted runner. Dev
 and staging obtain the fixed `cowork` test suite through auth's cluster-only
 service URL. Production must not mutate that shared `@emailsink.dev` identity
-until ENG-1420 is fixed. Its `prod` GitHub Environment instead supplies a
-dedicated `COWORK_TEST_API_KEY` secret and a reviewed
-`COWORK_TEST_USER_EMAIL` variable on the non-staff `@mindshub.ai` domain; the
+while the fixed password remains committed. The production test path therefore
+accepts a dedicated `COWORK_TEST_API_KEY` secret and a reviewed
+`COWORK_TEST_USER_EMAIL` variable on the non-staff `@mindshub.ai` domain. The
 suite resolves and matches that principal through production auth, and refuses
-an employee-classified or Hub-admin identity, before testing.
-Keep those values at Environment scope so non-prod reusable-workflow calls
-cannot receive them. A missing or mismatched identity fails the required prod
-run rather than falling back to provisioning or reporting skipped tests.
+an employee-classified or Hub-admin identity before testing. A missing or
+mismatched identity fails the required prod run instead of falling back to
+provisioning or reporting skipped tests.
+
+Do not store or use `COWORK_TEST_API_KEY` yet, or configure its paired email for
+a production run. The live `prod` GitHub Environment has no protection rules or
+deployment-branch policy. Although `publish.yml` refuses to enter its production
+build/deploy job from a non-main ref, a manually selected branch runs that
+branch's workflow text and can remove the check. Workflow code is therefore
+defense in depth, not the authority that protects an Environment secret.
+
+Before `COWORK_TEST_API_KEY` is stored or used, the `prod` Environment must have
+both a nonempty required-reviewer rule and a selected-branches deployment policy
+whose only entry is the `main` branch (no tags or wildcard branches). Verify the
+live settings without reading any secret value:
+
+```sh
+gh api repos/mindsdb/cowork-server/environments/prod \
+  --jq '
+    [.protection_rules[]?
+      | select(.type == "required_reviewers")
+      | .reviewers[]?
+      | {type, name: (.reviewer.login // .reviewer.slug)}] as $reviewers
+    | {reviewers: $reviewers, deployment_branch_policy}
+  '
+gh api 'repos/mindsdb/cowork-server/environments/prod/deployment-branch-policies?per_page=100' \
+  --jq '[.branch_policies[] | {name, type}]'
+```
+
+The first command must show at least one named reviewer, plus
+`protected_branches: false` and `custom_branch_policies: true` under
+`deployment_branch_policy`. The second must print exactly
+`[{"name":"main","type":"branch"}]`. Only after both checks pass may an
+operator store `COWORK_TEST_API_KEY` and `COWORK_TEST_USER_EMAIL` on that
+Environment and approve their use by a main-branch production run. Keeping the
+values at Environment scope prevents non-prod jobs from receiving them, but that
+scope is safe only when these Environment controls are active.
 
 ### Logging
 
