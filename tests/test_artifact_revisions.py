@@ -25,6 +25,7 @@ from cowork.services.artifact_revisions import (
     current_workspace,
     finalize_agent_repair,
     list_revisions,
+    release_repairs_for_comment,
     revision_with_content,
     save_source,
 )
@@ -712,6 +713,64 @@ def test_ready_repair_can_be_discarded_and_frees_the_path(artifact):
         conversation_id="conversation-2",
     )
     assert replacement["repair"]["status"] == "queued"
+
+
+def test_resolving_a_comment_releases_its_ready_repair(artifact):
+    """Resolving the comment is the obvious thing to do once the change has
+    been eyeballed, and it used to strand the repair in ready forever."""
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
+    requested = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=initial["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "Please change this"}],
+        conversation_id="conversation-1",
+    )
+    (folder / "brief.md").write_text("# Agent title\n", encoding="utf-8")
+    capture_agent_revision(folder, conversation_id="conversation-1")
+    assert agent_repair_detail(folder, requested["repair"]["id"])["repair"]["status"] == "ready"
+
+    released = release_repairs_for_comment(folder, "thread-1")
+
+    assert [r["status"] for r in released] == ["discarded"]
+    replacement = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=current_source(folder, metadata, artifact_id)["revision"]["id"],
+        comment_thread_id="thread-2",
+        selector=None,
+        thread=[{"text": "A second review"}],
+        conversation_id="conversation-2",
+    )
+    assert replacement["repair"]["status"] == "queued"
+
+
+def test_releasing_leaves_other_threads_and_decided_repairs_alone(artifact):
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
+    requested = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=initial["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "Please change this"}],
+        conversation_id="conversation-1",
+    )
+
+    assert release_repairs_for_comment(folder, "thread-other") == []
+    assert agent_repair_detail(folder, requested["repair"]["id"])["repair"]["status"] == "queued"
+
+    # A queued repair's turn is moot once its comment is closed.
+    assert [r["status"] for r in release_repairs_for_comment(folder, "thread-1")] == ["cancelled"]
+    # Already terminal: releasing again changes nothing.
+    assert release_repairs_for_comment(folder, "thread-1") == []
 
 
 def test_blocked_repair_names_the_comment_it_is_waiting_on(artifact):

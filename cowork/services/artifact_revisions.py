@@ -835,6 +835,31 @@ def cancel_agent_repair(folder: Path, repair_id: str, *, discard_ready: bool = F
         return repair
 
 
+def release_repairs_for_comment(folder: Path, comment_thread_id: str) -> list[dict]:
+    """Release any repair still waiting on a comment thread that was resolved.
+
+    Resolving the comment is the explicit decision the accept-or-reject rule
+    was protecting: the owner has read the feedback and closed it. A queued
+    repair's turn is moot from here and a ready one's suggestion is the
+    owner's to keep or drop, so neither should keep gating the path.
+    """
+    released: list[dict] = []
+    with artifact_lock(folder):
+        for repair in _repair_records(folder):
+            if repair.get("commentThreadId") != comment_thread_id:
+                continue
+            if repair.get("status") == "queued":
+                repair["status"] = "cancelled"
+            elif repair.get("status") == "ready":
+                repair["status"] = "discarded"
+            else:
+                continue
+            repair["updatedAt"] = _now()
+            _write_repair(folder, repair)
+            released.append(repair)
+    return released
+
+
 def finalize_agent_repair(
     folder: Path,
     metadata: dict,

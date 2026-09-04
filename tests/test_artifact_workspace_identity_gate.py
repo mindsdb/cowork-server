@@ -213,3 +213,75 @@ def test_discard_intent_reaches_the_handler_over_http(client, cancel_route, body
 
     assert res.status_code == 200, res.text
     assert cancel_route == [expected]
+
+
+# ── the comment-release route resolves as a literal, and is owner-scoped ─────
+# It sits next to /agent-repairs/{repair_id}/..., so "release" must not be read
+# as a repair id; and it is on this router precisely because the comments
+# router forwards to inference in org mode with no tenant scope, so the owner
+# gate has to be exercised here.
+
+
+@pytest.fixture
+def release_route(tmp_path, monkeypatch):
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+    from cowork.services.artifacts import ProjectArtifacts
+
+    project = tmp_path / "project"
+    base = project / ".anton" / "artifacts"
+    folder = base / "brief"
+    folder.mkdir(parents=True)
+    source = ProjectArtifacts(
+        base=base, project_id=None, project_name="project",
+        trusted_anchor=project, root_parts=(".anton", "artifacts"),
+    )
+    monkeypatch.setattr(
+        workspace_ep, "review_artifact_for_request",
+        lambda *_args: (source, folder, {"type": "document"}, True),
+    )
+    monkeypatch.setattr(workspace_ep, "require_artifact_owner", lambda *_args: {"role": "owner"})
+    seen: list[str] = []
+    monkeypatch.setattr(
+        workspace_ep, "release_repairs_for_comment",
+        lambda _folder, thread_id: seen.append(thread_id) or [{"id": "r1", "status": "discarded"}],
+    )
+    return seen
+
+
+_RELEASE_URL = (
+    "/api/v1/artifacts/workspace/local/0123456789abcdef0123456789abcdef"
+    "/agent-repairs/release"
+)
+
+
+def test_release_route_is_not_read_as_a_repair_id(client, release_route):
+    res = client.post(_RELEASE_URL, json={"commentThreadId": "thread-1"})
+
+    assert res.status_code == 200, res.text
+    assert res.json() == {"released": [{"id": "r1", "status": "discarded"}]}
+    assert release_route == ["thread-1"]
+
+
+def test_release_requires_a_comment_thread(client, release_route):
+    res = client.post(_RELEASE_URL, json={"commentThreadId": ""})
+
+    assert res.status_code == 422, res.text
+    assert release_route == []
+
+
+def test_release_is_refused_without_owner_access(client, tmp_path, monkeypatch):
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+    from fastapi import HTTPException as _HTTPException
+
+    def deny(*_args):
+        raise _HTTPException(status_code=403, detail="Not the owner")
+
+    monkeypatch.setattr(workspace_ep, "review_artifact_for_request", deny)
+    monkeypatch.setattr(
+        workspace_ep, "release_repairs_for_comment",
+        lambda *_a, **_k: pytest.fail("release ran without an owner check"),
+    )
+
+    res = client.post(_RELEASE_URL, json={"commentThreadId": "thread-1"})
+
+    assert res.status_code == 403, res.text

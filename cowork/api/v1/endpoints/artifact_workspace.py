@@ -43,6 +43,7 @@ from cowork.services.artifact_revisions import (
     current_workspace,
     finalize_agent_repair,
     list_revisions,
+    release_repairs_for_comment,
     revision_with_content,
     save_source,
 )
@@ -316,6 +317,10 @@ class _RepairDecisionBody(BaseModel):
 class _RepairCancelBody(BaseModel):
     # An older client posts `{}`, which must keep the queued-only behaviour.
     discardReady: bool = False
+
+
+class _RepairReleaseBody(BaseModel):
+    commentThreadId: str = Field(min_length=1, max_length=100)
 
 
 def _owner_workspace(session, project_ref: str, artifact_id: str):
@@ -720,6 +725,33 @@ async def get_agent_repair(
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except RevisionValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.post("/workspace/{project_ref}/{artifact_id}/agent-repairs/release")
+async def release_agent_repairs_for_comment(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    body: _RepairReleaseBody,
+    session: ScopedSessionDep,
+):
+    """Release the repairs waiting on a comment thread the owner resolved.
+
+    This lives on the workspace router rather than the comments one because
+    the comments route forwards to inference in org mode and carries no tenant
+    scope, so only here can one call serve both desktop and cloud.
+    """
+    _source, folder, _metadata, _capabilities = _owner_workspace(
+        session, project_ref, artifact_id
+    )
+    try:
+        released = await run_in_threadpool(
+            release_repairs_for_comment, folder, body.commentThreadId
+        )
+        return {"released": released}
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except (RevisionValidationError, TimeoutError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
