@@ -1097,6 +1097,38 @@ def repair_behind_a_moved_head(artifact):
     return folder, metadata, artifact_id, ready, head
 
 
+def test_detail_reports_supersession_so_the_viewer_need_not_infer_it(artifact):
+    """A caller that infers supersession from its own copy of head cannot tell
+    a repair the artifact moved past from one whose revision is simply newer
+    than the copy it holds. Both routes answer the same computed flag."""
+    folder, metadata, artifact_id = artifact
+    requested = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=current_source(folder, metadata, artifact_id)["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "Please change this"}],
+        conversation_id="conversation-1",
+    )
+    (folder / "brief.md").write_text("# Agent title\n", encoding="utf-8")
+    capture_agent_revision(folder, conversation_id="conversation-1")
+
+    # The agent's revision IS head here, so nothing has superseded it.
+    assert agent_repair_detail(folder, requested["repair"]["id"])["repair"]["superseded"] is False
+
+    save_source(
+        folder,
+        metadata,
+        artifact_id,
+        content="# Owner title\n",
+        expected_revision_id=current_source(folder, metadata, artifact_id)["revision"]["id"],
+    )
+
+    assert agent_repair_detail(folder, requested["repair"]["id"])["repair"]["superseded"] is True
+
+
 def test_active_repair_reports_whether_the_artifact_moved_past_it(repair_behind_a_moved_head):
     """The viewer decides whether to open the comparison from this flag, so it
     has to distinguish a pending decision from one the artifact overtook."""

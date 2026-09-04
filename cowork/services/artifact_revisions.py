@@ -807,6 +807,12 @@ def agent_repair_detail(folder: Path, repair_id: str) -> dict:
     with artifact_lock(folder):
         _recover_pending_source_write(folder)
         repair = _read_repair(folder, repair_id)
+        # Same flag active_agent_repair attaches. Without it here, opening the
+        # comparison replaced the record with one that had lost it, and a
+        # caller left to infer supersession from its own copy of head cannot:
+        # a repair whose revision is NEWER than that copy looks identical to
+        # one the artifact has moved past.
+        repair = {**repair, "superseded": _is_superseded(_read_manifest(folder), repair)}
         result = {"repair": repair}
         if repair.get("status") == "ready" and repair.get("revisionId"):
             before = _revision_with_content_locked(folder, repair["baseRevisionId"])
