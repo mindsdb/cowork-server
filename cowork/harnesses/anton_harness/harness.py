@@ -702,6 +702,44 @@ class AntonHarness:
         return initial_history, seed_info
 
     @staticmethod
+    def _recall_history_tool(conversation: Conversation, user):
+        """The archive-search tool for this turn, or None when there is nothing
+        to search (ENG-735).
+
+        Withheld in three cases:
+        - no summary saved yet — the whole history is still replayed, so the
+          tool's description and prompt would be dead prompt weight
+        - compaction switched off — nothing will ever be archived
+        - the conversation is detached from its DB session, so the archive
+          cannot be read at all
+
+        The DB stays on this side of the boundary: the tool receives a callable
+        that returns the archive, so its handler holds no session and the
+        hosted path can hand it the same data read off the shared mount.
+        """
+        if not user.history_compaction_enabled:
+            return None
+        if not conversation.history_summary_cutoff_id:
+            return None
+
+        from sqlalchemy.orm import object_session
+
+        from cowork.db.scoped import adopt_scoped_session
+        from cowork.services.conversations import ConversationService
+
+        from .tools import build_cowork_recall_history_tool
+
+        db_session = object_session(conversation)
+        if db_session is None:
+            return None
+        # Read per call, not here: most turns never call the tool, and the
+        # archive only changes when a compaction lands at turn end.
+        service = ConversationService(adopt_scoped_session(db_session))
+        return build_cowork_recall_history_tool(
+            lambda: service.archived_messages(conversation.id)
+        )
+
+    @staticmethod
     def _persist_history_compaction(conversation: Conversation, session, seed_info: dict) -> None:
         """Save anton's compacted summary + cutoff if it compacted this turn.
 
@@ -823,6 +861,8 @@ class AntonHarness:
 
         user = get_user_settings()
         _overlay_user_settings(anton_settings, user)
+
+        RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
 
         # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
         for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
@@ -1132,6 +1172,7 @@ class AntonHarness:
                 CREATE_SKILL_DRAFT_TOOL,
                 # FETCH_SUBMISSION_TOOL,
                 # UPDATE_FORM_TOOL,
+                *([RECALL_HISTORY_TOOL] if RECALL_HISTORY_TOOL else []),
             ],
             cells=cells
         )
