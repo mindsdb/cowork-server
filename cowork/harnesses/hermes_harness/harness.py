@@ -10,6 +10,7 @@ from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock
 from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
 from cowork.harnesses.hermes_harness.stream_formatter import format_hermes_stream
 from cowork.models.conversation import Conversation
+from cowork.services.projects import display_label
 from cowork.models.skill import Skill
 
 # Redirect all Hermes data (skills, sessions, config) to ~/.cowork/hermes before
@@ -233,7 +234,7 @@ class HermesHarness:
                     str(conversation.id),
                     prompt,
                     history,
-                    project_name=conversation.project.name,
+                    project_name=display_label(conversation.project),
                     project_path=project_path,
                     conversation_topic=conversation_topic,
                     stream_callback=stream_callback,
