@@ -6,6 +6,8 @@ import os
 import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from cowork.common.paths import (
@@ -28,6 +30,21 @@ PROJECT_SLOTS = (MemorySlot.RULES, MemorySlot.LESSONS)
 # this closed set (and rejects any separator) so the value reaching os.open /
 # os.unlink is provably one of a handful of constants, never attacker-shaped.
 _KNOWN_SLOT_FILENAMES = frozenset(spec.filename for spec in SLOT_REGISTRY.values())
+
+
+@dataclass(frozen=True)
+class SlotRead:
+    """One slot as a caller found it on disk.
+
+    ``exists`` says the slot name is taken, ``readable`` that its bytes decoded.
+    A slot that exists but cannot be read — a symlink squatting the name,
+    non-UTF-8 bytes, a permission error — is neither missing nor empty, and
+    authorization has to tell those three apart.
+    """
+
+    exists: bool
+    readable: bool
+    content: str
 
 
 class MemoryStore:
@@ -100,6 +117,72 @@ class MemoryStore:
             # ELOOP): no readable slot content.
             return ""
 
+    def read_checked(self, slot_id: MemorySlot | str) -> tuple[bool, str]:
+        """Return verified existence and content, propagating unsafe/read errors.
+
+        Authorization must distinguish a missing slot from a legacy slot that
+        exists but cannot currently be read. Treating both as empty would let a
+        member claim and overwrite an unreadable shared resource.
+        """
+        name = self._filename(slot_id)
+        try:
+            with self._root_fd(create=False) as root:
+                sfd = dir_open(root, name, os.O_RDONLY | O_NOFOLLOW)
+                # Keep valid legacy newline bytes intact for an exact
+                # compensation snapshot. ``newline=None`` would translate
+                # CRLF to LF before ``restore_exact`` can put it back.
+                with open(sfd, encoding="utf-8", newline="") as f:
+                    return True, f.read()
+        except FileNotFoundError:
+            return False, ""
+
+    def read_state(self, slot_id: MemorySlot | str) -> SlotRead:
+        """Classify a slot instead of failing when it cannot be read.
+
+        ``read_checked`` propagates a read failure so a write can fail closed on
+        a slot whose authorship it cannot establish. Deletes, existence checks
+        and responses need that same fact without an unhandled error, so they
+        ask here: an unreadable slot comes back present with no content, never
+        as a missing one.
+        """
+        try:
+            exists, content = self.read_checked(slot_id)
+        except (OSError, UnicodeError):
+            return SlotRead(
+                exists=self._name_is_taken(slot_id),
+                readable=False,
+                content="",
+            )
+        return SlotRead(exists=exists, readable=True, content=content)
+
+    def modified_at(self, slot_id: MemorySlot | str) -> datetime | None:
+        """UTC mtime of the slot file, or None when there is no regular one.
+
+        Stats through the same pinned, no-follow handle as the content helpers,
+        so a symlink squatting the slot name reports nothing rather than the
+        mtime of whatever it points at.
+        """
+        try:
+            st = self._lstat_slot(slot_id)
+        except OSError:
+            return None
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        return datetime.fromtimestamp(st.st_mtime, tz=timezone.utc)
+
+    def _name_is_taken(self, slot_id: MemorySlot | str) -> bool:
+        """Whether anything at all holds the slot name, symlinks included."""
+        try:
+            self._lstat_slot(slot_id)
+        except OSError:
+            return False
+        return True
+
+    def _lstat_slot(self, slot_id: MemorySlot | str) -> os.stat_result:
+        name = self._filename(slot_id)
+        with self._root_fd(create=False) as root:
+            return dir_lstat(root, name)
+
     def write(self, slot_id: MemorySlot | str, content: str) -> None:
         name = self._filename(slot_id)
         with self._root_fd(create=True) as root:
@@ -114,6 +197,35 @@ class MemoryStore:
             )
             with open(sfd, "w", encoding="utf-8") as f:
                 f.write(content.rstrip() + "\n")
+
+    def restore_exact(
+        self,
+        slot_id: MemorySlot | str,
+        content: str | bytes,
+        *,
+        existed: bool,
+    ) -> None:
+        """Restore a pre-mutation snapshot without normalizing its bytes.
+
+        This is intentionally separate from ``write`` and only for failure
+        compensation: normal writes retain Anton's canonical trailing-newline
+        behavior, while rollback must reproduce the exact prior UTF-8 file.
+        The same pinned, no-follow open protects every path component.
+        """
+        if not existed:
+            self.delete(slot_id)
+            return
+        name = self._filename(slot_id)
+        payload = content.encode("utf-8") if isinstance(content, str) else content
+        with self._root_fd(create=True) as root:
+            sfd = dir_open(
+                root,
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | O_NOFOLLOW,
+                0o600,
+            )
+            with open(sfd, "wb") as f:
+                f.write(payload)
 
     def delete(self, slot_id: MemorySlot | str) -> None:
         name = self._filename(slot_id)

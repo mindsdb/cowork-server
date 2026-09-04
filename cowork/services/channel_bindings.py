@@ -37,7 +37,8 @@ class ChannelBindingService:
         stmt = self.session.select(ChannelBinding)
         if channel_type:
             stmt = stmt.where(ChannelBinding.channel_type == channel_type)
-        return [self._dto(row) for row in self.session.exec(stmt).all()]
+        rows = self.session.exec(stmt).all()
+        return [self._dto(row) for row in rows if self._binding_readable(row)]
 
     def create(self, req: BindingCreateRequest) -> BindingResponse:
         self._validate_channel(req.channel_type)
@@ -74,7 +75,7 @@ class ChannelBindingService:
 
     def update(self, binding_id: UUID, req: BindingUpdateRequest) -> BindingResponse:
         binding = self.session.get(ChannelBinding, binding_id)
-        if binding is None:
+        if binding is None or not self._binding_readable(binding):
             raise BindingNotFoundError(str(binding_id))
 
         provided = req.model_fields_set
@@ -186,7 +187,7 @@ class ChannelBindingService:
 
     def delete(self, binding_id: UUID) -> bool:
         binding = self.session.get(ChannelBinding, binding_id)
-        if binding is None:
+        if binding is None or not self._binding_readable(binding):
             return False
 
         self._drop_sessions(binding_id)
@@ -228,8 +229,26 @@ class ChannelBindingService:
         # Scoped get: another org's project/conversation reads as nonexistent.
         if project_id is not None and self.session.get(Project, project_id) is None:
             raise ValueError(f"project not found: {project_id}")
-        if conversation_id is not None and self.session.get(Conversation, conversation_id) is None:
-            raise ValueError(f"conversation not found: {conversation_id}")
+        if conversation_id is not None:
+            conversation = self.session.get(Conversation, conversation_id)
+            if conversation is None or not self._conversation_readable(conversation):
+                raise ValueError(f"conversation not found: {conversation_id}")
+
+    def _conversation_readable(self, conversation: Conversation) -> bool:
+        # Same-org membership isn't enough for a private conversation: only its
+        # own creator may bind a channel to it or see that binding.
+        scope = self.session.scope
+        if not scope.org_mode or conversation.created_by is None:
+            return True
+        return conversation.created_by == scope.user_id
+
+    def _binding_readable(self, binding: ChannelBinding) -> bool:
+        # A binding pinned to a conversation is only as visible as that
+        # conversation; one that isn't pinned to anything is org-wide.
+        if binding.anton_conversation_id is None:
+            return True
+        conversation = self.session.get(Conversation, binding.anton_conversation_id)
+        return conversation is None or self._conversation_readable(conversation)
 
     @staticmethod
     def _dto(binding: ChannelBinding) -> BindingResponse:
