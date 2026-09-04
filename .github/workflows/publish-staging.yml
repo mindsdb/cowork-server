@@ -129,7 +129,9 @@ jobs:
         run: |
           set -euo pipefail
           uv venv .smoke-venv
-          uv pip install --python .smoke-venv "$(ls dist/*.whl)"
+          # Same overrides as pyproject [tool.uv]; they are not part of the wheel.
+          printf 'openai>=3.0\npillow>=12.3.0\n' > .smoke-overrides.txt
+          uv pip install --python .smoke-venv --override .smoke-overrides.txt "$(ls dist/*.whl)[hermes]"
           VENV_PY="$(pwd)/.smoke-venv/bin/python"
           # Run from outside the checkout: the repo root has its own cowork/
           # source directory, and `python -c` puts cwd first on sys.path, so
