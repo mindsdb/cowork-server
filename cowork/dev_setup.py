@@ -98,6 +98,16 @@ def run_dev_setup() -> None:
     # org-first under the shared root and created on demand.
     import cowork.harnesses  # noqa: F401 — registers memory adapters
 
+    # After the import above so the dependency on a populated registry is
+    # visible; importing cowork.migrations happens to populate it too, which is
+    # not worth relying on. Ungated: it repairs the deployment-global row, which
+    # is the only shape that can hold an unbuildable value (every write path
+    # validates, and org rows postdate the flag that would reject one).
+    from cowork.migrations import reset_unbuildable_harness
+
+    with SQLSession(engine) as session:
+        reset_unbuildable_harness(session)
+
     if settings.tenancy_mode != "org":
         from cowork.harnesses.memory.migration import migrate_harness_memory_to_shared
         from cowork.harnesses.memory.runtime import ensure_all_layouts

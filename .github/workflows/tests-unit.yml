@@ -31,9 +31,16 @@ jobs:
       # top level, so an import that resolves only through it would pass the
       # suite and fail on the wheel. Import the app from the shipped set first.
       - name: Check the shipped dependency set imports
+        # The real install, as opposed to the simulated one in
+        # tests/test_hermes_harness_gate.py. registered_harness_ids, not
+        # available_harness_ids: this is about what got registered, and the
+        # offered list would also drop hermes in org mode with the gate gone.
+        # anton is the positive control, so an empty registry cannot pass.
         run: |
           uv sync --group dev
           uv run --no-sync python -c "import cowork.server"
+          uv run --no-sync python -c "from cowork.harnesses.base import registered_harness_ids as r; ids = r(); assert 'anton' in ids and 'hermes' not in ids, ids; print('shipped set registers:', ids)"
+          uv run --no-sync python -c "from cowork.harnesses.memory.adapter import get_memory_adapter as g; assert g('hermes') is not None; print('hermes memory adapter still registered')"
 
       - name: Install dependencies
         # --extra hermes: hermes-agent is optional for installs but its

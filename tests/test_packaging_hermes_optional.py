@@ -71,3 +71,4 @@ def test_the_unit_job_installs_the_hermes_extra() -> None:
     removing the flag fails loudly instead of matching something adjacent.
     """
     assert "run: uv sync --group dev --extra hermes" in _stripped_lines(_UNIT_WORKFLOW)
+
