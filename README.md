@@ -108,6 +108,94 @@ rerun of an attempt that began before protection does not count. Keeping the
 values at Environment scope prevents non-prod jobs from receiving them, but that
 scope is safe only when these Environment controls are active.
 
+#### Nightly production read-only smoke
+
+The production nightly runs at `43 7 * * *` on `mdb-prod`. It uses the same
+guarded standing identity, but selects only
+`tests/integration/test_production_read_only.py`. That selection is GET-only:
+it reads health, conversations, schedules, files, and pins. It never
+provisions an identity and does not create conversations, schedules, files,
+artifacts, or model turns. The broad integration target excludes the
+`production_read_only` marker, so release and staging callers cannot include
+this production-only selection by accident.
+
+Failures and the next recovery use the shared engineering-channel notifier.
+The nightly is an alert, not a release gate. Review any new endpoint in
+`READ_ONLY_ENDPOINTS` together with
+`tests/test_production_read_only_workflow.py`, which rejects mutating HTTP calls
+and pins the complete request list.
+
+The unattended nightly cannot reference the existing `prod` Environment.
+That Environment must retain its required-reviewer gate for production deploys,
+and GitHub pauses every job that references such an Environment until a reviewer
+approves it. The monitor instead uses a dedicated `prod-read-only` Environment
+with unique `COWORK_PROD_READ_ONLY_API_KEY`,
+`COWORK_PROD_READ_ONLY_USER_EMAIL`, and
+`COWORK_PROD_READ_ONLY_ORG_ID` inputs. Unique names prevent a missing
+Environment value from falling back to a repository or organization credential.
+
+Before promoting this workflow to `main`, an operator must create
+`prod-read-only` with no required-reviewer or wait-timer rule and a custom
+deployment policy whose only entry is the exact `main` branch. The repository's
+`main` protection must continue to require a pull-request approval, resolve
+review conversations, and apply to administrators. These controls let the
+scheduled job start without weakening the separately protected `prod`
+Environment:
+
+```bash
+gh api --method PUT repos/mindsdb/cowork-server/environments/prod-read-only \
+  --input - <<'JSON'
+{
+  "wait_timer": 0,
+  "prevent_self_review": false,
+  "reviewers": [],
+  "deployment_branch_policy": {
+    "protected_branches": false,
+    "custom_branch_policies": true
+  }
+}
+JSON
+gh api --method POST \
+  repos/mindsdb/cowork-server/environments/prod-read-only/deployment-branch-policies \
+  -f name=main -f type=branch
+```
+
+Only after those controls exist may the operator copy the already reviewed
+standing identity into the dedicated names. The commands prompt for the secret
+and variable values and do not print them:
+
+```bash
+gh secret set COWORK_PROD_READ_ONLY_API_KEY \
+  --repo mindsdb/cowork-server --env prod-read-only
+gh variable set COWORK_PROD_READ_ONLY_USER_EMAIL \
+  --repo mindsdb/cowork-server --env prod-read-only
+gh variable set COWORK_PROD_READ_ONLY_ORG_ID \
+  --repo mindsdb/cowork-server --env prod-read-only
+```
+
+Verify policy and names without reading credential values:
+
+```bash
+gh api repos/mindsdb/cowork-server/environments/prod-read-only \
+  --jq '{protection_rules, deployment_branch_policy}'
+gh api \
+  'repos/mindsdb/cowork-server/environments/prod-read-only/deployment-branch-policies?per_page=100' \
+  --jq '[.branch_policies[] | {name, type}]'
+gh api repos/mindsdb/cowork-server/branches/main/protection \
+  --jq '{required_pull_request_reviews, enforce_admins, required_conversation_resolution}'
+gh secret list --repo mindsdb/cowork-server --env prod-read-only \
+  | rg '^COWORK_PROD_READ_ONLY_API_KEY\b'
+gh variable list --repo mindsdb/cowork-server --env prod-read-only \
+  | rg '^COWORK_PROD_READ_ONLY_(USER_EMAIL|ORG_ID)\b'
+```
+
+The Environment response must have no `required_reviewers` or `wait_timer`
+entry and must enable only custom branch policies. The branch-policy response
+must be exactly `[{"name":"main","type":"branch"}]`. The branch-protection
+response must show at least one required approval, administrator enforcement,
+and required conversation resolution. Do not dispatch or enable the schedule
+until every check passes and cowork-server#466 has landed.
+
 ### Logging
 
 Set `LOG_LEVEL` (default `INFO`) to control verbosity. Enable file logging with `ENABLE_FILE_LOGGING=true` (writes to `LOG_DIR`, defaults to `~/.cowork/logs/`).
