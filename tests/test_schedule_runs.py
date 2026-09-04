@@ -894,3 +894,50 @@ def test_same_org_users_cannot_see_each_others_schedules(tmp_path, monkeypatch):
     assert svc("bob").delete_schedule(a.id) is False
     assert svc("alice").get_schedule(a.id).id == a.id
     get_app_settings.cache_clear()
+
+
+def _fk_enforced_session() -> Session:
+    """A SQLite session with `PRAGMA foreign_keys=ON`, so the delete-ordering
+    that Postgres rejects in the cloud fails here too instead of passing under
+    SQLite's default unenforced foreign keys."""
+    from sqlalchemy import event
+    from sqlalchemy.pool import StaticPool
+
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+
+    @event.listens_for(engine, "connect")
+    def _fk_on(dbapi_conn, _record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    SQLModel.metadata.create_all(engine)
+    session = Session(engine)
+    session.add(Project(id=GENERAL_PROJECT_ID, name="general", path="/general"))
+    session.commit()
+    return session
+
+
+def test_delete_schedule_with_runs_under_enforced_foreign_keys():
+    """ENG-2356: deleting a schedule that has run rows returned HTTP 500 on
+    Postgres because the parent DELETE was emitted before its schedule_runs.
+    Deleting must remove the schedule and its runs with foreign keys enforced."""
+    from sqlmodel import select
+
+    from cowork.models.schedule import ScheduleRun
+
+    session = _fk_enforced_session()
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    schedule = _schedule(session)
+    run_service = ScheduleRunService(scoped)
+    for _ in range(3):
+        run_service.create_run(schedule.id, is_manual=False)
+
+    assert ScheduleService(scoped).delete_schedule(schedule.id) is True
+
+    assert session.get(Schedule, schedule.id) is None
+    assert not session.exec(
+        select(ScheduleRun).where(ScheduleRun.schedule_id == schedule.id)
+    ).all()

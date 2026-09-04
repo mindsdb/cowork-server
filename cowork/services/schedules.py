@@ -99,10 +99,11 @@ class ScheduleService:
         schedule = self._owned(schedule_id)
         if schedule is None:
             return False
-        for run in self.session.exec(
-            self.session.select(ScheduleRun).where(ScheduleRun.schedule_id == schedule_id)
-        ).all():
-            self.session.delete(run)
+        # Runs are removed by the Schedule.runs delete-orphan cascade. Deleting
+        # them by hand here left the parent DELETE to be emitted first (no
+        # relationship told the unit of work otherwise), which trips the
+        # schedule_runs foreign key on Postgres — a raw 500 the desktop's
+        # unenforced SQLite FKs hid.
         self.session.delete(schedule)
         self.session.commit()
         return True
