@@ -46,6 +46,69 @@ uv run pytest
 
 Tests use an isolated in-memory database and temporary directories — no side effects on your local `~/.cowork/` data.
 
+Post-deploy integration runs use the target cluster's self-hosted runner. Dev
+and staging obtain the fixed `cowork` test suite through auth's cluster-only
+service URL. Production must not mutate that shared `@emailsink.dev` identity
+while the fixed password remains committed. The production test path therefore
+accepts a dedicated `COWORK_TEST_API_KEY` secret, a reviewed
+`COWORK_TEST_USER_EMAIL` variable on the non-staff `@mindshub.ai` domain, and
+the immutable dedicated organization id in `COWORK_TEST_ORG_ID`. The suite
+resolves and matches that principal and organization through production auth,
+and refuses an employee-classified or Hub-admin identity before testing. A
+missing or mismatched identity fails the required prod run instead of falling
+back to provisioning or reporting skipped tests. Standing-identity mode also
+requires the test target to be exactly `https://cowork.mindshub.ai` before the
+first network call, so a changed environment file or workflow cannot send the
+production key to another origin.
+
+Do not store or use `COWORK_TEST_API_KEY` yet, or configure its paired email and
+organization id for a production run. The live `prod` GitHub Environment has no
+protection rules or deployment-branch policy. Although `publish.yml` refuses to
+enter its production build/deploy job from a non-main ref, a manually selected
+branch runs that branch's workflow text and can remove the check. Workflow code
+is therefore defense in depth, not the authority that protects an Environment
+secret.
+
+Before `COWORK_TEST_API_KEY` is stored or used, or any production evidence run
+starts, the `prod` Environment must have a nonempty required-reviewer rule with
+`prevent_self_review: true`, `can_admins_bypass: false`, and a selected-branches
+deployment policy whose only entry is the `main` branch, created as an exact
+Branch rule (no tag, wildcard, or second branch rule). Verify the live settings
+without reading any secret value:
+
+```sh
+gh api repos/mindsdb/cowork-server/environments/prod \
+  --jq '
+    [.protection_rules[]?
+      | select(.type == "required_reviewers")
+      | {
+          prevent_self_review,
+          reviewers: [.reviewers[]?
+            | {type, name: (.reviewer.login // .reviewer.slug)}]
+        }] as $required_reviewers
+    | {
+        can_admins_bypass,
+        required_reviewers: $required_reviewers,
+        deployment_branch_policy
+      }
+  '
+gh api 'repos/mindsdb/cowork-server/environments/prod/deployment-branch-policies?per_page=100' \
+  --jq '[.branch_policies[] | {name, type}]'
+```
+
+The first command must show exactly one required-reviewer rule with at least one
+named reviewer and `prevent_self_review: true`, plus `can_admins_bypass: false`,
+`protected_branches: false`, and `custom_branch_policies: true`. The second must
+print exactly `[{"name":"main","type":"branch"}]`. Only after both checks pass
+may an operator store `COWORK_TEST_API_KEY`, `COWORK_TEST_USER_EMAIL`, and
+`COWORK_TEST_ORG_ID` on that Environment. Evidence must come from a fresh
+main-branch run started after the
+protection was active, with `run_attempt: 1`; an eligible reviewer other than the
+run's `actor` and `triggering_actor` must approve its `prod` Environment gate. A
+rerun of an attempt that began before protection does not count. Keeping the
+values at Environment scope prevents non-prod jobs from receiving them, but that
+scope is safe only when these Environment controls are active.
+
 ### Logging
 
 Set `LOG_LEVEL` (default `INFO`) to control verbosity. Enable file logging with `ENABLE_FILE_LOGGING=true` (writes to `LOG_DIR`, defaults to `~/.cowork/logs/`).
