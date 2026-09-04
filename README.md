@@ -45,6 +45,18 @@ uv run pytest
 
 Tests use an isolated in-memory database and temporary directories — no side effects on your local `~/.cowork/` data.
 
+Post-deploy integration runs use the target cluster's self-hosted runner. Dev
+and staging obtain the fixed `cowork` test suite through auth's cluster-only
+service URL. Production must not mutate that shared `@emailsink.dev` identity
+until ENG-1420 is fixed. Its `prod` GitHub Environment instead supplies a
+dedicated `COWORK_TEST_API_KEY` secret and a reviewed
+`COWORK_TEST_USER_EMAIL` variable on the non-staff `@mindshub.ai` domain; the
+suite resolves and matches that principal through production auth, and refuses
+an employee-classified or Hub-admin identity, before testing.
+Keep those values at Environment scope so non-prod reusable-workflow calls
+cannot receive them. A missing or mismatched identity fails the required prod
+run rather than falling back to provisioning or reporting skipped tests.
+
 ### Logging
 
 Set `LOG_LEVEL` (default `INFO`) to control verbosity. Enable file logging with `ENABLE_FILE_LOGGING=true` (writes to `LOG_DIR`, defaults to `~/.cowork/logs/`).
