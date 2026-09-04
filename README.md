@@ -588,6 +588,10 @@ Environment variables fall into two namespaces:
 | `ANTON_GLOBAL_MEMORY_ROOT_DIR` | Anton | Global memory files |
 | `HERMES_HOME` / `HERMES_ROOT_DIR` | Hermes | Hermes data root |
 
+The `HERMES_*` variables apply only where the optional `hermes` extra is
+installed. A base install does not pull `hermes-agent`, which pins an `openai`
+major that `anton-agent` no longer accepts.
+
 In Docker/Lightsail deployments, the container also receives `ANTON_MINDS_API_KEY`, `ANTON_OPENAI_API_KEY`, etc. — these are consumed by the Anton agent library directly (not by cowork-server settings), and are injected by the provisioning lambda via cloud-init user-data.
 
 ## Docs

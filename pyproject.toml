@@ -85,9 +85,9 @@ fallback-version = "0.0.0-dev"
 packages = ["cowork"]
 
 [tool.uv]
-# hermes-agent pins Pillow==12.2.0 exactly (still true as of its latest
-# upstream commit), which blocks picking up Pillow security fixes. Override
-# it project-wide so the resolver isn't held back by that inner pin.
+# hermes-agent pins Pillow==12.2.0 exactly, which would block picking up
+# Pillow security fixes wherever the optional `hermes` extra is installed.
+# Override it so the resolver isn't held back by that inner pin.
 override-dependencies = ["pillow>=12.3.0"]
 
 [tool.uv.sources]
