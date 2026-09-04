@@ -12,7 +12,10 @@ from __future__ import annotations
 import json
 import re
 import tempfile
+from importlib.util import find_spec
 from pathlib import Path
+
+import pytest
 
 from cowork.harnesses.hermes_harness.tools import (
     _hermes_create_artifact,
@@ -23,6 +26,12 @@ from cowork.harnesses.hermes_harness.tools import (
 )
 
 TASK_ID = "test-conversation-1"
+
+# hermes-agent is an optional extra, and its top-level `tools` package is what
+# the register_*_tools() helpers write into. Only those two tests need it.
+_needs_hermes = pytest.mark.skipif(
+    find_spec("tools") is None, reason="hermes-agent (optional extra) not installed"
+)
 
 
 def _make_ctx(tmp: Path) -> Path:
@@ -123,6 +132,7 @@ def test_create_rejects_unknown_type():
             finalize_artifact_run_context(TASK_ID)
 
 
+@_needs_hermes
 def test_register_artifact_tools_is_idempotent():
     register_artifact_tools()
     register_artifact_tools()
@@ -138,6 +148,7 @@ def test_register_artifact_tools_is_idempotent():
     assert registry.get_entry("list_artifacts") is not None
 
 
+@_needs_hermes
 def test_registry_dispatch_forwards_task_id_to_handler():
     """run_agent invokes tools via registry.dispatch(name, args, task_id=...);
     pin that the context lookup works through that exact path."""

@@ -143,7 +143,7 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.8.31.3.dev1+g18b043f65"
+version = "2.26.9.2.1"
 source = { git = "https://github.com/mindsdb/anton.git?branch=main#18b043f650f17f65234fe6a172f0be3484481bf9" }
 dependencies = [
     { name = "aiohttp" },
@@ -419,7 +419,6 @@ dependencies = [
     { name = "anton-agent" },
     { name = "cryptography" },
     { name = "fastapi" },
-    { name = "hermes-agent" },
     { name = "htmldocx" },
     { name = "httpx" },
     { name = "markdown" },
@@ -445,6 +444,9 @@ channels = [
     { name = "discord-py" },
     { name = "slack-sdk" },
 ]
+hermes = [
+    { name = "hermes-agent" },
+]
 
 [package.dev-dependencies]
 dev = [
@@ -463,7 +465,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=48.0.0,<49" },
     { name = "discord-py", marker = "extra == 'channels'", specifier = ">=2.3.0" },
     { name = "fastapi", specifier = ">=0.136.1" },
-    { name = "hermes-agent", git = "https://github.com/NousResearch/hermes-agent.git?rev=44ddc552f5e054759a6970af8997ea588a9d81c9" },
+    { name = "hermes-agent", marker = "extra == 'hermes'", git = "https://github.com/NousResearch/hermes-agent.git?rev=44ddc552f5e054759a6970af8997ea588a9d81c9" },
     { name = "htmldocx", specifier = ">=0.0.6" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "markdown", specifier = ">=3.7" },
@@ -483,7 +485,7 @@ requires-dist = [
     { name = "uvicorn", specifier = ">=0.47.0" },
     { name = "xhtml2pdf", specifier = ">=0.2.16" },
 ]
-provides-extras = ["channels"]
+provides-extras = ["channels", "hermes"]
 
 [package.metadata.requires-dev]
 dev = [
