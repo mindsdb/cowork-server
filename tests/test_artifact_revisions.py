@@ -530,6 +530,85 @@ def test_agent_repair_carries_context_and_requires_compare_before_accept(artifac
     )["status"] == "accepted"
 
 
+def test_superseded_ready_repair_stops_blocking_but_stays_decidable(artifact):
+    """Once the owner edits past the agent's revision the suggestion can no
+    longer gate the artifact, but it still holds real agent work, so it keeps
+    its `ready` status and remains acceptable."""
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
+    requested = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=initial["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "Please change this"}],
+        conversation_id="conversation-1",
+    )
+    (folder / "brief.md").write_text("# Agent title\n", encoding="utf-8")
+    agent_revision = capture_agent_revision(folder, conversation_id="conversation-1")
+    assert agent_repair_detail(folder, requested["repair"]["id"])["repair"]["status"] == "ready"
+
+    save_source(
+        folder,
+        metadata,
+        artifact_id,
+        content="# Owner title\n",
+        expected_revision_id=agent_revision["id"],
+    )
+
+    replacement = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=current_source(folder, metadata, artifact_id)["revision"]["id"],
+        comment_thread_id="thread-2",
+        selector=None,
+        thread=[{"text": "A second review"}],
+        conversation_id="conversation-2",
+    )
+
+    assert replacement["repair"]["status"] == "queued"
+    assert agent_repair_detail(folder, requested["repair"]["id"])["repair"]["status"] == "ready"
+
+
+def test_stale_queued_repair_stops_blocking_and_is_finished(artifact):
+    """A turn killed between minting the handoff and starting the agent used to
+    gate the path forever, because only capture_agent_revision could finish a
+    queued repair."""
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
+    requested = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=initial["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "Please change this"}],
+        conversation_id="conversation-1",
+    )
+    stranded = folder / ".revisions" / "repairs" / f"{requested['repair']['id']}.json"
+    record = json.loads(stranded.read_text(encoding="utf-8"))
+    record["createdAt"] = "2020-01-01T00:00:00+00:00"
+    stranded.write_text(json.dumps(record), encoding="utf-8")
+
+    replacement = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=initial["revision"]["id"],
+        comment_thread_id="thread-2",
+        selector=None,
+        thread=[{"text": "A second review"}],
+        conversation_id="conversation-2",
+    )
+
+    assert replacement["repair"]["status"] == "queued"
+    assert json.loads(stranded.read_text(encoding="utf-8"))["status"] == "no_change"
+
+
 def test_queued_agent_repair_can_be_cancelled_when_turn_does_not_start(artifact):
     folder, metadata, artifact_id = artifact
     initial = current_source(folder, metadata, artifact_id)

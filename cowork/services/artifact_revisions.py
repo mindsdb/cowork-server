@@ -19,6 +19,10 @@ EDITABLE_EXTENSIONS = frozenset({".md", ".txt", ".html", ".htm"})
 MAX_SOURCE_BYTES = 2_000_000
 MAX_REVISIONS = 80
 JOURNAL_DIRNAME = ".revisions"
+# A queued repair whose turn never reported inside this window is presumed
+# dead. Without it a turn killed between minting the handoff and starting the
+# agent gates that source path forever.
+QUEUED_REPAIR_TTL_SECONDS = 3600
 
 
 class RevisionConflict(RuntimeError):
@@ -166,6 +170,62 @@ def _actionable_repairs_for_path(folder: Path, rel_path: str) -> list[dict]:
         if repair.get("status") in {"queued", "ready"}
         and repair.get("path") == rel_path
     ]
+
+
+def _parse_timestamp(value: str | None) -> datetime | None:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _is_superseded(manifest: dict, repair: dict) -> bool:
+    """Whether the agent's revision is no longer head for the repair's path.
+
+    Computed rather than stored, so an artifact wedged by an older build
+    recovers on the first request instead of needing a migration.
+    """
+    revision_id = repair.get("revisionId")
+    if not revision_id:
+        return False
+    latest = next(
+        (
+            entry
+            for entry in reversed(manifest["revisions"])
+            if entry.get("path") == repair.get("path")
+        ),
+        None,
+    )
+    return latest is not None and latest.get("id") != revision_id
+
+
+def _partition_actionable_repairs(
+    folder: Path, manifest: dict, rel_path: str
+) -> tuple[list[dict], list[dict]]:
+    """Split one path's actionable repairs into those that still gate a new
+    repair and those whose turn is presumed dead.
+
+    A superseded repair appears in neither list. It keeps its `ready` status so
+    the owner can still accept or discard the agent's work, but it cannot gate
+    a new turn: the content it was computed against is already history.
+    """
+    now = datetime.now(timezone.utc)
+    blocking: list[dict] = []
+    dead: list[dict] = []
+    for repair in _actionable_repairs_for_path(folder, rel_path):
+        if _is_superseded(manifest, repair):
+            continue
+        created = _parse_timestamp(repair.get("createdAt"))
+        if (
+            repair.get("status") == "queued"
+            and created is not None
+            and (now - created).total_seconds() > QUEUED_REPAIR_TTL_SECONDS
+        ):
+            dead.append(repair)
+            continue
+        blocking.append(repair)
+    return blocking, dead
 
 
 def has_queued_agent_repair(folder: Path, conversation_id: str) -> bool:
@@ -666,10 +726,16 @@ def create_agent_repair(
         current = source["revision"]
         if current.get("id") != expected_revision_id:
             raise RevisionConflict(current)
-        if _actionable_repairs_for_path(folder, source["path"]):
+        manifest = _read_manifest(folder)
+        blocking, dead = _partition_actionable_repairs(folder, manifest, source["path"])
+        if blocking:
             raise RevisionValidationError(
                 "This artifact already has an agent repair awaiting review"
             )
+        for repair in dead:
+            repair["status"] = "no_change"
+            repair["updatedAt"] = _now()
+            _write_repair(folder, repair)
         repair_id = str(uuid.uuid4())
         repair = {
             "id": repair_id,
