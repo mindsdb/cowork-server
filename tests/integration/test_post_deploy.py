@@ -104,7 +104,9 @@ class _Identity(dict[str, str]):
 def _base_url() -> str:
     url = os.environ.get("COWORK_BASE_URL")
     if not url:
-        missing_prerequisite("COWORK_BASE_URL not set; post-deploy tests only run against a deployment")
+        missing_prerequisite(
+            "COWORK_BASE_URL not set; post-deploy tests only run against a deployment"
+        )
     return url.rstrip("/")
 
 
@@ -142,27 +144,39 @@ def _verified_prod_standing_identity() -> _Identity:
     try:
         payload = response.json()
     except ValueError:
-        pytest.fail("auth returned non-JSON for the dedicated prod Cowork test identity")
+        pytest.fail(
+            "auth returned non-JSON for the dedicated prod Cowork test identity"
+        )
     if not isinstance(payload, dict) or payload.get("valid") is not True:
         pytest.fail("auth did not validate the dedicated prod Cowork test identity")
     if str(payload.get("email", "")).lower() != expected_email.lower():
-        pytest.fail("auth returned a different email for the dedicated prod Cowork test identity")
+        pytest.fail(
+            "auth returned a different email for the dedicated prod Cowork test identity"
+        )
     if not payload.get("user_id") or not payload.get("organization_id"):
-        pytest.fail("auth returned no user or organization id for the dedicated prod Cowork test identity")
+        pytest.fail(
+            "auth returned no user or organization id for the dedicated prod Cowork test identity"
+        )
     try:
         hub_admin = payload["entitlements"]["permissions"]["admin"]["hub"]
     except (KeyError, TypeError):
-        pytest.fail("auth returned no Hub admin entitlement for the dedicated prod Cowork test identity")
+        pytest.fail(
+            "auth returned no Hub admin entitlement for the dedicated prod Cowork test identity"
+        )
     if hub_admin is not False:
         pytest.fail("the dedicated prod Cowork test identity has Hub admin access")
     if response.headers.get("X-Billing-Segment", "").lower() not in {"free", "paid"}:
-        pytest.fail("auth did not classify the dedicated prod Cowork test identity as non-employee")
-    return _Identity({
-        "api_key": api_key,
-        "user_id": str(payload["user_id"]),
-        "organization_id": str(payload["organization_id"]),
-        "email": str(payload["email"]),
-    })
+        pytest.fail(
+            "auth did not classify the dedicated prod Cowork test identity as non-employee"
+        )
+    return _Identity(
+        {
+            "api_key": api_key,
+            "user_id": str(payload["user_id"]),
+            "organization_id": str(payload["organization_id"]),
+            "email": str(payload["email"]),
+        }
+    )
 
 
 def _provision_identity() -> _Identity:
@@ -192,12 +206,16 @@ def _provision_identity() -> _Identity:
     user_id = os.environ.get("COWORK_TEST_USER_ID")
     org_id = os.environ.get("COWORK_TEST_ORG_ID")
     if api_key and user_id and org_id:
-        return _Identity({
-            "api_key": api_key,
-            "user_id": user_id,
-            "organization_id": org_id,
-            "email": os.environ.get("COWORK_TEST_USER_EMAIL", "postdeploy@example.com"),
-        })
+        return _Identity(
+            {
+                "api_key": api_key,
+                "user_id": user_id,
+                "organization_id": org_id,
+                "email": os.environ.get(
+                    "COWORK_TEST_USER_EMAIL", "postdeploy@example.com"
+                ),
+            }
+        )
 
     mint_url = os.environ.get("TEST_USER_MINT_URL")
     if mint_url:
@@ -228,7 +246,9 @@ def _provision_identity() -> _Identity:
             follow_redirects=False,
         )
         if resp.status_code != 201:
-            pytest.fail(f"provisioning the cowork test user failed: HTTP {resp.status_code}")
+            pytest.fail(
+                f"provisioning the cowork test user failed: HTTP {resp.status_code}"
+            )
         users = resp.json()["users"]
         if not users:
             pytest.fail("the cowork suite provisioned no users")
@@ -272,7 +292,9 @@ def _direct_headers(identity: dict[str, str]) -> dict[str, str]:
 
 @pytest.fixture
 def api(identity):
-    with httpx.Client(base_url=_base_url(), headers=_headers(identity), timeout=30.0) as client:
+    with httpx.Client(
+        base_url=_base_url(), headers=_headers(identity), timeout=30.0
+    ) as client:
         yield client
 
 
@@ -292,8 +314,14 @@ def _sse_events(text: str) -> list[str]:
     ]
 
 
-def _stream_turn(client: httpx.Client, conversation_id: str, prompt: str, *,
-                 read_timeout: float = TURN_TIMEOUT_S, failures: list[str] | None = None) -> list[str]:
+def _stream_turn(
+    client: httpx.Client,
+    conversation_id: str,
+    prompt: str,
+    *,
+    read_timeout: float = TURN_TIMEOUT_S,
+    failures: list[str] | None = None,
+) -> list[str]:
     """POST a turn and drain its SSE response, returning the event names.
 
     Pass ``failures`` to also collect the reason from any ``response.failed`` /
@@ -304,7 +332,8 @@ def _stream_turn(client: httpx.Client, conversation_id: str, prompt: str, *,
     events: list[str] = []
     current: str | None = None
     with client.stream(
-        "POST", "/api/v1/responses/",
+        "POST",
+        "/api/v1/responses/",
         json={"input": prompt, "conversation": conversation_id, "stream": True},
         timeout=httpx.Timeout(read_timeout, connect=10.0),
     ) as resp:
@@ -313,11 +342,17 @@ def _stream_turn(client: httpx.Client, conversation_id: str, prompt: str, *,
             if line.startswith("event:"):
                 current = line.removeprefix("event:").strip()
                 events.append(current)
-            elif line.startswith("data:") and failures is not None and current in ("response.failed", "error"):
+            elif (
+                line.startswith("data:")
+                and failures is not None
+                and current in ("response.failed", "error")
+            ):
                 raw = line.removeprefix("data:").strip()
                 try:
                     payload = json.loads(raw)
-                    failures.append(f"code={payload.get('code')!r} message={payload.get('message')!r}")
+                    failures.append(
+                        f"code={payload.get('code')!r} message={payload.get('message')!r}"
+                    )
                 except (ValueError, AttributeError):
                     failures.append(raw[:300])
     return events
@@ -329,29 +364,32 @@ def test_a_turn_runs_end_to_end(api, conversation_id):
     events = _stream_turn(api, conversation_id, QUICK_PROMPT, failures=failures)
 
     assert "response.created" in events
-    assert "response.completed" in events, (
-        f"turn did not complete: events={events} failure={failures}"
-    )
+    assert (
+        "response.completed" in events
+    ), f"turn did not complete: events={events} failure={failures}"
 
 
 def test_reconnect_replays_a_turn_in_progress(api, conversation_id):
     """Close the stream mid-turn and tail it back, the page-reload path."""
     with api.stream(
-        "POST", "/api/v1/responses/",
+        "POST",
+        "/api/v1/responses/",
         json={"input": SLOW_PROMPT, "conversation": conversation_id, "stream": True},
         timeout=httpx.Timeout(TURN_TIMEOUT_S, connect=10.0),
     ) as resp:
         assert resp.status_code == 200
-        for line in resp.iter_lines():          # drop the connection early
+        for line in resp.iter_lines():  # drop the connection early
             if line.startswith("event:"):
                 break
 
-    probe = api.get("/api/v1/responses/in-flight",
-                    params={"conversation_id": conversation_id}).json()
+    probe = api.get(
+        "/api/v1/responses/in-flight", params={"conversation_id": conversation_id}
+    ).json()
     assert probe["has_buffer"] is True, probe
 
     with api.stream(
-        "GET", "/api/v1/responses/tail",
+        "GET",
+        "/api/v1/responses/tail",
         params={"conversation_id": conversation_id, "from_seq": 0},
         timeout=httpx.Timeout(TURN_TIMEOUT_S, connect=10.0),
     ) as resp:
@@ -372,13 +410,22 @@ def test_reconnect_works_on_the_other_replica(conversation_id, identity):
     url_a = os.environ.get("COWORK_BASE_URL_A")
     url_b = os.environ.get("COWORK_BASE_URL_B")
     if not (url_a and url_b):
-        missing_prerequisite("COWORK_BASE_URL_A and _B not set; needs two reachable pods")
+        missing_prerequisite(
+            "COWORK_BASE_URL_A and _B not set; needs two reachable pods"
+        )
 
     headers = _direct_headers(identity)
-    with httpx.Client(base_url=url_a.rstrip("/"), headers=headers, timeout=30.0) as replica_a:
+    with httpx.Client(
+        base_url=url_a.rstrip("/"), headers=headers, timeout=30.0
+    ) as replica_a:
         with replica_a.stream(
-            "POST", "/api/v1/responses/",
-            json={"input": SLOW_PROMPT, "conversation": conversation_id, "stream": True},
+            "POST",
+            "/api/v1/responses/",
+            json={
+                "input": SLOW_PROMPT,
+                "conversation": conversation_id,
+                "stream": True,
+            },
             timeout=httpx.Timeout(TURN_TIMEOUT_S, connect=10.0),
         ) as resp:
             assert resp.status_code == 200
@@ -386,14 +433,17 @@ def test_reconnect_works_on_the_other_replica(conversation_id, identity):
                 if line.startswith("event:"):
                     break
 
-    with httpx.Client(base_url=url_b.rstrip("/"), headers=headers, timeout=30.0) as replica_b:
+    with httpx.Client(
+        base_url=url_b.rstrip("/"), headers=headers, timeout=30.0
+    ) as replica_b:
         probe = _await_shared_buffer(replica_b, conversation_id)
         # Before the Redis backend this replica had no handle and no buffer,
         # and answered has_buffer=False.
         assert probe["has_buffer"] is True, probe
 
         with replica_b.stream(
-            "GET", "/api/v1/responses/tail",
+            "GET",
+            "/api/v1/responses/tail",
             params={"conversation_id": conversation_id, "from_seq": 0},
             timeout=httpx.Timeout(TURN_TIMEOUT_S, connect=10.0),
         ) as resp:
@@ -403,7 +453,9 @@ def test_reconnect_works_on_the_other_replica(conversation_id, identity):
     assert "response.created" in replayed, replayed
 
 
-def _await_shared_buffer(api, conversation_id, *, timeout_s=CROSS_REPLICA_VISIBILITY_S) -> dict:
+def _await_shared_buffer(
+    api, conversation_id, *, timeout_s=CROSS_REPLICA_VISIBILITY_S
+) -> dict:
     """Wait for a peer replica to observe the turn index written by the producer.
 
     ``response.created`` is appended before the remote reply generator starts,
@@ -448,8 +500,9 @@ def _await_running_turn(api, conversation_id) -> dict | None:
     deadline = time.monotonic() + CANCEL_PREMISE_S
     probe = None
     while time.monotonic() < deadline:
-        probe = api.get("/api/v1/responses/in-flight",
-                        params={"conversation_id": conversation_id}).json()
+        probe = api.get(
+            "/api/v1/responses/in-flight", params={"conversation_id": conversation_id}
+        ).json()
         if probe.get("in_flight") is True:
             return probe
         # Not running, and this replica has the turn: it ended. `latest_seq`
@@ -468,7 +521,8 @@ def _await_running_turn(api, conversation_id) -> dict | None:
 def test_cancel_ends_the_turn(api, conversation_id):
     """After POST /cancel, /in-flight reports the turn as finished."""
     with api.stream(
-        "POST", "/api/v1/responses/",
+        "POST",
+        "/api/v1/responses/",
         json={"input": CANCEL_PROMPT, "conversation": conversation_id, "stream": True},
         timeout=httpx.Timeout(TURN_TIMEOUT_S, connect=10.0),
     ) as resp:
@@ -500,25 +554,28 @@ def test_cancel_ends_the_turn(api, conversation_id):
             "needs to outlast two HTTP calls on this deployment"
         )
 
-    cancel = api.post("/api/v1/responses/cancel",
-                      json={"conversation_id": conversation_id})
+    cancel = api.post(
+        "/api/v1/responses/cancel", json={"conversation_id": conversation_id}
+    )
     assert cancel.status_code == 200, cancel.text
     # Now load-bearing: the turn was running one call ago, so False here means
     # the server failed to stop a turn it was told to stop.
-    assert cancel.json()["cancelled"] is True, (
-        f"cancel reported nothing to cancel for a turn that was in flight: {running}"
-    )
+    assert (
+        cancel.json()["cancelled"] is True
+    ), f"cancel reported nothing to cancel for a turn that was in flight: {running}"
 
     deadline = time.monotonic() + CANCEL_VISIBLE_S
     while time.monotonic() < deadline:
-        probe = api.get("/api/v1/responses/in-flight",
-                        params={"conversation_id": conversation_id}).json()
+        probe = api.get(
+            "/api/v1/responses/in-flight", params={"conversation_id": conversation_id}
+        ).json()
         if probe["in_flight"] is False:
             break
         time.sleep(2)
     else:
         pytest.fail(
-            f"turn still in flight {CANCEL_VISIBLE_S:.0f}s after cancel: {probe}")
+            f"turn still in flight {CANCEL_VISIBLE_S:.0f}s after cancel: {probe}"
+        )
 
 
 def test_a_second_message_queues_behind_the_first(api, conversation_id):
@@ -534,7 +591,9 @@ def test_a_second_message_queues_behind_the_first(api, conversation_id):
     assert items.status_code == 200, items.text
     body = items.json()
     payload = body if isinstance(body, list) else body.get("items", [])
-    assert len(payload) >= 4, f"expected both turns persisted, got {json.dumps(body)[:400]}"
+    assert (
+        len(payload) >= 4
+    ), f"expected both turns persisted, got {json.dumps(body)[:400]}"
 
 
 def test_deleting_a_conversation_leaves_no_replayable_buffer(api, conversation_id):
@@ -545,8 +604,9 @@ def test_deleting_a_conversation_leaves_no_replayable_buffer(api, conversation_i
     deleted = api.delete(f"/api/v1/conversations/{conversation_id}")
     assert deleted.status_code in (200, 204), deleted.text
 
-    probe = api.get("/api/v1/responses/in-flight",
-                    params={"conversation_id": conversation_id}).json()
+    probe = api.get(
+        "/api/v1/responses/in-flight", params={"conversation_id": conversation_id}
+    ).json()
     assert probe["has_buffer"] is False, probe
 
 
@@ -557,13 +617,16 @@ def test_deleting_a_scheduled_runs_conversation_keeps_the_run(api):
     survive with its verdict intact. The unit suite pins this on an
     FK-enforcing SQLite engine; this is the same cascade against the
     deployment's real alembic-built Postgres."""
-    created = api.post("/api/v1/schedules/", json={
-        "title": "post-deploy delete cascade",
-        "prompt": QUICK_PROMPT,
-        "cadence": "daily",
-        "nextRunAt": "2030-01-01T00:00:00Z",
-        "enabled": False,  # run-now only; the cron loop must not pick it up
-    })
+    created = api.post(
+        "/api/v1/schedules/",
+        json={
+            "title": "post-deploy delete cascade",
+            "prompt": QUICK_PROMPT,
+            "cadence": "daily",
+            "nextRunAt": "2030-01-01T00:00:00Z",
+            "enabled": False,  # run-now only; the cron loop must not pick it up
+        },
+    )
     assert created.status_code == 201, created.text
     schedule_id = created.json()["id"]
     try:
@@ -580,16 +643,19 @@ def test_deleting_a_scheduled_runs_conversation_keeps_the_run(api):
             listing = api.get(f"/api/v1/schedules/{schedule_id}/runs")
             assert listing.status_code == 200, listing.text
             run = next(
-                (r for r in listing.json()["runs"]
-                 if r.get("conversationId") == conversation_id),
+                (
+                    r
+                    for r in listing.json()["runs"]
+                    if r.get("conversationId") == conversation_id
+                ),
                 None,
             )
             if run is not None and run["status"] != "running":
                 break
             time.sleep(2)
-        assert run is not None and run["status"] != "running", (
-            f"run never reached a terminal status: {run}"
-        )
+        assert (
+            run is not None and run["status"] != "running"
+        ), f"run never reached a terminal status: {run}"
 
         deleted = api.delete(f"/api/v1/conversations/{conversation_id}")
         assert deleted.status_code in (200, 204), deleted.text
@@ -598,7 +664,10 @@ def test_deleting_a_scheduled_runs_conversation_keeps_the_run(api):
         kept = next((r for r in after if r["id"] == run["id"]), None)
         assert kept is not None, "run history must outlive the chat it produced"
         assert kept["conversationId"] is None
-        assert (kept["status"], kept["durationMs"]) == (run["status"], run["durationMs"])
+        assert (kept["status"], kept["durationMs"]) == (
+            run["status"],
+            run["durationMs"],
+        )
 
         schedule = api.get(f"/api/v1/schedules/{schedule_id}")
         assert schedule.status_code == 200, schedule.text
