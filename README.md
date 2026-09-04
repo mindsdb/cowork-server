@@ -10,6 +10,7 @@ Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```sh
 # Install and run
+
 uv tool install cowork-server
 cowork-server
 ```
