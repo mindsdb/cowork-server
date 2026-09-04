@@ -6,6 +6,7 @@ from fastapi import APIRouter, BackgroundTasks, HTTPException, status
 
 from cowork.db.scoped import ScopedSessionDep
 from cowork.schemas.schedules import (
+    DEFAULT_MODEL_SENTINEL,
     ScheduleCreateRequest,
     ScheduleResponse,
     ScheduleRunResponse,
@@ -38,7 +39,7 @@ def create_schedule(body: ScheduleCreateRequest, scoped: ScopedSessionDep):
             prompt=body.prompt,
             cadence=body.cadence,
             next_run_at=body.next_run_at,
-            model=body.model or "default",
+            model=body.model or DEFAULT_MODEL_SENTINEL,
             timezone=body.timezone,
             project_id=body.project_id,
             enabled=body.enabled,
