@@ -38,6 +38,7 @@ jobs:
           uv sync --group dev
           uv run --no-sync python -c "import cowork.server"
           uv run --no-sync python -c "from cowork.harnesses.base import available_harness_ids as a; ids = a(); assert 'hermes' not in ids, ids; print('shipped set offers:', ids)"
+          uv run --no-sync python -c "from cowork.harnesses.memory.adapter import get_memory_adapter as g; assert g('hermes') is not None; print('hermes memory adapter still registered')"
 
       - name: Install dependencies
         # --extra hermes: hermes-agent is optional for installs but its

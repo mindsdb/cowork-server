@@ -83,3 +83,13 @@ def test_the_shipped_set_job_asserts_hermes_is_unregistered() -> None:
     can.
     """
     assert "'hermes' not in ids" in "\n".join(_stripped_lines(_UNIT_WORKFLOW))
+
+
+def test_the_shipped_set_job_asserts_the_memory_adapter_survives() -> None:
+    """Gating the memory adapter alongside the harness would be silent.
+
+    It needs no hermes import, and harnesses/memory/migration.py resolves it to
+    delete legacy hermes memory files. Folded into the harness gate, that cleanup
+    would simply stop happening for the users who have those files.
+    """
+    assert "get_memory_adapter as g" in "\n".join(_stripped_lines(_UNIT_WORKFLOW))
