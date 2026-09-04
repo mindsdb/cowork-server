@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import ipaddress
 import logging
 import os
 import re
@@ -72,6 +73,28 @@ class ProjectNotFoundError(ValueError):
 
 class ProjectPathNotAllowedError(ValueError):
     """A caller chose a project folder on a deployment that does not allow one."""
+
+
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _binds_loopback_only(host: str) -> bool:
+    """Whether the server was told to listen only on loopback.
+
+    The peer address cannot carry this decision. The container runs uvicorn
+    with ``--forwarded-allow-ips "*"``, so ``X-Forwarded-For`` rewrites
+    ``request.client`` and a remote caller can present 127.0.0.1. The address
+    the server was told to bind is configuration, which a request cannot
+    forge: the desktop sidecar binds 127.0.0.1, the self-host container binds
+    0.0.0.0.
+    """
+    value = (host or "").strip().strip("[]").casefold()
+    if value in _LOOPBACK_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
 
 
 @dataclass
@@ -529,10 +552,16 @@ class ProjectService:
         if get_app_settings().tenancy_mode == "org" or self.session.scope.org_mode:
             return False
         try:
-            resolved = Path(project.path).resolve(strict=False)
+            # The parent is resolved, not the leaf. A project directory that is
+            # itself a symlink to elsewhere is still a direct child of the
+            # root, and renaming it renames the link -- the same comparison
+            # `_in_scoped_root` makes. Resolving the leaf would reclassify it
+            # as chosen and refuse a rename that works today.
+            parent = Path(project.path).resolve(strict=False).parent
+            root = self._root_dir().resolve(strict=False)
         except (OSError, RuntimeError):
             return False
-        return not self._within_root(resolved)
+        return parent != root
 
     def _within_root(self, path: Path) -> bool:
         try:
@@ -557,9 +586,15 @@ class ProjectService:
         org deployment does not run on the caller's machine, so statting a
         path it chose would answer whether that server path exists.
         """
-        if get_app_settings().tenancy_mode == "org":
+        settings = get_app_settings()
+        if settings.tenancy_mode == "org":
             raise ProjectPathNotAllowedError(
                 "Choosing a project folder is not available on this deployment"
+            )
+        if not _binds_loopback_only(settings.host):
+            raise ProjectPathNotAllowedError(
+                "Choosing a project folder needs a server listening only on "
+                "localhost"
             )
         try:
             resolved = path.expanduser().resolve(strict=True)
@@ -638,14 +673,26 @@ class ProjectService:
 
         # Skill symlink distribution is desktop-only (see SkillService).
         if not self.session.scope.org_mode:
-            from cowork.services.skill_links import reconcile_project
-            from cowork.services.skills import SkillService
+            try:
+                from cowork.services.skill_links import reconcile_project
+                from cowork.services.skills import SkillService
 
-            reconcile_project(
-                project_dir,
-                SkillService(self.session.scope).list_skills(),
-                project_name=final_name,
-            )
+                reconcile_project(
+                    project_dir,
+                    SkillService(self.session.scope).list_skills(),
+                    project_name=final_name,
+                )
+            except Exception:
+                # These links are derived desktop state and the row is already
+                # committed, so a failure here must not answer 500 for a
+                # project that exists — the name is taken by then, so the
+                # client cannot even retry. A folder the user chose can hold a
+                # real `skills/<slug>` directory or be read-only, which is
+                # exactly how this now fails. Same treatment as rename.
+                logger.exception(
+                    "Could not reconcile desktop skill links for project %s",
+                    project.id,
+                )
 
         return project
 
