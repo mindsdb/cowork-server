@@ -82,18 +82,16 @@ def test_an_adopted_folder_is_a_discoverable_artifacts_source(engine, tmp_path):
 
 
 def test_the_source_carries_the_row_name_not_the_folder_basename(engine, tmp_path):
-    """Adopting a folder while its name is already taken gives a row named
-    `notes-2` over a directory named `notes`. The scan reports the basename,
-    which addresses the wrong project."""
+    """The project's name is what the user typed, not the folder's basename,
+    so the two differ whenever they name the project something else. The scan
+    reports the basename, which addresses the wrong project."""
     from cowork.services.artifact_roots import artifacts_sources_for_scope
 
     folder = tmp_path / "notes"
     folder.mkdir()
     base = _artifacts_dir(folder)
-    svc = ProjectService(_scoped(engine))
-    svc.create_project("notes")
     adopting = ProjectService(_scoped(engine))
-    project = adopting.create_project("notes", path=folder)
+    project = adopting.create_project("Reports", path=folder)
     assert project.name != folder.name
 
     session = _scoped(engine)
@@ -189,10 +187,8 @@ def test_a_listed_card_from_an_adopted_folder_serves_under_the_row_name(
     folder = tmp_path / "notes"
     folder.mkdir()
     base = _artifacts_dir(folder)
-    svc = ProjectService(_scoped(engine))
-    svc.create_project("notes")
     adopting = ProjectService(_scoped(engine))
-    project = adopting.create_project("notes", path=folder)
+    project = adopting.create_project("Reports", path=folder)
 
     artifact = base / "dash"
     artifact.mkdir()
@@ -248,7 +244,8 @@ def test_the_artifacts_route_lists_an_adopted_folder(projects_root, tmp_path):
 
     client = TestClient(create_app(), client=("127.0.0.1", 54321))
     created = client.post(
-        "/api/v1/projects/", json={"name": "notes", "path": str(folder)}
+        "/api/v1/projects/",
+        json={"name": "adopted-dash-project", "path": str(folder)},
     )
     assert created.status_code == 201, created.text
     project_name = created.json()["name"]

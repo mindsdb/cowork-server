@@ -143,15 +143,31 @@ def test_the_users_own_files_are_left_alone(engine, tmp_path):
     assert (folder / "draft.md").read_text() == "keep me"
 
 
-def test_two_projects_named_the_same_still_get_unique_names(engine, tmp_path):
-    """`name` is the lookup key, the URL segment and the directory basename,
-    and `get_project_by_name` is a `.first()` on an unordered select, so a
-    duplicate would resolve to an arbitrary one of the two."""
+def test_a_taken_name_is_refused_rather_than_bumped(engine, tmp_path):
+    """`name` is the lookup key, the URL segment and the folder basename, and
+    `get_project_by_name` is a `.first()` on an unordered select. The allocated
+    path can bump to `-2` because `mkdir` arbitrates a concurrent pair;
+    adoption creates nothing, so it refuses instead."""
     first_svc = _svc(engine)
-    first = first_svc.create_project("notes", path=_folder(tmp_path, "a"))
-    second_svc = _svc(engine)
-    second = second_svc.create_project("notes", path=_folder(tmp_path, "b"))
-    assert first.name != second.name
+    first_svc.create_project("notes", path=_folder(tmp_path, "a"))
+    with pytest.raises(ValueError, match="already exists"):
+        _svc(engine).create_project("notes", path=_folder(tmp_path, "b"))
+
+
+def test_a_taken_name_is_refused_against_an_allocated_project(engine, tmp_path):
+    allocated = _svc(engine)
+    allocated.create_project("notes")
+    with pytest.raises(ValueError, match="already exists"):
+        _svc(engine).create_project("notes", path=_folder(tmp_path, "b"))
+
+
+def test_the_name_is_what_the_user_typed_not_the_folder(engine, tmp_path):
+    """The two are independent, so an adopted folder's basename still differs
+    from the row name whenever the user names the project something else.
+    Every scan-based subsystem had assumed they were the same string."""
+    svc = _svc(engine)
+    project = svc.create_project("My Reports", path=_folder(tmp_path, "notes"))
+    assert project.name == "My-Reports"
 
 
 def test_a_folder_is_still_optional(engine, projects_root):
@@ -207,9 +223,12 @@ def test_a_missing_folder_is_a_client_error_not_a_crash(projects_root, tmp_path)
 
 
 def test_a_folder_can_be_chosen_from_loopback(projects_root, tmp_path):
-    folder = _folder(tmp_path, "notes")
+    # The app database is shared across the HTTP tests in this suite, and an
+    # adopted folder now refuses a name that is already taken.
+    folder = _folder(tmp_path, "chosen-from-loopback")
     res = _loopback_client().post(
-        "/api/v1/projects/", json={"name": "notes", "path": str(folder)}
+        "/api/v1/projects/",
+        json={"name": "chosen-from-loopback", "path": str(folder)},
     )
     assert res.status_code == 201, res.text
     assert Path(res.json()["path"]) == folder.resolve()
@@ -225,10 +244,10 @@ def test_a_non_loopback_caller_cannot_choose_a_folder(projects_root, tmp_path):
 
     from cowork.server import create_app
 
-    folder = _folder(tmp_path, "notes")
+    folder = _folder(tmp_path, "refused-remotely")
     remote = TestClient(create_app(), client=("203.0.113.7", 44321))
     res = remote.post(
-        "/api/v1/projects/", json={"name": "notes", "path": str(folder)}
+        "/api/v1/projects/", json={"name": "refused-remotely", "path": str(folder)}
     )
     assert res.status_code == 403, res.text
 
@@ -240,5 +259,5 @@ def test_a_non_loopback_caller_can_still_create_a_normal_project(projects_root):
     from cowork.server import create_app
 
     remote = TestClient(create_app(), client=("203.0.113.7", 44321))
-    res = remote.post("/api/v1/projects/", json={"name": "notes"})
+    res = remote.post("/api/v1/projects/", json={"name": "remote-no-folder"})
     assert res.status_code == 201, res.text

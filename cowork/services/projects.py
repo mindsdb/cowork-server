@@ -573,9 +573,22 @@ class ProjectService:
             raise ValueError("Choose a folder outside the Cowork projects directory")
         if self._path_in_use(resolved):
             raise ValueError("Another project already uses this folder")
-        # `_unique_name` still applies: `name` is the lookup key, the URL
-        # segment and the basename, and nothing else keeps it unique.
-        return self._unique_name(base), resolved
+        # Refused rather than bumped to `<name>-2`. The allocated path can
+        # safely bump because `mkdir` arbitrates a concurrent pair; adoption
+        # creates nothing, so it has no such backstop and `projects` has no
+        # unique index on `name` to settle it. A duplicate `name` is not a
+        # cosmetic problem: it is the lookup key, and `get_project_by_name` is
+        # a `.first()` on an unordered select.
+        #
+        # A concurrent pair can still both pass this check. On desktop, where
+        # this is the only place a folder can be adopted, SQLite serialises the
+        # writes and the loser's name is already taken by the time it commits.
+        if self._unique_name(base) != base:
+            raise ValueError(
+                f"A project called {base!r} already exists. Rename it, or "
+                "choose a different name for this folder."
+            )
+        return base, resolved
 
     def create_project(
         self,

@@ -155,14 +155,15 @@ def test_external_project_dirs_reads_real_rows(tmp_path, monkeypatch):
         adopted.mkdir(parents=True)
         client = TestClient(create_app(), client=("127.0.0.1", 54321))
         created = client.post(
-            "/api/v1/projects/", json={"name": "notes", "path": str(adopted)}
+            "/api/v1/projects/",
+            json={"name": "real-row-adopted", "path": str(adopted)},
         )
         assert created.status_code == 201, created.text
-        client.post("/api/v1/projects/", json={"name": "allocated"})
+        client.post("/api/v1/projects/", json={"name": "real-row-allocated"})
 
         found = sl._external_project_dirs()
 
         assert found.get(created.json()["name"]) == adopted
-        assert "allocated" not in found
+        assert "real-row-allocated" not in found
     finally:
         get_app_settings.cache_clear()
