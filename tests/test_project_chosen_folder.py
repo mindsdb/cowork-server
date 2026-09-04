@@ -164,30 +164,81 @@ def test_a_folder_is_still_optional(engine, projects_root):
 # -- the wire ----------------------------------------------------------------
 
 
-@pytest.mark.parametrize("raw", ["notes", "./notes", "../notes", "", "."])
-def test_a_non_absolute_path_is_rejected_by_the_schema(raw):
+@pytest.mark.parametrize("raw", ["notes", "./notes", "../notes", "."])
+def test_a_relative_path_is_rejected_by_the_schema(raw):
     with pytest.raises(ValidationError):
         ProjectCreateRequest(name="n", path=raw)
 
 
-def test_whitespace_reads_as_no_folder_chosen():
-    assert ProjectCreateRequest(name="n", path="   ").path is None
+@pytest.mark.parametrize("raw", ["~", "~/Documents", "~root/x", "~nosuchuser/x"])
+def test_a_tilde_path_is_rejected_rather_than_expanded(raw):
+    """expanduser consults the passwd database, so expanding here would let a
+    caller tell a real account from a missing one before the service has
+    refused the request at all."""
+    with pytest.raises(ValidationError):
+        ProjectCreateRequest(name="n", path=raw)
+
+
+@pytest.mark.parametrize("raw", ["", "   ", None])
+def test_no_folder_chosen_reads_as_none(raw):
+    assert ProjectCreateRequest(name="n", path=raw).path is None
 
 
 def test_an_omitted_path_is_none():
     assert ProjectCreateRequest(name="n").path is None
 
 
-def test_a_missing_folder_is_a_client_error_not_a_crash(projects_root, tmp_path):
-    """The create endpoint carried no `ValueError` mapping, so every rejection
-    added here would otherwise reach the client as a 500."""
+def _loopback_client():
     from fastapi.testclient import TestClient
 
     from cowork.server import create_app
 
-    client = TestClient(create_app())
-    res = client.post(
+    return TestClient(create_app(), client=("127.0.0.1", 54321))
+
+
+def test_a_missing_folder_is_a_client_error_not_a_crash(projects_root, tmp_path):
+    """The create endpoint carried no `ValueError` mapping, so every rejection
+    added here would otherwise reach the client as a 500."""
+    res = _loopback_client().post(
         "/api/v1/projects/",
         json={"name": "notes", "path": str(tmp_path / "absent")},
     )
     assert res.status_code == 400, res.text
+
+
+def test_a_folder_can_be_chosen_from_loopback(projects_root, tmp_path):
+    folder = _folder(tmp_path, "notes")
+    res = _loopback_client().post(
+        "/api/v1/projects/", json={"name": "notes", "path": str(folder)}
+    )
+    assert res.status_code == 201, res.text
+    assert Path(res.json()["path"]) == folder.resolve()
+    assert res.json()["capabilities"]["directoryIsExternal"] is True
+    assert res.json()["capabilities"]["canRename"] is False
+
+
+def test_a_non_loopback_caller_cannot_choose_a_folder(projects_root, tmp_path):
+    """`tenancy_mode` is local on a self-host deployment that binds 0.0.0.0.
+    Without this, a chosen path plus the project-file endpoints is read and
+    write anywhere the server user can reach."""
+    from fastapi.testclient import TestClient
+
+    from cowork.server import create_app
+
+    folder = _folder(tmp_path, "notes")
+    remote = TestClient(create_app(), client=("203.0.113.7", 44321))
+    res = remote.post(
+        "/api/v1/projects/", json={"name": "notes", "path": str(folder)}
+    )
+    assert res.status_code == 403, res.text
+
+
+def test_a_non_loopback_caller_can_still_create_a_normal_project(projects_root):
+    """The gate is on the chosen folder, not on project creation."""
+    from fastapi.testclient import TestClient
+
+    from cowork.server import create_app
+
+    remote = TestClient(create_app(), client=("203.0.113.7", 44321))
+    res = remote.post("/api/v1/projects/", json={"name": "notes"})
+    assert res.status_code == 201, res.text

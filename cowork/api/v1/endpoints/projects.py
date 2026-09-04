@@ -2,7 +2,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from cowork.db.scoped import ScopedSessionDep
 from cowork.harnesses.memory.registry import MemorySlot
@@ -15,6 +15,7 @@ from cowork.schemas.projects import (
     ProjectUpdateRequest,
 )
 from cowork.schemas.shared_resources import ProjectCapabilities
+from cowork.api.v1.endpoints.guards import require_local
 from cowork.services.projects import (
     GENERAL_PROJECT,
     ProjectNotFoundError,
@@ -243,10 +244,27 @@ def list_projects(
     return [_project_response(project, access) for project in service.list_projects()]
 
 
+def require_local_for_chosen_folder(
+    body: ProjectCreateRequest, request: Request
+) -> None:
+    """A caller-chosen project folder is only accepted from loopback.
+
+    `tenancy_mode` is not the same question as "did this come from the
+    desktop": a local-mode deployment can be bound off loopback (the self-host
+    compose that binds 0.0.0.0), and a chosen path plus the project-file
+    endpoints is then read and write anywhere the server user can reach. A
+    native folder picker is a loopback caller by construction, so nothing
+    legitimate is refused. The service still refuses org deployments outright.
+    """
+    if body.path is not None:
+        require_local(request)
+
+
 @router.post(
     "/",
     status_code=status.HTTP_201_CREATED,
     response_model=ProjectResponse,
+    dependencies=[Depends(require_local_for_chosen_folder)],
 )
 def create_project(
     body: ProjectCreateRequest,
@@ -282,7 +300,9 @@ def create_project(
                         access.coordination_lock(SKILL_PROJECT_REFERENCES, "all")
                     )
                 project = service.create_project(
-                    body.name, project_id=project_id, path=body.path
+                    body.name,
+                    project_id=project_id,
+                    path=Path(body.path) if body.path is not None else None,
                 )
                 if claim is not None and claim_token is not None:
                     finalized = access.finalize_claim(

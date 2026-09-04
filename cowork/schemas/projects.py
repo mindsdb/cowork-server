@@ -1,5 +1,5 @@
 from datetime import datetime
-from pathlib import Path
+from pathlib import PurePath
 from uuid import UUID
 
 from pydantic import BaseModel, field_validator
@@ -10,22 +10,28 @@ from cowork.schemas.shared_resources import ProjectCapabilities, ResourceAttribu
 
 class ProjectCreateRequest(CamelRequest):
     name: str
-    path: Path | None = None
+    # A string, not a Path: pydantic coerces "" to Path("."), which is then
+    # indistinguishable from a caller who really sent ".". One of those means
+    # "no folder chosen" and the other is a relative path to refuse.
+    path: str | None = None
 
     @field_validator("path")
     @classmethod
-    def _absolute_path_only(cls, path: Path | None) -> Path | None:
+    def _absolute_path_only(cls, path: str | None) -> str | None:
         # Syntax only: a field validator runs before the handler, so a
         # filesystem check here would precede the service's tenancy refusal.
-        if path is None or not str(path).strip():
+        if path is None or not path.strip():
             return None
-        try:
-            expanded = path.expanduser()
-        except RuntimeError as exc:
-            raise ValueError("path could not be resolved") from exc
-        if not expanded.is_absolute():
+        raw = path.strip()
+        # `~` is deliberately not expanded. expanduser consults the passwd
+        # database, so over HTTP it separates a real account from a missing one
+        # before the request has been refused at all. The picker sends an
+        # absolute path, so nothing legitimate needs it.
+        if raw.startswith("~"):
+            raise ValueError("path must be absolute, not ~-relative")
+        if not PurePath(raw).is_absolute():
             raise ValueError("path must be absolute")
-        return expanded
+        return raw
 
 
 class ProjectUpdateRequest(CamelRequest):
