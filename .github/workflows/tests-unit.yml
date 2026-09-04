@@ -27,7 +27,7 @@ jobs:
         run: uv lock --check
 
       - name: Install dependencies
-        run: uv sync --group dev --extra hermes
+        run: uv sync --group dev
 
       - name: Run unit tests
         run: make test/unit/coverage
