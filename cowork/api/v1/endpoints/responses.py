@@ -31,7 +31,7 @@ from cowork.streaming.answers import SubmitResult, broker
 from cowork.streaming.backend import get_backend
 from cowork.streaming.buffer import RedisStreamBuffer
 from cowork.streaming.turn_index import get_turn, list_turns
-from cowork.turnqueue.redis_client import get_redis
+from cowork.turnqueue.redis_client import cancel_flag_key, get_redis
 
 
 logger = setup_logging()
@@ -144,7 +144,7 @@ async def _request_cancel(correlation_id: str) -> None:
     the request landed on.
     """
     await get_redis().set(
-        f"cowork:cancel:{correlation_id}", "1", ex=CANCEL_FLAG_TTL_SECONDS
+        cancel_flag_key(correlation_id), "1", ex=CANCEL_FLAG_TTL_SECONDS
     )
 
 

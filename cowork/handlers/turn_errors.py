@@ -254,6 +254,106 @@ GENERIC_TURN_ERROR_MESSAGE = "An unexpected error occurred."
 # clients (which may branch on it) keep working after the migration.
 GENERIC_TURN_ERROR_CODE = "anton_error"
 
+# Curated copy for scratchpad-controller literals that carry no "TypeName:"
+# prefix at all (main.py's own turn_failed publishes), so the type-name parse
+# in remote_turn_error never sees them. Matched by prefix/suffix rather than
+# passed through verbatim: some carry an optional "; stderr tail: ..." suffix
+# or an interpolated correlation_id, neither of which must reach the user.
+POD_STREAM_ENDED_PREFIX = "pod stream ended without a terminal event"
+POD_STREAM_ENDED_USER_MESSAGE = "The turn ended unexpectedly. Please try again."
+TURN_ABORTED_TIMEOUT_PREFIX = "turn aborted: hard turn timeout"
+TURN_ABORTED_TIMEOUT_USER_MESSAGE = (
+    "This turn took too long and was stopped. Try again with a smaller request."
+)
+TURN_ABORTED_STALL_PREFIX = "turn aborted: no output within stall window"
+TURN_ABORTED_STALL_USER_MESSAGE = (
+    "This turn stopped producing output and was ended. Please try again."
+)
+# MissingOrganization (_scratchpad_id_for_job): "job {correlation_id} has no
+# organization_id; ...". The correlation_id prefix varies per job — matched
+# on the static suffix, which doesn't. A data-integrity condition, not
+# something a plain retry is guaranteed to fix, so the copy steers to
+# support rather than implying "just try again" will resolve it.
+MISSING_ORGANIZATION_SUFFIX = (
+    "has no organization_id; refusing to run a turn without an "
+    "organization-scoped workspace"
+)
+# Anchored at the front as well, because the suffix test alone is the one
+# match here that a scrubbed "TypeName: message" could satisfy: an exception
+# whose message merely ENDS with the controller's phrasing would take this
+# branch ahead of its own, trading (say) the provider-auth card for workspace
+# copy.
+#
+# "job " is what the live path sends: _run_job catches MissingOrganization
+# while resolving the scratchpad id and publishes the message verbatim, then
+# returns before dispatching, so the exception never reaches _fail_job and
+# _handle_anton_turn_k8s's own guard never fires. The typed shape is kept as
+# defensive cover for a controller change that lets it through, not because
+# anything emits it today.
+MISSING_ORGANIZATION_PREFIXES = ("job ", "MissingOrganization:")
+MISSING_ORGANIZATION_USER_MESSAGE = (
+    "This task's workspace couldn't be set up. Please try again — if it "
+    "keeps happening, contact support."
+)
+# The two failures whose user-facing sentence we author ourselves: anton's
+# no-terminal-event fallback (anton/cloud_turn/__main__.py) and
+# scratchpad-controller's PEL reclaim (pel_reclaim.py's ORPHANED_ERROR).
+# Both are fixed constants at their source with nothing interpolated, so they
+# are matched WHOLE rather than on the "TypeName:" prefix — an exception class
+# of either name wrapping provider text then cannot ride the prefix through to
+# the user, and this module keeps its promise never to pass raw provider text
+# on. Drift at either source falls through to the generic message, which is
+# the safe direction to fail.
+SELF_AUTHORED_TURN_FAILURES = frozenset({
+    "TurnInterrupted: The turn ended unexpectedly. Please try again.",
+    "TurnWorkerLost: the worker running this turn stopped before it finished; "
+    "the turn was not retried",
+})
+
+# scratchpad-controller publishes a cancel two ways. main.py's own cancel
+# branch sends this bare literal, and nothing else produces it, so it is
+# proof of a cancel on its own.
+REMOTE_CANCEL_LITERAL = "cancelled"
+# A keepalive-driven cancel instead unwinds through _run_job's CancelledError
+# handler into _fail_job, which shapes it as "ExceptionType: message". That
+# is the only shape reachable while the pod is still starting, because the
+# per-stream-line cancel check needs stream lines to run and none exist
+# before the pod is Running.
+#
+# Ambiguous on its own: a replica taking SIGTERM during a rolling deploy
+# unwinds through the same handler, and reading that as a cancel would end
+# the turn with partial text, no error frame and no lookup id — the one
+# failure class that would come out of this change LESS visible. Callers
+# confirm it against the cancel flag before treating it as a Stop.
+REMOTE_CANCEL_VIA_FAIL_JOB = "RuntimeError: cancelled"
+
+# live_pod.py raises a bare RuntimeError from two places when the pod never
+# reaches Running: a terminal phase before Running (kubelet rejected or
+# evicted it) and the poll deadline expiring (no gVisor capacity, a quota
+# block, a cold node still pulling the image). Both are caught by
+# _handle_anton_turn_k8s's own generic except Exception, so neither carries a
+# type prefix. The deadline one is the capacity/image-pull class, which is
+# the one that clusters — matched on the family rather than one raise site,
+# and on markers rather than the interpolated timeout, which can be retuned.
+# pod_name/phase are k8s-controlled (safe), but a fixed message is returned
+# anyway rather than echoing internal names to the user.
+LIVE_POD_PREFIX = "live pod "
+LIVE_POD_NEVER_RAN_MARKERS = ("before Running", "did not reach Running within")
+LIVE_POD_NEVER_RAN_USER_MESSAGE = (
+    "This task's sandbox failed to start. Please try again."
+)
+# live_pod.py's PodIdentityMismatch: "pod {name} belongs to scratchpad {a!r},
+# not {b!r}" — a refusal to run in another scratchpad's workspace. The
+# squatting pod is not discarded, so a plain retry hits it again until the
+# reaper clears it; the copy steers to support rather than promising a retry
+# will work, and never echoes the two scratchpad ids the message carries.
+POD_IDENTITY_MISMATCH_PREFIX = "pod "
+POD_IDENTITY_MISMATCH_MARKER = "belongs to scratchpad"
+POD_IDENTITY_MISMATCH_USER_MESSAGE = (
+    "This task's sandbox couldn't be started safely. Please try again — if it "
+    "keeps happening, contact support."
+)
+
 # The exception-shaped type name the remote producer sends when no reply
 # arrives for a turn. `cowork.turnqueue.producer.UNRESPONSIVE_WORKER_ERROR` is
 # built from this constant, so the string it puts on the reply stream and the
@@ -941,6 +1041,32 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
     gets the generic redacted message — never the raw provider text.
     """
     text = (error or "").strip()
+    # Our own curated sentences, matched whole. Same generic code as any other
+    # unmapped failure (no card exists for either), but the sentence survives
+    # instead of being discarded for the fully generic message.
+    if text in SELF_AUTHORED_TURN_FAILURES:
+        return GENERIC_TURN_ERROR_CODE, text.partition(":")[2].strip()
+    # Matched ahead of the type-name parse below: none of these carry a
+    # "TypeName:" prefix, so that parse would never recognize them. Prefix
+    # matched (not exact), each can carry an optional "; stderr tail: ..."
+    # suffix that must never reach the user — so a fixed message is
+    # returned rather than any part of the wire text.
+    if text.startswith(POD_STREAM_ENDED_PREFIX):
+        return GENERIC_TURN_ERROR_CODE, POD_STREAM_ENDED_USER_MESSAGE
+    if text.startswith(TURN_ABORTED_TIMEOUT_PREFIX):
+        return GENERIC_TURN_ERROR_CODE, TURN_ABORTED_TIMEOUT_USER_MESSAGE
+    if text.startswith(TURN_ABORTED_STALL_PREFIX):
+        return GENERIC_TURN_ERROR_CODE, TURN_ABORTED_STALL_USER_MESSAGE
+    if text.startswith(MISSING_ORGANIZATION_PREFIXES) and text.endswith(
+        MISSING_ORGANIZATION_SUFFIX
+    ):
+        return GENERIC_TURN_ERROR_CODE, MISSING_ORGANIZATION_USER_MESSAGE
+    if text.startswith(LIVE_POD_PREFIX) and any(
+        marker in text for marker in LIVE_POD_NEVER_RAN_MARKERS
+    ):
+        return GENERIC_TURN_ERROR_CODE, LIVE_POD_NEVER_RAN_USER_MESSAGE
+    if text.startswith(POD_IDENTITY_MISMATCH_PREFIX) and POD_IDENTITY_MISMATCH_MARKER in text:
+        return GENERIC_TURN_ERROR_CODE, POD_IDENTITY_MISMATCH_USER_MESSAGE
     type_name, _, message = text.partition(":")
     message = message.strip()
     if type_name == WORKER_UNRESPONSIVE_TYPE_NAME:
@@ -997,6 +1123,7 @@ def response_failed_payload(
     retry_after: float | None = None,
     retry_at: str | None = None,
     reset_at: str | None = None,
+    request_id: str | None = None,
 ) -> dict:
     """Wire payload for a ``response.failed`` event (SSE + DB sidecar).
 
@@ -1007,6 +1134,12 @@ def response_failed_payload(
     ``rate_limited`` so the card can time-gate its Retry — omitted otherwise to
     keep the shape unchanged for every other failure. All additive: an older
     client ignores fields it doesn't read.
+
+    ``request_id`` is the remote turn's own correlation id — present on every
+    remote-backend failure regardless of code, including the fully generic
+    ``anton_error`` bucket, so a user report of "An unexpected error
+    occurred" can still be pinned to this turn's server-side logs. The
+    in-process path has no such id to offer and omits it.
     """
     payload = {"type": "response.failed", "code": code, "error": error}
     if reconnectable is not None:
@@ -1021,6 +1154,8 @@ def response_failed_payload(
         payload["retry_at"] = retry_at
     if reset_at is not None:
         payload["reset_at"] = reset_at
+    if request_id is not None:
+        payload["request_id"] = request_id
     return payload
 
 
@@ -1034,6 +1169,7 @@ def response_failed_sse(
     retry_after: float | None = None,
     retry_at: str | None = None,
     reset_at: str | None = None,
+    request_id: str | None = None,
 ) -> str:
     """Build a ``response.failed`` SSE frame (same wire shape the renderer's
     parser already handles, plus the optional auth/model/retry-after fields)."""
@@ -1046,5 +1182,6 @@ def response_failed_sse(
         retry_after=retry_after,
         retry_at=retry_at,
         reset_at=reset_at,
+        request_id=request_id,
     )
     return f"event: response.failed\ndata: {json.dumps(payload)}\n\n"

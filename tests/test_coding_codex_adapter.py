@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from cowork.coding.contracts import EventType, ExtensionInventory, PermissionMode
@@ -81,6 +84,36 @@ def test_codex_model_discovery_keeps_models_that_need_credits(monkeypatch) -> No
     assert models == ["mindshub_air", "fable", "gpt-codex"]
 
 
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_codex_model_discovery_classifies_authentication_failures(
+    monkeypatch: pytest.MonkeyPatch, status_code: int
+) -> None:
+    response = httpx.Response(
+        status_code,
+        request=httpx.Request("GET", "https://api.mindshub.ai/v1/models"),
+    )
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def get(self, *_args, **_kwargs) -> httpx.Response:
+            return response
+
+    monkeypatch.setattr(codex_module.httpx, "Client", lambda **_kwargs: FakeClient())
+
+    with pytest.raises(
+        codex_module.ModelDiscoveryAuthenticationError,
+        match="sign-in does not match this server",
+    ):
+        codex_module.CodexEngine().discover_models(
+            EngineCredentials(minds_url="https://api.mindshub.ai", minds_api_key="mdb_test"),
+        )
+
+
 def test_codex_child_environment_never_contains_the_real_mindshub_key() -> None:
     environment = codex_config.client_environment(Path("/tmp/codex-home"))
     assert environment == {
@@ -107,7 +140,9 @@ def test_windows_skips_the_legacy_wsl_bash_launcher() -> None:
     assert shells._windows_bash_is_compatible(r"C:\Windows\System32\bash.exe") is False
 
 
-def test_bash_terminal_suppresses_the_misleading_macos_zsh_notice() -> None:
+def test_bash_terminal_suppresses_the_misleading_macos_zsh_notice(monkeypatch) -> None:
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLORTERM", "truecolor")
     assert codex_config.interactive_shell_environment(["/bin/bash", "--login"]) == {
         "BASH_SILENCE_DEPRECATION_WARNING": "1",
         "PREFIX": "",
@@ -276,14 +311,34 @@ def test_extension_inventory_normalizes_codex_skills_and_mcp_servers() -> None:
     assert inventory.mcp_servers[0].detail == "2 tools · 0 resources"
 
 
-def _codex_skill(name: str, path: Path, scope: str) -> SimpleNamespace:
+def test_extension_inventory_describes_mcp_sign_in_state_in_plain_words() -> None:
+    from openai_codex.generated.v2_all import McpAuthStatus
+
+    inventory = ExtensionInventory()
+    servers = [
+        SimpleNamespace(name=name, server_info=None, auth_status=auth_status, tools={"a": 1, "b": 2}, resources=[])
+        for name, auth_status in (
+            ("mindshub-code", McpAuthStatus.unsupported),
+            ("github", McpAuthStatus.not_logged_in),
+            ("linear", McpAuthStatus.o_auth),
+        )
+    ]
+    add_extension_response(inventory, "mcp", SimpleNamespace(data=servers))
+
+    assert [entry.status for entry in inventory.mcp_servers] == ["No sign-in needed", "Sign-in required", "Signed in"]
+    assert inventory.mcp_servers[0].detail == "2 tools · 0 resources"
+
+
+def _codex_skill(name: str, path: Path | None, scope: str) -> SimpleNamespace:
+    from openai_codex.generated.v2_all import AbsolutePathBuf
+
     return SimpleNamespace(
         name=name,
         description=f"{name} skill",
         short_description=None,
         enabled=True,
         scope=scope,
-        path=path,
+        path=AbsolutePathBuf(str(path)) if path else None,
     )
 
 
@@ -298,20 +353,21 @@ def _skills_inventory(skills: list[SimpleNamespace], skill_roots: tuple[Path, ..
     return inventory
 
 
-def test_extension_inventory_folds_a_skill_installed_in_both_skill_roots(tmp_path: Path) -> None:
+def test_extension_inventory_folds_a_skill_installed_in_both_skill_roots(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
     snapshot_root = tmp_path / "snapshot"
     user_root = tmp_path / "codex" / "skills"
     user_copy = _codex_skill("Thermo Nuclear Review", user_root / "thermo-nuclear-review" / "SKILL.md", "user")
-    snapshot_copy = _codex_skill("thermo-nuclear-review", snapshot_root / "thermo-nuclear-review" / "SKILL.md", "repo")
+    snapshot_copy = _codex_skill("thermo-nuclear-review", snapshot_root / "thermo-nuclear-review" / "SKILL.md", "user")
 
     inventory = _skills_inventory([user_copy, snapshot_copy], (snapshot_root,))
 
-    assert [entry.path for entry in inventory.skills] == [str(snapshot_copy.path)]
+    assert [entry.path for entry in inventory.skills] == [str(snapshot_root / "thermo-nuclear-review" / "SKILL.md")]
     surviving = inventory.skills[0]
-    assert [hidden.path for hidden in surviving.supersedes] == [str(user_copy.path)]
+    assert [hidden.path for hidden in surviving.supersedes] == [str(user_root / "thermo-nuclear-review" / "SKILL.md")]
     assert surviving.supersedes[0].label == "Thermo Nuclear Review"
     assert surviving.supersedes[0].description == "Thermo Nuclear Review skill"
-    assert surviving.detail == "repo · also installed in user"
+    assert surviving.detail == "Task snapshot · also installed in your Codex skills folder"
     assert len({entry.id for entry in inventory.skills}) == len(inventory.skills)
 
 
@@ -334,7 +390,7 @@ def test_extension_inventory_keeps_a_pathless_skill_out_of_the_snapshot_root(tmp
 
     inventory = _skills_inventory([pathless, snapshot_copy], (snapshot_root,))
 
-    assert [entry.path for entry in inventory.skills] == [str(snapshot_copy.path)]
+    assert [entry.path for entry in inventory.skills] == [str(snapshot_root / "review" / "SKILL.md")]
     assert inventory.skills[0].supersedes[0].path is None
 
 
@@ -349,7 +405,24 @@ def test_extension_inventory_keeps_distinct_skills_and_single_user_skills_untouc
     assert [entry.id for entry in inventory.skills] == ["review", "deploy"]
     assert all(entry.supersedes == [] for entry in inventory.skills)
     assert inventory.skills[0].detail == "user"
-    assert inventory.skills[1].detail == "repo"
+    assert inventory.skills[1].detail == "Task snapshot"
+
+
+def test_extension_inventory_renders_hook_and_plugin_paths_as_plain_paths(tmp_path: Path) -> None:
+    from openai_codex.generated.v2_all import AbsolutePathBuf
+
+    inventory = ExtensionInventory()
+    hook = SimpleNamespace(
+        key="format", event_name="PostToolUse", enabled=True, source="user", trust_status="trusted",
+        source_path=AbsolutePathBuf(str(tmp_path / "hooks.json")),
+    )
+    add_extension_response(inventory, "hooks", SimpleNamespace(data=[SimpleNamespace(hooks=[hook])]))
+    plugin = SimpleNamespace(id="lint", name="lint", installed=True, enabled=True, interface=None)
+    marketplace = SimpleNamespace(name="Team", path=AbsolutePathBuf(str(tmp_path / "marketplace")), plugins=[plugin])
+    add_extension_response(inventory, "plugins", SimpleNamespace(marketplaces=[marketplace]))
+
+    assert inventory.hooks[0].path == str(tmp_path / "hooks.json")
+    assert inventory.plugins[0].path == str(tmp_path / "marketplace")
 
 
 def test_code_and_user_skill_roots_use_current_codex_rpc_name(monkeypatch, tmp_path: Path) -> None:
@@ -789,6 +862,7 @@ def test_user_terminal_is_not_restricted_by_agent_permissions() -> None:
     engine_session._sandbox_policy = {"type": "readOnly", "networkAccess": False}
     engine_session._terminal_handlers = {"process-1": lambda *_args: None}
     engine_session._terminal_lock = codex_module.threading.Lock()
+    engine_session._terminal_commands = set()
     engine_session._secrets = ()
     exits: list[tuple[int | None, str | None]] = []
 
@@ -811,3 +885,165 @@ class _Payload:
 
     def model_dump(self, **_kwargs):
         return self.data
+
+
+def test_steer_past_the_deadline_is_followed_not_rejected(monkeypatch) -> None:
+    release = threading.Event()
+
+    class HangingClient:
+        def turn_steer(self, _thread_id: str, _turn_id: str, _items) -> None:
+            release.wait(timeout=5)
+
+    monkeypatch.setattr(codex_module, "_STEER_TIMEOUT_SECONDS", 0.05)
+    engine_session = object.__new__(codex_module.CodexEngineSession)
+    engine_session._client = HangingClient()
+    engine_session._session_id = "session-1"
+    engine_session._goal_states = {}
+
+    started = time.monotonic()
+    outcome = engine_session.steer("turn-1", "Change direction")
+    assert time.monotonic() - started < 2
+    # The request is still in flight: the caller gets something to follow, not
+    # a rejection, and a second steer for the same turn is refused meanwhile.
+    assert outcome is not None and outcome.settled is None
+    with pytest.raises(RuntimeError, match="still being delivered"):
+        engine_session.steer("turn-1", "Change direction again")
+
+    settled: list[tuple[bool, str]] = []
+    outcome.on_settled(lambda ok, detail: settled.append((ok, detail)))
+    release.set()
+    deadline = time.monotonic() + 2
+    while not settled and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert settled == [(True, "")]
+    # Once settled, the turn accepts new instructions again.
+    assert engine_session.steer("turn-1", "Next instruction") is None
+
+
+def test_steer_relays_the_codex_error_when_it_answers_in_time() -> None:
+    class RejectingClient:
+        def turn_steer(self, _thread_id: str, _turn_id: str, _items) -> None:
+            raise RuntimeError("turn is not active")
+
+    engine_session = object.__new__(codex_module.CodexEngineSession)
+    engine_session._client = RejectingClient()
+    engine_session._session_id = "session-1"
+    engine_session._goal_states = {}
+
+    with pytest.raises(RuntimeError, match="turn is not active"):
+        engine_session.steer("turn-1", "Change direction")
+
+
+def test_a_finished_turn_reaps_its_command_trees_but_keeps_codex_helpers(monkeypatch) -> None:
+    """WIN-QA-007: the app-server stays open between turns, so the turn's own
+    processes must be ended when it completes, without touching the MCP servers
+    and code-mode host Codex keeps for the next turn."""
+    import threading
+    from types import SimpleNamespace
+
+    from cowork.coding.engines import codex as codex_module
+    from cowork.coding.engines.codex import CodexEngineSession
+
+    class FakeClient:
+        _proc = SimpleNamespace(pid=4242)
+
+        def __init__(self) -> None:
+            self.notifications = iter([
+                SimpleNamespace(method="item/agentMessage/delta", payload={"delta": "hi"}),
+                SimpleNamespace(method="turn/completed", payload={"turn": {"id": "turn-1", "status": "completed"}}),
+            ])
+            self.unregistered: list[str] = []
+
+        def next_turn_notification(self, turn_id: str):
+            return next(self.notifications)
+
+        def unregister_turn_notifications(self, turn_id: str) -> None:
+            self.unregistered.append(turn_id)
+
+    session = object.__new__(CodexEngineSession)
+    session._client = FakeClient()
+    session._secrets = ()
+    session._closed = threading.Event()
+    session._cancel_watchdogs = {}
+    session._cancel_lock = threading.Lock()
+    session._goal_states = {}
+    session._mcp_servers = (("node", ("mcp.js",)),)
+    session._terminal_commands = {("/bin/bash", "--login")}
+
+    reaped: list[tuple[int | None, object]] = []
+    monkeypatch.setattr(codex_module, "terminate_command_trees", lambda pid, *, protected: reaped.append((pid, protected)) or 3)
+
+    list(session.events("turn-1"))
+
+    assert session._client.unregistered == ["turn-1"]
+    assert [pid for pid, _ in reaped] == [4242]
+    protected = reaped[0][1]
+
+    def proc(name, cmdline, environ=None):
+        return SimpleNamespace(name=lambda: name, cmdline=lambda: cmdline, environ=lambda: environ or {})
+
+    assert protected(proc("codex-code-mode-host.exe", ["codex-code-mode-host.exe"]))
+    assert protected(proc("python", ["python", "-m", "cowork.coding.integration_mcp", "/root", "task"]))
+    assert protected(proc("node", ["/usr/bin/node", "mcp.js"]))
+    # A terminal tab or Run action: the sidecar marks its environment, and on
+    # macOS, where a PTY shell's environment is unreadable, its argv is known.
+    assert protected(proc("zsh", ["/bin/zsh", "-il"], {"COWORK_CODE_TERMINAL": "terminal-1", "TERM": "xterm-256color"}))
+    assert protected(proc("bash", ["/bin/bash", "--login"], {}))
+    assert not protected(proc("bash", ["/bin/bash", "-lc", "npm test"], {}))
+    assert not protected(proc("node", ["node", "server.js"]))
+    assert not protected(proc("cmd.exe", ["cmd.exe", "/c", "npm test"]))
+    assert not protected(proc("zsh", ["/bin/zsh", "-lc", "npm run dev"], {"TERM": "xterm-256color"}))
+
+    class Opaque:
+        def name(self):
+            raise PermissionError("no access")
+
+        def cmdline(self):
+            return []
+
+        def environ(self):
+            return {}
+
+    assert protected(Opaque())
+
+    # Once the session is closed, close() has already torn everything down.
+    session._closed.set()
+    list(FakeClient().notifications)  # unused; keeps the fake independent
+    session._client = FakeClient()
+    list(session.events("turn-2"))
+    assert len(reaped) == 1
+
+
+def test_terminal_tabs_are_marked_so_a_finished_turn_leaves_them_running(tmp_path: Path) -> None:
+    import threading
+    from types import SimpleNamespace
+
+    from cowork.coding.contracts import TerminalShellPreference
+    from cowork.coding.engines.codex import CodexEngineSession
+    from cowork.coding.processes import TERMINAL_ENV_MARKER
+
+    requests: list[tuple[str, dict]] = []
+
+    class FakeClient:
+        def request(self, method, params, response_model=None):
+            requests.append((method, params))
+            return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    session = object.__new__(CodexEngineSession)
+    session._client = FakeClient()
+    session._terminal_workspace = tmp_path
+    session._terminal_handlers = {}
+    session._terminal_lock = threading.Lock()
+    session._secrets = ()
+    session._closed = threading.Event()
+    session._terminal_commands = set()
+    exits: list[tuple[int | None, str | None]] = []
+
+    session._run_terminal("terminal-7", 120, 40, TerminalShellPreference.bash, lambda code, error: exits.append((code, error)))
+
+    (method, params), = requests
+    assert method == "command/exec"
+    assert params["processId"] == "terminal-7"
+    assert params["env"][TERMINAL_ENV_MARKER] == "terminal-7"
+    assert tuple(params["command"]) in session._terminal_commands
+    assert exits == [(0, None)]

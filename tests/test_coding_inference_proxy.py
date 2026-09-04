@@ -10,8 +10,20 @@ from cowork.api.v1.endpoints.coding import (
     _inference_url,
     _require_inference_client,
 )
+import json
+
+import httpx
+
+from cowork.coding import inference_proxy as inference_proxy_module
+from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.engines.codex_config import LOCAL_PROXY_TOKEN
-from cowork.coding.inference_proxy import MAX_INFERENCE_BODY_BYTES, read_inference_body
+from cowork.coding.inference_proxy import (
+    MAX_INFERENCE_BODY_BYTES,
+    proxy_inference,
+    read_inference_body,
+    terminal_rejection,
+    upstream_error_message,
+)
 
 
 def _request(headers: list[tuple[bytes, bytes]], body: bytes = b"") -> Request:
@@ -98,3 +110,87 @@ async def test_inference_body_reader_rejects_declared_and_streamed_oversize_payl
     with pytest.raises(HTTPException) as streamed_error:
         await read_inference_body(streamed)
     assert streamed_error.value.status_code == 413
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [(401, "model_authentication_failed"), (402, "insufficient_credits"), (403, "model_authentication_failed"), (404, "model_unavailable")],
+)
+def test_deterministic_upstream_rejections_become_a_terminal_400_with_a_stable_code(status: int, code: str) -> None:
+    rejection = terminal_rejection(status, b'{"error": {"message": "Your wallet has no balance.", "type": "x"}}')
+
+    assert rejection is not None
+    returned_code, body = rejection
+    assert returned_code == code
+    assert json.loads(body) == {
+        "error": {
+            "message": "Your wallet has no balance.",
+            "type": "invalid_request_error",
+            "code": code,
+            "upstream_status": status,
+        }
+    }
+
+
+@pytest.mark.parametrize("status", [400, 429, 500, 502, 503])
+def test_retryable_and_already_terminal_statuses_are_not_rewritten(status: int) -> None:
+    assert terminal_rejection(status, b"{}") is None
+
+
+def test_upstream_error_message_survives_plain_text_and_odd_json_shapes() -> None:
+    assert upstream_error_message(b"Payment Required") == "Payment Required"
+    assert upstream_error_message(b'{"error": "wallet empty"}') == "wallet empty"
+    assert upstream_error_message(b'{"detail": "Not Found"}') == "Not Found"
+    assert upstream_error_message(b"\xff\xfe") == "��"
+
+
+@pytest.mark.asyncio
+async def test_proxy_answers_an_upstream_402_with_one_terminal_400(monkeypatch: pytest.MonkeyPatch) -> None:
+    upstream_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal upstream_calls
+        upstream_calls += 1
+        return httpx.Response(
+            402,
+            json={"error": {"message": "Your wallet has no balance to cover the model 'gpt'.", "code": "insufficient_credits"}},
+            headers={"x-request-id": "req-1"},
+        )
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        inference_proxy_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    request = _request([(b"content-type", b"application/json")], b'{"model": "gpt", "input": "hi"}')
+
+    response = await proxy_inference(request, "responses", EngineCredentials(minds_url="https://api.example", minds_api_key="mdb_key"))
+
+    assert upstream_calls == 1
+    assert response.status_code == 400
+    assert response.headers["x-mindshub-error-code"] == "insufficient_credits"
+    assert response.headers["x-mindshub-upstream-status"] == "402"
+    assert response.headers["x-request-id"] == "req-1"
+    assert json.loads(response.body)["error"]["code"] == "insufficient_credits"
+    assert json.loads(response.body)["error"]["message"] == "Your wallet has no balance to cover the model 'gpt'."
+
+
+@pytest.mark.asyncio
+async def test_proxy_streams_successful_and_retryable_responses_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, content=b"busy", headers={"retry-after": "2"})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        inference_proxy_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    request = _request([(b"content-type", b"application/json")], b"{}")
+
+    response = await proxy_inference(request, "responses", EngineCredentials(minds_url="https://api.example", minds_api_key="mdb_key"))
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "2"
+    assert "x-mindshub-error-code" not in response.headers

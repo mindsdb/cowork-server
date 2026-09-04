@@ -142,6 +142,7 @@ class CodingCommandHandler:
                         title="Compaction started",
                         text="Codex is compacting the task context. Future turns will continue from the compacted history.",
                         phase="completed",
+                        data={"command": "compact"},
                     ),
                 )
             elif intent.name == "goal":
@@ -180,7 +181,7 @@ class CodingCommandHandler:
                 title=labels[action],
                 text=text,
                 phase="completed",
-                data={"goal": goal or {}},
+                data={"command": "goal", "goal": goal or {}},
             ),
         )
 
@@ -209,6 +210,6 @@ class CodingCommandHandler:
                 title="Task status",
                 text=text,
                 phase="completed",
-                data={"goal": goal or {}},
+                data={"command": "status", "goal": goal or {}},
             ),
         )

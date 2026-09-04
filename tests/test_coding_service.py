@@ -10,6 +10,7 @@ import time
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -25,6 +26,7 @@ from coding_service_fakes import (
     wait_for_steers,
 )
 
+from cowork.coding.engines.base import SteerOutcome
 from cowork.coding.contracts import (
     CodingEvent,
     CodingSession,
@@ -1147,6 +1149,65 @@ def test_failed_adapter_stream_closes_the_runtime_before_another_turn_can_reuse_
     assert service.get_session(created.id).last_error == "adapter stream disconnected"
 
 
+def test_credit_exhaustion_is_reported_with_a_stable_code_and_the_technical_detail(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    engine.events_error = True
+    engine.events_error_message = (
+        '{"error": {"message": "Your wallet has no balance to cover the model \'gpt\'.", '
+        '"type": "invalid_request_error", "code": "insufficient_credits", "upstream_status": 402}}'
+    )
+    service = service_with(tmp_path, engine)
+
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Start work"), CREDS, "fake", "gpt"
+    )
+    wait_for_status(service, created.id, SessionStatus.failed)
+
+    failed = service.get_session(created.id)
+    error = [event for event in service.events(created.id).items if event.type == EventType.error][-1]
+    assert failed.last_error == "This model needs credits. Add credits or choose another model."
+    assert error.text == failed.last_error
+    assert error.data == {
+        "code": "insufficient_credits",
+        "detail": engine.events_error_message,
+        "model": "gpt",
+    }
+    assert engine.closed == 1
+
+
+def test_a_turn_codex_reports_as_failed_is_classified_at_its_terminal_event(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    engine.turn_failure_message = (
+        '{"error": {"message": "Invalid API key", "type": "invalid_request_error", '
+        '"code": "model_authentication_failed", "upstream_status": 401}}'
+    )
+    service = service_with(tmp_path, engine)
+
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Start work"), CREDS, "fake", "gpt"
+    )
+    wait_for_status(service, created.id, SessionStatus.failed)
+
+    failed = service.get_session(created.id)
+    events = service.events(created.id).items
+    terminal = [event for event in events if event.type == EventType.session and event.data.get("status") == "failed"][-1]
+    raw = [event for event in events if event.type == EventType.error][-1]
+    assert failed.last_error == (
+        "Your sign-in does not match this server. Sign in again, or switch back to the environment you signed into."
+    )
+    assert terminal.text == failed.last_error
+    assert terminal.data == {
+        "status": "failed",
+        "code": "model_authentication_failed",
+        "detail": engine.turn_failure_message,
+        "model": "gpt",
+    }
+    assert raw.text == engine.turn_failure_message
+    assert raw.data == {}
+
+
 def test_local_context_exhaustion_recovers_ready_with_a_fresh_agent_session(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     engine = FakeEngine()
@@ -1563,6 +1624,27 @@ def test_status_and_compact_commands_do_not_start_model_turns(tmp_path: Path) ->
     assert "compacting the task context" in text
 
 
+def test_a_queued_read_only_command_does_not_continue_a_completed_task(tmp_path: Path) -> None:
+    # The queued form of D7: /status typed while the task was still working is
+    # delivered after the turn completes and must leave the task Completed.
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    created = service.create_session(SessionCreateRequest(path=str(repo), prompt="Start work"), CREDS, "fake", "gpt")
+    wait_for_status(service, created.id, SessionStatus.completed)
+    before = service.get_session(created.id)
+    queued = QueuedInstruction(id="queued-status", prompt="/status")
+    service.store.update_session(created.id, lambda session: session.queued_instructions.append(queued))
+
+    after = service.run_next_queued(created.id, CREDS, queued.id)
+
+    assert after.status == SessionStatus.completed
+    assert after.run_id == before.run_id
+    assert after.queued_instructions == []
+    status_events = [event for event in service.events(created.id).items if event.title == "Task status"]
+    assert len(status_events) == 1
+    assert status_events[0].text.startswith("Status: completed")
+
+
 def test_queue_continues_after_an_immediate_command_without_reusing_its_id(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     engine = FakeEngine()
@@ -1711,6 +1793,46 @@ def test_steering_reaches_active_engine_and_is_recorded(tmp_path: Path) -> None:
     wait_for_steers(engine)
     assert engine.steers == [("turn-1", "Focus on tests")]
     assert service.events(created.id).items[-1].text == "Focus on tests"
+    service.cancel(created.id)
+    wait_for_status(service, created.id, SessionStatus.cancelled)
+
+
+def test_a_steer_codex_has_not_confirmed_is_recorded_and_followed(tmp_path: Path) -> None:
+    # When Codex does not answer turn/steer in time the instruction is still in
+    # flight. Record it as unconfirmed and report what finally happened, rather
+    # than rejecting it and inviting the user to send it twice.
+    repo = repository(tmp_path)
+    engine = FakeEngine(block_until_cancel=True)
+    service = service_with(tmp_path, engine)
+    created = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Long turn"), CREDS, "fake", "fake-model"
+    )
+    assert engine.started.wait(timeout=1)
+
+    engine.steer_pending = SteerOutcome()
+    service.steer(created.id, "Focus on tests")
+    recorded = service.events(created.id).items[-1]
+    assert recorded.type == EventType.user_message
+    assert recorded.title == "Follow-up (unconfirmed)"
+    assert recorded.phase == "pending"
+    assert recorded.text == "Focus on tests"
+
+    engine.steer_pending.settle(False, "turn is not active")
+    failed = service.events(created.id).items[-1]
+    assert failed.type == EventType.error
+    assert failed.title == "Follow-up not delivered"
+    assert "Send it again" in failed.text
+
+    engine.steer_pending = SteerOutcome()
+    queued = service.queue_turn(created.id, "Also add a README")
+    instruction_id = queued.queued_instructions[0].id
+    after = service.steer_queued_turn(created.id, instruction_id)
+    assert after.queued_instructions == []  # in flight, not re-queued: it must not run twice
+    engine.steer_pending.settle(True)
+    delivered = service.events(created.id).items[-1]
+    assert delivered.type == EventType.command_result
+    assert delivered.title == "Follow-up delivered"
+
     service.cancel(created.id)
     wait_for_status(service, created.id, SessionStatus.cancelled)
 
@@ -2057,6 +2179,95 @@ def test_fork_writes_the_durable_session_without_the_control_plane_projection(tm
     assert child.run_status == "completed"
 
 
+def test_tasks_inheriting_a_legacy_default_model_run_with_the_catalog_id(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(ProjectCreateRequest(
+        name="Legacy model",
+        folders=[ProjectFolder(id="repo", name="Repo", path=str(repo))],
+        default_engine_id="fake",
+        default_model="gpt-5.6-sol",
+    ))
+
+    from_project = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Use the project default"),
+        CREDS,
+        "fake",
+        "gpt-5.6-sol",
+    )
+    from_settings = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Use the settings default"), CREDS, "fake", "gpt-5.6-sol"
+    )
+    explicit = service.create_session(
+        SessionCreateRequest(path=str(repo), prompt="Use an unknown id", model="fable"), CREDS, "fake", "gpt"
+    )
+
+    assert (from_project.model, from_settings.model, explicit.model) == ("gpt", "gpt", "fable")
+
+
+def test_a_project_default_reasoning_effort_applies_unless_the_task_chooses_its_own(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(ProjectCreateRequest(
+        name="Effort defaults",
+        folders=[ProjectFolder(id="repo", name="Repo", path=str(repo))],
+        default_engine_id="fake",
+        default_model="fake-model",
+        default_reasoning_effort="low",
+    ))
+
+    inherited = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Use the project default"), CREDS, "fake", "fake-model"
+    )
+    chosen = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Pick my own", reasoning_effort="xhigh"), CREDS, "fake", "fake-model"
+    )
+
+    assert inherited.reasoning_effort == "low"
+    assert chosen.reasoning_effort == "xhigh"
+    wait_for_status(service, inherited.id, SessionStatus.completed)
+    wait_for_status(service, chosen.id, SessionStatus.completed)
+
+
+def test_effort_levels_follow_what_the_gateway_advertises_for_the_task_model(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(ProjectCreateRequest(
+        name="Effort levels",
+        folders=[ProjectFolder(id="repo", name="Repo", path=str(repo))],
+        default_engine_id="fake",
+        default_model="fake-model",
+        default_reasoning_effort="max",
+    ))
+    levels = SimpleNamespace(
+        ids=["fake-model", "fake-small"],
+        efforts={
+            "fake-model": {"efforts": ["low", "high", "max"], "default": "high"},
+            "fake-small": {"efforts": ["low", "high"], "default": "low"},
+        },
+    )
+
+    with pytest.raises(ValueError, match='Reasoning effort "xhigh" isn\'t available for fake-model. It offers: low, high, max.'):
+        service.create_session(
+            SessionCreateRequest(project_id=project.id, prompt="Ask for a level it lacks", reasoning_effort="xhigh"),
+            CREDS, "fake", "fake-model", model_levels=levels,
+        )
+    assert service.list_sessions(False).items == []
+
+    inherited = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Inherit max"), CREDS, "fake", "fake-model", model_levels=levels
+    )
+    other_model = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="A model without max", model="fake-small"),
+        CREDS, "fake", "fake-model", model_levels=levels,
+    )
+
+    assert inherited.reasoning_effort == "max"
+    assert other_model.reasoning_effort is None
+    wait_for_status(service, inherited.id, SessionStatus.completed)
+    wait_for_status(service, other_model.id, SessionStatus.completed)
+
+
 def test_failed_fork_preparation_does_not_leave_control_records(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2136,7 +2347,7 @@ def test_project_fork_keeps_every_folder_change_isolated_and_reviewable(tmp_path
     assert child.allocated_ports["PORT"] != parent.allocated_ports["PORT"]
     assert child.workspaces[1].workspace_path in child.additional_dirs
     assert child.workspaces[1].workspace_path in child.developer_instructions
-    assert engine.forked_workspaces[-1] == str(Path(child.workspaces[0].workspace_path).parent)
+    assert engine.forked_workspaces[-1] == child.workspaces[0].workspace_path
     assert engine.forked_additional_dirs[-1] == tuple(child.additional_dirs)
 
 
@@ -2217,7 +2428,7 @@ def test_scoped_task_validation_and_fork_use_immutable_project_snapshot(tmp_path
     assert child.run_id != parent.run_id
 
 
-def test_project_runtime_opens_at_the_task_root_for_goal_writes_across_folders(tmp_path: Path) -> None:
+def test_project_runtime_opens_in_primary_workspace_and_keeps_other_folders_available(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     notes = tmp_path / "notes"
     notes.mkdir()
@@ -2244,10 +2455,10 @@ def test_project_runtime_opens_at_the_task_root_for_goal_writes_across_folders(t
     )
     wait_for_status(service, task.id, SessionStatus.completed)
 
-    expected_root = Path(task.workspaces[0].workspace_path).parent
-    assert expected_root.name == task.id
-    assert {Path(item.workspace_path).parent for item in task.workspaces} == {expected_root}
-    assert engine.opened_workspaces[-1] == str(expected_root)
+    primary = task.workspaces[0].workspace_path
+    secondary = task.workspaces[1].workspace_path
+    assert engine.opened_workspaces[-1] == primary
+    assert engine.configs[-1].additional_dirs == (secondary,)
 
 
 def test_project_delivery_is_planned_then_explicitly_publishes_a_draft_pr(tmp_path: Path) -> None:
@@ -2601,3 +2812,39 @@ def test_project_task_resumes_same_workspaces_and_ports_after_service_restart(tm
     assert loaded.allocated_ports == original_ports
     assert restarted_engine.existing_ids[0] == original_engine_session_id
     assert next_task.allocated_ports["PORT"] != original_ports["PORT"]
+
+
+def test_steering_while_an_approval_is_pending_is_refused_and_keeps_the_queue(tmp_path: Path) -> None:
+    session = stored_local_session(tmp_path, SessionStatus.ready)
+    service = service_with(tmp_path, FakeEngine())
+    pending = PendingApproval(id="approval-1", method="command", kind="command", title="Run it", detail="npm install", risk="low", scope="once")
+    service._emit(session.id, CodingEvent(type=EventType.session, phase="started"), mark_running)
+    service._emit(session.id, CodingEvent(type=EventType.approval, phase="pending"), lambda current: service._open_approval(current, pending))
+    queued = QueuedInstruction(id="queued-readme", prompt="Also add a README")
+    service.store.update_session(session.id, lambda current: current.queued_instructions.append(queued))
+
+    with pytest.raises(StateConflict, match="Resolve the pending approval first"):
+        service.steer(session.id, "Change direction")
+
+    current = service.get_session(session.id)
+    assert current.pending_approval is not None
+    assert [item.id for item in current.queued_instructions] == [queued.id]
+    assert current.status == SessionStatus.awaiting_approval
+
+
+def test_a_read_only_command_does_not_continue_a_completed_task(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    created = service.create_session(SessionCreateRequest(path=str(repo), prompt="Start work"), CREDS, "fake", "gpt")
+    wait_for_status(service, created.id, SessionStatus.completed)
+    before = service.get_session(created.id)
+
+    service.submit_turn(created.id, "/status", CREDS)
+
+    after = service.get_session(created.id)
+    status_events = [event for event in service.events(created.id).items if event.title == "Task status"]
+    assert after.status == SessionStatus.completed
+    assert after.run_id == before.run_id
+    assert len(status_events) == 1
+    assert status_events[0].text.startswith("Status: completed")
+    assert status_events[0].data["command"] == "status"
