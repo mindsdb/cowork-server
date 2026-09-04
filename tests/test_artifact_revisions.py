@@ -919,7 +919,10 @@ def test_rejected_repair_retry_finishes_interrupted_status_write(artifact, monke
     ]) == 1
 
 
-def test_agent_repair_decision_refuses_a_changed_head(artifact):
+@pytest.fixture
+def repair_behind_a_moved_head(artifact):
+    """A ready repair whose revision the owner has since edited past - the
+    state every accept and reject used to fail in, permanently."""
     folder, metadata, artifact_id = artifact
     initial = current_source(folder, metadata, artifact_id)
     requested = create_agent_repair(
@@ -935,14 +938,92 @@ def test_agent_repair_decision_refuses_a_changed_head(artifact):
     (folder / "brief.md").write_text("# Agent title\n", encoding="utf-8")
     capture_agent_revision(folder, conversation_id="conversation-1")
     ready = agent_repair_detail(folder, requested["repair"]["id"])["repair"]
-    current = current_source(folder, metadata, artifact_id)
     save_source(
         folder,
         metadata,
         artifact_id,
         content="# Owner follow-up\n",
-        expected_revision_id=current["revision"]["id"],
+        expected_revision_id=current_source(folder, metadata, artifact_id)["revision"]["id"],
     )
+    head = current_source(folder, metadata, artifact_id)["revision"]["id"]
+    return folder, metadata, artifact_id, ready, head
+
+
+def test_active_repair_reports_whether_the_artifact_moved_past_it(repair_behind_a_moved_head):
+    """The viewer decides whether to open the comparison from this flag, so it
+    has to distinguish a pending decision from one the artifact overtook."""
+    folder, _metadata, _artifact_id, ready, _head = repair_behind_a_moved_head
+
+    active = active_agent_repair(folder, ready["path"])
+
+    assert active["id"] == ready["id"]
+    assert active["status"] == "ready"
+    assert active["superseded"] is True
+
+
+def test_active_repair_ignores_other_paths(artifact):
+    """The create guard is path filtered, so a repair on another file must not
+    reach the viewer opening this one."""
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
+    create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=initial["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "Please change this"}],
+        conversation_id="conversation-1",
+    )
+
+    assert active_agent_repair(folder, "brief.md")["commentThreadId"] == "thread-1"
+    assert active_agent_repair(folder, "other.md") is None
+    assert active_agent_repair(folder)["commentThreadId"] == "thread-1"
+
+
+def test_accept_survives_a_moved_head(repair_behind_a_moved_head):
+    """Accepting keeps the agent's revision, which is already in history; it
+    writes no content, so head having moved does not make it unsafe."""
+    folder, metadata, artifact_id, ready, _head = repair_behind_a_moved_head
+
+    decided = finalize_agent_repair(folder, metadata, artifact_id, ready["id"], "accepted")
+
+    assert decided["status"] == "accepted"
+    # The owner's later edit is untouched.
+    assert (folder / "brief.md").read_text(encoding="utf-8") == "# Owner follow-up\n"
+
+
+def test_accept_is_idempotent(repair_behind_a_moved_head):
+    """A lost response or a double-click must not report a failure for a
+    decision that already landed."""
+    folder, metadata, artifact_id, ready, _head = repair_behind_a_moved_head
+    finalize_agent_repair(folder, metadata, artifact_id, ready["id"], "accepted")
+
+    again = finalize_agent_repair(folder, metadata, artifact_id, ready["id"], "accepted")
+
+    assert again["status"] == "accepted"
+
+
+def test_accept_refuses_when_the_agent_revision_left_history(repair_behind_a_moved_head):
+    """History is pruned past MAX_REVISIONS, so there is a real case where the
+    agent's revision is gone and there is nothing left to keep."""
+    folder, metadata, artifact_id, ready, _head = repair_behind_a_moved_head
+    manifest_path = folder / ".revisions" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["revisions"] = [
+        entry for entry in manifest["revisions"] if entry["id"] != ready["revisionId"]
+    ]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="no longer in this artifact's history"):
+        finalize_agent_repair(folder, metadata, artifact_id, ready["id"], "accepted")
+
+
+def test_reject_refuses_a_head_the_user_did_not_confirm(repair_behind_a_moved_head):
+    """Rejecting restores the pre-agent content over whatever is there now, so
+    it stays guarded - including against a head that moved after the confirm."""
+    folder, metadata, artifact_id, ready, _head = repair_behind_a_moved_head
 
     with pytest.raises(RevisionConflict):
         finalize_agent_repair(
@@ -950,10 +1031,37 @@ def test_agent_repair_decision_refuses_a_changed_head(artifact):
             metadata,
             artifact_id,
             ready["id"],
-            "accepted",
+            "rejected",
+            expected_head_revision_id="a-head-that-moved-on",
         )
 
     assert agent_repair_detail(folder, ready["id"])["repair"]["status"] == "ready"
+    assert (folder / "brief.md").read_text(encoding="utf-8") == "# Owner follow-up\n"
+
+
+def test_reject_restores_when_the_user_confirmed_the_current_head(repair_behind_a_moved_head):
+    folder, metadata, artifact_id, ready, head = repair_behind_a_moved_head
+
+    decided = finalize_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        ready["id"],
+        "rejected",
+        expected_head_revision_id=head,
+    )
+
+    assert decided["status"] == "rejected"
+    assert (folder / "brief.md").read_text(encoding="utf-8") == "# First\n"
+
+
+def test_reject_without_a_confirmed_head_keeps_the_strict_rule(repair_behind_a_moved_head):
+    """An older client sends no head, and must keep refusing rather than
+    silently restoring over an edit its user never saw."""
+    folder, metadata, artifact_id, ready, _head = repair_behind_a_moved_head
+
+    with pytest.raises(RevisionConflict):
+        finalize_agent_repair(folder, metadata, artifact_id, ready["id"], "rejected")
 
 
 def test_agent_repair_finishes_when_agent_makes_no_change(artifact):

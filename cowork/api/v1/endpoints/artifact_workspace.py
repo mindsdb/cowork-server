@@ -312,6 +312,9 @@ class _AgentRepairBody(BaseModel):
 
 class _RepairDecisionBody(BaseModel):
     status: Literal["accepted", "rejected"]
+    # The head the user confirmed against. Rejecting restores over it, so a
+    # head that moved between the confirm and this request must not be written.
+    expectedHeadRevisionId: str | None = Field(default=None, max_length=80)
 
 
 class _RepairCancelBody(BaseModel):
@@ -351,7 +354,7 @@ async def artifact_source(
     )
     try:
         result = await run_in_threadpool(current_workspace, folder, metadata, artifact_id, path)
-        repair = await run_in_threadpool(active_agent_repair, folder)
+        repair = await run_in_threadpool(active_agent_repair, folder, result.get("path"))
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -802,6 +805,7 @@ async def decide_agent_repair(
             repair_id,
             body.status,
             actor_id=actor_id,
+            expected_head_revision_id=body.expectedHeadRevisionId,
         )
     except RevisionConflict as exc:
         raise HTTPException(

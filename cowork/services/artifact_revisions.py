@@ -796,19 +796,28 @@ def agent_repair_detail(folder: Path, repair_id: str) -> dict:
         return result
 
 
-def active_agent_repair(folder: Path) -> dict | None:
+def active_agent_repair(folder: Path, rel_path: str | None = None) -> dict | None:
     """Return the newest repair that still needs owner attention.
 
     The artifact viewer is unmounted when the user follows the generated agent
     task. Persisted discovery lets reopening the artifact resume polling or
     show the comparison instead of losing the handoff in React state.
+
+    Filtered by path when one is given, matching the create guard: a repair on
+    another file has nothing to say about the source being opened. The record
+    carries `superseded` so the viewer can tell a decision it can still act on
+    from one the artifact has moved past.
     """
     active = [
         repair
         for repair in _repair_records(folder)
         if repair.get("status") in {"queued", "ready"}
+        and (rel_path is None or repair.get("path") == rel_path)
     ]
-    return max(active, key=lambda repair: str(repair.get("createdAt") or ""), default=None)
+    newest = max(active, key=lambda repair: str(repair.get("createdAt") or ""), default=None)
+    if newest is None:
+        return None
+    return {**newest, "superseded": _is_superseded(_read_manifest(folder), newest)}
 
 
 def cancel_agent_repair(folder: Path, repair_id: str, *, discard_ready: bool = False) -> dict:
@@ -868,17 +877,25 @@ def finalize_agent_repair(
     decision: str,
     *,
     actor_id: str | None = None,
+    expected_head_revision_id: str | None = None,
 ) -> dict:
     """Accept or reject a ready repair under one artifact-wide lock.
 
-    Both the head check and a rejection restore happen while the same lock is
-    held. This prevents two review tabs from accepting one suggestion while a
-    concurrent request restores its pre-agent content.
+    Accepting keeps the agent's revision and writes no content, so it does not
+    need that revision to still be head - only to still exist in history.
+    Rejecting restores the pre-agent content over whatever is there now, so it
+    stays guarded: the caller passes the head it showed the user, and a head
+    that moved since answers a conflict. Both that check and the restore happen
+    under the same lock, so two review tabs cannot interleave.
     """
     if decision not in {"accepted", "rejected"}:
         raise RevisionValidationError("Invalid repair status")
     with artifact_lock(folder):
         repair = _read_repair(folder, repair_id)
+        if repair.get("status") == decision:
+            # A retried or double-clicked decision that already landed must not
+            # report a failure for work the user completed.
+            return repair
         if repair.get("status") != "ready":
             raise RevisionValidationError("Agent repair is not ready for review")
         source = _current_source_locked(folder, metadata, artifact_id, repair.get("path"))
@@ -897,7 +914,22 @@ def finalize_agent_repair(
             repair["updatedAt"] = _now()
             _write_repair(folder, repair)
             return repair
-        if current.get("id") != repair.get("revisionId"):
+        if decision == "accepted":
+            manifest = _read_manifest(folder)
+            if not any(
+                entry.get("id") == repair.get("revisionId")
+                and entry.get("path") == repair.get("path")
+                for entry in manifest["revisions"]
+            ):
+                # History is pruned past MAX_REVISIONS, so the agent's revision
+                # can age out. There is nothing left to keep, only to discard.
+                raise RevisionValidationError(
+                    "The agent's revision is no longer in this artifact's history"
+                )
+        elif expected_head_revision_id is not None:
+            if current.get("id") != expected_head_revision_id:
+                raise RevisionConflict(current)
+        elif current.get("id") != repair.get("revisionId"):
             raise RevisionConflict(current)
 
         if decision == "rejected":
