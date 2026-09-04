@@ -51,8 +51,12 @@ jobs:
     # it enters the reusable production path, while leaving push-to-main
     # unchanged. This is defense in depth against an accidental dispatch, not
     # the credential boundary: a selected branch can change this workflow. The
-    # prod GitHub Environment must independently require reviewers and allow
-    # deployments from main only before it carries a standing test credential.
+    # prod GitHub Environment must first have a nonempty reviewer rule, prevent
+    # self-review, disable admin bypass, and allow exactly one `main` Branch
+    # rule. Add credentials only after that policy is active. Count evidence
+    # only from a fresh attempt 1 started afterward and approved at the prod gate
+    # by an eligible reviewer other than both the actor and triggering actor.
+    # See README.md.
     if: github.ref == 'refs/heads/main'
     permissions:
       contents: read

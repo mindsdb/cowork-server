@@ -114,10 +114,15 @@ def _verified_prod_standing_identity() -> _Identity:
     """Resolve the dedicated prod API key through auth without mutating a user."""
     api_key = os.environ.get("COWORK_TEST_API_KEY")
     expected_email = os.environ.get("COWORK_TEST_USER_EMAIL")
-    if not (api_key and expected_email):
+    expected_org_id = os.environ.get("COWORK_TEST_ORG_ID")
+    if not (api_key and expected_email and expected_org_id):
         missing_prerequisite(
             "COWORK_TEST_IDENTITY_MODE=standing requires COWORK_TEST_API_KEY and "
-            "COWORK_TEST_USER_EMAIL"
+            "COWORK_TEST_USER_EMAIL and COWORK_TEST_ORG_ID"
+        )
+    if not api_key.startswith("mdb_"):
+        missing_prerequisite(
+            "COWORK_TEST_API_KEY must be a MindsDB API key beginning with mdb_"
         )
     if not expected_email.lower().endswith(CONTROLLED_TEST_EMAIL_SUFFIX):
         missing_prerequisite(
@@ -149,13 +154,25 @@ def _verified_prod_standing_identity() -> _Identity:
         )
     if not isinstance(payload, dict) or payload.get("valid") is not True:
         pytest.fail("auth did not validate the dedicated prod Cowork test identity")
+    if (
+        payload.get("auth_method") != "api_key"
+        or payload.get("key_type") != "user"
+        or payload.get("key_prefix") != api_key.partition(".")[0]
+    ):
+        pytest.fail(
+            "the dedicated prod Cowork credential is not a standing user API key"
+        )
     if str(payload.get("email", "")).lower() != expected_email.lower():
         pytest.fail(
             "auth returned a different email for the dedicated prod Cowork test identity"
         )
-    if not payload.get("user_id") or not payload.get("organization_id"):
+    if str(payload.get("organization_id", "")) != expected_org_id:
         pytest.fail(
-            "auth returned no user or organization id for the dedicated prod Cowork test identity"
+            "auth returned a different organization for the dedicated prod Cowork test identity"
+        )
+    if not payload.get("user_id"):
+        pytest.fail(
+            "auth returned no user id for the dedicated prod Cowork test identity"
         )
     try:
         hub_admin = payload["entitlements"]["permissions"]["admin"]["hub"]
