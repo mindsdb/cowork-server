@@ -23,6 +23,11 @@ class ProjectResponse(BaseModel):
     created_at: datetime | None = None
     modified_at: datetime | None = None
     name: str
+    # The label the user typed; `name` stays the slug. NULL means the row
+    # predates the column, and every reader resolves it as `display_name or
+    # name` (ENG-1676). It has to be declared here or FastAPI filters it out
+    # of the response and the whole feature disappears from the wire.
+    display_name: str | None = None
     path: str
     is_active: bool
     org_id: str | None = None
