@@ -623,7 +623,9 @@ class ProjectService:
             from cowork.services.skills import SkillService
 
             reconcile_project(
-                project_dir, SkillService(self.session.scope).list_skills()
+                project_dir,
+                SkillService(self.session.scope).list_skills(),
+                project_name=final_name,
             )
 
         return project
@@ -833,7 +835,11 @@ class ProjectService:
 
                 skill_service = SkillService(self.session.scope)
                 skill_service.finalize_project_reference_rewrites(stage.skill_rewrites)
-                reconcile_project(stage.new_path, skill_service.list_skills())
+                reconcile_project(
+                    stage.new_path,
+                    skill_service.list_skills(),
+                    project_name=stage.new_name,
+                )
             except Exception:
                 logger.exception(
                     "Could not reconcile desktop links for renamed project %s",
