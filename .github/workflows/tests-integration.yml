@@ -36,7 +36,7 @@ jobs:
         run: |
           printf "machine github.com\nlogin x-access-token\npassword %s\n" "$GITHUB_TOKEN" > ~/.netrc
           chmod 600 ~/.netrc
-          uv sync --locked --group dev --extra hermes
+          uv sync --locked --group dev
 
       # Where to point the tests, and where to get an identity.
       #
