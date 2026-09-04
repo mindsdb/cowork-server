@@ -101,6 +101,8 @@ A background **scheduler** loop polls the database every 30 seconds for due sche
 
 Data lives in two places: a **SQLite database** for structured records and the **filesystem** for project files and agent workspaces. Understanding both is essential.
 
+> The `~/.cowork` paths below are the default (prod) home. The desktop app runs one of several build channels, each with its own isolated home (`~/.cowork-dev`, `~/.cowork-stable`, etc.) selected via `COWORK_HOME`. See the [Cowork frontend README → Build Channels](https://github.com/mindsdb/cowork#build-channels) for the full mapping.
+
 ### SQLite database
 
 - **Location**: `~/.cowork/cowork.db` (override with `DATABASE_URI`)
