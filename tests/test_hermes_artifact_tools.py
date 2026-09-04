@@ -126,7 +126,7 @@ def test_create_rejects_unknown_type():
 
 
 def test_register_artifact_tools_is_idempotent():
-    pytest.importorskip("tools.registry")
+    pytest.importorskip("tools.registry", exc_type=ModuleNotFoundError)
     register_artifact_tools()
     register_artifact_tools()
     from tools.registry import registry
@@ -144,7 +144,7 @@ def test_register_artifact_tools_is_idempotent():
 def test_registry_dispatch_forwards_task_id_to_handler():
     """run_agent invokes tools via registry.dispatch(name, args, task_id=...);
     pin that the context lookup works through that exact path."""
-    pytest.importorskip("tools.registry")
+    pytest.importorskip("tools.registry", exc_type=ModuleNotFoundError)
     register_artifact_tools()
     from tools.registry import registry
 
