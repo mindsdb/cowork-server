@@ -27,7 +27,14 @@ def _serialize(schedule, scoped) -> dict:
 @router.get("/")
 def list_schedules(scoped: ScopedSessionDep, project_id: UUID | None = None):
     schedules = ScheduleService(scoped).list_schedules(project_id=project_id)
-    return {"schedules": [_serialize(s, scoped) for s in schedules]}
+    # runs_index lets the client collapse a schedule's run-conversations into one
+    # grouped task row (ENG-770); keyed on the schedules we're returning so it
+    # never names a schedule outside this scope.
+    runs_index = ScheduleRunService(scoped).runs_index([s.id for s in schedules])
+    return {
+        "schedules": [_serialize(s, scoped) for s in schedules],
+        "runs_index": runs_index,
+    }
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED)

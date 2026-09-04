@@ -334,6 +334,27 @@ class ScheduleRunService:
         self.session.commit()
         return len(runs)
 
+    def runs_index(self, schedule_ids: list[UUID]) -> dict[str, str]:
+        """Map each run's conversation to its schedule: ``{conversation_id: schedule_id}``.
+
+        The desktop collapses every run-conversation of one schedule into a
+        single grouped task row; without this map the client can't tell which
+        conversations belong to a schedule and lists each run separately
+        (ENG-770). Keyed by *schedule_ids* — the caller passes the schedules it
+        is already returning (owner/org-scoped by ``list_schedules``), so the
+        map never reaches beyond what the request can see and stays consistent
+        with the accompanying schedule list. Runs whose conversation was
+        released (deleted chat) carry a NULL and are skipped.
+        """
+        if not schedule_ids:
+            return {}
+        runs = self.session.exec(
+            self.session.select(ScheduleRun)
+            .where(ScheduleRun.schedule_id.in_(schedule_ids))  # type: ignore[attr-defined]
+            .where(ScheduleRun.conversation_id.is_not(None))  # type: ignore[union-attr]
+        ).all()
+        return {str(r.conversation_id): str(r.schedule_id) for r in runs}
+
     def list_runs(self, schedule_id: UUID, limit: int = 100) -> list[ScheduleRun]:
         # Anchor on parent visibility (child table, request-reachable).
         _stmt = self.session.select(Schedule).where(Schedule.id == schedule_id)
