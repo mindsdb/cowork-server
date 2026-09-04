@@ -582,40 +582,46 @@ def _safe_relpath(rel: str | _ValidatedProjectPath, base: Path) -> Path:
 #: path beneath it with a stat and a resolve each before returning anything.
 _MAX_LISTED_FILES = 2000
 
+#: Entries examined, as opposed to returned. The cap above counts files the
+#: caller may actually see, so on its own an unreadable subtree could still be
+#: walked without limit before any of them were found.
+_MAX_EXAMINED_ENTRIES = 50_000
 
-def _walk_project_files(base: Path) -> tuple[list[Path], bool]:
-    """Files under `base`, capped. Second value is whether the cap cut it short.
 
-    Breadth-first, so a truncated listing shows the user's own top-level files
+def _iter_project_files(base: Path) -> Iterator[Path]:
+    """Candidate files under `base`, breadth-first, bounded by entries seen.
+
+    Breadth-first so a truncated listing shows the user's own top-level files
     instead of whatever a depth-first walk reached inside the first large
     subdirectory it happened to enter.
 
-    Directories are visited once by resolved path: a folder the user chose can
-    contain a symlink loop, which the previous recursive glob would have
-    followed until the cap.
+    A symlinked directory is neither descended into nor listed, which is what
+    `Path.rglob` did: it yielded the link itself and the caller skipped it as a
+    directory. Every desktop project has `skills/<slug>` directory symlinks
+    from `reconcile_project`, so descending would spend the budget on trees
+    whose entries `_file_meta` then discards for resolving outside `base`.
     """
-    found: list[Path] = []
     queue: deque[Path] = deque([base])
-    seen: set[Path] = set()
+    examined = 0
     while queue:
         try:
             entries = sorted(queue.popleft().iterdir())
         except OSError:
             continue
         for entry in entries:
+            examined += 1
+            if examined > _MAX_EXAMINED_ENTRIES:
+                return
             try:
-                if entry.is_dir():
-                    real = entry.resolve(strict=False)
-                    if real not in seen:
-                        seen.add(real)
-                        queue.append(entry)
+                if entry.is_symlink():
+                    if entry.is_dir():
+                        continue
+                elif entry.is_dir():
+                    queue.append(entry)
                     continue
-            except (OSError, RuntimeError):
+            except OSError:
                 continue
-            if len(found) >= _MAX_LISTED_FILES:
-                return found, True
-            found.append(entry)
-    return found, False
+            yield entry
 
 
 def _file_meta(p: Path, base: Path) -> dict[str, Any] | None:
@@ -1049,11 +1055,18 @@ def list_project_files(
     base = _project_dir(project_name, scoped)
     files: list[dict[str, Any]] = []
     _conv_cache: dict = {}
-    candidates, truncated = _walk_project_files(base)
-    for p in candidates:
+    truncated = False
+    for p in _iter_project_files(base):
         meta = _file_meta(p, base)
-        if meta and _conversation_workspace_ok(meta["path"], scoped, _conv_cache):
-            files.append(meta)
+        if not (meta and _conversation_workspace_ok(meta["path"], scoped, _conv_cache)):
+            continue
+        # Counted after the filters, not before: budgeting candidates let a
+        # subtree the caller cannot see (another member's conversation
+        # workspace) spend the whole listing on rows that are then dropped.
+        if len(files) >= _MAX_LISTED_FILES:
+            truncated = True
+            break
+        files.append(meta)
     # The walk yields shallowest first; the response stays path-ordered as it
     # was when it came from one recursive glob.
     files.sort(key=lambda f: f["path"])
