@@ -19,6 +19,7 @@ from cowork.coding.contracts import (
 from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_models import TERMINAL_RUN_STATUSES, RunStatus, RuntimeCommand, RuntimeEvent, TaskRun
 from cowork.coding.engines.base import EngineCredentials, EngineSession
+from cowork.coding.reasoning import ModelLevels
 from cowork.coding.turns import RunningTurn, fail_turn, mark_running
 from cowork.services.skills import CodeSkillService
 
@@ -33,6 +34,7 @@ class CodingTurnOperations:
         default_engine: str,
         default_model: str,
         code_skills: CodeSkillService | None = None,
+        model_levels: ModelLevels | None = None,
     ) -> CodingSession:
         session = self.session_factory.create(
             request,
@@ -40,6 +42,7 @@ class CodingTurnOperations:
             default_engine,
             default_model,
             code_skills,
+            model_levels=model_levels,
         )
         if self._is_remote(session):
             intent = self._validated_command_intent(session, request.prompt, request.attachments)
