@@ -26,6 +26,15 @@ jobs:
         # Snyk is reporting on dependencies we no longer install.
         run: uv lock --check
 
+      # The tests below run WITH the hermes extra, which is not what anyone
+      # installs. hermes-agent drops tools, agent, providers, utils and cli at
+      # top level, so an import that resolves only through it would pass the
+      # suite and fail on the wheel. Import the app from the shipped set first.
+      - name: Check the shipped dependency set imports
+        run: |
+          uv sync --group dev
+          uv run --no-sync python -c "import cowork.server"
+
       - name: Install dependencies
         # --extra hermes: hermes-agent is optional for installs but its
         # top-level `tools` registry is what the hermes harness writes into,
