@@ -52,6 +52,7 @@ class CodeProjectService:
             skill_sources=request.skill_sources,
             default_engine_id=request.default_engine_id,
             default_model=request.default_model,
+            default_reasoning_effort=request.default_reasoning_effort,
             permission_mode=request.permission_mode,
         )
         return self.store.create(self._validated(project))
