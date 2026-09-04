@@ -607,6 +607,125 @@ def test_repair_whose_primary_drifted_is_finished_not_stranded(artifact):
     assert stranded["status"] == "conflict"
 
 
+def test_editing_during_a_turn_does_not_block_the_next_repair(artifact):
+    """A queued repair whose base has moved can only land on conflict, so it
+    should not hold the path until the TTL expires - an owner editing while a
+    turn runs is a normal action, not a wedge."""
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
+    requested = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=initial["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "Please change this"}],
+        conversation_id="conversation-1",
+    )
+    save_source(
+        folder,
+        metadata,
+        artifact_id,
+        content="# Owner edit mid-turn\n",
+        expected_revision_id=initial["revision"]["id"],
+    )
+
+    replacement = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=current_source(folder, metadata, artifact_id)["revision"]["id"],
+        comment_thread_id="thread-2",
+        selector=None,
+        thread=[{"text": "A second review"}],
+        conversation_id="conversation-2",
+    )
+
+    assert replacement["repair"]["status"] == "queued"
+    stranded = json.loads(
+        (folder / ".revisions" / "repairs" / f"{requested['repair']['id']}.json")
+        .read_text(encoding="utf-8")
+    )
+    assert stranded["status"] == "conflict"
+
+
+def test_an_unreadable_timestamp_does_not_block_forever(artifact):
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
+    requested = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=initial["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "Please change this"}],
+        conversation_id="conversation-1",
+    )
+    record_path = folder / ".revisions" / "repairs" / f"{requested['repair']['id']}.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    record["createdAt"] = "not-a-date"
+    record_path.write_text(json.dumps(record), encoding="utf-8")
+
+    replacement = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=initial["revision"]["id"],
+        comment_thread_id="thread-2",
+        selector=None,
+        thread=[{"text": "A second review"}],
+        conversation_id="conversation-2",
+    )
+
+    assert replacement["repair"]["status"] == "queued"
+
+
+def test_a_superseded_repair_stops_being_the_active_one(artifact):
+    """Nothing moves a superseded repair on, so without a preference it stays
+    the artifact's active repair for good and its notice never clears."""
+    folder, metadata, artifact_id = artifact
+    first = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=current_source(folder, metadata, artifact_id)["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "First review"}],
+        conversation_id="conversation-1",
+    )
+    (folder / "brief.md").write_text("# Agent one\n", encoding="utf-8")
+    capture_agent_revision(folder, conversation_id="conversation-1")
+    save_source(
+        folder,
+        metadata,
+        artifact_id,
+        content="# Owner\n",
+        expected_revision_id=current_source(folder, metadata, artifact_id)["revision"]["id"],
+    )
+    assert active_agent_repair(folder, "brief.md")["id"] == first["repair"]["id"]
+
+    second = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=current_source(folder, metadata, artifact_id)["revision"]["id"],
+        comment_thread_id="thread-2",
+        selector=None,
+        thread=[{"text": "Second review"}],
+        conversation_id="conversation-2",
+    )
+    (folder / "brief.md").write_text("# Agent two\n", encoding="utf-8")
+    capture_agent_revision(folder, conversation_id="conversation-2")
+
+    # The one the owner can act on wins while it is live.
+    active = active_agent_repair(folder, "brief.md")
+    assert active["id"] == second["repair"]["id"]
+    assert active["superseded"] is False
+
+
 def test_stale_queued_repair_stops_blocking_and_is_finished(artifact):
     """A turn killed between minting the handoff and starting the agent used to
     gate the path forever, because only capture_agent_revision could finish a
@@ -984,10 +1103,14 @@ def test_active_repair_ignores_other_paths(artifact):
 
 def test_accept_survives_a_moved_head(repair_behind_a_moved_head):
     """Accepting keeps the agent's revision, which is already in history; it
-    writes no content, so head having moved does not make it unsafe."""
-    folder, metadata, artifact_id, ready, _head = repair_behind_a_moved_head
+    writes no content, so head having moved does not make it unsafe - as long
+    as the owner confirmed against the head they were shown."""
+    folder, metadata, artifact_id, ready, head = repair_behind_a_moved_head
 
-    decided = finalize_agent_repair(folder, metadata, artifact_id, ready["id"], "accepted")
+    decided = finalize_agent_repair(
+        folder, metadata, artifact_id, ready["id"], "accepted",
+        expected_head_revision_id=head,
+    )
 
     assert decided["status"] == "accepted"
     # The owner's later edit is untouched.
@@ -997,12 +1120,62 @@ def test_accept_survives_a_moved_head(repair_behind_a_moved_head):
 def test_accept_is_idempotent(repair_behind_a_moved_head):
     """A lost response or a double-click must not report a failure for a
     decision that already landed."""
-    folder, metadata, artifact_id, ready, _head = repair_behind_a_moved_head
-    finalize_agent_repair(folder, metadata, artifact_id, ready["id"], "accepted")
+    folder, metadata, artifact_id, ready, head = repair_behind_a_moved_head
+    finalize_agent_repair(
+        folder, metadata, artifact_id, ready["id"], "accepted",
+        expected_head_revision_id=head,
+    )
 
     again = finalize_agent_repair(folder, metadata, artifact_id, ready["id"], "accepted")
 
     assert again["status"] == "accepted"
+
+
+def test_accept_refuses_a_superseded_repair_the_owner_did_not_confirm(
+    repair_behind_a_moved_head,
+):
+    """Accepting resolves the review comment, so it must not happen against a
+    head the owner never saw."""
+    folder, metadata, artifact_id, ready, _head = repair_behind_a_moved_head
+
+    with pytest.raises(RevisionConflict, match="changed after the agent's edit"):
+        finalize_agent_repair(folder, metadata, artifact_id, ready["id"], "accepted")
+
+    assert agent_repair_detail(folder, ready["id"])["repair"]["status"] == "ready"
+
+
+def test_accept_refuses_when_the_owner_undid_the_agents_work(artifact):
+    """Restoring the pre-agent content leaves the agent's revision in history,
+    so "still in the manifest" is not enough on its own: accepting would close
+    the review comment with the change not applied."""
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
+    requested = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=initial["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "Try a different title"}],
+        conversation_id="conversation-1",
+    )
+    (folder / "brief.md").write_text("# Agent title\n", encoding="utf-8")
+    capture_agent_revision(folder, conversation_id="conversation-1")
+    ready = agent_repair_detail(folder, requested["repair"]["id"])["repair"]
+    save_source(
+        folder,
+        metadata,
+        artifact_id,
+        content="# First\n",
+        expected_revision_id=current_source(folder, metadata, artifact_id)["revision"]["id"],
+    )
+
+    with pytest.raises(RevisionConflict, match="changed after the agent's edit"):
+        finalize_agent_repair(folder, metadata, artifact_id, ready["id"], "accepted")
+
+    assert (folder / "brief.md").read_text(encoding="utf-8") == "# First\n"
+    assert agent_repair_detail(folder, ready["id"])["repair"]["status"] == "ready"
 
 
 def test_accept_refuses_when_the_agent_revision_left_history(repair_behind_a_moved_head):

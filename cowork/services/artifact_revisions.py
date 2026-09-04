@@ -26,9 +26,25 @@ QUEUED_REPAIR_TTL_SECONDS = 3600
 
 
 class RevisionConflict(RuntimeError):
-    def __init__(self, current: dict):
-        super().__init__("Artifact changed since this edit began")
+    def __init__(self, current: dict, message: str = "Artifact changed since this edit began"):
+        super().__init__(message)
         self.current = current
+
+
+class RepairSupersededConflict(RevisionConflict):
+    """The artifact moved on after the agent's edit.
+
+    Distinct from a stale-editor conflict: reloading does not resolve it, and
+    the answer is to look at what changed since and then keep or discard the
+    suggestion.
+    """
+
+    def __init__(self, current: dict):
+        super().__init__(
+            current,
+            "This artifact changed after the agent's edit. Review the current "
+            "revision, then keep or discard the suggestion.",
+        )
 
 
 class RevisionValidationError(ValueError):
@@ -184,6 +200,14 @@ def _parse_timestamp(value: str | None) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
+def _head_revision_id(manifest: dict, rel_path: str | None) -> str | None:
+    latest = next(
+        (entry for entry in reversed(manifest["revisions"]) if entry.get("path") == rel_path),
+        None,
+    )
+    return latest.get("id") if latest else None
+
+
 def _is_superseded(manifest: dict, repair: dict) -> bool:
     """Whether the agent's revision is no longer head for the repair's path.
 
@@ -193,41 +217,38 @@ def _is_superseded(manifest: dict, repair: dict) -> bool:
     revision_id = repair.get("revisionId")
     if not revision_id:
         return False
-    latest = next(
-        (
-            entry
-            for entry in reversed(manifest["revisions"])
-            if entry.get("path") == repair.get("path")
-        ),
-        None,
-    )
-    return latest is not None and latest.get("id") != revision_id
+    head = _head_revision_id(manifest, repair.get("path"))
+    return head is not None and head != revision_id
 
 
 def _partition_actionable_repairs(
     folder: Path, manifest: dict, rel_path: str
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[tuple[dict, str]]]:
     """Split one path's actionable repairs into those that still gate a new
-    repair and those whose turn is presumed dead.
+    repair, and those that cannot, each with the status that finishes it.
 
     A superseded repair appears in neither list. It keeps its `ready` status so
     the owner can still accept or discard the agent's work, but it cannot gate
     a new turn: the content it was computed against is already history.
     """
     now = datetime.now(timezone.utc)
+    head = _head_revision_id(manifest, rel_path)
     blocking: list[dict] = []
-    dead: list[dict] = []
+    dead: list[tuple[dict, str]] = []
     for repair in _actionable_repairs_for_path(folder, rel_path):
         if _is_superseded(manifest, repair):
             continue
-        created = _parse_timestamp(repair.get("createdAt"))
-        if (
-            repair.get("status") == "queued"
-            and created is not None
-            and (now - created).total_seconds() > QUEUED_REPAIR_TTL_SECONDS
-        ):
-            dead.append(repair)
-            continue
+        if repair.get("status") == "queued":
+            if head is not None and repair.get("baseRevisionId") != head:
+                # The turn is still running, but it can only land on conflict
+                # now, so it should not hold the path until it gets there.
+                dead.append((repair, "conflict"))
+                continue
+            created = _parse_timestamp(repair.get("createdAt"))
+            # An unreadable timestamp must not mean "blocks forever".
+            if created is None or (now - created).total_seconds() > QUEUED_REPAIR_TTL_SECONDS:
+                dead.append((repair, "no_change"))
+                continue
         blocking.append(repair)
     return blocking, dead
 
@@ -745,8 +766,8 @@ def create_agent_repair(
         blocking, dead = _partition_actionable_repairs(folder, manifest, source["path"])
         if blocking:
             raise RepairAlreadyPending(blocking[0])
-        for repair in dead:
-            repair["status"] = "no_change"
+        for repair, finished_status in dead:
+            repair["status"] = finished_status
             repair["updatedAt"] = _now()
             _write_repair(folder, repair)
         repair_id = str(uuid.uuid4())
@@ -814,10 +835,18 @@ def active_agent_repair(folder: Path, rel_path: str | None = None) -> dict | Non
         if repair.get("status") in {"queued", "ready"}
         and (rel_path is None or repair.get("path") == rel_path)
     ]
-    newest = max(active, key=lambda repair: str(repair.get("createdAt") or ""), default=None)
-    if newest is None:
+    if not active:
         return None
-    return {**newest, "superseded": _is_superseded(_read_manifest(folder), newest)}
+    manifest = _read_manifest(folder)
+    # A superseded repair would otherwise stay the active one for good, since
+    # nothing moves it on: prefer one the owner can still act on, and fall back
+    # to a superseded record only when it is all there is.
+    def _newest(candidates: list[dict]) -> dict | None:
+        return max(candidates, key=lambda r: str(r.get("createdAt") or ""), default=None)
+
+    live = [repair for repair in active if not _is_superseded(manifest, repair)]
+    newest = _newest(live) or _newest(active)
+    return {**newest, "superseded": _is_superseded(manifest, newest)}
 
 
 def cancel_agent_repair(folder: Path, repair_id: str, *, discard_ready: bool = False) -> dict:
@@ -914,8 +943,8 @@ def finalize_agent_repair(
             repair["updatedAt"] = _now()
             _write_repair(folder, repair)
             return repair
+        manifest = _read_manifest(folder)
         if decision == "accepted":
-            manifest = _read_manifest(folder)
             if not any(
                 entry.get("id") == repair.get("revisionId")
                 and entry.get("path") == repair.get("path")
@@ -926,11 +955,21 @@ def finalize_agent_repair(
                 raise RevisionValidationError(
                     "The agent's revision is no longer in this artifact's history"
                 )
+            # Being in history is not enough: an owner who edited or restored
+            # past the agent's revision may be looking at content that does not
+            # contain it, and accepting resolves the review comment. So once the
+            # artifact has moved on, accept means "against this head, which I am
+            # looking at", and an unconfirmed accept is refused.
+            if _is_superseded(manifest, repair) and (
+                expected_head_revision_id is None
+                or expected_head_revision_id != current.get("id")
+            ):
+                raise RepairSupersededConflict(current)
         elif expected_head_revision_id is not None:
             if current.get("id") != expected_head_revision_id:
-                raise RevisionConflict(current)
+                raise RepairSupersededConflict(current)
         elif current.get("id") != repair.get("revisionId"):
-            raise RevisionConflict(current)
+            raise RepairSupersededConflict(current)
 
         if decision == "rejected":
             before = _revision_with_content_locked(folder, repair["baseRevisionId"])
@@ -938,7 +977,6 @@ def finalize_agent_repair(
                 raise RevisionValidationError("Agent repair revision path is inconsistent")
             encoded = before["content"].encode("utf-8")
             target, relative = resolve_source(folder, metadata, repair["path"])
-            manifest = _read_manifest(folder)
             _commit_source_revision(
                 folder,
                 manifest,
