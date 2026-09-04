@@ -521,7 +521,13 @@ class ProjectService:
         True only for a folder the user chose. Artifact discovery, skill link
         distribution and rename all find projects by scanning that root, so
         they need this to know when to consult the row instead.
+
+        Always False in org mode. A folder can only be adopted on a local
+        deployment, so a path outside the org-keyed root there is a stale or
+        pre-org-keyed row -- `_repoint_if_stale`'s job, not a chosen folder.
         """
+        if get_app_settings().tenancy_mode == "org" or self.session.scope.org_mode:
+            return False
         try:
             resolved = Path(project.path).resolve(strict=False)
         except (OSError, RuntimeError):
@@ -776,6 +782,14 @@ class ProjectService:
             if resolved_name is not None and resolved_name != project.name:
                 if project.name == GENERAL_PROJECT:
                     raise ValueError("Cannot rename the General project")
+                if self.directory_is_external(project):
+                    # Refused here rather than inside the move: _rename_in_root
+                    # would raise "not a direct child of a trusted projects
+                    # root", which is true and unusable as a message.
+                    raise ValueError(
+                        "This project points at a folder you chose, so it cannot "
+                        "be renamed. Rename the folder instead."
+                    )
                 stage = self._stage_project_rename(
                     project,
                     resolved_name,

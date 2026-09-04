@@ -210,6 +210,7 @@ def _project_response(project: Project, access: SharedResourceAccess) -> dict:
     creator_id = project.created_by
     is_general = project.name == GENERAL_PROJECT
     can_change = not pending and not is_general and access.can_change(creator_id)
+    directory_is_external = ProjectService(access.session).directory_is_external(project)
     return {
         **project.model_dump(),
         "attribution": access.attribution(
@@ -219,9 +220,12 @@ def _project_response(project: Project, access: SharedResourceAccess) -> dict:
             fallback_modified_at=project.modified_at,
         ),
         "capabilities": ProjectCapabilities(
-            can_rename=can_change,
+            # A rename moves the directory, which is only defined inside the
+            # projects root. A folder the user chose is theirs, not ours to move.
+            can_rename=can_change and not directory_is_external,
             can_delete=can_change,
             can_edit_instructions=not pending and access.can_change(project.created_by),
+            directory_is_external=directory_is_external,
         ),
     }
 
