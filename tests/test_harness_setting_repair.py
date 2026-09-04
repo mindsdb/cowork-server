@@ -14,6 +14,7 @@ leftover global ``harness`` row would change what they resolve.
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -113,16 +114,6 @@ def test_writes_nothing_when_the_default_itself_is_missing(engine, monkeypatch) 
     assert _stored(engine) == "hermes"
 
 
-def test_writes_nothing_when_no_harness_is_registered(engine, monkeypatch) -> None:
-    _seed(engine, "hermes")
-    _registry(monkeypatch)
-
-    with Session(engine) as session:
-        assert reset_unbuildable_harness(session) is False
-
-    assert _stored(engine) == "hermes"
-
-
 def test_a_fresh_install_with_no_row_is_not_an_error(engine, monkeypatch) -> None:
     _registry(monkeypatch, _DEFAULT)
 
@@ -142,7 +133,7 @@ def test_the_repaired_value_is_one_the_model_accepts(engine, monkeypatch) -> Non
     _seed(engine, "hermes")
     _registry(monkeypatch, _DEFAULT)
 
-    with pytest.raises(Exception):
+    with pytest.raises(ValidationError):
         UserSettings(harness="hermes")
 
     with Session(engine) as session:

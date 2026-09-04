@@ -215,6 +215,11 @@ def reset_unbuildable_harness(session: Session) -> bool:
     than once. Without it, ``validate_harness`` rejects the stored value and
     every settings read raises, which leaves no route back through the UI.
 
+    Repairs the deployment-global row only, the one an unscoped ``_fetch_row``
+    resolves. That is the only shape that can hold an unbuildable value today:
+    every write path validates first, and org-scoped rows postdate the flag that
+    would have rejected one.
+
     Keyed on what is registered, never on ``available_harness_ids()``: that list
     also hides harnesses this deployment merely declines to offer, and rewriting
     on that basis would discard a valid preference during a rolling deploy where
@@ -226,7 +231,8 @@ def reset_unbuildable_harness(session: Session) -> bool:
     default = UserSettings.model_fields["harness"].default
     # A boot that somehow lost the default harness must not replace one
     # unvalidatable value with another; there is no sentinel or history to undo.
-    if not installed or default not in installed:
+    # Covers an empty registry too, for the same reason.
+    if default not in installed:
         return False
 
     row = SettingService(session)._fetch_row("harness")
