@@ -575,3 +575,103 @@ def test_migrated_schema_enforces_one_attribution_row_per_resource(
         "shared_resource_attributions lost its unique key; concurrent creates "
         f"can now record two creators. Unique indexes found: {unique_columns}"
     )
+
+
+# The revision immediately before projects.display_name. Named rather than
+# inlined: this has now moved TWICE while the branch was open (cfbc79856e9e,
+# then b7f4d2c9a3e1 when ENG-1911 merged its two heads), and a rebase that
+# forgets it forks the graph.
+PRIOR_TO_DISPLAY_NAME = "b7f4d2c9a3e1"
+
+
+def _table_columns(path, table_name: str) -> set[str]:
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {row[1] for row in rows}
+
+
+def _has_index(path, index_name: str) -> bool:
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
+    return index_name in {row[0] for row in rows}
+
+
+def test_project_display_name_downgrade_keeps_the_projects_indexes(tmp_path, monkeypatch):
+    """ENG-1676. The display_name downgrade must not rebuild the projects table.
+
+    `op.batch_alter_table` recreates the table on SQLite, and
+    `uq_projects_default_per_org` is expression-based — SQLAlchemy cannot
+    reflect it (it warns and skips), so the rebuild drops it silently and every
+    *later* downgrade in the chain then dies on `DROP INDEX
+    uq_projects_default_per_org`. The failure surfaces in an unrelated
+    migration's test, which is what makes it worth pinning here by name.
+    """
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "display_name.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    assert "display_name" in _table_columns(db_path, "projects")
+    assert _has_index(db_path, "uq_projects_default_per_org")
+
+    _downgrade_to(engine, uri, PRIOR_TO_DISPLAY_NAME)
+
+    assert "display_name" not in _table_columns(db_path, "projects")
+    # The whole point: the index survives the column drop.
+    assert _has_index(db_path, "uq_projects_default_per_org")
+
+    # And the chain still runs forward again afterwards.
+    _upgrade_to(engine, uri, expected_head())
+    assert "display_name" in _table_columns(db_path, "projects")
+    assert _has_index(db_path, "uq_projects_default_per_org")
+
+
+def test_project_display_name_upgrades_a_populated_projects_table(tmp_path, monkeypatch):
+    """ENG-1676. The real production shape: rows already exist when it runs.
+
+    Every other test in this file migrates an empty database, so none of them
+    would notice a column addition that fails, or silently drops data, on a
+    table that already has rows — which is the only state any real install is
+    ever in. Adds the rows at the revision *before* this one, then upgrades.
+    """
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "populated.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+
+    # Stop one short of the display_name revision.
+    _upgrade_to(engine, uri, PRIOR_TO_DISPLAY_NAME)
+    assert "display_name" not in _table_columns(db_path, "projects")
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO projects (id, name, path, is_active) VALUES "
+                "('11111111-1111-1111-1111-111111111111', 'reports', '/p/reports', 0),"
+                "('22222222-2222-2222-2222-222222222222', 'untitled-project', '/p/u', 1)"
+            )
+        )
+
+    _upgrade_to(engine, uri, expected_head())
+
+    assert "display_name" in _table_columns(db_path, "projects")
+    with engine.begin() as connection:
+        rows = sorted(connection.execute(text("SELECT name, display_name FROM projects")).all())
+    # Both inserted rows survive with a NULL label — which `display_label`
+    # resolves to the slug, so they render exactly as they did before. Asserted
+    # by membership rather than equality: the chain seeds a `general` row, and
+    # pinning the whole set would fail on that rather than on anything real.
+    assert ("reports", None) in rows
+    assert ("untitled-project", None) in rows
+    assert all(label is None for _, label in rows), "the migration must not invent labels"
+
+    # And the downgrade leaves the rows alone too.
+    _downgrade_to(engine, uri, PRIOR_TO_DISPLAY_NAME)
+    with engine.begin() as connection:
+        names = sorted(r[0] for r in connection.execute(text("SELECT name FROM projects")).all())
+    assert "reports" in names and "untitled-project" in names
