@@ -15,6 +15,7 @@ import cowork.models.pin  # noqa: F401
 import cowork.models.project  # noqa: F401
 import cowork.models.schedule  # noqa: F401
 import cowork.models.setting  # noqa: F401
+import cowork.models.shared_resource  # noqa: F401
 import cowork.models.skill  # noqa: F401
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.migrations import (
@@ -286,6 +287,27 @@ def test_task_objects_downgrade_guards_missing_table(tmp_path, monkeypatch):
     assert _alembic_version(db_path) == "c4e7a1b9d2f0"
 
 
+def test_shared_resource_audit_upgrade_and_downgrade(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "shared-resources.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    assert _has_table(db_path, "shared_resource_attributions")
+    assert _has_table(db_path, "shared_resource_mutations")
+
+    _downgrade_to(engine, uri, "a4c8e1f6b3d9")
+    assert not _has_table(db_path, "shared_resource_attributions")
+    assert not _has_table(db_path, "shared_resource_mutations")
+
+    _upgrade_to(engine, uri, "head")
+    assert _has_table(db_path, "shared_resource_attributions")
+    assert _has_table(db_path, "shared_resource_mutations")
+
+
 # ── ENG-338: attachment purpose re-keying (f7d2b9e4a1c6) ─────────────────
 
 ATTACH_REKEY_REV = "f7d2b9e4a1c6"
@@ -514,3 +536,142 @@ def test_channel_installations_per_org_downgrade_preflights_duplicates(tmp_path,
             )
         }
     assert {"uq_channel_installations_type_global", "uq_channel_installations_type_org"} <= names
+
+
+def test_migrated_schema_enforces_one_attribution_row_per_resource(
+    tmp_path, monkeypatch
+):
+    """The unique key the whole first-writer race design rests on.
+
+    Two replicas can both pass the pre-check at READ COMMITTED, so the loser is
+    supposed to lose on this constraint and adopt the winner's row. Without it
+    a resource ends up with two creator rows and the authorization read becomes
+    nondeterministic. The suite builds its schema from the models, so only a
+    real migration run proves the constraint actually ships.
+    """
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "attribution.db"
+    uri = _sqlite_uri(db_path)
+    run_schema_migrations(create_engine(uri), uri)
+
+    with sqlite3.connect(db_path) as connection:
+        indexes = connection.execute(
+            "select name, \"unique\" from pragma_index_list('shared_resource_attributions')"
+        ).fetchall()
+        unique_columns = {
+            tuple(
+                row[2]
+                for row in connection.execute(
+                    f"select * from pragma_index_info('{name}')"
+                ).fetchall()
+            )
+            for name, is_unique in indexes
+            if is_unique
+        }
+
+    assert ("org_id", "resource_kind", "resource_key") in unique_columns, (
+        "shared_resource_attributions lost its unique key; concurrent creates "
+        f"can now record two creators. Unique indexes found: {unique_columns}"
+    )
+
+
+# The revision immediately before projects.display_name. Named rather than
+# inlined: this has now moved TWICE while the branch was open (cfbc79856e9e,
+# then b7f4d2c9a3e1 when ENG-1911 merged its two heads), and a rebase that
+# forgets it forks the graph.
+PRIOR_TO_DISPLAY_NAME = "b7f4d2c9a3e1"
+
+
+def _table_columns(path, table_name: str) -> set[str]:
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    return {row[1] for row in rows}
+
+
+def _has_index(path, index_name: str) -> bool:
+    with sqlite3.connect(path) as connection:
+        rows = connection.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()
+    return index_name in {row[0] for row in rows}
+
+
+def test_project_display_name_downgrade_keeps_the_projects_indexes(tmp_path, monkeypatch):
+    """ENG-1676. The display_name downgrade must not rebuild the projects table.
+
+    `op.batch_alter_table` recreates the table on SQLite, and
+    `uq_projects_default_per_org` is expression-based — SQLAlchemy cannot
+    reflect it (it warns and skips), so the rebuild drops it silently and every
+    *later* downgrade in the chain then dies on `DROP INDEX
+    uq_projects_default_per_org`. The failure surfaces in an unrelated
+    migration's test, which is what makes it worth pinning here by name.
+    """
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "display_name.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    assert "display_name" in _table_columns(db_path, "projects")
+    assert _has_index(db_path, "uq_projects_default_per_org")
+
+    _downgrade_to(engine, uri, PRIOR_TO_DISPLAY_NAME)
+
+    assert "display_name" not in _table_columns(db_path, "projects")
+    # The whole point: the index survives the column drop.
+    assert _has_index(db_path, "uq_projects_default_per_org")
+
+    # And the chain still runs forward again afterwards.
+    _upgrade_to(engine, uri, expected_head())
+    assert "display_name" in _table_columns(db_path, "projects")
+    assert _has_index(db_path, "uq_projects_default_per_org")
+
+
+def test_project_display_name_upgrades_a_populated_projects_table(tmp_path, monkeypatch):
+    """ENG-1676. The real production shape: rows already exist when it runs.
+
+    Every other test in this file migrates an empty database, so none of them
+    would notice a column addition that fails, or silently drops data, on a
+    table that already has rows — which is the only state any real install is
+    ever in. Adds the rows at the revision *before* this one, then upgrades.
+    """
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "populated.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+
+    # Stop one short of the display_name revision.
+    _upgrade_to(engine, uri, PRIOR_TO_DISPLAY_NAME)
+    assert "display_name" not in _table_columns(db_path, "projects")
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO projects (id, name, path, is_active) VALUES "
+                "('11111111-1111-1111-1111-111111111111', 'reports', '/p/reports', 0),"
+                "('22222222-2222-2222-2222-222222222222', 'untitled-project', '/p/u', 1)"
+            )
+        )
+
+    _upgrade_to(engine, uri, expected_head())
+
+    assert "display_name" in _table_columns(db_path, "projects")
+    with engine.begin() as connection:
+        rows = sorted(connection.execute(text("SELECT name, display_name FROM projects")).all())
+    # Both inserted rows survive with a NULL label — which `display_label`
+    # resolves to the slug, so they render exactly as they did before. Asserted
+    # by membership rather than equality: the chain seeds a `general` row, and
+    # pinning the whole set would fail on that rather than on anything real.
+    assert ("reports", None) in rows
+    assert ("untitled-project", None) in rows
+    assert all(label is None for _, label in rows), "the migration must not invent labels"
+
+    # And the downgrade leaves the rows alone too.
+    _downgrade_to(engine, uri, PRIOR_TO_DISPLAY_NAME)
+    with engine.begin() as connection:
+        names = sorted(r[0] for r in connection.execute(text("SELECT name FROM projects")).all())
+    assert "reports" in names and "untitled-project" in names

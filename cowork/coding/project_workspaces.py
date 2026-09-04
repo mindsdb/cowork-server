@@ -400,6 +400,11 @@ class ProjectWorkspaceManager:
         ]
 
     def commit(self, workspaces: list[TaskWorkspace], message: str) -> list[GitState]:
+        repositories = [workspace for workspace in workspaces if workspace.workspace_kind == WorkspaceKind.git_worktree]
+        # A missing author identity would fail every repository; ask for it
+        # before touching any of them rather than after a rolled-back attempt.
+        for workspace in repositories:
+            self.workspaces.check_git_identity(workspace.workspace_path)
         states: list[GitState] = []
         checkpoints: list[tuple[TaskWorkspace, str]] = []
         try:
@@ -420,8 +425,11 @@ class ProjectWorkspaceManager:
                     "Some repository commits could not be restored; open the task workspaces to recover them: "
                     + "; ".join(failures)
                 ) from exc
+            reason = str(exc).strip().splitlines()[0][:300] if str(exc).strip() else ""
             raise WorkspaceError(
-                "No repositories were committed. All task changes remain available to retry."
+                "No repositories were committed"
+                + (f": {reason}" if reason else "")
+                + ". All task changes remain available to retry."
             ) from exc
 
     def apply(self, session_id: str, workspaces: list[TaskWorkspace]) -> list[str]:
