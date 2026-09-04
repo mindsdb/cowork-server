@@ -133,6 +133,22 @@ reusable in [mindsdb/github-actions](https://github.com/mindsdb/github-actions)
 workflows: PyPI trusted publishing matches the OIDC claim on the workflow
 filename and does not support reusable workflows.
 
+### Nightly staging integration
+
+The cowork-server maintainers own the deployed integration signal and its
+staging prerequisites. [`nightly-staging-integration.yml`](.github/workflows/nightly-staging-integration.yml)
+runs every day at 06:41 UTC and can also be dispatched by hand. It calls the
+same `tests-integration.yml` reusable workflow as a deployment on `mdb-dev`,
+then reports a failure or the first recovery through the shared
+engineering-channel notifier. It is a standalone monitor and never gates a
+publish, release, or deployment.
+
+The suite may create and delete test conversations, schedules, files, and agent
+turns in staging. The fixed test tenant is reserved for the `cowork` suite, and
+the workflow sets `COWORK_REQUIRE_INTEGRATION=true` for staging so a missing
+target, identity source, replica, or port-forward fails instead of becoming a
+green skip.
+
 In the packaged Electron app, a background updater checks PyPI on every launch and upgrades automatically (with rollback on failure). See [`server-updater.ts`](https://github.com/mindsdb/cowork/blob/main/src/main/server-updater.ts) in the frontend repo.
 
 ## Architecture
