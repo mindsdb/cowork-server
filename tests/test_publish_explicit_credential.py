@@ -13,13 +13,13 @@ import pytest
 
 from cowork.services import publish as p
 
-# What the autopublish reconciler will publish with. `org_allowed` is not
-# optional decoration: `resolve_access` degrades a `restricted` request with
-# neither emails nor org to `public` (anton/publish_access.py), so without it
-# every auto-published artifact would be world-readable. It also gives the
-# author two independent grants — owner-by-FK and org membership — instead of
-# depending on the owner check alone.
-AUTOPUBLISH_ACCESS = {"mode": "restricted", "emails": [], "org_allowed": True}
+# What the autopublish reconciler will publish a NEW artifact with. `owner_only`
+# is not optional decoration: `resolve_access` degrades a `restricted` request
+# with neither emails, nor org, nor owner_only to `public`
+# (anton/publish_access.py), so without it every auto-published artifact would be
+# world-readable. It is what makes "only the owner" expressible at all, and an
+# artifact stays private until its owner shares it (ENG-2316).
+AUTOPUBLISH_ACCESS = {"mode": "restricted", "emails": [], "owner_only": True}
 
 
 def test_installed_publisher_accepts_stable_artifact_key():
@@ -76,7 +76,11 @@ def test_publish_passes_caller_key_and_url_to_publisher(artifact, monkeypatch):
     # Asserted on what the PUBLISHER receives, not on what we passed in:
     # `resolve_access` rewrites the request on the way through, and a mode that
     # silently became `public` there is exactly the failure this pins down.
-    assert seen["access"] == {"mode": "restricted", "emails": [], "org_allowed": True}
+    # `owner_only` is an OWNER-SIDE flag: resolve_access consumes it to avoid the
+    # degrade-to-public path and emits an effective access with no positive grant
+    # beyond the owner's own FK condition in auth. That asymmetry is the contract
+    # — the request carries owner_only, the publisher never sees it.
+    assert seen["access"] == {"mode": "restricted", "emails": [], "org_allowed": False}
 
 
 def test_publish_writes_published_json_with_report_id(artifact, monkeypatch):
@@ -96,7 +100,10 @@ def test_publish_writes_published_json_with_report_id(artifact, monkeypatch):
     assert entry["report_id"] == "rid-1"
     assert entry["published"] is True
     assert entry["mode"] == "restricted"
-    assert entry["org_allowed"] is True
+    # Owner-side record keeps the flag, so a later "keep" re-publish can rebuild
+    # the same private selection instead of degrading it to public.
+    assert entry["owner_only"] is True
+    assert entry["org_allowed"] is False
 
 
 def test_republish_reuses_stored_report_id(artifact, monkeypatch):
