@@ -24,7 +24,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 
 from urllib.parse import quote
 
@@ -38,6 +38,9 @@ from cowork.common.paths import (
     dir_unlink,
 )
 from cowork.common.settings.app_settings import get_app_settings
+
+if TYPE_CHECKING:
+    from cowork.db.scoped import ScopedSession
 
 logger = logging.getLogger(__name__)
 
@@ -625,7 +628,9 @@ def _published_access_for(
     return out
 
 
-def _external_project_artifacts_base(project_name: str, session) -> Path | None:
+def _external_project_artifacts_base(
+    project_name: str, session: ScopedSession
+) -> Path | None:
     """The artifacts dir of an adopted-folder project, addressed by row name.
 
     Scoped read, so it cannot reach another tenant's project. Returns None for
@@ -642,7 +647,9 @@ def _external_project_artifacts_base(project_name: str, session) -> Path | None:
     return base if base.is_dir() else None
 
 
-def _project_artifacts_base(project_name: str, session=None) -> Path | None:
+def _project_artifacts_base(
+    project_name: str, session: ScopedSession | None = None
+) -> Path | None:
     """Resolve a project name to its `.anton/artifacts` dir, only when it
     maps to a registered project. Returns None for unknown projects or
     path-traversal attempts.

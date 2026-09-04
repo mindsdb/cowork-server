@@ -169,7 +169,13 @@ def _sources_for(
     """One `ProjectArtifacts` per root. They all carry the SAME project identity:
     a conversation is where the bytes happen to live, not a thing the client
     addresses artifacts by, so cards stay project-addressed in both modes."""
+    from cowork.services.projects import ProjectService
+
     project_path = Path(project.path)
+    # The same truth as the scope resolver's: a serve URL for an adopted
+    # folder cannot be rediscovered by scanning, and this is the resolver the
+    # desktop rail reaches (it addresses artifacts by project id).
+    external = ProjectService(session).directory_is_external(project)
     sources: list[ProjectArtifacts] = []
     for base in _project_artifact_bases(
         project.path, session, include_other_members=include_other_members
@@ -181,6 +187,7 @@ def _sources_for(
                 project_name=project.name,
                 trusted_anchor=project_path,
                 root_parts=base.relative_to(project_path).parts,
+                external=external,
             )
         )
     return sources

@@ -216,3 +216,60 @@ def test_a_listed_card_from_an_adopted_folder_serves_under_the_row_name(
         f"/api/v1/artifacts/serve/{project.name}/dash/index.html"
     )
     assert project.name != folder.name
+
+
+def test_the_artifacts_route_lists_an_adopted_folder(projects_root, tmp_path):
+    """Through HTTP, not through the resolver. The unit tests above passed
+    while the local branch of `artifact_sources_for_request` still called the
+    filesystem scan directly, so none of this was reachable from the route.
+    """
+    import json
+
+    from fastapi.testclient import TestClient
+
+    from cowork.server import create_app
+
+    folder = tmp_path / "Documents" / "notes"
+    folder.mkdir(parents=True)
+    artifact = folder / ".anton" / "artifacts" / "dash"
+    artifact.mkdir(parents=True)
+    (artifact / "index.html").write_text("<html></html>")
+    (artifact / "metadata.json").write_text(
+        json.dumps(
+            {
+                "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "slug": "dash",
+                "name": "Adopted dashboard",
+                "primary": "index.html",
+                "type": "html-app",
+            }
+        )
+    )
+
+    client = TestClient(create_app(), client=("127.0.0.1", 54321))
+    created = client.post(
+        "/api/v1/projects/", json={"name": "notes", "path": str(folder)}
+    )
+    assert created.status_code == 201, created.text
+    project_name = created.json()["name"]
+    project_id = created.json()["id"]
+
+    unfiltered = client.get("/api/v1/artifacts/")
+    assert unfiltered.status_code == 200, unfiltered.text
+    card = next(
+        c for c in unfiltered.json() if c["title"] == "Adopted dashboard"
+    )
+    assert card["serveUrl"] == f"/api/v1/artifacts/serve/{project_name}/dash/index.html"
+
+    # The rail addresses artifacts by project id, which is a different
+    # resolver, and it must agree.
+    by_id = client.get(f"/api/v1/artifacts/?project_id={project_id}")
+    assert by_id.status_code == 200, by_id.text
+    by_id_card = next(
+        c for c in by_id.json() if c["title"] == "Adopted dashboard"
+    )
+    assert by_id_card["serveUrl"] == card["serveUrl"]
+
+    served = client.get(card["serveUrl"])
+    assert served.status_code == 200, served.text
+    assert served.text == "<html></html>"
