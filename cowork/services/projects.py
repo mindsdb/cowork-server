@@ -515,6 +515,19 @@ class ProjectService:
                 candidate = self._unique_name(f"{base}-{attempt}")
         raise ValueError("Could not allocate a project directory")
 
+    def directory_is_external(self, project: Project) -> bool:
+        """Whether this project's directory sits outside the projects root.
+
+        True only for a folder the user chose. Artifact discovery, skill link
+        distribution and rename all find projects by scanning that root, so
+        they need this to know when to consult the row instead.
+        """
+        try:
+            resolved = Path(project.path).resolve(strict=False)
+        except (OSError, RuntimeError):
+            return False
+        return not self._within_root(resolved)
+
     def _within_root(self, path: Path) -> bool:
         try:
             root = self._root_dir().resolve(strict=False)
