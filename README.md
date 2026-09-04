@@ -194,7 +194,7 @@ entry and must enable only custom branch policies. The branch-policy response
 must be exactly `[{"name":"main","type":"branch"}]`. The branch-protection
 response must show at least one required approval, administrator enforcement,
 and required conversation resolution. Do not dispatch or enable the schedule
-until every check passes and cowork-server#466 has landed.
+until every check passes and the cowork-server#472 prerequisite has landed.
 
 ### Logging
 

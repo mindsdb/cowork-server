@@ -321,6 +321,6 @@ def test_readme_records_the_no_write_boundary() -> None:
         "COWORK_PROD_READ_ONLY_API_KEY",
         "COWORK_PROD_READ_ONLY_USER_EMAIL",
         "COWORK_PROD_READ_ONLY_ORG_ID",
-        "cowork-server#466 has landed",
+        "cowork-server#472 prerequisite has landed",
     ):
         assert phrase in normalized
