@@ -46,6 +46,24 @@ _WIN_RESERVED = {
 }
 _NAME_MAX_LEN = 48
 _NAME_FALLBACK = "untitled-project"
+_DISPLAY_NAME_MAX_LEN = 255
+
+
+def display_label(project: "Project") -> str:
+    """The name a person reads for this project.
+
+    The ONE place that answers "which field do we show". `display_name` holds
+    what the user typed; it is NULL on every row created before that column
+    existed, and those fall back to the slug so they render exactly as they
+    always have (ENG-1676).
+
+    Never use this to address anything. `name` is the directory, the URL
+    segment and the lookup key, and it stays that way.
+    """
+    # getattr, not attribute access: the harness passes project-shaped objects
+    # (SimpleNamespace in tests, and any caller predating the column), and a
+    # label helper must not be the thing that raises.
+    return getattr(project, "display_name", None) or project.name
 
 
 class ProjectNotFoundError(ValueError):
@@ -378,6 +396,49 @@ class ProjectService:
                 return candidate
             i += 1
 
+    def _display_base(self, raw: str | None, fallback: str) -> str:
+        """The label to start from, before de-duplication.
+
+        Whitespace-only input does NOT become NULL: that would quietly expose
+        the slug on a project the user just created, and NULL is reserved for
+        "predates the column". Such input resolves through the existing
+        empty-name fallback instead, and we store the label that produced.
+        """
+        cleaned = (raw or "").strip()
+        return cleaned[:_DISPLAY_NAME_MAX_LEN] if cleaned else fallback
+
+    def _unique_display_name(self, base: str, *, exclude_id: UUID | None = None) -> str:
+        """`base`, or `base 2` / `base 3` when another project already reads that way.
+
+        Compared against the RESOLVED label of every other project, so a new
+        project typed literally `My-Project` still collides with an existing
+        slug-labelled `My-Project`. Space-separated, unlike `_unique_name`'s
+        hyphen: this suffix is read by humans, not used as a path.
+
+        Known limitation, accepted. This is a read-then-write with no unique
+        constraint behind it, so two concurrent creates of the same name can
+        both pick the unsuffixed label. `_unique_name` has the same shape but
+        `mkdir` settles it; there is no equivalent backstop for a label, and
+        adding one means a unique index and a failure path on a column that
+        addresses nothing. The cost of losing the race is two rows reading the
+        same way in the sidebar -- which is where every non-Latin project
+        already was before this ticket -- and renaming either one fixes it.
+        """
+        taken = {
+            (p.display_name or p.name)
+            for p in self.session.exec(self.session.select(Project)).all()
+            if p.id != exclude_id
+        }
+        if base not in taken:
+            return base
+        i = 2
+        while True:
+            # Leave room for the suffix rather than overflowing the column.
+            candidate = f"{base[: _DISPLAY_NAME_MAX_LEN - len(str(i)) - 1]} {i}"
+            if candidate not in taken:
+                return candidate
+            i += 1
+
     def _sanitize_name(self, name: str) -> str:
         raw = (name or "").strip()
         cleaned = _NAME_DISALLOWED.sub("-", raw)
@@ -469,15 +530,25 @@ class ProjectService:
         # being adopted with stale contents. On collision, take the next name.
         final_name, path = self._allocate_project_dir(sanitized)
         # self._scaffold(path)
+        # The literal input, kept verbatim; `final_name` stays the slug. A new
+        # project always gets an explicit display_name -- NULL means "predates
+        # the column", never "the user typed nothing" (ENG-1676).
+        display = self._unique_display_name(self._display_base(name, final_name))
         project = (
             Project(
                 id=project_id,
                 name=final_name,
+                display_name=display,
                 path=str(path),
                 is_active=False,
             )
             if project_id is not None
-            else Project(name=final_name, path=str(path), is_active=False)
+            else Project(
+                name=final_name,
+                display_name=display,
+                path=str(path),
+                is_active=False,
+            )
         )
         self.session.add(project)
         self.session.commit()
@@ -490,6 +561,18 @@ class ProjectService:
             reconcile_project(path, SkillService(self.session.scope).list_skills())
 
         return project
+
+    def resolve_display_label(self, project: Project, name: str) -> str:
+        """The label this project would read as after being renamed to `name`.
+
+        Exposed so the endpoint can tell a label-only rename from a true no-op
+        without reimplementing the resolution. `_sanitize_name` is lossy for
+        exactly the input ENG-1676 is about, so a rename can leave the slug
+        untouched and still change what every member sees.
+        """
+        return self._unique_display_name(
+            self._display_base(name, project.name), exclude_id=project.id
+        )
 
     def resolve_update_name(self, project: Project, name: str) -> str:
         """Return the canonical collision-resolved name for an update."""
@@ -602,9 +685,21 @@ class ProjectService:
         *,
         resolved_name: str | None,
         is_active: bool | None,
+        # No default on purpose. Both endpoint branches call this, and only one
+        # of them passed a label -- so an org rename moved the directory and
+        # rewrote every skill reference while `display_name` stayed frozen at
+        # the old name. Requiring it makes that omission a TypeError instead of
+        # a stale label, and matches the two parameters above.
+        display_label: str | None,
         skill_rewrites: list["ProjectReferenceRewrite"] | None = None,
     ) -> tuple[Project, ProjectRenameStage | None]:
-        """Stage a project update without committing its DB transaction."""
+        """Stage a project update without committing its DB transaction.
+
+        `display_label` is the raw name the user typed, not the slug. It is a
+        separate parameter because `resolved_name` has already been through
+        `_sanitize_name`, which is lossy for exactly the input ENG-1676 is
+        about: every Cyrillic name sanitizes to `untitled-project`.
+        """
         project = self.session.get(Project, project_id)
         if project is None:
             raise ProjectNotFoundError("Project not found")
@@ -617,6 +712,15 @@ class ProjectService:
                     project,
                     resolved_name,
                     skill_rewrites=skill_rewrites,
+                )
+            if display_label is not None:
+                # Outside the rename branch on purpose: two different names can
+                # sanitize to the same slug -- every pair of Cyrillic names
+                # does -- and the user still renamed the project, so the label
+                # must follow even when nothing moved on disk (ENG-1676).
+                project.display_name = self._unique_display_name(
+                    self._display_base(display_label, project.name),
+                    exclude_id=project.id,
                 )
             self._apply_active_selection(project, is_active)
             self.session.add(project)
@@ -687,6 +791,7 @@ class ProjectService:
             project_id,
             resolved_name=resolved_name,
             is_active=is_active,
+            display_label=name,
         )
         return self.commit_staged_project_update(updated, stage)
 
