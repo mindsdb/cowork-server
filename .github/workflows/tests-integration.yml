@@ -209,8 +209,12 @@ jobs:
       - name: Run integration tests (prod)
         if: inputs.deploy-env == 'prod'
         env:
-          # Keep these on the prod GitHub Environment only. Auth resolves the
-          # key's ids and verifies the configured controlled-domain email live.
+          # Configure these only after the prod GitHub Environment has nonempty
+          # required reviewers and a deployment-branch policy allowing main
+          # only. Auth then resolves the key's ids and verifies the configured
+          # controlled-domain email live. The caller workflow's main-ref check
+          # prevents accidental dispatches; Environment settings, not workflow
+          # text a branch can edit, are the credential boundary.
           COWORK_TEST_API_KEY: ${{ secrets.COWORK_TEST_API_KEY }}
           COWORK_TEST_USER_EMAIL: ${{ vars.COWORK_TEST_USER_EMAIL }}
         run: make test/integration

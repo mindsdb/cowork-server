@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BUILD_DEPLOY = (ROOT / ".github/workflows/build-deploy.yml").read_text()
 INTEGRATION = (ROOT / ".github/workflows/tests-integration.yml").read_text()
 PUBLISH = (ROOT / ".github/workflows/publish.yml").read_text()
+README = (ROOT / "README.md").read_text()
 
 
 def test_integration_uses_callers_target_cluster_runner() -> None:
@@ -18,6 +19,32 @@ def test_integration_uses_callers_target_cluster_runner() -> None:
     assert INTEGRATION.count("runs-on: ${{ inputs.runner }}") == 1
     assert BUILD_DEPLOY.count("runner: ${{ inputs.build-runner }}") == 2
     assert "build-runner: mdb-prod" in PUBLISH
+
+
+def test_prod_build_deploy_refuses_a_non_main_dispatch() -> None:
+    """A branch-selected manual run must not enter the production workflow."""
+    build_deploy = PUBLISH.split("  build-deploy:\n", 1)[1].split("\n  release:\n", 1)[
+        0
+    ]
+
+    assert "push:\n    branches: [main]" in PUBLISH
+    assert "build-environment: production" in build_deploy
+    assert "if: github.ref == 'refs/heads/main'" in build_deploy
+
+
+def test_prod_standing_key_docs_require_authoritative_environment_guards() -> None:
+    """The workflow guard must not be presented as protection for the key."""
+    normalized_readme = " ".join(README.split())
+    for required in (
+        "Do not store or use `COWORK_TEST_API_KEY` yet",
+        "nonempty required-reviewer rule",
+        "only entry is the `main` branch",
+        "Workflow code is therefore defense in depth, not the authority",
+        "protected_branches: false",
+        "custom_branch_policies: true",
+        "deployment-branch-policies",
+    ):
+        assert required in normalized_readme
 
 
 def test_all_permanent_environments_fail_on_missing_prerequisites() -> None:

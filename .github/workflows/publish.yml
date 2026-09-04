@@ -46,6 +46,14 @@ jobs:
     # installs from, and a failed publish should not hide a broken image. Both
     # land in this one run tree, and `notify` covers both. Mirrors the same job
     # in `publish-staging.yml`.
+    #
+    # workflow_dispatch can select any ref. Refuse a non-main selection before
+    # it enters the reusable production path, while leaving push-to-main
+    # unchanged. This is defense in depth against an accidental dispatch, not
+    # the credential boundary: a selected branch can change this workflow. The
+    # prod GitHub Environment must independently require reviewers and allow
+    # deployments from main only before it carries a standing test credential.
+    if: github.ref == 'refs/heads/main'
     permissions:
       contents: read
     uses: ./.github/workflows/build-deploy.yml
