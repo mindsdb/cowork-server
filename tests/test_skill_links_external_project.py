@@ -134,3 +134,35 @@ def test_a_db_failure_degrades_to_the_scan(tmp_path, monkeypatch):
     monkeypatch.setattr("cowork.db.session.get_open_session", boom)
 
     assert [p.name for p in sl._all_projects()] == ["a"]
+
+
+def test_external_project_dirs_reads_real_rows(tmp_path, monkeypatch):
+    """Every test above monkeypatches `_external_project_dirs`, so the DB read
+    itself — the part that runs in a deployment — was never exercised."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path))
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    from cowork.common.settings.app_settings import get_app_settings
+
+    get_app_settings.cache_clear()
+    try:
+        from cowork.server import create_app
+
+        adopted = tmp_path / "Documents" / "notes"
+        adopted.mkdir(parents=True)
+        client = TestClient(create_app(), client=("127.0.0.1", 54321))
+        created = client.post(
+            "/api/v1/projects/", json={"name": "notes", "path": str(adopted)}
+        )
+        assert created.status_code == 201, created.text
+        client.post("/api/v1/projects/", json={"name": "allocated"})
+
+        found = sl._external_project_dirs()
+
+        assert found.get(created.json()["name"]) == adopted
+        assert "allocated" not in found
+    finally:
+        get_app_settings.cache_clear()
