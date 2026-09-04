@@ -210,12 +210,16 @@ jobs:
       - name: Run integration tests (prod)
         if: inputs.deploy-env == 'prod'
         env:
-          # Configure these only after the prod GitHub Environment has nonempty
-          # required reviewers and a deployment-branch policy allowing main
-          # only. Auth then resolves the key's ids and verifies the configured
-          # controlled-domain email live. The caller workflow's main-ref check
-          # prevents accidental dispatches; Environment settings, not workflow
-          # text a branch can edit, are the credential boundary.
+          # Configure these only after the prod GitHub Environment has a
+          # nonempty reviewer rule, prevents self-review, disables admin bypass,
+          # and allows exactly one `main` Branch rule. Production evidence must
+          # use a fresh attempt 1 started after protection and approved by an
+          # eligible reviewer other than both its actor and triggering actor.
+          # Auth then resolves the key's ids and verifies the configured
+          # controlled-domain email and dedicated organization live.
+          # The caller's main-ref check is defense in depth; Environment settings
+          # are the credential boundary. See README.md for the exact checks.
           COWORK_TEST_API_KEY: ${{ secrets.COWORK_TEST_API_KEY }}
           COWORK_TEST_USER_EMAIL: ${{ vars.COWORK_TEST_USER_EMAIL }}
+          COWORK_TEST_ORG_ID: ${{ vars.COWORK_TEST_ORG_ID }}
         run: make test/integration

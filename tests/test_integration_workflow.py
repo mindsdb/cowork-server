@@ -64,6 +64,7 @@ def test_prod_uses_a_standing_identity_without_provisioner_fallback() -> None:
     assert "TEST_USER_PROVISION_SECRET" not in prod_step
     assert "COWORK_TEST_API_KEY: ${{ secrets.COWORK_TEST_API_KEY }}" in prod_step
     assert "COWORK_TEST_USER_EMAIL: ${{ vars.COWORK_TEST_USER_EMAIL }}" in prod_step
+    assert "COWORK_TEST_ORG_ID: ${{ vars.COWORK_TEST_ORG_ID }}" in prod_step
 
 
 def test_standing_identity_mode_fails_before_a_configured_provisioner(
@@ -73,6 +74,7 @@ def test_standing_identity_mode_fails_before_a_configured_provisioner(
     monkeypatch.setenv("COWORK_TEST_IDENTITY_MODE", "standing")
     monkeypatch.delenv("COWORK_TEST_API_KEY", raising=False)
     monkeypatch.delenv("COWORK_TEST_USER_EMAIL", raising=False)
+    monkeypatch.delenv("COWORK_TEST_ORG_ID", raising=False)
     monkeypatch.setenv(
         "TEST_USER_PROVISION_URL",
         "http://auth.prod.svc.cluster.local/v1/internal/test-users/",
@@ -106,8 +108,9 @@ def test_prod_standing_identity_rejects_an_uncontrolled_email_before_network(
 ) -> None:
     monkeypatch.setenv("COWORK_REQUIRE_INTEGRATION", "true")
     monkeypatch.setenv("COWORK_TEST_IDENTITY_MODE", "standing")
-    monkeypatch.setenv("COWORK_TEST_API_KEY", "must-not-be-sent")
+    monkeypatch.setenv("COWORK_TEST_API_KEY", "mdb_deadbeef.must-not-be-sent")
     monkeypatch.setenv("COWORK_TEST_USER_EMAIL", email)
+    monkeypatch.setenv("COWORK_TEST_ORG_ID", "org-id")
     monkeypatch.setattr(
         test_post_deploy.httpx,
         "get",
@@ -132,8 +135,9 @@ def test_prod_standing_identity_is_resolved_live_without_a_mutating_post(
 ) -> None:
     monkeypatch.setenv("COWORK_REQUIRE_INTEGRATION", "true")
     monkeypatch.setenv("COWORK_TEST_IDENTITY_MODE", "standing")
-    monkeypatch.setenv("COWORK_TEST_API_KEY", "dedicated-key")
+    monkeypatch.setenv("COWORK_TEST_API_KEY", "mdb_deadbeef.dedicated-key")
     monkeypatch.setenv("COWORK_TEST_USER_EMAIL", "cowork-ci@mindshub.ai")
+    monkeypatch.setenv("COWORK_TEST_ORG_ID", "org-id")
     monkeypatch.setenv(
         "TEST_USER_PROVISION_URL",
         "http://auth.prod.svc.cluster.local/v1/internal/test-users/",
@@ -149,6 +153,9 @@ def test_prod_standing_identity_is_resolved_live_without_a_mutating_post(
         def json():
             return {
                 "valid": True,
+                "auth_method": "api_key",
+                "key_type": "user",
+                "key_prefix": "mdb_deadbeef",
                 "email": "cowork-ci@mindshub.ai",
                 "user_id": "user-id",
                 "organization_id": "org-id",
@@ -169,7 +176,7 @@ def test_prod_standing_identity_is_resolved_live_without_a_mutating_post(
     identity = test_post_deploy._provision_identity()
 
     assert identity == {
-        "api_key": "dedicated-key",
+        "api_key": "mdb_deadbeef.dedicated-key",
         "email": "cowork-ci@mindshub.ai",
         "user_id": "user-id",
         "organization_id": "org-id",
@@ -177,7 +184,9 @@ def test_prod_standing_identity_is_resolved_live_without_a_mutating_post(
     assert len(calls) == 1
     assert calls[0][0] == test_post_deploy.PROD_AUTHENTICATE_URL
     assert calls[0][1]["follow_redirects"] is False
-    assert calls[0][1]["headers"]["Authorization"] == "Bearer dedicated-key"
+    assert (
+        calls[0][1]["headers"]["Authorization"] == "Bearer mdb_deadbeef.dedicated-key"
+    )
 
 
 @pytest.mark.parametrize(
@@ -195,8 +204,9 @@ def test_prod_standing_identity_rejects_privileged_principal(
 ) -> None:
     monkeypatch.setenv("COWORK_REQUIRE_INTEGRATION", "true")
     monkeypatch.setenv("COWORK_TEST_IDENTITY_MODE", "standing")
-    monkeypatch.setenv("COWORK_TEST_API_KEY", "dedicated-key")
+    monkeypatch.setenv("COWORK_TEST_API_KEY", "mdb_deadbeef.dedicated-key")
     monkeypatch.setenv("COWORK_TEST_USER_EMAIL", "cowork-ci@mindshub.ai")
+    monkeypatch.setenv("COWORK_TEST_ORG_ID", "org-id")
 
     class Response:
         status_code = 200
@@ -206,6 +216,9 @@ def test_prod_standing_identity_rejects_privileged_principal(
         def json():
             return {
                 "valid": True,
+                "auth_method": "api_key",
+                "key_type": "user",
+                "key_prefix": "mdb_deadbeef",
                 "email": "cowork-ci@mindshub.ai",
                 "user_id": "user-id",
                 "organization_id": "org-id",
@@ -222,4 +235,103 @@ def test_prod_standing_identity_rejects_privileged_principal(
     )
 
     with pytest.raises(pytest.fail.Exception, match=message):
+        test_post_deploy._provision_identity()
+
+
+@pytest.mark.parametrize(
+    ("auth_method", "key_type", "key_prefix"),
+    [
+        ("api_key", None, "mdb_deadbeef"),
+        ("api_key", "instance", "mdb_deadbeef"),
+        ("api_key", "turn", "mdb_deadbeef"),
+        ("jwt", "user", None),
+        ("api_key", "user", None),
+        ("api_key", "user", "mdb_different"),
+    ],
+)
+def test_prod_standing_identity_rejects_a_non_user_api_key(
+    monkeypatch, auth_method, key_type, key_prefix
+) -> None:
+    monkeypatch.setenv("COWORK_REQUIRE_INTEGRATION", "true")
+    monkeypatch.setenv("COWORK_TEST_IDENTITY_MODE", "standing")
+    monkeypatch.setenv("COWORK_TEST_API_KEY", "mdb_deadbeef.dedicated-key")
+    monkeypatch.setenv("COWORK_TEST_USER_EMAIL", "cowork-ci@mindshub.ai")
+    monkeypatch.setenv("COWORK_TEST_ORG_ID", "org-id")
+
+    class Response:
+        status_code = 200
+        headers = {"X-Billing-Segment": "free"}
+
+        @staticmethod
+        def json():
+            return {
+                "valid": True,
+                "auth_method": auth_method,
+                "key_type": key_type,
+                "key_prefix": key_prefix,
+                "email": "cowork-ci@mindshub.ai",
+                "user_id": "user-id",
+                "organization_id": "org-id",
+                "entitlements": {"permissions": {"admin": {"hub": False}}},
+            }
+
+    monkeypatch.setattr(
+        test_post_deploy.httpx,
+        "get",
+        lambda *_args, **_kwargs: Response(),
+    )
+
+    with pytest.raises(pytest.fail.Exception, match="standing user API key"):
+        test_post_deploy._provision_identity()
+
+
+def test_prod_standing_identity_rejects_a_non_mindsdb_key_before_network(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("COWORK_REQUIRE_INTEGRATION", "true")
+    monkeypatch.setenv("COWORK_TEST_IDENTITY_MODE", "standing")
+    monkeypatch.setenv("COWORK_TEST_API_KEY", "not-a-mindsdb-key")
+    monkeypatch.setenv("COWORK_TEST_USER_EMAIL", "cowork-ci@mindshub.ai")
+    monkeypatch.setenv("COWORK_TEST_ORG_ID", "org-id")
+    monkeypatch.setattr(
+        test_post_deploy.httpx,
+        "get",
+        lambda *_args, **_kwargs: pytest.fail("invalid key reached auth"),
+    )
+
+    with pytest.raises(pytest.fail.Exception, match="beginning with mdb_"):
+        test_post_deploy._provision_identity()
+
+
+def test_prod_standing_identity_rejects_a_different_organization(monkeypatch) -> None:
+    monkeypatch.setenv("COWORK_REQUIRE_INTEGRATION", "true")
+    monkeypatch.setenv("COWORK_TEST_IDENTITY_MODE", "standing")
+    monkeypatch.setenv("COWORK_TEST_API_KEY", "mdb_deadbeef.dedicated-key")
+    monkeypatch.setenv("COWORK_TEST_USER_EMAIL", "cowork-ci@mindshub.ai")
+    monkeypatch.setenv("COWORK_TEST_ORG_ID", "dedicated-org-id")
+
+    class Response:
+        status_code = 200
+        headers = {"X-Billing-Segment": "free"}
+
+        @staticmethod
+        def json():
+            return {
+                "valid": True,
+                "auth_method": "api_key",
+                "key_type": "user",
+                "key_prefix": "mdb_deadbeef",
+                "email": "cowork-ci@mindshub.ai",
+                "user_id": "user-id",
+                "organization_id": "different-live-org-id",
+                "entitlements": {"permissions": {"admin": {"hub": False}}},
+            }
+
+    monkeypatch.setattr(
+        test_post_deploy.httpx,
+        "get",
+        lambda *_args, **_kwargs: Response(),
+    )
+
+    with pytest.raises(pytest.fail.Exception, match="different organization"):
         test_post_deploy._provision_identity()
