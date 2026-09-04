@@ -14,6 +14,8 @@ import re
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from cowork.harnesses.hermes_harness.tools import (
     _hermes_create_artifact,
     _hermes_list_artifacts,
@@ -124,6 +126,8 @@ def test_create_rejects_unknown_type():
 
 
 def test_register_artifact_tools_is_idempotent():
+    # hermes-agent is an optional extra; these two tests drive its registry.
+    pytest.importorskip("tools.registry")
     register_artifact_tools()
     register_artifact_tools()
     from tools.registry import registry
@@ -141,6 +145,7 @@ def test_register_artifact_tools_is_idempotent():
 def test_registry_dispatch_forwards_task_id_to_handler():
     """run_agent invokes tools via registry.dispatch(name, args, task_id=...);
     pin that the context lookup works through that exact path."""
+    pytest.importorskip("tools.registry")
     register_artifact_tools()
     from tools.registry import registry
 
