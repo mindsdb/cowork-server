@@ -10,6 +10,7 @@ import time
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI, HTTPException
@@ -2202,6 +2203,69 @@ def test_tasks_inheriting_a_legacy_default_model_run_with_the_catalog_id(tmp_pat
     )
 
     assert (from_project.model, from_settings.model, explicit.model) == ("gpt", "gpt", "fable")
+
+
+def test_a_project_default_reasoning_effort_applies_unless_the_task_chooses_its_own(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(ProjectCreateRequest(
+        name="Effort defaults",
+        folders=[ProjectFolder(id="repo", name="Repo", path=str(repo))],
+        default_engine_id="fake",
+        default_model="fake-model",
+        default_reasoning_effort="low",
+    ))
+
+    inherited = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Use the project default"), CREDS, "fake", "fake-model"
+    )
+    chosen = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Pick my own", reasoning_effort="xhigh"), CREDS, "fake", "fake-model"
+    )
+
+    assert inherited.reasoning_effort == "low"
+    assert chosen.reasoning_effort == "xhigh"
+    wait_for_status(service, inherited.id, SessionStatus.completed)
+    wait_for_status(service, chosen.id, SessionStatus.completed)
+
+
+def test_effort_levels_follow_what_the_gateway_advertises_for_the_task_model(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(ProjectCreateRequest(
+        name="Effort levels",
+        folders=[ProjectFolder(id="repo", name="Repo", path=str(repo))],
+        default_engine_id="fake",
+        default_model="fake-model",
+        default_reasoning_effort="max",
+    ))
+    levels = SimpleNamespace(
+        ids=["fake-model", "fake-small"],
+        efforts={
+            "fake-model": {"efforts": ["low", "high", "max"], "default": "high"},
+            "fake-small": {"efforts": ["low", "high"], "default": "low"},
+        },
+    )
+
+    with pytest.raises(ValueError, match='Reasoning effort "xhigh" isn\'t available for fake-model. It offers: low, high, max.'):
+        service.create_session(
+            SessionCreateRequest(project_id=project.id, prompt="Ask for a level it lacks", reasoning_effort="xhigh"),
+            CREDS, "fake", "fake-model", model_levels=levels,
+        )
+    assert service.list_sessions(False).items == []
+
+    inherited = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Inherit max"), CREDS, "fake", "fake-model", model_levels=levels
+    )
+    other_model = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="A model without max", model="fake-small"),
+        CREDS, "fake", "fake-model", model_levels=levels,
+    )
+
+    assert inherited.reasoning_effort == "max"
+    assert other_model.reasoning_effort is None
+    wait_for_status(service, inherited.id, SessionStatus.completed)
+    wait_for_status(service, other_model.id, SessionStatus.completed)
 
 
 def test_failed_fork_preparation_does_not_leave_control_records(

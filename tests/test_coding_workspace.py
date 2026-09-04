@@ -8,7 +8,7 @@ import pytest
 
 from cowork.coding import workspace as workspace_module
 from cowork.coding.contracts import WorkspaceKind
-from cowork.coding.workspace import GitRunner, GitUnavailableError, WorkspaceError, WorkspaceManager
+from cowork.coding.workspace import GitIdentityMissingError, GitRunner, GitUnavailableError, WorkspaceError, WorkspaceManager
 from cowork.common.settings.app_settings import get_app_settings
 
 
@@ -442,3 +442,87 @@ def test_a_local_copy_is_reviewable_and_applies_back_without_git(
     assert sorted(applied) == ["added.txt", "notes.txt"]
     assert (source / "notes.txt").read_text(encoding="utf-8") == "v2\n"
     assert (source / "added.txt").read_text(encoding="utf-8") == "new\n"
+
+
+def isolate_git_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Point Git at an empty global config and forbid the guessed identity, as a fresh Windows account behaves."""
+    global_config = tmp_path / "gitconfig"
+    global_config.write_text("[user]\n\tuseConfigOnly = true\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(global_config))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    for variable in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL", "EMAIL"):
+        monkeypatch.delenv(variable, raising=False)
+    return global_config
+
+
+def test_identity_check_passes_for_a_repository_that_names_its_author(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    WorkspaceManager(tmp_path / "coding").check_git_identity(str(repo))
+
+
+def test_identity_check_names_the_missing_fields_before_any_commit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    isolate_git_identity(monkeypatch, tmp_path)
+    repo = repository(tmp_path)
+    git(repo, "config", "--unset", "user.email")
+
+    with pytest.raises(GitIdentityMissingError) as raised:
+        WorkspaceManager(tmp_path / "coding").check_git_identity(str(repo))
+
+    assert raised.value.missing == ["user.email"]
+    assert raised.value.code == "git_identity_missing"
+    assert "email" in str(raised.value) and "nothing in the task is lost" in str(raised.value)
+
+    git(repo, "config", "--unset", "user.name")
+    with pytest.raises(GitIdentityMissingError) as raised:
+        WorkspaceManager(tmp_path / "coding").check_git_identity(str(repo))
+    assert raised.value.missing == ["user.name", "user.email"]
+    assert "name and email" in str(raised.value)
+
+
+def test_setting_the_identity_fills_only_what_is_unset(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    global_config = isolate_git_identity(monkeypatch, tmp_path)
+    manager = WorkspaceManager(tmp_path / "coding")
+    assert manager.git_identity().missing == ["user.name", "user.email"]
+
+    written = manager.set_git_identity("Ian Unsworth", "ian@example.invalid")
+
+    assert (written.name, written.email) == ("Ian Unsworth", "ian@example.invalid")
+    assert "useConfigOnly" in global_config.read_text(encoding="utf-8")
+
+    # A second call never overwrites what is already configured.
+    kept = manager.set_git_identity("Someone Else", "else@example.invalid")
+    assert (kept.name, kept.email) == ("Ian Unsworth", "ian@example.invalid")
+
+    # And the repository that failed before now passes the check.
+    repo = repository(tmp_path)
+    git(repo, "config", "--unset", "user.email")
+    git(repo, "config", "--unset", "user.name")
+    manager.check_git_identity(str(repo))
+
+
+def test_a_direct_folder_commit_stops_before_staging_without_an_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    isolate_git_identity(monkeypatch, tmp_path)
+    repo = repository(tmp_path)
+    git(repo, "config", "--unset", "user.email")
+    (repo / "keep.txt").write_text("changed\n", encoding="utf-8")
+
+    with pytest.raises(GitIdentityMissingError):
+        WorkspaceManager(tmp_path / "coding").commit(str(repo), "Change keep")
+
+    # Nothing was staged, so the working tree reads exactly as before.
+    assert git(repo, "diff", "--cached", "--name-only") == ""
+    assert git(repo, "status", "--short") == "M keep.txt"
+
+
+def test_an_author_only_environment_is_still_a_missing_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    isolate_git_identity(monkeypatch, tmp_path)
+    repo = repository(tmp_path)
+    git(repo, "config", "--unset", "user.name")
+    git(repo, "config", "--unset", "user.email")
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Only Author")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "author@example.invalid")
+
+    with pytest.raises(GitIdentityMissingError) as raised:
+        WorkspaceManager(tmp_path / "coding").check_git_identity(str(repo))
+
+    assert raised.value.missing == ["user.name", "user.email"]

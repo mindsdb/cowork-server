@@ -432,6 +432,121 @@ async def artifact_review_entry(
     }
 
 
+# A share is a re-publish, so it inherits the upload's cost. Generous enough for
+# a fullstack bundle, bounded so a wedged target can't hold the request open.
+_ACCESS_PUBLISH_TIMEOUT_S = 60.0
+
+
+class _AccessBody(BaseModel):
+    """The access selection, in `anton.publish_access.resolve_access` shape.
+
+    Passed through rather than re-modelled per mode: the publisher owns the
+    schema (`{"mode": "public"}`, `{"mode": "password", "password": ...}`,
+    `{"mode": "restricted", "emails": [...], "org_allowed": bool,
+    "owner_only": bool}`) and validates it, so a second definition here could
+    only drift away from it.
+    """
+
+    access: dict
+
+
+def _owner_publish_context(session, folder: Path):
+    """The (artifacts_base, publish_url, key) an org-mode publish needs.
+
+    The same three `autopublish_project_artifacts` resolves, and deliberately
+    not `publish.py`'s `_desktop_context`: that one wants an absolute path from
+    the request plus a credential out of stored provider settings, neither of
+    which exists on an org deployment — which is why the whole `/publish` router
+    is local-only.
+    """
+    from cowork.services.artifact_autopublish import _publish_url
+    from cowork.services.artifact_publish_key import PublishKey
+
+    scope = session.scope
+    return (
+        folder.parent,
+        _publish_url(scope),
+        PublishKey(str(scope.user_id), str(scope.org_id), min_ttl_s=_ACCESS_PUBLISH_TIMEOUT_S + 60.0),
+    )
+
+
+def _artifact_primary(folder: Path, metadata: dict | None):
+    from cowork.services.artifacts import _pick_primary, _user_files
+
+    return _pick_primary(folder, _user_files(folder), primary_hint=(metadata or {}).get("primary"))
+
+
+@router.get("/workspace/{project_ref}/{artifact_id}/access")
+async def artifact_access(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    session: ScopedSessionDep,
+):
+    """The owner's full access state for the Share control.
+
+    Owner-only, and that is the point. The artifact CARD drops `accessEmails`
+    and `accessPassword` in org mode because one artifacts root is shared by the
+    whole organization, so the card cannot tell owner from co-member. This route
+    can: `_owner_workspace` refuses anyone else, so the owner gets back what they
+    need to pre-fill the dialog without widening what a card exposes.
+    """
+    from cowork.services.artifacts import _published_access_for
+
+    _source, folder, metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
+    primary = await run_in_threadpool(_artifact_primary, folder, metadata)
+    if primary is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This artifact has no publishable file.",
+        )
+    return await run_in_threadpool(_published_access_for, folder, primary)
+
+
+@router.put("/workspace/{project_ref}/{artifact_id}/access")
+async def set_artifact_access(
+    project_ref: str,
+    artifact_id: ArtifactIdDep,
+    body: _AccessBody,
+    session: ScopedSessionDep,
+):
+    """Re-publish this artifact with a new audience. Owner-only.
+
+    A publish, not a separate access API, because the publish target stores
+    access alongside the bundle and reuses the existing `report_id` — so the
+    shared URL survives the change. This is the same call autopublish makes on
+    every turn, with the owner's selection in place of the first-publish default.
+    """
+    from cowork.services.publish import publish_artifact as _publish_bundle
+
+    _source, folder, metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
+    if _artifact_primary(folder, metadata) is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This artifact has no publishable file.",
+        )
+    artifacts_base, publish_url, key = _owner_publish_context(session, folder)
+    api_key = await key.get()
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Publishing is unavailable right now. Try again in a moment.",
+        )
+    try:
+        return await run_in_threadpool(
+            _publish_bundle,
+            folder,
+            artifacts_base=artifacts_base,
+            api_key=api_key,
+            publish_url=publish_url,
+            access=dict(body.access or {}),
+            scope=session.scope,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
 @router.post("/workspace/{project_ref}/{artifact_id}/comments-access")
 async def enable_artifact_comments(
     project_ref: str,

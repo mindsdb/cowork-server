@@ -133,7 +133,9 @@ def test_delete_pins_complete_inventory_before_project_name_selection(
     )
 
     assert result == {"status": "deleted", "path": "notes.txt"}
-    assert basename_calls == ["reports", "other", "reports"]
+    # The fourth call is dir_unlink validating its own direct-child name, which
+    # every destructive helper repeats beside its sink.
+    assert basename_calls == ["reports", "other", "reports", "notes.txt"]
     assert opened == [reports_root.parent, other_root.parent]
     assert closed == [other_root.parent, reports_root.parent]
     assert not target.exists()

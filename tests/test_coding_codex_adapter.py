@@ -862,6 +862,7 @@ def test_user_terminal_is_not_restricted_by_agent_permissions() -> None:
     engine_session._sandbox_policy = {"type": "readOnly", "networkAccess": False}
     engine_session._terminal_handlers = {"process-1": lambda *_args: None}
     engine_session._terminal_lock = codex_module.threading.Lock()
+    engine_session._terminal_commands = set()
     engine_session._secrets = ()
     exits: list[tuple[int | None, str | None]] = []
 
@@ -952,3 +953,118 @@ def test_codex_is_an_optional_extra_and_reports_itself_missing_plainly(monkeypat
 
     assert capabilities.available is False
     assert capabilities.reason == "Code Mode components are not installed on this computer yet."
+
+
+def test_a_finished_turn_reaps_its_command_trees_but_keeps_codex_helpers(monkeypatch) -> None:
+    """WIN-QA-007: the app-server stays open between turns, so the turn's own
+    processes must be ended when it completes, without touching the MCP servers
+    and code-mode host Codex keeps for the next turn."""
+    import threading
+    from types import SimpleNamespace
+
+    from cowork.coding.engines import codex as codex_module
+    from cowork.coding.engines.codex import CodexEngineSession
+
+    class FakeClient:
+        _proc = SimpleNamespace(pid=4242)
+
+        def __init__(self) -> None:
+            self.notifications = iter([
+                SimpleNamespace(method="item/agentMessage/delta", payload={"delta": "hi"}),
+                SimpleNamespace(method="turn/completed", payload={"turn": {"id": "turn-1", "status": "completed"}}),
+            ])
+            self.unregistered: list[str] = []
+
+        def next_turn_notification(self, turn_id: str):
+            return next(self.notifications)
+
+        def unregister_turn_notifications(self, turn_id: str) -> None:
+            self.unregistered.append(turn_id)
+
+    session = object.__new__(CodexEngineSession)
+    session._client = FakeClient()
+    session._secrets = ()
+    session._closed = threading.Event()
+    session._cancel_watchdogs = {}
+    session._cancel_lock = threading.Lock()
+    session._goal_states = {}
+    session._mcp_servers = (("node", ("mcp.js",)),)
+    session._terminal_commands = {("/bin/bash", "--login")}
+
+    reaped: list[tuple[int | None, object]] = []
+    monkeypatch.setattr(codex_module, "terminate_command_trees", lambda pid, *, protected: reaped.append((pid, protected)) or 3)
+
+    list(session.events("turn-1"))
+
+    assert session._client.unregistered == ["turn-1"]
+    assert [pid for pid, _ in reaped] == [4242]
+    protected = reaped[0][1]
+
+    def proc(name, cmdline, environ=None):
+        return SimpleNamespace(name=lambda: name, cmdline=lambda: cmdline, environ=lambda: environ or {})
+
+    assert protected(proc("codex-code-mode-host.exe", ["codex-code-mode-host.exe"]))
+    assert protected(proc("python", ["python", "-m", "cowork.coding.integration_mcp", "/root", "task"]))
+    assert protected(proc("node", ["/usr/bin/node", "mcp.js"]))
+    # A terminal tab or Run action: the sidecar marks its environment, and on
+    # macOS, where a PTY shell's environment is unreadable, its argv is known.
+    assert protected(proc("zsh", ["/bin/zsh", "-il"], {"COWORK_CODE_TERMINAL": "terminal-1", "TERM": "xterm-256color"}))
+    assert protected(proc("bash", ["/bin/bash", "--login"], {}))
+    assert not protected(proc("bash", ["/bin/bash", "-lc", "npm test"], {}))
+    assert not protected(proc("node", ["node", "server.js"]))
+    assert not protected(proc("cmd.exe", ["cmd.exe", "/c", "npm test"]))
+    assert not protected(proc("zsh", ["/bin/zsh", "-lc", "npm run dev"], {"TERM": "xterm-256color"}))
+
+    class Opaque:
+        def name(self):
+            raise PermissionError("no access")
+
+        def cmdline(self):
+            return []
+
+        def environ(self):
+            return {}
+
+    assert protected(Opaque())
+
+    # Once the session is closed, close() has already torn everything down.
+    session._closed.set()
+    list(FakeClient().notifications)  # unused; keeps the fake independent
+    session._client = FakeClient()
+    list(session.events("turn-2"))
+    assert len(reaped) == 1
+
+
+def test_terminal_tabs_are_marked_so_a_finished_turn_leaves_them_running(tmp_path: Path) -> None:
+    import threading
+    from types import SimpleNamespace
+
+    from cowork.coding.contracts import TerminalShellPreference
+    from cowork.coding.engines.codex import CodexEngineSession
+    from cowork.coding.processes import TERMINAL_ENV_MARKER
+
+    requests: list[tuple[str, dict]] = []
+
+    class FakeClient:
+        def request(self, method, params, response_model=None):
+            requests.append((method, params))
+            return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    session = object.__new__(CodexEngineSession)
+    session._client = FakeClient()
+    session._terminal_workspace = tmp_path
+    session._terminal_handlers = {}
+    session._terminal_lock = threading.Lock()
+    session._secrets = ()
+    session._closed = threading.Event()
+    session._terminal_commands = set()
+    exits: list[tuple[int | None, str | None]] = []
+
+    session._run_terminal("terminal-7", 120, 40, TerminalShellPreference.bash, lambda code, error: exits.append((code, error)))
+
+    (method, params), = requests
+    assert method == "command/exec"
+    assert params["processId"] == "terminal-7"
+    assert params["env"][TERMINAL_ENV_MARKER] == "terminal-7"
+    assert tuple(params["command"]) in session._terminal_commands
+    assert exits == [(0, None)]
