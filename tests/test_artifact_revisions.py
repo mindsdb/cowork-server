@@ -886,10 +886,39 @@ def test_releasing_leaves_other_threads_and_decided_repairs_alone(artifact):
     assert release_repairs_for_comment(folder, "thread-other") == []
     assert agent_repair_detail(folder, requested["repair"]["id"])["repair"]["status"] == "queued"
 
-    # A queued repair's turn is moot once its comment is closed.
-    assert [r["status"] for r in release_repairs_for_comment(folder, "thread-1")] == ["cancelled"]
-    # Already terminal: releasing again changes nothing.
+    # A queued repair is left to its own turn: capture_agent_revision only
+    # reconciles records that are still queued, so finishing one here would let
+    # the agent's edit land with nothing tracking it and no comparison to
+    # review it in.
     assert release_repairs_for_comment(folder, "thread-1") == []
+    assert agent_repair_detail(folder, requested["repair"]["id"])["repair"]["status"] == "queued"
+
+
+def test_resolving_mid_turn_leaves_the_agents_edit_reviewable(artifact):
+    """Resolving while the turn is still running must not finish the repair:
+    capture_agent_revision only reconciles queued records, so the edit would
+    land with no ready state and no comparison behind it."""
+    folder, metadata, artifact_id = artifact
+    requested = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=current_source(folder, metadata, artifact_id)["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "Please change this"}],
+        conversation_id="conversation-1",
+    )
+
+    release_repairs_for_comment(folder, "thread-1")
+
+    # The turn finishes afterwards, as it would in the product.
+    (folder / "brief.md").write_text("# Agent title\n", encoding="utf-8")
+    capture_agent_revision(folder, conversation_id="conversation-1")
+
+    detail = agent_repair_detail(folder, requested["repair"]["id"])
+    assert detail["repair"]["status"] == "ready"
+    assert detail["compare"]["after"]["content"] == "# Agent title\n"
 
 
 def test_blocked_repair_names_the_comment_it_is_waiting_on(artifact):

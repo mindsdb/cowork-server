@@ -874,24 +874,26 @@ def cancel_agent_repair(folder: Path, repair_id: str, *, discard_ready: bool = F
 
 
 def release_repairs_for_comment(folder: Path, comment_thread_id: str) -> list[dict]:
-    """Release any repair still waiting on a comment thread that was resolved.
+    """Release a ready repair still waiting on a comment thread that was resolved.
 
     Resolving the comment is the explicit decision the accept-or-reject rule
-    was protecting: the owner has read the feedback and closed it. A queued
-    repair's turn is moot from here and a ready one's suggestion is the
-    owner's to keep or drop, so neither should keep gating the path.
+    was protecting: the owner has read the suggestion and closed it out.
+
+    A queued repair is deliberately left alone. Its turn may still be running,
+    and capture_agent_revision only reconciles records that are still queued -
+    so finishing one here would let the agent's edit land with no repair
+    tracking it, no ready state and no comparison to review it in. A queued
+    repair ends with its own turn, or through the create guard once its base
+    has moved or its TTL has passed.
     """
     released: list[dict] = []
     with artifact_lock(folder):
         for repair in _repair_records(folder):
             if repair.get("commentThreadId") != comment_thread_id:
                 continue
-            if repair.get("status") == "queued":
-                repair["status"] = "cancelled"
-            elif repair.get("status") == "ready":
-                repair["status"] = "discarded"
-            else:
+            if repair.get("status") != "ready":
                 continue
+            repair["status"] = "discarded"
             repair["updatedAt"] = _now()
             _write_repair(folder, repair)
             released.append(repair)
