@@ -31,9 +31,26 @@ ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
 ORG_B = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
 USER_A = "11111111-1111-4111-8111-111111111111"
 USER_B = "22222222-2222-4222-8222-222222222222"
+USER_A_PEER = "33333333-3333-4333-8333-333333333333"
+USER_A_ADMIN = "44444444-4444-4444-8444-444444444444"
 
-A = {"X-User-Id": USER_A, "X-Organization-Id": ORG_A}
+A = {
+    "X-User-Id": USER_A,
+    "X-User-Email": "creator@example.com",
+    "X-Organization-Id": ORG_A,
+}
 B = {"X-User-Id": USER_B, "X-Organization-Id": ORG_B}
+A_PEER = {
+    "X-User-Id": USER_A_PEER,
+    "X-User-Email": "peer@example.com",
+    "X-Organization-Id": ORG_A,
+}
+A_OTHER_ADMIN = {
+    "X-User-Id": USER_A_ADMIN,
+    "X-User-Email": "admin@example.com",
+    "X-Organization-Id": ORG_A,
+    "X-User-Roles": "manage-organization",
+}
 
 
 @pytest.fixture(scope="module")
@@ -149,6 +166,159 @@ def test_projects_isolated(client):
     assert a_after == a_before  # row unchanged, not merely present
 
 
+def test_shared_resource_authorization_and_contract_through_http(client):
+    """Exercise same-org policy through middleware, DI, routes, and storage."""
+    project_name = f"shared-{uuid4().hex[:8]}"
+    created = client.post(
+        "/api/v1/projects/",
+        json={"name": project_name},
+        headers=A,
+    )
+    assert created.status_code == 201, created.text
+    project = created.json()
+    project_id = project["id"]
+    assert project["attribution"]["createdBy"] == {
+        "userId": USER_A,
+        "email": "creator@example.com",
+    }
+    assert project["capabilities"] == {
+        "canRename": True,
+        "canDelete": True,
+        "canEditInstructions": True,
+    }
+
+    denied = client.patch(
+        f"/api/v1/projects/{project_id}",
+        json={"name": f"{project_name}-peer"},
+        headers=A_PEER,
+    )
+    assert denied.status_code == 403, denied.text
+
+    # Echoing the current name must remain a selection-only update for a peer.
+    selected = client.patch(
+        f"/api/v1/projects/{project_id}",
+        json={"name": project_name, "isActive": True},
+        headers=A_PEER,
+    )
+    assert selected.status_code == 200, selected.text
+    assert selected.json()["name"] == project_name
+
+    renamed_name = f"{project_name}-admin"
+    renamed = client.patch(
+        f"/api/v1/projects/{project_id}",
+        json={"name": renamed_name},
+        headers=A_OTHER_ADMIN,
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["attribution"]["lastModifiedBy"]["userId"] == USER_A_ADMIN
+
+    skill_label = f"http skill {uuid4().hex[:8]}"
+    skill_created = client.post(
+        "/api/v1/skills/",
+        json={"label": skill_label, "instructions": "Initial skill"},
+        headers=A,
+    )
+    assert skill_created.status_code == 201, skill_created.text
+    skill = skill_created.json()
+    assert skill["attribution"]["createdBy"]["userId"] == USER_A
+    assert set(skill["capabilities"]) == {"canEdit", "canDelete", "canDisable"}
+    denied = client.put(
+        f"/api/v1/skills/{skill['id']}",
+        json={"instructions": "Peer overwrite"},
+        headers=A_PEER,
+    )
+    assert denied.status_code == 403, denied.text
+    skill_updated = client.put(
+        f"/api/v1/skills/{skill['id']}",
+        json={"enabled": False},
+        headers=A_OTHER_ADMIN,
+    )
+    assert skill_updated.status_code == 200, skill_updated.text
+    assert (
+        skill_updated.json()["attribution"]["lastModifiedBy"]["userId"] == USER_A_ADMIN
+    )
+
+    memory_created = client.put(
+        "/api/v1/memory/",
+        headers=A,
+        json={
+            "scope": "project",
+            "category": "rules",
+            "content": "Creator memory",
+            "project_id": project_id,
+        },
+    )
+    assert memory_created.status_code == 200, memory_created.text
+    assert memory_created.json()["attribution"]["createdBy"]["userId"] == USER_A
+    denied = client.put(
+        "/api/v1/memory/",
+        headers=A_PEER,
+        json={
+            "scope": "project",
+            "category": "rules",
+            "content": "Peer memory",
+            "project_id": project_id,
+        },
+    )
+    assert denied.status_code == 403, denied.text
+    memory_updated = client.put(
+        "/api/v1/memory/",
+        headers=A_OTHER_ADMIN,
+        json={
+            "scope": "project",
+            "category": "rules",
+            "content": "Admin memory",
+            "project_id": project_id,
+        },
+    )
+    assert memory_updated.status_code == 200, memory_updated.text
+    assert memory_updated.json()["capabilities"] == {
+        "canEdit": True,
+        "canDelete": True,
+    }
+
+    instructions_url = f"/api/v1/projects/{renamed_name}/files/.anton/anton.md"
+    instructions_created = client.put(
+        instructions_url,
+        json={"content": "Creator instructions"},
+        headers=A,
+    )
+    assert instructions_created.status_code == 200, instructions_created.text
+    assert instructions_created.json()["attribution"]["createdBy"]["userId"] == USER_A
+    denied = client.put(
+        instructions_url,
+        json={"content": "Peer instructions"},
+        headers=A_PEER,
+    )
+    assert denied.status_code == 403, denied.text
+    instructions_updated = client.put(
+        instructions_url,
+        json={"content": "Admin instructions"},
+        headers=A_OTHER_ADMIN,
+    )
+    assert instructions_updated.status_code == 200, instructions_updated.text
+    assert (
+        instructions_updated.json()["attribution"]["lastModifiedBy"]["userId"]
+        == USER_A_ADMIN
+    )
+    assert instructions_updated.json()["capabilities"] == {
+        "canEdit": True,
+        "canDelete": True,
+    }
+
+    general = next(
+        row
+        for row in client.get("/api/v1/projects/", headers=A_PEER).json()
+        if row["name"] == "general"
+    )
+    general_selected = client.patch(
+        f"/api/v1/projects/{general['id']}",
+        json={"name": "general", "isActive": True},
+        headers=A_PEER,
+    )
+    assert general_selected.status_code == 200, general_selected.text
+
+
 # -- conversations --------------------------------------------------------------
 
 def test_conversations_isolated(client):
@@ -172,7 +342,7 @@ def test_conversations_isolated(client):
 def test_conversation_create_under_foreign_project(client):
     a_pid = _project(client, A)
 
-    cross = _same_as_missing_body(
+    _same_as_missing_body(
         client, "POST", "/api/v1/conversations/",
         lambda i: {"topic": "intruder", "projectId": i}, a_pid,
     )

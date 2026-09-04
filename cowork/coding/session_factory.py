@@ -26,6 +26,7 @@ from cowork.coding.playbooks import PlaybookService
 from cowork.coding.project_models import CodeProject, canonical_model_id
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
+from cowork.coding.reasoning import ModelLevels, resolve_reasoning_effort
 from cowork.coding.skill_models import SkillResolution
 from cowork.coding.skill_runtime import SkillRuntimeResolver
 from cowork.coding.store import CodingStore
@@ -137,10 +138,19 @@ class CodingSessionFactory:
         default_engine: str,
         default_model: str,
         code_skills: CodeSkillService | None = None,
+        model_levels: ModelLevels | None = None,
     ) -> CodingSession:
         project = self.projects.get(request.project_id) if request.project_id else None
         engine_id = request.engine_id or (project.default_engine_id if project else default_engine)
         model = canonical_model_id(request.model or (project.default_model if project else default_model))
+        # A task chooses its own effort; otherwise it inherits the project's,
+        # provided the model it runs on advertises that level.
+        reasoning_effort = resolve_reasoning_effort(
+            model,
+            request.reasoning_effort,
+            project.default_reasoning_effort if project else None,
+            model_levels,
+        )
         capabilities = self.registry.get(engine_id).capabilities()
         if not capabilities.available:
             raise RuntimeError(capabilities.reason or f"{capabilities.label} is unavailable")
@@ -168,6 +178,7 @@ class CodingSessionFactory:
                 capabilities.adapter_version,
                 control_snapshot,
                 code_skills,
+                reasoning_effort,
             )
         self.control.set_run_status(control_snapshot.run.id, RunStatus.preparing)
         preparation: LocalSessionPreparation | None = None
@@ -185,6 +196,7 @@ class CodingSessionFactory:
                 preparation=preparation,
                 skill_resolution=skill_resolution,
                 contexts=contexts,
+                reasoning_effort=reasoning_effort,
             )
             self.store.save_session(session)
             task = self.control.store.get_task(control_snapshot.task.id)
@@ -295,6 +307,7 @@ class CodingSessionFactory:
         preparation: LocalSessionPreparation,
         skill_resolution: SkillResolution,
         contexts: list[SourceContext],
+        reasoning_effort: str | None,
     ) -> CodingSession:
         project = preparation.project
         instructions = project_instructions(
@@ -313,7 +326,7 @@ class CodingSessionFactory:
             engine_adapter_version=adapter_version,
             model=model,
             permission_mode=preparation.permission_mode,
-            reasoning_effort=request.reasoning_effort,
+            reasoning_effort=reasoning_effort,
             service_tier=request.service_tier,
             personality=request.personality,
             network_access=request.network_access or preparation.permission_mode.value == "full_access",
@@ -356,6 +369,7 @@ class CodingSessionFactory:
         adapter_version: str,
         control_snapshot: TaskControlSnapshot,
         code_skills: CodeSkillService | None,
+        reasoning_effort: str | None,
     ) -> CodingSession:
         if project is None:
             raise RuntimeError("A folder on this computer cannot run on another computer")
@@ -389,7 +403,7 @@ class CodingSessionFactory:
             engine_adapter_version=adapter_version,
             model=model,
             permission_mode=permission_mode,
-            reasoning_effort=request.reasoning_effort,
+            reasoning_effort=reasoning_effort,
             service_tier=request.service_tier,
             personality=request.personality,
             network_access=request.network_access or permission_mode.value == "full_access",

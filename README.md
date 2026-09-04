@@ -120,6 +120,8 @@ Key tables:
 | `settings` | Key-value user settings; sensitive values Fernet-encrypted |
 | `pins` | User-pinned items (conversations, artifacts, etc.) |
 | `channel_*` | Channel installations, bindings, sessions, and events |
+| `shared_resource_attributions` | Creator and latest-editor user IDs for org-shared filesystem resources |
+| `shared_resource_mutations` | Append-only actor trail for allowed org-shared mutations, including deletes |
 
 All models use UUID primary keys with auto-tracked `created_at`/`modified_at` timestamps.
 
@@ -154,11 +156,11 @@ All models use UUID primary keys with auto-tracked `created_at`/`modified_at` ti
 
 The **database** holds structured metadata and relationships (which messages belong to which conversation, which conversation belongs to which project). The **filesystem** holds the actual content agents work with — project files, artifacts, memory entries, and uploaded documents. The `files` and `projects` DB tables store filesystem paths that point into the directory tree above.
 
-This split is the result of an ongoing migration from a purely filesystem-based architecture. Structured data that benefits from querying and relationships — conversations, messages, settings, schedules — lives in SQLite. Components that are inherently file-based — project working directories, agent artifacts, harness-managed memory, connector vault credentials, and skills — remain on the filesystem by design. (Skills briefly lived in a DB table; they were moved back to canonical `SKILL.md` files so they can be edited, uploaded, and distributed per project — see [docs/SKILLS.md](docs/SKILLS.md).) See [docs/SERVER_MIGRATION.md](docs/SERVER_MIGRATION.md) for the full migration story.
+This split is the result of an ongoing migration from a purely filesystem-based architecture. Structured data that benefits from querying and relationships, such as conversations, messages, settings, and schedules, lives in SQLite. Components that are inherently file-based, such as project working directories, agent artifacts, harness-managed memory, local-mode connector vault credentials, and skills, remain on the filesystem by design. Cloud OAuth credentials instead live per user in auth's Data Vault. Skills briefly lived in a DB table. They were moved back to canonical `SKILL.md` files so they can be edited, uploaded, and distributed per project; see [docs/SKILLS.md](docs/SKILLS.md). See [docs/SERVER_MIGRATION.md](docs/SERVER_MIGRATION.md) for the full migration story.
 
 Agents (via their harness) have read/write access to their project's working directory and the private `.anton/` subdirectory. They do **not** access the SQLite database directly — all DB interaction flows through the service layer.
 
-**Settings** use a hybrid approach: user preferences and API keys are stored in the `settings` DB table (with Fernet encryption for secrets), while connector credentials live in the filesystem vault (`data-vault/`).
+**Settings** use a hybrid approach: user preferences and API keys are stored in the `settings` DB table (with Fernet encryption for secrets), while desktop connector credentials live in the filesystem vault (`data-vault/`). Org-mode OAuth routes proxy the caller's private connection in auth's Data Vault instead.
 
 **The MindsHub credential is the exception, and it is stored nowhere.** On the
 desktop it is the user's own session token, which lives ten minutes, so the
@@ -352,12 +354,39 @@ Inside one organization, two different rules apply, and which one you get
 depends on the resource:
 
 - **Shared with the organization:** projects, project files at the project root,
-  skills, project memory, connected apps. Every member reads them.
+  skills, and project memory. Every member reads them.
 - **Private to whoever created it:** conversations and their history, scheduled
   tasks, personal memory, uploaded files, and everything under a conversation's
   own workspace at `conversations/<conversation_id>/`. Live artifacts are in
   that last group, because the agent writes them into the conversation it is
-  running in.
+  running in. Cloud OAuth connections are also user-private, held in auth's
+  Data Vault rather than here. cowork-server stores none of it and relays the
+  caller's own credential to auth for the whole lifecycle: the connect
+  handshake and its status poll, the connection catalogue, one connection's
+  detail, the Google Picker file grant, a short-lived picker access token, and
+  disconnect. auth resolves the caller from that credential, so each route only
+  ever reaches that user's own connections.
+
+Shared visibility does not imply shared destructive access. Project creators
+and organization admins can rename or delete a project; the General project is
+immutable. Any member can create a skill, while only its creator or an admin can
+edit, disable, or delete it. Packaged skills are immutable in org mode for every
+role (desktop keeps its existing editable-copy behavior). The first member to
+write a non-empty project-memory slot becomes its author, and only that author
+or an admin can subsequently change it. Project instructions follow the project
+creator/admin rule. Empty memory writes do not claim a slot, and ordinary
+project files remain member-writeable.
+
+The API derives these decisions from the trusted principal and returns typed
+`attribution` and `capabilities` objects for the client. Stable user IDs drive
+authorization, and they are the only identity these rows keep: no email address
+is stored, and the API fills one in only when the actor is the viewer
+themselves, so an attribution never discloses another member's address.
+File-backed resource ownership lives in `shared_resource_attributions`, outside
+the agent-writeable project tree, and every allowed protected mutation appends a
+`shared_resource_mutations` row. A delete removes the current attribution but
+keeps its mutation event. Unattributed legacy resources fail closed to
+admin-only mutation.
 
 The private rule is enforced by the service layer rather than by the routes:
 `ConversationService._owned`, `FileService._owned_select` and
