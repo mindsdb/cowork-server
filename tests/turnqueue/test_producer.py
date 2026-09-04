@@ -21,12 +21,23 @@ def _stub_llm_mint(monkeypatch):
 
 
 class FakeRedis:
-    def __init__(self, replies): self.added = []; self.registered = []; self._replies = replies
-    async def sadd(self, key, member): self.registered.append((key, member)); return 1
+    def __init__(self, replies):
+        self.added = []
+        self.registered = []
+        self._replies = replies
+
+    async def sadd(self, key, member):
+        self.registered.append((key, member))
+        return 1
+
     async def hset(self, key, mapping=None): return 1
     async def expire(self, key, seconds): return 1
     async def delete(self, *keys): return len(keys)
-    async def xadd(self, stream, fields): self.added.append((stream, fields)); return "1-0"
+
+    async def xadd(self, stream, fields):
+        self.added.append((stream, fields))
+        return "1-0"
+
     async def xread(self, streams, count=None, block=None):
         if self._replies:
             stream, fields = self._replies.pop(0)
@@ -124,12 +135,9 @@ async def test_stream_remote_replies_history_defaults_empty(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_oversized_request_warns_because_nothing_is_sheddable(monkeypatch):
-    # _fit_request used to shed skills then memory. Both now live on the shared
-    # EFS mount and never enter the payload, so what remains (input, model, llm,
-    # history) cannot be dropped without changing the turn's meaning. An
-    # oversized line must therefore be reported, not silently truncated by the
-    # pod's readline, and the real fix is history windowing upstream.
+async def test_oversized_required_request_warns_without_shedding_history(monkeypatch):
+    # Once optional project memory is absent, input/model/llm/history cannot be
+    # silently dropped without changing the turn's meaning.
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
@@ -151,6 +159,46 @@ async def test_oversized_request_warns_because_nothing_is_sheddable(monkeypatch)
     assert any("over the 4096-byte cap" in w for w in warnings), warnings
     params = json.loads(fake.added[0][1]["payload"])["params"]
     assert params["history"] == huge_history, "history must not be silently dropped"
+
+
+@pytest.mark.asyncio
+async def test_oversized_request_sheds_whole_project_memory_first(monkeypatch):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(prod, "_MAX_REQUEST_BYTES", 4096)
+    monkeypatch.setattr(prod, "_REQUEST_BYTES_MARGIN", 0)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        prod.logger,
+        "warning",
+        lambda msg, *args, **kw: warnings.append(msg % args if args else msg),
+    )
+
+    history = [{"role": "user", "content": "required history"}]
+    await _drain(
+        prod.stream_remote_replies(
+            conversation_id="conv-1",
+            org_id="org-1",
+            user_id="user-1",
+            input_text="hi",
+            model="m",
+            history=history,
+            memory={
+                "project": {
+                    "rules": "r" * 5000,
+                    "lessons": "l" * 5000,
+                }
+            },
+        )
+    )
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert "memory" not in params
+    assert params["history"] == history
+    shedding = [warning for warning in warnings if "project memory" in warning]
+    assert len(shedding) == 1
+    assert "dropped project memory" in shedding[0]
 
 
 @pytest.mark.asyncio

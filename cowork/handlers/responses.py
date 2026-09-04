@@ -68,7 +68,7 @@ from cowork.handlers.turn_errors import (
     retry_at_instant,
     response_failed_sse,
 )
-from cowork.db.scoped import ScopedSession, scope_from_principal
+from cowork.db.scoped import ScopedSession, TenantScope, scope_from_principal
 from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
@@ -782,6 +782,33 @@ class ResponsesHandler:
             logger.exception("[responses] failed to stage workspace files for conversation %s", conv_id)
 
     @staticmethod
+    def _stage_remote_workspace_files_in_new_session(
+        conv_id: UUID,
+        scope: TenantScope,
+    ) -> None:
+        raw_session = None
+        session = None
+        try:
+            raw_session = get_open_session()
+            session = ScopedSession(raw_session, scope)
+            ResponsesHandler._stage_remote_workspace_files(session, conv_id)
+        except Exception:
+            logger.exception(
+                "[responses] failed to open workspace staging session for conversation %s",
+                conv_id,
+            )
+        finally:
+            opened = session or raw_session
+            if opened is not None:
+                try:
+                    opened.close()
+                except Exception:
+                    logger.exception(
+                        "[responses] failed to close workspace staging session for conversation %s",
+                        conv_id,
+                    )
+
+    @staticmethod
     def _remote_workspace(session: ScopedSession, conv_id: UUID) -> dict:
         """The conversation's project as a path relative to the org root.
 
@@ -847,17 +874,30 @@ class ResponsesHandler:
 
     @staticmethod
     def _remote_memory(session: ScopedSession, conv_id: UUID) -> dict:
-        """This org's memory slots for the pod. A read error degrades to a turn
-        without memory rather than failing the turn."""
+        """This project's shared memory slots for the pod.
+
+        Personal/global memory is already mounted read-only per (org, user).
+        The pod's writable mount starts at the conversation workspace, so it
+        cannot see the project-level ``.anton/memory`` sibling unless these two
+        slots travel on the wire. A read error degrades to a turn without
+        project memory rather than failing the turn.
+        """
         try:
             conversation = ConversationService(session).get_conversation(conv_id)
-            return build_turn_memory(session.scope, conversation.project.path)
+            resolved = build_turn_memory(session.scope, conversation.project.path)
+            project = resolved.get("project")
+            return {"project": project} if project else {}
         except Exception:
             logger.exception("[responses] failed to read memory for conversation %s", conv_id)
             return {}
 
     @staticmethod
-    def _persist_turn_memory(session: ScopedSession, conv_id: UUID, entries: list) -> None:
+    def _persist_turn_memory(
+        session: ScopedSession,
+        conv_id: UUID,
+        entries: list,
+        principal: Principal | None,
+    ) -> None:
         """Apply what the pod asked to remember, re-anchoring the conversation
         first (like persist(): one deleted mid-turn must not write memory).
 
@@ -867,11 +907,77 @@ class ResponsesHandler:
             return
         try:
             conversation = ConversationService(session).get_conversation(conv_id)
-            applied = apply_turn_memory(session.scope, conversation.project.path, entries)
+            from cowork.models.project import Project
+            from cowork.services.shared_resources import (
+                PROJECT,
+                SharedResourceAccess,
+                project_resource_key,
+            )
+
+            access = SharedResourceAccess(session, principal)
+            project_id = conversation.project_id
+            with access.coordination_lock(
+                PROJECT,
+                project_resource_key(project_id),
+            ):
+                # The turn may have waited behind rename/delete. Re-anchor both
+                # rows while holding the project lock and use only that current
+                # path for the contained memory mutation.
+                conversation = ConversationService(session).get_conversation(conv_id)
+                session.refresh(conversation)
+                if conversation.project_id != project_id:
+                    raise RuntimeError("Conversation project changed during memory write")
+                project = session.get(Project, project_id)
+                if project is None:
+                    raise ValueError("Project not found")
+                session.refresh(project)
+                applied = apply_turn_memory(
+                    session.scope,
+                    project.path,
+                    entries,
+                    access=access,
+                    project_id=project.id,
+                )
             logger.info("[responses] applied %d memory entr(ies) for conversation %s",
                         applied, conv_id)
         except Exception:
             logger.exception("[responses] failed to apply memory for conversation %s", conv_id)
+
+    @staticmethod
+    def _persist_turn_memory_in_new_session(
+        conv_id: UUID,
+        entries: list,
+        principal: Principal | None,
+        scope: TenantScope,
+    ) -> None:
+        if not entries:
+            return
+        raw_session = None
+        session = None
+        try:
+            raw_session = get_open_session()
+            session = ScopedSession(raw_session, scope)
+            ResponsesHandler._persist_turn_memory(
+                session,
+                conv_id,
+                entries,
+                principal,
+            )
+        except Exception:
+            logger.exception(
+                "[responses] failed to open memory persistence session for conversation %s",
+                conv_id,
+            )
+        finally:
+            opened = session or raw_session
+            if opened is not None:
+                try:
+                    opened.close()
+                except Exception:
+                    logger.exception(
+                        "[responses] failed to close memory persistence session for conversation %s",
+                        conv_id,
+                    )
 
     @staticmethod
     def _remote_history(session, conv_id) -> list[dict]:
@@ -904,7 +1010,6 @@ class ResponsesHandler:
         user + assistant together on terminal (deferred, so _remote_history
         reads prior turns without the current input)."""
         lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
-        producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
         collected_text: list[str] = []
         collected_events: list[dict] = []
         # This turn's tool block-rows, for LLM-history persistence only. Kept
@@ -934,15 +1039,12 @@ class ResponsesHandler:
             if event_type == "response.output_text.delta":
                 collected_text.append(data.get("delta", ""))
 
-        # Stage attachments + project instructions into the workspace before the
-        # pod runs, so it can read them off the shared mount (no other channel).
-        # Off the event loop: the copies are blocking fs I/O (multi-MB uploads,
-        # EFS latency) and would otherwise stall every other SSE stream on this
-        # worker. Safe to share the producer session with the thread — nothing
-        # else touches it until the reply stream below starts.
-        await asyncio.to_thread(self._stage_remote_workspace_files, producer_session, conv_id)
+        producer_scope: TenantScope | None = None
+        producer_session: ScopedSession | None = None
 
         async def replies_as_stream_events():
+            if producer_session is None or producer_scope is None:
+                raise RuntimeError("Remote producer session is not initialized")
             from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
             from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated
             from cowork.services.task_objects import (
@@ -963,6 +1065,12 @@ class ResponsesHandler:
             new_slugs: list[str] = []
             touched_slugs: set[str] = set()
             turn_scope = None
+            # Off the loop: this reads the project's memory slots off the shared
+            # mount, and one worker serves every other request on this process
+            # while a blocking EFS round trip is in flight.
+            memory = await asyncio.to_thread(
+                self._remote_memory, producer_session, conv_id
+            )
 
             try:
                 async for kind, data in stream_remote_replies(
@@ -975,8 +1083,10 @@ class ResponsesHandler:
                     # Producer session, NOT self.scoped: this coroutine is detached
                     # and the request session may be closed by the time it runs.
                     history=self._remote_history(producer_session, conv_id),
-                    # Skills and memory are NOT sent: the pod reads them off the
-                    # shared mount. Only the org-relative project path travels.
+                    # Global memory and skills use read-only mounts. Project
+                    # memory is outside the conversation workspace and therefore
+                    # travels as a bounded, sheddable wire block.
+                    memory=memory,
                     **self._remote_workspace(producer_session, conv_id),
                     correlation_id=corr,
                     llm=(turn_llm or {}).get("llm"),
@@ -988,7 +1098,13 @@ class ResponsesHandler:
                         for event in step_stream_events(data):
                             yield event
                     elif kind == "turn_memory":
-                        self._persist_turn_memory(producer_session, conv_id, data.get("entries") or [])
+                        await asyncio.to_thread(
+                            self._persist_turn_memory_in_new_session,
+                            conv_id,
+                            data.get("entries") or [],
+                            self.principal,
+                            producer_scope,
+                        )
                     elif kind == "turn_history":
                         # Slice-assign, not extend: the pod emits one frame per
                         # turn, so a repeated frame must replace the rows rather
@@ -1061,6 +1177,12 @@ class ResponsesHandler:
             if persisted:
                 return
             persisted = True
+            if producer_session is None:
+                logger.error(
+                    "[responses] cannot persist remote turn without a session for conversation %s",
+                    conv_id,
+                )
+                return
             try:
                 # Re-anchor first: the conversation may be gone or out of scope.
                 svc = ConversationService(producer_session)
@@ -1088,6 +1210,19 @@ class ResponsesHandler:
                 logger.exception("[responses] failed to persist remote turn for conversation %s", conv_id)
 
         try:
+            # Stage attachments + project instructions before the pod runs. The
+            # copies use a worker-owned session, so cancellation can safely close
+            # this producer without racing blocking EFS or database work.
+            producer_scope = scope_from_principal(self.principal)
+            await asyncio.to_thread(
+                self._stage_remote_workspace_files_in_new_session,
+                conv_id,
+                producer_scope,
+            )
+            producer_session = ScopedSession(
+                get_open_session(),
+                producer_scope,
+            )
             # Persist the user message (pending) as the first thing this producer
             # does (ENG-1231) — see the note in handle(). Committed here, before
             # streaming, so a refresh/reconnect mid-turn shows the question via
@@ -1161,8 +1296,14 @@ class ResponsesHandler:
             persist()
             await buffer.close("error")
         finally:
-            await _seal_unterminated_buffer(buffer, lifecycle, conv_id, request_id=corr)
-            producer_session.close()
+            await _seal_unterminated_buffer(
+                buffer, lifecycle, conv_id, request_id=corr
+            )
+            # The session is only bound part-way into the try above, so a
+            # failure before that point leaves it None. Closing unguarded would
+            # raise here and mask the exception that actually ended the turn.
+            if producer_session is not None:
+                producer_session.close()
 
     async def _produce(self, **kwargs) -> None:
         # Detached task: bind the turn's org scope so every settings reader in the
@@ -1452,7 +1593,7 @@ class ResponsesHandler:
         if "response.created" in sse_string and "conversation_id" not in sse_string:
             try:
                 lines = sse_string.strip().split("\n")
-                data_line = next(l for l in lines if l.startswith("data:"))
+                data_line = next(line for line in lines if line.startswith("data:"))
                 payload = json.loads(data_line[5:])
                 payload["conversation_id"] = str(conversation_id)
                 if harness_id:
