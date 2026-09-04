@@ -414,12 +414,22 @@ class ResponsesHandler:
         if reason:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
         try:
-            history = [
-                message.to_openai_message().model_dump()
-                for message in ConversationService(self.scoped).get_ordered_messages(conversation_id)
-                if message.role in {"user", "assistant"}
-            ]
-            history.append({"role": "user", "content": self._prompt_text(harness_input)})
+            # Scrub credentials (ENG-2105): this history bypasses the normal
+            # turn's _scrub_user_input/_stamp_message pass.
+            from anton.utils.datasources import scrub_credentials
+
+            history = []
+            for message in ConversationService(self.scoped).get_ordered_messages(conversation_id):
+                if message.role not in {"user", "assistant"}:
+                    continue
+                om = message.to_openai_message().model_dump()
+                if isinstance(om.get("content"), str) and om["content"]:
+                    om["content"] = scrub_credentials(om["content"])
+                history.append(om)
+            history.append({
+                "role": "user",
+                "content": scrub_credentials(self._prompt_text(harness_input)),
+            })
             # The gate's LLM call is the only one a direct turn makes, and it
             # is made outside any ChatSession — so without a trace context it
             # reaches MindsHub anonymous, and a direct turn leaves no trace to
