@@ -212,6 +212,7 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/settings` | User preferences and API keys |
 | `/runtime-credential` | Desktop hand-over of the MindsHub credential (write-only, loopback, local mode) |
 | `/hub/workspaces` | Which MindsHub workspace this person is working in |
+| `/hub/usage` | The caller's free monthly tokens, balance, auto top up and credit spend, for the desktop's usage warnings |
 
 ### The MindsHub workspace selector
 
