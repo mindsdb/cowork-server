@@ -163,3 +163,53 @@ def test_preview_is_unchanged_without_the_flag(client, served_xlsx, query):
     assert res.status_code == 200, res.text
     assert "content-disposition" not in res.headers
     assert res.content == b"PK\x03\x04sheet"
+
+
+# ── the cancel route's discard intent is read at the boundary ────────────────
+# The service tests call cancel_agent_repair directly, which proves the
+# discard, not that FastAPI parses the body into the flag. An old client posts
+# a bare `{}` and must keep the queued-only behaviour, so both spellings go
+# over HTTP for the same reason as the tests above.
+
+
+@pytest.fixture
+def cancel_route(tmp_path, monkeypatch):
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+    from cowork.services.artifacts import ProjectArtifacts
+
+    project = tmp_path / "project"
+    base = project / ".anton" / "artifacts"
+    folder = base / "brief"
+    folder.mkdir(parents=True)
+    source = ProjectArtifacts(
+        base=base, project_id=None, project_name="project",
+        trusted_anchor=project, root_parts=(".anton", "artifacts"),
+    )
+    monkeypatch.setattr(
+        workspace_ep, "review_artifact_for_request",
+        lambda *_args: (source, folder, {"type": "document"}, True),
+    )
+    monkeypatch.setattr(workspace_ep, "require_artifact_owner", lambda *_args: {"role": "owner"})
+    seen: list[bool] = []
+
+    def capture(_folder, _repair_id, *, discard_ready=False):
+        seen.append(discard_ready)
+        return {"id": "repair-1", "status": "discarded" if discard_ready else "cancelled"}
+
+    monkeypatch.setattr(workspace_ep, "cancel_agent_repair", capture)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [({}, False), ({"discardReady": False}, False), ({"discardReady": True}, True)],
+)
+def test_discard_intent_reaches_the_handler_over_http(client, cancel_route, body, expected):
+    res = client.post(
+        "/api/v1/artifacts/workspace/local/0123456789abcdef0123456789abcdef"
+        "/agent-repairs/repair-1/cancel",
+        json=body,
+    )
+
+    assert res.status_code == 200, res.text
+    assert cancel_route == [expected]

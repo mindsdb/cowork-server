@@ -14,6 +14,7 @@ from cowork.services.artifact_identity import (
 )
 from cowork.services.artifacts import ProjectArtifacts
 from cowork.services.artifact_revisions import (
+    RepairAlreadyPending,
     RevisionConflict,
     active_agent_repair,
     agent_repair_detail,
@@ -670,6 +671,79 @@ def test_queued_agent_repair_can_be_cancelled_when_turn_does_not_start(artifact)
         conversation_id="conversation-2",
     )
     assert replacement["repair"]["status"] == "queued"
+
+
+def test_ready_repair_can_be_discarded_and_frees_the_path(artifact):
+    """Accept and reject were the only exits from ready, so an owner who had
+    already dealt with the feedback another way had no way out at all."""
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
+    requested = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=initial["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "Please change this"}],
+        conversation_id="conversation-1",
+    )
+    (folder / "brief.md").write_text("# Agent title\n", encoding="utf-8")
+    capture_agent_revision(folder, conversation_id="conversation-1")
+    repair_id = requested["repair"]["id"]
+    assert agent_repair_detail(folder, repair_id)["repair"]["status"] == "ready"
+
+    # An old client posting no intent keeps the queued-only refusal.
+    with pytest.raises(ValueError, match="Only a queued agent repair"):
+        cancel_agent_repair(folder, repair_id)
+
+    discarded = cancel_agent_repair(folder, repair_id, discard_ready=True)
+    assert discarded["status"] == "discarded"
+    assert cancel_agent_repair(folder, repair_id, discard_ready=True)["status"] == "discarded"
+
+    replacement = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=current_source(folder, metadata, artifact_id)["revision"]["id"],
+        comment_thread_id="thread-2",
+        selector=None,
+        thread=[{"text": "A second review"}],
+        conversation_id="conversation-2",
+    )
+    assert replacement["repair"]["status"] == "queued"
+
+
+def test_blocked_repair_names_the_comment_it_is_waiting_on(artifact):
+    """The guard used to answer a bare string, so the viewer could not offer a
+    way out of the state it described."""
+    folder, metadata, artifact_id = artifact
+    initial = current_source(folder, metadata, artifact_id)
+    requested = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=initial["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "Please change this"}],
+        conversation_id="conversation-1",
+    )
+
+    with pytest.raises(RepairAlreadyPending) as excinfo:
+        create_agent_repair(
+            folder,
+            metadata,
+            artifact_id,
+            expected_revision_id=initial["revision"]["id"],
+            comment_thread_id="thread-2",
+            selector=None,
+            thread=[{"text": "Another change"}],
+            conversation_id="conversation-2",
+        )
+
+    assert excinfo.value.repair["id"] == requested["repair"]["id"]
+    assert excinfo.value.repair["commentThreadId"] == "thread-1"
 
 
 def test_active_agent_repair_survives_viewer_navigation(artifact):

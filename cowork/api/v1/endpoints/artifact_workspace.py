@@ -32,6 +32,7 @@ from cowork.services.artifact_permissions import (
 )
 from cowork.services.comments_layer import inject_layer
 from cowork.services.artifact_revisions import (
+    RepairAlreadyPending,
     RevisionConflict,
     RevisionValidationError,
     active_agent_repair,
@@ -310,6 +311,11 @@ class _AgentRepairBody(BaseModel):
 
 class _RepairDecisionBody(BaseModel):
     status: Literal["accepted", "rejected"]
+
+
+class _RepairCancelBody(BaseModel):
+    # An older client posts `{}`, which must keep the queued-only behaviour.
+    discardReady: bool = False
 
 
 def _owner_workspace(session, project_ref: str, artifact_id: str):
@@ -686,6 +692,15 @@ async def request_agent_repair(
             status_code=status.HTTP_409_CONFLICT,
             detail={"message": str(exc), "currentRevision": exc.current},
         ) from exc
+    except RepairAlreadyPending as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": str(exc),
+                "repairId": exc.repair.get("id"),
+                "commentThreadId": exc.repair.get("commentThreadId"),
+            },
+        ) from exc
     except (RevisionValidationError, TimeoutError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -714,13 +729,19 @@ async def cancel_queued_agent_repair(
     artifact_id: ArtifactIdDep,
     repair_id: str,
     session: ScopedSessionDep,
+    body: _RepairCancelBody | None = None,
 ):
-    """Release a queued repair when its agent turn could not be started."""
+    """Release a queued repair, or discard a ready one the owner is done with."""
     _source, folder, _metadata, _capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
     try:
-        return await run_in_threadpool(cancel_agent_repair, folder, repair_id)
+        return await run_in_threadpool(
+            cancel_agent_repair,
+            folder,
+            repair_id,
+            discard_ready=bool(body and body.discardReady),
+        )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except RevisionValidationError as exc:

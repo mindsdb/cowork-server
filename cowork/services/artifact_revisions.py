@@ -35,6 +35,18 @@ class RevisionValidationError(ValueError):
     pass
 
 
+class RepairAlreadyPending(RevisionValidationError):
+    """The path already has a repair that still gates new agent work.
+
+    Carries the blocker so the caller can name the comment it belongs to and
+    offer to discard it, rather than reporting a fact with no way to act on it.
+    """
+
+    def __init__(self, repair: dict):
+        super().__init__("This artifact already has an agent repair awaiting review")
+        self.repair = repair
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -732,9 +744,7 @@ def create_agent_repair(
         manifest = _read_manifest(folder)
         blocking, dead = _partition_actionable_repairs(folder, manifest, source["path"])
         if blocking:
-            raise RevisionValidationError(
-                "This artifact already has an agent repair awaiting review"
-            )
+            raise RepairAlreadyPending(blocking[0])
         for repair in dead:
             repair["status"] = "no_change"
             repair["updatedAt"] = _now()
@@ -801,20 +811,25 @@ def active_agent_repair(folder: Path) -> dict | None:
     return max(active, key=lambda repair: str(repair.get("createdAt") or ""), default=None)
 
 
-def cancel_agent_repair(folder: Path, repair_id: str) -> dict:
-    """Cancel a repair whose agent turn never started.
+def cancel_agent_repair(folder: Path, repair_id: str, *, discard_ready: bool = False) -> dict:
+    """Release a repair without accepting or rejecting its content.
 
-    Cancellation is deliberately limited to queued repairs. Once a turn has
-    produced a revision, the owner must compare and accept or reject it so an
-    agent change can never disappear without an explicit decision.
+    A queued repair is cancelled: its turn never produced anything. A ready one
+    holds real agent work, so it is only discarded when the caller says so
+    explicitly. That keeps the property the queued-only rule was protecting -
+    an agent change never vanishes on its own - while giving an owner who has
+    already dealt with the feedback some other way a way out.
     """
     with artifact_lock(folder):
         repair = _read_repair(folder, repair_id)
-        if repair.get("status") == "cancelled":
+        if repair.get("status") in {"cancelled", "discarded"}:
             return repair
-        if repair.get("status") != "queued":
+        if repair.get("status") == "queued":
+            repair["status"] = "cancelled"
+        elif discard_ready and repair.get("status") == "ready":
+            repair["status"] = "discarded"
+        else:
             raise RevisionValidationError("Only a queued agent repair can be cancelled")
-        repair["status"] = "cancelled"
         repair["updatedAt"] = _now()
         _write_repair(folder, repair)
         return repair
