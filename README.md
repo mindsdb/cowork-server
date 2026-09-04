@@ -14,6 +14,8 @@ uv tool install cowork-server
 cowork-server
 ```
 
+The Hermes harness is an optional extra: `uv tool install 'cowork-server[hermes]'`. It cannot be installed alongside anton-agent 2.26.9.3.1rc2 or later because hermes-agent pins openai 2.x and anton needs openai 3.x.
+
 The server starts on `http://127.0.0.1:26866`. Confirm with:
 
 ```sh
@@ -25,6 +27,8 @@ curl http://127.0.0.1:26866/api/v1/health/
 ```sh
 # Run from source (auto-manages virtualenv + deps)
 uv run cowork-server
+# With the Hermes harness
+uv run --extra hermes cowork-server
 ```
 
 When running alongside the Electron app in dev mode, the app spawns the server automatically — no manual start needed. The Electron app looks for a sibling `cowork-server/` directory by convention (override with `COWORK_SERVER_DIR`).
