@@ -55,7 +55,10 @@ the immutable dedicated organization id in `COWORK_TEST_ORG_ID`. The suite
 resolves and matches that principal and organization through production auth,
 and refuses an employee-classified or Hub-admin identity before testing. A
 missing or mismatched identity fails the required prod run instead of falling
-back to provisioning or reporting skipped tests.
+back to provisioning or reporting skipped tests. Standing-identity mode also
+requires the test target to be exactly `https://cowork.mindshub.ai` before the
+first network call, so a changed environment file or workflow cannot send the
+production key to another origin.
 
 Do not store or use `COWORK_TEST_API_KEY` yet, or configure its paired email and
 organization id for a production run. The live `prod` GitHub Environment has no

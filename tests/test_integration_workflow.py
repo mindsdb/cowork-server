@@ -14,6 +14,12 @@ PUBLISH = (ROOT / ".github/workflows/publish.yml").read_text()
 README = (ROOT / "README.md").read_text()
 
 
+@pytest.fixture(autouse=True)
+def _canonical_prod_cowork_target(monkeypatch) -> None:
+    """Standing-identity tests start from the one permitted key destination."""
+    monkeypatch.setenv("COWORK_BASE_URL", test_post_deploy.PROD_COWORK_BASE_URL)
+
+
 def test_integration_uses_callers_target_cluster_runner() -> None:
     """Both reusable-workflow calls pass through the deployment runner."""
     assert INTEGRATION.count("runs-on: ${{ inputs.runner }}") == 1
@@ -92,6 +98,36 @@ def test_standing_identity_mode_fails_before_a_configured_provisioner(
     )
 
     with pytest.raises(pytest.fail.Exception, match="standing requires"):
+        test_post_deploy._provision_identity()
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://attacker.example",
+        "http://cowork.mindshub.ai",
+        "https://cowork.mindshub.ai.evil.example",
+        "https://cowork.mindshub.ai/other",
+    ],
+)
+def test_prod_standing_identity_rejects_a_different_target_before_network(
+    monkeypatch, base_url
+) -> None:
+    monkeypatch.setenv("COWORK_REQUIRE_INTEGRATION", "true")
+    monkeypatch.setenv("COWORK_TEST_IDENTITY_MODE", "standing")
+    monkeypatch.setenv("COWORK_BASE_URL", base_url)
+    monkeypatch.setenv("COWORK_TEST_API_KEY", "mdb_deadbeef.must-not-be-sent")
+    monkeypatch.setenv("COWORK_TEST_USER_EMAIL", "cowork-ci@mindshub.ai")
+    monkeypatch.setenv("COWORK_TEST_ORG_ID", "org-id")
+    monkeypatch.setattr(
+        test_post_deploy.httpx,
+        "get",
+        lambda *_args, **_kwargs: pytest.fail(
+            "network reached before production target validation"
+        ),
+    )
+
+    with pytest.raises(pytest.fail.Exception, match="refusing to send"):
         test_post_deploy._provision_identity()
 
 

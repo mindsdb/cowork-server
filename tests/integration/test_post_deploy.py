@@ -88,6 +88,7 @@ BROWSER_UA = (
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
 PROD_AUTHENTICATE_URL = "https://auth.mindshub.ai/v1/authenticate/"
+PROD_COWORK_BASE_URL = "https://cowork.mindshub.ai"
 CONTROLLED_TEST_EMAIL_SUFFIX = "@mindshub.ai"
 
 
@@ -107,11 +108,25 @@ def _base_url() -> str:
         missing_prerequisite(
             "COWORK_BASE_URL not set; post-deploy tests only run against a deployment"
         )
-    return url.rstrip("/")
+    normalized_url = url.rstrip("/")
+    if (
+        os.environ.get("COWORK_TEST_IDENTITY_MODE") == "standing"
+        and normalized_url != PROD_COWORK_BASE_URL
+    ):
+        missing_prerequisite(
+            "COWORK_TEST_IDENTITY_MODE=standing requires COWORK_BASE_URL to be "
+            f"exactly {PROD_COWORK_BASE_URL}; refusing to send the production key "
+            "to a different origin"
+        )
+    return normalized_url
 
 
 def _verified_prod_standing_identity() -> _Identity:
     """Resolve the dedicated prod API key through auth without mutating a user."""
+    # Validate the eventual credential destination before the first network call.
+    # The prod URL is committed config, but the Python guard is the last boundary
+    # if workflow code or that file is changed in the same revision.
+    _base_url()
     api_key = os.environ.get("COWORK_TEST_API_KEY")
     expected_email = os.environ.get("COWORK_TEST_USER_EMAIL")
     expected_org_id = os.environ.get("COWORK_TEST_ORG_ID")
