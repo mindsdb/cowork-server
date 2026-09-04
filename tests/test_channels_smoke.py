@@ -7,6 +7,7 @@ real credentials, network, or LLM.
 """
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -1117,13 +1118,36 @@ def test_should_respond_matrix():
         return SimpleNamespace(trigger_rule=rule, trigger_pattern=pattern)
 
     should = AntonChannelRuntime._should_respond
-    assert should(binding("always"), event()) is True
-    assert should(binding("mention_only"), event(is_mention=True)) is True
-    assert should(binding("mention_only"), event(is_mention=False)) is False
-    assert should(binding("regex", r"listing"), event("any listings?")) is True
-    assert should(binding("regex", r"listing"), event("hello")) is False
-    assert should(binding("regex", None), event("hello")) is False
-    assert should(binding("regex", "("), event("hello")) is False
+    assert asyncio.run(should(binding("always"), event())) is True
+    assert asyncio.run(should(binding("mention_only"), event(is_mention=True))) is True
+    assert asyncio.run(should(binding("mention_only"), event(is_mention=False))) is False
+    assert asyncio.run(should(binding("regex", r"listing"), event("any listings?"))) is True
+    assert asyncio.run(should(binding("regex", r"listing"), event("hello"))) is False
+    assert asyncio.run(should(binding("regex", None), event("hello"))) is False
+    assert asyncio.run(should(binding("regex", "("), event("hello"))) is False
+
+
+def test_should_respond_regex_catastrophic_backtracking_is_bounded(monkeypatch):
+    # A syntactically-valid-but-pathological trigger_pattern (ChannelBindingService
+    # only checks it parses, not that it's cheap to run) must not hang — bounded
+    # by TRIGGER_REGEX_TIMEOUT_S, not by luck. Shrunk here so the test is fast.
+    monkeypatch.setattr(runtime_mod, "TRIGGER_REGEX_TIMEOUT_S", 0.2)
+
+    def event(text):
+        return SimpleNamespace(message=SimpleNamespace(content=text, is_mention=False))
+
+    def binding(pattern):
+        return SimpleNamespace(trigger_rule="regex", trigger_pattern=pattern)
+
+    evil_pattern = r"(a+)+$"
+    evil_input = "a" * 40 + "!"  # no trailing match -> catastrophic backtracking
+
+    started = time.monotonic()
+    result = asyncio.run(AntonChannelRuntime._should_respond(binding(evil_pattern), event(evil_input)))
+    elapsed = time.monotonic() - started
+
+    assert result is False
+    assert elapsed < 2.0  # well under what unbounded backtracking on this input would take
 
 
 def test_binding_instructions_roundtrip():

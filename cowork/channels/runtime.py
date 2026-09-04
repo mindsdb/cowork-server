@@ -4,7 +4,6 @@ import asyncio
 import base64
 import contextlib
 import logging
-import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -12,6 +11,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
+
+import regex
 
 from anton.core.dispatch import OutboundMessage
 from cowork.build_info import build_trace_metadata
@@ -68,6 +69,12 @@ def is_new_command(text: str, *, is_mention: bool | None = None) -> bool:
 TYPING_REFRESH_S = 4.0
 
 MAX_TURN_ATTACHMENTS = 3
+
+# `trigger_pattern` is org-controlled (ChannelBindingService only checks it
+# parses, not that it's cheap to run) and is matched against every inbound
+# message, so a pathological pattern is a ReDoS. Bound match time rather than
+# trust the pattern; module-level so tests can shrink it.
+TRIGGER_REGEX_TIMEOUT_S = 1.0
 
 
 def artifacts_since(project_path: str, conversation_id: UUID, since: float) -> list[tuple[str, str]]:
@@ -295,7 +302,7 @@ class AntonChannelRuntime:
                 "channel %s: binding %s → project %s (trigger=%s)",
                 channel_type, binding.id, binding.anton_project_id, binding.trigger_rule,
             )
-            if not self._should_respond(binding, event):
+            if not await self._should_respond(binding, event):
                 log.info("channel %s: trigger rule %r skipped a message", channel_type, binding.trigger_rule)
                 return
             if is_new_command(self._event_text(event), is_mention=event.message.is_mention):
@@ -390,7 +397,7 @@ class AntonChannelRuntime:
         return binding
 
     @staticmethod
-    def _should_respond(binding: ChannelBinding, event: Any) -> bool:
+    async def _should_respond(binding: ChannelBinding, event: Any) -> bool:
         rule = binding.trigger_rule
         if rule == "always":
             return True
@@ -400,9 +407,16 @@ class AntonChannelRuntime:
             pattern = binding.trigger_pattern
             if not pattern:
                 return False
+            content = str(event.message.content)
+            # Off the event loop, with a bound: `regex.search` still
+            # backtracks like `re`, so an unbounded call on the loop would
+            # stall every other channel/request for as long as the match
+            # runs, not just this one.
             try:
-                return re.search(pattern, str(event.message.content)) is not None
-            except re.error:
+                return await asyncio.to_thread(
+                    lambda: regex.search(pattern, content, timeout=TRIGGER_REGEX_TIMEOUT_S) is not None
+                )
+            except (regex.error, TimeoutError):
                 return False
         return True
 
