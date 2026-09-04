@@ -70,6 +70,10 @@ class ProjectNotFoundError(ValueError):
     """The requested project is absent from the caller's scoped view."""
 
 
+class ProjectPathNotAllowedError(ValueError):
+    """A caller chose a project folder on a deployment that does not allow one."""
+
+
 @dataclass
 class ProjectRenameStage:
     """Filesystem changes held open until the project transaction commits."""
@@ -511,11 +515,55 @@ class ProjectService:
                 candidate = self._unique_name(f"{base}-{attempt}")
         raise ValueError("Could not allocate a project directory")
 
+    def _within_root(self, path: Path) -> bool:
+        try:
+            root = self._root_dir().resolve(strict=False)
+        except (OSError, RuntimeError):
+            return False
+        return path == root or root in path.parents
+
+    def _path_in_use(self, path: Path) -> bool:
+        for project in self.session.exec(self.session.select(Project)).all():
+            try:
+                if Path(project.path).resolve(strict=False) == path:
+                    return True
+            except (OSError, RuntimeError):
+                continue
+        return False
+
+    def _adopt_project_dir(self, base: str, path: Path) -> tuple[str, Path]:
+        """Take a folder the user already has, creating nothing.
+
+        The tenancy refusal comes before any filesystem access on purpose: an
+        org deployment does not run on the caller's machine, so statting a
+        path it chose would answer whether that server path exists.
+        """
+        if get_app_settings().tenancy_mode == "org":
+            raise ProjectPathNotAllowedError(
+                "Choosing a project folder is not available on this deployment"
+            )
+        try:
+            resolved = path.expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("Choose an existing local folder") from exc
+        if not resolved.is_dir():
+            raise ValueError("Choose an existing local folder")
+        # Inside the root a chosen folder can equal _project_path() for another
+        # row, and delete_project would re-derive a match and rmtree it.
+        if self._within_root(resolved):
+            raise ValueError("Choose a folder outside the Cowork projects directory")
+        if self._path_in_use(resolved):
+            raise ValueError("Another project already uses this folder")
+        # `_unique_name` still applies: `name` is the lookup key, the URL
+        # segment and the basename, and nothing else keeps it unique.
+        return self._unique_name(base), resolved
+
     def create_project(
         self,
         name: str,
         *,
         project_id: UUID | None = None,
+        path: Path | None = None,
     ) -> Project:
         sanitized = self._sanitize_name(name)
         # `general` belongs to the system row. A member creating it first would own
@@ -523,13 +571,16 @@ class ProjectService:
         # which is looked up by name.
         if sanitized == GENERAL_PROJECT:
             sanitized = f"{GENERAL_PROJECT}-2"
-        # No exist_ok: `_unique_name` is a read-then-write with no unique
-        # constraint behind it, so two concurrent creates can pick the same name.
-        # Letting mkdir fail keeps them from sharing one directory (where deleting
-        # either would rmtree the other's files) and stops a leftover directory
-        # being adopted with stale contents. On collision, take the next name.
-        final_name, path = self._allocate_project_dir(sanitized)
-        # self._scaffold(path)
+        if path is not None:
+            final_name, project_dir = self._adopt_project_dir(sanitized, path)
+        else:
+            # No exist_ok: `_unique_name` is a read-then-write with no unique
+            # constraint behind it, so two concurrent creates can pick the same name.
+            # Letting mkdir fail keeps them from sharing one directory (where deleting
+            # either would rmtree the other's files) and stops a leftover directory
+            # being adopted with stale contents. On collision, take the next name.
+            final_name, project_dir = self._allocate_project_dir(sanitized)
+        # self._scaffold(project_dir)
         # The literal input, kept verbatim; `final_name` stays the slug. A new
         # project always gets an explicit display_name -- NULL means "predates
         # the column", never "the user typed nothing" (ENG-1676).
@@ -539,14 +590,14 @@ class ProjectService:
                 id=project_id,
                 name=final_name,
                 display_name=display,
-                path=str(path),
+                path=str(project_dir),
                 is_active=False,
             )
             if project_id is not None
             else Project(
                 name=final_name,
                 display_name=display,
-                path=str(path),
+                path=str(project_dir),
                 is_active=False,
             )
         )
@@ -558,7 +609,9 @@ class ProjectService:
             from cowork.services.skill_links import reconcile_project
             from cowork.services.skills import SkillService
 
-            reconcile_project(path, SkillService(self.session.scope).list_skills())
+            reconcile_project(
+                project_dir, SkillService(self.session.scope).list_skills()
+            )
 
         return project
 

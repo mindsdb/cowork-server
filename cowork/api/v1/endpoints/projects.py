@@ -18,6 +18,7 @@ from cowork.schemas.shared_resources import ProjectCapabilities
 from cowork.services.projects import (
     GENERAL_PROJECT,
     ProjectNotFoundError,
+    ProjectPathNotAllowedError,
     ProjectService,
 )
 from cowork.services.shared_resources import (
@@ -254,46 +255,55 @@ def create_project(
     claim = None
     claim_token = None
     project_id = uuid4() if session.scope.org_mode else None
-    with ExitStack() as locks:
-        try:
-            if project_id is not None:
-                locks.enter_context(
-                    access.coordination_lock(
+    try:
+        with ExitStack() as locks:
+            try:
+                if project_id is not None:
+                    locks.enter_context(
+                        access.coordination_lock(
+                            PROJECT,
+                            project_resource_key(project_id),
+                        )
+                    )
+                    claim, claim_token = access.reserve_claim(
                         PROJECT,
                         project_resource_key(project_id),
                     )
+                    if claim is None or claim_token is None:
+                        raise RuntimeError("Project ownership could not be reserved")
+                    # This lock is also the project-name namespace: skill project
+                    # validation and every org create/rename observe one canonical
+                    # name allocation order across replicas.
+                    locks.enter_context(
+                        access.coordination_lock(SKILL_PROJECT_REFERENCES, "all")
+                    )
+                project = service.create_project(
+                    body.name, project_id=project_id, path=body.path
                 )
-                claim, claim_token = access.reserve_claim(
-                    PROJECT,
-                    project_resource_key(project_id),
-                )
-                if claim is None or claim_token is None:
-                    raise RuntimeError("Project ownership could not be reserved")
-                # This lock is also the project-name namespace: skill project
-                # validation and every org create/rename observe one canonical
-                # name allocation order across replicas.
-                locks.enter_context(
-                    access.coordination_lock(SKILL_PROJECT_REFERENCES, "all")
-                )
-            project = service.create_project(body.name, project_id=project_id)
-            if claim is not None and claim_token is not None:
-                finalized = access.finalize_claim(
-                    claim,
-                    claim_token,
-                    action="create",
-                )
-                if finalized is None:
-                    raise RuntimeError("Project ownership changed during creation")
-        except Exception:
-            session.rollback()
-            if project_id is not None:
-                try:
-                    service.delete_project(project_id)
-                except Exception:
-                    session.rollback()
                 if claim is not None and claim_token is not None:
-                    access.release_claim(claim, claim_token=claim_token)
-            raise
+                    finalized = access.finalize_claim(
+                        claim,
+                        claim_token,
+                        action="create",
+                    )
+                    if finalized is None:
+                        raise RuntimeError("Project ownership changed during creation")
+            except Exception:
+                session.rollback()
+                if project_id is not None:
+                    try:
+                        service.delete_project(project_id)
+                    except Exception:
+                        session.rollback()
+                    if claim is not None and claim_token is not None:
+                        access.release_claim(claim, claim_token=claim_token)
+                raise
+    except ProjectPathNotAllowedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except ProjectNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return _project_response(project, access)
 
 

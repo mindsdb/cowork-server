@@ -1,7 +1,8 @@
 from datetime import datetime
+from pathlib import Path
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from cowork.schemas.base import CamelRequest
 from cowork.schemas.shared_resources import ProjectCapabilities, ResourceAttribution
@@ -9,6 +10,22 @@ from cowork.schemas.shared_resources import ProjectCapabilities, ResourceAttribu
 
 class ProjectCreateRequest(CamelRequest):
     name: str
+    path: Path | None = None
+
+    @field_validator("path")
+    @classmethod
+    def _absolute_path_only(cls, path: Path | None) -> Path | None:
+        # Syntax only: a field validator runs before the handler, so a
+        # filesystem check here would precede the service's tenancy refusal.
+        if path is None or not str(path).strip():
+            return None
+        try:
+            expanded = path.expanduser()
+        except RuntimeError as exc:
+            raise ValueError("path could not be resolved") from exc
+        if not expanded.is_absolute():
+            raise ValueError("path must be absolute")
+        return expanded
 
 
 class ProjectUpdateRequest(CamelRequest):
