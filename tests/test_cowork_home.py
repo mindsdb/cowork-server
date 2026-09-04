@@ -216,7 +216,7 @@ _IMPORT_TIME_PATHS = r"""
 import json, os
 from pathlib import Path
 
-from cowork.common.settings.app_settings import _env_file_chain
+from cowork.common.settings.app_settings import Settings
 import cowork.migrations as migrations
 import cowork.api.v1.endpoints.settings as settings_api
 import cowork.harnesses.memory.migration as memory_migration
@@ -225,7 +225,12 @@ from cowork.coding.service import get_coding_service
 from cowork.common.paths import cowork_home
 
 paths = {
-    "dotenv_chain": [p for p in _env_file_chain() if os.path.isabs(p)],
+    # model_config, not _env_file_chain(): this is the value pydantic-settings
+    # reads, so appending a shared path straight to model_config cannot slip
+    # past this probe.
+    "dotenv_chain": [
+        str(p) for p in (Settings.model_config.get("env_file") or ()) if os.path.isabs(str(p))
+    ],
     "migrations_env": [str(migrations._ENV_PATH)],
     "settings_endpoint_env": [str(settings_api._ENV_PATH)],
     "memory_sources": [str(p) for p, _ in memory_migration._MIGRATION_SOURCES],
@@ -243,6 +248,13 @@ def _import_time_paths(home: Path) -> dict[str, list[str]]:
     import sys
 
     env = dict(os.environ)
+    # The parent environment comes along for PATH and the interpreter, so the
+    # overrides that would redirect a probed path have to go, exactly as
+    # test_all_settings_paths_derive_from_cowork_home clears them. Without this
+    # the test fails on a machine that legitimately sets one of them, while
+    # production behaviour is correct.
+    for var in (*_PER_RESOURCE_OVERRIDES, "ANTON_COWORK_STATE_DIR"):
+        env.pop(var, None)
     env["COWORK_HOME"] = str(home)
     env["COWORK_TENANCY_MODE"] = "local"
     result = subprocess.run(
@@ -268,8 +280,12 @@ def test_import_time_paths_follow_cowork_home(tmp_path):
     home.mkdir()
     paths = _import_time_paths(home)
 
+    # Resolved components, not a string prefix: `<home>-shared/state.json` and
+    # `<home>/../shared/state.json` both START WITH str(home) while sitting
+    # outside it, so a regression onto either would have passed.
+    resolved_home = home.resolve()
     outside = {
-        name: [p for p in group if not p.startswith(str(home))]
+        name: [p for p in group if not Path(p).resolve().is_relative_to(resolved_home)]
         for name, group in paths.items()
     }
     outside = {name: group for name, group in outside.items() if group}
