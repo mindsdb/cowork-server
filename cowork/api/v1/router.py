@@ -13,6 +13,8 @@ from cowork.api.v1.endpoints import (
     capabilities,
     channels,
     comments,
+    coding,
+    coding_runtime,
     conversations,
     files,
     health,
@@ -61,6 +63,10 @@ api_router.include_router(oauth.router, prefix="/connectors/oauth", tags=["conne
 api_router.include_router(projects.router, prefix="/projects", tags=["projects"])
 api_router.include_router(project_files.router, prefix="/projects", tags=["project-files"])
 api_router.include_router(conversations.router, prefix="/conversations", tags=["conversations"])
+# `/tasks` is a branding alias for `/conversations` (ENG-2069) — same router,
+# same request/response schemas, mounted under a second prefix so it can
+# never drift from the canonical implementation.
+api_router.include_router(conversations.router, prefix="/tasks", tags=["tasks"])
 api_router.include_router(responses.router, prefix="/responses", tags=["responses"])
 api_router.include_router(files.router, prefix="/files", tags=["files"])
 api_router.include_router(schedules.router, prefix="/schedules", tags=["schedules"])
@@ -77,6 +83,8 @@ api_router.include_router(
     runtime_credential.router, prefix="/runtime-credential", tags=["runtime-credential"]
 )
 api_router.include_router(search.router, prefix="/search", tags=["search"])
+api_router.include_router(coding.router, prefix="/coding", tags=["coding"])
+api_router.include_router(coding_runtime.router, prefix="/coding/runtime", tags=["coding-runtime"])
 api_router.include_router(hub_workspaces.router, prefix="/hub/workspaces", tags=["hub-workspaces"])
 
 # ── Compat routes (SHIM:client-compat — delete this section) ────────

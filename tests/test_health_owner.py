@@ -43,6 +43,7 @@ def test_health_reports_owner_from_app_settings():
 
     assert body["owner"] == "install-token-abc"
     assert body["status"] == "ok"
+    assert "coding" in body["capabilities"]
 
 
 def test_health_owner_empty_when_unset():

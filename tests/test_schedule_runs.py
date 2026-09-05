@@ -263,6 +263,128 @@ def test_execute_schedule_stamps_trace_identity(monkeypatch):
         s.close()
 
 
+# ENG-2353: a schedule stores the "default" sentinel (the UI removed the model
+# picker), which is NOT a servable model id. If it reached the turn verbatim the
+# harness would override every model role with the literal string "default" and
+# the gateway would 404 it as model_not_found ("That model isn't available") —
+# but only for prompts that delegate to Anton, since the pre-Anton routing gate
+# answers trivial prompts on its own gate model and never touches it. The run
+# must instead pass None so the account-wide default models govern the turn.
+
+def test_resolve_schedule_model_sentinel_and_pins():
+    from cowork.schemas.schedules import (
+        DEFAULT_MODEL_SENTINEL,
+        resolve_schedule_model,
+    )
+
+    # The sentinel and anything falsy resolve to None (account defaults).
+    assert resolve_schedule_model(DEFAULT_MODEL_SENTINEL) is None
+    assert resolve_schedule_model("default") is None
+    assert resolve_schedule_model("") is None
+    assert resolve_schedule_model(None) is None
+    # A real id passes through untouched.
+    assert resolve_schedule_model("sonnet") == "sonnet"
+
+
+def test_execute_schedule_resolves_default_sentinel_to_none(monkeypatch):
+    import asyncio
+
+    import cowork.handlers.responses as responses_mod
+    from cowork.db.session import get_open_session
+    from cowork.scheduler import execute_schedule
+
+    captured: list = []
+
+    class FakeHandler:
+        def __init__(self, session, principal=None):
+            pass
+
+        async def handle(self, request):
+            captured.append(request)
+
+            async def _gen():
+                if False:
+                    yield
+
+            return _gen()
+
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", FakeHandler)
+
+    session = get_open_session()
+    schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
+        title="default model test",
+        prompt="generate random hausa names",
+        cadence="daily",
+        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+        model="default",
+        timezone="UTC",
+        project_id=GENERAL_PROJECT_ID,
+        enabled=True,
+    )
+    schedule_id = schedule.id
+    session.close()
+
+    try:
+        asyncio.run(execute_schedule(schedule_id, is_manual=False))
+        assert captured, "handler was never invoked"
+        # None → _apply_model_override is a no-op → account defaults apply.
+        assert captured[0].model is None
+    finally:
+        s = get_open_session()
+        ScheduleService(ScopedSession(s, SYSTEM_SCOPE)).delete_schedule(schedule_id)
+        s.close()
+
+
+def test_execute_schedule_passes_pinned_model_through(monkeypatch):
+    """A schedule that pinned a concrete id (legacy rows, or a future picker)
+    still runs on that id — the sentinel resolution must not flatten real picks."""
+    import asyncio
+
+    import cowork.handlers.responses as responses_mod
+    from cowork.db.session import get_open_session
+    from cowork.scheduler import execute_schedule
+
+    captured: list = []
+
+    class FakeHandler:
+        def __init__(self, session, principal=None):
+            pass
+
+        async def handle(self, request):
+            captured.append(request)
+
+            async def _gen():
+                if False:
+                    yield
+
+            return _gen()
+
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", FakeHandler)
+
+    session = get_open_session()
+    schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
+        title="pinned model test",
+        prompt="do the thing",
+        cadence="daily",
+        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+        model="sonnet",
+        timezone="UTC",
+        project_id=GENERAL_PROJECT_ID,
+        enabled=True,
+    )
+    schedule_id = schedule.id
+    session.close()
+
+    try:
+        asyncio.run(execute_schedule(schedule_id, is_manual=False))
+        assert captured, "handler was never invoked"
+        assert captured[0].model == "sonnet"
+    finally:
+        s = get_open_session()
+        ScheduleService(ScopedSession(s, SYSTEM_SCOPE)).delete_schedule(schedule_id)
+        s.close()
+
+
 # A scheduled run in org mode has no request, so it derives a service principal
 # from the schedule row: the conversation is created under the owning org and
 # the turn receives that principal so the remote backend can mint the org's key
@@ -659,6 +781,93 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
         s.close()
 
 
+def test_execute_schedule_derives_service_principal_in_org_mode(monkeypatch):
+    """A schedule's own org_id/created_by — stamped when a real user created it
+    through the request-scoped path — is what fires the turn in org mode. No
+    live request principal exists at cron time, so the schedule row is the only
+    source of identity."""
+    import asyncio
+
+    import cowork.handlers.responses as responses_mod
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.scoped import TenantScope
+    from cowork.models.conversation import Conversation
+    from cowork.db.session import get_open_session
+    from cowork.scheduler import execute_schedule
+    from cowork.principal import Principal
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+
+    org_id = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    created_by = "u-schedule-owner"
+
+    # SYSTEM_SCOPE never auto-stamps or filters, so it can plant rows with an
+    # explicit org_id/created_by exactly as if a real org-mode user created
+    # them. The project must actually belong to the org — an org-scoped
+    # conversation create can't anchor onto the local/desktop default project.
+    session = get_open_session()
+    project = Project(name="org project", path="/org-project", org_id=org_id)
+    ScopedSession(session, SYSTEM_SCOPE).add(project)
+    session.commit()
+    session.refresh(project)
+
+    schedule = Schedule(
+        title="org schedule",
+        prompt="do the thing",
+        cadence="daily",
+        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+        model="default",
+        project_id=project.id,
+        org_id=org_id,
+        created_by=created_by,
+    )
+    ScopedSession(session, SYSTEM_SCOPE).add(schedule)
+    session.commit()
+    session.refresh(schedule)
+    schedule_id = schedule.id
+    session.close()
+
+    seen: dict = {}
+
+    class FakeHandler:
+        def __init__(self, session, principal=None):
+            seen["principal"] = principal
+
+        async def handle(self, request):
+            async def _gen():
+                if False:
+                    yield
+
+            return _gen()
+
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", FakeHandler)
+
+    try:
+        asyncio.run(execute_schedule(schedule_id, is_manual=False))
+
+        assert seen["principal"] == Principal(user_id=created_by, org_id=org_id)
+
+        check = get_open_session()
+        org_scope = TenantScope(org_mode=True, org_id=org_id, user_id=created_by)
+        run = ScheduleRunService(ScopedSession(check, org_scope)).list_runs(schedule_id)[0]
+        conversation = ScopedSession(check, org_scope).get(Conversation, run.conversation_id)
+        assert conversation is not None
+        assert conversation.org_id == org_id
+        check.close()
+    finally:
+        s = get_open_session()
+        scoped_s = ScopedSession(s, SYSTEM_SCOPE)
+        ScheduleService(scoped_s).delete_schedule(schedule_id)
+        project_row = scoped_s.get(Project, project.id)
+        if project_row is not None:
+            scoped_s.delete(project_row)
+            s.commit()
+        s.close()
+        monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+        get_app_settings.cache_clear()
+
+
 # --- ENG-1675: a due one-off must RUN on the tick its slot passes, not get
 # disabled ("Paused") by the missed-run sweep before `_due_schedules` sees it.
 
@@ -807,3 +1016,50 @@ def test_same_org_users_cannot_see_each_others_schedules(tmp_path, monkeypatch):
     assert svc("bob").delete_schedule(a.id) is False
     assert svc("alice").get_schedule(a.id).id == a.id
     get_app_settings.cache_clear()
+
+
+def _fk_enforced_session() -> Session:
+    """A SQLite session with `PRAGMA foreign_keys=ON`, so the delete-ordering
+    that Postgres rejects in the cloud fails here too instead of passing under
+    SQLite's default unenforced foreign keys."""
+    from sqlalchemy import event
+    from sqlalchemy.pool import StaticPool
+
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+
+    @event.listens_for(engine, "connect")
+    def _fk_on(dbapi_conn, _record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    SQLModel.metadata.create_all(engine)
+    session = Session(engine)
+    session.add(Project(id=GENERAL_PROJECT_ID, name="general", path="/general"))
+    session.commit()
+    return session
+
+
+def test_delete_schedule_with_runs_under_enforced_foreign_keys():
+    """ENG-2356: deleting a schedule that has run rows returned HTTP 500 on
+    Postgres because the parent DELETE was emitted before its schedule_runs.
+    Deleting must remove the schedule and its runs with foreign keys enforced."""
+    from sqlmodel import select
+
+    from cowork.models.schedule import ScheduleRun
+
+    session = _fk_enforced_session()
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    schedule = _schedule(session)
+    run_service = ScheduleRunService(scoped)
+    for _ in range(3):
+        run_service.create_run(schedule.id, is_manual=False)
+
+    assert ScheduleService(scoped).delete_schedule(schedule.id) is True
+
+    assert session.get(Schedule, schedule.id) is None
+    assert not session.exec(
+        select(ScheduleRun).where(ScheduleRun.schedule_id == schedule.id)
+    ).all()

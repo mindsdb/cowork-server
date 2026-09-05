@@ -69,13 +69,30 @@ async def test_project_id_travels_on_the_job(captured):
 
 
 @pytest.mark.asyncio
-async def test_skills_and_memory_are_not_shipped(captured):
-    """They live on the shared mount now. Sending them would also reintroduce
-    the payload-size pressure _fit_request exists to relieve."""
-    await _enqueue(project_id="proj-1", workspace_rel_path="projects/general")
+async def test_only_project_memory_is_shipped_in_anton_job_params(captured):
+    """Global memory is already mounted per user; the conversation workspace
+    cannot reach its project-level sibling, so Anton receives exactly that tier."""
+    project_memory = {
+        "rules": "Always cite the source.",
+        "lessons": "Retries need idempotency.",
+    }
+    await _enqueue(
+        project_id="proj-1",
+        workspace_rel_path="projects/general",
+        memory={
+            "global": {"rules": "private preference"},
+            "project": project_memory,
+        },
+    )
     params = captured["payload"]["params"]
     assert "skills" not in params
-    assert "memory" not in params
+    assert params["memory"] == {"project": project_memory}
+
+
+@pytest.mark.asyncio
+async def test_empty_or_global_only_memory_is_omitted(captured):
+    await _enqueue(memory={"global": {"rules": "private preference"}})
+    assert "memory" not in captured["payload"]["params"]
 
 
 @pytest.mark.asyncio

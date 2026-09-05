@@ -1,0 +1,30 @@
+name: Nightly staging integration
+
+on:
+  schedule:
+    # Staggered from the other staging suites to limit shared environment load.
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  integration:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/tests-integration.yml
+    with:
+      deploy-env: staging
+    secrets: inherit
+
+  notify:
+    needs: [integration]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') }}
+    permissions:
+      contents: read
+      actions: read
+    uses: mindsdb/github-actions/.github/workflows/notify-main-failure.yml@main
+    with:
+      env-name: "cowork-server nightly staging integration"
+      status: ${{ contains(needs.*.result, 'failure') && 'failed' || 'recovered' }}
+    secrets: inherit
