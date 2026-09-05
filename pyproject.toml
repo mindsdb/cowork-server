@@ -122,4 +122,5 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
     "integration: needs a real Redis; skips itself when none is reachable",
     "postdeploy: runs against a deployed cowork-server; skips unless COWORK_BASE_URL is set",
+    "production_read_only: GET-only smoke selected by the production nightly",
 ]
