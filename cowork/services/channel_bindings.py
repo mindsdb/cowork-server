@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import re
 from uuid import UUID
 
+import regex
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
@@ -221,8 +221,8 @@ class ChannelBindingService:
             if not pattern:
                 raise ValueError("trigger_pattern is required when trigger_rule is 'regex'")
             try:
-                re.compile(pattern)
-            except re.error as exc:
+                regex.compile(pattern)
+            except regex.error as exc:
                 raise ValueError(f"invalid trigger_pattern regex: {exc}")
 
     def _validate_links(self, project_id: UUID | None, conversation_id: UUID | None) -> None:

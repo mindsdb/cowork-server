@@ -39,6 +39,12 @@ dependencies = [
     # the driver has to be present or `db-migrate` dies on import.
     "psycopg2-binary>=2.9",
     "redis>=5,<6",
+    # Org-controlled channel-binding trigger patterns (channel_bindings.py)
+    # are matched against every inbound message at runtime (channels/runtime.py).
+    # stdlib `re` has no backtracking bound, so a syntactically-valid but
+    # pathological pattern (e.g. "(a+)+$") plus an adversarial message is a
+    # ReDoS. `regex` is drop-in for `re` syntax and adds a `timeout=` kwarg.
+    "regex>=2024.11.6",
     "python-multipart>=0.0.28",
     "sqlmodel>=0.0.38",
     "tzlocal>=5.0",
