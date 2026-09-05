@@ -4,6 +4,7 @@ Every cowork path must derive from a single root so preview/stable desktop
 builds can be fully isolated from a user's production ~/.cowork (ENG-324) by
 setting one env var. These tests pin that contract.
 """
+import os
 from pathlib import Path
 
 from cowork.common.paths import cowork_home, pod_local_only
@@ -203,3 +204,109 @@ def test_bearer_auth_token_env_derives_from_cowork_home(monkeypatch, tmp_path):
         assert "COWORK_AUTH_TOKEN=tok-eng-868" in env_file.read_text(encoding="utf-8")
     finally:
         get_app_settings.cache_clear()
+
+
+# The test above covers every path resolved through a settings FIELD. It cannot
+# cover the ones computed at import: the dotenv chain baked into
+# `Settings.model_config`, the module-level `_ENV_PATH`s, and the memory
+# migration's source list. Those are exactly the paths a per-account desktop
+# session must not share, so they get a subprocess where COWORK_HOME is set
+# before anything is imported.
+_IMPORT_TIME_PATHS = r"""
+import json, os
+from pathlib import Path
+
+from cowork.common.settings.app_settings import Settings
+import cowork.migrations as migrations
+import cowork.api.v1.endpoints.settings as settings_api
+import cowork.harnesses.memory.migration as memory_migration
+import cowork.services.publish as publish
+from cowork.coding.service import get_coding_service
+from cowork.common.paths import cowork_home
+
+paths = {
+    # model_config, not _env_file_chain(): this is the value pydantic-settings
+    # reads, so appending a shared path straight to model_config cannot slip
+    # past this probe.
+    "dotenv_chain": [
+        str(p) for p in (Settings.model_config.get("env_file") or ()) if os.path.isabs(str(p))
+    ],
+    "migrations_env": [str(migrations._ENV_PATH)],
+    "settings_endpoint_env": [str(settings_api._ENV_PATH)],
+    "memory_sources": [str(p) for p, _ in memory_migration._MIGRATION_SOURCES],
+    "publish_state": [str(publish._state_path())],
+    "coding_root": [str(get_coding_service().root)],
+    "home": [str(cowork_home())],
+}
+print("PATHS" + json.dumps(paths))
+"""
+
+
+def _import_time_paths(home: Path) -> dict[str, list[str]]:
+    import json
+    import subprocess
+    import sys
+
+    env = dict(os.environ)
+    # The parent environment comes along for PATH and the interpreter, so the
+    # overrides that would redirect a probed path have to go, exactly as
+    # test_all_settings_paths_derive_from_cowork_home clears them. Without this
+    # the test fails on a machine that legitimately sets one of them, while
+    # production behaviour is correct.
+    for var in (*_PER_RESOURCE_OVERRIDES, "ANTON_COWORK_STATE_DIR"):
+        env.pop(var, None)
+    env["COWORK_HOME"] = str(home)
+    env["COWORK_TENANCY_MODE"] = "local"
+    result = subprocess.run(
+        [sys.executable, "-c", _IMPORT_TIME_PATHS],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=Path(__file__).resolve().parent.parent,
+    )
+    line = next((ln for ln in result.stdout.splitlines() if ln.startswith("PATHS")), None)
+    assert line, f"probe failed\nstdout:{result.stdout[-2000:]}\nstderr:{result.stderr[-2000:]}"
+    return json.loads(line[len("PATHS"):])
+
+
+def test_import_time_paths_follow_cowork_home(tmp_path):
+    """Nothing a desktop session reads may sit outside its own COWORK_HOME.
+
+    This is the invariant per-account isolation rests on: pointing one variable
+    at an account's root has to take the whole world with it, including the
+    dotenv chain, or an account reads another's provider secrets.
+    """
+    home = tmp_path / "account-root"
+    home.mkdir()
+    paths = _import_time_paths(home)
+
+    # Resolved components, not a string prefix: `<home>-shared/state.json` and
+    # `<home>/../shared/state.json` both START WITH str(home) while sitting
+    # outside it, so a regression onto either would have passed.
+    resolved_home = home.resolve()
+    outside = {
+        name: [p for p in group if not Path(p).resolve().is_relative_to(resolved_home)]
+        for name, group in paths.items()
+    }
+    outside = {name: group for name, group in outside.items() if group}
+    assert not outside, (
+        "path(s) resolved outside COWORK_HOME, so two accounts would share them: "
+        f"{outside}"
+    )
+
+
+def test_import_time_paths_move_with_cowork_home(tmp_path):
+    """The control: the same probe against a different root must follow it, so a
+    passing run above cannot just mean the probe found nothing."""
+    first = tmp_path / "root-a"
+    second = tmp_path / "root-b"
+    first.mkdir()
+    second.mkdir()
+
+    a = _import_time_paths(first)
+    b = _import_time_paths(second)
+
+    assert a["dotenv_chain"] != b["dotenv_chain"]
+    assert a["migrations_env"] != b["migrations_env"]
+    assert a["memory_sources"] != b["memory_sources"]
+    assert a["coding_root"] != b["coding_root"]
