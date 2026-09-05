@@ -1,8 +1,9 @@
+import ipaddress
 from contextlib import ExitStack
 from pathlib import Path
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from cowork.db.scoped import ScopedSessionDep
 from cowork.harnesses.memory.registry import MemorySlot
@@ -15,9 +16,11 @@ from cowork.schemas.projects import (
     ProjectUpdateRequest,
 )
 from cowork.schemas.shared_resources import ProjectCapabilities
+from cowork.api.v1.endpoints.guards import require_local
 from cowork.services.projects import (
     GENERAL_PROJECT,
     ProjectNotFoundError,
+    ProjectPathNotAllowedError,
     ProjectService,
 )
 from cowork.services.shared_resources import (
@@ -209,6 +212,7 @@ def _project_response(project: Project, access: SharedResourceAccess) -> dict:
     creator_id = project.created_by
     is_general = project.name == GENERAL_PROJECT
     can_change = not pending and not is_general and access.can_change(creator_id)
+    directory_is_external = ProjectService(access.session).directory_is_external(project)
     return {
         **project.model_dump(),
         "attribution": access.attribution(
@@ -218,9 +222,12 @@ def _project_response(project: Project, access: SharedResourceAccess) -> dict:
             fallback_modified_at=project.modified_at,
         ),
         "capabilities": ProjectCapabilities(
-            can_rename=can_change,
+            # A rename moves the directory, which is only defined inside the
+            # projects root. A folder the user chose is theirs, not ours to move.
+            can_rename=can_change and not directory_is_external,
             can_delete=can_change,
             can_edit_instructions=not pending and access.can_change(project.created_by),
+            directory_is_external=directory_is_external,
         ),
     }
 
@@ -238,10 +245,56 @@ def list_projects(
     return [_project_response(project, access) for project in service.list_projects()]
 
 
+def _is_loopback_address(host: str | None) -> bool:
+    """Whether an address literal names the loopback interface."""
+    value = (host or "").strip().strip("[]").casefold()
+    if value == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def require_local_for_chosen_folder(
+    body: ProjectCreateRequest, request: Request
+) -> None:
+    """A caller-chosen project folder is only accepted over loopback.
+
+    A chosen path plus the project-file endpoints is read and write anywhere
+    the server user can reach, so this has to hold on a deployment that is
+    local-mode but not local-only.
+
+    Neither of the obvious signals can carry it. The peer address is forgeable:
+    the image runs uvicorn with ``--forwarded-allow-ips "*"``, so
+    ``X-Forwarded-For`` rewrites ``request.client``. The configured host is
+    blind: that same CMD passes ``--host 0.0.0.0`` on argv and sets no
+    ``COWORK_SERVER_HOST``, so ``AppSettings.host`` still reads its loopback
+    default inside the container.
+
+    ``scope["server"]`` is the local address of the accepted socket. The proxy
+    middleware rewrites only ``client`` and ``scheme``, and a caller cannot
+    choose which interface their connection lands on, so a request that
+    arrived over loopback really did. The desktop sidecar binds 127.0.0.1, so
+    nothing legitimate is refused. ``require_local`` stays as a second layer
+    and the service refuses org deployments outright as a third.
+    """
+    if body.path is None:
+        return
+    require_local(request)
+    server = request.scope.get("server") or ()
+    if not _is_loopback_address(server[0] if server else None):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="a chosen project folder needs a request over loopback",
+        )
+
+
 @router.post(
     "/",
     status_code=status.HTTP_201_CREATED,
     response_model=ProjectResponse,
+    dependencies=[Depends(require_local_for_chosen_folder)],
 )
 def create_project(
     body: ProjectCreateRequest,
@@ -254,46 +307,57 @@ def create_project(
     claim = None
     claim_token = None
     project_id = uuid4() if session.scope.org_mode else None
-    with ExitStack() as locks:
-        try:
-            if project_id is not None:
-                locks.enter_context(
-                    access.coordination_lock(
+    try:
+        with ExitStack() as locks:
+            try:
+                if project_id is not None:
+                    locks.enter_context(
+                        access.coordination_lock(
+                            PROJECT,
+                            project_resource_key(project_id),
+                        )
+                    )
+                    claim, claim_token = access.reserve_claim(
                         PROJECT,
                         project_resource_key(project_id),
                     )
+                    if claim is None or claim_token is None:
+                        raise RuntimeError("Project ownership could not be reserved")
+                    # This lock is also the project-name namespace: skill project
+                    # validation and every org create/rename observe one canonical
+                    # name allocation order across replicas.
+                    locks.enter_context(
+                        access.coordination_lock(SKILL_PROJECT_REFERENCES, "all")
+                    )
+                project = service.create_project(
+                    body.name,
+                    project_id=project_id,
+                    path=Path(body.path) if body.path is not None else None,
                 )
-                claim, claim_token = access.reserve_claim(
-                    PROJECT,
-                    project_resource_key(project_id),
-                )
-                if claim is None or claim_token is None:
-                    raise RuntimeError("Project ownership could not be reserved")
-                # This lock is also the project-name namespace: skill project
-                # validation and every org create/rename observe one canonical
-                # name allocation order across replicas.
-                locks.enter_context(
-                    access.coordination_lock(SKILL_PROJECT_REFERENCES, "all")
-                )
-            project = service.create_project(body.name, project_id=project_id)
-            if claim is not None and claim_token is not None:
-                finalized = access.finalize_claim(
-                    claim,
-                    claim_token,
-                    action="create",
-                )
-                if finalized is None:
-                    raise RuntimeError("Project ownership changed during creation")
-        except Exception:
-            session.rollback()
-            if project_id is not None:
-                try:
-                    service.delete_project(project_id)
-                except Exception:
-                    session.rollback()
                 if claim is not None and claim_token is not None:
-                    access.release_claim(claim, claim_token=claim_token)
-            raise
+                    finalized = access.finalize_claim(
+                        claim,
+                        claim_token,
+                        action="create",
+                    )
+                    if finalized is None:
+                        raise RuntimeError("Project ownership changed during creation")
+            except Exception:
+                session.rollback()
+                if project_id is not None:
+                    try:
+                        service.delete_project(project_id)
+                    except Exception:
+                        session.rollback()
+                    if claim is not None and claim_token is not None:
+                        access.release_claim(claim, claim_token=claim_token)
+                raise
+    except ProjectPathNotAllowedError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except ProjectNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     return _project_response(project, access)
 
 

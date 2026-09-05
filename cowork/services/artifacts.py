@@ -24,7 +24,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator
+from typing import TYPE_CHECKING, Iterator
 
 from urllib.parse import quote
 
@@ -38,6 +38,9 @@ from cowork.common.paths import (
     dir_unlink,
 )
 from cowork.common.settings.app_settings import get_app_settings
+
+if TYPE_CHECKING:
+    from cowork.db.scoped import ScopedSession
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +64,11 @@ class ProjectArtifacts:
     # Optional defaults preserve callers which construct an explicit local root.
     trusted_anchor: Path | None = None
     root_parts: tuple[str, ...] = ()
+    # True only for a desktop project pointed at a folder the user chose. The
+    # filesystem scan cannot find those, and their folder basename is not their
+    # project name, so a serve URL has to be built from this source rather than
+    # rediscovered. Never set for a scanned or an explicitly constructed root.
+    external: bool = False
 
 
 def _org_mode() -> bool:
@@ -620,14 +628,44 @@ def _published_access_for(
     return out
 
 
-def _project_artifacts_base(project_name: str) -> Path | None:
+def _external_project_artifacts_base(
+    project_name: str, session: ScopedSession
+) -> Path | None:
+    """The artifacts dir of an adopted-folder project, addressed by row name.
+
+    Scoped read, so it cannot reach another tenant's project. Returns None for
+    every project the filesystem scan already resolves, leaving that path
+    untouched.
+    """
+    from cowork.services.projects import ProjectService
+
+    service = ProjectService(session)
+    project = service.get_project_by_name_or_none(project_name)
+    if project is None or not service.directory_is_external(project):
+        return None
+    base = Path(project.path) / ".anton" / "artifacts"
+    return base if base.is_dir() else None
+
+
+def _project_artifacts_base(
+    project_name: str, session: ScopedSession | None = None
+) -> Path | None:
     """Resolve a project name to its `.anton/artifacts` dir, only when it
     maps to a registered project. Returns None for unknown projects or
-    path-traversal attempts."""
+    path-traversal attempts.
+
+    The scan below derives the directory as `<root>/<name>`, which is only true
+    for a project the scan can see. A project pointed at a folder the user
+    chose is resolved from its row instead, when a session is available.
+    """
     if (not project_name or "\x00" in project_name
             or "/" in project_name or "\\" in project_name
             or project_name in (".", "..")):
         return None
+    if session is not None:
+        base = _external_project_artifacts_base(project_name, session)
+        if base is not None:
+            return base
     # Compare canonical paths on both sides. On macOS, temporary and user
     # paths commonly cross aliases such as /var -> /private/var; comparing a
     # resolved candidate with raw registry entries incorrectly rejects a
@@ -649,7 +687,12 @@ def _project_artifacts_base(project_name: str) -> Path | None:
     return base if base.is_dir() else None
 
 
-def serve_url_for(path: str | Path) -> str:
+def serve_url_for(
+    path: str | Path,
+    *,
+    artifacts_base: Path | None = None,
+    project_name: str | None = None,
+) -> str:
     """Origin-relative `/api/v1/artifacts/serve/...` URL for a file under a
     project's `.anton/artifacts` tree. Returns "" when the path isn't
     inside such a tree.
@@ -657,6 +700,11 @@ def serve_url_for(path: str | Path) -> str:
     Always "" in org mode: there the server does not serve artifact content at
     all. The only route to content is the published URL, which carries an access
     check — so there is no local URL to build.
+
+    A caller that already knows the artifacts root and the project's name says
+    so. The scan below can only find projects inside the projects root, so for
+    an adopted folder it is both wrong about the URL segment (it would use the
+    folder's basename) and unable to find the tree at all.
     """
     if _org_mode():
         return ""
@@ -664,6 +712,15 @@ def serve_url_for(path: str | Path) -> str:
         p = Path(path).resolve(strict=False)
     except (OSError, ValueError):
         return ""
+    if artifacts_base is not None and project_name:
+        try:
+            rel = p.relative_to(artifacts_base.resolve())
+        except (ValueError, OSError):
+            return ""
+        if not rel.parts:
+            return ""
+        rel_str = "/".join(quote(part) for part in rel.parts)
+        return f"/api/v1/artifacts/serve/{quote(project_name)}/{rel_str}"
     for project_dir in _registered_project_dirs():
         base = project_dir / ".anton" / "artifacts"
         try:
@@ -1065,6 +1122,7 @@ def _prepare_artifact_card(
     project_name: str,
     pinned_folder: PinnedDir | None,
     pinned_root: PinnedDir | None,
+    artifacts_base: Path | None = None,
 ) -> _PreparedArtifactCard | None:
     """Assemble the shared card shape without any filesystem mutation."""
     logical_folder = folder
@@ -1146,7 +1204,9 @@ def _prepare_artifact_card(
         **_published_access_for(
             io_folder, primary, published_map=published_map
         ),
-        "serveUrl": serve_url_for(primary_path),
+        "serveUrl": serve_url_for(
+            primary_path, artifacts_base=artifacts_base, project_name=project_name
+        ),
     }
     from cowork.services.artifact_identity import artifact_key
 
@@ -1201,6 +1261,7 @@ def card_for_folder(
     project_name: str = "",
     _pinned_folder: PinnedDir | None = None,
     _pinned_root: PinnedDir | None = None,
+    artifacts_base: Path | None = None,
 ) -> dict | None:
     """Build one card, retaining legacy metadata and publish-map self-heals.
 
@@ -1237,6 +1298,7 @@ def card_for_folder(
         project_name=project_name,
         pinned_folder=_pinned_folder,
         pinned_root=_pinned_root,
+        artifacts_base=artifacts_base,
     )
     if prepared is None:
         return None
@@ -1259,6 +1321,7 @@ def _listed_card_for_pinned_folder(
     project_name: str,
     pinned_folder: PinnedDir,
     pinned_root: PinnedDir,
+    artifacts_base: Path | None = None,
 ) -> dict | None:
     """Build one list card through a call graph containing no artifact writes."""
     from cowork.services.artifact_identity import read_full_id
@@ -1283,6 +1346,7 @@ def _listed_card_for_pinned_folder(
         project_name=project_name,
         pinned_folder=pinned_folder,
         pinned_root=pinned_root,
+        artifacts_base=artifacts_base,
     )
     if prepared is None:
         return None
@@ -1429,6 +1493,9 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                                 project_name=source.project_name,
                                 pinned_folder=pinned_folder,
                                 pinned_root=root,
+                                artifacts_base=(
+                                    source.base if source.external else None
+                                ),
                             )
                             if card is None:
                                 continue

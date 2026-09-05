@@ -28,6 +28,9 @@ class ProjectInstructionsResponse(BaseModel):
 
 class ProjectFileListResponse(BaseModel):
     files: list[ProjectFileMetadata]
+    # Set only when the walk hit its cap, so an untruncated listing keeps the
+    # wire shape it had before a project could point at a folder of any size.
+    truncated: bool | None = None
 
 
 class ProjectFileReadResponse(BaseModel):

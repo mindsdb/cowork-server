@@ -895,11 +895,16 @@ async def preview_asset(token: str, rel_path: str, request: Request):
 
 
 @router.get("/serve/{project_name}/{file_path:path}", dependencies=[Depends(require_local_tenancy)])
-def serve_artifact_file(project_name: str, file_path: str, request: Request):
+def serve_artifact_file(
+    project_name: str,
+    file_path: str,
+    request: Request,
+    session: ScopedSessionDep,
+):
     """Serve a file from `<project>/.anton/artifacts/<file_path>` over
     HTTP. Stateless, origin-relative, frame-able so the in-app iframe
     and new-tab open both work in web deployments."""
-    base = _project_artifacts_base(project_name)
+    base = _project_artifacts_base(project_name, session)
     if base is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown project")
     try:
