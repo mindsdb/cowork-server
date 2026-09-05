@@ -5,7 +5,6 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import ipaddress
 import logging
 import os
 import re
@@ -73,28 +72,6 @@ class ProjectNotFoundError(ValueError):
 
 class ProjectPathNotAllowedError(ValueError):
     """A caller chose a project folder on a deployment that does not allow one."""
-
-
-_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
-
-
-def _binds_loopback_only(host: str) -> bool:
-    """Whether the server was told to listen only on loopback.
-
-    The peer address cannot carry this decision. The container runs uvicorn
-    with ``--forwarded-allow-ips "*"``, so ``X-Forwarded-For`` rewrites
-    ``request.client`` and a remote caller can present 127.0.0.1. The address
-    the server was told to bind is configuration, which a request cannot
-    forge: the desktop sidecar binds 127.0.0.1, the self-host container binds
-    0.0.0.0.
-    """
-    value = (host or "").strip().strip("[]").casefold()
-    if value in _LOOPBACK_HOSTS:
-        return True
-    try:
-        return ipaddress.ip_address(value).is_loopback
-    except ValueError:
-        return False
 
 
 @dataclass
@@ -552,12 +529,14 @@ class ProjectService:
         if get_app_settings().tenancy_mode == "org" or self.session.scope.org_mode:
             return False
         try:
-            # The parent is resolved, not the leaf. A project directory that is
-            # itself a symlink to elsewhere is still a direct child of the
-            # root, and renaming it renames the link -- the same comparison
-            # `_in_scoped_root` makes. Resolving the leaf would reclassify it
-            # as chosen and refuse a rename that works today.
-            parent = Path(project.path).resolve(strict=False).parent
+            # `.parent` first, then resolve: `Path.resolve()` resolves the
+            # final component too, so resolving and then taking the parent is
+            # a different question. A project directory that is itself a
+            # symlink elsewhere is still a direct child of the root, and
+            # renaming it renames the link -- the comparison `_in_scoped_root`
+            # makes. Resolving the leaf would reclassify it as chosen and
+            # refuse a rename that works today.
+            parent = Path(project.path).parent.resolve(strict=False)
             root = self._root_dir().resolve(strict=False)
         except (OSError, RuntimeError):
             return False
@@ -586,15 +565,9 @@ class ProjectService:
         org deployment does not run on the caller's machine, so statting a
         path it chose would answer whether that server path exists.
         """
-        settings = get_app_settings()
-        if settings.tenancy_mode == "org":
+        if get_app_settings().tenancy_mode == "org":
             raise ProjectPathNotAllowedError(
                 "Choosing a project folder is not available on this deployment"
-            )
-        if not _binds_loopback_only(settings.host):
-            raise ProjectPathNotAllowedError(
-                "Choosing a project folder needs a server listening only on "
-                "localhost"
             )
         try:
             resolved = path.expanduser().resolve(strict=True)

@@ -153,7 +153,12 @@ def test_external_project_dirs_reads_real_rows(tmp_path, monkeypatch):
 
         adopted = tmp_path / "Documents" / "notes"
         adopted.mkdir(parents=True)
-        client = TestClient(create_app(), client=("127.0.0.1", 54321))
+        # base_url sets scope["server"], which the chosen-folder gate reads.
+        client = TestClient(
+            create_app(),
+            base_url="http://127.0.0.1:26866",
+            client=("127.0.0.1", 54321),
+        )
         created = client.post(
             "/api/v1/projects/",
             json={"name": "real-row-adopted", "path": str(adopted)},
@@ -167,3 +172,81 @@ def test_external_project_dirs_reads_real_rows(tmp_path, monkeypatch):
         assert "real-row-allocated" not in found
     finally:
         get_app_settings.cache_clear()
+
+
+# -- the folder is the user's, and can hold anything --------------------------
+
+
+def _real_skill(canon_root: Path, slug: str):
+    (canon_root / slug).mkdir(parents=True, exist_ok=True)
+    return SimpleNamespace(name=slug, enabled=True, projects=[])
+
+
+def test_a_real_directory_in_the_way_does_not_fail_the_skill_write(
+    tmp_path, monkeypatch
+):
+    """An adopted repo can already have a top-level `skills/` with real
+    directories in it. Reconciliation must not raise into the caller that was
+    creating or enabling a skill — the skill file is written by then."""
+    canon = tmp_path / "canonical"
+    skill = _real_skill(canon, "notes")
+    monkeypatch.setattr(sl, "_canon_root", lambda: canon)
+
+    adopted = tmp_path / "repo"
+    (adopted / "skills" / "notes").mkdir(parents=True)
+    (adopted / "skills" / "notes" / "theirs.md").write_text("mine, not a link")
+    monkeypatch.setattr(sl, "_project_dirs", lambda: [])
+    monkeypatch.setattr(sl, "_external_project_dirs", lambda: {"repo": adopted})
+
+    sl.reconcile_skill_links(skill)
+
+    assert (adopted / "skills" / "notes" / "theirs.md").read_text() == (
+        "mine, not a link"
+    )
+
+
+def test_one_unwritable_folder_does_not_abort_the_others(tmp_path, monkeypatch):
+    canon = tmp_path / "canonical"
+    skill = _real_skill(canon, "notes")
+    monkeypatch.setattr(sl, "_canon_root", lambda: canon)
+
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    blocked.chmod(0o500)
+    reachable = tmp_path / "reachable"
+    reachable.mkdir()
+    monkeypatch.setattr(sl, "_project_dirs", lambda: [])
+    monkeypatch.setattr(
+        sl,
+        "_external_project_dirs",
+        lambda: {"blocked": blocked, "reachable": reachable},
+    )
+
+    try:
+        sl.reconcile_skill_links(skill)
+    finally:
+        blocked.chmod(0o700)
+
+    assert (reachable / "skills" / "notes").is_symlink()
+
+
+def test_removal_survives_a_folder_it_cannot_write(tmp_path, monkeypatch):
+    blocked = tmp_path / "blocked"
+    blocked.mkdir()
+    (blocked / "skills").mkdir()
+    (blocked / "skills" / "notes").mkdir()
+    reachable = tmp_path / "reachable"
+    (reachable / "skills").mkdir(parents=True)
+    (reachable / "skills" / "notes").symlink_to(tmp_path, target_is_directory=True)
+    monkeypatch.setattr(sl, "_project_dirs", lambda: [])
+    monkeypatch.setattr(
+        sl,
+        "_external_project_dirs",
+        lambda: {"blocked": blocked, "reachable": reachable},
+    )
+
+    sl.remove_skill_links("notes")
+
+    # The real directory the user owns is untouched; the link Cowork made goes.
+    assert (blocked / "skills" / "notes").is_dir()
+    assert not (reachable / "skills" / "notes").exists()

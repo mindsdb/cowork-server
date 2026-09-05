@@ -242,7 +242,10 @@ def test_the_artifacts_route_lists_an_adopted_folder(projects_root, tmp_path):
         )
     )
 
-    client = TestClient(create_app(), client=("127.0.0.1", 54321))
+    # base_url sets scope["server"], which the chosen-folder gate reads.
+    client = TestClient(
+        create_app(), base_url="http://127.0.0.1:26866", client=("127.0.0.1", 54321)
+    )
     created = client.post(
         "/api/v1/projects/",
         json={"name": "adopted-dash-project", "path": str(folder)},

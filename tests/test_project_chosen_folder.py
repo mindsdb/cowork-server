@@ -86,46 +86,6 @@ def test_org_mode_refuses_a_chosen_folder(engine, monkeypatch, tmp_path):
         svc.create_project("notes", path=tmp_path / "definitely-absent")
 
 
-def test_a_server_bound_off_loopback_refuses_a_chosen_folder(
-    engine, monkeypatch, tmp_path
-):
-    """The peer address cannot carry this decision. The container runs uvicorn
-    with `--forwarded-allow-ips "*"`, so X-Forwarded-For rewrites
-    request.client and a remote caller can present 127.0.0.1. What it cannot
-    present is the address the server was told to bind."""
-    monkeypatch.setenv("COWORK_SERVER_HOST", "0.0.0.0")
-    from cowork.common.settings.app_settings import get_app_settings
-
-    get_app_settings.cache_clear()
-    folder = _folder(tmp_path, "notes")
-    with pytest.raises(ProjectPathNotAllowedError, match="listening only on"):
-        _svc(engine).create_project("notes", path=folder)
-
-
-@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1", "127.0.1.1"])
-def test_a_loopback_bound_server_allows_a_chosen_folder(
-    engine, monkeypatch, tmp_path, host
-):
-    monkeypatch.setenv("COWORK_SERVER_HOST", host)
-    from cowork.common.settings.app_settings import get_app_settings
-
-    get_app_settings.cache_clear()
-    folder = _folder(tmp_path, f"notes-{host.replace(':', '-')}")
-    svc = _svc(engine)
-    project = svc.create_project(f"notes-{host.replace(':', '-')}", path=folder)
-    assert Path(project.path) == folder.resolve()
-
-
-def test_a_server_on_a_routable_address_refuses_it(engine, monkeypatch, tmp_path):
-    monkeypatch.setenv("COWORK_SERVER_HOST", "10.0.0.5")
-    from cowork.common.settings.app_settings import get_app_settings
-
-    get_app_settings.cache_clear()
-    folder = _folder(tmp_path, "notes")
-    with pytest.raises(ProjectPathNotAllowedError, match="listening only on"):
-        _svc(engine).create_project("notes", path=folder)
-
-
 # -- what counts as a folder -------------------------------------------------
 
 
@@ -244,12 +204,19 @@ def test_an_omitted_path_is_none():
     assert ProjectCreateRequest(name="n").path is None
 
 
-def _loopback_client():
+def _client(base_url: str = "http://127.0.0.1:26866", peer: str = "127.0.0.1"):
+    """`base_url` sets `scope["server"]`, the accepted socket's local address,
+    which is what the chosen-folder gate reads. `client` sets the peer, which
+    `require_local` reads."""
     from fastapi.testclient import TestClient
 
     from cowork.server import create_app
 
-    return TestClient(create_app(), client=("127.0.0.1", 54321))
+    return TestClient(create_app(), base_url=base_url, client=(peer, 54321))
+
+
+def _loopback_client():
+    return _client()
 
 
 def test_a_missing_folder_is_a_client_error_not_a_crash(projects_root, tmp_path):
@@ -280,24 +247,52 @@ def test_a_non_loopback_caller_cannot_choose_a_folder(projects_root, tmp_path):
     """`tenancy_mode` is local on a self-host deployment that binds 0.0.0.0.
     Without this, a chosen path plus the project-file endpoints is read and
     write anywhere the server user can reach."""
-    from fastapi.testclient import TestClient
-
-    from cowork.server import create_app
-
     folder = _folder(tmp_path, "refused-remotely")
-    remote = TestClient(create_app(), client=("203.0.113.7", 44321))
-    res = remote.post(
+    res = _client(peer="203.0.113.7").post(
         "/api/v1/projects/", json={"name": "refused-remotely", "path": str(folder)}
+    )
+    assert res.status_code == 403, res.text
+
+
+def test_a_request_that_did_not_arrive_over_loopback_is_refused(
+    projects_root, tmp_path
+):
+    """The peer address is forgeable: the image runs uvicorn with
+    `--forwarded-allow-ips "*"`, so X-Forwarded-For rewrites request.client.
+    The socket the request actually landed on is not, and in the container
+    that socket is the published one, not loopback."""
+    folder = _folder(tmp_path, "arrived-off-loopback")
+    forging = _client(base_url="http://172.17.0.2:9010", peer="127.0.0.1")
+    res = forging.post(
+        "/api/v1/projects/",
+        json={"name": "arrived-off-loopback", "path": str(folder)},
+        headers={"Host": "localhost"},
+    )
+    assert res.status_code == 403, res.text
+
+
+def test_the_configured_host_setting_does_not_decide_it(
+    projects_root, tmp_path, monkeypatch
+):
+    """The image's CMD passes `--host 0.0.0.0` on argv and sets no
+    COWORK_SERVER_HOST, so the setting reads its loopback default inside a
+    container that is published to the world. It must not be the gate."""
+    monkeypatch.setenv("COWORK_SERVER_HOST", "127.0.0.1")
+    from cowork.common.settings.app_settings import get_app_settings
+
+    get_app_settings.cache_clear()
+    folder = _folder(tmp_path, "setting-says-loopback")
+    res = _client(base_url="http://172.17.0.2:9010").post(
+        "/api/v1/projects/",
+        json={"name": "setting-says-loopback", "path": str(folder)},
+        headers={"Host": "localhost"},
     )
     assert res.status_code == 403, res.text
 
 
 def test_a_non_loopback_caller_can_still_create_a_normal_project(projects_root):
     """The gate is on the chosen folder, not on project creation."""
-    from fastapi.testclient import TestClient
-
-    from cowork.server import create_app
-
-    remote = TestClient(create_app(), client=("203.0.113.7", 44321))
-    res = remote.post("/api/v1/projects/", json={"name": "remote-no-folder"})
+    res = _client(peer="203.0.113.7").post(
+        "/api/v1/projects/", json={"name": "remote-no-folder"}
+    )
     assert res.status_code == 201, res.text

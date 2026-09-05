@@ -70,6 +70,11 @@ def _external_project_dirs() -> dict[str, Path]:
     A failure degrades to the scan alone, which is the behaviour before
     adopted folders existed, so it is logged rather than raised.
     """
+    if get_app_settings().tenancy_mode == "org":
+        # LOCAL_SCOPE below disables org filtering, so this query would read
+        # every tenant's rows. A folder can only be adopted on a local
+        # deployment, so there is nothing here to find.
+        return {}
     try:
         from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
         from cowork.db.session import get_open_session
@@ -219,16 +224,36 @@ def reconcile_skill_links(skill: Skill) -> None:
         desired = {p.name for p in all_projects}
     for project in all_projects:
         link = safe_join_lexical(project.path / "skills", skill.name)
-        if project.name in desired and canon.exists():
-            _ensure_symlink(link, canon)
-        else:
-            _remove_link(link)
+        try:
+            if project.name in desired and canon.exists():
+                _ensure_symlink(link, canon)
+            else:
+                _remove_link(link)
+        except Exception:
+            # Per project, so one folder cannot abort the fan-out. An adopted
+            # folder is the user's: it can already hold a real `skills/<slug>`
+            # directory, or be read-only, and neither should fail the skill
+            # write that triggered this.
+            logger.warning(
+                "Could not reconcile skill %r into project %r",
+                skill.name,
+                project.name,
+                exc_info=True,
+            )
 
 
 def remove_skill_links(slug: str) -> None:
     """Drop the skill's link from every project (used on delete / rename)."""
     for project in _all_projects():
-        _remove_link(safe_join_lexical(project.path / "skills", slug))
+        try:
+            _remove_link(safe_join_lexical(project.path / "skills", slug))
+        except Exception:
+            logger.warning(
+                "Could not remove skill %r from project %r",
+                slug,
+                project.name,
+                exc_info=True,
+            )
 
 
 def reconcile_project(
