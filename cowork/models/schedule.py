@@ -19,7 +19,14 @@ class Schedule(BaseSQLModel, table=True):
         description="UTC datetime of next scheduled execution",
     )
     enabled: bool = Field(default=True, description="Whether the schedule is active")
-    project_id: UUID = Field(foreign_key="projects.id", description="Project context for execution")
+    project_id: UUID = Field(
+        sa_column=sa.Column(
+            sa.Uuid(),
+            sa.ForeignKey("projects.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        description="Project context for execution",
+    )
     model: str = Field(description="Model identifier to use for execution")
     last_run_at: datetime | None = Field(
         default=None,
