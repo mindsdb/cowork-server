@@ -20,6 +20,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, select
 
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession
+from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule, ScheduleRun
 from cowork.services.projects import GENERAL_PROJECT_ID, ProjectService
@@ -118,3 +119,42 @@ def test_delete_project_without_schedules_still_works(tmp_path, monkeypatch):
 
     assert ProjectService(scoped).delete_project(project.id) is True
     assert session.get(Project, project.id) is None
+
+
+def test_delete_project_when_a_schedule_points_at_a_deleted_conversation(
+    tmp_path, monkeypatch
+):
+    """The two cascades meet.
+
+    `delete_project` removes the project's conversations BEFORE the project
+    row, and both `schedules.last_result_conversation_id` and
+    `schedule_runs.conversation_id` are foreign keys into conversations with no
+    `ondelete`. So a schedule that recorded a run in one of those conversations
+    is pointing at a row that is about to disappear, while the schedule itself
+    survives until the project row goes.
+
+    `ScheduleService.release_conversation` nulls those pointers on the way past,
+    which is what keeps this working -- but nothing pinned it, and the ordering
+    is not obvious from either side.
+    """
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path))
+    session = _fk_enforced_session()
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    project = _project(session, tmp_path, name="entangled")
+
+    conversation = Conversation(project_id=project.id, topic="run output")
+    session.add(conversation)
+    session.commit()
+    session.refresh(conversation)
+
+    schedule = _schedule(session, project.id)
+    schedule.last_result_conversation_id = conversation.id
+    session.add(schedule)
+    session.commit()
+    ScheduleRunService(scoped).create_run(schedule.id, is_manual=False)
+
+    assert ProjectService(scoped).delete_project(project.id) is True
+
+    assert session.get(Project, project.id) is None
+    assert session.get(Schedule, schedule.id) is None
+    assert session.get(Conversation, conversation.id) is None
