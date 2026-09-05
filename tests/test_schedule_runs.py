@@ -263,6 +263,128 @@ def test_execute_schedule_stamps_trace_identity(monkeypatch):
         s.close()
 
 
+# ENG-2353: a schedule stores the "default" sentinel (the UI removed the model
+# picker), which is NOT a servable model id. If it reached the turn verbatim the
+# harness would override every model role with the literal string "default" and
+# the gateway would 404 it as model_not_found ("That model isn't available") —
+# but only for prompts that delegate to Anton, since the pre-Anton routing gate
+# answers trivial prompts on its own gate model and never touches it. The run
+# must instead pass None so the account-wide default models govern the turn.
+
+def test_resolve_schedule_model_sentinel_and_pins():
+    from cowork.schemas.schedules import (
+        DEFAULT_MODEL_SENTINEL,
+        resolve_schedule_model,
+    )
+
+    # The sentinel and anything falsy resolve to None (account defaults).
+    assert resolve_schedule_model(DEFAULT_MODEL_SENTINEL) is None
+    assert resolve_schedule_model("default") is None
+    assert resolve_schedule_model("") is None
+    assert resolve_schedule_model(None) is None
+    # A real id passes through untouched.
+    assert resolve_schedule_model("sonnet") == "sonnet"
+
+
+def test_execute_schedule_resolves_default_sentinel_to_none(monkeypatch):
+    import asyncio
+
+    import cowork.handlers.responses as responses_mod
+    from cowork.db.session import get_open_session
+    from cowork.scheduler import execute_schedule
+
+    captured: list = []
+
+    class FakeHandler:
+        def __init__(self, session, principal=None):
+            pass
+
+        async def handle(self, request):
+            captured.append(request)
+
+            async def _gen():
+                if False:
+                    yield
+
+            return _gen()
+
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", FakeHandler)
+
+    session = get_open_session()
+    schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
+        title="default model test",
+        prompt="generate random hausa names",
+        cadence="daily",
+        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+        model="default",
+        timezone="UTC",
+        project_id=GENERAL_PROJECT_ID,
+        enabled=True,
+    )
+    schedule_id = schedule.id
+    session.close()
+
+    try:
+        asyncio.run(execute_schedule(schedule_id, is_manual=False))
+        assert captured, "handler was never invoked"
+        # None → _apply_model_override is a no-op → account defaults apply.
+        assert captured[0].model is None
+    finally:
+        s = get_open_session()
+        ScheduleService(ScopedSession(s, SYSTEM_SCOPE)).delete_schedule(schedule_id)
+        s.close()
+
+
+def test_execute_schedule_passes_pinned_model_through(monkeypatch):
+    """A schedule that pinned a concrete id (legacy rows, or a future picker)
+    still runs on that id — the sentinel resolution must not flatten real picks."""
+    import asyncio
+
+    import cowork.handlers.responses as responses_mod
+    from cowork.db.session import get_open_session
+    from cowork.scheduler import execute_schedule
+
+    captured: list = []
+
+    class FakeHandler:
+        def __init__(self, session, principal=None):
+            pass
+
+        async def handle(self, request):
+            captured.append(request)
+
+            async def _gen():
+                if False:
+                    yield
+
+            return _gen()
+
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", FakeHandler)
+
+    session = get_open_session()
+    schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
+        title="pinned model test",
+        prompt="do the thing",
+        cadence="daily",
+        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+        model="sonnet",
+        timezone="UTC",
+        project_id=GENERAL_PROJECT_ID,
+        enabled=True,
+    )
+    schedule_id = schedule.id
+    session.close()
+
+    try:
+        asyncio.run(execute_schedule(schedule_id, is_manual=False))
+        assert captured, "handler was never invoked"
+        assert captured[0].model == "sonnet"
+    finally:
+        s = get_open_session()
+        ScheduleService(ScopedSession(s, SYSTEM_SCOPE)).delete_schedule(schedule_id)
+        s.close()
+
+
 # A scheduled run in org mode has no request, so it derives a service principal
 # from the schedule row: the conversation is created under the owning org and
 # the turn receives that principal so the remote backend can mint the org's key

@@ -8,6 +8,7 @@ from tests.integration.prereq import missing_prerequisite
 
 ROOT = Path(__file__).resolve().parents[1]
 NIGHTLY_WORKFLOW = ROOT / ".github/workflows/nightly-staging-integration.yml"
+INTEGRATION_SUITE = ROOT / ".github/workflows/tests-integration.yml"
 
 
 def test_nightly_workflow_calls_staging_suite_and_reports_its_result():
@@ -27,7 +28,6 @@ def test_nightly_workflow_calls_staging_suite_and_reports_its_result():
     uses: ./.github/workflows/tests-integration.yml
     with:
       deploy-env: staging
-      runner: mdb-dev
     secrets: inherit
 """
         in workflow
@@ -47,6 +47,22 @@ def test_nightly_workflow_calls_staging_suite_and_reports_its_result():
     assert (
         "status: ${{ contains(needs.*.result, 'failure') && 'failed' || 'recovered' }}"
         in workflow
+    )
+
+
+def test_nightly_workflow_passes_only_inputs_the_suite_defines():
+    # actionlint rejects the whole workflow-lint job over an input the callee
+    # does not declare, so the caller's `with:` block is checked here too.
+    # `yaml.safe_load` reads the `on:` key as the boolean True.
+    caller = yaml.safe_load(NIGHTLY_WORKFLOW.read_text(encoding="utf-8"))
+    suite = yaml.safe_load(INTEGRATION_SUITE.read_text(encoding="utf-8"))
+
+    passed = set(caller["jobs"]["integration"]["with"])
+    defined = set(suite[True]["workflow_call"]["inputs"])
+
+    assert not passed - defined, (
+        f"nightly caller passes {sorted(passed - defined)}, "
+        f"which tests-integration.yml does not define"
     )
 
 
