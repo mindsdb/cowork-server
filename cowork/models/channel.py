@@ -91,7 +91,17 @@ class ChannelBinding(BaseSQLModel, table=True):
     )
     anton_project_id: UUID | None = Field(
         default=None,
-        foreign_key="projects.id",
+        sa_column=sa.Column(
+            sa.Uuid(),
+            # SET NULL, not CASCADE: deleting a project must not delete
+            # someone's Slack/Telegram route. The runtime already treats a null
+            # as "use the default project" -- `binding.anton_project_id or
+            # self._resolve_default_project_id(scoped)` at runtime.py:357 and
+            # :417 -- so the binding survives the project and keeps working
+            # (ENG-2357).
+            sa.ForeignKey("projects.id", ondelete="SET NULL"),
+            nullable=True,
+        ),
         description="Project context this channel routes into",
     )
     anton_conversation_id: UUID | None = Field(
