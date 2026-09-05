@@ -20,6 +20,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, select
 
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession
+from cowork.models.channel import ChannelBinding
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule, ScheduleRun
@@ -158,3 +159,42 @@ def test_delete_project_when_a_schedule_points_at_a_deleted_conversation(
     assert session.get(Project, project.id) is None
     assert session.get(Schedule, schedule.id) is None
     assert session.get(Conversation, conversation.id) is None
+
+
+def test_delete_project_releases_a_channel_binding_without_deleting_it(
+    tmp_path, monkeypatch
+):
+    """The fourth foreign key into projects, found in review.
+
+    `channel_bindings.anton_project_id` is nullable and had no `ondelete`, so a
+    project that a Slack/Telegram route pointed at could not be deleted at all.
+
+    SET NULL rather than CASCADE is the point of this test: deleting a project
+    must NOT delete someone's channel route. The runtime reads the column as
+    optional (`binding.anton_project_id or self._resolve_default_project_id(...)`
+    at runtime.py:357 and :417), so a released binding keeps serving on the
+    default project. Asserting only "the delete stopped throwing" would pass
+    just as happily with CASCADE, which would silently destroy the route.
+    """
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path))
+    session = _fk_enforced_session()
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    project = _project(session, tmp_path, name="routed")
+
+    binding = ChannelBinding(
+        channel_type="slack",
+        external_group_id="C123",
+        anton_project_id=project.id,
+    )
+    session.add(binding)
+    session.commit()
+    session.refresh(binding)
+
+    assert ProjectService(scoped).delete_project(project.id) is True
+
+    assert session.get(Project, project.id) is None
+    survivor = session.get(ChannelBinding, binding.id)
+    assert survivor is not None, "the channel route must outlive the project"
+    session.refresh(survivor)
+    assert survivor.anton_project_id is None
+    assert survivor.external_group_id == "C123"
