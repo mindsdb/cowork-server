@@ -1,116 +1,451 @@
-"""The channel config surface refuses org mode, and says so with a 403.
+"""Per-org channel installations, credentials, and inbound dedupe.
 
-`_require_local_channels` guards every route that reads or writes channel
-credentials, the shared adapter, or the harness setting. Those live in
-deployment-global rows, so in org mode one tenant could otherwise read or
-delete another's. The runtime side already fails closed; the guard closes the
-config side.
-
-The refusal is a 403 rather than a 501 because it turns a caller away at a
-tenant boundary instead of admitting a missing capability. The two lifecycle
-501s in the same module are the other kind, and the last test here keeps them
-apart.
-
-TestClient is enough: the guard reads the tenancy setting at request time, so
-the app's build-time mode does not matter. The scope resolver reads it at
-request time too, so these requests carry an org scope with no org id rather
-than LOCAL_SCOPE. The guard still refuses first on every guarded route, because
-it is the first statement of each handler body and building a ScopedSession
-touches no table. Move a guard below a `scoped.select(...)` and that route
-answers 401 from the scope layer instead.
+Installations are org-wide, not per-member (matches the existing provider-
+credential pattern: org-shared, not per-user). Local/desktop mode keeps
+today's behavior verbatim — exactly one installation per channel_type,
+credentials in global (scope=NULL) rows, dedupe with no org dimension.
 """
 from __future__ import annotations
 
 import pytest
-from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.pool import StaticPool
+from sqlmodel import Session, SQLModel, create_engine
 
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.channels.plugin import ChannelPlugin, CredentialField, CredentialSchema
+from cowork.channels.registry import PluginRegistry
+from cowork.channels.runtime import LiveAdapterRegistry
+from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError, ScopedSession, TenantScope
+from cowork.models.channel import ChannelEvent, ChannelInstallation
+from cowork.services.channel_events import ChannelEventService
+from cowork.services.channels import ChannelConfigService, resolve_installation_by_external_account
 
-DETAIL = "channels are not available in org deployments yet"
-
-# Every route behind `_require_local_channels`. Seven call the guard directly;
-# setup and teardown reach it through `_lifecycle_service`, which is why a grep
-# over the route decorators alone comes up two short.
-GUARDED = [
-    ("GET", "/api/v1/channels/status", None),
-    ("GET", "/api/v1/channels/agent", None),
-    ("PUT", "/api/v1/channels/agent", {"harness": "anton"}),
-    ("GET", "/api/v1/channels/slack/config", None),
-    ("PUT", "/api/v1/channels/slack/config", {"values": {}}),
-    ("DELETE", "/api/v1/channels/slack/config", None),
-    ("POST", "/api/v1/channels/slack/reload", None),
-    ("POST", "/api/v1/channels/slack/setup", None),
-    ("POST", "/api/v1/channels/slack/teardown", None),
-]
-
-# The catalogue and bindings routes sit outside the guard on purpose: they carry
-# a tenant scope of their own and expose no credentials. They are the negative
-# case, so the guard cannot quietly grow to cover the whole router.
-#
-# Their statuses are pinned rather than asserted "not 403". A TestClient request
-# carries no gateway identity headers, so the fail-closed scope layer refuses the
-# two org-scoped routes with a 401; "not 403" would pass on that refusal and read
-# as though those routes were reachable.
-UNGUARDED = [
-    ("/api/v1/channels/plugins", 200),  # catalogue only, no tenant data
-    ("/api/v1/channels/installations", 401),
-    ("/api/v1/channels/bindings", 401),
-]
+ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+ORG_B = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
 
 
-@pytest.fixture
-def org_mode(monkeypatch):
-    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
-    get_app_settings.cache_clear()
-    yield
-    get_app_settings.cache_clear()
+async def _fake_factory(creds):
+    return None
 
 
-@pytest.fixture
-def local_mode(monkeypatch):
-    monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
-    get_app_settings.cache_clear()
-    yield
-    get_app_settings.cache_clear()
+def _fake_registry() -> PluginRegistry:
+    registry = PluginRegistry()
+    registry.register(
+        ChannelPlugin(
+            channel_type="slack",
+            display_name="Slack",
+            factory=_fake_factory,
+            credentials=CredentialSchema(
+                fields=(CredentialField(name="signing_secret", label="Signing secret"),)
+            ),
+        )
+    )
+    return registry
 
 
-def _call(method: str, path: str, body):
-    from cowork.server import app
+class _FakeAdapter:
+    """Echoes back the creds it was built from, so a test can tell which
+    org's credentials produced this particular cached adapter."""
 
-    kwargs = {"json": body} if body is not None else {}
-    return TestClient(app).request(method, path, **kwargs)
+    def __init__(self, creds):
+        self.creds = creds
 
-
-@pytest.mark.parametrize("method,path,body", GUARDED)
-def test_channel_config_routes_are_403_in_org_mode(org_mode, method, path, body):
-    res = _call(method, path, body)
-    assert res.status_code == 403
-    # The detail is load-bearing: it tells this refusal apart from the other
-    # 403s the app raises, and it tells the caller why.
-    assert res.json()["detail"] == DETAIL
+    async def shutdown(self) -> None:
+        pass
 
 
-@pytest.mark.parametrize("path,expected", UNGUARDED)
-def test_unguarded_channel_routes_are_not_refused_by_the_guard(org_mode, path, expected):
-    from cowork.server import app
+def _live_fake_registry() -> PluginRegistry:
+    async def _factory(creds):
+        return _FakeAdapter(creds)
 
-    assert TestClient(app).get(path).status_code == expected
+    registry = PluginRegistry()
+    registry.register(
+        ChannelPlugin(
+            channel_type="slack",
+            display_name="Slack",
+            factory=_factory,
+            credentials=CredentialSchema(
+                fields=(CredentialField(name="signing_secret", label="Signing secret"),)
+            ),
+        )
+    )
+    return registry
 
 
-@pytest.mark.parametrize("action", ["setup", "teardown"])
-def test_lifecycle_refusals_keep_their_501(local_mode, action):
-    """A channel plugin that ships no setup or teardown is a real missing
-    capability, so those two raises keep their 501 while the tenancy guard moves
-    to 403. `slack` ships no lifecycle, so it is the live case; a blanket status
-    sweep over the module turns these into 403 and fails here.
+@pytest.fixture()
+def engine():
+    import cowork.models.project, cowork.models.conversation  # noqa: F401
+    eng = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    SQLModel.metadata.create_all(eng)
+    return eng
 
-    Builds its own app instead of importing the module-level one: whichever test
-    imports `cowork.server` first fixes the app's build-time tenancy mode for the
-    session, and an app built in org mode loads no plugins, which would answer
-    404 here rather than 501.
-    """
-    from cowork.server import create_app
 
-    res = TestClient(create_app()).post(f"/api/v1/channels/slack/{action}")
-    assert res.status_code == 501
-    assert res.json()["detail"] == f"{action} not implemented for channel: slack"
+def _org(org: str) -> TenantScope:
+    return TenantScope(org_mode=True, org_id=org)
+
+
+def _scoped(engine, scope: TenantScope = LOCAL_SCOPE) -> ScopedSession:
+    return ScopedSession(Session(engine), scope)
+
+
+def _config_svc(engine, scope: TenantScope) -> ChannelConfigService:
+    return ChannelConfigService(_scoped(engine, scope), registry=_fake_registry())
+
+
+# --- ChannelInstallation: one per (channel_type, org_id), org_id NULL included ---
+
+def test_installation_unique_per_channel_type_in_local_mode(engine):
+    session = Session(engine)
+    session.add(ChannelInstallation(channel_type="slack", display_name="Slack"))
+    session.commit()
+    session.add(ChannelInstallation(channel_type="slack", display_name="Slack again"))
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_installation_allowed_per_org(engine):
+    session = Session(engine)
+    session.add(ChannelInstallation(channel_type="slack", display_name="Slack", org_id=ORG_A))
+    session.add(ChannelInstallation(channel_type="slack", display_name="Slack", org_id=ORG_B))
+    session.commit()  # must not raise: two orgs, same channel_type
+
+
+def test_installation_still_unique_per_org(engine):
+    session = Session(engine)
+    session.add(ChannelInstallation(channel_type="slack", display_name="Slack", org_id=ORG_A))
+    session.commit()
+    session.add(ChannelInstallation(channel_type="slack", display_name="Slack again", org_id=ORG_A))
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_installation_org_row_does_not_collide_with_local_row(engine):
+    session = Session(engine)
+    session.add(ChannelInstallation(channel_type="slack", display_name="Slack"))
+    session.add(ChannelInstallation(channel_type="slack", display_name="Slack", org_id=ORG_A))
+    session.commit()  # must not raise: a local row and an org row are different tiers
+
+
+# --- ChannelInstallation.external_account_id: the pre-scope webhook-routing key ---
+
+def test_external_account_id_unique_per_channel_type(engine):
+    session = Session(engine)
+    session.add(ChannelInstallation(
+        channel_type="slack", display_name="Slack", org_id=ORG_A, external_account_id="T-A",
+    ))
+    session.commit()
+    session.add(ChannelInstallation(
+        channel_type="slack", display_name="Slack again", org_id=ORG_B, external_account_id="T-A",
+    ))
+    with pytest.raises(IntegrityError):
+        session.commit()
+
+
+def test_external_account_id_can_be_null_on_multiple_rows(engine):
+    # Not yet discovered (setup incomplete) — must not collide with each other.
+    session = Session(engine)
+    session.add(ChannelInstallation(channel_type="slack", display_name="Slack", org_id=ORG_A))
+    session.add(ChannelInstallation(channel_type="slack", display_name="Slack", org_id=ORG_B))
+    session.commit()  # must not raise: both external_account_id are NULL
+
+
+# --- ChannelConfigService: org-scoped credential storage ---
+
+def test_credentials_isolated_across_orgs(engine):
+    svc_a = _config_svc(engine, _org(ORG_A))
+    svc_b = _config_svc(engine, _org(ORG_B))
+
+    svc_a.set_config("slack", {"signing_secret": "org-a-secret"})
+
+    assert svc_a.load_credentials("slack") == {"signing_secret": "org-a-secret"}
+    assert svc_b.load_credentials("slack") == {}
+
+
+def test_org_write_does_not_clobber_another_orgs_value(engine):
+    svc_a = _config_svc(engine, _org(ORG_A))
+    svc_b = _config_svc(engine, _org(ORG_B))
+
+    svc_a.set_config("slack", {"signing_secret": "org-a-secret"})
+    svc_b.set_config("slack", {"signing_secret": "org-b-secret"})
+
+    assert svc_a.load_credentials("slack") == {"signing_secret": "org-a-secret"}
+    assert svc_b.load_credentials("slack") == {"signing_secret": "org-b-secret"}
+
+
+def test_local_mode_credentials_are_global_rows(engine):
+    svc = _config_svc(engine, LOCAL_SCOPE)
+    svc.set_config("slack", {"signing_secret": "desktop-secret"})
+    assert svc.load_credentials("slack") == {"signing_secret": "desktop-secret"}
+
+
+def test_org_mode_without_org_fails_closed_on_write(engine):
+    svc = _config_svc(engine, TenantScope(org_mode=True))
+    with pytest.raises(MissingTenantScopeError):
+        svc.set_config("slack", {"signing_secret": "x"})
+
+
+def test_org_mode_without_org_fails_closed_on_read(engine):
+    svc = _config_svc(engine, TenantScope(org_mode=True))
+    with pytest.raises(MissingTenantScopeError):
+        svc.load_credentials("slack")
+
+
+def test_installation_row_is_scoped_to_its_org(engine):
+    svc_a = _config_svc(engine, _org(ORG_A))
+    svc_b = _config_svc(engine, _org(ORG_B))
+
+    svc_a.set_config("slack", {"signing_secret": "org-a-secret"})
+
+    assert [i.channel_type for i in svc_a.list_installations()] == ["slack"]
+    assert svc_b.list_installations() == []
+
+
+def test_set_external_account_id_stamps_the_installation(engine):
+    svc = _config_svc(engine, _org(ORG_A))
+    svc.set_config("slack", {"signing_secret": "org-a-secret"})
+
+    svc.set_external_account_id("slack", "T-A")
+
+    installations = svc.list_installations()
+    assert len(installations) == 1
+    assert installations[0].external_account_id == "T-A"
+
+
+def test_set_external_account_id_creates_installation_if_missing(engine):
+    svc = _config_svc(engine, _org(ORG_A))
+    svc.set_external_account_id("slack", "T-A")
+
+    installations = svc.list_installations()
+    assert len(installations) == 1
+    assert installations[0].external_account_id == "T-A"
+
+
+def test_set_external_account_id_fails_closed_without_org(engine):
+    svc = _config_svc(engine, TenantScope(org_mode=True))
+    with pytest.raises(MissingTenantScopeError):
+        svc.set_external_account_id("slack", "T-A")
+
+
+def test_set_external_account_id_rejects_taken_id_across_orgs(engine):
+    svc_a = _config_svc(engine, _org(ORG_A))
+    svc_b = _config_svc(engine, _org(ORG_B))
+    svc_a.set_external_account_id("slack", "T-A")
+
+    with pytest.raises(IntegrityError):
+        svc_b.set_external_account_id("slack", "T-A")
+
+
+# --- ChannelEventService: org-scoped inbound dedupe ---
+
+def test_dedupe_isolated_across_orgs(engine):
+    svc_a = ChannelEventService(_scoped(engine, _org(ORG_A)))
+    svc_b = ChannelEventService(_scoped(engine, _org(ORG_B)))
+
+    assert svc_a.record_inbound("slack", dedupe_key="evt-1") is not None
+    # Same channel_type + dedupe_key, different org: not a duplicate.
+    assert svc_b.is_duplicate_inbound("slack", "evt-1") is False
+    assert svc_b.record_inbound("slack", dedupe_key="evt-1") is not None
+
+
+def test_dedupe_still_works_within_the_same_org(engine):
+    svc_a = ChannelEventService(_scoped(engine, _org(ORG_A)))
+    assert svc_a.record_inbound("slack", dedupe_key="evt-1") is not None
+    assert svc_a.is_duplicate_inbound("slack", "evt-1") is True
+
+
+def test_local_mode_dedupe_is_unaffected(engine):
+    svc = ChannelEventService(_scoped(engine, LOCAL_SCOPE))
+    assert svc.record_inbound("slack", dedupe_key="evt-1") is not None
+    assert svc.is_duplicate_inbound("slack", "evt-1") is True
+
+
+# --- resolve_installation_by_external_account: the pre-scope webhook lookup ---
+
+def test_resolve_installation_finds_the_right_org(engine):
+    svc_a = _config_svc(engine, _org(ORG_A))
+    svc_b = _config_svc(engine, _org(ORG_B))
+    svc_a.set_external_account_id("slack", "T-A")
+    svc_b.set_external_account_id("slack", "T-B")
+
+    session = Session(engine)
+    install = resolve_installation_by_external_account(session, "slack", "T-B")
+    assert install is not None
+    assert install.org_id == ORG_B
+
+
+def test_resolve_installation_returns_none_for_unknown_account(engine):
+    session = Session(engine)
+    assert resolve_installation_by_external_account(session, "slack", "T-nope") is None
+
+
+def test_resolve_installation_needs_no_scope_at_all(engine):
+    # The whole point: this runs BEFORE any org context exists. A raw Session
+    # works; nothing here requires a ScopedSession or a TenantScope.
+    svc = _config_svc(engine, _org(ORG_A))
+    svc.set_external_account_id("slack", "T-A")
+
+    session = Session(engine)
+    install = resolve_installation_by_external_account(session, "slack", "T-A")
+    assert install is not None and install.org_id == ORG_A
+
+
+# --- LiveAdapterRegistry: cached per (channel_type, org_id) ---
+
+async def test_refresh_caches_independently_per_org(engine):
+    registry = LiveAdapterRegistry(_live_fake_registry())
+    _config_svc(engine, _org(ORG_A)).set_config("slack", {"signing_secret": "org-a-secret"})
+    _config_svc(engine, _org(ORG_B)).set_config("slack", {"signing_secret": "org-b-secret"})
+
+    assert await registry.refresh("slack", ORG_A, session=_scoped(engine, _org(ORG_A)))
+    assert await registry.refresh("slack", ORG_B, session=_scoped(engine, _org(ORG_B)))
+
+    a = registry.get("slack", ORG_A)
+    b = registry.get("slack", ORG_B)
+    assert a is not b
+    assert a.creds == {"signing_secret": "org-a-secret"}
+    assert b.creds == {"signing_secret": "org-b-secret"}
+
+
+async def test_local_mode_registry_is_unaffected(engine):
+    registry = LiveAdapterRegistry(_live_fake_registry())
+    _config_svc(engine, LOCAL_SCOPE).set_config("slack", {"signing_secret": "desktop-secret"})
+
+    assert await registry.refresh("slack", session=_scoped(engine, LOCAL_SCOPE))
+
+    adapter = registry.get("slack")
+    assert adapter is not None
+    assert adapter.creds == {"signing_secret": "desktop-secret"}
+    # An org lookup must never see the local/desktop adapter.
+    assert registry.get("slack", ORG_A) is None
+
+
+async def test_remove_only_drops_the_named_org(engine):
+    registry = LiveAdapterRegistry(_live_fake_registry())
+    _config_svc(engine, _org(ORG_A)).set_config("slack", {"signing_secret": "org-a-secret"})
+    _config_svc(engine, _org(ORG_B)).set_config("slack", {"signing_secret": "org-b-secret"})
+    await registry.refresh("slack", ORG_A, session=_scoped(engine, _org(ORG_A)))
+    await registry.refresh("slack", ORG_B, session=_scoped(engine, _org(ORG_B)))
+
+    await registry.remove("slack", ORG_A)
+
+    assert registry.get("slack", ORG_A) is None
+    assert registry.get("slack", ORG_B) is not None
+
+
+async def test_get_or_refresh_returns_cached_without_touching_session(engine):
+    registry = LiveAdapterRegistry(_live_fake_registry())
+    _config_svc(engine, _org(ORG_A)).set_config("slack", {"signing_secret": "org-a-secret"})
+    await registry.refresh("slack", ORG_A, session=_scoped(engine, _org(ORG_A)))
+    cached = registry.get("slack", ORG_A)
+
+    # session=None here would try get_open_session() if this weren't a cache hit.
+    adapter = await registry.get_or_refresh("slack", ORG_A, session=_scoped(engine, _org(ORG_A)))
+    assert adapter is cached
+
+
+async def test_get_or_refresh_builds_on_first_use(engine):
+    registry = LiveAdapterRegistry(_live_fake_registry())
+    _config_svc(engine, _org(ORG_A)).set_config("slack", {"signing_secret": "org-a-secret"})
+    assert registry.get("slack", ORG_A) is None
+
+    adapter = await registry.get_or_refresh("slack", ORG_A, session=_scoped(engine, _org(ORG_A)))
+
+    assert adapter is not None
+    assert adapter.creds == {"signing_secret": "org-a-secret"}
+    assert registry.get("slack", ORG_A) is adapter
+
+
+async def test_get_or_refresh_returns_none_for_unregistered_channel_type(engine):
+    # Real and fake plugin factories both build a bridge unconditionally —
+    # incomplete credentials surface later at verify_signature, not here.
+    registry = LiveAdapterRegistry(_live_fake_registry())
+    adapter = await registry.get_or_refresh("discord", ORG_B, session=_scoped(engine, _org(ORG_B)))
+    assert adapter is None
+
+
+# --- LiveAdapterRegistry.resolve_org_bridge: the real org_resolver server.py wires in ---
+
+async def test_resolve_org_bridge_finds_the_right_orgs_bridge(engine):
+    registry = LiveAdapterRegistry(_live_fake_registry())
+    _config_svc(engine, _org(ORG_A)).set_config("slack", {"signing_secret": "org-a-secret"})
+    _config_svc(engine, _org(ORG_A)).set_external_account_id("slack", "T-A")
+
+    resolved = await registry.resolve_org_bridge("slack", "T-A", session=Session(engine))
+
+    assert resolved is not None
+    bridge, org_id = resolved
+    assert org_id == ORG_A
+    assert bridge.creds == {"signing_secret": "org-a-secret"}
+    assert registry.get("slack", ORG_A) is bridge  # cached for next time
+
+
+async def test_resolve_org_bridge_returns_none_for_unknown_routing_key(engine):
+    registry = LiveAdapterRegistry(_live_fake_registry())
+    resolved = await registry.resolve_org_bridge("slack", "T-nope", session=Session(engine))
+    assert resolved is None
+
+
+async def test_resolve_org_bridge_resolves_the_local_installation_too(engine):
+    # A local/desktop install can have external_account_id set too — nothing
+    # about resolution is org-mode-specific, and it must not crash on org_id=None.
+    registry = LiveAdapterRegistry(_live_fake_registry())
+    _config_svc(engine, LOCAL_SCOPE).set_config("slack", {"signing_secret": "desktop-secret"})
+    _config_svc(engine, LOCAL_SCOPE).set_external_account_id("slack", "T-local")
+
+    resolved = await registry.resolve_org_bridge("slack", "T-local", session=Session(engine))
+
+    assert resolved is not None
+    bridge, org_id = resolved
+    assert org_id is None
+    assert bridge.creds == {"signing_secret": "desktop-secret"}
+    assert registry.get("slack") is bridge  # same cache slot as the local bootstrap
+
+
+# --- ChannelLifecycleService: setup/teardown act on the caller's own org slot ---
+
+def _lifecycle_registry() -> PluginRegistry:
+    from cowork.channels.lifecycle import ChannelLifecycle, LifecycleResult
+
+    async def _factory(creds):
+        return _FakeAdapter(creds)
+
+    async def _setup(ctx):
+        await ctx.refresh_adapter()
+        return LifecycleResult(active=True, detail="ok")
+
+    async def _teardown(ctx):
+        await ctx.remove_adapter()
+        return LifecycleResult(active=False, detail="ok")
+
+    registry = PluginRegistry()
+    registry.register(
+        ChannelPlugin(
+            channel_type="slack",
+            display_name="Slack",
+            factory=_factory,
+            credentials=CredentialSchema(
+                fields=(CredentialField(name="signing_secret", label="Signing secret"),)
+            ),
+            lifecycle=ChannelLifecycle(setup=_setup, teardown=_teardown),
+        )
+    )
+    return registry
+
+
+async def test_lifecycle_setup_and_teardown_hit_the_callers_own_org_slot(engine):
+    from cowork.services.channel_lifecycle import ChannelLifecycleService
+
+    plugins = _lifecycle_registry()
+    scoped = _scoped(engine, _org(ORG_A))
+    ChannelConfigService(scoped, registry=plugins).set_config("slack", {"signing_secret": "org-a-secret"})
+    adapters = LiveAdapterRegistry(plugins)
+    svc = ChannelLifecycleService(scoped, adapters, plugins)
+
+    await svc.setup("slack")
+    assert adapters.get("slack", ORG_A) is not None
+    assert adapters.get("slack") is None  # never the local slot
+
+    await svc.teardown("slack")
+    assert adapters.get("slack", ORG_A) is None

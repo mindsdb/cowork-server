@@ -4,9 +4,13 @@ Placed at `<artifacts_base>/.locks/<slug>.lock`, deliberately OUTSIDE the artifa
 folders: `services.artifacts._user_files` walks a folder recursively and only
 filters housekeeping names at the top level, so a lock file inside an artifact
 would count as user content — moving `content_mtime`, making an empty artifact
-look non-empty, and (under `static/`) riding along into a fullstack bundle. The
-`.locks` directory has no `metadata.json`, so the artifact enumerator never sees
-it either.
+look non-empty, and (under `static/`) riding along into a fullstack bundle.
+
+`services.artifacts.list_artifacts` skips it by name, because every entry it
+walks that starts with a dot is housekeeping rather than an artifact. Do not
+rely on the absent `metadata.json` to hide this directory: an enumerator that
+opens a folder before checking still finds it, which is what happened when the
+symlink hardening replaced the old `metadata.json` pre-check.
 
 The lock is released only after a SUCCESSFUL publish, or after a publish that
 failed synchronously. It is deliberately NOT released when a publish wait times

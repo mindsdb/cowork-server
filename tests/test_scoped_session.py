@@ -19,6 +19,7 @@ from cowork.db.scoped import (
     TenantMismatchError,
     TenantScope,
     get_tenant_scope,
+    service_principal_for,
     unsafe_unscoped_session,
 )
 from cowork.principal import Principal
@@ -412,3 +413,32 @@ def test_scope_without_principal_in_org_mode_has_no_org(_settings_env):
     scope = get_tenant_scope(_request())
     assert scope.org_mode is True
     assert scope.org_id is None
+
+
+# ── service_principal_for: identity for a background job from its own row ──
+
+def test_service_principal_is_none_in_local_mode(_settings_env):
+    _settings_env.delenv("COWORK_TENANCY_MODE", raising=False)
+    get_app_settings.cache_clear()
+    assert service_principal_for(ORG_A, "u-1") is None
+
+
+def test_service_principal_built_from_org_and_user_in_org_mode(_settings_env):
+    _settings_env.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    principal = service_principal_for(ORG_A, "u-1")
+    assert principal == Principal(user_id="u-1", org_id=ORG_A)
+
+
+def test_service_principal_fails_closed_without_org_id(_settings_env):
+    _settings_env.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    with pytest.raises(MissingTenantScopeError):
+        service_principal_for(None, "u-1")
+
+
+def test_service_principal_fails_closed_without_user_id(_settings_env):
+    _settings_env.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    with pytest.raises(MissingTenantScopeError):
+        service_principal_for(ORG_A, None)
