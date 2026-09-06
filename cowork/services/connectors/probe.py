@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from anton.core.datasources.data_vault import LocalDataVault
 from cowork.build_info import surface_kwarg
 from cowork.common.chat_session import build_chat_session
 from cowork.common.paths import cowork_home, pod_local_only
@@ -438,6 +439,11 @@ class CredentialProbe:
 
         config = ChatSessionConfig(
             llm_client=self.llm_client,
+            # An empty vault, so the manager derives an empty DS_* set and the
+            # runtime strips the inherited ones: the probe tests the candidate
+            # credentials it writes to its own env file, and must not be able
+            # to read a saved connection's.
+            data_vault=LocalDataVault(_probe_tmp_dir() / "empty-vault"),
             # WHICH agent ran: anton, same as a UI turn — the probe is anton
             # doing a job, not a different agent (ENG-1694's definition of
             # `harness` as agent identity). Without this the probe's traces

@@ -424,7 +424,7 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
     handler = _routing_handler(monkeypatch)
     monkeypatch.setattr(
         responses, "TurnQueueSettings",
-        lambda: SimpleNamespace(backend="remote", turn_key_ttl_seconds=1200),
+        lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200),
     )
     monkeypatch.setattr(
         responses, "get_user_settings",
@@ -457,7 +457,9 @@ async def test_router_binding_absent_outside_remote_backend(monkeypatch):
     import cowork.handlers.responses as responses
 
     handler = _routing_handler(monkeypatch)
-    monkeypatch.setattr(responses, "TurnQueueSettings", lambda: SimpleNamespace(backend="inprocess"))
+    monkeypatch.setattr(
+        responses, "TurnQueueSettings", lambda: SimpleNamespace(backend="inprocess", is_remote=False)
+    )
 
     assert await handler._router_binding() == (None, None)
 

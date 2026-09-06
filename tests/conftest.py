@@ -56,3 +56,22 @@ def db_schema():
             session.add(Project(id=GENERAL_PROJECT_ID, name=GENERAL_PROJECT, path=str(general_dir)))
             session.commit()
     yield
+
+
+@pytest.fixture(autouse=True)
+def close_coding_services():
+    yield
+    from coding_service_fakes import close_services
+
+    close_services()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def trust_test_client_host():
+    """Starlette's TestClient sends ``Host: testserver``; only tests trust it."""
+    from cowork.api.v1.endpoints import guards
+
+    production = guards._TRUSTED_LOOPBACK_HOSTS
+    guards._TRUSTED_LOOPBACK_HOSTS = production | {"testserver"}
+    yield
+    guards._TRUSTED_LOOPBACK_HOSTS = production

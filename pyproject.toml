@@ -22,10 +22,16 @@ dependencies = [
     # Capped <49: 49+ drops the macOS universal2 wheel, breaking Intel-Mac installs.
     "cryptography>=48.0.0,<49",
     "fastapi>=0.136.1",
-    "hermes-agent>=0.15.2,<0.18",
     "httpx>=0.27",
+    # Structured app-server integration with a pinned, bundled Codex runtime;
+    # users do not need to install a separate CLI.
+    "openai-codex==0.147.0",
     "pydantic>=2.12.5",
     "pydantic-settings>=2.14.1",
+    "python-dotenv>=1.2.2",
+    # Used to terminate the complete coding-agent subprocess tree on both
+    # macOS and Windows; killing only the app-server can orphan commands.
+    "psutil>=7.0",
     "psycopg[binary]>=3.2",
     # psycopg 3 is what the code targets, but the hosted DB URIs come from the
     # shared mindsdb DB stack, which mints every service's URI as bare
@@ -53,8 +59,11 @@ Issues = "https://github.com/mindsdb/cowork-server/issues"
 [project.scripts]
 cowork-server = "cowork.cli:main"
 cowork-dev-setup = "cowork.cli:dev_setup_main"
+cowork-code-runtime = "cowork.coding.runtime_worker:main"
 
 [project.optional-dependencies]
+# Optional: hermes-agent pins openai==2.24.0, anton needs openai>=3 (see override below).
+hermes = ["hermes-agent>=0.15.2,<0.18"]
 channels = [
     "slack-sdk>=3.27.0",
     "aiohttp>=3.9.0",
@@ -76,7 +85,8 @@ packages = ["cowork"]
 # hermes-agent pins Pillow==12.2.0 exactly (still true as of its latest
 # upstream commit), which blocks picking up Pillow security fixes. Override
 # it project-wide so the resolver isn't held back by that inner pin.
-override-dependencies = ["pillow>=12.3.0"]
+# hermes-agent also pins openai==2.24.0; anton needs openai>=3 and hermes runs on it.
+override-dependencies = ["pillow>=12.3.0", "openai>=3.0"]
 
 [tool.uv.sources]
 # cowork-server imports the artifact-identity derivation

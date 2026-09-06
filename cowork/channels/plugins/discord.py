@@ -17,6 +17,7 @@ from cowork.channels.plugin import (
     ChannelPlugin,
     CredentialField,
     CredentialSchema,
+    VerifyResult,
     WebhookRoute,
 )
 from cowork.channels.text import split_for_limit
@@ -63,6 +64,20 @@ def extract_media(data: dict) -> list[Attachment]:
         attachment.discord_url = raw.get("url")
         media.append(attachment)
     return media
+
+
+def extract_application_id(body: bytes, headers: Mapping[str, str]) -> str | None:
+    """Unverified lookup key for which org's public_key to verify against.
+    application_id (the bot itself), not guild_id — DM-context interactions
+    have no guild_id, but application_id is always present."""
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    app_id = data.get("application_id") if isinstance(data, dict) else None
+    return app_id if isinstance(app_id, str) and app_id else None
+
+
 _INTERACTION_PING = 1
 _INTERACTION_APPLICATION_COMMAND = 2
 
@@ -391,6 +406,32 @@ class DiscordBridge:
         return str((resp.json() or {}).get("id", ""))
 
 
+async def verify_discord_credentials(credentials: Mapping[str, str]) -> VerifyResult:
+    """Verify the bot token works and get its application_id for webhook routing."""
+    bot_token = (credentials.get("bot_token") or "").strip()
+    if not bot_token:
+        return VerifyResult(ok=False, detail="bot_token is not set")
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            # Get application info for the routing key (application_id), not the bot user.
+            resp = await client.get(
+                f"{DISCORD_API_BASE}/oauth2/applications/@me",
+                headers={"Authorization": f"Bot {bot_token}"},
+            )
+    except (httpx.TimeoutException, httpx.TransportError) as exc:
+        return VerifyResult(ok=False, detail=f"could not reach Discord: {exc}")
+    if resp.status_code == 200:
+        app_data = resp.json() or {}
+        app_id = app_data.get("id", "")
+        app_name = app_data.get("name", "")
+        return VerifyResult(
+            ok=True,
+            detail=f"Connected as {app_name}" if app_name else "Connected",
+            routing_key=app_id or None,
+        )
+    return VerifyResult(ok=False, detail=f"Discord rejected the token: HTTP {resp.status_code}")
+
+
 async def _factory(credentials: Mapping[str, str]) -> ChannelAdapter | None:
     # Only the bot token is required: it powers the Gateway (inbound) and the
     # REST API (outbound). public_key is needed solely for the interactions
@@ -420,5 +461,8 @@ plugin = ChannelPlugin(
         supports_oauth=False,
         supports_direct_credentials=True,
         supports_custom_ack=True,
+        supports_verify=True,
     ),
+    extract_routing_key=extract_application_id,
+    verify=verify_discord_credentials,
 )

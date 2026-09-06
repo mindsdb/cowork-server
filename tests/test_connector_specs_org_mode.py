@@ -45,3 +45,33 @@ async def test_org_mode_with_an_empty_catalogue_returns_no_connectors(monkeypatc
     result = await specs_endpoints.list_connector_specs(ORG_SCOPE, FakeRequest())
 
     assert result == []
+
+
+@pytest.mark.asyncio
+async def test_org_mode_include_unavailable_returns_all_flagged(monkeypatch):
+    """`include_unavailable` keeps the whole registry but marks what cloud
+    can't run, so the directory can list those under a desktop-only group
+    instead of hiding them."""
+
+    async def fake_proxy_catalogue(request, settings):
+        return {"items": [{"id": "google_drive"}, {"id": "gmail"}]}
+
+    monkeypatch.setattr(specs_endpoints.auth_proxy, "proxy_catalogue", fake_proxy_catalogue)
+
+    result = await specs_endpoints.list_connector_specs(
+        ORG_SCOPE, FakeRequest(), include_unavailable=True
+    )
+
+    assert len(result) > 100
+    by_id = {c.id: c for c in result}
+    assert by_id["gmail"].cloud_available is True
+    assert by_id["google_drive"].cloud_available is True
+    assert by_id["postgres"].cloud_available is False
+
+
+@pytest.mark.asyncio
+async def test_local_mode_reports_every_connector_available():
+    """Desktop runs the whole registry, so nothing is ever desktop-only there."""
+    result = await specs_endpoints.list_connector_specs(LOCAL_SCOPE, FakeRequest())
+
+    assert all(c.cloud_available for c in result)

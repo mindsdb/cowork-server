@@ -284,6 +284,23 @@ def _is_embedding_row(row: dict, model_id: str) -> bool:
     return any(hint in lowered for hint in _EMBEDDING_ID_HINTS)
 
 
+def cached_minds_models(minds_url: str, tenant_key: str | None = None) -> MindsModelListing | None:
+    """The last successful ``/v1/models`` listing for this gateway, however old.
+
+    A synchronous read for callers that cannot await the fetch (the coding
+    endpoints run in a threadpool) and need only what the gateway advertises per
+    model, which changes on the gateway's release cadence rather than the cache
+    TTL's. None until something has fetched the listing since the process
+    started, and None for a negatively cached failure.
+    """
+    if not minds_url:
+        return None
+    cached = _minds_models_cache.get((minds_chat_base_url(minds_url), tenant_key))
+    if not cached or not cached[1].ids:
+        return None
+    return cached[1]
+
+
 async def fetch_minds_models(
     minds_url: str, api_key: str, *, force_refresh: bool = False, tenant_key: str | None = None
 ) -> MindsModelListing:
