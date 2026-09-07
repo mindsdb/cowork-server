@@ -12,6 +12,7 @@ co-member. This route can.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -19,6 +20,7 @@ from fastapi import HTTPException
 
 from cowork.api.v1.endpoints import artifact_workspace as aw
 from cowork.db.scoped import TenantScope
+from cowork.services import artifact_locks
 
 ORG_SCOPE = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
 ARTIFACT_ID = "11111111-1111-1111-1111-111111111111"
@@ -113,6 +115,28 @@ async def test_sharing_publicly_is_passed_through_verbatim(
     )
 
     assert publish_calls[0]["access"] == {"mode": "public"}
+
+
+async def test_audience_change_waits_for_an_inflight_live_sync(
+    as_owner, publish_calls, publish_context,
+):
+    assert artifact_locks.acquire(as_owner.parent, as_owner.name, ttl_s=60) is True
+    task = asyncio.create_task(
+        aw.set_artifact_access(
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "restricted"}), _Session(),
+        )
+    )
+
+    try:
+        await asyncio.sleep(0.05)
+        assert publish_calls == []
+    finally:
+        artifact_locks.release(as_owner.parent, as_owner.name)
+
+    await task
+    assert publish_calls[0]["access"] == {"mode": "restricted"}
+    assert artifact_locks.acquire(as_owner.parent, as_owner.name, ttl_s=60) is True
+    artifact_locks.release(as_owner.parent, as_owner.name)
 
 
 async def test_a_non_owner_cannot_change_access(monkeypatch, publish_calls, publish_context):
