@@ -362,21 +362,12 @@ async def _sync_live_artifact(session, folder: Path) -> bool | None:
         publish_artifact,
         published_artifact_access,
     )
-    from cowork.services.artifact_locks import acquire, release
+    from cowork.services.artifact_locks import release
 
     artifacts_base = folder.parent
-    loop = asyncio.get_running_loop()
-    lock_deadline = loop.time() + _LIVE_PUBLISH_TIMEOUT_S
-    while not await run_in_threadpool(
-        acquire,
-        artifacts_base,
-        folder.name,
-        ttl_s=_LIVE_PUBLISH_LOCK_TTL_S,
-    ):
-        if loop.time() >= lock_deadline:
-            logger.warning("Could not synchronize live artifact %s: publish lock busy", folder)
-            return False
-        await asyncio.sleep(0.1)
+    if not await _acquire_live_publish_lock(folder):
+        logger.warning("Could not synchronize live artifact %s: publish lock busy", folder)
+        return False
 
     key = None
     publish_abandoned = False
@@ -436,6 +427,23 @@ async def _sync_live_artifact(session, folder: Path) -> bool | None:
             await run_in_threadpool(release, folder.parent, folder.name)
         if key is not None and not publish_abandoned:
             await key.revoke()
+
+
+async def _acquire_live_publish_lock(folder: Path) -> bool:
+    from cowork.services.artifact_locks import acquire
+
+    loop = asyncio.get_running_loop()
+    lock_deadline = loop.time() + _LIVE_PUBLISH_TIMEOUT_S
+    while not await run_in_threadpool(
+        acquire,
+        folder.parent,
+        folder.name,
+        ttl_s=_LIVE_PUBLISH_LOCK_TTL_S,
+    ):
+        if loop.time() >= lock_deadline:
+            return False
+        await asyncio.sleep(0.1)
+    return True
 
 
 @router.get("/workspace/{project_ref}/{artifact_id}")
@@ -634,27 +642,54 @@ async def set_artifact_access(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="This artifact has no publishable file.",
         )
-    artifacts_base, publish_url, key = _owner_publish_context(session, folder)
-    api_key = await key.get()
-    if not api_key:
+    if not await _acquire_live_publish_lock(folder):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Publishing is unavailable right now. Try again in a moment.",
+            detail="Publishing is busy right now. Try again in a moment.",
         )
+    from cowork.services.artifact_locks import release
+
+    key = None
+    publish_abandoned = False
+    publish_started = False
     try:
-        return await run_in_threadpool(
-            _publish_bundle,
-            folder,
-            artifacts_base=artifacts_base,
-            api_key=api_key,
-            publish_url=publish_url,
-            access=dict(body.access or {}),
-            scope=session.scope,
-        )
+        artifacts_base, publish_url, key = _owner_publish_context(session, folder)
+        api_key = await key.get()
+        if not api_key:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Publishing is unavailable right now. Try again in a moment.",
+            )
+        publish_started = True
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    _publish_bundle,
+                    folder,
+                    artifacts_base=artifacts_base,
+                    api_key=api_key,
+                    publish_url=publish_url,
+                    access=dict(body.access or {}),
+                    scope=session.scope,
+                ),
+                timeout=_LIVE_PUBLISH_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError as exc:
+            publish_abandoned = True
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Publishing timed out. Try again in a moment.",
+            ) from exc
+    except asyncio.CancelledError:
+        publish_abandoned = publish_started
+        raise
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    finally:
+        if not publish_abandoned:
+            await run_in_threadpool(release, folder.parent, folder.name)
 
 
 @router.post("/workspace/{project_ref}/{artifact_id}/comments-access")
