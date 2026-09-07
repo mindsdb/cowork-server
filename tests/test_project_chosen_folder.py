@@ -163,71 +163,174 @@ def test_a_taken_name_is_refused_against_an_allocated_project(engine, tmp_path):
         _svc(engine).create_project("notes", path=_folder(tmp_path, "b"))
 
 
-def test_two_concurrent_adoptions_cannot_commit_the_same_name(projects_root, tmp_path):
-    """The refusal above is a read, and nothing downstream re-checks it.
+@pytest.fixture()
+def race_engine(projects_root, tmp_path):
+    """A file-backed engine, so two sessions get two real connections.
 
-    Needs a real pair of connections, so this engine is file-backed rather
-    than the shared in-memory one: on `StaticPool` both sessions ride one
-    connection and would see each other's uncommitted rows.
-
-    The first thread parks inside the locked region, still holding it, and the
-    second must not get past its own name check while that is true. Unlocked,
-    the second sails through and both commit `notes` -- SQLite serialises the
-    two writes but never re-evaluates either read.
+    On the shared in-memory `StaticPool` engine both ride one connection and
+    would see each other's uncommitted rows, which is the opposite of the
+    isolation these tests need.
     """
     engine = create_engine(f"sqlite:///{tmp_path / 'race.db'}")
     SQLModel.metadata.create_all(engine)
+    return engine
 
-    first = _svc(engine)
-    second = _svc(engine)
+
+def _park_inside_the_lock(svc) -> tuple[threading.Event, threading.Event]:
+    """Stall `svc` mid-create, after its name check and before its commit.
+
+    `_unique_display_name` is the next call after the name is settled and is
+    inside the locked region, so patching it holds the name without touching
+    the code under test.
+    """
     parked = threading.Event()
     release = threading.Event()
-    second_returned = threading.Event()
-    real_display = first._unique_display_name
+    real_display = svc._unique_display_name
 
-    def park_inside_the_locked_region(*args, **kwargs):
+    def park(*args, **kwargs):
         parked.set()
         assert release.wait(timeout=10)
         return real_display(*args, **kwargs)
 
-    first._unique_display_name = park_inside_the_locked_region
-    outcomes: dict[str, BaseException | None] = {}
+    svc._unique_display_name = park
+    return parked, release
 
-    def adopt(svc, key, folder):
+
+def _run(target) -> tuple[threading.Thread, threading.Event]:
+    returned = threading.Event()
+
+    def body():
         try:
-            svc.create_project("notes", path=folder)
-            outcomes[key] = None
-        except BaseException as exc:  # noqa: BLE001 - recorded, re-raised below
-            outcomes[key] = exc
+            target()
+        finally:
+            returned.set()
 
-    winner = threading.Thread(
-        target=adopt, args=(first, "first", _folder(tmp_path, "a"))
-    )
-    winner.start()
-    assert parked.wait(timeout=10), "the first adoption never reached the row build"
+    thread = threading.Thread(target=body)
+    thread.start()
+    return thread, returned
 
-    def attempt_and_report():
-        adopt(second, "second", _folder(tmp_path, "b"))
-        second_returned.set()
 
-    loser = threading.Thread(target=attempt_and_report)
-    loser.start()
-    # The first thread is still parked, so a serialised second attempt cannot
-    # have returned. Unlocked it returns in milliseconds, having committed.
-    finished_early = second_returned.wait(timeout=2)
+def _rows_named(engine, name: str) -> list[Project]:
+    with Session(engine) as check:
+        return list(check.exec(sa.select(Project).where(Project.name == name)).all())
+
+
+# The lock covers the name namespace, not the adoption path, so each of these
+# is a different pair racing for one name. Unserialised, all three commit two
+# rows called `notes` -- and `name` is the lookup key, with
+# `get_project_by_name` a `.first()` on an unordered select, so one of the two
+# projects becomes unreachable and its files resolve to the other's directory.
+# SQLite serialises the writes but never re-evaluates the reads.
+
+
+def test_two_concurrent_adoptions_cannot_commit_the_same_name(race_engine, tmp_path):
+    first = _svc(race_engine)
+    second = _svc(race_engine)
+    parked, release = _park_inside_the_lock(first)
+    outcome: dict[str, ValueError | None] = {}
+
+    winner, _ = _run(lambda: first.create_project("notes", path=_folder(tmp_path, "a")))
+    assert parked.wait(timeout=10), "the first adoption never settled its name"
+
+    def adopt_second():
+        try:
+            second.create_project("notes", path=_folder(tmp_path, "b"))
+            outcome["second"] = None
+        except ValueError as exc:
+            outcome["second"] = exc
+
+    loser, returned = _run(adopt_second)
+    # The first thread still holds the name, so a serialised second attempt
+    # cannot have returned. Unguarded it returns in milliseconds, committed.
+    finished_while_held = returned.wait(timeout=1)
     release.set()
     winner.join(timeout=10)
     loser.join(timeout=10)
-    assert not winner.is_alive() and not loser.is_alive()
-    assert not finished_early, "the second adoption ran while the first held the name"
+    assert not finished_while_held, "the second adoption ran while the first held the name"
+    # Adoption refuses a taken name rather than bumping it: it creates nothing,
+    # so `<root>/notes-2` would not describe the folder it points at.
+    assert isinstance(outcome["second"], ValueError)
+    assert "already exists" in str(outcome["second"])
+    assert len(_rows_named(race_engine, "notes")) == 1
 
-    assert outcomes["first"] is None, outcomes["first"]
-    assert isinstance(outcomes["second"], ValueError), outcomes["second"]
-    assert "already exists" in str(outcomes["second"])
 
-    with Session(engine) as check:
-        named = check.exec(sa.select(Project).where(Project.name == "notes")).all()
-    assert len(named) == 1
+def test_an_allocated_create_cannot_take_the_name_an_adoption_holds(
+    race_engine, projects_root, tmp_path
+):
+    """The pair the argument-keyed guard missed.
+
+    `mkdir` settles one allocated create against another, and nothing at all
+    against an adoption: a chosen folder is refused inside the projects root,
+    so `<root>/notes` is still free while the adoption holds the name.
+    """
+    adopting = _svc(race_engine)
+    allocating = _svc(race_engine)
+    parked, release = _park_inside_the_lock(adopting)
+    outcome: dict[str, Project] = {}
+
+    winner, _ = _run(
+        lambda: adopting.create_project("notes", path=_folder(tmp_path, "chosen"))
+    )
+    assert parked.wait(timeout=10), "the adoption never settled its name"
+
+    loser, returned = _run(
+        lambda: outcome.__setitem__("allocated", allocating.create_project("notes"))
+    )
+    finished_while_held = returned.wait(timeout=1)
+    release.set()
+    winner.join(timeout=10)
+    loser.join(timeout=10)
+    assert not finished_while_held, "the allocated create ran while the adoption held the name"
+    # Bumped, not refused: an allocated create owns its directory, so taking
+    # the next free name is a real outcome rather than a lost folder.
+    assert outcome["allocated"].name == "notes-2"
+    assert len(_rows_named(race_engine, "notes")) == 1
+
+
+def test_a_rename_cannot_take_the_name_an_adoption_holds(race_engine, tmp_path):
+    """A local rename resolves a name through the same unguarded read."""
+    adopting = _svc(race_engine)
+    renaming = _svc(race_engine)
+    existing = renaming.create_project("scratch")
+    parked, release = _park_inside_the_lock(adopting)
+    outcome: dict[str, Project] = {}
+
+    winner, _ = _run(
+        lambda: adopting.create_project("notes", path=_folder(tmp_path, "chosen"))
+    )
+    assert parked.wait(timeout=10), "the adoption never settled its name"
+
+    loser, returned = _run(
+        lambda: outcome.__setitem__(
+            "renamed", renaming.update_project(existing.id, name="notes")
+        )
+    )
+    finished_while_held = returned.wait(timeout=1)
+    release.set()
+    winner.join(timeout=10)
+    loser.join(timeout=10)
+    assert not finished_while_held, "the rename ran while the adoption held the name"
+    assert outcome["renamed"].name == "notes-2"
+    assert len(_rows_named(race_engine, "notes")) == 1
+
+
+def test_an_is_active_toggle_does_not_queue_behind_a_create(race_engine, tmp_path):
+    """No name is allocated, so nothing should serialise."""
+    adopting = _svc(race_engine)
+    toggling = _svc(race_engine)
+    existing = toggling.create_project("scratch")
+    parked, release = _park_inside_the_lock(adopting)
+
+    winner, _ = _run(
+        lambda: adopting.create_project("notes", path=_folder(tmp_path, "chosen"))
+    )
+    assert parked.wait(timeout=10), "the adoption never settled its name"
+
+    loser, returned = _run(lambda: toggling.update_project(existing.id, is_active=True))
+    assert returned.wait(timeout=10), "the toggle blocked on the name lock"
+    release.set()
+    winner.join(timeout=10)
+    loser.join(timeout=10)
 
 
 def test_the_name_is_what_the_user_typed_not_the_folder(engine, tmp_path):

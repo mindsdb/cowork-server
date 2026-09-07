@@ -35,10 +35,15 @@ logger = logging.getLogger(__name__)
 GENERAL_PROJECT = "general"
 GENERAL_PROJECT_ID = UUID("00000000-0000-0000-0000-000000000001")
 
-# Adoption has no arbiter of its own: the allocated path is settled by
-# `mkdir`, adoption creates nothing, and `projects.name` carries no unique
-# index. Held across the name check and the insert in `create_project`.
-_ADOPT_NAME_LOCK = threading.Lock()
+# The local deployment's project-name namespace, mirroring the distributed
+# lock an org create takes on `SKILL_PROJECT_REFERENCES`. `projects.name` has
+# no unique index, so every name allocation is a read with nothing behind it,
+# and `mkdir` only arbitrates one allocated create against another.
+#
+# Process-local is enough only because it is taken exactly where the
+# distributed lock is not: on the single-process desktop sidecar. Do not reuse
+# it on a cloud path, where replicas would each hold their own.
+_LOCAL_NAME_LOCK = threading.Lock()
 
 _NAME_DISALLOWED = re.compile(r"[^A-Za-z0-9._-]+")
 _NAME_HYPHEN_RUNS = re.compile(r"-{2,}")
@@ -449,6 +454,21 @@ class ProjectService:
                 return candidate
             i += 1
 
+    def _name_namespace_lock(self):
+        """Serialise a name allocation against every other one in this process.
+
+        Skipped in org mode, where the create and rename endpoints already hold
+        `coordination_lock(SKILL_PROJECT_REFERENCES, "all")` across replicas.
+        Keyed on the scope rather than on whether a folder was chosen: the
+        colliding pair need not both be adoptions. An adoption holding `notes`
+        before its commit does not stop an allocated create taking the same
+        name, because adoption is refused inside the projects root and so
+        creates nothing for `mkdir` to trip over.
+        """
+        if self.session.scope.org_mode:
+            return nullcontext()
+        return _LOCAL_NAME_LOCK
+
     def _sanitize_name(self, name: str) -> str:
         raw = (name or "").strip()
         cleaned = _NAME_DISALLOWED.sub("-", raw)
@@ -594,10 +614,10 @@ class ProjectService:
         # cosmetic problem: it is the lookup key, and `get_project_by_name` is
         # a `.first()` on an unordered select.
         #
-        # Serialised by `_ADOPT_NAME_LOCK`, which `create_project` holds from
-        # here through the insert. SQLite serialises the writes but never
-        # re-evaluates this read, so without the lock a concurrent pair both
-        # see the name free and both commit it.
+        # Serialised by `_name_namespace_lock`, held from here through the
+        # insert. SQLite serialises the writes but never re-evaluates this
+        # read, so unguarded a concurrent pair both see the name free and both
+        # commit it.
         if self._unique_name(base) != base:
             raise ValueError(
                 f"A project called {base!r} already exists. Rename it, or "
@@ -618,10 +638,7 @@ class ProjectService:
         # which is looked up by name.
         if sanitized == GENERAL_PROJECT:
             sanitized = f"{GENERAL_PROJECT}-2"
-        # Only adoption needs the lock. The allocated branch is arbitrated by
-        # `mkdir` and must not serialise behind an unrelated create.
-        name_guard = _ADOPT_NAME_LOCK if path is not None else nullcontext()
-        with name_guard:
+        with self._name_namespace_lock():
             if path is not None:
                 final_name, project_dir = self._adopt_project_dir(sanitized, path)
             else:
@@ -914,16 +931,21 @@ class ProjectService:
         project = self.session.get(Project, project_id)
         if project is None:
             raise ProjectNotFoundError("Project not found")
-        resolved_name = (
-            self.resolve_update_name(project, name) if name is not None else None
-        )
-        updated, stage = self.stage_project_update(
-            project_id,
-            resolved_name=resolved_name,
-            is_active=is_active,
-            display_label=name,
-        )
-        return self.commit_staged_project_update(updated, stage)
+        # A rename allocates a name the same way a create does, so it takes the
+        # same lock. Only when one is being resolved: an is_active toggle
+        # touches no name and should not queue behind an unrelated create.
+        guard = self._name_namespace_lock() if name is not None else nullcontext()
+        with guard:
+            resolved_name = (
+                self.resolve_update_name(project, name) if name is not None else None
+            )
+            updated, stage = self.stage_project_update(
+                project_id,
+                resolved_name=resolved_name,
+                is_active=is_active,
+                display_label=name,
+            )
+            return self.commit_staged_project_update(updated, stage)
 
     def delete_project(
         self,
