@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import random
+import socket
 import subprocess
 from pathlib import Path
 
@@ -9,6 +11,7 @@ import pytest
 from cowork.coding import workspace as workspace_module
 from cowork.coding.contracts import WorkspaceKind
 from cowork.coding.workspace import GitIdentityMissingError, GitRunner, GitUnavailableError, WorkspaceError, WorkspaceManager
+from cowork.coding.workspace_key import managed_key
 from cowork.common.settings.app_settings import get_app_settings
 
 
@@ -34,6 +37,18 @@ def repository(tmp_path: Path) -> Path:
 
 def missing_git(*_args, **_kwargs):
     raise FileNotFoundError(2, "not found", "git")
+
+
+def bind_socket(path: Path) -> None:
+    """AF_UNIX caps sun_path at 104 bytes on macOS and a pytest tmp_path already
+    exceeds it, so bind a relative name and restore the directory immediately."""
+    origin = Path.cwd()
+    os.chdir(path.parent)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(path.name)
+    finally:
+        os.chdir(origin)
 
 
 def test_prepare_uses_detached_worktree_and_preserves_dirty_source(tmp_path: Path) -> None:
@@ -442,6 +457,58 @@ def test_a_local_copy_is_reviewable_and_applies_back_without_git(
     assert sorted(applied) == ["added.txt", "notes.txt"]
     assert (source / "notes.txt").read_text(encoding="utf-8") == "v2\n"
     assert (source / "added.txt").read_text(encoding="utf-8") == "new\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="sockets and FIFOs are POSIX")
+def test_a_local_copy_skips_entries_a_copy_cannot_reproduce(tmp_path: Path) -> None:
+    source = tmp_path / "plain"
+    data = source / "data"
+    data.mkdir(parents=True)
+    (data / "real.txt").write_text("content\n", encoding="utf-8")
+    bind_socket(data / "cli.sock")
+    os.mkfifo(data / "pipe.fifo")
+    manager = WorkspaceManager(tmp_path / "coding")
+
+    prepared = manager.prepare("socket-1", str(source), allow_direct_folder=True)
+    workspace = prepared.workspace_path
+    baseline = manager.local_copies.baselines_root / managed_key("socket-1")
+
+    assert prepared.kind == WorkspaceKind.local_copy
+    assert (workspace / "data" / "real.txt").read_text(encoding="utf-8") == "content\n"
+    for root in (workspace, baseline):
+        assert not (root / "data" / "cli.sock").exists()
+        assert not (root / "data" / "pipe.fifo").exists()
+    assert manager.diff(str(workspace), base_revision=None) == []
+
+    # preflight only reads the source for paths that already differ, so change
+    # one to prove the skipped entries raise neither a phantom path nor a
+    # phantom conflict on a real handoff.
+    (workspace / "data" / "real.txt").write_text("from task\n", encoding="utf-8")
+    assert manager.local_copies.preflight(source, workspace) == ["data/real.txt"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="sockets and FIFOs are POSIX")
+def test_fork_and_cleanup_survive_a_socket_made_inside_the_task(tmp_path: Path) -> None:
+    source = tmp_path / "plain"
+    source.mkdir()
+    (source / "notes.txt").write_text("v1\n", encoding="utf-8")
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare("socket-2", str(source), allow_direct_folder=True)
+    workspace = prepared.workspace_path
+    # A task that runs a dev server leaves a socket in its own workspace.
+    (workspace / "notes.txt").write_text("v2\n", encoding="utf-8")
+    bind_socket(workspace / "dev.sock")
+
+    forked = manager.fork("socket-3", str(source), str(workspace), WorkspaceKind.local_copy, None)
+
+    assert forked.kind == WorkspaceKind.local_copy
+    assert (forked.workspace_path / "notes.txt").read_text(encoding="utf-8") == "v2\n"
+    assert not (forked.workspace_path / "dev.sock").exists()
+
+    # A non-empty diff is what makes cleanup take its recovery-snapshot copy.
+    manager.cleanup("socket-2", str(source), str(workspace), WorkspaceKind.local_copy, None)
+
+    assert not workspace.exists()
 
 
 def isolate_git_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:

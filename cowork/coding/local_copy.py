@@ -46,8 +46,8 @@ class LocalCopyManager:
         workspace.parent.mkdir(parents=True, exist_ok=True)
         baseline.parent.mkdir(parents=True, exist_ok=True)
         try:
-            shutil.copytree(source, baseline, symlinks=True)
-            shutil.copytree(source, workspace, symlinks=True)
+            shutil.copytree(source, baseline, symlinks=True, ignore=self._skip_unsupported)
+            shutil.copytree(source, workspace, symlinks=True, ignore=self._skip_unsupported)
         except Exception:
             shutil.rmtree(workspace, ignore_errors=True)
             shutil.rmtree(baseline, ignore_errors=True)
@@ -67,8 +67,8 @@ class LocalCopyManager:
         # inherited changes disappear from review and handoff.
         parent_baseline = self._baseline_for(current_workspace)
         try:
-            shutil.copytree(current_workspace, workspace, symlinks=True)
-            shutil.copytree(parent_baseline, baseline, symlinks=True)
+            shutil.copytree(current_workspace, workspace, symlinks=True, ignore=self._skip_unsupported)
+            shutil.copytree(parent_baseline, baseline, symlinks=True, ignore=self._skip_unsupported)
         except Exception:
             shutil.rmtree(workspace, ignore_errors=True)
             shutil.rmtree(baseline, ignore_errors=True)
@@ -170,7 +170,7 @@ class LocalCopyManager:
             recovery.parent.mkdir(parents=True, exist_ok=True)
             if recovery.exists():
                 shutil.rmtree(recovery)
-            shutil.copytree(workspace, recovery, symlinks=True)
+            shutil.copytree(workspace, recovery, symlinks=True, ignore=self._skip_unsupported)
         shutil.rmtree(workspace, ignore_errors=True)
         shutil.rmtree(baseline, ignore_errors=True)
 
@@ -197,6 +197,22 @@ class LocalCopyManager:
             return path.relative_to(root.resolve())
         except ValueError:
             return None
+
+    @staticmethod
+    def _skip_unsupported(directory: str, names: list[str]) -> set[str]:
+        # Sockets, FIFOs and device nodes cannot be reproduced by a copy, and
+        # _manifest already ignores them, so nothing skipped here is reviewable.
+        unsupported: set[str] = set()
+        for name in names:
+            try:
+                mode = os.lstat(os.path.join(directory, name)).st_mode
+            except OSError:
+                # Leave it to copytree, which collects per-entry failures
+                # instead of aborting the whole tree the way a raise here would.
+                continue
+            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode)):
+                unsupported.add(name)
+        return unsupported
 
     @staticmethod
     def _manifest(root: Path) -> dict[str, str]:
