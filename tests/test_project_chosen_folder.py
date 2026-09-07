@@ -453,6 +453,26 @@ def test_a_missing_folder_is_a_client_error_not_a_crash(projects_root, tmp_path)
     assert res.status_code == 400, res.text
 
 
+def test_a_busy_name_lock_is_a_503_not_a_crash(projects_root, tmp_path, monkeypatch):
+    """Sibling of the test above, same failure shape.
+
+    `ProjectNameLockBusyError` is deliberately not a `ValueError`, so the
+    endpoint's 400 mapping does not catch it and it needs its own. Without one
+    a bounded acquire reaches the client as a 500, which reads as a bug in the
+    request rather than as "retry".
+    """
+    monkeypatch.setattr(projects_module, "_NAME_LOCK_TIMEOUT_SECONDS", 0.05)
+    assert projects_module._LOCAL_NAME_LOCK.acquire(timeout=5)
+    try:
+        res = _loopback_client().post(
+            "/api/v1/projects/",
+            json={"name": "notes", "path": str(_folder(tmp_path, "chosen"))},
+        )
+    finally:
+        projects_module._LOCAL_NAME_LOCK.release()
+    assert res.status_code == 503, res.text
+
+
 def test_a_folder_can_be_chosen_from_loopback(projects_root, tmp_path):
     # The app database is shared across the HTTP tests in this suite, and an
     # adopted folder now refuses a name that is already taken.

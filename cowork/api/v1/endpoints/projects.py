@@ -19,6 +19,7 @@ from cowork.schemas.shared_resources import ProjectCapabilities
 from cowork.api.v1.endpoints.guards import require_local
 from cowork.services.projects import (
     GENERAL_PROJECT,
+    ProjectNameLockBusyError,
     ProjectNotFoundError,
     ProjectPathNotAllowedError,
     ProjectService,
@@ -352,6 +353,10 @@ def create_project(
                     if claim is not None and claim_token is not None:
                         access.release_claim(claim, claim_token=claim_token)
                 raise
+    except ProjectNameLockBusyError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)
+        )
     except ProjectPathNotAllowedError as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except ProjectNotFoundError as e:
@@ -580,6 +585,10 @@ def update_project(
                             # The service logs individual restore failures.
                             pass
                         raise
+    except ProjectNameLockBusyError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)
+        )
     except ProjectNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
