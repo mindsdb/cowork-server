@@ -507,21 +507,30 @@ def test_fork_and_cleanup_survive_a_socket_made_inside_the_task(tmp_path: Path) 
     assert not (forked.workspace_path / "dev.sock").exists()
 
     # A non-empty diff is what makes cleanup take its recovery-snapshot copy.
+    recovery = manager.local_copies.recovery_root / managed_key("socket-2") / "local-copy"
     manager.cleanup("socket-2", str(source), str(workspace), WorkspaceKind.local_copy, None)
 
     assert not workspace.exists()
+    assert (recovery / "notes.txt").read_text(encoding="utf-8") == "v2\n"
+    assert not (recovery / "dev.sock").exists()
 
 
+@pytest.mark.parametrize("failure", ["collected", "immediate"])
 def test_a_local_copy_that_fails_reports_the_path_it_failed_on(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    failure: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     source = tmp_path / "plain"
     source.mkdir()
     (source / "notes.txt").write_text("v1\n", encoding="utf-8")
     manager = WorkspaceManager(tmp_path / "coding")
+    target = str(source / "notes.txt")
 
     def failing_copytree(*_args, **_kwargs):
-        raise shutil.Error([(str(source / "notes.txt"), "destination", "[Errno 28] No space left on device")])
+        # Built here rather than in the parametrize list, which is evaluated at
+        # collection time and would share one exception across the whole run.
+        if failure == "collected":
+            raise shutil.Error([(target, "destination", "[Errno 28] No space left on device")])
+        raise FileNotFoundError(2, "No such file or directory", target)
 
     monkeypatch.setattr(shutil, "copytree", failing_copytree)
 

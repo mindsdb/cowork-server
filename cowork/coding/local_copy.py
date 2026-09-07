@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import logging
 import os
 import shutil
 import stat
@@ -10,6 +11,8 @@ from pathlib import Path
 
 from cowork.coding.contracts import DiffFile
 from cowork.coding.workspace_key import managed_key
+
+logger = logging.getLogger(__name__)
 
 MAX_LOCAL_DIFF_FILES = 250
 MAX_LOCAL_TEXT_BYTES = 2 * 1024 * 1024
@@ -51,10 +54,8 @@ class LocalCopyManager:
         except Exception as exc:
             shutil.rmtree(workspace, ignore_errors=True)
             shutil.rmtree(baseline, ignore_errors=True)
-            # shutil.Error is an OSError, so without this it reaches the API as
-            # an unclassified 500 rather than a message naming the failing path.
-            if isinstance(exc, shutil.Error):
-                raise LocalCopyError(f"The task folder could not be copied: {exc}") from exc
+            if isinstance(exc, OSError):
+                raise self._copy_failure("The task folder could not be copied", exc) from exc
             raise
         return PreparedLocalCopy(source=source, workspace=workspace, baseline=baseline)
 
@@ -76,10 +77,8 @@ class LocalCopyManager:
         except Exception as exc:
             shutil.rmtree(workspace, ignore_errors=True)
             shutil.rmtree(baseline, ignore_errors=True)
-            # shutil.Error is an OSError, so without this it reaches the API as
-            # an unclassified 500 rather than a message naming the failing path.
-            if isinstance(exc, shutil.Error):
-                raise LocalCopyError(f"The task folder could not be copied: {exc}") from exc
+            if isinstance(exc, OSError):
+                raise self._copy_failure("The existing task copy could not be duplicated", exc) from exc
             raise
         return PreparedLocalCopy(source=source, workspace=workspace, baseline=baseline)
 
@@ -180,8 +179,8 @@ class LocalCopyManager:
                 shutil.rmtree(recovery)
             try:
                 shutil.copytree(workspace, recovery, symlinks=True, ignore=self._skip_unsupported)
-            except shutil.Error as exc:
-                raise LocalCopyError(f"The task copy could not be saved for recovery: {exc}") from exc
+            except OSError as exc:
+                raise self._copy_failure("The task copy could not be saved for recovery", exc) from exc
         shutil.rmtree(workspace, ignore_errors=True)
         shutil.rmtree(baseline, ignore_errors=True)
 
@@ -208,6 +207,15 @@ class LocalCopyManager:
             return path.relative_to(root.resolve())
         except ValueError:
             return None
+
+    @staticmethod
+    def _copy_failure(subject: str, exc: OSError) -> LocalCopyError:
+        # The endpoint boundary does not log a RuntimeError, so this warning is
+        # the only operator-visible record. A full disk makes shutil.Error carry
+        # one tuple per remaining entry, so keep the first few.
+        detail = exc.args[0][:5] if isinstance(exc, shutil.Error) and exc.args else exc
+        logger.warning("%s: %s", subject, detail)
+        return LocalCopyError(f"{subject}: {detail}")
 
     @staticmethod
     def _skip_unsupported(directory: str, names: list[str]) -> set[str]:
