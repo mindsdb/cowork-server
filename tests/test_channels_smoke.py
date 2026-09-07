@@ -1127,56 +1127,46 @@ def test_should_respond_matrix():
     assert asyncio.run(should(binding("regex", "("), event("hello"))) is False
 
 
-def test_should_respond_regex_catastrophic_backtracking_is_bounded(monkeypatch):
+def test_should_respond_regex_catastrophic_backtracking_is_bounded():
     # A syntactically-valid-but-pathological trigger_pattern (ChannelBindingService
-    # only checks it parses, not that it's cheap to run) must not hang — bounded
-    # by TRIGGER_REGEX_TIMEOUT_S, not by luck. Shrunk here so the test is fast.
-    monkeypatch.setattr(runtime_mod, "TRIGGER_REGEX_TIMEOUT_S", 0.2)
-
+    # only checks it parses, not that it's cheap to run) must not hang. Under a
+    # backtracking engine (stdlib `re`) this input takes exponential time; re2's
+    # linear-time automaton has no such failure mode, so no timeout is needed —
+    # this just proves the match still completes fast and correctly.
     def event(text):
         return SimpleNamespace(message=SimpleNamespace(content=text, is_mention=False))
 
     def binding(pattern):
         return SimpleNamespace(trigger_rule="regex", trigger_pattern=pattern)
 
-    # (a+)+$ resolves in ~0.3ms under the locked `regex` version's optimizer and
-    # would pass even with no timeout at all — (a|aa)+$ against the same kind of
-    # non-matching input still hits the configured bound (confirmed in review).
     evil_pattern = r"(a|aa)+$"
-    evil_input = "a" * 40 + "!"  # no trailing match -> catastrophic backtracking
+    evil_input = "a" * 5000 + "!"  # no trailing match -> pathological for a backtracking engine
 
     started = time.monotonic()
     result = asyncio.run(AntonChannelRuntime._should_respond(binding(evil_pattern), event(evil_input)))
     elapsed = time.monotonic() - started
 
     assert result is False
-    assert elapsed < 2.0  # well under what unbounded backtracking on this input would take
+    assert elapsed < 1.0  # re2 resolves this in microseconds; generous margin for CI jitter
 
 
-def test_should_respond_regex_timeout_is_enforced_and_caught(monkeypatch):
-    # Deterministic companion to the test above: proves the timeout kwarg is
-    # actually threaded through to regex.search, and that a TimeoutError is
-    # caught and treated as no-match — independent of whether any particular
-    # pattern happens to be slow enough to trip it on a given machine/regex
-    # version, which is exactly the gap the (a+)+$ pattern above had.
-    calls = {}
-
-    def fake_search(pattern, content, timeout=None):
-        calls["timeout"] = timeout
-        raise TimeoutError
-
-    monkeypatch.setattr(runtime_mod.regex, "search", fake_search)
-
+def test_should_respond_regex_re2_incompatible_syntax_is_caught():
+    # re2 isn't syntax-compatible with `re`/`regex` — no backreferences, no
+    # lookahead/lookbehind. ChannelBindingService._validate_trigger rejects these
+    # at binding-creation time, but this proves the runtime match path is also
+    # safe (returns no-match rather than raising) for any pattern that reaches
+    # it regardless, e.g. one created before this constraint existed.
     def event(text):
         return SimpleNamespace(message=SimpleNamespace(content=text, is_mention=False))
 
     def binding(pattern):
         return SimpleNamespace(trigger_rule="regex", trigger_pattern=pattern)
 
-    result = asyncio.run(AntonChannelRuntime._should_respond(binding(r"anything"), event("hello")))
+    backreference_pattern = r"(a)\1"  # valid in `re`/`regex`, unsupported by re2
+
+    result = asyncio.run(AntonChannelRuntime._should_respond(binding(backreference_pattern), event("aa")))
 
     assert result is False
-    assert calls["timeout"] == runtime_mod.TRIGGER_REGEX_TIMEOUT_S
 
 
 def test_binding_instructions_roundtrip():

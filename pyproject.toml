@@ -44,8 +44,10 @@ dependencies = [
     # are matched against every inbound message at runtime (channels/runtime.py).
     # stdlib `re` has no backtracking bound, so a syntactically-valid but
     # pathological pattern (e.g. "(a+)+$") plus an adversarial message is a
-    # ReDoS. `regex` is drop-in for `re` syntax and adds a `timeout=` kwarg.
-    "regex>=2024.11.6",
+    # ReDoS. re2 uses a linear-time automaton instead of backtracking, so no
+    # pattern can hang a match — no timeout needed, unlike `re`/`regex`. Not
+    # syntax-compatible with `re`: no backreferences, no lookahead/lookbehind.
+    "google-re2>=1.1",
     "python-multipart>=0.0.28",
     "sqlmodel>=0.0.38",
     "tzlocal>=5.0",

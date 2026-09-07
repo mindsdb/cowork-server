@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
-import regex
+import re2
 
 from anton.core.dispatch import OutboundMessage
 from cowork.build_info import build_trace_metadata
@@ -70,11 +70,12 @@ TYPING_REFRESH_S = 4.0
 
 MAX_TURN_ATTACHMENTS = 3
 
-# `trigger_pattern` is org-controlled (ChannelBindingService only checks it
-# parses, not that it's cheap to run) and is matched against every inbound
-# message, so a pathological pattern is a ReDoS. Bound match time rather than
-# trust the pattern; module-level so tests can shrink it.
-TRIGGER_REGEX_TIMEOUT_S = 1.0
+# re2 logs pattern-compile/search errors to the process's raw stderr by
+# default (before absl::InitializeLog() — bypasses Python logging entirely),
+# which would misrepresent an org-controlled trigger_pattern mistake as a
+# server error in production logs.
+_QUIET_REGEX_OPTIONS = re2.Options()
+_QUIET_REGEX_OPTIONS.log_errors = False
 
 
 def artifacts_since(project_path: str, conversation_id: UUID, since: float) -> list[tuple[str, str]]:
@@ -408,15 +409,18 @@ class AntonChannelRuntime:
             if not pattern:
                 return False
             content = str(event.message.content)
-            # Off the event loop, with a bound: `regex.search` still
-            # backtracks like `re`, so an unbounded call on the loop would
-            # stall every other channel/request for as long as the match
-            # runs, not just this one.
+            # `trigger_pattern` is org-controlled (ChannelBindingService only
+            # checks it parses, not that it's cheap to run) and is matched
+            # against every inbound message, so a backtracking engine here
+            # would be a ReDoS. re2 guarantees linear-time matching — no
+            # pattern can make this hang — so no timeout is needed; still
+            # off the event loop so a very large message can't stall other
+            # channels/requests while it matches.
             try:
                 return await asyncio.to_thread(
-                    lambda: regex.search(pattern, content, timeout=TRIGGER_REGEX_TIMEOUT_S) is not None
+                    lambda: re2.search(pattern, content, options=_QUIET_REGEX_OPTIONS) is not None
                 )
-            except (regex.error, TimeoutError):
+            except re2.error:
                 return False
         return True
 
