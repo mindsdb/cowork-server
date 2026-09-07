@@ -8,17 +8,19 @@ heartbeat. Wired into the responses handler in a later task.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
 import uuid
 
-from cowork.handlers.turn_errors import remote_turn_error
+from cowork.build_info import KEY_ANTON_VERSION, build_trace_metadata, surface
+from cowork.handlers.turn_errors import WORKER_UNRESPONSIVE_TYPE_NAME, remote_turn_error
 from cowork.services.providers import minds_chat_base_url
-from cowork.turnqueue.auth_keys import mint_turn_key
+from cowork.turnqueue.auth_keys import list_active_connections, mint_turn_key
 from cowork.turnqueue.models import TurnJob, TurnReply
 from cowork.streaming.turn_index import record_turn
-from cowork.turnqueue.redis_client import get_redis
+from cowork.turnqueue.redis_client import cancel_flag_key, get_redis
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host
 
 logger = logging.getLogger(__name__)
@@ -30,32 +32,65 @@ _MAX_REQUEST_BYTES = 10 * 1024 * 1024
 _REQUEST_BYTES_MARGIN = 64 * 1024
 
 
+def _trace_block() -> dict[str, str]:
+    """Attribution the pod cannot work out for itself, for the job's params.
+
+    Kept tiny and total-failure-tolerant: telemetry must never be the reason a
+    turn does not start, and an absent block reads as "no attribution" on the
+    pod side rather than an error. That is also what lets the three repos in
+    this chain deploy in any order.
+    """
+    try:
+        resolved = surface()
+        block = build_trace_metadata({"surface": resolved} if resolved else None)
+        # Drop OUR anton version: the pod runs a different anton entirely (its
+        # own pinned `minds-anton-scratchpad` image, bumped independently of
+        # this server's vendored dep), so the value would be wrong on the wire.
+        # It is harmless today only because anton overwrites it when building
+        # its headers — shipping a knowingly-wrong value and relying on a
+        # downstream overwrite is a trap for whoever touches that overwrite.
+        # ENG-1279 sends it in-process as a fallback for antons too old to
+        # self-report; the pod image is never that old.
+        block.pop(KEY_ANTON_VERSION, None)
+        return block
+    except Exception:  # pragma: no cover - defensive: never block a turn
+        logger.warning("could not build the turn's trace attribution", exc_info=True)
+        return {}
+
+
 def _request_wire_size(params: dict) -> int:
     """Bytes the controller's request line will occupy for these params."""
     return len(json.dumps(params, separators=(",", ":")).encode("utf-8"))
 
 
 def _fit_request(params: dict, conversation_id: str) -> dict:
-    """Warn when the request line will not fit the pod's stdin cap.
+    """Drop project memory first, then warn if the request still will not fit.
 
-    This used to shed ``skills`` then ``memory``, which were re-sent every turn
-    and degraded gracefully. Both now live on the shared mount and never enter
-    the payload, so there is nothing optional left to drop: what remains is
-    input, model, llm and history, and none of them can be silently discarded
-    without changing the turn's meaning.
+    Skills and personal/global memory live on read-only mounts. Project memory
+    does not: the worker mounts only this conversation's workspace, so its two
+    shared slots ride the request again. They are the one optional block we can
+    deterministically shed as a unit without changing the user's input or
+    history (and without serving rules but silently losing lessons).
 
-    So this no longer trims, it reports. An oversized line is a real problem
-    (the pod's readline will truncate it) and history is the only thing that
-    grows unboundedly, so the fix belongs in history windowing upstream, not in
-    a silent drop here.
+    If the required fields alone exceed the envelope, report that explicitly.
+    The pod would otherwise truncate the line into invalid JSON; history
+    windowing remains the upstream fix for that required-payload case.
     """
     budget = _MAX_REQUEST_BYTES - _REQUEST_BYTES_MARGIN
     size = _request_wire_size(params)
+    if size > budget and params.pop("memory", None) is not None:
+        logger.warning(
+            "[producer] dropped project memory from turn %s: request line was "
+            "%d bytes, over the %d-byte cap",
+            conversation_id,
+            size,
+            budget,
+        )
+        size = _request_wire_size(params)
     if size > budget:
         logger.warning(
             "[producer] turn %s request line is %d bytes, over the %d-byte cap; "
-            "nothing is sheddable now that skills and memory read off the shared mount, "
-            "so this needs history windowing upstream",
+            "project memory is already absent, so this needs history windowing upstream",
             conversation_id, size, budget,
         )
     return params
@@ -90,10 +125,68 @@ async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
     return block
 
 
+async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
+                            disabled: list[dict] | None,
+                            settings: TurnQueueSettings) -> dict | None:
+    """Build everything the job's `oauth` block needs except the turn key —
+    the list of connections anton is allowed to use this turn. Deliberately
+    doesn't take the turn key `_mint_llm_block` mints: this function's own
+    network call (listing active connections) never uses it, only the final
+    block does, so the caller runs the two mints concurrently and folds the
+    turn key in afterward instead of sequencing this behind the llm mint.
+
+    `disabled` mirrors the desktop path's `disabled_connections` — the same
+    general per-conversation concept (`cowork/schemas/conversations.py`),
+    just not previously threaded into this remote-producer path.
+
+    None when there's nothing to offer this turn: no org context (local/
+    desktop callers never reach this path), auth has no active connections
+    for this org, or every connection is disabled — an absent block is the
+    pod's existing signal for "no connector tokens available," same as
+    before this feature existed.
+    """
+    if not org_id or not user_id:
+        return None
+    try:
+        connections = await list_active_connections(org_id=org_id, user_id=user_id, settings=settings)
+    except Exception:
+        # Never block a turn over connector availability — see _trace_block's
+        # identical reasoning above. A turn that can't reach the connections
+        # list still runs, just without connector tools this time.
+        logger.warning(
+            "[producer] could not list active connections for org %s; oauth block omitted",
+            org_id, exc_info=True,
+        )
+        return None
+    if disabled:
+        disabled_keys = {(d.get("engine"), d.get("name")) for d in disabled}
+        connections = [c for c in connections if (c.get("engine"), c.get("name")) not in disabled_keys]
+    if not connections:
+        return None
+    # No base_url here (ENG-2128): it used to carry
+    # settings.auth_internal_base_url, but anton's TurnKeyDataVault
+    # constructs it positionally and never bound the keyword-only base_url
+    # override, so the value was dead on the wire — anyone changing
+    # auth_internal_base_url would see it flow into the payload and
+    # reasonably conclude it took effect, when the pod was always resolving
+    # the auth host from its own ANTON_CLOUD_AUTH_BASE_URL env var instead
+    # (set per environment by scratchpad-controller). Decided to drop it
+    # rather than wire it up: ANTON_CLOUD_AUTH_BASE_URL is already the
+    # correct, working, per-environment source, and nothing today needs
+    # cowork-server to steer the auth host per-request.
+    return {
+        "connections": connections,
+    }
+
+
 # What the reply loop reports when the worker stops answering. Shaped like the
 # pod's own scrubbed "ExceptionType: message" errors so remote_turn_error can
-# classify it (today: the generic redacted message and the generic error card).
-UNRESPONSIVE_WORKER_ERROR = "TurnWorkerUnresponsive: the turn worker stopped responding"
+# classify it, and built from the type name that function branches on so the two
+# cannot drift. It maps to WORKER_UNRESPONSIVE_CODE, which the client renders
+# differently from anton_error because nothing ran.
+UNRESPONSIVE_WORKER_ERROR = (
+    f"{WORKER_UNRESPONSIVE_TYPE_NAME}: the turn worker stopped responding"
+)
 
 
 def step_stream_events(data: dict) -> list:
@@ -158,10 +251,12 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 model: str | None,
                                 turn_id: int = 0,
                                 history: list | None = None,
+                                memory: dict | None = None,
                                 project_id: str | None = None,
                                 workspace_rel_path: str = "projects/general",
                                 correlation_id: str | None = None,
-                                llm: dict | None = None):
+                                llm: dict | None = None,
+                                disabled: list[dict] | None = None):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
 
     Yields turn_delta / turn_step / turn_memory in arrival order and ends with
@@ -173,7 +268,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     r = get_redis()
     corr = correlation_id or _new_correlation_id()
     # A flag left by an earlier turn would cancel this one on its first line.
-    await r.delete(f"cowork:cancel:{corr}")
+    await r.delete(cancel_flag_key(corr))
     reply_stream = f"scratchpad:reply:{conversation_id}"
 
     # No client-picked model → the deployment's resolved default (org mode: the
@@ -185,19 +280,55 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         scope = TenantScope(org_mode=bool(org_id), org_id=org_id, user_id=user_id)
         model = get_user_settings(scope).resolved_planning_model
 
-    llm_block = llm or await _mint_llm_block(
-        org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
+    # Independent network round trips (llm's turn-key mint, oauth's active-
+    # connections list) — run concurrently rather than paying both latencies
+    # in sequence on every turn's hot path. Skipped for llm when a turn key
+    # was already minted upstream (the `llm` param), since there's nothing
+    # to overlap with in that case.
+    oauth_connections_coro = _mint_oauth_block(
+        org_id=org_id, user_id=user_id, disabled=disabled, settings=settings,
     )
+    if llm:
+        llm_block = llm
+        oauth_connections = await oauth_connections_coro
+    else:
+        llm_block, oauth_connections = await asyncio.gather(
+            _mint_llm_block(org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings),
+            oauth_connections_coro,
+        )
+    # Reuses the turn key already minted for llm_block — never mints a
+    # second one. Org/cloud mode only: local-mode turns build in-process
+    # and never reach this function at all.
+    oauth_block = {**oauth_connections, "turn_key": llm_block.get("api_key", "")} if oauth_connections else None
 
     # Org-relative, never absolute. cowork-server sees the shared tree at
     # <root>/<org_id> while the pod mounts its own org's access point AT
     # <root>, so the two sit at different depths and an absolute path from
     # here is wrong inside the pod. Each side joins its own root.
     #
-    # Skills and memory are no longer shipped: the pod reads them off the same
-    # mount, which also removes most of what _fit_request exists to trim.
+    # Skills and personal/global memory are mounted read-only. Project memory is
+    # outside the conversation-scoped workspace mount, so send only that tier on
+    # the wire. Filtering here as well as in ResponsesHandler keeps a future
+    # caller from accidentally serializing private global memory into the job.
+    project_memory = memory.get("project") if isinstance(memory, dict) else None
+    memory_block = (
+        {"project": project_memory}
+        if isinstance(project_memory, dict) and project_memory
+        else None
+    )
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
-              "model": model, "history": history or [], "llm": llm_block}
+              "model": model, "history": history or [], "llm": llm_block,
+              **({"memory": memory_block} if memory_block else {}),
+              # Absent entirely (not an empty dict) when there's nothing to
+              # offer — see _mint_oauth_block's docstring for why.
+              **({"oauth": oauth_block} if oauth_block else {}),
+              # Trace attribution for the pod (ENG-1459). The remote turn runs in
+              # a scratchpad pod that has no cowork-server installed, so nothing
+              # there can derive the surface, this server's version, or its
+              # install channel — measured on prod, 0 of 68 cloud traces carried
+              # any of them. Same helper the in-process path uses, so the two
+              # cannot drift. Observability only; the pod must never act on it.
+              "trace": _trace_block()}
     params = _fit_request(params, conversation_id)
 
     job = TurnJob(
@@ -264,7 +395,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                         conversation_id, corr, data.get("error"),
                     )
                 if kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill",
-                            "turn_completed", "turn_failed"):
+                            "turn_history", "turn_completed", "turn_failed"):
                     yield kind, data
                 if kind in ("turn_completed", "turn_failed"):
                     return

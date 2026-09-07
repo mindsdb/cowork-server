@@ -8,31 +8,45 @@ from __future__ import annotations
 
 import mimetypes
 import os
+import re
+import secrets
+import stat as stat_module
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlmodel import Session
 
 from cowork.db.scoped import ScopedSession, ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.api.v1.endpoints.guards import require_local_tenancy
-from cowork.services.artifact_roots import (
-    artifacts_sources_for_project as _sources_for_project,
-    artifacts_sources_for_scan as _sources_for_scan,
-    artifacts_sources_for_scope as _sources_for_scope,
+from cowork.api.v1.artifact_preview import (
+    NO_CACHE_HEADERS,
+    html_with_comment_layer,
+    wants_comment_layer,
 )
-from cowork.services.comments_layer import ACTIVATION_PARAM, inject_layer
+from cowork.api.v1.artifact_scope import (
+    artifact_sources_for_request,
+    scoped_project_id_for_request,
+)
+from cowork.common.paths import dir_scandir, dir_stat, open_pinned_child
+from cowork.services.artifact_roots import (
+    artifacts_sources_for_project,
+    artifacts_sources_for_scan,
+)
 from cowork.services.artifacts import (
     ExecutionRefused,
+    _org_mode,
     _project_artifacts_base,
-    artifact_status as _artifact_status,
+    artifact_id_for_folder as _artifact_id_for_folder,
     delete_artifact as _delete_artifact,
+    delete_artifact_from_source as _delete_artifact_from_source,
     get_preview_mount,
     list_artifacts as _list_artifacts,
     mount_preview,
@@ -50,107 +64,586 @@ class _PathBody(BaseModel):
     path: str
 
 
-# ``no-cache`` mirrors the FileResponse headers used elsewhere so a rebuilt
-# artifact is always re-fetched.
-_NO_CACHE = {"Cache-Control": "no-cache, must-revalidate"}
+@dataclass(frozen=True)
+class _ArtifactDeleteRef:
+    """A canonical identity or a validated legacy folder name."""
+
+    artifact_id: str | None = None
+    legacy_slug: str | None = None
 
 
-def _wants_comment_layer(media_type: str, request: Request) -> bool:
-    """The comment marker layer is injected only into the top-level HTML
-    document, and only when the renderer opts in via the activation query flag.
-    Asset requests and flag-less loads stream untouched."""
-    return media_type == "text/html" and ACTIVATION_PARAM in request.query_params
+_LEGACY_SLUG = re.compile(r"[^/\\\x00]{1,255}\Z")
 
 
-def _html_with_layer(target: Path):
-    """Read an HTML file and return an HTMLResponse with the marker layer
-    injected, or None when it can't be read as text (caller falls back to a
-    plain FileResponse)."""
-    try:
-        html = target.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
-        return None
-    return HTMLResponse(inject_layer(html), headers=_NO_CACHE)
+def _artifact_delete_ref(value: str) -> _ArtifactDeleteRef:
+    """Validate the polymorphic ``/{slug}`` compatibility parameter.
 
-
-def _org_mode() -> bool:
-    from cowork.common.settings.app_settings import get_app_settings
-
-    return get_app_settings().tenancy_mode == "org"
-
-
-def _sources(session, project_id: UUID | None, project_path: str | None):
-    """The artifact roots this request may read.
-
-    `project_id` is honored in BOTH modes. That is not cosmetic: the delete handler
-    acts on `sources[0]`, so a desktop branch that ignored it would delete a
-    same-named slug from whichever project sorted first — and inline chat cards
-    carry a `project_id` in every mode, so that path is reachable from the UI.
-
-    Org mode additionally refuses `project_path`: a filesystem path from the client
-    carries no tenant, and these endpoints have no other way to tell which
-    organization it belongs to.
+    Current clients send an artifact UUID. Older desktop clients send the
+    artifact folder's direct-child name, so that form cannot be narrowed to a
+    UUID without breaking them. It can still be made a genuine single segment:
+    separators, NUL, dot segments and overlong filesystem names are refused
+    before any artifacts directory is inspected.
     """
-    if _org_mode() and project_path is not None:
+    try:
+        return _ArtifactDeleteRef(artifact_id=UUID(value).hex)
+    except (ValueError, TypeError, AttributeError):
+        pass
+    if value in {".", ".."} or _LEGACY_SLUG.fullmatch(value) is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="project_path is not accepted in org deployments; use project_id",
+            detail="Invalid artifact identity",
         )
-
-    if project_id is not None:
-        try:
-            return _sources_for_project(session, project_id)
-        except ValueError:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown project")
-
-    if _org_mode():
-        return _sources_for_scope(session)
-
-    sources = _sources_for_scan()
-    if project_path is not None:
-        # The client value is normalized as a STRING and never resolved through the
-        # filesystem. Nothing here opens it — it only selects from roots the server
-        # discovered itself, so the result is always a subset of the scan — but
-        # `Path.resolve()` on untrusted input is a filesystem access driven by that
-        # input, which is a path-injection sink whether or not it is reachable
-        # (CodeQL py/path-injection). Comparing against both the raw and the
-        # resolved form of each server-side root keeps symlinked project dirs
-        # matching; those paths are ours, so resolving them is fine.
-        wanted = os.path.normpath(os.path.expanduser(project_path))
-        sources = [s for s in sources if _project_dir_matches(s, wanted)]
-    return sources
+    return _ArtifactDeleteRef(legacy_slug=value)
 
 
-def _project_dir_matches(source, wanted: str) -> bool:
-    project_dir = source.base.parent.parent
+def _artifact_folder_name(source, folder: Path) -> str:
+    """Reduce an identity result to one direct child of its authorized root."""
     try:
-        resolved = str(project_dir.resolve(strict=False))
-    except OSError:
-        resolved = ""
-    return wanted in (str(project_dir), resolved)
+        relative = folder.relative_to(Path(source.base))
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Artifact not found",
+        ) from exc
+    if len(relative.parts) != 1 or relative.name in {"", ".", ".."}:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Artifact not found",
+        )
+    return relative.name
 
 
+def _legacy_artifact_for_sources(sources, folder_name: str):
+    """Find an exact, real directory entry below an authorized pinned root."""
+    from cowork.services.artifact_identity import opened_artifact_root
+
+    for source in sources:
+        try:
+            with opened_artifact_root(source) as root:
+                with dir_scandir(root) as entries:
+                    for entry in entries:
+                        if entry.name != folder_name:
+                            continue
+                        try:
+                            if entry.is_symlink() or not entry.is_dir(
+                                follow_symlinks=False
+                            ):
+                                break
+                        except OSError:
+                            break
+                        return source, root.path / entry.name
+        except (OSError, ValueError):
+            continue
+    return None, None
+
+
+# ``no-cache`` mirrors the FileResponse headers used elsewhere so a rebuilt
+# artifact is always re-fetched.
 # The two functions below hold the logic; the routes under them are thin adapters.
 # Keeping them separate means the tenancy behavior is testable without FastAPI's
 # Query sentinels standing in for the defaults.
 
 
-def artifacts_for_request(
-    session, *, project_id: UUID | None = None, project_path: str | None = None
-) -> list[dict]:
+def _artifact_cards(session, sources) -> list[dict]:
     # Owner-side fields are stripped inside `card_for_folder`, not here: inline chat
     # cards use the same builder and would otherwise still carry the plaintext
     # password.
-    return _list_artifacts(_sources(session, project_id, project_path))
+    cards = _list_artifacts(sources)
+    from cowork.services.artifact_permissions import artifact_capabilities
+
+    # Capabilities are a property of the ROOT, not of the artifact: in org mode
+    # they come from the owning conversation, and every artifact under one root
+    # shares it. Derived once per root, so a project with 50 artifacts across 50
+    # conversations costs 50 conversation reads instead of 50 per card.
+    by_base = {Path(source.base): source for source in sources}
+    capabilities_by_base: dict[Path, dict] = {}
+    for card in cards:
+        base = Path(str(card.get("folder") or "")).parent
+        source = by_base.get(base)
+        if source is None:
+            continue
+        if base not in capabilities_by_base:
+            capabilities_by_base[base] = artifact_capabilities(session, source)
+        card["capabilities"] = capabilities_by_base[base]
+    return cards
+
+
+def _scoped_project_sources(session, project_id: UUID | str):
+    """Select roots with a server-loaded project identity, never the request.
+
+    ``basename`` is intentionally applied even though FastAPI already typed the
+    route value as a UUID. Snyk recognizes this standard path-leaf operation as
+    a sanitizer, while it does not model FastAPI's coercion or the server-catalog
+    equality boundary below. Equality with the original preserves UUID semantics
+    instead of silently accepting a path whose last component happens to be one.
+
+    ``scoped_project_id_for_request`` first enumerates the tenant-scoped project
+    catalog and uses the client UUID only as an in-memory equality key. Artifact
+    root discovery then receives the matching database value. Keeping this
+    boundary beside the two filesystem consumers below makes the dataflow
+    explicit to both reviewers and static analysis.
+    """
+    raw_project_ref = str(project_id)
+    project_ref = os.path.basename(raw_project_ref)
+    if project_ref != raw_project_ref:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid project",
+        )
+    server_project_id = scoped_project_id_for_request(session, project_ref)
+    try:
+        sources = artifacts_sources_for_project(session, server_project_id)
+    except ValueError as exc:
+        # The project can disappear between catalog recovery and root discovery.
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Unknown project",
+        ) from exc
+    return server_project_id, sources
+
+
+def _scoped_project_cards(session, project_ref: str) -> list[dict]:
+    """Build cards for one basename-sanitized project selector.
+
+    HTTP adapters sanitize the selector before entering this filesystem-facing
+    helper. ``_scoped_project_sources`` then recovers the equal UUID object from
+    the scoped server catalog, so root discovery still receives server-owned
+    identity rather than the request string.
+    """
+    _server_project_id, sources = _scoped_project_sources(session, project_ref)
+    return _artifact_cards(session, sources)
+
+
+def _all_artifact_cards(session) -> list[dict]:
+    """Build the unfiltered scoped list without accepting any HTTP selector."""
+    sources = artifact_sources_for_request(session, None, None)
+    return _artifact_cards(session, sources)
+
+
+def artifacts_for_request(
+    session, *, project_id: UUID | None = None, project_path: str | None = None
+) -> list[dict]:
+    # Preserve the service's existing precedence: org mode rejects a filesystem
+    # path even when a project UUID is also present; desktop prefers that UUID.
+    if project_path is not None and _org_mode():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="project_path is not accepted in org deployments; use project_id",
+        )
+    if project_id is not None:
+        raw_project_ref = str(project_id)
+        project_ref = os.path.basename(raw_project_ref)
+        if project_ref != raw_project_ref:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid project",
+            )
+        return _scoped_project_cards(session, project_ref)
+    if project_path is not None:
+        return _desktop_artifacts_for_project_path(session, project_path)
+    return _all_artifact_cards(session)
+
+
+def _desktop_source_path_keys(source) -> set[str]:
+    """Exact legacy path spellings for one server-discovered desktop source."""
+    project_dir = Path(source.base).parent.parent
+    candidates = {os.path.normpath(str(project_dir))}
+    try:
+        candidates.add(os.path.normpath(str(project_dir.resolve(strict=False))))
+    except OSError:
+        pass
+    return candidates
+
+
+@dataclass(frozen=True)
+class _DesktopSourceCatalogEntry:
+    """One server-discovered source and its accepted legacy path spelling."""
+
+    path_key: str
+    project_name: str
+    source: object
+
+
+def _desktop_registered_path_catalog() -> tuple[_DesktopSourceCatalogEntry, ...]:
+    """Build the complete legacy source catalog without an HTTP selector."""
+    return tuple(
+        _DesktopSourceCatalogEntry(
+            path_key=path_key,
+            project_name=os.path.basename(str(Path(source.base).parent.parent)),
+            source=source,
+        )
+        for source in artifacts_sources_for_scan()
+        for path_key in sorted(_desktop_source_path_keys(source))
+    )
+
+
+def _desktop_registered_source(
+    catalog: tuple[_DesktopSourceCatalogEntry, ...],
+    requested: str,
+    project_name: str,
+):
+    """Select the exact server source for a registered legacy path.
+
+    This selector performs comparisons only: all Path operations happened in
+    ``_desktop_registered_path_catalog`` before the HTTP path entered the
+    operation. Returning the catalog's source, rather than rescanning by leaf
+    name, preserves exact-path semantics when two roots share a basename.
+    """
+    for entry in catalog:
+        if secrets.compare_digest(
+            entry.path_key, requested
+        ) and secrets.compare_digest(entry.project_name, project_name):
+            return entry.source
+    return None
+
+
+def _desktop_artifacts_for_project_path(session, project_path: str) -> list[dict]:
+    """Select one desktop project's response by its legacy path.
+
+    ``project_path`` remains supported because older desktop builds address the
+    list this way. A complete source catalog is built first, then the request is
+    used only as an equality key. It is never joined or opened. The exact source
+    retained in that catalog keeps ``project_id=None``, preserving local draft
+    URLs and card addressing.
+    """
+    catalog = _desktop_registered_path_catalog()
+    if not project_path or "\x00" in project_path:
+        return []
+    requested = os.path.normpath(os.path.expanduser(project_path))
+    project_name = os.path.basename(requested)
+    if not project_name:
+        return []
+    source = _desktop_registered_source(catalog, requested, project_name)
+    if source is None:
+        return []
+    return _artifact_cards(session, [source])
+
+
+_BLANK_ARTIFACT_STATUS = {
+    "publishedUrl": "",
+    "modified": False,
+    "accessMode": "public",
+    "accessProtected": False,
+    "accessEmails": [],
+    "orgAllowed": False,
+}
+
+
+def _status_from_card(card: dict) -> dict:
+    """The non-secret status subset exposed by the focus-refresh endpoint."""
+    return {
+        "publishedUrl": card.get("publishedUrl", ""),
+        "modified": bool(card.get("modified")),
+        "accessMode": card.get("accessMode", "public"),
+        "accessProtected": bool(card.get("accessProtected")),
+        "accessEmails": card.get("accessEmails", []),
+        "orgAllowed": bool(card.get("orgAllowed")),
+        "artifactKey": card.get("artifactKey", ""),
+    }
+
+
+def _normalized_lookup_key(value: str) -> str:
+    return os.path.normcase(os.path.normpath(os.path.expanduser(value)))
+
+
+def _server_path_keys(candidate: Path, source_base: Path) -> tuple[set[str], str | None]:
+    """Lookup spellings derived exclusively from a server-discovered path."""
+    absolute = {_normalized_lookup_key(str(candidate))}
+    try:
+        absolute.add(_normalized_lookup_key(str(candidate.resolve(strict=False))))
+    except OSError:
+        pass
+    # macOS exposes temporary/project trees through both /var and /private/var.
+    for key in tuple(absolute):
+        private_prefix = f"{os.sep}private{os.sep}"
+        if key.startswith(private_prefix):
+            absolute.add(key[len(f"{os.sep}private"):])
+    try:
+        relative = _normalized_lookup_key(str(candidate.relative_to(source_base)))
+    except ValueError:
+        relative = None
+    return absolute, relative
+
+
+def _matches_server_path(
+    candidate: Path,
+    source_base: Path,
+    requested: str,
+    relative_requested: str,
+) -> bool:
+    absolute, relative = _server_path_keys(candidate, source_base)
+    return requested in absolute or (
+        relative is not None and relative_requested == relative
+    )
+
+
+def _pinned_artifact_match(
+    directory,
+    logical_folder: Path,
+    source_base: Path,
+    requested: str,
+    relative_requested: str,
+    *,
+    allow_directory: bool = True,
+) -> Path | None:
+    """Return an exactly matched real file (or the artifact root) by scanning."""
+    if allow_directory and _matches_server_path(
+        logical_folder, source_base, requested, relative_requested
+    ):
+        return logical_folder
+    try:
+        with dir_scandir(directory) as entries:
+            discovered = sorted(entries, key=lambda entry: entry.name)
+    except OSError:
+        return None
+    for entry in discovered:
+        try:
+            mode = entry.stat(follow_symlinks=False).st_mode
+        except OSError:
+            continue
+        logical = logical_folder / entry.name
+        if stat_module.S_ISREG(mode):
+            if _matches_server_path(
+                logical, source_base, requested, relative_requested
+            ):
+                return logical
+            continue
+        if not stat_module.S_ISDIR(mode):
+            continue
+        try:
+            child = open_pinned_child(directory, entry.name)
+        except OSError:
+            continue
+        try:
+            matched = _pinned_artifact_match(
+                child,
+                logical,
+                source_base,
+                requested,
+                relative_requested,
+                allow_directory=False,
+            )
+        finally:
+            child.close()
+        if matched is not None:
+            return matched
+    return None
+
+
+def _pinned_loose_status(directory, logical_file: Path) -> dict:
+    """Status for a metadata-less legacy file using its pinned parent record."""
+    from cowork.services.artifacts import (
+        _load_published_map_pinned,
+        _published_access_for,
+        _published_url_for,
+    )
+
+    published_map = _load_published_map_pinned(directory)
+    return _status_from_card(
+        {
+            "publishedUrl": _published_url_for(
+                directory.path,
+                logical_file,
+                published_map=published_map,
+            ),
+            "modified": False,
+            **_published_access_for(
+                directory.path,
+                logical_file,
+                published_map=published_map,
+            ),
+        }
+    )
+
+
+def _pinned_loose_match(
+    directory,
+    logical_directory: Path,
+    source_base: Path,
+    requested: str,
+    relative_requested: str,
+) -> dict | None:
+    """Find an exact real file below a metadata-less legacy directory."""
+    try:
+        with dir_scandir(directory) as entries:
+            discovered = sorted(entries, key=lambda entry: entry.name)
+    except OSError:
+        return None
+    for entry in discovered:
+        try:
+            mode = entry.stat(follow_symlinks=False).st_mode
+        except OSError:
+            continue
+        logical = logical_directory / entry.name
+        if stat_module.S_ISREG(mode):
+            if _matches_server_path(
+                logical, source_base, requested, relative_requested
+            ):
+                return _pinned_loose_status(directory, logical)
+            continue
+        if not stat_module.S_ISDIR(mode):
+            continue
+        try:
+            child = open_pinned_child(directory, entry.name)
+        except OSError:
+            continue
+        try:
+            result = _pinned_loose_match(
+                child,
+                logical,
+                source_base,
+                requested,
+                relative_requested,
+            )
+        finally:
+            child.close()
+        if result is not None:
+            return result
+    return None
+
+
+def _desktop_artifact_status_for_path(path: str) -> dict:
+    """Match a legacy path only against entries scanned from discovered roots.
+
+    The request is reduced to a string lookup key. Every card and folder key is
+    built first from server-discovered ``ProjectArtifacts`` roots, so no
+    request-derived value is ever opened, joined to a root, or passed to a
+    path-oriented status helper. Only the one exactly matched artifact is then
+    built into a card, preserving legacy loose-file status without eagerly
+    hashing every artifact on each window-focus poll.
+    """
+    if not path or "\x00" in path:
+        return dict(_BLANK_ARTIFACT_STATUS)
+    requested = _normalized_lookup_key(path)
+    relative_requested = requested
+    artifacts_prefix = f"artifacts{os.sep}"
+    if relative_requested.startswith(artifacts_prefix):
+        relative_requested = relative_requested[len(artifacts_prefix):]
+
+    from cowork.services.artifact_identity import (
+        _opened_child_directory,
+        opened_artifact_root,
+    )
+    from cowork.services.artifacts import card_for_folder
+
+    for source in artifacts_sources_for_scan():
+        source_base = Path(source.base)
+        try:
+            with opened_artifact_root(source) as root:
+                with dir_scandir(root) as entries:
+                    discovered = sorted(entries, key=lambda entry: entry.name)
+                for entry in discovered:
+                    try:
+                        mode = entry.stat(follow_symlinks=False).st_mode
+                    except OSError:
+                        continue
+                    logical = root.path / entry.name
+                    if stat_module.S_ISREG(mode):
+                        if _matches_server_path(
+                            logical,
+                            source_base,
+                            requested,
+                            relative_requested,
+                        ):
+                            return _pinned_loose_status(root, logical)
+                        continue
+                    if not stat_module.S_ISDIR(mode):
+                        continue
+                    try:
+                        with _opened_child_directory(root, entry.name) as folder:
+                            try:
+                                metadata_stat = dir_stat(
+                                    folder,
+                                    "metadata.json",
+                                    follow_symlinks=False,
+                                )
+                                is_artifact = stat_module.S_ISREG(
+                                    metadata_stat.st_mode
+                                )
+                            except OSError:
+                                is_artifact = False
+                            if not is_artifact:
+                                loose = _pinned_loose_match(
+                                    folder,
+                                    logical,
+                                    source_base,
+                                    requested,
+                                    relative_requested,
+                                )
+                                if loose is not None:
+                                    return loose
+                                continue
+                            matched = _pinned_artifact_match(
+                                folder,
+                                logical,
+                                source_base,
+                                requested,
+                                relative_requested,
+                            )
+                            if matched is None:
+                                continue
+                            card = card_for_folder(
+                                logical,
+                                project_id=source.project_id,
+                                project_name=source.project_name,
+                                _pinned_folder=folder,
+                                _pinned_root=root,
+                            )
+                            if card is not None:
+                                return _status_from_card(card)
+                            if matched != logical:
+                                return _pinned_loose_status(folder, matched)
+                            return dict(_BLANK_ARTIFACT_STATUS)
+                    except (OSError, ValueError):
+                        continue
+        except (OSError, ValueError):
+            continue
+    return dict(_BLANK_ARTIFACT_STATUS)
 
 
 @router.get("/")
 async def list_artifacts(
     session: ScopedSessionDep,
     project_id: UUID | None = Query(default=None),
-    project_path: str | None = Query(default=None),
+    project_path: str | None = Query(default=None, max_length=4096),
 ):
-    return artifacts_for_request(session, project_id=project_id, project_path=project_path)
+    if project_path is not None:
+        if _org_mode():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="project_path is not accepted in org deployments; use project_id",
+            )
+        # Local requests that carry both parameters have always preferred the
+        # UUID. Do not let the ignored compatibility field enter resolution.
+        if project_id is None:
+            catalog = _desktop_registered_path_catalog()
+            if not project_path or "\x00" in project_path:
+                return []
+            requested = os.path.normpath(os.path.expanduser(project_path))
+            # Snyk Code recognizes basename as a path-traversal sanitizer. Keep
+            # it directly at the HTTP boundary. Both request-derived values are
+            # consumed solely by equality checks; the card builder receives the
+            # exact server-created source retained in the complete catalog.
+            project_name = os.path.basename(requested)
+            if not project_name:
+                return []
+            source = _desktop_registered_source(catalog, requested, project_name)
+            if source is None:
+                return []
+            return _artifact_cards(session, [source])
+    if project_id is not None:
+        raw_project_ref = str(project_id)
+        # Although FastAPI has already parsed this as UUID, make the recognized
+        # taint barrier explicit before the value enters root discovery.
+        project_ref = os.path.basename(raw_project_ref)
+        if project_ref != raw_project_ref:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid project",
+            )
+        return _scoped_project_cards(session, project_ref)
+    return _all_artifact_cards(session)
+
 
 
 @router.delete("/{slug}", status_code=status.HTTP_204_NO_CONTENT)
@@ -159,33 +652,60 @@ async def delete_artifact_by_slug(
     session: ScopedSessionDep,
     project_id: UUID = Query(...),
 ):
-    return await delete_artifact_for_request(session, slug, project_id=project_id)
+    ref = _artifact_delete_ref(slug)
+    return await delete_artifact_for_request(session, ref, project_id=project_id)
 
 
-async def delete_artifact_for_request(session, slug: str, *, project_id: UUID) -> None:
+async def delete_artifact_for_request(
+    session, slug: str | _ArtifactDeleteRef, *, project_id: UUID
+) -> None:
     """Delete one artifact of one project. Unpublishes first; a failed unpublish
     leaves the folder in place and surfaces the error."""
     from cowork.common.settings.user_settings import get_user_settings
     from cowork.services.artifact_publish_key import PublishKey
     from cowork.services.publish import _resolve_publish_endpoint
 
-    # A project can have several artifacts roots in org mode (one per
-    # conversation — see artifact_roots.CONVERSATIONS_DIRNAME), so the slug alone
-    # does not name a directory. Pick the root that actually holds it.
-    #
-    # MVP limitation: the slug is only unique WITHIN a conversation, so two
-    # conversations can both produce e.g. `untitled-artifact` and this deletes
-    # whichever sorts first. Addressing by the artifact's own `metadata.json` id
-    # (already on the card) is the fix; deliberately deferred.
-    bases = [source.base for source in _sources(session, project_id, None)]
-    base = next((b for b in bases if (b / slug).is_dir()), None)
-    if base is None:
-        # No root holds it. Report against the first one so the message names a
-        # real location; with no roots at all there is nothing to delete.
-        if not bases:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
-        base = bases[0]
-    folder = base / slug
+    # This helper is also called directly by internal/test code, so retain the
+    # same concrete parsing boundary the HTTP adapter applies above. In
+    # particular, no request-derived string can select a project path.
+    project_id = UUID(str(project_id))
+
+    # New clients address deletion by artifact id. Keep the slug fallback for
+    # older desktop clients, but never use it when the caller supplied a UUID:
+    # two conversations in one project can legitimately produce the same slug.
+    ref = slug if isinstance(slug, _ArtifactDeleteRef) else _artifact_delete_ref(slug)
+    server_project_id, sources = _scoped_project_sources(session, project_id)
+    source = None
+    folder = None
+    if ref.artifact_id is not None:
+        # `_artifact_delete_ref` already canonicalized this value, but carrying
+        # it through a dataclass hides that sanitizer from SAST dataflow. Parse
+        # again at the resolver boundary so the path-producing identity lookup
+        # receives a visibly canonical UUID, never the route string.
+        artifact_id = UUID(ref.artifact_id).hex
+        # Resolved through the review path so a reviewer who was granted access
+        # to this draft is told they cannot delete it, instead of being told it
+        # does not exist. Without a grant it still 404s — `require_artifact_owner`
+        # below is what refuses, the resolver only decides visibility.
+        from cowork.api.v1.artifact_scope import review_artifact_for_request
+
+        source, folder, _metadata, _is_own = review_artifact_for_request(
+            session, str(server_project_id), artifact_id
+        )
+    else:
+        # The legacy name is compared with entries discovered under each
+        # authorized root. It is never joined onto the root, and symlinked
+        # artifact folders are not eligible for mutation.
+        assert ref.legacy_slug is not None
+        source, folder = _legacy_artifact_for_sources(sources, ref.legacy_slug)
+    if source is None or folder is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
+    folder_name = _artifact_folder_name(source, folder)
+
+    from cowork.services.artifact_permissions import require_artifact_owner
+
+    require_artifact_owner(session, source)
+    expected_artifact_id = artifact_id if ref.artifact_id is not None else None
     publish_url, api_key = _resolve_publish_endpoint(get_user_settings())
     if _org_mode():
         # `ScopedSession.scope` is the wrapper's own attribute — the same one
@@ -202,13 +722,46 @@ async def delete_artifact_for_request(session, slug: str, *, project_id: UUID) -
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Could not mint a publish credential",
             )
+        from cowork.services.artifact_access import (
+            ArtifactAccessUnavailable,
+            revoke_draft_review_access,
+        )
+        try:
+            if expected_artifact_id is None:
+                expected_artifact_id = await run_in_threadpool(
+                    _artifact_id_for_folder, source, folder_name
+                )
+            await revoke_draft_review_access(expected_artifact_id)
+        except ArtifactAccessUnavailable as exc:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=str(exc),
+            ) from exc
+        except OSError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Artifact not found",
+            ) from exc
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
     try:
         await run_in_threadpool(
-            _delete_artifact, folder,
-            artifacts_base=base, api_key=api_key, publish_url=publish_url,
+            _delete_artifact_from_source,
+            source,
+            folder_name,
+            expected_artifact_id=expected_artifact_id,
+            api_key=api_key,
+            publish_url=publish_url,
         )
     except FileNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except OSError as e:
+        # A root/folder replaced by a symlink is deliberately indistinguishable
+        # from an artifact that disappeared between resolution and mutation.
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found") from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except HTTPException:
@@ -218,10 +771,10 @@ async def delete_artifact_for_request(session, slug: str, *, project_id: UUID) -
 
 
 @router.get("/status", dependencies=[Depends(require_local_tenancy)])
-async def artifact_status(path: str = Query(...)):
+async def artifact_status(path: str = Query(..., min_length=1, max_length=4096)):
     # Cheap published/modified/access read for the preview viewer's in-place
     # refresh. Never raises for an unknown path — returns the blank default.
-    return _artifact_status(path)
+    return _desktop_artifact_status_for_path(path)
 
 
 @router.get("/preview", dependencies=[Depends(require_local_tenancy)])
@@ -332,13 +885,13 @@ async def preview_asset(token: str, rel_path: str, request: Request):
     if not target.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-    if _wants_comment_layer(media_type, request):
+    if wants_comment_layer(media_type, request):
         # Offload the (potentially large) synchronous read so it doesn't stall
         # the event loop / other in-flight SSE streams — this endpoint is async.
-        resp = await run_in_threadpool(_html_with_layer, target)
+        resp = await run_in_threadpool(html_with_comment_layer, target)
         if resp is not None:
             return resp
-    return FileResponse(target, media_type=media_type, headers=_NO_CACHE)
+    return FileResponse(target, media_type=media_type, headers=NO_CACHE_HEADERS)
 
 
 @router.get("/serve/{project_name}/{file_path:path}", dependencies=[Depends(require_local_tenancy)])
@@ -359,11 +912,11 @@ def serve_artifact_file(project_name: str, file_path: str, request: Request):
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
     # This endpoint is a sync `def`, so FastAPI already runs it in a threadpool
     # — the blocking read here doesn't touch the event loop.
-    if _wants_comment_layer(media_type, request):
-        resp = _html_with_layer(target)
+    if wants_comment_layer(media_type, request):
+        resp = html_with_comment_layer(target)
         if resp is not None:
             return resp
-    return FileResponse(target, media_type=media_type, headers=_NO_CACHE)
+    return FileResponse(target, media_type=media_type, headers=NO_CACHE_HEADERS)
 
 
 @router.post("/open", dependencies=[Depends(require_local_tenancy)])

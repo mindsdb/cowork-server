@@ -122,7 +122,7 @@ def test_attachment_raw_serves_inline(session, tmp_path):
     session.commit()
     session.refresh(file)
 
-    response = attachment_raw("general", "ignored", file.id, session)
+    response = attachment_raw("general", "ignored", file.id, ScopedSession(session, LOCAL_SCOPE))
     assert response.headers["content-disposition"].startswith("inline")
     assert "photo.png" in response.headers["content-disposition"]
 

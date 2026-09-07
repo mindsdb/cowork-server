@@ -12,7 +12,7 @@ import cowork.channels.plugins.telegram as telegram
 from cowork.channels.ingress import IngressManager, sync_channel_ingress
 
 
-async def _noop_sink(channel_type, event):
+async def _noop_sink(channel_type, event, org_id=None):
     return None
 
 
@@ -39,10 +39,15 @@ class _FakeStreamBridge:
 
     def __init__(self):
         self.opened = asyncio.Event()
+        self.cancelled = False
 
     async def stream_events(self):
         self.opened.set()
-        await asyncio.sleep(3600)
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
         yield []  # unreachable; makes this an async generator
 
     def dedupe_key(self, event):
@@ -53,7 +58,7 @@ class _FakeAdapters:
     def __init__(self, by_type):
         self._by_type = by_type
 
-    def get(self, channel_type):
+    def get(self, channel_type, org_id=None):
         return self._by_type.get(channel_type)
 
 
@@ -272,3 +277,336 @@ def test_slack_event_from_callback():
 
     # Non-event envelopes (e.g. a bare url_verification) are ignored here.
     assert bridge._event_from_callback({"type": "url_verification", "challenge": "abc"}) is None
+
+
+def test_ingress_manager_org_scoped_lease_mutual_exclusion(monkeypatch):
+    import fakeredis
+    import fakeredis.aioredis as fakeaioredis
+
+    from cowork.channels import ingress_lease
+
+    server = fakeredis.FakeServer()
+    client = fakeaioredis.FakeRedis(server=server, decode_responses=True)
+    monkeypatch.setattr(ingress_lease, "get_redis", lambda: client)
+
+    async def scenario():
+        mgr1 = IngressManager(sink=_noop_sink)
+        mgr2 = IngressManager(sink=_noop_sink)
+        bridge1 = _FakeStreamBridge()
+        bridge2 = _FakeStreamBridge()
+
+        await mgr1.start("discord", bridge1, org_id="org-a")
+        await mgr2.start("discord", bridge2, org_id="org-a")
+
+        assert mgr1.is_running("discord", "org-a")
+        assert not mgr2.is_running("discord", "org-a")
+        assert not bridge2.opened.is_set()
+
+        await mgr1.stop("discord", "org-a")
+        assert not mgr1.is_running("discord", "org-a")
+
+        # The lease was released on stop — mgr2 can now acquire it.
+        await mgr2.start("discord", bridge2, org_id="org-a")
+        assert mgr2.is_running("discord", "org-a")
+        await mgr2.stop("discord", "org-a")
+
+    asyncio.run(scenario())
+
+
+def test_ingress_manager_org_scoped_lease_failover_on_renew_loss(monkeypatch):
+    import fakeredis
+    import fakeredis.aioredis as fakeaioredis
+
+    from cowork.channels import ingress_lease
+
+    server = fakeredis.FakeServer()
+    client = fakeaioredis.FakeRedis(server=server, decode_responses=True)
+    monkeypatch.setattr(ingress_lease, "get_redis", lambda: client)
+    monkeypatch.setattr(ingress_lease, "RENEW_INTERVAL_S", 0.01)
+    monkeypatch.setattr(ingress_lease, "LEASE_TTL_S", 0.03)
+
+    async def scenario():
+        mgr1 = IngressManager(sink=_noop_sink)
+        bridge1 = _FakeStreamBridge()
+        await mgr1.start("discord", bridge1, org_id="org-a")
+        assert mgr1.is_running("discord", "org-a")
+
+        # Simulate another replica stealing the lease after mgr1's TTL lapsed.
+        await client.delete(ingress_lease._key("discord", "org-a"))
+        await ingress_lease.acquire("discord", "org-a", "someone-else")
+
+        # mgr1's next renewal tick must notice and stop its own stream loop.
+        await asyncio.sleep(0.05)
+        assert not mgr1.is_running("discord", "org-a")
+
+        mgr2 = IngressManager(sink=_noop_sink)
+        bridge2 = _FakeStreamBridge()
+        await mgr2.start("discord", bridge2, org_id="org-a")
+        assert mgr2.is_running("discord", "org-a")
+        await mgr2.stop("discord", "org-a")
+
+    asyncio.run(scenario())
+
+
+def test_start_swaps_in_a_rebuilt_bridge_for_an_already_running_key(monkeypatch):
+    """Rotating credentials rebuilds the adapter, so start() is handed a new
+    bridge for a key already running on the old token, and must take over."""
+    import fakeredis
+    import fakeredis.aioredis as fakeaioredis
+
+    from cowork.channels import ingress_lease
+
+    server = fakeredis.FakeServer()
+    client = fakeaioredis.FakeRedis(server=server, decode_responses=True)
+    monkeypatch.setattr(ingress_lease, "get_redis", lambda: client)
+
+    async def scenario():
+        mgr = IngressManager(sink=_noop_sink)
+        old_token, new_token = _FakeStreamBridge(), _FakeStreamBridge()
+
+        await mgr.start("discord", old_token, org_id="org-rotate")
+        await asyncio.wait_for(old_token.opened.wait(), 1.0)
+
+        # Same instance again: idempotent, the connection is left alone.
+        await mgr.start("discord", old_token, org_id="org-rotate")
+        assert not old_token.cancelled
+
+        await mgr.start("discord", new_token, org_id="org-rotate")
+        assert mgr.is_running("discord", "org-rotate")
+        await asyncio.wait_for(new_token.opened.wait(), 1.0)
+        assert old_token.cancelled
+
+        await mgr.stop("discord", "org-rotate")
+        assert new_token.cancelled
+
+    asyncio.run(scenario())
+
+
+def test_start_swaps_in_a_rebuilt_bridge_in_local_mode_too():
+    async def scenario():
+        mgr = IngressManager(sink=_noop_sink)
+        old_token, new_token = _FakeStreamBridge(), _FakeStreamBridge()
+
+        await mgr.start("discord", old_token)
+        await asyncio.wait_for(old_token.opened.wait(), 1.0)
+        await mgr.start("discord", new_token)
+        await asyncio.wait_for(new_token.opened.wait(), 1.0)
+
+        assert old_token.cancelled
+        assert mgr.is_running("discord")
+        await mgr.stop("discord")
+
+    asyncio.run(scenario())
+
+
+def test_renew_loop_releases_the_lease_when_its_own_task_died(monkeypatch):
+    """A stream loop can die without going through stop(); renewing forever
+    would then pin the org to a replica that no longer consumes anything."""
+    import contextlib
+
+    import fakeredis
+    import fakeredis.aioredis as fakeaioredis
+
+    from cowork.channels import ingress_lease
+
+    server = fakeredis.FakeServer()
+    client = fakeaioredis.FakeRedis(server=server, decode_responses=True)
+    monkeypatch.setattr(ingress_lease, "get_redis", lambda: client)
+    monkeypatch.setattr(ingress_lease, "RENEW_INTERVAL_S", 0.01)
+
+    async def scenario():
+        mgr1 = IngressManager(sink=_noop_sink)
+        await mgr1.start("discord", _FakeStreamBridge(), org_id="org-dead")
+        task = mgr1._tasks[("discord", "org-dead")]
+
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        await asyncio.sleep(0.05)
+        assert await client.get(ingress_lease._key("discord", "org-dead")) is None
+
+        mgr2 = IngressManager(sink=_noop_sink)
+        await mgr2.start("discord", _FakeStreamBridge(), org_id="org-dead")
+        assert mgr2.is_running("discord", "org-dead")
+        await mgr2.stop_all()
+        await mgr1.stop_all()
+
+    asyncio.run(scenario())
+
+
+def test_ingress_manager_local_mode_never_touches_the_lease(monkeypatch):
+    # org_id=None must skip the lease path entirely — if it didn't, this
+    # would blow up (get_redis is never patched in this test).
+    async def scenario():
+        mgr = IngressManager(sink=_noop_sink)
+        bridge = _FakeStreamBridge()
+        await mgr.start("discord", bridge)
+        assert mgr.is_running("discord")
+        await mgr.stop("discord")
+
+    asyncio.run(scenario())
+
+
+def test_reconcile_once_starts_configured_orgs_and_stops_deleted_ones(monkeypatch):
+    import fakeredis
+    import fakeredis.aioredis as fakeaioredis
+
+    from cowork.channels import ingress_lease
+    from cowork.channels.ingress import reconcile_once
+    from cowork.db.session import get_open_session
+    from cowork.models.channel import ChannelInstallation
+
+    server = fakeredis.FakeServer()
+    client = fakeaioredis.FakeRedis(server=server, decode_responses=True)
+    monkeypatch.setattr(ingress_lease, "get_redis", lambda: client)
+
+    session = get_open_session()
+    try:
+        row = ChannelInstallation(
+            channel_type="discord", display_name="Discord", org_id="org-recon-1",
+        )
+        session.add(row)
+        session.commit()
+        row_id = row.id
+    finally:
+        session.close()
+
+    class _FakeOrgAdapters:
+        """No cache yet for this org — get() misses until get_or_refresh()
+        populates it, exactly like the real LiveAdapterRegistry."""
+
+        def __init__(self):
+            self.bridge = _FakeStreamBridge()
+            self._cached = False
+
+        def get(self, channel_type, org_id=None):
+            if self._cached and channel_type == "discord" and org_id == "org-recon-1":
+                return self.bridge
+            return None
+
+        async def get_or_refresh(self, channel_type, org_id, *, session=None):
+            if channel_type == "discord" and org_id == "org-recon-1":
+                self._cached = True
+                return self.bridge
+            return None
+
+    try:
+        async def scenario():
+            mgr = IngressManager(sink=_noop_sink)
+            adapters = _FakeOrgAdapters()
+
+            await reconcile_once(mgr, adapters)
+            assert mgr.is_running("discord", "org-recon-1")
+
+            cleanup = get_open_session()
+            try:
+                stored = cleanup.get(ChannelInstallation, row_id)
+                cleanup.delete(stored)
+                cleanup.commit()
+            finally:
+                cleanup.close()
+
+            await reconcile_once(mgr, adapters)
+            assert not mgr.is_running("discord", "org-recon-1")
+
+        asyncio.run(scenario())
+    finally:
+        cleanup = get_open_session()
+        try:
+            stored = cleanup.get(ChannelInstallation, row_id)
+            if stored is not None:
+                cleanup.delete(stored)
+                cleanup.commit()
+        finally:
+            cleanup.close()
+
+
+def test_reconciler_task_can_be_started_and_cancelled():
+    from cowork.channels.ingress import start_reconciler
+
+    async def scenario():
+        mgr = IngressManager(sink=_noop_sink)
+        task = start_reconciler(mgr, _FakeAdapters({}), interval_s=0.01)
+        await asyncio.sleep(0.03)
+        assert not task.done()
+        task.cancel()
+        with __import__("contextlib").suppress(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+
+def test_reconcile_once_with_multiple_orgs(monkeypatch):
+    import fakeredis
+    import fakeredis.aioredis as fakeaioredis
+
+    from cowork.channels import ingress_lease
+    from cowork.channels.ingress import reconcile_once
+    from cowork.db.session import get_open_session
+    from cowork.models.channel import ChannelInstallation
+
+    server = fakeredis.FakeServer()
+    client = fakeaioredis.FakeRedis(server=server, decode_responses=True)
+    monkeypatch.setattr(ingress_lease, "get_redis", lambda: client)
+
+    session = get_open_session()
+    row_ids = []
+    try:
+        row1 = ChannelInstallation(
+            channel_type="discord", display_name="Discord", org_id="org-multi-1",
+        )
+        row2 = ChannelInstallation(
+            channel_type="slack", display_name="Slack", org_id="org-multi-2",
+        )
+        session.add(row1)
+        session.add(row2)
+        session.commit()
+        row_ids = [row1.id, row2.id]
+    finally:
+        session.close()
+
+    class _FakeMultiOrgAdapters:
+        """Adapters for two distinct orgs."""
+
+        def __init__(self):
+            self.bridge1 = _FakeStreamBridge()
+            self.bridge2 = _FakeStreamBridge()
+            self._cached = set()
+
+        def get(self, channel_type, org_id=None):
+            if channel_type == "discord" and org_id == "org-multi-1" and "org-multi-1" in self._cached:
+                return self.bridge1
+            if channel_type == "slack" and org_id == "org-multi-2" and "org-multi-2" in self._cached:
+                return self.bridge2
+            return None
+
+        async def get_or_refresh(self, channel_type, org_id, *, session=None):
+            if channel_type == "discord" and org_id == "org-multi-1":
+                self._cached.add("org-multi-1")
+                return self.bridge1
+            if channel_type == "slack" and org_id == "org-multi-2":
+                self._cached.add("org-multi-2")
+                return self.bridge2
+            return None
+
+    try:
+        async def scenario():
+            mgr = IngressManager(sink=_noop_sink)
+            adapters = _FakeMultiOrgAdapters()
+
+            await reconcile_once(mgr, adapters)
+            assert mgr.is_running("discord", "org-multi-1")
+            assert mgr.is_running("slack", "org-multi-2")
+
+        asyncio.run(scenario())
+    finally:
+        cleanup = get_open_session()
+        try:
+            for row_id in row_ids:
+                stored = cleanup.get(ChannelInstallation, row_id)
+                if stored is not None:
+                    cleanup.delete(stored)
+            cleanup.commit()
+        finally:
+            cleanup.close()

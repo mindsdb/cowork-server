@@ -1,8 +1,8 @@
 """Turn-boundary artifact state: what appeared and what changed.
 
-The pre-turn snapshot carries content mtimes, not just folder names, so an
-artifact the agent EDITED (rather than created) is reported as touched. The
-autopublish reconciler's first phase depends on that distinction.
+The pre-turn snapshot carries nanosecond content mtimes, not just folder names,
+so an artifact the agent EDITED (rather than created) is reported as touched
+even inside one whole-second mtime bucket.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import pytest
 from sqlmodel import Session
 
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_engine
 from cowork.services import task_objects as t
 from cowork.services.conversations import ConversationService
@@ -90,6 +90,29 @@ def test_index_reports_edited_existing_slug_as_touched_not_new(conv, tmp_path):
     assert new == []
     assert touched == {"old"}
 
+    from cowork.services.artifact_revisions import list_revisions
+
+    latest = list_revisions(base / "old")[0]
+    assert latest["actor"]["kind"] == "agent"
+    assert latest["conversationId"] == str(conv.id)
+
+
+def test_index_detects_same_second_same_size_agent_edit(conv, tmp_path):
+    base = tmp_path / "artifacts"
+    _make_artifact(base, "old", files={"a.md": "v1"}, meta={"slug": "old", "type": "document"})
+    before, before_mtimes = t.snapshot_artifact_state(base)
+    original_stat = (base / "old" / "a.md").stat()
+
+    (base / "old" / "a.md").write_text("v2")
+    os.utime(base / "old" / "a.md", ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 1))
+
+    new, touched, _scope = t.index_turn_artifacts(
+        conv, conv.id, conv.project_id, base, before, before_mtimes,
+    )
+
+    assert new == []
+    assert touched == {"old"}
+
 
 def test_index_leaves_untouched_slug_out_of_touched(conv, tmp_path):
     base = tmp_path / "artifacts"
@@ -99,6 +122,122 @@ def test_index_leaves_untouched_slug_out_of_touched(conv, tmp_path):
     new, touched, _scope = t.index_turn_artifacts(
         conv, conv.id, conv.project_id, base, before, before_mtimes,
     )
+    assert new == []
+    assert touched == set()
+
+
+def test_index_finishes_no_change_repair_without_marking_artifact_touched(conv, tmp_path):
+    from cowork.services.artifact_identity import ensure_full_id
+    from cowork.services.artifact_revisions import (
+        agent_repair_detail,
+        create_agent_repair,
+        current_source,
+    )
+
+    base = tmp_path / "artifacts"
+    _make_artifact(
+        base,
+        "old",
+        files={"a.md": "v1"},
+        meta={"slug": "old", "type": "document", "primary": "a.md"},
+    )
+    folder = base / "old"
+    artifact_id, metadata = ensure_full_id(folder)
+    current = current_source(folder, metadata, artifact_id)
+    repair = create_agent_repair(
+        folder,
+        metadata,
+        artifact_id,
+        expected_revision_id=current["revision"]["id"],
+        comment_thread_id="thread-1",
+        selector=None,
+        thread=[{"text": "Check this"}],
+        conversation_id=str(conv.id),
+    )
+    before, before_mtimes = t.snapshot_artifact_state(base)
+
+    _new, touched, _scope = t.index_turn_artifacts(
+        conv, conv.id, conv.project_id, base, before, before_mtimes,
+    )
+
+    assert touched == set()
+    detail = agent_repair_detail(folder, repair["repair"]["id"])
+    assert detail["repair"]["status"] == "no_change"
+
+
+def test_concurrent_sibling_artifact_is_not_claimed_by_this_turn(conv, tmp_path):
+    """ENG-1933 regression: every conversation in a project shares one
+    artifacts dir, so a sibling conversation's brand-new artifact appears in
+    this turn's before/after diff too. `tracked_new` — what this turn's own
+    tools reported creating — is what keeps it out of this turn's cards."""
+    base = tmp_path / "artifacts"
+    base.mkdir()
+    before, before_mtimes = t.snapshot_artifact_state(base)
+
+    _make_artifact(base, "mine", files={"a.md": "x"}, meta={"slug": "mine", "type": "document"})
+    # A concurrent turn in another conversation, writing the same directory.
+    _make_artifact(base, "theirs", files={"b.md": "y"}, meta={"slug": "theirs", "type": "document"})
+
+    new, touched, _scope = t.index_turn_artifacts(
+        conv, conv.id, conv.project_id, base, before, before_mtimes,
+        tracked_new={"mine"}, tracked_edits={"mine"},
+    )
+
+    assert new == ["mine"]
+    assert "theirs" not in touched
+
+
+def test_without_tracking_both_are_claimed(conv, tmp_path):
+    """The old behaviour, pinned so the fix above is not vacuous: with no
+    tracked set every folder that appeared is claimed — which is exactly the
+    bug when two conversations share a directory. Still the path org mode
+    takes, where a pod's dir cannot be written by another conversation."""
+    base = tmp_path / "artifacts"
+    base.mkdir()
+    before, before_mtimes = t.snapshot_artifact_state(base)
+
+    _make_artifact(base, "mine", files={"a.md": "x"}, meta={"slug": "mine", "type": "document"})
+    _make_artifact(base, "theirs", files={"b.md": "y"}, meta={"slug": "theirs", "type": "document"})
+
+    new, _touched, _scope = t.index_turn_artifacts(
+        conv, conv.id, conv.project_id, base, before, before_mtimes,
+    )
+
+    assert new == ["mine", "theirs"]
+
+
+def test_tracked_edit_of_a_sibling_artifact_is_not_claimed(conv, tmp_path):
+    """A pre-existing artifact edited by a CONCURRENT turn must not be carded
+    onto this one either, even though its mtime grew during this turn."""
+    base = tmp_path / "artifacts"
+    _make_artifact(base, "mine", files={"a.md": "v1"}, meta={"slug": "mine", "type": "document"})
+    _make_artifact(base, "theirs", files={"b.md": "v1"}, meta={"slug": "theirs", "type": "document"})
+    before, before_mtimes = t.snapshot_artifact_state(base)
+
+    for slug, name in (("mine", "a.md"), ("theirs", "b.md")):
+        (base / slug / name).write_text("v2")
+        _bump_mtime(base / slug / name, 120)
+
+    _new, touched, _scope = t.index_turn_artifacts(
+        conv, conv.id, conv.project_id, base, before, before_mtimes,
+        tracked_new={"mine"}, tracked_edits={"mine"},
+    )
+
+    assert touched == {"mine"}
+
+
+def test_tracked_slug_that_never_appeared_is_ignored(conv, tmp_path):
+    """An artifact the agent opened and then deleted must not produce a card
+    for a folder that is no longer on disk."""
+    base = tmp_path / "artifacts"
+    base.mkdir()
+    before, before_mtimes = t.snapshot_artifact_state(base)
+
+    new, touched, _scope = t.index_turn_artifacts(
+        conv, conv.id, conv.project_id, base, before, before_mtimes,
+        tracked_new={"vanished"}, tracked_edits={"vanished"},
+    )
+
     assert new == []
     assert touched == set()
 
@@ -145,6 +284,49 @@ def test_cards_carry_project_identity_when_given(tmp_path):
 
     assert card["projectId"] == "p-1"
     assert card["projectName"] == "Alpha"
+
+
+async def test_local_mode_cards_an_edited_slug_without_publishing(tmp_path):
+    # Desktop/local mode never publishes (autopublish_project_artifacts is a
+    # no-op outside org mode), so an edited artifact must still card off the
+    # local folder alone — gating it on `republished` would mean local edits
+    # never card at all.
+    base = tmp_path / "artifacts"
+    _make_artifact(base, "dash", files={"index.html": "v2"},
+                   meta={"slug": "dash", "name": "Dash", "type": "html-app"})
+
+    cards = await t.publish_and_card_turn_artifacts(
+        base, new_slugs=[], touched_slugs={"dash"}, scope=LOCAL_SCOPE,
+    )
+
+    assert [c["slug"] for c in cards] == ["dash"]
+
+
+async def test_org_mode_still_requires_a_successful_republish_to_card_an_edit(
+    tmp_path, monkeypatch,
+):
+    # Org mode keeps the original guarantee: an edited artifact only cards once
+    # its republish this turn actually succeeded (a card without a fresh URL
+    # would be useless there, and self-heal publishes of unrelated slugs must
+    # never attach to this answer).
+    base = tmp_path / "artifacts"
+    _make_artifact(base, "dash", files={"index.html": "v2"},
+                   meta={"slug": "dash", "name": "Dash", "type": "html-app"})
+
+    async def fake_autopublish(*args, **kwargs):
+        return set()  # republish did not succeed this turn
+
+    monkeypatch.setattr(
+        "cowork.services.artifact_autopublish.autopublish_project_artifacts",
+        fake_autopublish,
+    )
+    org_scope = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
+
+    cards = await t.publish_and_card_turn_artifacts(
+        base, new_slugs=[], touched_slugs={"dash"}, scope=org_scope,
+    )
+
+    assert cards == []
 
 
 def test_scope_falls_back_to_the_ambient_turn_scope(conv, tmp_path, monkeypatch):

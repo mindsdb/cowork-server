@@ -44,14 +44,19 @@ def set_artifact_run_context(
         }
 
 
-def finalize_artifact_run_context(task_id: str) -> None:
+def finalize_artifact_run_context(task_id: str) -> set[str]:
     """Drop the run context and refresh files[] in the metadata of every
     artifact this run created (Hermes writes files with its own file
-    tools, so the store only learns about them by rescanning)."""
+    tools, so the store only learns about them by rescanning).
+
+    Returns the slugs this run created. The caller uses them to bound which
+    artifacts the turn may claim: every conversation in a project shares one
+    artifacts directory, so "a folder appeared during this turn" does not mean
+    this turn made it (ENG-1933)."""
     with _ARTIFACT_CONTEXT_LOCK:
         ctx = _ARTIFACT_RUN_CONTEXTS.pop(task_id, None)
     if ctx is None or not ctx["created_slugs"]:
-        return
+        return set()
     from anton.core.artifacts.store import ArtifactStore
 
     store = ArtifactStore(ctx["artifacts_root"])
@@ -60,6 +65,7 @@ def finalize_artifact_run_context(task_id: str) -> None:
             store.rescan_files(slug)
         except Exception:
             logger.warning("Could not rescan artifact %r after run", slug, exc_info=True)
+    return set(ctx["created_slugs"])
 
 
 def _artifact_context(kwargs: dict) -> dict | None:

@@ -70,6 +70,17 @@ class OAuthSpec:
 
 
 @dataclass(frozen=True)
+class VerifyResult:
+    """Outcome of a plugin's `verify` hook: did these credentials actually
+    authenticate against the platform, not just get typed into the form. In org
+    mode, routing_key (if present) is stamped on the installation."""
+
+    ok: bool
+    detail: str = ""
+    routing_key: str | None = None
+
+
+@dataclass(frozen=True)
 class ChannelCapabilities:
     """What a channel supports, for the UI to decide which forms/buttons to show.
 
@@ -83,6 +94,7 @@ class ChannelCapabilities:
     supports_oauth: bool = False
     supports_direct_credentials: bool = True
     supports_custom_ack: bool = False
+    supports_verify: bool = False
 
 
 @dataclass(frozen=True)
@@ -99,3 +111,12 @@ class ChannelPlugin:
     connector_spec: dict[str, Any] | None = field(default=None)
     lifecycle: ChannelLifecycle | None = field(default=None)
     capabilities: ChannelCapabilities = field(default_factory=ChannelCapabilities)
+    # Pulls a pre-scope routing key (Slack team_id, ...) from inbound
+    # body/headers, or None if no per-org webhook routing applies.
+    extract_routing_key: Callable[[bytes, Mapping[str, str]], str | None] | None = None
+    # Calls the platform to verify credentials authenticate (None means no check available).
+    # `_is_configured` only checks presence, not validity.
+    verify: Callable[[Mapping[str, str]], Awaitable["VerifyResult"]] | None = None
+    # Handles platform handshakes (e.g. Slack url_verification, WhatsApp hub.challenge)
+    # that arrive before routing. Returns WebhookHandshake; None means no handshake applies.
+    handshake: Callable[[bytes, Mapping[str, str], Mapping[str, str]], WebhookHandshake | None] | None = None

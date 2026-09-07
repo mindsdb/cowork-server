@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Annotated, Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
@@ -22,7 +23,7 @@ from cowork.api.v1.endpoints.guards import require_local, require_local_tenancy
 from cowork.common.paths import cowork_home
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
-from cowork.principal import Principal, can_manage_org, get_principal
+from cowork.principal import Principal, caller_bearer, can_manage_org, get_principal
 from cowork.schemas.base import CamelRequest
 from cowork.schemas.settings import (
     SettingResponse,
@@ -35,18 +36,25 @@ from cowork.services.providers import (
     fetch_minds_models,
     fetch_org_model_catalog,
     model_value_rejection,
+    persist_enabled_model_map,
+    persist_role_defaults_map,
     ping_providers,
     resolve_stored_key,
     validate_provider as validate_provider_svc,
+    warm_enabled_model_map,
 )
 from cowork.services.settings import SettingService
+
+logger = logging.getLogger(__name__)
 from cowork.common.settings.app_settings import (
+    AGENT_ROLE_NAMES,
     DIRECT_EFFORT_CATALOG,
     RECOMMENDED_MODELS,
     RECOMMENDED_PAIR,
 )
 from cowork.common.settings.user_settings import (
     Provider,
+    minds_role_start_models,
     provider_api_key_str,
     setting_is_org_scoped,
 )
@@ -81,15 +89,42 @@ def list_settings(session: SessionDep, scope: ScopeDep) -> list[SettingResponse]
     return SettingService(session, scope).list_settings()
 
 
-def _bearer_token(request: Request | None) -> str:
-    """The caller's own bearer, for the org catalog fetch. Mirrors
-    ``recommended_models``: never the stored key or the tenant-settable
-    ``minds_url``, or a member's JWT could be forwarded to an admin-chosen
-    host."""
-    if request is None:
-        return ""
-    header = request.headers.get("Authorization", "")
-    return header[7:].strip() if header.lower().startswith("bearer ") else ""
+def _reject_malformed_role_defaults(updates: dict[str, Any]) -> None:
+    """400 on a ``minds_role_defaults`` write that is not role -> model id.
+
+    The endpoint below writes this map itself, from the catalog, but the key is a
+    declared `UserSettings` field like any other, so `PUT /settings/{key}` accepts
+    it too and its values become the model every role with no explicit pick starts
+    on. Resolution filters the map when it reads it, which turns a bad hand-write
+    into every role silently falling back to the compiled table; failing the write
+    says which part was wrong instead.
+
+    Catalog membership is deliberately NOT checked here (see the writer inventory
+    in `cowork/services/providers.py`): the value is derived from the catalog in the
+    first place, and `_enabled_aware_default` discards a model the availability map
+    does not affirm.
+    """
+    raw = (updates or {}).get("minds_role_defaults")
+    if raw is None or not isinstance(raw, str) or not raw.strip():
+        return
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="minds_role_defaults must be a JSON object of agent role -> model id",
+        ) from None
+    bad = None
+    if not isinstance(parsed, dict):
+        bad = "must be a JSON object of agent role -> model id"
+    elif unknown := sorted(k for k in parsed if k not in AGENT_ROLE_NAMES):
+        bad = f"names no agent role: {', '.join(unknown)}"
+    elif empty := sorted(k for k, v in parsed.items() if not isinstance(v, str) or not v.strip()):
+        bad = f"gives no model id for: {', '.join(empty)}"
+    if bad:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"minds_role_defaults {bad}"
+        )
 
 
 async def _reject_unservable_models(
@@ -136,7 +171,7 @@ async def _reject_unservable_models(
             key,
             value,
             org_id=scope.org_id if scope and scope.org_mode else None,
-            bearer_token=_bearer_token(request),
+            bearer_token=caller_bearer(request),
         )
         if rejection:
             raise HTTPException(
@@ -163,6 +198,7 @@ async def bulk_upsert_settings(
     _require_org_admin_for(live_keys, scope, principal)
     # Before anything is staged, so a bad model id 400s with nothing written —
     # same all-or-nothing contract as the field validation below.
+    _reject_malformed_role_defaults(body.values or {})
     await _reject_unservable_models(session, scope, body.values or {}, request)
     try:
         updated = SettingService(session, scope).save_all(body.values)
@@ -181,6 +217,7 @@ async def upsert_setting(
     request: Request = None,
 ) -> SettingResponse:
     _require_org_admin_for([key], scope, principal)
+    _reject_malformed_role_defaults({key: body.value})
     await _reject_unservable_models(session, scope, {key: body.value}, request)
     try:
         return SettingService(session, scope).upsert_setting(key, body.value)
@@ -406,8 +443,7 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         # Org catalog: operator endpoint + the caller's own bearer, per org.
         # Never the stored key or s.minds_url (both tenant-settable), or a
         # member's JWT could be forwarded to an admin-chosen host.
-        bearer = request.headers.get("Authorization", "")
-        token = bearer[7:].strip() if bearer.lower().startswith("bearer ") else ""
+        token = caller_bearer(request)
         if token and scope.org_id:
             listing = await fetch_org_model_catalog(
                 org_id=scope.org_id, bearer_token=token, refresh=refresh
@@ -422,40 +458,60 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         live_efforts = listing.efforts
         live_enabled = listing.enabled
         live_labels = listing.labels
+        live_role_defaults = listing.role_defaults
         if live:
             recommended["minds-cloud"] = live
             # Cache the availability map so model-default resolution
             # (UserSettings._minds_enabled_map) can avoid locked models without
             # a network call in the turn path. Adding credits re-enables the
-            # canonical defaults on the next settings load.
+            # canonical defaults on the next settings load. The guarded write
+            # (never clobber a good map with {}, order-preserving, change-only)
+            # is shared with the startup / credential-sync warm via
+            # persist_enabled_model_map so the invariants can't drift.
             #
             # Guard on `live_enabled` (the map we actually write), NOT `live`
             # (the id list): a gateway that returns ids without `enabled` flags
             # yields `live` non-empty but `live_enabled == {}`, and writing {}
             # would wipe a previously-good map — re-locking the canonical
-            # default, i.e. the exact bug this PR fixes. And only write on a real
-            # change: this endpoint is hit on every boot/settings-open, and
-            # upsert_setting commits a row + invalidates the settings cache, so
-            # an unconditional write churns every UserSettings reader.
-            if live_enabled:
-                # Persist ORDER-PRESERVING JSON — never sort_keys. The
-                # first-enabled default fallback (_enabled_aware_default)
-                # iterates the map in insertion order, relying on /v1/models
-                # listing the free/baseline model first; an alphabetized map
-                # could silently promote the wrong model. The compare is
-                # order-sensitive too, so a gateway re-ranking (same set, new
-                # baseline first) also counts as a change and refreshes the map.
-                desired = json.dumps(live_enabled)
-                try:
-                    stored = json.dumps(json.loads(s.minds_model_enabled or "{}"))
-                except (ValueError, TypeError):
-                    stored = "{}"
-                if desired != stored:
-                    # Intentionally ungated by _require_org_admin_for: the value
-                    # is system-derived (MindsHub, via admin-set key/URL), so a
-                    # member can trigger this refresh but can't steer what's
-                    # stored — and gating it would leave the map stale.
-                    SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
+            # default, i.e. the exact bug this PR fixes.
+            #
+            # Intentionally ungated by _require_org_admin_for: the value is
+            # system-derived (MindsHub, via admin-set key/URL), so a member can
+            # trigger this refresh but can't steer what's stored — and gating it
+            # would leave the map stale.
+            persist_enabled_model_map(session, scope, s.minds_model_enabled, live_enabled, live)
+        # Cache the catalog's declared per-role defaults, so a default moved in
+        # the config reaches this install on its next settings load with no client
+        # release (UserSettings._minds_role_default_map).
+        #
+        # Its own writer rather than the one above, because the availability map
+        # carries rules this one has no use for: that map is densified over the
+        # served catalogue and pruned of retired ids, since resolution reads key
+        # absence there as "not served". Here every key is a role we serve.
+        #
+        # Outside the `if live:` block on purpose. That block is gated on the id
+        # list, and a gateway can publish role defaults while listing nothing we
+        # recognise; nested, the defaults would be dropped for exactly that
+        # gateway.
+        persist_role_defaults_map(session, scope, s.minds_role_defaults, live_role_defaults)
+        # The picker asks the server which model each role starts on, so it has to
+        # be told the same answer resolution will give. Left on the compiled table,
+        # the two disagree the moment a default moves in config and the user sees
+        # one model in Settings while turns run another — and the desktop writes
+        # this pair back as explicit model pins when a save repoints a role onto
+        # MindsHub, so a wrong value here does not stay a display bug.
+        #
+        # Read from the map resolution will read, which is the live one when the
+        # gateway published defaults and the stored one otherwise. Not gated on
+        # `live_role_defaults`: a gateway that stops sending `default_for` leaves a
+        # good cache in place, resolution keeps using it, and a pair rebuilt from
+        # the compiled table would then contradict every turn.
+        declared_roles = live_role_defaults or s._minds_role_default_map()
+        if declared_roles:
+            pair["minds-cloud"] = minds_role_start_models(
+                declared=declared_roles,
+                enabled_map=live_enabled or s._minds_enabled_map(),
+            )
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
         model_labels.update(live_labels)
@@ -534,6 +590,23 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         _fill_missing(model_providers, oc_listing.providers, skip=reserved_ids)
         _fill_missing(model_families, oc_listing.families, skip=reserved_ids)
 
+    # Which model the pre-Anton route gate will actually run on (ENG-1851), so
+    # the Settings row can show it instead of inferring it from the provider —
+    # the UI ships OTA ahead of or behind this server, and its idea of the
+    # row's provider can differ from `_resolve_provider`'s. Reloaded after the
+    # persists above so the availability map and role defaults just written
+    # are what resolve, exactly as the next turn will see them. `model` is
+    # None when the gate has nothing to run on (openai-compatible with no
+    # model picked): that turn delegates without a gate call.
+    gate_settings = SettingService(session, scope).load()
+    gate_provider = gate_settings.resolved_router_provider
+    gate = {
+        # The UI's provider type is the enum value hyphenated ("minds-cloud").
+        "provider": gate_provider.value.replace("_", "-"),
+        "model": gate_settings.resolved_gate_model,
+        "followsRouterPick": gate_provider is Provider.OPENAI_COMPATIBLE,
+    }
+
     return {
         "recommendedModels": recommended,
         "recommendedPair": pair,
@@ -542,6 +615,7 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         "modelLabels": model_labels,
         "modelProviders": model_providers,
         "modelFamilies": model_families,
+        "gate": gate,
     }
 
 
@@ -585,7 +659,7 @@ class _RawSettingsBody(BaseModel):
 
 
 @router.post("/raw")
-def write_raw_settings(body: _RawSettingsBody, session: SessionDep, request: Request):
+async def write_raw_settings(body: _RawSettingsBody, session: SessionDep, request: Request):
     """Merge dotenv content into ~/.cowork/.env and sync recognised keys to the DB.
 
     Uses key-level merge (not full overwrite) because callers like the
@@ -624,6 +698,22 @@ def write_raw_settings(body: _RawSettingsBody, session: SessionDep, request: Req
         raise HTTPException(status_code=400, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail="Settings could not be saved.") from e
+
+    # If this write lands a MindsHub key, warm the availability map now — before
+    # any first turn — so a free-tier default resolves to an affordable model
+    # instead of 402'ing on message one (ENG-748). NOTE: the Electron desktop
+    # sign-in does NOT reach here — it writes .env directly and syncs keys via
+    # per-key PUTs (see cowork minds-auth.ts), so the desktop first-turn gap is
+    # closed by the boot warm in server.py, not this seam. This covers the
+    # non-Electron dotenv-import callers (standalone anton, direct /raw). Keep
+    # it: it's the correct place to warm for any caller that does POST here, and
+    # it's fail-open. Best-effort: never let a warm failure break the save the
+    # client is waiting on, and log message-only (the warm frames hold the API
+    # key, which RICH_LOGGING's tracebacks_show_locals would render).
+    try:
+        await warm_enabled_model_map(session)
+    except Exception as exc:
+        logger.debug("post-credential-sync model-map warm failed (non-fatal): %s", exc)
 
     return {"ok": True}
 

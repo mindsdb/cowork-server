@@ -11,8 +11,13 @@ provisioning secret; PR envs POST to /dev/mint-test-user/, which is mounted
 only where `ephemeral` is on and needs no secret. Either way the response
 carries the user_id and organization_id these tests send as headers.
 
+Cloudflare Access fronts /v1/internal* on auth's public host, so the
+provisioning call goes to auth's Service instead. CI uses cluster DNS from a
+runner in the cluster; by hand, forward the port first with
+`kubectl port-forward -n staging svc/auth 8080:80`.
+
     COWORK_BASE_URL=https://cowork.staging.example.com \\
-    TEST_USER_PROVISION_URL=https://auth.staging.example.com/v1/internal/test-users/ \\
+    TEST_USER_PROVISION_URL=http://localhost:8080/v1/internal/test-users/ \\
     TEST_USER_PROVISION_SECRET=... \\
     uv run pytest tests/integration/test_post_deploy.py -v
 
@@ -44,6 +49,8 @@ import uuid
 import httpx
 import pytest
 
+from tests.integration.prereq import missing_prerequisite
+
 pytestmark = pytest.mark.postdeploy
 
 # A turn that runs for a while, so there is something to cancel and something
@@ -52,10 +59,25 @@ SLOW_PROMPT = (
     "Count slowly from 1 to 40, one number per line, "
     "pausing to think between each one."
 )
+# The cancel test needs a turn that is still running one HTTP call later, which
+# SLOW_PROMPT does not guarantee: a fast deployment answered all 40 lines before
+# the next call landed, and the test skipped rather than cancelling anything.
+# Ten times the output buys that margin without making a failure hang CI — the
+# turn is cancelled or abandoned either way, so the extra tokens are never
+# actually generated.
+CANCEL_PROMPT = (
+    "Count slowly from 1 to 400, one number per line, "
+    "pausing to think between each one."
+)
 QUICK_PROMPT = "Reply with exactly the word: pong"
 
 TURN_TIMEOUT_S = 180.0
 CANCEL_VISIBLE_S = 45.0
+CROSS_REPLICA_VISIBILITY_S = 10.0
+# How long to wait for the server to report the turn as running before giving
+# up on having anything to cancel. This covers the gap between the caller
+# disconnecting and the registry answering, not the model's thinking time.
+CANCEL_PREMISE_S = 10.0
 
 # The auth hosts sit behind Cloudflare, whose bot rules 403 a default httpx or
 # requests User-Agent ("error code: 1010"). The block is signature-based, so a
@@ -66,14 +88,24 @@ BROWSER_UA = (
 )
 
 
+class _Identity(dict[str, str]):
+    """A test identity whose repr can safely appear in a pytest traceback."""
+
+    def __repr__(self) -> str:
+        redacted = dict(self)
+        if "api_key" in redacted:
+            redacted["api_key"] = "***"
+        return repr(redacted)
+
+
 def _base_url() -> str:
     url = os.environ.get("COWORK_BASE_URL")
     if not url:
-        pytest.skip("COWORK_BASE_URL not set; post-deploy tests only run against a deployment")
+        missing_prerequisite("COWORK_BASE_URL not set; post-deploy tests only run against a deployment")
     return url.rstrip("/")
 
 
-def _provision_identity() -> dict[str, str]:
+def _provision_identity() -> _Identity:
     """A user_id, organization_id and email for a throwaway tenant.
 
     Three sources, in order:
@@ -91,12 +123,12 @@ def _provision_identity() -> dict[str, str]:
     user_id = os.environ.get("COWORK_TEST_USER_ID")
     org_id = os.environ.get("COWORK_TEST_ORG_ID")
     if api_key and user_id and org_id:
-        return {
+        return _Identity({
             "api_key": api_key,
             "user_id": user_id,
             "organization_id": org_id,
             "email": os.environ.get("COWORK_TEST_USER_EMAIL", "postdeploy@example.com"),
-        }
+        })
 
     mint_url = os.environ.get("TEST_USER_MINT_URL")
     if mint_url:
@@ -109,7 +141,7 @@ def _provision_identity() -> dict[str, str]:
         provision_url = os.environ.get("TEST_USER_PROVISION_URL")
         secret = os.environ.get("TEST_USER_PROVISION_SECRET")
         if not (provision_url and secret):
-            pytest.skip(
+            missing_prerequisite(
                 "no identity source: set COWORK_TEST_API_KEY + COWORK_TEST_USER_ID + "
                 "COWORK_TEST_ORG_ID, or TEST_USER_MINT_URL, or TEST_USER_PROVISION_URL "
                 "+ TEST_USER_PROVISION_SECRET"
@@ -132,11 +164,11 @@ def _provision_identity() -> dict[str, str]:
             f"auth returned no organization_id for {user.get('email')}; "
             "the personal org is provisioned on first login and could not be resolved"
         )
-    return user
+    return _Identity(user)
 
 
 @pytest.fixture(scope="session")
-def identity() -> dict[str, str]:
+def identity() -> _Identity:
     """Provisioned once per run: minting is a Keycloak round trip per call."""
     return _provision_identity()
 
@@ -265,7 +297,7 @@ def test_reconnect_works_on_the_other_replica(conversation_id, identity):
     url_a = os.environ.get("COWORK_BASE_URL_A")
     url_b = os.environ.get("COWORK_BASE_URL_B")
     if not (url_a and url_b):
-        pytest.skip("COWORK_BASE_URL_A and _B not set; needs two reachable pods")
+        missing_prerequisite("COWORK_BASE_URL_A and _B not set; needs two reachable pods")
 
     headers = _direct_headers(identity)
     with httpx.Client(base_url=url_a.rstrip("/"), headers=headers, timeout=30.0) as replica_a:
@@ -280,8 +312,7 @@ def test_reconnect_works_on_the_other_replica(conversation_id, identity):
                     break
 
     with httpx.Client(base_url=url_b.rstrip("/"), headers=headers, timeout=30.0) as replica_b:
-        probe = replica_b.get("/api/v1/responses/in-flight",
-                              params={"conversation_id": conversation_id}).json()
+        probe = _await_shared_buffer(replica_b, conversation_id)
         # Before the Redis backend this replica had no handle and no buffer,
         # and answered has_buffer=False.
         assert probe["has_buffer"] is True, probe
@@ -297,22 +328,111 @@ def test_reconnect_works_on_the_other_replica(conversation_id, identity):
     assert "response.created" in replayed, replayed
 
 
+def _await_shared_buffer(api, conversation_id, *, timeout_s=CROSS_REPLICA_VISIBILITY_S) -> dict:
+    """Wait for a peer replica to observe the turn index written by the producer.
+
+    ``response.created`` is appended before the remote reply generator starts,
+    so seeing that frame on replica A does not mean its Redis turn-index write
+    has completed. The index is shared synchronously once written; this wait
+    covers only that startup ordering window.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        probe = api.get(
+            "/api/v1/responses/in-flight",
+            params={"conversation_id": conversation_id},
+        ).json()
+        if probe.get("has_buffer") or time.monotonic() >= deadline:
+            return probe
+        time.sleep(0.1)
+
+
+def _await_running_turn(api, conversation_id) -> dict | None:
+    """Wait until the server says this conversation has a turn running.
+
+    Returns the probe once `in_flight` is true, or None when the turn provably
+    ran to completion before it could be observed running.
+
+    Breaking out of the stream on the first `event:` line is not enough to
+    know a turn is cancellable. The formatter yields `response.created` before
+    it iterates the model's stream at all, so that frame says the turn was
+    registered and nothing more, while `cancel` answers `False` for a turn that
+    has already finished. A cancel fired off the back of that frame is
+    asserting on a race, and it lost four of the five runs on record.
+
+    Two things answer `in_flight: false` and they are not the same. A turn that
+    ran and ended has a buffer on this replica, and no amount of waiting brings
+    it back. A replica that never saw this turn has no buffer, and the answer
+    changes as soon as the shared store catches up. `has_buffer` is what
+    separates them, and it is the only thing that does: the endpoint always
+    sends `latest_seq`, as 0 when there is no buffer, so a turn that ended
+    having written no records is indistinguishable by that field from a turn
+    this replica never heard of. Reading it would report a routing problem as
+    "the model was too fast", and a zero-record turn as no buffer at all.
+    """
+    deadline = time.monotonic() + CANCEL_PREMISE_S
+    probe = None
+    while time.monotonic() < deadline:
+        probe = api.get("/api/v1/responses/in-flight",
+                        params={"conversation_id": conversation_id}).json()
+        if probe.get("in_flight") is True:
+            return probe
+        # Not running, and this replica has the turn: it ended. `latest_seq`
+        # deliberately does not appear here, see above.
+        if probe.get("has_buffer") is True:
+            return None
+        time.sleep(0.5)
+    # Ran out of window without ever seeing a buffer. That is not a fast model,
+    # so say so rather than letting the caller blame one.
+    raise AssertionError(
+        f"no turn was ever visible for this conversation within {CANCEL_PREMISE_S:.0f}s, "
+        f"and no buffer appeared either — the turn never reached this replica: {probe}"
+    )
+
+
 def test_cancel_ends_the_turn(api, conversation_id):
     """After POST /cancel, /in-flight reports the turn as finished."""
     with api.stream(
         "POST", "/api/v1/responses/",
-        json={"input": SLOW_PROMPT, "conversation": conversation_id, "stream": True},
+        json={"input": CANCEL_PROMPT, "conversation": conversation_id, "stream": True},
         timeout=httpx.Timeout(TURN_TIMEOUT_S, connect=10.0),
     ) as resp:
         assert resp.status_code == 200
+        # Wait for a frame the MODEL produced, not just the one the formatter
+        # emits before it touches the model's stream. `response.created` arrives
+        # whether or not anything is generating yet, so disconnecting on it is
+        # what put the whole race here in the first place. A second event means
+        # the turn is mid-stream at the moment this connection drops.
+        seen = 0
         for line in resp.iter_lines():
             if line.startswith("event:"):
-                break
+                seen += 1
+                if seen >= 2:
+                    break
+        assert seen >= 2, "the turn produced no frame beyond response.created"
+
+    # Establish the premise before asserting on it: there has to be a running
+    # turn for "cancel stops it" to mean anything. A skip here means the model
+    # finished a 400-step prompt between two HTTP calls, which is a fact about
+    # the deployment and not a defect — but it also means this test covered
+    # nothing on this run, so read the outcome line and not the job's colour:
+    #   gh run view <id> --log | grep test_cancel_ends_the_turn
+    running = _await_running_turn(api, conversation_id)
+    if running is None:
+        pytest.skip(
+            "the turn ran to completion before it could be observed running, so "
+            "there was nothing to cancel and this run proved nothing; the prompt "
+            "needs to outlast two HTTP calls on this deployment"
+        )
 
     cancel = api.post("/api/v1/responses/cancel",
                       json={"conversation_id": conversation_id})
     assert cancel.status_code == 200, cancel.text
-    assert cancel.json()["cancelled"] is True
+    # Now load-bearing: the turn was running one call ago, so False here means
+    # the server failed to stop a turn it was told to stop.
+    assert cancel.json()["cancelled"] is True, (
+        f"cancel reported nothing to cancel for a turn that was in flight: {running}"
+    )
 
     deadline = time.monotonic() + CANCEL_VISIBLE_S
     while time.monotonic() < deadline:
@@ -353,3 +473,60 @@ def test_deleting_a_conversation_leaves_no_replayable_buffer(api, conversation_i
     probe = api.get("/api/v1/responses/in-flight",
                     params={"conversation_id": conversation_id}).json()
     assert probe["has_buffer"] is False, probe
+
+
+def test_deleting_a_scheduled_runs_conversation_keeps_the_run(api):
+    """Deleting a conversation a scheduled run produced must release
+    schedule_runs.conversation_id and schedules.last_result_conversation_id
+    instead of FK-violating into a 500 (ENG-1950), and the run history must
+    survive with its verdict intact. The unit suite pins this on an
+    FK-enforcing SQLite engine; this is the same cascade against the
+    deployment's real alembic-built Postgres."""
+    created = api.post("/api/v1/schedules/", json={
+        "title": "post-deploy delete cascade",
+        "prompt": QUICK_PROMPT,
+        "cadence": "daily",
+        "nextRunAt": "2030-01-01T00:00:00Z",
+        "enabled": False,  # run-now only; the cron loop must not pick it up
+    })
+    assert created.status_code == 201, created.text
+    schedule_id = created.json()["id"]
+    try:
+        run_now = api.post(f"/api/v1/schedules/{schedule_id}/run-now")
+        assert run_now.status_code == 202, run_now.text
+        conversation_id = run_now.json()["conversation_id"]
+
+        # Wait for the run to reach a terminal status. Which terminal status
+        # is the turn's business (test_a_turn_runs_end_to_end owns that);
+        # the cascade below must hold for any of them.
+        deadline = time.time() + TURN_TIMEOUT_S
+        run = None
+        while time.time() < deadline:
+            listing = api.get(f"/api/v1/schedules/{schedule_id}/runs")
+            assert listing.status_code == 200, listing.text
+            run = next(
+                (r for r in listing.json()["runs"]
+                 if r.get("conversationId") == conversation_id),
+                None,
+            )
+            if run is not None and run["status"] != "running":
+                break
+            time.sleep(2)
+        assert run is not None and run["status"] != "running", (
+            f"run never reached a terminal status: {run}"
+        )
+
+        deleted = api.delete(f"/api/v1/conversations/{conversation_id}")
+        assert deleted.status_code in (200, 204), deleted.text
+
+        after = api.get(f"/api/v1/schedules/{schedule_id}/runs").json()["runs"]
+        kept = next((r for r in after if r["id"] == run["id"]), None)
+        assert kept is not None, "run history must outlive the chat it produced"
+        assert kept["conversationId"] is None
+        assert (kept["status"], kept["durationMs"]) == (run["status"], run["durationMs"])
+
+        schedule = api.get(f"/api/v1/schedules/{schedule_id}")
+        assert schedule.status_code == 200, schedule.text
+        assert schedule.json()["lastResultConversationId"] is None
+    finally:
+        api.delete(f"/api/v1/schedules/{schedule_id}")

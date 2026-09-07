@@ -7,6 +7,7 @@ scope from the session (never derives one from the conversation row).
 from __future__ import annotations
 
 import io
+from collections.abc import Callable
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -21,6 +22,7 @@ from cowork.harnesses.anton_harness.harness import _conversation_attachment_cont
 from cowork.models.conversation import Conversation
 from cowork.models.file import File
 from cowork.models.project import Project
+from cowork.principal import Principal
 from cowork.services.files import FileService, attachment_purpose
 
 ORG_A = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
@@ -525,6 +527,49 @@ def test_remove_conversation_workspace_dir_is_noop_on_desktop(tmp_path, monkeypa
     assert ws.exists(), "desktop conversation delete must not rmtree a project subdir"
 
 
+def test_remove_conversation_workspace_dir_refuses_a_symlinked_parent(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    from cowork.services.files import remove_conversation_workspace_dir
+
+    conv = str(uuid4())
+    proj = tmp_path / "proj"
+    outside = tmp_path / "outside"
+    victim = outside / conv
+    proj.mkdir()
+    victim.mkdir(parents=True)
+    (victim / "keep.txt").write_text("keep", encoding="utf-8")
+    (proj / "conversations").symlink_to(outside, target_is_directory=True)
+
+    remove_conversation_workspace_dir(proj, conv)
+
+    assert (victim / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_remove_conversation_workspace_dir_refuses_a_symlinked_project(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    from cowork.services.files import remove_conversation_workspace_dir
+
+    conv = str(uuid4())
+    real_project = tmp_path / "real-project"
+    victim = real_project / "conversations" / conv
+    victim.mkdir(parents=True)
+    (victim / "keep.txt").write_text("keep", encoding="utf-8")
+    project_link = tmp_path / "project-link"
+    project_link.symlink_to(real_project, target_is_directory=True)
+
+    remove_conversation_workspace_dir(project_link, conv)
+
+    assert (victim / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+
 def test_stage_instructions_restages_a_same_length_same_mtime_edit(tmp_path):
     """A typo-fix edit (same length, same mtime second) must still re-stage —
     the old size+mtime skip could serve stale instructions."""
@@ -545,3 +590,267 @@ def test_stage_instructions_restages_a_same_length_same_mtime_edit(tmp_path):
     os.utime(src, (fixed_mtime, fixed_mtime))
     assert stage_project_instructions(proj, conv) is True
     assert dest.read_text() == "be funny"            # re-staged despite the tie
+
+
+def test_stage_instructions_clears_removed_instructions_in_place(tmp_path):
+    """Instructions removed at the project → the staged copy is emptied, but
+    NEVER unlinked: the sandbox pod caches NFS handles for this file (gVisor
+    gofer), and deleting the inode leaves the pod failing every stat with
+    ESTALE until the pod is recycled (ENG-1817). Same inode before and after
+    is the contract this test pins."""
+    from cowork.services.files import stage_project_instructions
+    conv = str(uuid4())
+    proj = tmp_path / "proj"
+    (proj / ".anton").mkdir(parents=True)
+    src = proj / ".anton" / "anton.md"
+    src.write_text("be terse")
+    assert stage_project_instructions(proj, conv) is True
+    dest = proj / "conversations" / conv / ".anton" / "anton.md"
+    inode = dest.stat().st_ino
+
+    src.unlink()  # user removes the project instructions
+    assert stage_project_instructions(proj, conv) is False
+    assert dest.is_file()                # still exists…
+    assert dest.read_text() == ""        # …but the agent stops seeing them
+    assert dest.stat().st_ino == inode   # same inode: cached pod handles stay valid
+
+
+def test_stage_instructions_clear_does_not_follow_a_symlink_planted_after_the_check(
+    tmp_path, monkeypatch
+):
+    """TOCTOU at the use site: safe_join resolves and checks, but is documented
+    as non-atomic — a symlink the pod swaps in after the check must fail the
+    truncate (O_NOFOLLOW → ELOOP), not empty the file it points at. unlink
+    didn't follow symlinks; the in-place clear must not either."""
+    import cowork.services.files as files_mod
+    conv = str(uuid4())
+    proj = tmp_path / "proj"
+    victim = tmp_path / "victim.md"
+    victim.write_text("another tenant's data")
+    link = proj / "conversations" / conv / ".anton" / "anton.md"
+    link.parent.mkdir(parents=True)
+    link.symlink_to(victim)
+    # Simulate the swap landing after the containment check: hand the caller
+    # the unresolved path, as if the link appeared a moment later.
+    monkeypatch.setattr(files_mod, "safe_join", lambda base, *parts: link)
+
+    assert files_mod.stage_project_instructions(proj, conv) is False
+    assert victim.read_text() == "another tenant's data"
+
+
+def test_stage_instructions_removal_does_not_rewrite_an_empty_copy(tmp_path):
+    """The clear runs before every turn — an already-empty copy must be left
+    untouched, not truncated again (mtime churn on every turn)."""
+    from cowork.services.files import stage_project_instructions
+    conv = str(uuid4())
+    proj = tmp_path / "proj"
+    dest = proj / "conversations" / conv / ".anton" / "anton.md"
+    dest.parent.mkdir(parents=True)
+    dest.write_text("")
+    before = dest.stat().st_mtime_ns
+    assert stage_project_instructions(proj, conv) is False
+    assert dest.stat().st_mtime_ns == before
+
+
+def test_same_org_users_cannot_see_each_others_files(engine):
+    """Staging audit P0: files are personal (created_by) but list/get/delete
+    filtered by org only, so coworkers saw/read/deleted each other's files."""
+    alice = _svc(engine, _scope(ORG_A, "alice"))
+    bob = _svc(engine, _scope(ORG_A, "bob"))
+    a_file = _mkfile(alice)
+
+    assert a_file.id not in {f.id for f in bob.list_files()}
+    import pytest
+    with pytest.raises(ValueError):
+        bob.get_file(a_file.id)
+    assert bob.delete_file(a_file.id) is False
+    assert alice.get_file(a_file.id).id == str(a_file.id)  # still Alice's
+
+
+# ── project-memory faults must not lie about the project ─────────────────────
+
+ORG_MEMBER = "11111111-1111-4111-8111-111111111111"
+ORG_PEER = "22222222-2222-4222-8222-222222222222"
+
+
+@pytest.fixture()
+def org_engine(tmp_path, monkeypatch):
+    """Org mode against an isolated database and projects root."""
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    # Org mode roots every store at cowork_home(), so pin that too or these
+    # tests write into the developer's real ~/.cowork.
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path / "shared"))
+    monkeypatch.setenv("COWORK_MEMORY_DIR", str(tmp_path / "memory"))
+    get_app_settings.cache_clear()
+    import cowork.models.message  # noqa: F401  mappers
+    import cowork.models.message_event  # noqa: F401  mappers
+    eng = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    SQLModel.metadata.create_all(eng)
+    yield eng
+    get_app_settings.cache_clear()
+
+
+def _org_scoped(engine, user_id: str) -> ScopedSession:
+    return ScopedSession(Session(engine), _scope(ORG_A, user_id))
+
+
+def _org_principal(user_id: str) -> Principal:
+    return Principal(user_id=user_id, org_id=ORG_A, email="member@example.com")
+
+
+def _project_with_unreadable_rules(
+    engine,
+    make_unreadable: Callable[[Path], None],
+) -> tuple[ScopedSession, Project]:
+    """A project whose `rules.md` slot exists but cannot be read back."""
+    from cowork.services.projects import ProjectService
+
+    scoped = _org_scoped(engine, ORG_MEMBER)
+    project = ProjectService(scoped).create_project("unreadable-memory")
+    memory_dir = Path(project.path) / ".anton" / "memory"
+    memory_dir.mkdir(parents=True)
+    make_unreadable(memory_dir)
+    return scoped, project
+
+
+def test_undecodable_memory_slot_does_not_404_a_project_delete(org_engine):
+    """The agent may leave non-UTF-8 bytes in a slot the delete inventory reads.
+
+    That raised UnicodeDecodeError, which the endpoint's blanket ValueError
+    handler answered as 404 "not found" for a project that plainly exists, and
+    because the inventory runs on every attempt the project could never be
+    deleted at all.
+    """
+    from cowork.api.v1.endpoints import projects as projects_endpoint
+    from cowork.services.projects import ProjectService
+
+    scoped, project = _project_with_unreadable_rules(
+        org_engine,
+        lambda memory: (memory / "rules.md").write_bytes(b"\xff\xfe not utf-8"),
+    )
+    project_id = project.id
+
+    projects_endpoint.delete_project(
+        project_id,
+        scoped,
+        _org_principal(ORG_MEMBER),
+    )
+
+    with pytest.raises(ValueError, match="not found"):
+        ProjectService(scoped).get_project(project_id)
+
+
+def test_symlinked_memory_dir_does_not_500_a_project_delete(org_engine):
+    """A link planted over `.anton/memory` makes the slot read raise OSError.
+
+    That escaped both handlers as a 500 and left the project undeletable.
+    """
+    from cowork.api.v1.endpoints import projects as projects_endpoint
+    from cowork.services.projects import ProjectService
+
+    def plant_link(memory: Path) -> None:
+        elsewhere = memory.parent / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "rules.md").write_text("someone else's rules")
+        memory.rmdir()
+        memory.symlink_to(elsewhere, target_is_directory=True)
+
+    scoped, project = _project_with_unreadable_rules(org_engine, plant_link)
+    project_id = project.id
+
+    projects_endpoint.delete_project(
+        project_id,
+        scoped,
+        _org_principal(ORG_MEMBER),
+    )
+
+    with pytest.raises(ValueError, match="not found"):
+        ProjectService(scoped).get_project(project_id)
+
+
+# ── the instructions gate on the ordinary project-file routes ────────────────
+
+def _instructions_project(engine) -> tuple[ScopedSession, Project]:
+    """A project whose `.anton/anton.md` belongs to ORG_MEMBER."""
+    from cowork.api.v1.endpoints import project_files
+    from cowork.services.projects import ProjectService
+
+    scoped = _org_scoped(engine, ORG_MEMBER)
+    project = ProjectService(scoped).create_project("gated-instructions")
+    project_files.write_project_file(
+        project.name,
+        project_files._validated_project_path(".anton/anton.md"),
+        project_files._FileWriteRequest(content="the creator's rules"),
+        scoped,
+        _org_principal(ORG_MEMBER),
+    )
+    return scoped, project
+
+
+@pytest.mark.parametrize("alias", [".anton/anton.md", ".anton\\anton.md", "link/anton.md"])
+def test_peer_member_cannot_write_instructions_through_the_file_route(org_engine, alias):
+    """Ordinary project files are member-wide; `.anton/anton.md` is not.
+
+    Every spelling that RESOLVES to the instructions file has to reach the
+    creator/admin gate, including a separator alias and a symlinked directory
+    component, or the generic write route becomes a way around it.
+    """
+    from cowork.api.v1.endpoints import project_files
+    from fastapi import HTTPException
+
+    _creator, project = _instructions_project(org_engine)
+    (Path(project.path) / "link").symlink_to(
+        Path(project.path) / ".anton", target_is_directory=True
+    )
+    peer = _org_scoped(org_engine, ORG_PEER)
+    path = project_files._validated_project_path(alias)
+
+    with pytest.raises(HTTPException) as denied:
+        project_files.write_project_file(
+            project.name,
+            path,
+            project_files._FileWriteRequest(content="peer takeover"),
+            peer,
+            _org_principal(ORG_PEER),
+        )
+    assert denied.value.status_code == 403
+
+    with pytest.raises(HTTPException) as delete_denied:
+        project_files.delete_project_file(
+            project.name,
+            path,
+            peer,
+            _org_principal(ORG_PEER),
+        )
+    assert delete_denied.value.status_code == 403
+
+    anton_md = Path(project.path) / ".anton" / "anton.md"
+    assert anton_md.read_text() == "the creator's rules"
+
+
+@pytest.mark.asyncio
+async def test_upload_route_cannot_reach_the_instructions_file(org_engine):
+    """The upload route writes project-root children only.
+
+    A separator in the filename is stripped rather than honoured, so an upload
+    named `.anton/anton.md` lands beside the instructions file, never on it.
+    """
+    from cowork.api.v1.endpoints import project_files
+
+    _creator, project = _instructions_project(org_engine)
+    peer = _org_scoped(org_engine, ORG_PEER)
+
+    result = await project_files.upload_project_files(
+        project.name,
+        peer,
+        files=[_upload(".anton/anton.md", b"peer takeover")],
+    )
+
+    assert result["results"] == [{"name": "anton.md", "ok": True, "size": 13}]
+    anton_md = Path(project.path) / ".anton" / "anton.md"
+    assert anton_md.read_text() == "the creator's rules"
+    assert (Path(project.path) / "anton.md").read_bytes() == b"peer takeover"

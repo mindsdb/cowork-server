@@ -10,9 +10,11 @@ if TYPE_CHECKING:
 from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_validator
 
 from cowork.common.settings.app_settings import (
+    AGENT_ROLE_NAMES,
     CODING_MODEL_DEFAULTS,
     MINDS_FREE_MODEL,
     PLANNING_MODEL_DEFAULTS,
+    ROLE_MODEL_DEFAULTS,
     ROUTER_MODEL_DEFAULTS,
     Settings,
     default_minds_url,
@@ -111,6 +113,73 @@ def provider_api_key_str(settings: "UserSettings", provider: "Provider") -> str:
     return val.get_secret_value() if isinstance(val, SecretStr) else ""
 
 
+def _defaults_with_declared(
+    role: str, compiled: dict[str, str], declared: dict[str, str]
+) -> dict[str, str]:
+    """``compiled``, with the catalog's declared default over the minds-cloud slot.
+
+    Only that slot moves. The direct providers are BYOK models that are not in
+    MindsHub's catalog, so it has nothing to say about them and their defaults stay
+    compiled in.
+
+    The compiled value is not dead code underneath: it is what resolves before any
+    ``/v1/models`` fetch has been persisted, which is every fresh install on its
+    first message, and what resolves when the catalog is unreachable. Demoted, not
+    retired.
+    """
+    if role not in declared:
+        return compiled
+    return {**compiled, Provider.MINDS_CLOUD.value: declared[role]}
+
+
+def minds_role_start_models(
+    *, declared: dict[str, str], enabled_map: dict[str, bool]
+) -> list[str]:
+    """The model each minds-cloud role starts on, in ``AGENT_ROLE_ORDER``.
+
+    Ordered by ``ROLE_MODEL_DEFAULTS``, which is built in that order, so the list
+    lines up with the ``recommendedPair`` slots without anyone counting them.
+
+    What the picker is served as ``recommendedPair``, and it goes through the same
+    two steps resolution does: the declared default replaces the compiled one, then
+    availability adjusts it. Both steps matter to the picker, because the desktop
+    writes these values back as explicit model pins when a save repoints a role
+    onto MindsHub. Served unadjusted, it would show, and then pin, a model the
+    wallet cannot pay for while turns ran something else.
+
+    Calls ``_enabled_aware_default`` directly rather than going through
+    ``_resolved_model(..., wallet_aware=True)`` the way the three
+    ``resolved_*_model`` properties do. The two agree here because a default is
+    only ever read where nothing is stored, and ``wallet_aware`` decides what
+    happens to a STORED id the availability map does not affirm. There is no
+    stored id on this path, so the extra step has nothing to act on.
+    """
+    return [
+        _enabled_aware_default(
+            Provider.MINDS_CLOUD.value,
+            _defaults_with_declared(role, compiled, declared),
+            enabled_map,
+        )
+        or ""
+        for role, compiled in ROLE_MODEL_DEFAULTS.items()
+    ]
+
+def _first_available_model(enabled_map: dict[str, bool]) -> str | None:
+    """First enabled model in map order, else the first served one, else None.
+
+    The map lists the full ``/v1/models`` catalogue in the gateway's ranking, so
+    its first enabled entry is the affordable baseline; when nothing is enabled the
+    first key is still a served (locked) model — recoverable via top-up, unlike a
+    retired id that 404s every turn. Empty map → None.
+    """
+    if not enabled_map:
+        return None
+    return next(
+        (m for m, en in enabled_map.items() if en),
+        next(iter(enabled_map)),
+    )
+
+
 def _enabled_aware_default(
     provider_value: str,
     defaults: dict[str, str],
@@ -118,12 +187,18 @@ def _enabled_aware_default(
 ) -> str | None:
     """The provider's canonical default model, adjusted for availability.
 
-    Applies only to minds-cloud; direct (BYOK) providers have no such
-    availability map. A non-empty map always carries an explicit flag for
-    every alias the catalog serves, so a default that's locked OR simply
-    missing from it falls back to the first enabled model — missing means
-    gone (renamed/retired), not degraded data. An empty/absent map (no tier
-    data at all) leaves the default untouched.
+    MindsHub marks a model the org's wallet can't currently pay for (or whose
+    free allowance is exhausted) as ``enabled: false`` from ``/v1/models``, so
+    blindly handing out the canonical default could be denied every turn. When
+    the cached availability map (``minds_model_enabled``) marks the default as
+    disabled — OR simply doesn't list it, meaning gone (renamed/retired), not
+    degraded data — fall back to the first enabled model in the map. That map
+    preserves the gateway's ``/v1/models`` ordering (a remote order we neither
+    control nor pin), so this is the first model MindsHub itself ranks that the
+    wallet can actually pay for: a free-tier wallet, with the paid aliases ahead
+    of it marked disabled, lands on the free/baseline model. An empty/absent map
+    (no tier data at all) leaves the default untouched. Applies only to
+    minds-cloud: direct (BYOK) providers have no such availability map.
 
     Org mode requires the same positive evidence, but falls back to
     MINDS_FREE_MODEL instead, so a credit-less org isn't charged.
@@ -134,6 +209,12 @@ def _enabled_aware_default(
     if get_app_settings().tenancy_mode == "org":
         if default is not None and enabled_map.get(default) is True:
             return default
+        # Free model, unless a known catalogue no longer serves it — then it's
+        # retired and would 404 every turn, so hand out a served model.
+        if enabled_map and MINDS_FREE_MODEL not in enabled_map:
+            served = _first_available_model(enabled_map)
+            if served is not None:
+                return served
         return MINDS_FREE_MODEL
     if not enabled_map:
         return default
@@ -142,6 +223,13 @@ def _enabled_aware_default(
     for model_id, enabled in enabled_map.items():
         if enabled:
             return model_id
+    # Nothing affordable. A still-served (locked) default is kept — it 402s with a
+    # top-up path. A default absent from this non-empty catalogue is retired and
+    # would 404 every turn, so fall back to a served model instead.
+    if default is not None and default not in enabled_map:
+        served = _first_available_model(enabled_map)
+        if served is not None:
+            return served
     return default
 
 
@@ -219,16 +307,22 @@ def _resolved_model(
             bare = user_model.removeprefix("latest:")
             if not enabled.get(bare, False):
                 # First enabled entry in map order. The real guarantee here is
-                # NOT "the gateway lists the free model first" (it doesn't —
-                # verified against prod, haiku leads the catalogue): it is
-                # that enablement tracks affordability, so on a locked wallet
-                # only free-bucket models are enabled and the first enabled
-                # entry is affordable by construction. Embedding rows never
+                # NOT "the gateway lists the free model first" (it doesn't, and
+                # the ranking changes per deployment): it is that enablement
+                # tracks affordability, so on a locked wallet only free-bucket
+                # models are enabled and the first enabled entry is affordable
+                # by construction. Embedding rows never
                 # reach this map — filtered at construction in
                 # fetch_minds_models (_is_embedding_row).
                 fallback = next((mid for mid, en in enabled.items() if en), None)
                 if fallback:
                     return fallback
+                # Nothing affordable. A still-served (locked) pin is kept below. But
+                # an id absent from this non-empty catalogue is retired/foreign and
+                # 404s every turn with no recovery, so hand out a served model
+                # instead of a dead id.
+                if bare not in enabled:
+                    return next(iter(enabled))
         return user_model
     # No explicit choice (or provider switched): the resolved provider's default,
     # availability-adjusted. openai-compatible has no default -> None, so the
@@ -277,6 +371,15 @@ ORG = _OrgScoped()
 def _harness_options() -> list[str]:
     from cowork.harnesses.base import available_harness_ids
     return available_harness_ids()
+
+
+def _coding_engine_options() -> list[str]:
+    # Imported lazily so normal Cowork settings startup does not import or
+    # launch a coding runtime. The registry only reports functional adapters;
+    # future engines become additive here without UI conditionals.
+    from cowork.coding.engines.registry import engine_registry
+
+    return engine_registry.ids()
 
 
 # ── .env ↔ DB setting aliases ────────────────────────────────────────
@@ -427,6 +530,18 @@ class UserSettings(Settings):
         title="Coding Model",
         description="The coding model. Defaults to the recommended model for the selected provider.",
     )
+    coding_agent_engine: Annotated[str, _DynamicOptions(_coding_engine_options)] = Field(
+        default="codex",
+        title="Coding Agent",
+        description="The agent engine used by the separate Code workspace.",
+    )
+    coding_agent_model: str = Field(
+        default="gpt",
+        min_length=1,
+        max_length=256,
+        title="Coding Agent Model",
+        description="The MindsHub Inference model used by the selected coding agent.",
+    )
     planning_reasoning_effort: str | None = Field(
         default=None,
         title="Planning Reasoning Effort",
@@ -458,10 +573,12 @@ class UserSettings(Settings):
         default=None,
         title="Routing & Summarization Model",
         description=(
-            "The cheap model used for respond-vs-delegate routing and history "
-            "summarization. Defaults to the recommended model for the selected "
-            "provider (MindsHub → MindsHub Air; other providers → their smallest "
-            "model)."
+            "The cheap model used for history summarization. The pre-Anton route "
+            "gate does NOT run on it — it takes the role's fast default for the "
+            "provider (see resolved_gate_model), except on openai-compatible, "
+            "where this is the only model there is. Defaults to the recommended "
+            "model for the selected provider (MindsHub → MindsHub Air; other "
+            "providers → their smallest model)."
         ),
     )
     harness: Annotated[str, _DynamicOptions(_harness_options), ORG] = Field(
@@ -541,6 +658,29 @@ class UserSettings(Settings):
         default=True,
         title="Memory Enabled",
         description="Enable conversation memory.",
+    )
+    # `hub_workspace_id`, not `workspace_id`: in this repo `workspace` already
+    # means a filesystem location (the per-conversation private directory, the
+    # project tree, the paths on AntonSettings), and that meaning is load-bearing
+    # in dozens of places. This field holds a MindsHub Workspace uuid, an
+    # org-internal container that owns hub resources and lives in the auth
+    # service. The two concepts share nothing but a word.
+    #
+    # Untagged, so it writes per-user: `SettingService._new_row` files an
+    # untagged key at (org, user) scope in org mode and in the single global row
+    # on a desktop install, which is the right answer for both. It carries no
+    # ORG marker deliberately: which workspace a person is looking at is their
+    # own preference, not org configuration an admin sets for everyone.
+    hub_workspace_id: str = Field(
+        default="",
+        title="Active MindsHub Workspace",
+        description=(
+            "Which MindsHub workspace this person is working in, as a uuid. "
+            "Empty means no pick has been made, and readers fall back to the "
+            "organization's default workspace. Interim storage: the shared "
+            "per-user preference the console reads has no route in auth yet, and "
+            "this field is what a follow-up migrates onto it."
+        ),
     )
     coding_mode_enabled: bool = Field(
         default=False,
@@ -756,9 +896,23 @@ class UserSettings(Settings):
         ),
     )
 
+    minds_role_defaults: Annotated[str, ORG] = Field(
+        default="{}",
+        title="MindsHub Role Defaults",
+        description=(
+            "JSON-encoded map of agent role -> the model id MindsHub's catalog "
+            "declares as that role's default, cached from /v1/models whenever "
+            "recommended-models fetches it live. Lets the default a new user "
+            "starts on move by config, without a client release and without a "
+            "network call in the turn path."
+        ),
+    )
+
     # Memoized parse of `minds_model_enabled` (see `_minds_enabled_map`). Not a
     # settings field — never validated or serialized.
     _enabled_map_cache: dict[str, bool] | None = PrivateAttr(default=None)
+    # Same, for `minds_role_defaults` (see `_minds_role_default_map`).
+    _role_default_cache: dict[str, str] | None = PrivateAttr(default=None)
 
     @field_validator("harness")
     @classmethod
@@ -768,6 +922,24 @@ class UserSettings(Settings):
             available = ", ".join(options) or "none"
             raise ValueError(f"Unknown harness '{v}'. Available: {available}")
         return v
+
+    @field_validator("coding_agent_model")
+    @classmethod
+    def _canonical_coding_agent_model(cls, value: str) -> str:
+        # Installations that saved the retired "gpt-5.6-sol" id keep working:
+        # the stored row is read back as the catalogue id the model list uses.
+        from cowork.coding.project_models import canonical_model_id
+
+        return canonical_model_id(value)
+
+    @field_validator("coding_agent_engine")
+    @classmethod
+    def validate_coding_agent_engine(cls, value: str) -> str:
+        options = _coding_engine_options()
+        if value not in options:
+            available = ", ".join(options) or "none"
+            raise ValueError(f"Unknown coding agent '{value}'. Available: {available}")
+        return value
 
     def _minds_enabled_map(self) -> dict[str, bool]:
         """The cached MindsHub model-availability map (id → enabled), or {}.
@@ -799,6 +971,48 @@ class UserSettings(Settings):
         self._enabled_map_cache = result
         return result
 
+    def _minds_role_default_map(self) -> dict[str, str]:
+        """The cached agent-role -> model-id map MindsHub's catalog declares, or {}.
+
+        Sourced from the ``minds_role_defaults`` setting, which the
+        recommended-models endpoint refreshes from ``/v1/models`` on every
+        settings load, so moving a default in the catalog reaches this install on
+        its next settings load with no client release.
+
+        Parsed once per instance and memoized, for the same reason
+        ``_minds_enabled_map`` is: this is read once per role by
+        ``apply_model_defaults`` and again by each ``resolved_*_model``.
+        """
+        if self._role_default_cache is not None:
+            return self._role_default_cache
+        try:
+            raw = json.loads(self.minds_role_defaults or "{}")
+        except (ValueError, TypeError):
+            raw = {}
+        # Both halves must be real non-empty strings. A role is looked up by name
+        # and its value is handed to the gateway as a model id, so a stringified
+        # null or a number here would resolve a role onto a model that cannot
+        # exist, and the compiled fallback below is strictly better than that.
+        result = (
+            {
+                k: v
+                for k, v in raw.items()
+                if isinstance(k, str) and isinstance(v, str) and k in AGENT_ROLE_NAMES and v
+            }
+            if isinstance(raw, dict)
+            else {}
+        )
+        self._role_default_cache = result
+        return result
+
+    def _defaults_for_role(self, role: str, compiled: dict[str, str]) -> dict[str, str]:
+        """``compiled``, with the catalog's declared default over the minds-cloud slot.
+
+        The one place the remote declaration is preferred over the compiled table,
+        so the six resolution sites cannot drift on which wins.
+        """
+        return _defaults_with_declared(role, compiled, self._minds_role_default_map())
+
     @model_validator(mode='after')
     def apply_model_defaults(self) -> 'UserSettings':
         # Defaults are availability-aware for minds-cloud: when the canonical
@@ -827,15 +1041,21 @@ class UserSettings(Settings):
         enabled_map = self._minds_enabled_map()
         if self.planning_model is None:
             self.planning_model = _enabled_aware_default(
-                self.planning_provider.value, PLANNING_MODEL_DEFAULTS, enabled_map
+                self.planning_provider.value,
+                self._defaults_for_role("planning", PLANNING_MODEL_DEFAULTS),
+                enabled_map,
             )
         if self.coding_model is None:
             self.coding_model = _enabled_aware_default(
-                self.coding_provider.value, CODING_MODEL_DEFAULTS, enabled_map
+                self.coding_provider.value,
+                self._defaults_for_role("coding", CODING_MODEL_DEFAULTS),
+                enabled_map,
             )
         if self.router_model is None:
             self.router_model = _enabled_aware_default(
-                self.coding_provider.value, ROUTER_MODEL_DEFAULTS, enabled_map
+                self.coding_provider.value,
+                self._defaults_for_role("router", ROUTER_MODEL_DEFAULTS),
+                enabled_map,
             )
         return self
 
@@ -843,6 +1063,13 @@ class UserSettings(Settings):
         # Org mode mints a per-turn key, so minds-cloud is usable with nothing
         # stored; else a fresh org resolves to the pod's ambient ANTHROPIC key.
         if p is Provider.MINDS_CLOUD and get_app_settings().tenancy_mode == "org":
+            return True
+        # An openai-compatible endpoint's credential is its base URL — a local
+        # model server usually wants no key at all, and the Settings UI lets one
+        # be saved that way. Judged keyless, the resolver below walks straight
+        # past it to the hosted gateway, which is the one place these prompts
+        # must not go.
+        if p is Provider.OPENAI_COMPATIBLE and (self.openai_base_url or "").strip():
             return True
         # provider_api_key applies the gemini/openai-compatible → shared-openai
         # fallback, so a provider configured via EITHER its dedicated slot or the
@@ -906,7 +1133,7 @@ class UserSettings(Settings):
             self.resolved_planning_provider,
             self.planning_provider,
             self.planning_model,
-            PLANNING_MODEL_DEFAULTS,
+            self._defaults_for_role("planning", PLANNING_MODEL_DEFAULTS),
             self._minds_enabled_map(),
             wallet_aware=True,
         )
@@ -920,7 +1147,7 @@ class UserSettings(Settings):
             self.resolved_coding_provider,
             self.coding_provider,
             self.coding_model,
-            CODING_MODEL_DEFAULTS,
+            self._defaults_for_role("coding", CODING_MODEL_DEFAULTS),
             self._minds_enabled_map(),
             wallet_aware=True,
         )
@@ -932,15 +1159,42 @@ class UserSettings(Settings):
     @property
     def resolved_router_model(self) -> str | None:
         # wallet_aware: same rationale as resolved_coding_model — the router
-        # role (respond-vs-delegate gating, history summarization) is invisible
-        # in default mode (ENG-1632).
+        # role (history summarization; the route gate resolves its own model,
+        # see resolved_gate_model) is invisible in default mode (ENG-1632).
         return _resolved_model(
             self.resolved_router_provider,
             self.router_provider,
             self.router_model,
-            ROUTER_MODEL_DEFAULTS,
+            self._defaults_for_role("router", ROUTER_MODEL_DEFAULTS),
             self._minds_enabled_map(),
             wallet_aware=True,
+        )
+
+    @property
+    def resolved_gate_model(self) -> str | None:
+        """The model the pre-Anton route gate runs on (ENG-1851).
+
+        Deliberately NOT the user's ``router_model``. The gate sits ahead of
+        every turn with a budget measured in seconds, so it has one requirement
+        the router role's other consumer (history summarization) does not:
+        speed. A user who picks a large model for "routing and summarization"
+        is choosing it for the summaries; applied to the gate it times out on
+        every turn and bills for the attempt. So the gate takes the role's
+        *default* for the resolved provider — the catalog's declared default
+        for minds-cloud, the compiled one for the direct providers — which are
+        all chosen to be fast, availability-adjusted like every other default.
+
+        openai-compatible is the exception: it has no canonical model (it is a
+        BYO endpoint), so the user's own pick is the only model that exists
+        there and the gate uses it. The Settings UI carries the speed note.
+        """
+        provider = self.resolved_router_provider
+        if provider is Provider.OPENAI_COMPATIBLE:
+            return self.resolved_router_model
+        return _enabled_aware_default(
+            provider.value,
+            self._defaults_for_role("router", ROUTER_MODEL_DEFAULTS),
+            self._minds_enabled_map(),
         )
 
     @property

@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 
 from cowork.services import artifacts as a
+from cowork.services import artifact_identity
 
 
 def _make_artifact(base, slug, *, files: dict[str, str], meta: dict):
@@ -73,6 +75,208 @@ def test_list_artifacts_skips_a_missing_root(tmp_path):
     absent = a.ProjectArtifacts(base=tmp_path / "gone" / ".anton" / "artifacts",
                                 project_id="p-9", project_name="Gone")
     assert a.list_artifacts([absent]) == []
+
+
+def _file_identity(path: Path) -> tuple[int, int, int, int]:
+    value = path.stat(follow_symlinks=False)
+    return value.st_dev, value.st_ino, value.st_mtime_ns, value.st_ctime_ns
+
+
+def test_list_derives_legacy_id_without_mutating_metadata(source):
+    metadata = {
+        "id": "a1b2c3d4",
+        "slug": "dash",
+        "createdAt": "2026-08-28T12:00:00Z",
+        "primary": "index.html",
+        "type": "html-app",
+    }
+    folder = _make_artifact(
+        source.base,
+        "dash",
+        files={"index.html": "<html></html>"},
+        meta=metadata,
+    )
+    metadata_path = folder / "metadata.json"
+    before = metadata_path.read_bytes()
+    before_identity = _file_identity(metadata_path)
+
+    card = a.list_artifacts([source])[0]
+
+    assert UUID(card["id"]).hex == card["id"]
+    assert card["id"].startswith("a1b2c3d4")
+    assert card["artifactKey"] == f"artifact/{UUID(card['id'])}"
+    assert f"/drafts/{source.project_id}/{card['id']}/" in card["draftUrl"]
+    assert metadata_path.read_bytes() == before
+    assert _file_identity(metadata_path) == before_identity
+
+
+def test_list_uses_stable_id_without_persisting_the_normalized_metadata(source):
+    stable_id = "55555555-5555-4555-8555-555555555555"
+    metadata = {
+        "id": "a1b2c3d4",
+        "stableId": stable_id,
+        "slug": "dash",
+        "createdAt": "2026-08-28T12:00:00Z",
+        "type": "document",
+    }
+    folder = _make_artifact(
+        source.base,
+        "dash",
+        files={"brief.md": "hello"},
+        meta=metadata,
+    )
+    metadata_path = folder / "metadata.json"
+    before = metadata_path.read_bytes()
+
+    card = a.list_artifacts([source])[0]
+
+    assert card["id"] == UUID(stable_id).hex
+    assert metadata_path.read_bytes() == before
+    assert json.loads(before)["stableId"] == stable_id
+
+
+def test_list_derives_an_id_for_idless_metadata_without_persisting_it(source):
+    folder = _make_artifact(
+        source.base,
+        "idless",
+        files={"brief.md": "hello"},
+        meta={
+            "slug": "idless",
+            "createdAt": "2026-08-28T12:00:00Z",
+            "type": "document",
+        },
+    )
+    metadata_path = folder / "metadata.json"
+
+    card = a.list_artifacts([source])[0]
+
+    assert UUID(card["id"]).hex == card["id"]
+    assert "id" not in json.loads(metadata_path.read_text(encoding="utf-8"))
+
+
+def test_list_call_graph_does_not_reach_mutating_identity_or_card_helpers(
+    source, monkeypatch
+):
+    _make_artifact(
+        source.base,
+        "dash",
+        files={"index.html": "<html></html>"},
+        meta={"id": "a1b2c3d4", "slug": "dash", "type": "html-app"},
+    )
+
+    def unexpected(*_args, **_kwargs):
+        pytest.fail("read-only listing reached a mutating helper")
+
+    monkeypatch.setattr(artifact_identity, "ensure_full_id", unexpected)
+    monkeypatch.setattr(artifact_identity, "_atomic_json", unexpected)
+    monkeypatch.setattr(artifact_identity.os, "utime", unexpected)
+    monkeypatch.setattr(a, "_is_modified", unexpected)
+    monkeypatch.setattr(a, "_write_published_map_pinned", unexpected)
+
+    assert a.list_artifacts([source])[0]["slug"] == "dash"
+
+
+def test_list_does_not_self_heal_the_published_map(source, monkeypatch):
+    folder = _make_artifact(
+        source.base,
+        "dash",
+        files={"index.html": "<html></html>"},
+        meta={
+            "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "slug": "dash",
+            "primary": "index.html",
+            "type": "html-app",
+        },
+    )
+    published_path = folder / ".published.json"
+    published_path.write_text(
+        json.dumps(
+            {
+                "index.html": {
+                    "published": True,
+                    "report_id": "report-id",
+                    "published_mtime": 1,
+                    "last_md5": "unchanged",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    before = published_path.read_bytes()
+    before_identity = _file_identity(published_path)
+    monkeypatch.setattr(
+        "cowork.services.publish.compute_publish_md5",
+        lambda *_args, **_kwargs: "unchanged",
+    )
+    monkeypatch.setattr(
+        a,
+        "_write_published_map_pinned",
+        lambda *_args, **_kwargs: pytest.fail("listing attempted publish-map heal"),
+    )
+
+    card = a.list_artifacts([source])[0]
+
+    assert card["modified"] is False
+    assert published_path.read_bytes() == before
+    assert _file_identity(published_path) == before_identity
+
+
+def test_list_still_reports_a_real_published_content_change(source, monkeypatch):
+    folder = _make_artifact(
+        source.base,
+        "dash",
+        files={"index.html": "<html>changed</html>"},
+        meta={
+            "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "slug": "dash",
+            "primary": "index.html",
+            "type": "html-app",
+        },
+    )
+    (folder / ".published.json").write_text(
+        json.dumps(
+            {
+                "index.html": {
+                    "published": True,
+                    "report_id": "report-id",
+                    "published_mtime": 1,
+                    "last_md5": "before",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "cowork.services.publish.compute_publish_md5",
+        lambda *_args, **_kwargs: "after",
+    )
+
+    assert a.list_artifacts([source])[0]["modified"] is True
+
+
+def test_read_only_list_card_matches_the_canonical_card_shape(source, monkeypatch):
+    folder = _make_artifact(
+        source.base,
+        "dash",
+        files={"index.html": "<html></html>"},
+        meta={
+            "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "slug": "dash",
+            "name": "Dashboard",
+            "primary": "index.html",
+            "type": "html-app",
+        },
+    )
+    monkeypatch.setattr(a.time, "time", lambda: folder.stat().st_mtime + 1)
+
+    listed = a.list_artifacts([source])[0]
+    canonical = a.card_for_folder(
+        folder,
+        project_id=source.project_id,
+        project_name=source.project_name,
+    )
+
+    assert listed == canonical
 
 
 def test_serve_url_is_empty_in_org_mode(source, monkeypatch):

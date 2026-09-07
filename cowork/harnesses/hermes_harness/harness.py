@@ -10,6 +10,7 @@ from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock
 from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
 from cowork.harnesses.hermes_harness.stream_formatter import format_hermes_stream
 from cowork.models.conversation import Conversation
+from cowork.services.projects import display_label
 from cowork.models.skill import Skill
 
 # Redirect all Hermes data (skills, sessions, config) to ~/.cowork/hermes before
@@ -133,6 +134,10 @@ class HermesHarness:
         # a per-conversation model override, so this hint is intentionally
         # ignored.
         model: str | None = None,
+        # Accepted for HarnessProvider compatibility; Hermes does not support
+        # a per-conversation reasoning-effort override, so this hint is
+        # intentionally ignored.
+        reasoning_effort: str | None = None,
         disabled_connections: list[dict] | None = None,
         # Accepted for HarnessProvider compatibility; Hermes does not emit
         # Langfuse traces, so these observability hints are intentionally
@@ -229,7 +234,7 @@ class HermesHarness:
                     str(conversation.id),
                     prompt,
                     history,
-                    project_name=conversation.project.name,
+                    project_name=display_label(conversation.project),
                     project_path=project_path,
                     conversation_topic=conversation_topic,
                     stream_callback=stream_callback,
@@ -247,7 +252,7 @@ class HermesHarness:
 
         cards: list[dict] = []
         skill_drafts: list[dict] = []
-        result: dict
+        result: dict = {}
         try:
             while True:
                 item = await queue.get()
@@ -256,12 +261,26 @@ class HermesHarness:
                 yield item
             result = await task
         finally:
-            # One dir diff → index the new artifacts AND build their cards.
-            # Runs on every exit so an artifact is always indexed; cards are
-            # yielded just below before the terminal result on normal
-            # completion (mapped to response.artifact_created by the formatter,
-            # same event the Anton harness produces).
-            cards = finalize_turn_artifacts(conversation, conv_id, conv_project_id, artifacts_base, before_slugs)
+            # Index the new artifacts AND build their cards. Runs on every exit
+            # so an artifact is always indexed; cards are yielded just below
+            # before the terminal result on normal completion (mapped to
+            # response.artifact_created by the formatter, same event the Anton
+            # harness produces).
+            #
+            # `artifacts_created` is what THIS run's create_artifact calls
+            # made, and bounds what the turn may claim — several conversations
+            # share one artifacts dir, so "appeared during the turn" is not
+            # proof this turn made it (ENG-1933). Absent on a cancelled or
+            # failed turn (the result never arrives): None then, which keeps
+            # the pre-existing diff behaviour rather than dropping the cards.
+            cards = finalize_turn_artifacts(
+                conversation, conv_id, conv_project_id, artifacts_base, before_slugs,
+                tracked_new=(
+                    set(result["artifacts_created"])
+                    if isinstance(result, dict) and "artifacts_created" in result
+                    else None
+                ),
+            )
             # Sibling diff for skills the agent built this turn — relocates any
             # stray auto-save and returns self-contained draft payloads.
             skill_drafts = finalize_turn_skill_drafts(
@@ -484,13 +503,22 @@ class HermesHarness:
             turn_summary=prompt,
             skill_drafts_root=skill_drafts_root,
         )
+        result: dict | None = None
         try:
-            return agent.run_conversation(
+            result = agent.run_conversation(
                 user_message=prompt,
                 conversation_history=history,
                 stream_callback=stream_callback,
                 task_id=session_id,
             )
+            return result
         finally:
-            finalize_artifact_run_context(session_id)
+            # The slugs this run created ride back on the result so the caller
+            # can bound what the turn claims — see index_turn_artifacts. Set in
+            # the `finally` because the context has to be dropped on every exit
+            # (including a failed turn), and the rescan it does must happen
+            # before the caller builds cards from these slugs.
+            created = finalize_artifact_run_context(session_id)
+            if isinstance(result, dict):
+                result["artifacts_created"] = sorted(created)
             vault.clear_ds_env()

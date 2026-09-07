@@ -3,6 +3,7 @@ import json
 
 import pytest
 
+from cowork.handlers import turn_errors as te
 from cowork.turnqueue import producer as prod
 
 
@@ -20,12 +21,23 @@ def _stub_llm_mint(monkeypatch):
 
 
 class FakeRedis:
-    def __init__(self, replies): self.added = []; self.registered = []; self._replies = replies
-    async def sadd(self, key, member): self.registered.append((key, member)); return 1
+    def __init__(self, replies):
+        self.added = []
+        self.registered = []
+        self._replies = replies
+
+    async def sadd(self, key, member):
+        self.registered.append((key, member))
+        return 1
+
     async def hset(self, key, mapping=None): return 1
     async def expire(self, key, seconds): return 1
     async def delete(self, *keys): return len(keys)
-    async def xadd(self, stream, fields): self.added.append((stream, fields)); return "1-0"
+
+    async def xadd(self, stream, fields):
+        self.added.append((stream, fields))
+        return "1-0"
+
     async def xread(self, streams, count=None, block=None):
         if self._replies:
             stream, fields = self._replies.pop(0)
@@ -123,12 +135,9 @@ async def test_stream_remote_replies_history_defaults_empty(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_oversized_request_warns_because_nothing_is_sheddable(monkeypatch):
-    # _fit_request used to shed skills then memory. Both now live on the shared
-    # EFS mount and never enter the payload, so what remains (input, model, llm,
-    # history) cannot be dropped without changing the turn's meaning. An
-    # oversized line must therefore be reported, not silently truncated by the
-    # pod's readline, and the real fix is history windowing upstream.
+async def test_oversized_required_request_warns_without_shedding_history(monkeypatch):
+    # Once optional project memory is absent, input/model/llm/history cannot be
+    # silently dropped without changing the turn's meaning.
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
@@ -150,6 +159,133 @@ async def test_oversized_request_warns_because_nothing_is_sheddable(monkeypatch)
     assert any("over the 4096-byte cap" in w for w in warnings), warnings
     params = json.loads(fake.added[0][1]["payload"])["params"]
     assert params["history"] == huge_history, "history must not be silently dropped"
+
+
+@pytest.mark.asyncio
+async def test_oversized_request_sheds_whole_project_memory_first(monkeypatch):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(prod, "_MAX_REQUEST_BYTES", 4096)
+    monkeypatch.setattr(prod, "_REQUEST_BYTES_MARGIN", 0)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        prod.logger,
+        "warning",
+        lambda msg, *args, **kw: warnings.append(msg % args if args else msg),
+    )
+
+    history = [{"role": "user", "content": "required history"}]
+    await _drain(
+        prod.stream_remote_replies(
+            conversation_id="conv-1",
+            org_id="org-1",
+            user_id="user-1",
+            input_text="hi",
+            model="m",
+            history=history,
+            memory={
+                "project": {
+                    "rules": "r" * 5000,
+                    "lessons": "l" * 5000,
+                }
+            },
+        )
+    )
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert "memory" not in params
+    assert params["history"] == history
+    shedding = [warning for warning in warnings if "project memory" in warning]
+    assert len(shedding) == 1
+    assert "dropped project memory" in shedding[0]
+
+
+@pytest.mark.asyncio
+async def test_stream_remote_replies_attaches_oauth_block_with_the_llm_turn_key(monkeypatch):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    async def fake_mint(**kw):
+        return "mdb_turnkey"
+
+    monkeypatch.setattr(prod, "mint_turn_key", fake_mint)
+
+    async def fake_list_active_connections(**kw):
+        assert kw["org_id"] == "o1" and kw["user_id"] == "u1"
+        return [{"engine": "google_drive", "name": "work"}]
+
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
+    ))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    # Reuses the same turn key minted for the llm block — never a second mint.
+    # No base_url (ENG-2128): anton's TurnKeyDataVault only ever resolves the
+    # auth host from its own ANTON_CLOUD_AUTH_BASE_URL env var, so a wire
+    # value here was dead — see _mint_oauth_block.
+    assert params["oauth"] == {
+        "turn_key": "mdb_turnkey",
+        "connections": [{"engine": "google_drive", "name": "work"}],
+    }
+
+
+@pytest.mark.asyncio
+async def test_stream_remote_replies_omits_oauth_block_when_no_connections(monkeypatch):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    async def fake_mint(**kw):
+        return "mdb_turnkey"
+
+    async def fake_list_active_connections(**kw):
+        return []
+
+    monkeypatch.setattr(prod, "mint_turn_key", fake_mint)
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
+    ))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert "oauth" not in params
+
+
+@pytest.mark.asyncio
+async def test_llm_mint_and_oauth_connections_fetch_run_concurrently(monkeypatch):
+    """Both are independent network round trips (turn-key mint, active-
+    connections list) — sequencing them costs an extra full round trip on
+    every turn's hot path. Wired so a regression to sequential execution
+    deadlocks (caught via wait_for) rather than silently passing: the llm
+    mint can't return until the oauth fetch has already started."""
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    oauth_started = asyncio.Event()
+
+    async def slow_mint(**kw):
+        await oauth_started.wait()
+        return "mdb_turnkey"
+
+    async def tracking_list_active_connections(**kw):
+        oauth_started.set()
+        return []
+
+    monkeypatch.setattr(prod, "mint_turn_key", slow_mint)
+    monkeypatch.setattr(prod, "list_active_connections", tracking_list_active_connections)
+
+    try:
+        await asyncio.wait_for(_drain(prod.stream_remote_replies(
+            conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        )), timeout=2.0)
+    except asyncio.TimeoutError:
+        pytest.fail("deadlocked: the oauth connections fetch never started before the llm mint awaited it")
 
 
 @pytest.mark.asyncio
@@ -283,7 +419,9 @@ async def test_unresponsive_worker_fails_the_turn_instead_of_spinning(monkeypatc
     # and the caller persists a failure so a reload shows the error card.
     kind, data = items[-1]
     assert kind == "turn_failed"
-    assert data["code"] == "anton_error"
+    # Its own code, not the generic one (ENG-2126): nothing ran, so the card
+    # has to say the turn never started rather than blame the agent.
+    assert data["code"] == te.WORKER_UNRESPONSIVE_CODE
     assert data["error"] == prod.UNRESPONSIVE_WORKER_ERROR
 
 
@@ -403,3 +541,26 @@ async def test_turn_skill_reaches_the_caller(monkeypatch):
     items = await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
     assert items == [("turn_skill", {"entries": [draft]}), ("turn_completed", {})]
+
+
+@pytest.mark.asyncio
+async def test_turn_history_reaches_the_caller(monkeypatch):
+    """The kind filter is a whitelist, so this is the one place a frame that
+    already passed TurnReply validation can still be dropped — silently, with
+    no log line. It needs its own test because the behavioural _produce_remote
+    tests patch stream_remote_replies out and never exercise the filter."""
+    rows = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "scratchpad", "input": {"code": "1"}}]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1", "content": "1"}]},
+    ]
+    fake = FakeRedis(replies=[
+        ("scratchpad:reply:conv-1", _reply("turn_history", {"rows": rows})),
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+    ])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+    assert items == [("turn_history", {"rows": rows}), ("turn_completed", {})]

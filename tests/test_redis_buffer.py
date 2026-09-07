@@ -45,6 +45,28 @@ async def test_close_writes_one_terminal_record(fake_redis):
 
 
 @pytest.mark.asyncio
+async def test_close_leaves_buffer_open_when_the_terminal_append_fails(fake_redis, monkeypatch):
+    """If the terminal append fails mid-close, is_closed must stay False.
+
+    The unterminated-buffer seal backstop (handlers/responses.py) trusts
+    is_closed as proof a terminal was written and skips a buffer it reports as
+    closed. If close() flipped _closed before the append that actually persists
+    the terminal, a failed append would leave the buffer with no terminal yet
+    reporting closed — the exact hung-tail case the backstop exists to catch
+    (ENG-1717). So a failed append must both propagate and keep is_closed False.
+    """
+    buf = RedisStreamBuffer(conversation_id="c1", turn_id=1)
+
+    async def boom(*_args, **_kwargs):
+        raise RuntimeError("redis down")
+
+    monkeypatch.setattr(buf, "append", boom)
+    with pytest.raises(RuntimeError):
+        await buf.close("error")
+    assert buf.is_closed is False
+
+
+@pytest.mark.asyncio
 async def test_close_carries_extra_into_the_terminal_record(fake_redis):
     buf = RedisStreamBuffer(conversation_id="c1", turn_id=1)
     await buf.close("error", {"message": "boom"})

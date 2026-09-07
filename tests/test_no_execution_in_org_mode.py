@@ -140,36 +140,70 @@ async def test_export_html_not_refused_in_org_mode(org_mode, tmp_path):
 
 # ─── C2: apply_env_to_process would pollute this whole process's env ──
 
-def test_apply_workspace_env_refused_in_org_mode(org_mode):
+def test_load_workspace_env_refused_in_org_mode(org_mode):
     from unittest.mock import Mock
 
-    from cowork.harnesses.anton_harness.harness import _apply_workspace_env_if_safe
+    from cowork.harnesses.anton_harness.harness import _load_workspace_env_if_safe
 
     fake_workspace = Mock()
-    applied = _apply_workspace_env_if_safe(fake_workspace)
+    result = _load_workspace_env_if_safe(fake_workspace)
 
-    assert applied is False
-    fake_workspace.apply_env_to_process.assert_not_called()
+    assert result == {}
+    fake_workspace.load_env.assert_not_called()
 
 
-def test_apply_workspace_env_still_works_on_desktop(monkeypatch):
-    """Desktop still needs its own .env loaded into the process (e.g. a
-    locally-set API key). Guard against the kill switch being unconditional."""
-    from unittest.mock import Mock
+def test_load_workspace_env_still_works_on_desktop(monkeypatch, tmp_path):
+    """Desktop still needs its own .env made available to the scratchpad
+    (e.g. a locally-set API key), read off disk and returned rather than
+    applied to this process."""
+    import os
+
+    from anton.workspace import Workspace
 
     monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
     from cowork.common.settings.app_settings import get_app_settings
     get_app_settings.cache_clear()
 
-    from cowork.harnesses.anton_harness.harness import _apply_workspace_env_if_safe
+    from cowork.harnesses.anton_harness.harness import _load_workspace_env_if_safe
 
-    fake_workspace = Mock()
-    applied = _apply_workspace_env_if_safe(fake_workspace)
+    # A real workspace with a real .env, so this covers the read as well as
+    # the guard — a Mock returning what it was told proves neither.
+    workspace = Workspace(tmp_path)
+    workspace.initialize()
+    (tmp_path / ".anton" / ".env").write_text("MY_PROJECT_VAR=project-value\n")
+    # A developer shell or CI may already export it; the assertion below is
+    # about this function not setting it.
+    monkeypatch.delenv("MY_PROJECT_VAR", raising=False)
 
-    assert applied is True
-    fake_workspace.apply_env_to_process.assert_called_once()
+    result = _load_workspace_env_if_safe(workspace)
+
+    assert result["MY_PROJECT_VAR"] == "project-value"
+    assert "MY_PROJECT_VAR" not in os.environ
     get_app_settings.cache_clear()
 
+
+def test_code_project_commands_refused_in_org_mode(org_mode, monkeypatch):
+    """Project-configured commands are local desktop behavior, never org execution."""
+    from cowork.coding import project_workspaces
+    from cowork.coding.project_models import CodeProject, ProjectFolder
+
+    monkeypatch.setattr(
+        project_workspaces.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("subprocess must not run")),
+    )
+
+    with pytest.raises(RuntimeError, match="not available"):
+        project_workspaces.ProjectCommandRunner().run(
+            CodeProject(
+                id="blocked",
+                name="Blocked",
+                folders=[ProjectFolder(id="folder", name="Folder", path="/tmp/folder")],
+            ),
+            (),
+            "validate",
+            {},
+        )
 
 # ─── C3: stream_response is the single choke point for in-process turns ──
 
@@ -386,3 +420,37 @@ async def test_handle_refuses_non_streaming_turn_in_org_mode(org_mode):
         assert exc.value.status_code == 501
     finally:
         responses_mod.ConversationService = original
+
+
+def test_load_workspace_env_degrades_when_anton_has_no_load_env(monkeypatch):
+    """This server pins anton to a moving rev. A Workspace without load_env
+    must cost the overlay, not every in-process turn."""
+    from unittest.mock import Mock
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    from cowork.common.settings.app_settings import get_app_settings
+    get_app_settings.cache_clear()
+
+    from cowork.harnesses.anton_harness.harness import _load_workspace_env_if_safe
+
+    workspace = Mock(spec=[])  # no load_env at all
+
+    assert _load_workspace_env_if_safe(workspace) == {}
+    get_app_settings.cache_clear()
+
+
+def test_load_workspace_env_degrades_when_the_env_file_is_unreadable(monkeypatch):
+    """A malformed or unreadable .env must not take the turn down either."""
+    from unittest.mock import Mock
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    from cowork.common.settings.app_settings import get_app_settings
+    get_app_settings.cache_clear()
+
+    from cowork.harnesses.anton_harness.harness import _load_workspace_env_if_safe
+
+    workspace = Mock()
+    workspace.load_env.side_effect = OSError("unreadable")
+
+    assert _load_workspace_env_if_safe(workspace) == {}
+    get_app_settings.cache_clear()

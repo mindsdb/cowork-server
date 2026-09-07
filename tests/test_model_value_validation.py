@@ -23,7 +23,7 @@ CATALOG = ["mindshub_air", "claude-sonnet-5", "deepseek-v4-pro"]
 
 def _listing(ids):
     return providers.MindsModelListing(
-        ids=ids, efforts={}, enabled={}, labels={}, providers={}, families={}
+        ids=ids, efforts={}, enabled={}, labels={}, providers={}, families={}, role_defaults={}
     )
 
 
@@ -490,7 +490,7 @@ def test_org_mode_without_a_bearer_still_soft_fails(monkeypatch):
 # The tests above call model_value_rejection directly with org_id/bearer as
 # literal arguments, which leaves the ENDPOINT wiring unpinned: with a direct
 # call `request is None`, so the org branch is dead and both
-# `_bearer_token(request)` and `scope.org_id` could be gutted with the suite
+# `caller_bearer(request)` and `scope.org_id` could be gutted with the suite
 # still green. Hosted is the shipping mode and its gate rests on that wiring,
 # so drive it over HTTP once.
 

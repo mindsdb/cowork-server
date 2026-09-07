@@ -10,8 +10,11 @@ run's task_id passed as a kwarg.
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 from pathlib import Path
+
+import pytest
 
 from cowork.harnesses.hermes_harness.tools import (
     _hermes_create_artifact,
@@ -51,9 +54,10 @@ def test_create_artifact_writes_anton_convention_folder():
                     task_id=TASK_ID,
                 )
             )
-            assert result["slug"] == "sales-dashboard"
+            # Slug carries the artifact id (anton ENG-1680): <name>-<8 hex>.
+            assert re.fullmatch(r"sales-dashboard-[0-9a-f]{8}", result["slug"])
             folder = Path(result["path"])
-            assert folder == root / "sales-dashboard"
+            assert folder == root / result["slug"]
             metadata = json.loads((folder / "metadata.json").read_text())
             assert metadata["name"] == "Sales Dashboard"
             assert metadata["type"] == "html-app"
@@ -92,7 +96,8 @@ def test_list_artifacts_round_trips():
                 task_id=TASK_ID,
             )
             listed = json.loads(_hermes_list_artifacts({}, task_id=TASK_ID))
-            assert [a["slug"] for a in listed] == ["one"]
+            assert len(listed) == 1
+            assert re.fullmatch(r"one-[0-9a-f]{8}", listed[0]["slug"])
             assert listed[0]["type"] == "dataset"
         finally:
             finalize_artifact_run_context(TASK_ID)
@@ -121,6 +126,8 @@ def test_create_rejects_unknown_type():
 
 
 def test_register_artifact_tools_is_idempotent():
+    # hermes-agent is an optional extra; these two tests drive its registry.
+    pytest.importorskip("tools.registry")
     register_artifact_tools()
     register_artifact_tools()
     from tools.registry import registry
@@ -138,6 +145,7 @@ def test_register_artifact_tools_is_idempotent():
 def test_registry_dispatch_forwards_task_id_to_handler():
     """run_agent invokes tools via registry.dispatch(name, args, task_id=...);
     pin that the context lookup works through that exact path."""
+    pytest.importorskip("tools.registry")
     register_artifact_tools()
     from tools.registry import registry
 
@@ -151,7 +159,7 @@ def test_registry_dispatch_forwards_task_id_to_handler():
                     task_id=TASK_ID,
                 )
             )
-            assert result["slug"] == "via-dispatch"
+            assert re.fullmatch(r"via-dispatch-[0-9a-f]{8}", result["slug"])
         finally:
             finalize_artifact_run_context(TASK_ID)
 
@@ -200,7 +208,7 @@ def test_created_artifact_appears_in_cowork_listing():
     ])
     # The general project is shared across the test session — assert on
     # our artifact rather than the full listing.
-    entry = next((a for a in listed if a["slug"] == "hermes-dash"), None)
+    entry = next((a for a in listed if a["slug"] == result["slug"]), None)
     assert entry is not None
     assert entry["title"] == "Hermes Dash"
     assert entry["primary"] == "index.html"

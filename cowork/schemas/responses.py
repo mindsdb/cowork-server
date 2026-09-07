@@ -144,6 +144,19 @@ class ResponsesRequest(BaseModel):
         default=None,
         description="Model name for the chat completion request"
     )
+    # The composer's per-task reasoning-effort pick — mirrors `model` above.
+    # Overrides the account-wide planning/coding reasoning-effort settings for
+    # THIS turn only (see providers.build_llm_client's effort_override param).
+    # When set on the turn that creates a new conversation, it is persisted
+    # onto Conversation.reasoning_effort so a reopened task remembers the pick,
+    # same as `model`. Not validated against the model's advertised effort
+    # levels here — the client only offers levels the picked model supports
+    # (settings.modelEfforts), and an invalid pair is rejected reactively by
+    # the provider/gateway, same as an invalid model name.
+    reasoning_effort: str | None = Field(
+        default=None,
+        description="Reasoning effort level for the chat completion request",
+    )
     # The composer's per-task harness pick (Coding Mode). Overrides the
     # account-wide `harness` setting for THIS conversation only — mirrors
     # `model` above. Silently ignored (falls back to the account default) if

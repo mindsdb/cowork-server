@@ -68,7 +68,7 @@ class ConnectionsService:
             result.append(ConnectionSummaryResponse(
                 engine=engine,
                 name=name,
-                display_name=connection_display_name(fields),
+                display_name=connection_display_name(fields, engine),
                 created_at=item.get("created_at"),
                 label=spec.label if spec else None,
                 user_label=user_label,
@@ -95,7 +95,7 @@ class ConnectionsService:
                 fields[key] = _SENTINEL
                 masked_keys.append(key)
 
-        display_name = connection_display_name(fields)
+        display_name = connection_display_name(fields, engine)
         user_label = str(fields.get("_user_label", "")).strip() or str(fields.get("_label", "")).strip() or None
         # Pop both out of `fields` (still needed — see below), just without
         # re-adding either as `fields["label"]`/`fields["user_label"]` the way
@@ -122,6 +122,18 @@ class ConnectionsService:
             fields=fields,
             secure_keys=masked_keys,
         )
+
+    def runtime_fields(self, engine: str, name: str) -> dict | None:
+        """Return an internal-only credential copy for a connector runtime.
+
+        API response models must continue to use :meth:`get`, which masks
+        secrets. Coding integration adapters use this method only inside the
+        local server process and never serialize its result.
+        """
+        record = self._read_record(self._vault(), engine, name)
+        if record is None:
+            return None
+        return dict(record.get("fields") or {})
 
     def patch_token(self, engine: str, name: str, updates: dict) -> bool:
         """Partially update token fields on an existing vault entry.

@@ -82,10 +82,21 @@ def test_explicit_model_choice_is_never_rewritten():
     assert s.planning_model == "sonnet"
 
 
-def test_all_disabled_map_keeps_canonical_default():
-    # Degenerate metadata (nothing enabled) must not invent a model.
-    s = _minds(minds_model_enabled=json.dumps({"kimi": False, "gpt-codex": False}))
+def test_drained_wallet_keeps_a_still_served_default():
+    # Nothing enabled but the default is still served (locked). Keep it — it 402s
+    # with a top-up path and re-enables when credits return.
+    s = _minds(
+        minds_model_enabled=json.dumps({"mindshub_air": False, "kimi": False})
+    )
     assert s.planning_model == "mindshub_air"
+
+
+def test_retired_default_with_nothing_enabled_falls_back_to_first_served():
+    # Default absent from a non-empty catalogue (retired) and nothing
+    # enabled — the removed id would 404 every turn, so hand out a served model.
+    s = _minds(minds_model_enabled=json.dumps({"kimi": False, "gpt-codex": False}))
+    assert s.planning_model == "kimi"
+    assert s.coding_model == "kimi"
 
 
 def test_default_missing_from_nonempty_map_falls_back_to_first_enabled():
@@ -212,6 +223,55 @@ def test_stale_byok_planning_pin_survives_a_provider_switch_onto_minds():
     assert s.resolved_planning_model == "mindshub_air"
 
 
+def test_a_funded_wallet_restores_the_stored_pin_on_every_role():
+    """The other half of the substitution, and the reason the stored row is never rewritten.
+
+    A wallet that cannot pay resolves a locked pin to an affordable model, so the
+    user keeps working instead of watching every turn fail. The moment the wallet
+    can pay again the map flips the alias to ``enabled: true`` on the next
+    settings load, and each role resolves back to what the user actually picked,
+    with nothing to re-select in the picker.
+
+    Pinned for all three roles rather than one: the restore is what makes the
+    substitution acceptable, so a role that stopped restoring would be a silent
+    downgrade nobody could undo.
+    """
+    s = _pinned(
+        minds_model_enabled=PAID_MAP,
+        planning_model="sonnet",
+        coding_model="haiku",
+        router_model="kimi",
+    )
+    assert s.resolved_planning_model == "sonnet"
+    assert s.resolved_coding_model == "haiku"
+    assert s.resolved_router_model == "kimi"
+
+
+def test_the_same_pins_are_substituted_while_the_wallet_is_empty():
+    """The before half of the pair above, on identical pins.
+
+    Same three stored models, same three roles, same module-level maps, only the
+    availability one differs — so the pair reads as one rule with two directions
+    rather than two facts that happen to sit together.
+
+    The three single-role tests above already pin the substitution one role at a
+    time, so this is not the only guard against a build that stopped
+    substituting. What it adds is all three at once: a role that kept
+    substituting only because another role's pin was doing the work would pass
+    each of those and fail here.
+    """
+    s = _pinned(
+        minds_model_enabled=LOCKED_MAP,
+        planning_model="sonnet",
+        coding_model="haiku",
+        router_model="kimi",
+    )
+    assert (s.planning_model, s.coding_model, s.router_model) == ("sonnet", "haiku", "kimi")
+    assert s.resolved_planning_model == "mindshub_air"
+    assert s.resolved_coding_model == "mindshub_air"
+    assert s.resolved_router_model == "mindshub_air"
+
+
 def test_latest_prefixed_pin_is_probed_bare():
     # /v1/models ids are always bare; login-era pins carry "latest:". The map
     # probe must strip it or those pins silently escape the fallback.
@@ -233,14 +293,24 @@ def test_funded_pin_is_kept():
     assert s.resolved_router_model == "kimi"
 
 
-def test_fully_drained_map_keeps_the_pin():
-    # Nothing enabled (drained wallet AND spent allowance) → no fallback
-    # exists; keep the stored value and let anton's verifier deny quietly.
+def test_fully_drained_map_keeps_a_still_served_pin():
+    # Nothing enabled but the pin is still served (locked) → keep it; the stored
+    # row is never rewritten.
     all_off = json.dumps(
         {"mindshub_air": False, "sonnet": False, "haiku": False, "kimi": False}
     )
     s = _pinned(minds_model_enabled=all_off, coding_model="haiku")
     assert s.resolved_coding_model == "haiku"
+
+
+def test_retired_pin_with_nothing_enabled_falls_back_to_first_served():
+    # Hard-block: pin absent from a non-empty catalogue (retired/foreign)
+    # and nothing enabled — the removed id 404s every turn, so fall back to a
+    # served model. The stored row is still never rewritten.
+    all_off = json.dumps({"sonnet": False, "haiku": False, "kimi": False})
+    s = _pinned(minds_model_enabled=all_off, coding_model="mindshub_air")
+    assert s.coding_model == "mindshub_air"
+    assert s.resolved_coding_model == "sonnet"
 
 
 def test_absent_map_keeps_the_pin():
@@ -309,7 +379,7 @@ def test_recommended_models_caches_enabled_map(monkeypatch):
         from cowork.services.providers import MindsModelListing
 
         return MindsModelListing(
-            ["mindshub_air", "sonnet"], {}, {"mindshub_air": True, "sonnet": False}, {}, {}, {}
+            ["mindshub_air", "sonnet"], {}, {"mindshub_air": True, "sonnet": False}, {}, {}, {}, {}
         )
 
     monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)

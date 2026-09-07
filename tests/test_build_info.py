@@ -46,6 +46,7 @@ def _patch_channel_inputs(
     class _Settings:
         tenancy_mode = tenancy
         install_channel_override = override
+        surface_override = ""
 
     monkeypatch.setattr(
         "cowork.common.settings.app_settings.get_app_settings", lambda: _Settings()
@@ -234,3 +235,195 @@ class TestStampReachesTheHarness:
         assert metadata[KEY_SERVER_VERSION]
         assert metadata[KEY_ANTON_VERSION]
         assert metadata[KEY_INSTALL_CHANNEL]
+
+
+# ---------------------------------------------------------------------------
+# ENG-1459: which surface this deployment serves. One codebase and one server
+# run both the desktop sidecar and the multi-tenant web build, and both report
+# harness="anton" — so without this, "are web users behaving differently?" has
+# no answer.
+# ---------------------------------------------------------------------------
+
+
+def _patch_surface_inputs(monkeypatch, *, tenancy: str = "local", override: str = ""):
+    class _Settings:
+        tenancy_mode = tenancy
+        install_channel_override = ""
+        surface_override = override
+
+    monkeypatch.setattr(
+        "cowork.common.settings.app_settings.get_app_settings", lambda: _Settings()
+    )
+
+
+class TestSurface:
+    def test_org_tenancy_is_the_web_signal(self, monkeypatch):
+        # COWORK_TENANCY_MODE=org is set only on the k8s deployment, so it is
+        # the one fact that already distinguishes web from desktop.
+        _patch_surface_inputs(monkeypatch, tenancy="org")
+        assert build_info.surface() == "web"
+
+    def test_anything_else_is_a_desktop_sidecar(self, monkeypatch):
+        _patch_surface_inputs(monkeypatch, tenancy="local")
+        assert build_info.surface() == "desktop"
+
+    def test_explicit_override_beats_tenancy_inference(self, monkeypatch):
+        # The populations inference gets wrong on purpose: the hub snapshot
+        # instances being deprecated run local tenancy but are not desktops,
+        # and would otherwise inflate the baseline web is measured against.
+        _patch_surface_inputs(monkeypatch, tenancy="local", override="web")
+        assert build_info.surface() == "web"
+
+    def test_override_is_normalised(self, monkeypatch):
+        _patch_surface_inputs(monkeypatch, tenancy="local", override="  WEB ")
+        assert build_info.surface() == "web"
+
+    def test_an_invalid_override_yields_no_surface_rather_than_a_guess(
+        self, monkeypatch, caplog
+    ):
+        # Deliberately NOT falling back to inference here: a deployer that
+        # bothered to declare a surface and got it wrong should show up as
+        # unknown, not be silently filed under desktop.
+        _patch_surface_inputs(monkeypatch, tenancy="local", override="cowork")
+        with caplog.at_level("WARNING"):
+            assert build_info.surface() is None
+        assert any("cowork" in r.getMessage() for r in caplog.records)
+
+    def test_surface_is_not_cached_across_settings_changes(self, monkeypatch):
+        # install_channel() is memoized because it describes how the process
+        # was installed. This reads settings, which a reload can change — a
+        # stale cache here would report the wrong surface for the process life.
+        _patch_surface_inputs(monkeypatch, tenancy="local")
+        assert build_info.surface() == "desktop"
+        _patch_surface_inputs(monkeypatch, tenancy="org")
+        assert build_info.surface() == "web"
+
+    def test_resolution_never_raises(self, monkeypatch):
+        """Telemetry must not be able to fail a turn."""
+
+        def _boom():
+            raise RuntimeError("settings exploded")
+
+        monkeypatch.setattr(
+            "cowork.common.settings.app_settings.get_app_settings", _boom
+        )
+        assert build_info.surface() is None
+
+
+class TestTheWebSurfaceIsNotReachableYet:
+    """Pins a known GAP, not desired behaviour (ENG-1459).
+
+    `surface()` returns "web" exactly when `tenancy_mode == "org"`, and
+    `AntonHarness.stream_response` refuses to run in-process under that same
+    condition — the web deployment routes turns to a scratchpad-controller pod
+    instead (`COWORK_TURN_BACKEND=remote`). So the only consumer of a "web"
+    surface has already raised by the time one exists, and this PR delivers
+    `desktop` only.
+
+    This test exists so the gap is visible in the suite rather than living in a
+    docstring nobody reads. **If it starts failing, that is progress** — either
+    the in-process refusal was lifted or the surface now reaches the pod. Update
+    this test and the `surface()` warning together; do not just delete it.
+    """
+
+    def test_web_and_the_in_process_refusal_share_one_condition(self, monkeypatch):
+        import inspect
+
+        from cowork.harnesses.anton_harness.harness import AntonHarness
+
+        _patch_surface_inputs(monkeypatch, tenancy="org")
+        assert build_info.surface() == "web", "the web answer comes from org tenancy"
+
+        # …and the same tenancy check gates the in-process path off.
+        src = inspect.getsource(AntonHarness.stream_response)
+        assert 'tenancy_mode == "org"' in src
+        assert "in-process execution is disabled" in src
+
+    def test_desktop_is_the_half_that_actually_works(self, monkeypatch):
+        # Local tenancy runs in-process, so the kwarg reaches a real turn.
+        _patch_surface_inputs(monkeypatch, tenancy="local")
+        assert build_info.surface() == "desktop"
+
+
+class TestSupportedKwargs:
+    """This server pins anton to a rev, so a config field it knows about can be
+    missing from the installed copy. Passing it anyway raises on every turn."""
+
+    def test_a_declared_field_is_passed_through(self):
+        from dataclasses import dataclass
+
+        @dataclass
+        class Config:
+            known: str | None = None
+
+        assert build_info.supported_kwargs(Config, known="v") == {"known": "v"}
+
+    def test_an_undeclared_field_is_dropped_not_raised(self):
+        from dataclasses import dataclass
+
+        @dataclass
+        class OldConfig:
+            other: str | None = None
+
+        kwargs = build_info.supported_kwargs(OldConfig, missing="v")
+
+        assert kwargs == {}
+        OldConfig(**kwargs)  # would be a TypeError without the gate
+
+    def test_the_turn_config_is_constructible_with_the_gated_kwarg(self):
+        """The real thing: whatever anton is installed, building the turn's
+        config with the overlay kwarg must not raise."""
+        from anton.core.session import ChatSessionConfig
+
+        ChatSessionConfig(
+            llm_client=None,
+            **build_info.supported_kwargs(
+                ChatSessionConfig, workspace_env_overlay={"A": "b"}
+            ),
+        )
+
+
+class TestOverlayFallbackAtAnOldPin:
+    """Dropping the kwarg must not silently discard the project's .env.
+
+    With an anton that cannot carry the overlay, the harness falls back to
+    loading it the old way, so a desktop scratchpad keeps seeing project
+    values instead of losing them between this merge and the pin bump.
+    """
+
+    def test_the_turn_builder_routes_through_the_fallback(self):
+        """The helper is only useful if the turn builder actually calls it."""
+        from cowork.harnesses.anton_harness.harness import AntonHarness
+
+        # Compiled names rather than source text: a commented-out call still
+        # reads as present in the source, and renames are not the risk here.
+        names = AntonHarness._build_chat_session.__code__.co_names
+        assert "_apply_overlay_fallback" in names
+
+    def test_the_fallback_applies_only_when_the_kwarg_was_dropped(self):
+        from unittest.mock import Mock
+
+        from cowork.harnesses.anton_harness.harness import _apply_overlay_fallback
+
+        workspace = Mock()
+        overlay = {"MY_PROJECT_VAR": "v"}
+
+        # Kwarg carried the overlay: nothing to fall back to.
+        assert _apply_overlay_fallback(workspace, overlay, {"workspace_env_overlay": overlay}) is False
+        workspace.apply_env_to_process.assert_not_called()
+
+        # Kwarg dropped: load it the old way rather than losing it.
+        assert _apply_overlay_fallback(workspace, overlay, {}) is True
+        workspace.apply_env_to_process.assert_called_once()
+
+    def test_org_mode_cannot_reach_the_fallback(self):
+        """Org mode yields an empty overlay, and the guard needs a non-empty
+        one, so the untrusted shared .env is never applied to this process."""
+        from unittest.mock import Mock
+
+        from cowork.harnesses.anton_harness.harness import _apply_overlay_fallback
+
+        workspace = Mock()
+
+        assert _apply_overlay_fallback(workspace, {}, {}) is False
+        workspace.apply_env_to_process.assert_not_called()

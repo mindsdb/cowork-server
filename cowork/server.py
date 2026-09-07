@@ -5,6 +5,8 @@ This module sets up the FastAPI application with middleware, routing,
 and all necessary configurations for the Cowork service.
 """
 
+import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -31,9 +33,10 @@ logger = setup_logging()
 async def _start_channels(app: FastAPI) -> None:
     """Build live adapters from stored credentials and start ingress.
 
-    Org mode: channels are local-mode only — no adapters, no provider
-    connections, no ingress (the config endpoints 501 and webhook routes are
-    not mounted, see _install_channels)."""
+    Local mode only: adapters/ingress are boot-time and singleton, built from
+    the one deployment-global installation. Org mode resolves adapters
+    per-request instead (LiveAdapterRegistry.resolve_org_bridge), since
+    credentials are per-org and there is no single set to preload at boot."""
     if get_app_settings().tenancy_mode == "org":
         return
     await app.state.channel_adapters.refresh_all()
@@ -44,6 +47,50 @@ async def _start_channels(app: FastAPI) -> None:
         await sync_channel_ingress(
             app.state.channel_ingress, app.state.channel_adapters, plugin.channel_type
         )
+
+
+# Hard ceiling on the boot-time model-map warm. This runs during lifespan
+# startup, i.e. BEFORE uvicorn binds the port, so an unbounded fetch against a
+# degraded MindsHub would make the desktop app unreachable — and past the
+# client's 180s start cap (see cowork src/shared/server-status.ts), a hard
+# start failure. Bounded, the worst case is a short boot delay after which we
+# bind with the last-known-good map and let GET /recommended-models warm it.
+_BOOT_WARM_TIMEOUT_S = 3.0
+
+
+async def _warm_model_map_on_boot() -> bool:
+    """Warm the MindsHub availability map at boot when a key is already stored
+    (desktop, returning user), so the FIRST turn heals a stored paid pin instead
+    of 402'ing against an empty map (ENG-748). Since ENG-1652 the unset default
+    is already free (floored by ``role_defaults``); the map is what steers a
+    stored *paid pin* off an unaffordable model on a free-tier wallet.
+
+    Desktop only: org mode stores no key and is floored by ``role_defaults``.
+
+    Bounded (``_BOOT_WARM_TIMEOUT_S``) and fail-open — never raises, never blocks
+    the socket bind past the ceiling, and never clobbers a known-good map. On a
+    fresh desktop sign-in the credential is written to ``.env`` before the server
+    (re)starts, so ``run_dev_setup``'s env→DB migration seeds the key ahead of
+    this warm; the returning-user case already has the key stored. Returns True
+    iff the stored map was updated.
+    """
+    if get_app_settings().tenancy_mode == "org":
+        return False
+    from cowork.db.session import get_open_session
+    from cowork.services.providers import warm_enabled_model_map
+
+    warm_session = get_open_session()
+    try:
+        return await asyncio.wait_for(
+            warm_enabled_model_map(warm_session), timeout=_BOOT_WARM_TIMEOUT_S
+        )
+    except Exception as exc:
+        # Message only, never exc_info: the warm frames hold the MindsHub API
+        # key, and RICH_LOGGING's tracebacks_show_locals would render it.
+        logger.warning("model-map boot warm failed (non-fatal): %s", exc)
+        return False
+    finally:
+        warm_session.close()
 
 
 @asynccontextmanager
@@ -91,8 +138,21 @@ async def lifespan(app: FastAPI):
             recovery_session.close()
     except Exception:
         logger.exception("scheduled-run boot recovery failed (non-fatal)")
+    # Warm the MindsHub availability map at boot (desktop, returning or
+    # freshly-signed-in user) so the empty-map state — which keeps a stored
+    # paid pin and 402s the first message on a free-tier wallet (ENG-748) —
+    # is closed before the first turn. Bounded and fail-open; see the helper.
+    if await _warm_model_map_on_boot():
+        logger.info("warmed MindsHub model-availability map on boot")
     start_scheduler()
     await _start_channels(app)
+    app.state.channel_ingress_reconciler = None
+    if get_app_settings().tenancy_mode == "org":
+        from cowork.channels.ingress import start_reconciler
+
+        app.state.channel_ingress_reconciler = start_reconciler(
+            app.state.channel_ingress, app.state.channel_adapters
+        )
     try:
         yield
     finally:
@@ -100,10 +160,18 @@ async def lifespan(app: FastAPI):
         from cowork.common.http_client import close_proxy_client
         from cowork.services.artifacts import shutdown_launched_backends
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
+        from cowork.coding.service import get_coding_service
+
+        reconciler = getattr(app.state, "channel_ingress_reconciler", None)
+        if reconciler is not None:
+            reconciler.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reconciler
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
         await app.state.channel_adapters.shutdown()
+        get_coding_service().close_all()
         shutdown_launched_backends()
         await close_scratchpads()
         await close_proxy_client()
@@ -181,10 +249,13 @@ def create_app() -> FastAPI:
             TrustedHeaderMiddleware,
             exempt_paths=channel_webhook_paths,
             enforce=enforce,
+            organization_boundary_mode=settings.organization_boundary_mode,
         )
         logger.info(
-            "auth: org tenancy mode — principal middleware enabled (%s)",
+            "auth: org tenancy mode — principal middleware enabled "
+            "(identity=%s, organization-boundary=%s)",
             settings.identity_enforce,
+            settings.organization_boundary_mode,
         )
         # No explicit shared root → org data sits on the ephemeral pod FS.
         # Warn, don't fail: dev deployments predate the mount. model_fields_set
@@ -219,7 +290,8 @@ def create_app() -> FastAPI:
         )
         logger.info("auth: bearer-token authentication enabled")
 
-    # Configure CORS middleware (added last → outermost)
+    # Configure CORS outside the authentication and principal layers. The
+    # no-store wrapper added below remains outermost.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
@@ -235,8 +307,16 @@ def create_app() -> FastAPI:
     # and submission SSE streams set no-store at their own routes. OAuth is
     # swept in too: GET .../oauth/{engine}/credentials returns a raw
     # client_secret and, being a plain GET with no explicit cache directive,
-    # is cacheable by default wherever it's fetched from.
-    app.add_middleware(_NoStoreMiddleware, prefixes=("/api/v1/settings", "/api/v1/connectors/oauth"))
+    # is cacheable by default wherever it's fetched from. Capabilities are
+    # included so a browser never reuses a stale rollout state.
+    app.add_middleware(
+        _NoStoreMiddleware,
+        prefixes=(
+            "/api/v1/settings",
+            "/api/v1/connectors/oauth",
+            "/api/v1/capabilities",
+        ),
+    )
 
     # Include v1 API routes
     app.include_router(v1_router)
@@ -260,34 +340,37 @@ def _install_channels(app: FastAPI, webhook_paths: set[str]) -> None:
     Every mounted webhook path is recorded in ``webhook_paths`` so the bearer
     auth layer exempts it — these endpoints are called by external platforms
     that authenticate with their own signature, not the Cowork token.
+
+    Mounted in both local and org mode: org mode resolves the org per-request
+    from the payload (LiveAdapterRegistry.resolve_org_bridge) rather than
+    from one boot-time adapter, so there's no global set of credentials to
+    preload here the way local mode's lifespan startup does (_start_channels).
     """
     from cowork.channels.ingress import IngressManager
     from cowork.channels.registry import get_registry, load_first_party_plugins
     from cowork.channels.runtime import AntonChannelRuntime, LiveAdapterRegistry
     from cowork.channels.webhooks import build_channel_webhook_router
 
-    # Org mode: channels are local-mode only — mount no auth-exempt webhook
-    # routes and load no plugins. The empty registry/manager keep the
-    # lifespan start/stop paths inert.
-    local_mode = get_app_settings().tenancy_mode != "org"
-    if local_mode:
-        load_first_party_plugins()
+    load_first_party_plugins()
     adapters = LiveAdapterRegistry()
     runtime = AntonChannelRuntime(adapters)
-    if local_mode:
-        for plugin in get_registry().all():
-            if not plugin.webhooks:
-                continue
-            app.include_router(
-                build_channel_webhook_router(plugin, resolver=adapters.get, sink=runtime.handle),
-                prefix="/api/v1/channels",
-            )
-            # Mirrors the route path built in webhooks._add_webhook_route:
-            # f"/{channel_type}{webhook.path}" under the /api/v1/channels prefix.
-            webhook_paths.update(
-                f"/api/v1/channels/{plugin.channel_type}{webhook.path}"
-                for webhook in plugin.webhooks
-            )
+
+    for plugin in get_registry().all():
+        if not plugin.webhooks:
+            continue
+        app.include_router(
+            build_channel_webhook_router(
+                plugin, resolver=adapters.get, sink=runtime.handle,
+                org_resolver=adapters.resolve_org_bridge,
+            ),
+            prefix="/api/v1/channels",
+        )
+        # Mirrors the route path built in webhooks._add_webhook_route:
+        # f"/{channel_type}{webhook.path}" under the /api/v1/channels prefix.
+        webhook_paths.update(
+            f"/api/v1/channels/{plugin.channel_type}{webhook.path}"
+            for webhook in plugin.webhooks
+        )
     app.state.channel_adapters = adapters
     app.state.channel_runtime = runtime
     app.state.channel_ingress = IngressManager(sink=runtime.handle)
