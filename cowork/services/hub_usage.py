@@ -10,10 +10,12 @@ The desktop shows them above the composer and in Settings so a person sees
 Same rules as ``hub_workspaces``: the sidecar makes the call because auth's
 ingress does not allow Cowork origins, the bearer is the caller's own, and the
 host is the operator's (``default_minds_auth_host``), never the tenant-settable
-``minds_url``. Transport is ``hub_workspaces.get_auth_json``, shared.
+``minds_url``. Transport, cache key and sweep come from ``hub_workspaces``.
 
-The cache is per caller, not per org: the allowance and ``is_billing_owner``
-are the caller's own, and in org mode one process serves everyone in the org.
+The cache is per credential, not per org or per user id: the allowance and
+``is_billing_owner`` are the caller's own, in org mode one process serves
+everyone in the org, and on a desktop install the scope carries no user at all
+(``LOCAL_SCOPE``), so only the bearer tells one signed-in account from the next.
 """
 
 from __future__ import annotations
@@ -30,21 +32,31 @@ from cowork.schemas.hub_usage import (
     HubFreeTokens,
     HubUsageView,
 )
-from cowork.services.hub_workspaces import auth_v1, get_auth_json
+from cowork.services.hub_workspaces import cache_key, get_auth_json, sweep_cache
 
 logger = logging.getLogger(__name__)
 
 ENTITLEMENTS_PATH = "/entitlements/me/"
 WALLET_PATH = "/wallet/"
-# Same query the console issues; only ``totals`` and ``range`` are read here.
-USAGE_SUMMARY_PATH = "/usage/summary/?group_by=model&limit=200"
+# No ``group_by``: auth collapses the breakdown into one totals-only bucket, and
+# ``totals`` is summed over every row before paging either way. Only ``totals``,
+# ``range`` and ``meta`` are read here, so the console's per-model query would
+# fetch up to 200 rows to discard.
+USAGE_SUMMARY_PATH = "/usage/summary/"
 
 # Short on purpose. A top up made in the console should show up in the desktop
 # within a poll or two, and a failed read should be retried soon.
 _TTL_OK = 30.0
 _TTL_FAIL = 15.0
+# Derived, not restated, so raising a TTL cannot start evicting live entries.
+_MAX_TTL_S = max(_TTL_OK, _TTL_FAIL)
 
-_cache: dict[tuple[str, str, str], tuple[float, HubUsageView]] = {}
+# Keyed by (auth host, org, user, credential digest): the workspace caches' key,
+# for the same reason. `user_id` is empty outside org mode, so without the bearer
+# in the key every caller on a desktop install would share one entry, and a
+# sign-out and sign-in as another account would be served the first account's
+# balance and owner flag for the rest of the TTL.
+_cache: dict[tuple[str, str, str, str], tuple[float, HubUsageView]] = {}
 
 
 def _usd(value: Any) -> Optional[float]:
@@ -169,7 +181,7 @@ def parse_usage(entitlements: Any, wallet: Any, summary: Any = None) -> HubUsage
     )
 
 
-async def fetch_hub_usage(*, bearer_token: str, org_id: str, user_id: str = "") -> HubUsageView:
+async def fetch_hub_usage(*, bearer_token: str, org_id: str, user_id: str) -> HubUsageView:
     """The caller's free allowance and their organization's wallet.
 
     Unreachable returns ``reachable=False`` rather than raising: the surfaces
@@ -178,8 +190,8 @@ async def fetch_hub_usage(*, bearer_token: str, org_id: str, user_id: str = "") 
     if not bearer_token:
         return HubUsageView()
 
-    cache_key = (auth_v1(), org_id or "", user_id or "")
-    cached = _cache.get(cache_key)
+    key = cache_key(org_id=org_id, user_id=user_id, bearer_token=bearer_token)
+    cached = _cache.get(key)
     if cached:
         stamped, value = cached
         if (time.monotonic() - stamped) < (_TTL_OK if value.reachable else _TTL_FAIL):
@@ -195,7 +207,8 @@ async def fetch_hub_usage(*, bearer_token: str, org_id: str, user_id: str = "") 
     )
     entitlements, wallet, summary = (None if isinstance(r, BaseException) else r for r in results)
     view = parse_usage(entitlements, wallet, summary)
-    _cache[cache_key] = (time.monotonic(), view)
+    sweep_cache(_cache, max_ttl_s=_MAX_TTL_S)
+    _cache[key] = (time.monotonic(), view)
     return view
 
 

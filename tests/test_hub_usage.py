@@ -79,8 +79,8 @@ def _scope() -> TenantScope:
     return TenantScope(org_mode=True, org_id="org-a", user_id="user-a")
 
 
-def _fetch(bearer: str = "jwt-abc", user_id: str = "user-a"):
-    return asyncio.run(svc.fetch_hub_usage(bearer_token=bearer, org_id="org-a", user_id=user_id))
+def _fetch(bearer: str = "jwt-abc", user_id: str = "user-a", org_id: str = "org-a"):
+    return asyncio.run(svc.fetch_hub_usage(bearer_token=bearer, org_id=org_id, user_id=user_id))
 
 
 def test_no_bearer_is_unreachable_and_asks_nothing(calls):
@@ -169,6 +169,46 @@ def test_the_cache_is_per_caller_not_per_org(calls):
 
     assert view_b.is_billing_owner is False
     assert calls.asked.count(svc.ENTITLEMENTS_PATH) == 2
+
+
+def test_a_desktop_account_switch_does_not_reuse_the_previous_usage(calls):
+    """The key has to include the CREDENTIAL, not just the identity.
+
+    Outside org mode `scope_from_principal` returns LOCAL_SCOPE, so `org_id` and
+    `user_id` are both empty for every request on a desktop install, and an
+    identity-only key collapses to one shared entry. Sign out, sign in as another
+    MindsHub account, and the first account's balance and owner flag would be
+    served for the rest of the TTL.
+    """
+    calls.answers[svc.ENTITLEMENTS_PATH] = ENTITLEMENTS
+    calls.answers[svc.WALLET_PATH] = WALLET
+    first = _fetch(bearer="jwt-first-account", org_id="", user_id="")
+    assert first.balance.usd == 8.42
+    assert first.is_billing_owner is True
+
+    # Same process, same (empty) scope, a different MindsHub session.
+    calls.answers[svc.ENTITLEMENTS_PATH] = {**ENTITLEMENTS, "is_billing_owner": False}
+    calls.answers[svc.WALLET_PATH] = {**WALLET, "balance_usd": "0.01"}
+    second = _fetch(bearer="jwt-second-account", org_id="", user_id="")
+
+    assert second.balance.usd == 0.01
+    assert second.is_billing_owner is False
+    assert calls.asked.count(svc.ENTITLEMENTS_PATH) == 2
+
+
+def test_expired_entries_are_swept_rather_than_held_for_the_process_lifetime(calls):
+    """Nothing re-reads a departed caller's key, so nothing would ever drop it."""
+    calls.answers[svc.ENTITLEMENTS_PATH] = ENTITLEMENTS
+    _fetch(bearer="jwt-someone-who-leaves", org_id="", user_id="")
+    assert len(svc._cache) == 1
+
+    stale = {k: (stamped - (svc._MAX_TTL_S + 1), v) for k, (stamped, v) in svc._cache.items()}
+    svc._cache.clear()
+    svc._cache.update(stale)
+
+    _fetch(bearer="jwt-somebody-else", org_id="", user_id="")
+
+    assert len(svc._cache) == 1, "the departed caller's entry was never dropped"
 
 
 def test_an_uncapped_grant_with_no_remaining_field_is_not_zero(calls):
