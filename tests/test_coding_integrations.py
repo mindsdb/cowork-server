@@ -281,7 +281,8 @@ def test_github_requests_still_follow_same_origin_redirects(tmp_path: Path) -> N
     assert context.title == "Renamed"
 
 
-def test_connected_github_issue_becomes_normalized_source_context(tmp_path: Path) -> None:
+@pytest.mark.parametrize("standalone", [False, True])
+def test_connected_github_issue_becomes_normalized_source_context(tmp_path: Path, standalone: bool) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["Authorization"] == "Bearer secret"
         if request.url.path.endswith("/comments"):
@@ -303,7 +304,7 @@ def test_connected_github_issue_becomes_normalized_source_context(tmp_path: Path
 
     integration = service(handler, {("github", "github-work"): {"access_token": "secret"}})
     context = integration.read(
-        project(tmp_path),
+        None if standalone else project(tmp_path),
         SourceContextRequest(
             provider="github",
             kind="issue",
@@ -320,7 +321,8 @@ def test_connected_github_issue_becomes_normalized_source_context(tmp_path: Path
     assert context.attachments[0].url.endswith("mockup.png")
 
 
-def test_github_work_search_returns_normalized_issue_and_pull_request_results(tmp_path: Path) -> None:
+@pytest.mark.parametrize("standalone", [False, True])
+def test_github_work_search_returns_normalized_issue_and_pull_request_results(tmp_path: Path, standalone: bool) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/search/issues"
         assert request.url.params["q"] == "delivery is:open"
@@ -353,7 +355,7 @@ def test_github_work_search_returns_normalized_issue_and_pull_request_results(tm
     integration = service(handler, {("github", "github-work"): {"access_token": "secret"}})
     current = project(tmp_path)
     current.connections = []
-    page = integration.search(current, WorkItemSearchRequest(
+    page = integration.search(None if standalone else current, WorkItemSearchRequest(
         provider="github",
         query="delivery",
         connection_name="github-work",
@@ -367,7 +369,8 @@ def test_github_work_search_returns_normalized_issue_and_pull_request_results(tm
     assert current.connections == []
 
 
-def test_linear_work_search_uses_assigned_issues_for_an_empty_query(tmp_path: Path) -> None:
+@pytest.mark.parametrize("standalone", [False, True])
+def test_linear_work_search_uses_assigned_issues_for_an_empty_query(tmp_path: Path, standalone: bool) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert "viewer { assignedIssues" in body["query"]
@@ -387,7 +390,7 @@ def test_linear_work_search_uses_assigned_issues_for_an_empty_query(tmp_path: Pa
         }]}}}})
 
     integration = service(handler, {("linear", "linear-work"): {"api_key": "linear-secret"}})
-    page = integration.search(project(tmp_path), WorkItemSearchRequest(provider="linear"))
+    page = integration.search(None if standalone else project(tmp_path), WorkItemSearchRequest(provider="linear"))
 
     assert len(page.items) == 1
     assert page.items[0].external_id == "ENG-19"
@@ -415,7 +418,8 @@ def test_linear_work_search_uses_the_full_text_search_resolver(tmp_path: Path) -
     assert [item.external_id for item in page.items] == ["ENG-19"]
 
 
-def test_linear_and_slack_reads_use_their_connected_credentials(tmp_path: Path) -> None:
+@pytest.mark.parametrize("standalone", [False, True])
+def test_linear_and_slack_reads_use_their_connected_credentials(tmp_path: Path, standalone: bool) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -437,7 +441,7 @@ def test_linear_and_slack_reads_use_their_connected_credentials(tmp_path: Path) 
         ("linear", "linear-work"): {"api_key": "linear-secret"},
         ("slack", "slack-work"): {"bot_token": "slack-secret"},
     })
-    current = project(tmp_path)
+    current = None if standalone else project(tmp_path)
     linear = integration.read(current, SourceContextRequest(
         provider="linear",
         kind="issue",
