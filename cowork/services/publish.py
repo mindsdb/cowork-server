@@ -688,6 +688,7 @@ def update_artifact(raw_path: str) -> dict:
     _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
         artifact, container_dirs=[artifacts_base]
     )
+    published_json = published_dir / ".published.json"
     access = published_artifact_access(artifact, artifacts_base=artifacts_base)
 
     # Delegates: reuses report_id (read from .published.json) + refreshes last_md5.
@@ -706,7 +707,7 @@ def update_artifact(raw_path: str) -> dict:
             fresh_map[published_key] = fresh_entry
             _write_published_map(published_json, fresh_map)
     except Exception:
-        pass
+        logger.warning("Could not refresh publish mtime for %s", published_dir, exc_info=True)
 
     return result
 

@@ -554,7 +554,6 @@ async def artifact_review_entry(
     }
 
 
-# A share is a re-publish, so it inherits the upload's cost. Generous enough for
 class _AccessBody(BaseModel):
     """The access selection, in `anton.publish_access.resolve_access` shape.
 
