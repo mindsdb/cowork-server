@@ -19,9 +19,11 @@ from sqlmodel import Session, SQLModel, create_engine
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.models.project import Project
 from cowork.schemas.projects import ProjectCreateRequest
+import cowork.services.projects as projects_module
 from cowork.services.projects import (
     GENERAL_PROJECT,
     GENERAL_PROJECT_ID,
+    ProjectNameLockBusyError,
     ProjectPathNotAllowedError,
     ProjectService,
 )
@@ -173,7 +175,56 @@ def race_engine(projects_root, tmp_path):
     """
     engine = create_engine(f"sqlite:///{tmp_path / 'race.db'}")
     SQLModel.metadata.create_all(engine)
+    # `dev_setup` writes this row on every install, so a projects table
+    # without it is a state no deployment is ever in.
+    with Session(engine) as seed:
+        seed.add(
+            Project(
+                id=GENERAL_PROJECT_ID,
+                name=GENERAL_PROJECT,
+                path=str(projects_root / "general"),
+                is_active=True,
+            )
+        )
+        seed.commit()
     return engine
+
+
+class _Ran:
+    """A thread and what its call did, so "returned" is distinguishable
+    from "raised". Starts on construction."""
+
+    def __init__(self, target):
+        self.returned = threading.Event()
+        self.value = None
+        self.error: BaseException | None = None
+        self._thread = threading.Thread(target=self._body, args=(target,))
+        self._thread.start()
+
+    def _body(self, target) -> None:
+        try:
+            self.value = target()
+        except BaseException as exc:
+            self.error = exc
+        finally:
+            self.returned.set()
+
+    def _joined(self, timeout: float) -> None:
+        self._thread.join(timeout=timeout)
+        assert not self._thread.is_alive(), "the thread never finished"
+
+    def settled(self, timeout: float = 10):
+        """Insist the call returned, and hand back what it returned."""
+        self._joined(timeout)
+        if self.error is not None:
+            raise self.error
+        return self.value
+
+    def raised(self, timeout: float = 10) -> BaseException:
+        """Insist the call failed, and hand back why."""
+        self._joined(timeout)
+        assert self.error is not None, f"expected a failure, got {self.value!r}"
+        return self.error
 
 
 def _park_inside_the_lock(svc) -> tuple[threading.Event, threading.Event]:
@@ -196,20 +247,6 @@ def _park_inside_the_lock(svc) -> tuple[threading.Event, threading.Event]:
     return parked, release
 
 
-def _run(target) -> tuple[threading.Thread, threading.Event]:
-    returned = threading.Event()
-
-    def body():
-        try:
-            target()
-        finally:
-            returned.set()
-
-    thread = threading.Thread(target=body)
-    thread.start()
-    return thread, returned
-
-
 def _rows_named(engine, name: str) -> list[Project]:
     with Session(engine) as check:
         return list(check.exec(sa.select(Project).where(Project.name == name)).all())
@@ -221,41 +258,36 @@ def _rows_named(engine, name: str) -> list[Project]:
 # `get_project_by_name` a `.first()` on an unordered select, so one of the two
 # projects becomes unreachable and its files resolve to the other's directory.
 # SQLite serialises the writes but never re-evaluates the reads.
+#
+# Each test waits a beat on the loser to prove it did not proceed. That wait
+# is the assertion: "was serialised" is a negative, and the row count that
+# follows only catches the regression if the loser got as far as its own read
+# while the winner was parked.
 
 
 def test_two_concurrent_adoptions_cannot_commit_the_same_name(race_engine, tmp_path):
     first = _svc(race_engine)
     second = _svc(race_engine)
     parked, release = _park_inside_the_lock(first)
-    outcome: dict[str, ValueError | None] = {}
 
-    winner, _ = _run(lambda: first.create_project("notes", path=_folder(tmp_path, "a")))
+    winner = _Ran(lambda: first.create_project("notes", path=_folder(tmp_path, "a")))
     assert parked.wait(timeout=10), "the first adoption never settled its name"
 
-    def adopt_second():
-        try:
-            second.create_project("notes", path=_folder(tmp_path, "b"))
-            outcome["second"] = None
-        except ValueError as exc:
-            outcome["second"] = exc
-
-    loser, returned = _run(adopt_second)
-    # The first thread still holds the name, so a serialised second attempt
-    # cannot have returned. Unguarded it returns in milliseconds, committed.
-    finished_while_held = returned.wait(timeout=1)
+    loser = _Ran(lambda: second.create_project("notes", path=_folder(tmp_path, "b")))
+    finished_while_held = loser.returned.wait(timeout=1)
     release.set()
-    winner.join(timeout=10)
-    loser.join(timeout=10)
+    winner.settled()
+    error = loser.raised()
     assert not finished_while_held, "the second adoption ran while the first held the name"
     # Adoption refuses a taken name rather than bumping it: it creates nothing,
     # so `<root>/notes-2` would not describe the folder it points at.
-    assert isinstance(outcome["second"], ValueError)
-    assert "already exists" in str(outcome["second"])
+    assert isinstance(error, ValueError)
+    assert "already exists" in str(error)
     assert len(_rows_named(race_engine, "notes")) == 1
 
 
 def test_an_allocated_create_cannot_take_the_name_an_adoption_holds(
-    race_engine, projects_root, tmp_path
+    race_engine, tmp_path
 ):
     """The pair the argument-keyed guard missed.
 
@@ -266,24 +298,21 @@ def test_an_allocated_create_cannot_take_the_name_an_adoption_holds(
     adopting = _svc(race_engine)
     allocating = _svc(race_engine)
     parked, release = _park_inside_the_lock(adopting)
-    outcome: dict[str, Project] = {}
 
-    winner, _ = _run(
+    winner = _Ran(
         lambda: adopting.create_project("notes", path=_folder(tmp_path, "chosen"))
     )
     assert parked.wait(timeout=10), "the adoption never settled its name"
 
-    loser, returned = _run(
-        lambda: outcome.__setitem__("allocated", allocating.create_project("notes"))
-    )
-    finished_while_held = returned.wait(timeout=1)
+    loser = _Ran(lambda: allocating.create_project("notes"))
+    finished_while_held = loser.returned.wait(timeout=1)
     release.set()
-    winner.join(timeout=10)
-    loser.join(timeout=10)
+    winner.settled()
+    allocated = loser.settled()
     assert not finished_while_held, "the allocated create ran while the adoption held the name"
     # Bumped, not refused: an allocated create owns its directory, so taking
     # the next free name is a real outcome rather than a lost folder.
-    assert outcome["allocated"].name == "notes-2"
+    assert allocated.name == "notes-2"
     assert len(_rows_named(race_engine, "notes")) == 1
 
 
@@ -293,24 +322,19 @@ def test_a_rename_cannot_take_the_name_an_adoption_holds(race_engine, tmp_path):
     renaming = _svc(race_engine)
     existing = renaming.create_project("scratch")
     parked, release = _park_inside_the_lock(adopting)
-    outcome: dict[str, Project] = {}
 
-    winner, _ = _run(
+    winner = _Ran(
         lambda: adopting.create_project("notes", path=_folder(tmp_path, "chosen"))
     )
     assert parked.wait(timeout=10), "the adoption never settled its name"
 
-    loser, returned = _run(
-        lambda: outcome.__setitem__(
-            "renamed", renaming.update_project(existing.id, name="notes")
-        )
-    )
-    finished_while_held = returned.wait(timeout=1)
+    loser = _Ran(lambda: renaming.update_project(existing.id, name="notes"))
+    finished_while_held = loser.returned.wait(timeout=1)
     release.set()
-    winner.join(timeout=10)
-    loser.join(timeout=10)
+    winner.settled()
+    renamed = loser.settled()
     assert not finished_while_held, "the rename ran while the adoption held the name"
-    assert outcome["renamed"].name == "notes-2"
+    assert renamed.name == "notes-2"
     assert len(_rows_named(race_engine, "notes")) == 1
 
 
@@ -321,16 +345,44 @@ def test_an_is_active_toggle_does_not_queue_behind_a_create(race_engine, tmp_pat
     existing = toggling.create_project("scratch")
     parked, release = _park_inside_the_lock(adopting)
 
-    winner, _ = _run(
+    winner = _Ran(
         lambda: adopting.create_project("notes", path=_folder(tmp_path, "chosen"))
     )
     assert parked.wait(timeout=10), "the adoption never settled its name"
 
-    loser, returned = _run(lambda: toggling.update_project(existing.id, is_active=True))
-    assert returned.wait(timeout=10), "the toggle blocked on the name lock"
+    toggle = _Ran(lambda: toggling.update_project(existing.id, is_active=True))
+    assert toggle.returned.wait(timeout=10), "the toggle blocked on the name lock"
+    # Not just "returned": `_Ran` records a raise as a return, so the outcome
+    # has to be asserted or a toggle that fails outright reads as a pass.
+    assert toggle.settled().is_active is True
     release.set()
-    winner.join(timeout=10)
-    loser.join(timeout=10)
+    winner.settled()
+
+
+def test_a_name_that_cannot_be_locked_in_time_is_a_retryable_failure(
+    race_engine, tmp_path, monkeypatch
+):
+    """The locked region stats chosen paths, and a dead mount blocks there.
+
+    Bounded so one hung stat cannot wedge every create and rename in the
+    process. Not a `ValueError`: the endpoints map that to 400, and nothing
+    about the request is wrong.
+    """
+    monkeypatch.setattr(projects_module, "_NAME_LOCK_TIMEOUT_SECONDS", 0.05)
+    holding = _svc(race_engine)
+    waiting = _svc(race_engine)
+    parked, release = _park_inside_the_lock(holding)
+
+    winner = _Ran(lambda: holding.create_project("notes", path=_folder(tmp_path, "a")))
+    assert parked.wait(timeout=10), "the first adoption never settled its name"
+
+    blocked = _Ran(lambda: waiting.create_project("other", path=_folder(tmp_path, "b")))
+    error = blocked.raised()
+    assert isinstance(error, ProjectNameLockBusyError)
+    assert not isinstance(error, ValueError)
+    release.set()
+    winner.settled()
+    assert len(_rows_named(race_engine, "other")) == 0
 
 
 def test_the_name_is_what_the_user_typed_not_the_folder(engine, tmp_path):

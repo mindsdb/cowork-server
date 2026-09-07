@@ -25,6 +25,7 @@ from cowork.common.paths import (
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession, scoped_storage_root, unsafe_unscoped_session
 from cowork.models.project import Project
+from cowork.services.shared_resources import RESOURCE_LOCK_TIMEOUT_SECONDS
 
 if TYPE_CHECKING:
     from cowork.services.skills import ProjectReferenceRewrite
@@ -44,6 +45,12 @@ GENERAL_PROJECT_ID = UUID("00000000-0000-0000-0000-000000000001")
 # distributed lock is not: on the single-process desktop sidecar. Do not reuse
 # it on a cloud path, where replicas would each hold their own.
 _LOCAL_NAME_LOCK = threading.Lock()
+
+# Bounded on purpose. The locked region stats paths the user chose, and a
+# chosen folder on a mount that has gone away blocks in the kernel. Unbounded,
+# one dead mount would wedge every create and rename in the process; the
+# endpoints are sync, so the waiters would also hold anyio threadpool slots.
+_NAME_LOCK_TIMEOUT_SECONDS = RESOURCE_LOCK_TIMEOUT_SECONDS
 
 _NAME_DISALLOWED = re.compile(r"[^A-Za-z0-9._-]+")
 _NAME_HYPHEN_RUNS = re.compile(r"-{2,}")
@@ -79,6 +86,14 @@ def display_label(project: "Project") -> str:
 
 class ProjectNotFoundError(ValueError):
     """The requested project is absent from the caller's scoped view."""
+
+
+class ProjectNameLockBusyError(Exception):
+    """The project-name lock could not be taken in time.
+
+    Deliberately not a `ValueError`: the endpoints map that to 400, and this is
+    a retryable 503. Nothing about the request is wrong.
+    """
 
 
 class ProjectPathNotAllowedError(ValueError):
@@ -454,7 +469,8 @@ class ProjectService:
                 return candidate
             i += 1
 
-    def _name_namespace_lock(self):
+    @contextmanager
+    def _name_namespace_lock(self) -> Iterator[None]:
         """Serialise a name allocation against every other one in this process.
 
         Skipped in org mode, where the create and rename endpoints already hold
@@ -464,10 +480,22 @@ class ProjectService:
         before its commit does not stop an allocated create taking the same
         name, because adoption is refused inside the projects root and so
         creates nothing for `mkdir` to trip over.
+
+        Bounded acquire, matching `shared_resources._process_lock`: a caller
+        that cannot get the name in time is told to retry rather than parked
+        behind a stat that may never return.
         """
         if self.session.scope.org_mode:
-            return nullcontext()
-        return _LOCAL_NAME_LOCK
+            yield
+            return
+        if not _LOCAL_NAME_LOCK.acquire(timeout=_NAME_LOCK_TIMEOUT_SECONDS):
+            raise ProjectNameLockBusyError(
+                "Project names are busy right now; retry the request"
+            )
+        try:
+            yield
+        finally:
+            _LOCAL_NAME_LOCK.release()
 
     def _sanitize_name(self, name: str) -> str:
         raw = (name or "").strip()
@@ -887,6 +915,16 @@ class ProjectService:
         stage: ProjectRenameStage | None,
     ) -> Project:
         """Commit a staged update and compensate its filesystem on failure."""
+        self._commit_staged_project_update(project, stage)
+        self.reconcile_renamed_project_links(project, stage)
+        return project
+
+    def _commit_staged_project_update(
+        self,
+        project: Project,
+        stage: ProjectRenameStage | None,
+    ) -> None:
+        """Commit the staged rows, undoing the staged filesystem move on failure."""
         try:
             self.session.commit()
         except Exception:
@@ -900,27 +938,39 @@ class ProjectService:
                         project.id,
                     )
             raise
-        if stage is not None and not self.session.scope.org_mode:
-            # These links are derived desktop state, so a reconciliation failure
-            # is logged after the canonical project/skill commit rather than
-            # turning a successful rename into a false API failure.
-            try:
-                from cowork.services.skill_links import reconcile_project
-                from cowork.services.skills import SkillService
 
-                skill_service = SkillService(self.session.scope)
-                skill_service.finalize_project_reference_rewrites(stage.skill_rewrites)
-                reconcile_project(
-                    stage.new_path,
-                    skill_service.list_skills(),
-                    project_name=stage.new_name,
-                )
-            except Exception:
-                logger.exception(
-                    "Could not reconcile desktop links for renamed project %s",
-                    project.id,
-                )
-        return project
+    def reconcile_renamed_project_links(
+        self,
+        project: Project,
+        stage: ProjectRenameStage | None,
+    ) -> None:
+        """Re-point desktop skill links at a renamed project's directory.
+
+        Separate from the commit so a caller holding the name lock can release
+        it first. This walks every project row and writes a symlink per enabled
+        skill, none of which needs the name reserved once the row is committed.
+        """
+        if stage is None or self.session.scope.org_mode:
+            return
+        # These links are derived desktop state, so a reconciliation failure
+        # is logged after the canonical project/skill commit rather than
+        # turning a successful rename into a false API failure.
+        try:
+            from cowork.services.skill_links import reconcile_project
+            from cowork.services.skills import SkillService
+
+            skill_service = SkillService(self.session.scope)
+            skill_service.finalize_project_reference_rewrites(stage.skill_rewrites)
+            reconcile_project(
+                stage.new_path,
+                skill_service.list_skills(),
+                project_name=stage.new_name,
+            )
+        except Exception:
+            logger.exception(
+                "Could not reconcile desktop links for renamed project %s",
+                project.id,
+            )
 
     def update_project(
         self,
@@ -945,7 +995,12 @@ class ProjectService:
                 is_active=is_active,
                 display_label=name,
             )
-            return self.commit_staged_project_update(updated, stage)
+            self._commit_staged_project_update(updated, stage)
+        # Outside the lock, for the reason `create_project` keeps its own
+        # reconcile outside: the row is committed, so the name is no longer
+        # in question, and this part is filesystem work.
+        self.reconcile_renamed_project_links(updated, stage)
+        return updated
 
     def delete_project(
         self,
