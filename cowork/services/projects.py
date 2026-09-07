@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import logging
 import os
 import re
+import threading
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -33,6 +34,11 @@ logger = logging.getLogger(__name__)
 
 GENERAL_PROJECT = "general"
 GENERAL_PROJECT_ID = UUID("00000000-0000-0000-0000-000000000001")
+
+# Adoption has no arbiter of its own: the allocated path is settled by
+# `mkdir`, adoption creates nothing, and `projects.name` carries no unique
+# index. Held across the name check and the insert in `create_project`.
+_ADOPT_NAME_LOCK = threading.Lock()
 
 _NAME_DISALLOWED = re.compile(r"[^A-Za-z0-9._-]+")
 _NAME_HYPHEN_RUNS = re.compile(r"-{2,}")
@@ -588,9 +594,10 @@ class ProjectService:
         # cosmetic problem: it is the lookup key, and `get_project_by_name` is
         # a `.first()` on an unordered select.
         #
-        # A concurrent pair can still both pass this check. On desktop, where
-        # this is the only place a folder can be adopted, SQLite serialises the
-        # writes and the loser's name is already taken by the time it commits.
+        # Serialised by `_ADOPT_NAME_LOCK`, which `create_project` holds from
+        # here through the insert. SQLite serialises the writes but never
+        # re-evaluates this read, so without the lock a concurrent pair both
+        # see the name free and both commit it.
         if self._unique_name(base) != base:
             raise ValueError(
                 f"A project called {base!r} already exists. Rename it, or "
@@ -611,38 +618,42 @@ class ProjectService:
         # which is looked up by name.
         if sanitized == GENERAL_PROJECT:
             sanitized = f"{GENERAL_PROJECT}-2"
-        if path is not None:
-            final_name, project_dir = self._adopt_project_dir(sanitized, path)
-        else:
-            # No exist_ok: `_unique_name` is a read-then-write with no unique
-            # constraint behind it, so two concurrent creates can pick the same name.
-            # Letting mkdir fail keeps them from sharing one directory (where deleting
-            # either would rmtree the other's files) and stops a leftover directory
-            # being adopted with stale contents. On collision, take the next name.
-            final_name, project_dir = self._allocate_project_dir(sanitized)
-        # self._scaffold(project_dir)
-        # The literal input, kept verbatim; `final_name` stays the slug. A new
-        # project always gets an explicit display_name -- NULL means "predates
-        # the column", never "the user typed nothing" (ENG-1676).
-        display = self._unique_display_name(self._display_base(name, final_name))
-        project = (
-            Project(
-                id=project_id,
-                name=final_name,
-                display_name=display,
-                path=str(project_dir),
-                is_active=False,
+        # Only adoption needs the lock. The allocated branch is arbitrated by
+        # `mkdir` and must not serialise behind an unrelated create.
+        name_guard = _ADOPT_NAME_LOCK if path is not None else nullcontext()
+        with name_guard:
+            if path is not None:
+                final_name, project_dir = self._adopt_project_dir(sanitized, path)
+            else:
+                # No exist_ok: `_unique_name` is a read-then-write with no unique
+                # constraint behind it, so two concurrent creates can pick the same name.
+                # Letting mkdir fail keeps them from sharing one directory (where deleting
+                # either would rmtree the other's files) and stops a leftover directory
+                # being adopted with stale contents. On collision, take the next name.
+                final_name, project_dir = self._allocate_project_dir(sanitized)
+            # self._scaffold(project_dir)
+            # The literal input, kept verbatim; `final_name` stays the slug. A new
+            # project always gets an explicit display_name -- NULL means "predates
+            # the column", never "the user typed nothing" (ENG-1676).
+            display = self._unique_display_name(self._display_base(name, final_name))
+            project = (
+                Project(
+                    id=project_id,
+                    name=final_name,
+                    display_name=display,
+                    path=str(project_dir),
+                    is_active=False,
+                )
+                if project_id is not None
+                else Project(
+                    name=final_name,
+                    display_name=display,
+                    path=str(project_dir),
+                    is_active=False,
+                )
             )
-            if project_id is not None
-            else Project(
-                name=final_name,
-                display_name=display,
-                path=str(project_dir),
-                is_active=False,
-            )
-        )
-        self.session.add(project)
-        self.session.commit()
+            self.session.add(project)
+            self.session.commit()
 
         # Skill symlink distribution is desktop-only (see SkillService).
         if not self.session.scope.org_mode:

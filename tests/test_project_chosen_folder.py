@@ -7,9 +7,11 @@ only, never inside the root, and never a folder another project claims.
 """
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
+import sqlalchemy as sa
 from pydantic import ValidationError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
@@ -159,6 +161,73 @@ def test_a_taken_name_is_refused_against_an_allocated_project(engine, tmp_path):
     allocated.create_project("notes")
     with pytest.raises(ValueError, match="already exists"):
         _svc(engine).create_project("notes", path=_folder(tmp_path, "b"))
+
+
+def test_two_concurrent_adoptions_cannot_commit_the_same_name(projects_root, tmp_path):
+    """The refusal above is a read, and nothing downstream re-checks it.
+
+    Needs a real pair of connections, so this engine is file-backed rather
+    than the shared in-memory one: on `StaticPool` both sessions ride one
+    connection and would see each other's uncommitted rows.
+
+    The first thread parks inside the locked region, still holding it, and the
+    second must not get past its own name check while that is true. Unlocked,
+    the second sails through and both commit `notes` -- SQLite serialises the
+    two writes but never re-evaluates either read.
+    """
+    engine = create_engine(f"sqlite:///{tmp_path / 'race.db'}")
+    SQLModel.metadata.create_all(engine)
+
+    first = _svc(engine)
+    second = _svc(engine)
+    parked = threading.Event()
+    release = threading.Event()
+    second_returned = threading.Event()
+    real_display = first._unique_display_name
+
+    def park_inside_the_locked_region(*args, **kwargs):
+        parked.set()
+        assert release.wait(timeout=10)
+        return real_display(*args, **kwargs)
+
+    first._unique_display_name = park_inside_the_locked_region
+    outcomes: dict[str, BaseException | None] = {}
+
+    def adopt(svc, key, folder):
+        try:
+            svc.create_project("notes", path=folder)
+            outcomes[key] = None
+        except BaseException as exc:  # noqa: BLE001 - recorded, re-raised below
+            outcomes[key] = exc
+
+    winner = threading.Thread(
+        target=adopt, args=(first, "first", _folder(tmp_path, "a"))
+    )
+    winner.start()
+    assert parked.wait(timeout=10), "the first adoption never reached the row build"
+
+    def attempt_and_report():
+        adopt(second, "second", _folder(tmp_path, "b"))
+        second_returned.set()
+
+    loser = threading.Thread(target=attempt_and_report)
+    loser.start()
+    # The first thread is still parked, so a serialised second attempt cannot
+    # have returned. Unlocked it returns in milliseconds, having committed.
+    finished_early = second_returned.wait(timeout=2)
+    release.set()
+    winner.join(timeout=10)
+    loser.join(timeout=10)
+    assert not winner.is_alive() and not loser.is_alive()
+    assert not finished_early, "the second adoption ran while the first held the name"
+
+    assert outcomes["first"] is None, outcomes["first"]
+    assert isinstance(outcomes["second"], ValueError), outcomes["second"]
+    assert "already exists" in str(outcomes["second"])
+
+    with Session(engine) as check:
+        named = check.exec(sa.select(Project).where(Project.name == "notes")).all()
+    assert len(named) == 1
 
 
 def test_the_name_is_what_the_user_typed_not_the_folder(engine, tmp_path):
