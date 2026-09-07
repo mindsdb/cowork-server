@@ -7,6 +7,7 @@ real credentials, network, or LLM.
 """
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 
 import httpx
@@ -1117,13 +1118,55 @@ def test_should_respond_matrix():
         return SimpleNamespace(trigger_rule=rule, trigger_pattern=pattern)
 
     should = AntonChannelRuntime._should_respond
-    assert should(binding("always"), event()) is True
-    assert should(binding("mention_only"), event(is_mention=True)) is True
-    assert should(binding("mention_only"), event(is_mention=False)) is False
-    assert should(binding("regex", r"listing"), event("any listings?")) is True
-    assert should(binding("regex", r"listing"), event("hello")) is False
-    assert should(binding("regex", None), event("hello")) is False
-    assert should(binding("regex", "("), event("hello")) is False
+    assert asyncio.run(should(binding("always"), event())) is True
+    assert asyncio.run(should(binding("mention_only"), event(is_mention=True))) is True
+    assert asyncio.run(should(binding("mention_only"), event(is_mention=False))) is False
+    assert asyncio.run(should(binding("regex", r"listing"), event("any listings?"))) is True
+    assert asyncio.run(should(binding("regex", r"listing"), event("hello"))) is False
+    assert asyncio.run(should(binding("regex", None), event("hello"))) is False
+    assert asyncio.run(should(binding("regex", "("), event("hello"))) is False
+
+
+def test_should_respond_regex_catastrophic_backtracking_is_bounded():
+    # A syntactically-valid-but-pathological trigger_pattern (ChannelBindingService
+    # only checks it parses, not that it's cheap to run) must not hang. Under a
+    # backtracking engine (stdlib `re`) this input takes exponential time; re2's
+    # linear-time automaton has no such failure mode, so no timeout is needed —
+    # this just proves the match still completes fast and correctly.
+    def event(text):
+        return SimpleNamespace(message=SimpleNamespace(content=text, is_mention=False))
+
+    def binding(pattern):
+        return SimpleNamespace(trigger_rule="regex", trigger_pattern=pattern)
+
+    evil_pattern = r"(a|aa)+$"
+    evil_input = "a" * 5000 + "!"  # no trailing match -> pathological for a backtracking engine
+
+    started = time.monotonic()
+    result = asyncio.run(AntonChannelRuntime._should_respond(binding(evil_pattern), event(evil_input)))
+    elapsed = time.monotonic() - started
+
+    assert result is False
+    assert elapsed < 1.0  # re2 resolves this in microseconds; generous margin for CI jitter
+
+
+def test_should_respond_regex_re2_incompatible_syntax_is_caught():
+    # re2 isn't syntax-compatible with `re`/`regex` — no backreferences, no
+    # lookahead/lookbehind. ChannelBindingService._validate_trigger rejects these
+    # at binding-creation time, but this proves the runtime match path is also
+    # safe (returns no-match rather than raising) for any pattern that reaches
+    # it regardless, e.g. one created before this constraint existed.
+    def event(text):
+        return SimpleNamespace(message=SimpleNamespace(content=text, is_mention=False))
+
+    def binding(pattern):
+        return SimpleNamespace(trigger_rule="regex", trigger_pattern=pattern)
+
+    backreference_pattern = r"(a)\1"  # valid in `re`/`regex`, unsupported by re2
+
+    result = asyncio.run(AntonChannelRuntime._should_respond(binding(backreference_pattern), event("aa")))
+
+    assert result is False
 
 
 def test_binding_instructions_roundtrip():
