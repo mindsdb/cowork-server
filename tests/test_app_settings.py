@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from cowork.common.settings.app_settings import AppSettings
+from cowork.common.settings.app_settings import AppSettings, TurnQueueSettings
 
 
 def test_app_settings_ignores_generic_server_port(monkeypatch):
@@ -155,8 +155,78 @@ def test_app_settings_identity_enforce_defaults_to_enforce(monkeypatch):
     assert settings.identity_enforce == "enforce"
 
 
+def test_app_settings_identity_enforce_can_opt_into_audit(monkeypatch):
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "audit")
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.identity_enforce == "audit"
+
+
 def test_app_settings_rejects_invalid_identity_enforce(monkeypatch):
     monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "strict")
+
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None)
+
+
+def test_turn_queue_settings_is_remote(monkeypatch):
+    monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")
+    assert TurnQueueSettings().is_remote is True
+
+    monkeypatch.setenv("COWORK_TURN_BACKEND", "inprocess")
+    assert TurnQueueSettings().is_remote is False
+
+    monkeypatch.delenv("COWORK_TURN_BACKEND", raising=False)
+    assert TurnQueueSettings().is_remote is False  # default is "inprocess"
+
+
+def test_app_settings_organization_boundary_defaults_to_enforce(monkeypatch):
+    monkeypatch.delenv("COWORK_ORGANIZATION_BOUNDARY_MODE", raising=False)
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.organization_boundary_mode == "enforce"
+
+
+@pytest.mark.parametrize("mode", ["audit", "enforce"])
+def test_app_settings_reads_organization_boundary_mode(monkeypatch, mode):
+    monkeypatch.setenv("COWORK_ORGANIZATION_BOUNDARY_MODE", mode)
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.organization_boundary_mode == mode
+
+
+def test_app_settings_rejects_invalid_organization_boundary_mode(monkeypatch):
+    monkeypatch.setenv("COWORK_ORGANIZATION_BOUNDARY_MODE", "strict")
+
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None)
+
+
+def test_app_settings_organization_switch_defaults_to_disabled(monkeypatch):
+    monkeypatch.delenv("COWORK_ORGANIZATION_SWITCH_ENABLED", raising=False)
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.organization_switch_enabled is False
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("true", True), ("false", False), ("1", True), ("0", False)],
+)
+def test_app_settings_reads_organization_switch_enabled(monkeypatch, raw, expected):
+    monkeypatch.setenv("COWORK_ORGANIZATION_SWITCH_ENABLED", raw)
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.organization_switch_enabled is expected
+
+
+def test_app_settings_rejects_invalid_organization_switch_enabled(monkeypatch):
+    monkeypatch.setenv("COWORK_ORGANIZATION_SWITCH_ENABLED", "sometimes")
 
     with pytest.raises(ValidationError):
         AppSettings(_env_file=None)
