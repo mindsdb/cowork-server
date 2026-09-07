@@ -33,11 +33,15 @@ class _AccessBody(BaseModel):
     # Mutually exclusive publish modes (ENG-322):
     #   public     — anyone with the link
     #   password   — visitors must enter `password`
-    #   restricted — only `emails` and/or everyone in the owner's org
+    #   restricted — only `emails` and/or everyone in the owner's org, or the
+    #                owner alone when `owner_only` is set
     mode: Literal["public", "password", "restricted"] = "public"
     password: str | None = None
     emails: list[str] = []
     org_allowed: bool = False
+    # Explicit "only me": a restricted publish with no emails and no org.
+    # Without this flag that combination degrades to public (ENG-1769).
+    owner_only: bool = False
 
 
 class _PublishBody(BaseModel):

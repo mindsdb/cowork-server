@@ -18,6 +18,7 @@ from fastapi import APIRouter, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
 
 from cowork.db.scoped import MissingTenantScopeError, ScopedSessionDep
+from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
 
 logger = logging.getLogger(__name__)
 
@@ -161,8 +162,20 @@ def attachment_raw(project_name: str, session_id: str, attachment_id: UUID, scop
     )
 
 
+#: Project-root names the server owns. `.anton` holds instructions, memory and
+#: skill drafts; `conversations` holds every member's private workspace. A plain
+#: file landing on either name squats a directory the server has to create later,
+#: so a move that would take one is refused before anything is copied.
+_RESERVED_PROJECT_ROOT_NAMES = frozenset({".anton", CONVERSATIONS_DIRNAME})
+
+
+def _project_destination_name(filename: str | None) -> str:
+    """The project-root filename a moved attachment lands on."""
+    return os.path.basename(filename or "upload").strip() or "upload"
+
+
 def _unique_project_target(project_dir: Path, filename: str) -> Path:
-    safe_name = os.path.basename(filename or "upload").strip() or "upload"
+    safe_name = _project_destination_name(filename)
     target = project_dir / safe_name
     if not target.exists():
         return target
@@ -187,6 +200,13 @@ def move_attachment_to_project(
         content_type, filename, source = FileService(scoped).get_file_content(attachment_id)
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    destination_name = _project_destination_name(filename)
+    if scoped.scope.org_mode and destination_name in _RESERVED_PROJECT_ROOT_NAMES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"The {destination_name} project namespace is reserved",
+        )
 
     project_dir = Path(project.path)
     project_dir.mkdir(parents=True, exist_ok=True)
@@ -219,4 +239,3 @@ browse_router = APIRouter()
 @browse_router.get("/status")
 def browse_status():
     return {"available": False}
-

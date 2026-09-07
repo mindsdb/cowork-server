@@ -137,9 +137,37 @@ def setup_console_handler():
     return handler
 
 
+def _resolved_log_level_name() -> str:
+    """The configured log level, read through AppSettings like every other
+    setting, falling back to `os.getenv` only if settings cannot be built.
+
+    Reading it from the environment alone was the bug: the desktop keeps its
+    config in `<COWORK_HOME>/.env`, which no environment variable carries, so a
+    customer who set LOG_LEVEL there still got the WARNING default and a log
+    holding nothing but uvicorn access lines. AppSettings already reads that
+    file through its env-file chain, and pydantic-settings still ranks real
+    environment variables above it, so a deployment's LOG_LEVEL keeps winning.
+
+    Only CONSTRUCTION is guarded, and deliberately broadly: `cowork_home()` runs
+    inside the env-file chain, so the failure modes are not only pydantic's, and
+    this runs at import, before anything could report the error. Reading the
+    field is outside the guard, so a missing or renamed `log_level` raises here
+    instead of silently degrading every deployment to WARNING.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+
+    try:
+        settings = get_app_settings()
+    except Exception:
+        # `get_app_settings` is lru_cached and does not cache exceptions, so the
+        # app's own call still raises later with the real message.
+        return os.getenv("LOG_LEVEL", "WARNING")
+    return settings.log_level
+
+
 def setup_logging():
     """Setup comprehensive logging configuration"""
-    log_level_str = os.getenv("LOG_LEVEL", "WARNING")
+    log_level_str = _resolved_log_level_name()
     enable_file_logging = os.getenv("ENABLE_FILE_LOGGING", "false").lower() == "true"
     log_dir = os.getenv("LOG_DIR", "logs")
 

@@ -19,6 +19,17 @@ def _url() -> str:
     return os.environ.get("COWORK_TURN_REDIS_URL", "redis://localhost:6379/0")
 
 
+def cancel_flag_key(correlation_id: str) -> str:
+    """The key a ``/cancel`` writes and whoever runs the turn polls.
+
+    Three processes agree on this name: the endpoint sets it, the producer
+    clears a stale one before each turn, and scratchpad-controller's
+    ``_cancel_key`` rebuilds it. Kept in one place on this side so the local
+    users cannot drift from each other.
+    """
+    return f"cowork:cancel:{correlation_id}"
+
+
 def get_redis() -> aioredis.Redis:
     global _client
     if _client is None:

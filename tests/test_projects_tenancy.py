@@ -131,7 +131,18 @@ def test_general_is_idempotent_within_an_org(db):
     assert first is not None and second is not None
     assert first.id == second.id
     assert first.org_id == ORG_A
-    assert first.created_by is None  # system-created, never attributed
+    # The member who first reaches the org provisions General and is recorded as
+    # its creator, so its instructions are editable without an admin.
+    assert first.created_by == "user-1"
+
+
+def test_general_keeps_its_first_provisioner_as_creator(db):
+    """A later member never takes over General's recorded creator."""
+    first = _svc(db, _scope(ORG_A, "user-1")).ensure_general_for_scope()
+    later = _svc(db, _scope(ORG_A, "user-2")).ensure_general_for_scope()
+    assert first is not None and later is not None
+    assert later.id == first.id
+    assert later.created_by == "user-1"
 
 
 def test_every_org_gets_its_own_general(db):
@@ -299,7 +310,7 @@ def test_a_losing_insert_adopts_the_winners_row(db, monkeypatch):
     monkeypatch.setattr(
         type(loser),
         "_execute_general_insert",
-        lambda self, raw, path, org_id: (_ for _ in ()).throw(
+        lambda self, raw, path, org_id, created_by: (_ for _ in ()).throw(
             sa.exc.IntegrityError("insert", {}, Exception("duplicate"))
         ),
         raising=True,
@@ -331,8 +342,8 @@ def test_a_member_cannot_take_the_default_projects_name(db):
     assert hijack.name != GENERAL_PROJECT  # the name is reserved
     general = a.ensure_general_for_scope()
     assert general is not None
-    assert general.created_by is None  # the real system row, not the member's
-    assert general.id != hijack.id
+    assert general.id != hijack.id  # the real system row, not the member's
+    assert general.created_by == "alice"  # provisioned by, not hijacked by
 
 
 def test_repointing_does_not_attribute_the_system_project(db, tmp_path):

@@ -21,6 +21,7 @@ one, so both modes address artifacts the same way.
 """
 from __future__ import annotations
 
+import stat
 from pathlib import Path
 from uuid import UUID
 
@@ -51,6 +52,34 @@ def _artifacts_base(project_path: str) -> Path:
     return Path(project_path).joinpath(*_ARTIFACTS_SUBPATH)
 
 
+def _is_real_directory(path: Path) -> bool:
+    """True only for a directory entry, never a link to one."""
+    try:
+        return stat.S_ISDIR(path.stat(follow_symlinks=False).st_mode)
+    except OSError:
+        return False
+
+
+def _storage_components_are_safe(workspace: Path, *, may_be_absent: bool) -> bool:
+    """Reject a link in the writable ``.anton/artifacts`` chain.
+
+    This is an early discovery filter.  The identity service repeats the
+    guarantee atomically by reopening both components relative to a pinned
+    project directory, so replacing either entry after this check is refused at
+    use time too.
+    """
+    for component in (workspace / _ARTIFACTS_SUBPATH[0], workspace.joinpath(*_ARTIFACTS_SUBPATH)):
+        try:
+            mode = component.stat(follow_symlinks=False).st_mode
+        except FileNotFoundError:
+            return may_be_absent
+        except OSError:
+            return False
+        if not stat.S_ISDIR(mode):
+            return False
+    return True
+
+
 def conversation_artifacts_base(project_path: str, conversation_id) -> Path:
     """The artifacts root one org-mode turn writes into.
 
@@ -77,7 +106,9 @@ def _conversation_id(child: Path) -> UUID | None:
         return None
 
 
-def _project_artifact_bases(project_path: str, session: ScopedSession) -> list[Path]:
+def _project_artifact_bases(
+    project_path: str, session: ScopedSession, *, include_other_members: bool = False
+) -> list[Path]:
     """Every artifacts root of one project the caller is allowed to read.
 
     One on the desktop. In org mode, one per conversation that has actually
@@ -97,16 +128,31 @@ def _project_artifact_bases(project_path: str, session: ScopedSession) -> list[P
     on project files (`_conversation_workspace_ok`) treats such a name as a
     shared file instead, because it guards a tree where shared files really do
     sit beside the workspaces. Nothing shares this one.
+
+    `include_other_members` drops that filter and is NOT an access decision: it
+    only widens the search so a co-member's artifact can be found by id, and
+    every caller must then check the owner's per-artifact grant
+    (`artifact_draft_review.draft_review_allows`). It exists because a review
+    route receives an artifact id and no conversation id, so there is nothing
+    else to look the folder up by. Never reachable from the artifacts list or
+    from any mutation.
     """
     if not _org_mode():
         return [_artifacts_base(project_path)]
     conversations = Path(project_path) / CONVERSATIONS_DIRNAME
+    if not _is_real_directory(conversations):
+        return []
     try:
         children = sorted(conversations.iterdir())
     except OSError:
         return []
-    children = [child for child in children if child.is_dir()]
-    if session.scope.org_mode:
+    children = [
+        child
+        for child in children
+        if _is_real_directory(child)
+        and _storage_components_are_safe(child, may_be_absent=True)
+    ]
+    if not include_other_members and session.scope.org_mode:
         from cowork.services.conversations import ConversationService
 
         candidates = {child: _conversation_id(child) for child in children}
@@ -117,18 +163,27 @@ def _project_artifact_bases(project_path: str, session: ScopedSession) -> list[P
     return [child.joinpath(*_ARTIFACTS_SUBPATH) for child in children]
 
 
-def _sources_for(session: ScopedSession, project) -> list[ProjectArtifacts]:
+def _sources_for(
+    session: ScopedSession, project, *, include_other_members: bool = False
+) -> list[ProjectArtifacts]:
     """One `ProjectArtifacts` per root. They all carry the SAME project identity:
     a conversation is where the bytes happen to live, not a thing the client
     addresses artifacts by, so cards stay project-addressed in both modes."""
-    return [
-        ProjectArtifacts(
-            base=base,
-            project_id=str(project.id),
-            project_name=project.name,
+    project_path = Path(project.path)
+    sources: list[ProjectArtifacts] = []
+    for base in _project_artifact_bases(
+        project.path, session, include_other_members=include_other_members
+    ):
+        sources.append(
+            ProjectArtifacts(
+                base=base,
+                project_id=str(project.id),
+                project_name=project.name,
+                trusted_anchor=project_path,
+                root_parts=base.relative_to(project_path).parts,
+            )
         )
-        for base in _project_artifact_bases(project.path, session)
-    ]
+    return sources
 
 
 def artifacts_sources_for_scope(session: ScopedSession) -> list[ProjectArtifacts]:
@@ -151,7 +206,9 @@ def artifacts_sources_for_scope(session: ScopedSession) -> list[ProjectArtifacts
     ]
 
 
-def artifacts_sources_for_project(session: ScopedSession, project_id: UUID) -> list[ProjectArtifacts]:
+def artifacts_sources_for_project(
+    session: ScopedSession, project_id: UUID, *, include_other_members: bool = False
+) -> list[ProjectArtifacts]:
     """The caller's own project by id. Raises ValueError for anything else —
     including another organization's project, which the scoped read does not
     return at all.
@@ -164,10 +221,17 @@ def artifacts_sources_for_project(session: ScopedSession, project_id: UUID) -> l
     resolves fine on desktop too. That is deliberate — without it the desktop
     branch would have to ignore `project_id`, and a slug-addressed delete would
     then act on whichever project happened to sort first.
+
+    `include_other_members` is passed through for review-only resolution; see
+    `_project_artifact_bases`. It widens the search, never the permission.
     """
     from cowork.services.projects import ProjectService
 
-    return _sources_for(session, ProjectService(session).get_project(project_id))
+    return _sources_for(
+        session,
+        ProjectService(session).get_project(project_id),
+        include_other_members=include_other_members,
+    )
 
 
 def artifacts_sources_for_scan() -> list[ProjectArtifacts]:
@@ -179,7 +243,21 @@ def artifacts_sources_for_scan() -> list[ProjectArtifacts]:
     string, and a rename moves the directory and updates the row together
     (services/projects.py).
     """
-    return [
-        ProjectArtifacts(base=base, project_id=None, project_name=base.parent.parent.name)
-        for base in _scan_artifact_dirs()
-    ]
+    sources: list[ProjectArtifacts] = []
+    for base in _scan_artifact_dirs():
+        # ``_scan_artifact_dirs`` historically follows directory links in its
+        # ``is_dir`` probe.  Do not let such a root become an authorization
+        # source; ordinary desktop directories retain the exact same shape.
+        if not _storage_components_are_safe(base.parent.parent, may_be_absent=False):
+            continue
+        project_path = base.parent.parent
+        sources.append(
+            ProjectArtifacts(
+                base=base,
+                project_id=None,
+                project_name=project_path.name,
+                trusted_anchor=project_path,
+                root_parts=_ARTIFACTS_SUBPATH,
+            )
+        )
+    return sources

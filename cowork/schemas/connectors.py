@@ -113,6 +113,10 @@ class ConnectorMetadataResponse(BaseModel):
     logo_color: str | None = None
     aliases: list[str] = []
     featured: bool = False
+    # Org (cloud) mode only: False marks a connector the hosted build can't
+    # run yet, so the directory can list it under a desktop-only group instead
+    # of hiding it. Always True on desktop, where the whole registry works.
+    cloud_available: bool = True
 
 
 class ConnectorSpecResponse(ConnectorMetadataResponse):
@@ -213,7 +217,15 @@ class DirectSaveRequest(BaseModel):
     connector_id: str
     method: str | None = None
     name: str = ""
+    replace_existing: bool = False
     values: dict[str, Any] = Field(default_factory=dict)
+
+
+class DirectSaveResponse(BaseModel):
+    ok: bool
+    name: str
+    label: str
+    user_label: str | None = None
 
 
 class PickedFile(BaseModel):
@@ -244,6 +256,17 @@ class PickedFile(BaseModel):
 
 class PatchPickedFilesBody(BaseModel):
     files: list[PickedFile] = Field(default_factory=list)
+
+
+class PickerTokenResponse(BaseModel):
+    """What the SPA needs to build a Google Picker itself. `api_key` is
+    auth's `picker_api_key` under a different name, so this pins a rename
+    the client would otherwise only assert by hand."""
+
+    access_token: str
+    account_email: str = ""
+    api_key: str
+    app_id: str
 
 
 class OAuthStartRequest(BaseModel):

@@ -28,3 +28,8 @@ deployment:
     # headers are rejected with 401.
     - name: COWORK_IDENTITY_ENFORCE
       value: "enforce"
+
+    - name: COWORK_ORGANIZATION_BOUNDARY_MODE
+      value: "audit"
+    - name: COWORK_ORGANIZATION_SWITCH_ENABLED
+      value: "false"

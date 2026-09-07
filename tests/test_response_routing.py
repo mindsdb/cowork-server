@@ -424,7 +424,7 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
     handler = _routing_handler(monkeypatch)
     monkeypatch.setattr(
         responses, "TurnQueueSettings",
-        lambda: SimpleNamespace(backend="remote", turn_key_ttl_seconds=1200),
+        lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200),
     )
     monkeypatch.setattr(
         responses, "get_user_settings",
@@ -457,7 +457,9 @@ async def test_router_binding_absent_outside_remote_backend(monkeypatch):
     import cowork.handlers.responses as responses
 
     handler = _routing_handler(monkeypatch)
-    monkeypatch.setattr(responses, "TurnQueueSettings", lambda: SimpleNamespace(backend="inprocess"))
+    monkeypatch.setattr(
+        responses, "TurnQueueSettings", lambda: SimpleNamespace(backend="inprocess", is_remote=False)
+    )
 
     assert await handler._router_binding() == (None, None)
 
@@ -517,6 +519,54 @@ async def test_produce_direct_persists_before_emitting_and_roots_metadata(monkey
     assert created["harness"] == "cowork-direct"
     for frame in buffer.frames:
         assert frame.endswith("\n\n") and "\\n" not in frame
+
+
+@pytest.mark.asyncio
+async def test_streaming_direct_response_registers_its_shared_redis_buffer(monkeypatch):
+    from uuid import UUID
+
+    import cowork.handlers.responses as responses
+
+    handler = _routing_handler(monkeypatch)
+    handler.scoped = SimpleNamespace(
+        scope=SimpleNamespace(org_id="org-1", user_id="user-1"),
+    )
+    buffer = SimpleNamespace()
+    handle = SimpleNamespace(buffer=buffer)
+    recorded = {}
+
+    async def fake_start(**kwargs):
+        kwargs["producer_coro"].close()
+        return handle
+
+    async def fake_record(conversation_id, **kwargs):
+        recorded["conversation_id"] = conversation_id
+        recorded.update(kwargs)
+
+    monkeypatch.setattr(responses, "new_buffer", lambda _cid, _turn_id: buffer)
+    monkeypatch.setattr(responses.registry, "start", fake_start)
+    monkeypatch.setattr(responses, "get_backend", lambda: "redis")
+    monkeypatch.setattr(responses, "record_turn", fake_record)
+    conversation_id = UUID("d27d3533-2e4e-4021-bb5a-6e238245974c")
+
+    await handler._handle_direct_response(
+        request=SimpleNamespace(stream=True),
+        conversation_id=conversation_id,
+        turn_id=3,
+        original_content="Hello",
+        route=RouteDecision(
+            route=DIRECT_CONTEXT,
+            reason="router_direct_response",
+            model="m",
+            text="Hi.",
+        ),
+    )
+
+    assert recorded["conversation_id"] == str(conversation_id)
+    assert recorded["turn_id"] == 3
+    assert recorded["correlation_id"].startswith("direct-")
+    assert recorded["org_id"] == "org-1"
+    assert recorded["user_id"] == "user-1"
 
 
 # --- history view: tool rows become markers, not holes (ENG-1851) -----------

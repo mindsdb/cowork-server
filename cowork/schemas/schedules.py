@@ -9,6 +9,35 @@ from pydantic import BaseModel
 from cowork.schemas.base import CamelRequest, CamelResponse
 
 
+# The `model` value a schedule stores when it should run on the account's
+# configured default models rather than a pinned id. The scheduler UI removed
+# the per-task model picker (see ScheduleTaskModal), so the frontend always
+# sends `model: null` and every schedule carries this sentinel.
+#
+# It is NOT a servable model id. Passing it into a turn makes the harness
+# override every model role with the literal string "default"
+# (`_apply_model_override` treats any truthy value as a real pick), and the
+# gateway 404s it as `model_not_found` — surfaced to the user as "That model
+# isn't available" (ENG-2353). `resolve_schedule_model` turns it back into None
+# before the turn is built, so the account-wide defaults govern the run.
+DEFAULT_MODEL_SENTINEL = "default"
+
+
+def resolve_schedule_model(stored: str | None) -> str | None:
+    """The model to run a schedule with, or None to follow the account defaults.
+
+    A schedule stores ``DEFAULT_MODEL_SENTINEL`` when it should track the
+    account's configured default model — the only mode the UI offers. That
+    sentinel is not a real model id, so it must become None (a no-op override)
+    before the turn is built, or the gateway rejects it (ENG-2353). A schedule
+    that pinned a concrete id (legacy rows, or a future picker) is passed
+    through unchanged.
+    """
+    if not stored or stored == DEFAULT_MODEL_SENTINEL:
+        return None
+    return stored
+
+
 class Cadence(str, Enum):
     once = "once"
     hourly = "hourly"

@@ -164,17 +164,65 @@ async def test_settings_are_read_with_the_passed_scope_not_the_ambient_one(
 
 # ── the happy path ────────────────────────────────────────────────────────
 
-async def test_new_artifact_is_published_restricted_to_the_org(base, enabled, key, published):
+async def test_new_artifact_is_published_owner_only(base, enabled, key, published):
+    """A first autopublish is private to its owner (ENG-2316).
+
+    `owner_only` is mandatory, not decoration: without it resolve_access
+    degrades `restricted` with no emails to `public`, i.e. world-readable.
+    """
     _make(base, "rep", files={"report.html": "<html></html>"},
           meta={"slug": "rep", "type": "html-app"})
 
     out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
 
     assert out == {"rep"}
-    # org_allowed is mandatory: without it resolve_access degrades `restricted`
-    # with no emails to `public`, i.e. world-readable.
-    assert published[0]["access"] == {"mode": "restricted", "emails": [], "org_allowed": True}
+    assert published[0]["access"] == {"mode": "restricted", "emails": [], "owner_only": True}
     assert published[0]["api_key"] == "turnkey-1"
+
+
+async def test_republish_keeps_the_access_the_owner_chose(base, enabled, key, published):
+    """Re-applying the first-publish default here would silently revoke a share
+    every time the agent touched the artifact — which would make the Share
+    control untrustworthy rather than merely incomplete (ENG-2316)."""
+    folder = _make(base, "rep", files={"index.html": "<html>v2</html>"},
+                   meta={"slug": "rep", "type": "html-app"})
+    (folder / ".published.json").write_text(json.dumps({
+        "index.html": {
+            "report_id": "rid", "url": "u", "published": True,
+            "last_md5": "stale-so-the-content-counts-as-changed",
+            "published_mtime": 0,
+            "mode": "restricted", "emails": ["someone@example.com"],
+            "org_allowed": False, "owner_only": False,
+        },
+    }))
+
+    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+
+    assert out == {"rep"}
+    assert published[0]["access"] == {
+        "mode": "restricted", "emails": ["someone@example.com"],
+        "org_allowed": False, "owner_only": False,
+    }
+
+
+async def test_republish_of_an_owner_only_artifact_stays_owner_only(base, enabled, key, published):
+    """The degradation trap in reverse: reconstructing an owner-only entry
+    without its `owner_only` key yields an empty selection, which resolve_access
+    turns into `public` — silently un-privating the artifact."""
+    folder = _make(base, "rep", files={"index.html": "<html>v2</html>"},
+                   meta={"slug": "rep", "type": "html-app"})
+    (folder / ".published.json").write_text(json.dumps({
+        "index.html": {
+            "report_id": "rid", "url": "u", "published": True,
+            "last_md5": "stale", "published_mtime": 0,
+            "mode": "restricted", "emails": [], "org_allowed": False, "owner_only": True,
+        },
+    }))
+
+    await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+
+    assert published[0]["access"]["owner_only"] is True
+    assert published[0]["access"]["mode"] == "restricted"
 
 
 async def test_scope_is_threaded_into_the_publisher(base, enabled, key, published):
