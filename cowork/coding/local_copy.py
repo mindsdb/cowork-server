@@ -213,7 +213,7 @@ class LocalCopyManager:
         # The endpoint boundary does not log a RuntimeError, so this warning is
         # the only operator-visible record. A full disk makes shutil.Error carry
         # one tuple per remaining entry, so keep the first few.
-        detail = exc.args[0][:5] if isinstance(exc, shutil.Error) and exc.args else exc
+        detail = exc.args[0][:5] if exc.args and isinstance(exc.args[0], list) else exc
         logger.warning("%s: %s", subject, detail)
         return LocalCopyError(f"{subject}: {detail}")
 

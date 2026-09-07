@@ -479,7 +479,7 @@ def test_a_local_copy_skips_entries_a_copy_cannot_reproduce(tmp_path: Path) -> N
     for root in (workspace, baseline):
         assert not (root / "data" / "cli.sock").exists()
         assert not (root / "data" / "pipe.fifo").exists()
-    assert manager.diff(str(workspace), base_revision=None) == []
+    assert manager.local_copies.diff(workspace) == []
 
     # preflight only reads the source for paths that already differ, so change
     # one to prove the skipped entries raise neither a phantom path nor a
