@@ -48,9 +48,13 @@ class LocalCopyManager:
         try:
             shutil.copytree(source, baseline, symlinks=True, ignore=self._skip_unsupported)
             shutil.copytree(source, workspace, symlinks=True, ignore=self._skip_unsupported)
-        except Exception:
+        except Exception as exc:
             shutil.rmtree(workspace, ignore_errors=True)
             shutil.rmtree(baseline, ignore_errors=True)
+            # shutil.Error is an OSError, so without this it reaches the API as
+            # an unclassified 500 rather than a message naming the failing path.
+            if isinstance(exc, shutil.Error):
+                raise LocalCopyError(f"The task folder could not be copied: {exc}") from exc
             raise
         return PreparedLocalCopy(source=source, workspace=workspace, baseline=baseline)
 
@@ -69,9 +73,13 @@ class LocalCopyManager:
         try:
             shutil.copytree(current_workspace, workspace, symlinks=True, ignore=self._skip_unsupported)
             shutil.copytree(parent_baseline, baseline, symlinks=True, ignore=self._skip_unsupported)
-        except Exception:
+        except Exception as exc:
             shutil.rmtree(workspace, ignore_errors=True)
             shutil.rmtree(baseline, ignore_errors=True)
+            # shutil.Error is an OSError, so without this it reaches the API as
+            # an unclassified 500 rather than a message naming the failing path.
+            if isinstance(exc, shutil.Error):
+                raise LocalCopyError(f"The task folder could not be copied: {exc}") from exc
             raise
         return PreparedLocalCopy(source=source, workspace=workspace, baseline=baseline)
 
@@ -170,7 +178,10 @@ class LocalCopyManager:
             recovery.parent.mkdir(parents=True, exist_ok=True)
             if recovery.exists():
                 shutil.rmtree(recovery)
-            shutil.copytree(workspace, recovery, symlinks=True, ignore=self._skip_unsupported)
+            try:
+                shutil.copytree(workspace, recovery, symlinks=True, ignore=self._skip_unsupported)
+            except shutil.Error as exc:
+                raise LocalCopyError(f"The task copy could not be saved for recovery: {exc}") from exc
         shutil.rmtree(workspace, ignore_errors=True)
         shutil.rmtree(baseline, ignore_errors=True)
 

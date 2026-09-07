@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import random
+import shutil
 import socket
 import subprocess
 from pathlib import Path
@@ -509,6 +510,23 @@ def test_fork_and_cleanup_survive_a_socket_made_inside_the_task(tmp_path: Path) 
     manager.cleanup("socket-2", str(source), str(workspace), WorkspaceKind.local_copy, None)
 
     assert not workspace.exists()
+
+
+def test_a_local_copy_that_fails_reports_the_path_it_failed_on(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "plain"
+    source.mkdir()
+    (source / "notes.txt").write_text("v1\n", encoding="utf-8")
+    manager = WorkspaceManager(tmp_path / "coding")
+
+    def failing_copytree(*_args, **_kwargs):
+        raise shutil.Error([(str(source / "notes.txt"), "destination", "[Errno 28] No space left on device")])
+
+    monkeypatch.setattr(shutil, "copytree", failing_copytree)
+
+    with pytest.raises(WorkspaceError, match="notes.txt"):
+        manager.prepare("copy-fail-1", str(source), allow_direct_folder=True)
 
 
 def isolate_git_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
