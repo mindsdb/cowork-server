@@ -20,12 +20,47 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Optional
 
 from cowork.streaming.buffer import StreamBuffer
 
 logger = logging.getLogger(__name__)
+
+# Reap a turn only after it makes NO progress (writes no buffer record) for this
+# long. A hung producer otherwise runs forever, holding the client's shared
+# stream slot so sends wedge in every conversation; boot recovery only covers a
+# real restart, not a re-adopted crash-orphan sidecar, so the bound is enforced
+# at runtime.
+#
+# IDLE, not total duration: `buffer.latest_seq` advances on every frame, so an
+# actively-streaming turn — or one blocked on an `ask_user` card (up to 300s,
+# within this window) — resets the window and is never reaped. A total-duration
+# cap would kill a long deliberate turn mid-conversation.
+#
+# COWORK_MAX_TURN_IDLE_SECONDS widens the window for deployments with long silent
+# tool calls; a non-positive or unparseable value falls back to the default.
+def _idle_bound_seconds() -> int:
+    raw = os.environ.get("COWORK_MAX_TURN_IDLE_SECONDS")
+    if raw is None:
+        return 600
+    try:
+        val = int(raw)
+    except ValueError:
+        logger.warning("COWORK_MAX_TURN_IDLE_SECONDS=%r is not an int; using default 600s", raw)
+        return 600
+    if val <= 0:
+        logger.warning("COWORK_MAX_TURN_IDLE_SECONDS=%d is not positive; using default 600s", val)
+        return 600
+    return val
+
+
+_MAX_TURN_IDLE_SECONDS = _idle_bound_seconds()
+
+# How often the idle watchdog samples buffer progress. Detection latency for a
+# fully wedged producer is at most _MAX_TURN_IDLE_SECONDS + this.
+_IDLE_POLL_SECONDS = 15
 
 
 @dataclass
@@ -65,11 +100,10 @@ class RunHandle:
     # can't tail or cancel another org's in-flight turn; a conversation_id is
     # not an authorization token.
     org_id: str | None = None
-    # Author of the turn, for attribution/audit only — NOT an authorization
-    # gate. Conversations are org-shared (they carry org_id + created_by, never
-    # a personal user_id), so any member may tail a teammate's live turn, just
-    # as they can already read its persisted transcript. Recorded here so the
-    # boundary can be tightened to per-user later without a schema change.
+    # Owner of the turn AND an authorization gate: conversations are personal,
+    # so the tail/cancel/in-flight endpoints require BOTH org_id and user_id to
+    # match (_owner_matches). Matching org alone previously let any member tail
+    # or cancel a teammate's live turn and read its prompts/output (audit P0).
     user_id: str | None = None
     # Shared with the producer coroutine, see TurnLifecycle.
     lifecycle: TurnLifecycle = field(default_factory=TurnLifecycle)
@@ -80,7 +114,18 @@ class RunHandle:
 
     async def cancel(self) -> bool:
         """Request cancellation of the producer task. Returns True if a
-        cancel was issued (task still running), False if already done."""
+        cancel was issued, False if the turn had already finished.
+
+        The one thing this answers is "did this call stop a running turn". It
+        does NOT report whether the producer's own teardown went cleanly, and
+        it used to: an exception from `persist()` or `buffer.close()` on the
+        cancellation path escaped the producer, arrived here, and was turned
+        into `False`. That reads identically to "there was nothing to cancel"
+        while the turn had in fact been stopped, and it discarded the
+        exception, so the only symptom was a caller being told the turn was
+        still running. The turn is stopped either way, so a failed teardown is
+        logged and the answer stays True.
+        """
         if self.task.done():
             return False
         self.task.cancel()
@@ -90,7 +135,15 @@ class RunHandle:
         except asyncio.CancelledError:
             return True
         except Exception:
-            return False
+            # The producer was cancelled and then failed while unwinding. The
+            # `finally` in the producer still seals the buffer, so the client
+            # is not left hanging; what is lost is whatever persist() or
+            # close() was doing, which is worth a log rather than silence.
+            logger.exception(
+                "[registry] producer for conversation %s raised while unwinding a cancel",
+                self.conversation_id,
+            )
+            return True
         # The task finished without surfacing the cancellation — it either
         # absorbed it (every producer catches CancelledError to persist and
         # close its buffer) or was already on its last step. A cancel was
@@ -129,7 +182,10 @@ class RunRegistry:
                     conversation_id, existing.turn_id,
                 )
                 return existing
-            task = asyncio.create_task(producer_coro, name=f"turn[{conversation_id}/{turn_id}]")
+            task = asyncio.create_task(
+                self._run_bounded(producer_coro, buffer, conversation_id, turn_id),
+                name=f"turn[{conversation_id}/{turn_id}]",
+            )
             handle = RunHandle(
                 conversation_id=conversation_id,
                 turn_id=turn_id,
@@ -144,6 +200,68 @@ class RunRegistry:
             )
             self._by_cid[conversation_id] = handle
             return handle
+
+    async def _run_bounded(
+        self, producer_coro, buffer: StreamBuffer, conversation_id: str, turn_id: int,
+    ) -> None:
+        """Run a producer under the idle bound (see module comment).
+
+        On reap the producer is cancelled; its CancelledError handler seals the
+        buffer with a terminal record (the user-Stop path), so the tail ends and
+        the client releases its slot. An external cancel/discard cancels this
+        wrapper and ``await task`` forwards it into the producer, so
+        ``RunHandle.cancel``/``discard`` still work; a producer that raises on
+        its own propagates unchanged.
+        """
+        loop = asyncio.get_running_loop()
+        task = asyncio.ensure_future(producer_coro)
+        reaped = False
+
+        async def _watchdog() -> None:
+            nonlocal reaped
+            # The watchdog is a safety net, never a source of failure: an
+            # unexpected error here must not touch the turn, so it fails open
+            # (turn runs unbounded) and is logged rather than propagated.
+            try:
+                last_seq = buffer.latest_seq
+                last_progress = loop.time()
+                while True:
+                    await asyncio.sleep(_IDLE_POLL_SECONDS)
+                    seq = buffer.latest_seq
+                    if seq != last_seq:
+                        last_seq, last_progress = seq, loop.time()
+                    elif loop.time() - last_progress >= _MAX_TURN_IDLE_SECONDS:
+                        reaped = True
+                        logger.warning(
+                            "Turn for conversation %s (turn %d) made no progress for %ss; "
+                            "producer cancelled and its buffer sealed.",
+                            conversation_id, turn_id, _MAX_TURN_IDLE_SECONDS,
+                        )
+                        task.cancel()
+                        return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Idle watchdog for conversation %s (turn %d) failed; "
+                    "turn runs unbounded.", conversation_id, turn_id,
+                )
+
+        watchdog = asyncio.ensure_future(_watchdog())
+        try:
+            await task
+        except asyncio.CancelledError:
+            # A reap surfaces as the producer's cancellation. Unlike an external
+            # cancel (which must propagate for RunHandle.cancel to observe), a
+            # reap is already terminal — its buffer is sealed — so swallow it.
+            if not reaped:
+                raise
+        finally:
+            # Reap the watchdog without propagating its outcome — it must never
+            # overwrite the turn's own result (including a cancellation
+            # RunHandle.cancel is waiting to observe).
+            watchdog.cancel()
+            await asyncio.gather(watchdog, return_exceptions=True)
 
     def get(self, conversation_id: str) -> Optional[RunHandle]:
         """Current handle (incl. recently-finished, useful for replay)."""

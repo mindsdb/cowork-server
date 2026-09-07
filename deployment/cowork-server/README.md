@@ -47,6 +47,33 @@ The chart references two Secrets that must exist in the target namespace:
 - `mindsdb-secrets` — provider API keys: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
   `GEMINI_API_KEY`.
 
+## Required cluster permissions
+
+In `staging` and `prod` this chart renders a NetworkPolicy (`networkPolicy.enabled`
+is true in those values files), so whoever runs the upgrade needs
+`create networkpolicies` in the target namespace. Without it the release fails and
+`--atomic` rolls the whole deploy back. CI runs as
+`system:serviceaccount:infrastructure:<env>-gha-runner`, which holds the verb only
+in the namespaces listed under `runner_deploy_namespaces` in
+Kubernetes-Foundational-Services. See the `networkPolicy` block in `values.yaml`
+for the two selector checks to run alongside it, since getting either one wrong
+drops every real request without failing the release.
+
+## Browser organization rollout
+
+Keep `COWORK_ORGANIZATION_SWITCH_ENABLED=false` while changing the request
+boundary. Deploy `COWORK_ORGANIZATION_BOUNDARY_MODE=audit` first and inspect the
+`organization boundary` warnings for old web clients. Then deploy `enforce` to
+every replica, confirm the capability reports
+`expectedOrganizationEnforced: true` and `enabled: false`, and only then enable
+switching in a separate rollout. Do not combine boundary enforcement and picker
+enablement in one deployment.
+
+Pull-request environments use the code's fail-closed `enforce` default because
+they do not load a long-lived environment overlay. Deploy this server preview
+only with the capability-aware Cowork client image; an older client does not
+send the expected-organization header and receives 426.
+
 ## Configuration
 
 For configuration options possible, please see our [helm-charts](#todo) repository.

@@ -3,10 +3,11 @@ from __future__ import annotations
 import re
 from uuid import UUID
 
+import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
 from cowork.channels.registry import PluginRegistry, get_registry
-from cowork.db.scoped import ScopedSession
+from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.channel import ChannelBinding, ChannelSession
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
@@ -36,7 +37,8 @@ class ChannelBindingService:
         stmt = self.session.select(ChannelBinding)
         if channel_type:
             stmt = stmt.where(ChannelBinding.channel_type == channel_type)
-        return [self._dto(row) for row in self.session.exec(stmt).all()]
+        rows = self.session.exec(stmt).all()
+        return [self._dto(row) for row in rows if self._binding_readable(row)]
 
     def create(self, req: BindingCreateRequest) -> BindingResponse:
         self._validate_channel(req.channel_type)
@@ -73,7 +75,7 @@ class ChannelBindingService:
 
     def update(self, binding_id: UUID, req: BindingUpdateRequest) -> BindingResponse:
         binding = self.session.get(ChannelBinding, binding_id)
-        if binding is None:
+        if binding is None or not self._binding_readable(binding):
             raise BindingNotFoundError(str(binding_id))
 
         provided = req.model_fields_set
@@ -144,9 +146,48 @@ class ChannelBindingService:
             self.session.commit()
         return reset
 
+    def release_conversation(self, conversation_id: UUID) -> None:
+        """Unpin every binding pinned to a conversation that is being deleted.
+
+        Same outcome as `detach_conversation`, reached from the other side: here
+        the conversation is the thing going away, so the binding is looked up by
+        what it points at. The binding survives, so a Telegram or Slack group
+        stays bound to its project, and the next inbound message starts a fresh
+        conversation (`ChannelRuntime._ensure_conversation` already handles an
+        empty pointer). The session rows go with the pointer, matching
+        `detach_conversation` and `reset_conversations` (`update`'s explicit
+        repoint is the one path that keeps them): `anton_session_id` would
+        otherwise keep naming a conversation that no longer exists.
+
+        Staged into the caller's transaction, unlike `detach_conversation`,
+        which commits. The conversation delete commits once so a crash cannot
+        leave a conversation whose contents are gone, and committing here would
+        flush that half-finished work.
+
+        Keyed on the conversation id alone, and run on the raw session, for the
+        same reason `ScheduleService.release_conversation` is: the scoped select
+        adds an org filter for `ChannelBinding`, and a row it hides is a row
+        left pointing at a deleted conversation, which is the foreign-key
+        violation this exists to stop.
+        """
+        raw = unsafe_unscoped_session(self.session)
+        pinned = raw.execute(
+            sa.select(ChannelBinding.id).where(
+                ChannelBinding.anton_conversation_id == conversation_id
+            )
+        ).scalars().all()
+        if not pinned:
+            return
+        raw.execute(sa.delete(ChannelSession).where(ChannelSession.binding_id.in_(pinned)))
+        raw.execute(
+            sa.update(ChannelBinding)
+            .where(ChannelBinding.id.in_(pinned))
+            .values(anton_conversation_id=None)
+        )
+
     def delete(self, binding_id: UUID) -> bool:
         binding = self.session.get(ChannelBinding, binding_id)
-        if binding is None:
+        if binding is None or not self._binding_readable(binding):
             return False
 
         self._drop_sessions(binding_id)
@@ -188,8 +229,26 @@ class ChannelBindingService:
         # Scoped get: another org's project/conversation reads as nonexistent.
         if project_id is not None and self.session.get(Project, project_id) is None:
             raise ValueError(f"project not found: {project_id}")
-        if conversation_id is not None and self.session.get(Conversation, conversation_id) is None:
-            raise ValueError(f"conversation not found: {conversation_id}")
+        if conversation_id is not None:
+            conversation = self.session.get(Conversation, conversation_id)
+            if conversation is None or not self._conversation_readable(conversation):
+                raise ValueError(f"conversation not found: {conversation_id}")
+
+    def _conversation_readable(self, conversation: Conversation) -> bool:
+        # Same-org membership isn't enough for a private conversation: only its
+        # own creator may bind a channel to it or see that binding.
+        scope = self.session.scope
+        if not scope.org_mode or conversation.created_by is None:
+            return True
+        return conversation.created_by == scope.user_id
+
+    def _binding_readable(self, binding: ChannelBinding) -> bool:
+        # A binding pinned to a conversation is only as visible as that
+        # conversation; one that isn't pinned to anything is org-wide.
+        if binding.anton_conversation_id is None:
+            return True
+        conversation = self.session.get(Conversation, binding.anton_conversation_id)
+        return conversation is None or self._conversation_readable(conversation)
 
     @staticmethod
     def _dto(binding: ChannelBinding) -> BindingResponse:

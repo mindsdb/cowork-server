@@ -131,7 +131,18 @@ def test_general_is_idempotent_within_an_org(db):
     assert first is not None and second is not None
     assert first.id == second.id
     assert first.org_id == ORG_A
-    assert first.created_by is None  # system-created, never attributed
+    # The member who first reaches the org provisions General and is recorded as
+    # its creator, so its instructions are editable without an admin.
+    assert first.created_by == "user-1"
+
+
+def test_general_keeps_its_first_provisioner_as_creator(db):
+    """A later member never takes over General's recorded creator."""
+    first = _svc(db, _scope(ORG_A, "user-1")).ensure_general_for_scope()
+    later = _svc(db, _scope(ORG_A, "user-2")).ensure_general_for_scope()
+    assert first is not None and later is not None
+    assert later.id == first.id
+    assert later.created_by == "user-1"
 
 
 def test_every_org_gets_its_own_general(db):
@@ -299,7 +310,7 @@ def test_a_losing_insert_adopts_the_winners_row(db, monkeypatch):
     monkeypatch.setattr(
         type(loser),
         "_execute_general_insert",
-        lambda self, raw, path, org_id: (_ for _ in ()).throw(
+        lambda self, raw, path, org_id, created_by: (_ for _ in ()).throw(
             sa.exc.IntegrityError("insert", {}, Exception("duplicate"))
         ),
         raising=True,
@@ -331,8 +342,8 @@ def test_a_member_cannot_take_the_default_projects_name(db):
     assert hijack.name != GENERAL_PROJECT  # the name is reserved
     general = a.ensure_general_for_scope()
     assert general is not None
-    assert general.created_by is None  # the real system row, not the member's
-    assert general.id != hijack.id
+    assert general.id != hijack.id  # the real system row, not the member's
+    assert general.created_by == "alice"  # provisioned by, not hijacked by
 
 
 def test_repointing_does_not_attribute_the_system_project(db, tmp_path):
@@ -463,3 +474,65 @@ def test_ensure_dir_never_creates_a_path_outside_the_sanitizer(db, tmp_path):
     a.ensure_dir_exists(a.get_project_by_name("reports"))
 
     assert not escape.exists()  # the tampered path was never created
+
+
+# ── Resolving `general` by name before it is provisioned ────────────────────
+
+def test_get_or_provision_by_name_provisions_general_before_first_list(db):
+    """The bug: a send/task-create names `general` on an org whose default row has
+    not been provisioned yet (no prior GET /projects/). A plain by-name lookup 404s;
+    get_or_provision_by_name must create it instead."""
+    a = _svc(db, _scope(ORG_A))
+    # No GET /projects/ ran for this org, so the exact-match lookup still misses.
+    with pytest.raises(ValueError, match="not found"):
+        a.get_project_by_name(GENERAL_PROJECT)
+
+    general = a.get_or_provision_by_name(GENERAL_PROJECT)
+
+    assert general.name == GENERAL_PROJECT
+    assert general.org_id == ORG_A
+    assert Path(general.path).is_dir()
+
+
+def test_get_or_provision_by_name_still_404s_for_a_real_missing_project(db):
+    """Only the reserved default self-heals; every other name stays an exact match."""
+    a = _svc(db, _scope(ORG_A))
+    with pytest.raises(ValueError, match="not found"):
+        a.get_or_provision_by_name("does-not-exist")
+
+
+def test_conversation_project_by_name_provisions_general(db):
+    """The create/update/move task endpoints resolve the project name through
+    ConversationService.project_by_name — it must provision `general` too, so a task
+    created in the default project on a fresh org doesn't 404."""
+    from cowork.services.conversations import ConversationService
+
+    svc = ConversationService(ScopedSession(Session(db), _scope(ORG_A)))
+    project = svc.project_by_name(GENERAL_PROJECT)
+
+    assert project is not None
+    assert project.name == GENERAL_PROJECT and project.org_id == ORG_A
+
+
+def test_delete_project_cascades_all_members_conversations(db):
+    """Regression (owner-scoping PR): delete_project is org-wide cleanup, so it
+    must delete EVERY member's conversation in the project — owner-scoping the
+    cascade would orphan foreign members' rows/bytes (ENG-701)."""
+    from cowork.services.conversations import ConversationService
+    from cowork.models.conversation import Conversation
+    from sqlmodel import select as _select
+
+    alice = _svc(db, _scope(ORG_A, "alice"))
+    proj = alice.create_project("shared-reports")
+
+    a_conv = ConversationService(ScopedSession(Session(db), _scope(ORG_A, "alice"))).create_conversation(
+        topic="alice", project_id=proj.id)
+    b_conv = ConversationService(ScopedSession(Session(db), _scope(ORG_A, "bob"))).create_conversation(
+        topic="bob", project_id=proj.id)
+
+    # Bob's conversation lives in Alice's project; deleting the project (as any
+    # org member) must remove BOTH, leaving no orphaned conversation rows.
+    assert alice.delete_project(proj.id) is True
+    with Session(db) as s:
+        remaining = s.exec(_select(Conversation).where(Conversation.project_id == proj.id)).all()
+    assert remaining == []

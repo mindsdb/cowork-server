@@ -24,7 +24,12 @@ deployment:
     - name: LOG_LEVEL
       value: "INFO"
 
-    # Org-mode identity enforcement. 'audit': requests without identity headers
-    # are logged and allowed through (safe while the auth wiring is validated).
+    # Org-mode identity enforcement. 'enforce': requests without identity
+    # headers are rejected with 401.
     - name: COWORK_IDENTITY_ENFORCE
       value: "enforce"
+
+    - name: COWORK_ORGANIZATION_BOUNDARY_MODE
+      value: "audit"
+    - name: COWORK_ORGANIZATION_SWITCH_ENABLED
+      value: "false"

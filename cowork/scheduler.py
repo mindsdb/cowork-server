@@ -5,12 +5,14 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from uuid import UUID
 
+from sqlalchemy.exc import IntegrityError
+
 from cowork.common.datetime_utils import ensure_utc
 from cowork.common.logger import get_logger
 from cowork.db.session import get_open_session
 from cowork.models.schedule import Schedule
 from cowork.schedule_timing import count_missed_occurrences, next_future_occurrence
-from cowork.schemas.schedules import Cadence, RunStatus
+from cowork.schemas.schedules import Cadence, RunStatus, resolve_schedule_model
 from cowork.services.schedules import ScheduleRunService, ScheduleService
 from cowork.streaming.registry import registry
 
@@ -27,6 +29,20 @@ _MAX_RUN_DURATION_SECONDS = 600
 _scheduler_task: asyncio.Task | None = None
 
 _RECURRING_CADENCES = {Cadence.hourly, Cadence.daily, Cadence.weekly, Cadence.weekdays}
+
+# A one-off whose slot has just passed is still due this poll and must be run,
+# not disabled — the poll runs `_handle_missed_runs` before `_due_schedules`,
+# so disabling on any overdue amount kills the task before it can fire (the
+# task then shows as "Paused" and never runs; ENG-1675). Only a one-off overdue
+# by more than this catch-up window — the app was offline when its slot passed —
+# is disabled without running, so a long-stale task doesn't fire unexpectedly on
+# the next launch. Mirrors the recurring branch, which lets a single overdue slot
+# (missed == 1) run rather than fast-forwarding past it.
+#
+# Independent of `_FRESHNESS_WINDOW_SECONDS[Cadence.once]` below despite the shared
+# 1h value: this bounds how late a one-off may still run; the freshness window
+# suppresses a slot after a recent successful run. Tune them separately.
+_ONCE_CATCHUP_WINDOW_SECONDS = 60 * 60
 
 # Freshness guard (ENG-688): if a successful run — typically a manual
 # "run now" — finished this recently before a due cron slot, the slot is
@@ -59,6 +75,27 @@ def _advance_next_run_at(schedule: Schedule, session) -> None:
     session.add(schedule)
 
 
+def _apply_success_write_back(
+    schedule: Schedule,
+    run_service: ScheduleRunService,
+    conversation_id: UUID | None,
+    session,
+) -> None:
+    """Stage the bookkeeping for a run that completed: last run time, the
+    pointer to the conversation it produced, and a clean error slate.
+
+    The user can delete this chat while the run is still going, so check
+    before pointing the schedule back at it. Staged only — the caller owns
+    the commit, and its IntegrityError retry re-runs this with no
+    conversation when the delete wins the race anyway.
+    """
+    schedule.last_run_at = datetime.now(timezone.utc)
+    schedule.last_result_conversation_id = run_service.still_exists(conversation_id)
+    schedule.last_error = None
+    schedule.missed_runs = 0
+    session.add(schedule)
+
+
 def _handle_missed_runs(session) -> None:
     now = datetime.now(timezone.utc)
     schedules = ScheduleService(session).list_schedules()
@@ -72,9 +109,16 @@ def _handle_missed_runs(session) -> None:
             continue
 
         if schedule.cadence == Cadence.once:
-            # A one-off that was never executed — disable it without running
-            schedule.enabled = False
-            session.add(schedule)
+            # A due one-off is left enabled so `_due_schedules` executes it on
+            # this same tick. Only disable it without running when it is overdue
+            # beyond the catch-up window — the app was offline when its slot
+            # passed — so a long-stale one-off doesn't fire on the next launch.
+            # Bump missed_runs like the recurring branch so an auto-disabled
+            # one-off carries a signal it was skipped rather than run.
+            if (now - next_run).total_seconds() > _ONCE_CATCHUP_WINDOW_SECONDS:
+                schedule.missed_runs += 1
+                schedule.enabled = False
+                session.add(schedule)
             continue
 
         if schedule.cadence not in _RECURRING_CADENCES:
@@ -101,27 +145,19 @@ def _handle_missed_runs(session) -> None:
 def _principal_for_schedule(schedule: Schedule) -> Principal | None:
     """Service principal for a scheduled run, derived from the schedule row.
 
-    A scheduled run has no HTTP request and so no gateway-injected principal, so
-    the owning identity comes from the row itself: ``org_id`` scopes the turn's
-    data and the per-tenant key the remote backend mints, and ``created_by``
-    attributes the rows it writes.
-
-    Local mode has no tenant context, so return None (unscoped). Org mode
-    requires both ids; a NULL is corrupt data that would write rows the owner
-    can't see, so fail loud instead.
+    Delegates to `service_principal_for` from the scoped module, which handles
+    the org vs. local mode logic. The custom error message below wraps it with
+    schedule-specific context.
     """
-    from cowork.common.settings.app_settings import get_app_settings
-    from cowork.db.scoped import MissingTenantScopeError
-    from cowork.principal import Principal
+    from cowork.db.scoped import MissingTenantScopeError, service_principal_for
 
-    if get_app_settings().tenancy_mode != "org":
-        return None
-    if not schedule.org_id or not schedule.created_by:
+    try:
+        return service_principal_for(schedule.org_id, schedule.created_by)
+    except MissingTenantScopeError:
         raise MissingTenantScopeError(
             f"schedule {schedule.id} is missing org_id/created_by; "
             "cannot resolve a service principal to run it in org mode"
         )
-    return Principal(user_id=schedule.created_by, org_id=schedule.org_id)
 
 
 async def execute_schedule(
@@ -143,7 +179,6 @@ async def execute_schedule(
     final_status: RunStatus | None = None
     try:
         schedule = schedule_service.get_schedule(schedule_id)
-
         # A scheduled run has no request, so it derives its tenant identity from
         # the schedule row (see _principal_for_schedule). None in local mode.
         try:
@@ -159,11 +194,6 @@ async def execute_schedule(
             raise
 
         if conversation_id is None:
-            # Conversation not pre-created by the caller (e.g. cron tick). Create
-            # it under the schedule's OWN scope so org mode stamps the owning
-            # org_id: the scheduler's SYSTEM_SCOPE is deliberately unscoped (it
-            # scans every org), so creating through `session` would write an
-            # invisible NULL-org row.
             from cowork.db.scoped import (
                 ScopedSession,
                 scope_from_principal,
@@ -171,6 +201,11 @@ async def execute_schedule(
             )
             from cowork.services.conversations import ConversationService
 
+            # Conversation not pre-created by the caller (e.g. cron tick). Create
+            # it under the schedule's OWN scope so org mode stamps the owning
+            # org_id: the scheduler's SYSTEM_SCOPE is deliberately unscoped (it
+            # scans every org), so creating through `session` would write an
+            # invisible NULL-org row.
             conv_session = ScopedSession(
                 unsafe_unscoped_session(session), scope_from_principal(principal)
             )
@@ -187,8 +222,12 @@ async def execute_schedule(
         # trigger produced a turn from timestamps.
         trigger = "manual" if is_manual else "cron"
         request = ResponsesRequest(
+            # `schedule.model` is the "default" sentinel for every task the UI
+            # creates, not a servable id. Resolve it to None so the harness
+            # applies the account's configured default models instead of
+            # overriding every role with the literal string (ENG-2353).
             input=schedule.prompt,
-            model=schedule.model,
+            model=resolve_schedule_model(schedule.model),
             stream=True,
             conversation=str(conversation_id),
             trace_tags=["scheduled_task", f"trigger:{trigger}"],
@@ -236,11 +275,7 @@ async def execute_schedule(
             schedule.last_error = error
             session.add(schedule)
         else:
-            schedule.last_run_at = datetime.now(timezone.utc)
-            schedule.last_result_conversation_id = conversation_id
-            schedule.last_error = None
-            schedule.missed_runs = 0
-            session.add(schedule)
+            _apply_success_write_back(schedule, run_service, conversation_id, session)
 
         # Always consume the cron slot: the schedule stays due otherwise and
         # the loop would immediately restart the run the user killed (a
@@ -249,12 +284,29 @@ async def execute_schedule(
         if not is_manual:
             _advance_next_run_at(schedule, session)
 
-        session.commit()
+        try:
+            session.commit()
+        except IntegrityError:
+            # Only the success write-back stages a foreign-key write (the
+            # last_result pointer), so this is the user's delete landing
+            # between still_exists' read and this commit — the delete's
+            # release already nulled the column. Redo the write-back without
+            # the pointer so the bookkeeping and the consumed slot survive.
+            session.rollback()
+            schedule = schedule_service.get_schedule(schedule_id)
+            _apply_success_write_back(schedule, run_service, None, session)
+            if not is_manual:
+                _advance_next_run_at(schedule, session)
+            session.commit()
 
     except Exception as exc:
         error = str(exc)
         logger.exception(f"Schedule {schedule_id} run failed: {error}")
         try:
+            # The failed transaction blocks every later statement until it
+            # rolls back; without this the writes below die on
+            # PendingRollbackError and the error is never recorded.
+            session.rollback()
             schedule = schedule_service.get_schedule(schedule_id)
             schedule.last_error = error
             session.add(schedule)
@@ -263,6 +315,10 @@ async def execute_schedule(
             pass
     finally:
         try:
+            # Same guard for the run record: a swallowed failure above can
+            # leave the session unusable, and this write must always land or
+            # the run strands at `running` and wedges the schedule.
+            session.rollback()
             run_service.finish_run(
                 run.id, conversation_id=conversation_id, error=error, status=final_status
             )

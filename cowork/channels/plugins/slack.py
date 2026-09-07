@@ -18,6 +18,7 @@ from cowork.channels.plugin import (
     ChannelPlugin,
     CredentialField,
     CredentialSchema,
+    VerifyResult,
     WebhookRoute,
 )
 from cowork.channels.text import split_for_limit
@@ -56,6 +57,17 @@ def extract_media(event: dict) -> list[Attachment]:
         attachment.slack_url = url
         media.append(attachment)
     return media
+
+
+def extract_team_id(body: bytes, headers: Mapping[str, str]) -> str | None:
+    """Unverified lookup key for which org's signing_secret to verify
+    against — never trusted for anything beyond that lookup."""
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    team_id = data.get("team_id") if isinstance(data, dict) else None
+    return team_id if isinstance(team_id, str) and team_id else None
 
 
 class SlackBridge:
@@ -320,6 +332,32 @@ class SlackBridge:
         return str(result.get("ts", ""))
 
 
+async def verify_slack_credentials(credentials: Mapping[str, str]) -> VerifyResult:
+    """auth.test is the cheapest real proof a bot token works — building a
+    SlackBridge never rejects one on its own."""
+    bot_token = (credentials.get("bot_token") or "").strip()
+    if not bot_token:
+        return VerifyResult(ok=False, detail="bot_token is not set")
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                f"{SLACK_API_BASE}/auth.test",
+                headers={"Authorization": f"Bearer {bot_token}"},
+            )
+    except (httpx.TimeoutException, httpx.TransportError) as exc:
+        return VerifyResult(ok=False, detail=f"could not reach Slack: {exc}")
+    body = resp.json()
+    if body.get("ok"):
+        team_id = body.get("team_id") or ""
+        team_name = body.get("team") or team_id or ""
+        return VerifyResult(
+            ok=True,
+            detail=f"Connected to {team_name}" if team_name else "Connected",
+            routing_key=team_id or None,
+        )
+    return VerifyResult(ok=False, detail=f"Slack rejected the token: {body.get('error', 'unknown error')}")
+
+
 async def _factory(credentials: Mapping[str, str]) -> ChannelAdapter | None:
     if not (credentials.get("bot_token") or "").strip():
         return None
@@ -328,6 +366,18 @@ async def _factory(credentials: Mapping[str, str]) -> ChannelAdapter | None:
     if not (has_signing or has_app_token):
         return None
     return SlackBridge(credentials)
+
+
+def _handshake(body: bytes, headers: Mapping[str, str], query: Mapping[str, str]) -> "WebhookHandshake | None":
+    """Handle Slack's url_verification challenge without needing a live adapter."""
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if isinstance(data, dict) and data.get("type") == "url_verification":
+        from cowork.channels.webhooks import WebhookHandshake
+        return WebhookHandshake(handled=True, response_body=str(data.get("challenge", "")))
+    return None
 
 
 plugin = ChannelPlugin(
@@ -353,5 +403,9 @@ plugin = ChannelPlugin(
         supports_oauth=False,
         supports_direct_credentials=True,
         supports_custom_ack=False,
+        supports_verify=True,
     ),
+    extract_routing_key=extract_team_id,
+    verify=verify_slack_credentials,
+    handshake=_handshake,
 )

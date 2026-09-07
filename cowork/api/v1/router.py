@@ -9,16 +9,23 @@ from fastapi import APIRouter
 
 from cowork.api.v1.endpoints import (
     artifacts,
+    artifact_workspace,
+    capabilities,
+    channels,
     comments,
+    coding,
+    coding_runtime,
     conversations,
     files,
     health,
+    hub_workspaces,
     memory,
     pins,
     project_files,
     projects,
     publish,
     responses,
+    runtime_credential,
     schedules,
     search,
     settings,
@@ -31,19 +38,6 @@ from cowork.api.v1.endpoints.connectors import (
     specs,
     submissions,
 )
-from cowork.api.v1.endpoints import (
-    channels,
-    conversations,
-    files,
-    memory,
-    pins,
-    projects,
-    responses,
-    schedules,
-    settings,
-    skills
-)
-
 # SHIM:client-compat — compat imports; remove this block and the
 # "Compat routes" section below when the client is updated.
 from cowork.api.v1.endpoints.compat.stubs import (
@@ -58,6 +52,9 @@ api_router = APIRouter(prefix="/api/v1")
 
 # ── Canonical routes ─────────────────────────────────────────────────
 api_router.include_router(health.router, prefix="/health", tags=["health"])
+api_router.include_router(
+    capabilities.router, prefix="/capabilities", tags=["capabilities"]
+)
 api_router.include_router(specs.router, prefix="/connectors/specs", tags=["connectors"])
 api_router.include_router(submissions.router, prefix="/connectors/submissions", tags=["connectors"])
 api_router.include_router(posthog.router, prefix="/connectors/posthog", tags=["connectors"])
@@ -66,6 +63,10 @@ api_router.include_router(oauth.router, prefix="/connectors/oauth", tags=["conne
 api_router.include_router(projects.router, prefix="/projects", tags=["projects"])
 api_router.include_router(project_files.router, prefix="/projects", tags=["project-files"])
 api_router.include_router(conversations.router, prefix="/conversations", tags=["conversations"])
+# `/tasks` is a branding alias for `/conversations` (ENG-2069) — same router,
+# same request/response schemas, mounted under a second prefix so it can
+# never drift from the canonical implementation.
+api_router.include_router(conversations.router, prefix="/tasks", tags=["tasks"])
 api_router.include_router(responses.router, prefix="/responses", tags=["responses"])
 api_router.include_router(files.router, prefix="/files", tags=["files"])
 api_router.include_router(schedules.router, prefix="/schedules", tags=["schedules"])
@@ -74,10 +75,17 @@ api_router.include_router(skills.router, prefix="/skills", tags=["skills"])
 api_router.include_router(memory.router, prefix="/memory", tags=["memory"])
 api_router.include_router(channels.router, prefix="/channels", tags=["channels"])
 api_router.include_router(artifacts.router, prefix="/artifacts", tags=["artifacts"])
+api_router.include_router(artifact_workspace.router, prefix="/artifacts", tags=["artifact-workspace"])
 api_router.include_router(comments.router, prefix="/artifact-comments", tags=["artifact-comments"])
 api_router.include_router(publish.router, prefix="/publish", tags=["publish"])
 api_router.include_router(settings.router, prefix="/settings", tags=["settings"])
+api_router.include_router(
+    runtime_credential.router, prefix="/runtime-credential", tags=["runtime-credential"]
+)
 api_router.include_router(search.router, prefix="/search", tags=["search"])
+api_router.include_router(coding.router, prefix="/coding", tags=["coding"])
+api_router.include_router(coding_runtime.router, prefix="/coding/runtime", tags=["coding-runtime"])
+api_router.include_router(hub_workspaces.router, prefix="/hub/workspaces", tags=["hub-workspaces"])
 
 # ── Compat routes (SHIM:client-compat — delete this section) ────────
 api_router.include_router(integrations_router, prefix="/integrations", tags=["compat"])

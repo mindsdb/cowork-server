@@ -26,8 +26,9 @@ def _artifacts_base(project: Project) -> Path:
 
 def _artifact_owner(folder: Path) -> str | None:
     """The conversation id that first created this artifact, read from its
-    metadata `provenance` (written by the shared ArtifactStore for every
-    harness). The creating conversation is the first provenance entry."""
+    metadata `provenance`. Derivation lives in `services.artifacts` — the same
+    value ships to the client as the card's `originConversationId`, so the two
+    must never disagree about which conversation owns an artifact."""
     meta = folder / "metadata.json"
     if not meta.is_file():
         return None
@@ -35,14 +36,9 @@ def _artifact_owner(folder: Path) -> str | None:
         data = json.loads(meta.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    provenance = data.get("provenance") or []
-    if not isinstance(provenance, list) or not provenance:
-        return None
-    first = provenance[0]
-    if isinstance(first, dict):
-        owner = first.get("conversation")
-        return str(owner) if owner else None
-    return None
+    from cowork.services.artifacts import origin_conversation_id
+
+    return origin_conversation_id(data) or None
 
 
 class TaskObjectService:
@@ -215,26 +211,24 @@ def snapshot_artifact_slugs(artifacts_base) -> set[str]:
 
 
 def snapshot_artifact_state(artifacts_base) -> tuple[set[str], dict[str, int]]:
-    """Pre-turn snapshot: folder names PLUS each one's content mtime.
+    """Pre-turn snapshot of folder names and nanosecond content mtimes.
 
     Names alone only reveal artifacts the turn CREATED. The autopublish
     reconciler also needs the ones it EDITED, and those are invisible to a name
     diff, so the snapshot carries `content_mtime` per slug and the diff compares
     both.
 
-    Granularity is whole seconds (`content_mtime` truncates), so an artifact
-    edited within the same second as this snapshot is not reported as touched and
-    falls through to the reconciler's self-heal phase instead — published, just a
-    turn later.
+    Nanosecond precision closes the former whole-second gap without hashing the
+    full primary source of every artifact before and after every agent turn.
     """
-    from cowork.services.artifacts import content_mtime
+    from cowork.services.artifacts import content_mtime_ns
 
     base = Path(artifacts_base)
     slugs = snapshot_artifact_slugs(base)
     mtimes: dict[str, int] = {}
     for slug in slugs:
         try:
-            mtimes[slug] = content_mtime(base / slug)
+            mtimes[slug] = content_mtime_ns(base / slug)
         except OSError:
             mtimes[slug] = 0
     return slugs, mtimes
@@ -299,17 +293,38 @@ def index_turn_artifacts(
     artifacts_base,
     before: set[str],
     before_mtimes: dict[str, int],
+    tracked_new: set[str] | None = None,
+    tracked_edits: set[str] | None = None,
 ) -> tuple[list[str], set[str], TenantScope | None]:
-    """End-of-turn artifact bookkeeping from a SINGLE artifacts-dir diff.
+    """End-of-turn artifact bookkeeping.
 
     Returns (new_slugs, touched_slugs, scope):
-      • new_slugs — folders that appeared during the turn; each is indexed as
-        owned by this conversation so it relocates with the task and shows in
-        the artifacts panel;
-      • touched_slugs — new_slugs plus every pre-existing slug whose content
-        mtime grew, i.e. what this turn actually wrote. The autopublish
-        reconciler publishes these first;
+      • new_slugs — artifacts this turn CREATED; each is indexed as owned by
+        this conversation so it relocates with the task and shows in the
+        artifacts panel;
+      • touched_slugs — new_slugs plus pre-existing artifacts this turn WROTE
+        TO. The autopublish reconciler publishes these first;
       • scope — the tenant scope for post-turn work (see _recover_turn_scope).
+
+    The two `tracked_*` bounds are what the turn's own artifact tools reported
+    touching, and they are what makes attribution correct: every conversation
+    in a project shares one artifacts directory, so a folder that merely
+    APPEARED during this turn may well be a concurrent sibling turn's work
+    (ENG-1933). Only the caller knows what its own tools did.
+
+      • `tracked_new` — slugs this turn may claim as CREATED. Without it any
+        folder that appeared is claimed, which is the bug above.
+      • `tracked_edits` — slugs this turn may claim as EDITED. None means fall
+        back to "any pre-existing folder whose content mtime grew", which is
+        what a harness without an open-for-editing tool has to do: it cannot
+        know which artifact the agent wrote to. Narrower exposure than
+        `tracked_new` (two turns editing the same pre-existing artifact at
+        once, rather than the everyday case of both creating something), but
+        not zero.
+
+    Both default to None — a pure directory diff, the pre-existing behaviour.
+    That is only safe where no concurrent turn can write the directory: the
+    org deployment, where each conversation's pod mounts its own workspace.
 
     conversation_id/project_id are captured by the caller while the row is
     unambiguously attached (not read here, to avoid depending on the session
@@ -320,21 +335,38 @@ def index_turn_artifacts(
     ([], set(), None) and the next turn picks the work up.
     """
     try:
-        from cowork.services.artifacts import content_mtime
+        from cowork.services.artifacts import content_mtime_ns
+        from cowork.services.artifact_revisions import (
+            capture_agent_revision,
+            has_queued_agent_repair,
+        )
 
         base = Path(artifacts_base)
         after = snapshot_artifact_slugs(base)
-        new = sorted(after - set(before or ()))
+        appeared = after - set(before or ())
+        # Intersected with `after` throughout, so a slug the agent opened and
+        # then deleted can't produce a card for a folder that is gone.
+        new = sorted(appeared if tracked_new is None else appeared & set(tracked_new))
         touched = set(new)
-        for slug in after:
+        editable = after if tracked_edits is None else (after & set(tracked_edits))
+        for slug in editable:
             previous = (before_mtimes or {}).get(slug)
             if previous is None:
-                continue  # appeared this turn — already in `new`
+                continue  # appeared this turn — `new` above already ruled on it
             try:
-                if content_mtime(base / slug) > previous:
+                if content_mtime_ns(base / slug) > previous:
                     touched.add(slug)
             except OSError:
                 continue
+        for slug in touched:
+            capture_agent_revision(base / slug, conversation_id=str(conversation_id))
+        # A repair turn that makes no source change must still leave the
+        # polling state. Check only artifacts with a handoff explicitly bound
+        # to this conversation; unrelated queued work is never consumed.
+        conversation_key = str(conversation_id)
+        for slug in after - touched:
+            if has_queued_agent_repair(base / slug, conversation_key):
+                capture_agent_revision(base / slug, conversation_id=conversation_key)
         scope = _recover_turn_scope(conversation)
         if new:
             _index_new_slugs(conversation_id, project_id, new, scope)
@@ -380,7 +412,10 @@ def cards_for_slugs(
     return cards
 
 
-def finalize_turn_artifacts(conversation, conversation_id, project_id, artifacts_base, before: set[str]) -> list[dict]:
+def finalize_turn_artifacts(
+    conversation, conversation_id, project_id, artifacts_base, before: set[str],
+    tracked_new: set[str] | None = None,
+) -> list[dict]:
     """Index this turn's new artifacts and return their cards.
 
     Kept as the pre-split entry point for harnesses that do not participate in
@@ -393,6 +428,7 @@ def finalize_turn_artifacts(conversation, conversation_id, project_id, artifacts
     """
     new, _touched, _scope = index_turn_artifacts(
         conversation, conversation_id, project_id, artifacts_base, before, {},
+        tracked_new=tracked_new,
     )
     return cards_for_slugs(artifacts_base, new)
 
@@ -420,17 +456,28 @@ async def publish_and_card_turn_artifacts(
     `handlers.responses._produce_remote` calls this against the same shared
     artifacts tree the worker wrote to.
 
-    Cards cover what THIS turn produced or touched. `republished` also carries
-    phase-two self-heal publishes — older artifacts from earlier conversations —
-    and the stream reducer dedupes only within one message, so including them
-    would attach last week's artifacts to this answer.
+    Cards cover what THIS turn produced or touched. In org mode, `republished`
+    also carries phase-two self-heal publishes — older artifacts from earlier
+    conversations — and the stream reducer dedupes only within one message, so
+    an edited (not new) artifact only cards there once its republish this turn
+    actually succeeds; that keeps a self-heal from attaching last week's
+    artifact to this answer.
+
+    Outside org mode nothing is ever published — `autopublish_project_artifacts`
+    is a no-op there — so `republished` is always empty, and gating touched
+    (non-new) slugs on it would mean a local edit never cards at all.
+    `cards_for_slugs` builds a card straight from the local folder regardless of
+    publish state, so every slug this turn touched is cardable there.
     """
     from cowork.services.artifact_autopublish import autopublish_project_artifacts
 
     republished = await autopublish_project_artifacts(
         artifacts_base, scope, touched=set(touched_slugs),
     )
-    carded = set(new_slugs) | (republished & set(touched_slugs))
+    if getattr(scope, "org_mode", False):
+        carded = set(new_slugs) | (republished & set(touched_slugs))
+    else:
+        carded = set(touched_slugs)
     return cards_for_slugs(
         artifacts_base, sorted(carded),
         project_id=project_id, project_name=project_name,

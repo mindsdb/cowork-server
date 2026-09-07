@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
 import stat
+from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from uuid import UUID
@@ -11,13 +12,20 @@ from uuid import UUID
 from sqlalchemy import case, func
 from sqlalchemy import select as sa_select
 
-from cowork.common.paths import opened_subdir_nofollow
+from cowork.common.paths import (
+    dir_lstat,
+    dir_rmtree,
+    dir_unlink,
+    opened_subdir_nofollow,
+)
 from cowork.db.scoped import ScopedSession
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
 from cowork.schemas.responses import Role
+from cowork.services.channel_bindings import ChannelBindingService
+from cowork.services.schedules import ScheduleService
 from cowork.services.scratchpad_sessions import remove_conversation_sessions
 from cowork.services.task_objects import TaskObjectService
 
@@ -32,6 +40,15 @@ _MESSAGE_ORDER = (
     case((Message.role == Role.user, 0), else_=1),
     Message.id,
 )
+
+
+@dataclass(frozen=True)
+class ConversationDeleteStage:
+    """DB deletes plus the filesystem cleanup deferred until their commit."""
+
+    conversation_id: UUID
+    attachment_dirs: tuple[Path, ...]
+    project_path: str | None
 
 
 def _is_tool_row(content) -> bool:
@@ -49,6 +66,50 @@ def _is_tool_row(content) -> bool:
 
 
 logger = logging.getLogger(__name__)
+
+# ENG-1992: swapped in for an image content block a provider permanently
+# rejected (a schema/shape mismatch, not a moderation refusal), so it must
+# read as a removal notice, not as if the user said this.
+_IMAGE_PLACEHOLDER_TEXT = (
+    "[An image here could not be sent to the model and was removed "
+    "automatically so this conversation could continue. Re-share it if you "
+    "still need it referenced.]"
+)
+
+
+def _strip_image_blocks(content):
+    """Replace image content blocks with a text placeholder, recursing into
+    tool_result blocks' own nested content (a tool can return an image, e.g.
+    a screenshot).
+
+    Returns `(content, changed)` — `content` is the exact same object when
+    nothing needed stripping, so a caller can skip a write when `changed` is
+    False. Used to repair a conversation whose stored history contains an
+    image block a provider permanently rejected (ENG-1992's
+    ContentValidationError) — once removed, replay just works again, with no
+    special-casing needed on future turns.
+    """
+    if not isinstance(content, list):
+        return content, False
+
+    changed = False
+    new_blocks = []
+    for block in content:
+        if not isinstance(block, dict):
+            new_blocks.append(block)
+            continue
+        if block.get("type") == "image":
+            new_blocks.append({"type": "text", "text": _IMAGE_PLACEHOLDER_TEXT})
+            changed = True
+            continue
+        if block.get("type") == "tool_result":
+            nested, nested_changed = _strip_image_blocks(block.get("content"))
+            if nested_changed:
+                new_blocks.append({**block, "content": nested})
+                changed = True
+                continue
+        new_blocks.append(block)
+    return (new_blocks if changed else content), changed
 
 
 def _skill_created_slug(event_data) -> str | None:
@@ -80,7 +141,7 @@ def _sweep_skill_drafts(session, project_id, slugs: set[str]) -> None:
     # opened_subdir_nofollow). slug comes from an event, so reject anything that
     # is not a single path component before handing it to the kernel.
     try:
-        with opened_subdir_nofollow(Path(project.path), ".anton", "skill_drafts") as fd:
+        with opened_subdir_nofollow(Path(project.path), ".anton", "skill_drafts") as d:
             for slug in slugs:
                 if (
                     os.sep in slug
@@ -89,16 +150,14 @@ def _sweep_skill_drafts(session, project_id, slugs: set[str]) -> None:
                 ):
                     continue
                 try:
-                    st = os.lstat(slug, dir_fd=fd)
+                    st = dir_lstat(d, slug)
                 except FileNotFoundError:
                     continue
                 try:
                     if stat.S_ISLNK(st.st_mode):
-                        os.unlink(
-                            slug, dir_fd=fd
-                        )  # drop the link only, never follow it
+                        dir_unlink(d, slug)  # drop the link only, never follow it
                     elif stat.S_ISDIR(st.st_mode):
-                        shutil.rmtree(slug, dir_fd=fd)
+                        dir_rmtree(d, slug)
                 except OSError:
                     logger.warning(
                         "Could not sweep skill draft %r on turn delete",
@@ -223,6 +282,43 @@ class ConversationService:
             self.session.add(message)
         self.session.commit()
 
+    def repair_image_content(self, conversation_id: UUID) -> list[UUID]:
+        """Strip image content blocks from every stored message in a
+        conversation, replacing each with a text placeholder.
+
+        Called when a turn dies on ContentValidationError (ENG-1992): the
+        provider permanently rejected some image block in history, and
+        retrying identically fails identically forever, because the
+        translation that produced the bad block runs fresh from this same
+        stored data on every call. Fixing the DATA once, here, rather than
+        special-casing replay means every future turn just works — no flag,
+        no per-turn filtering to maintain.
+
+        Scans every message (including pending/tool-only rows — a poisoned
+        image could be in either) rather than trying to identify "the" one
+        culprit from the provider's error: that needs mapping a request-
+        relative index (e.g. Responses' "input[70]") back to a specific
+        stored message, which isn't reliable across providers or dialects.
+        Structurally finding every image block is deterministic and safe
+        instead.
+
+        Returns the ids of messages that were actually changed — empty if
+        none needed it (e.g. the failure turned out not to be image-shaped
+        after all, so there's nothing here to fix).
+        """
+        messages = self.get_ordered_messages(conversation_id, include_pending=True)
+        repaired: list[UUID] = []
+        for message in messages:
+            new_content, changed = _strip_image_blocks(message.content)
+            if not changed:
+                continue
+            message.content = new_content
+            self.session.add(message)
+            repaired.append(message.id)
+        if repaired:
+            self.session.commit()
+        return repaired
+
     def last_message_at(self, conversation_id: UUID) -> datetime | None:
         """Timestamp of the most recent message, or None for an empty
         conversation. This is the real "last activity" — the stored
@@ -262,6 +358,11 @@ class ConversationService:
             Conversation.created_at,
         )
         stmt = self.session.select(Conversation)
+        # Conversations are personal: the scoped session enforces the org, but
+        # user_id has no automatic scoping (see PinService), so without this
+        # every org member's tasks show in everyone's list.
+        if self.session.scope.org_mode:
+            stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
         if not all_projects:
             stmt = stmt.where(
                 Conversation.project_id == (project_id or self._default_project_id())
@@ -291,8 +392,40 @@ class ConversationService:
             (conv, self.last_message_at(conv.id) or conv.created_at) for conv in convs
         ]
 
+    def _owned(self, conversation_id: UUID) -> Conversation | None:
+        """Fetch a conversation only if it belongs to the caller.
+
+        Conversations are personal. The scoped session enforces the org, but
+        user_id has no automatic scoping (see PinService) and a bare
+        session.get by PK bypasses even the org filter — so every by-id access
+        must go through here or a member can read/rename/delete another
+        member's chat by guessing its id. Local mode has one user, so no owner
+        filter applies.
+        """
+        stmt = self.session.select(Conversation).where(
+            Conversation.id == conversation_id
+        )
+        if self.session.scope.org_mode:
+            stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
+        return self.session.exec(stmt).first()
+
+    def owned_ids(self, conversation_ids: Iterable[UUID]) -> set[UUID]:
+        """The subset of `conversation_ids` the caller owns, in one query.
+
+        Same rule as `_owned`, batched. The artifact roots resolver walks one
+        directory per conversation and holds every id at once, so without this
+        a plain list request would issue a SELECT per directory.
+        """
+        ids = list(conversation_ids)
+        if not ids:
+            return set()
+        stmt = self.session.select(Conversation).where(Conversation.id.in_(ids))
+        if self.session.scope.org_mode:
+            stmt = stmt.where(Conversation.created_by == self.session.scope.user_id)
+        return {row.id for row in self.session.exec(stmt).all()}
+
     def get_conversation(self, conversation_id: UUID) -> Conversation:
-        conversation = self.session.get(Conversation, conversation_id)
+        conversation = self._owned(conversation_id)
         if conversation is None:
             raise ValueError("Conversation not found")
         return conversation
@@ -304,6 +437,7 @@ class ConversationService:
         conversation_id: UUID | None = None,
         harness: str | None = None,
         model: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> Conversation:
         """`conversation_id` lets the caller adopt a client-allocated id —
         the composer allocates one up front so attachments can be uploaded
@@ -319,6 +453,7 @@ class ConversationService:
             project_id=target_project_id,
             harness=harness,
             model=model,
+            reasoning_effort=reasoning_effort,
         )
         if conversation_id is not None:
             conversation.id = conversation_id
@@ -330,9 +465,11 @@ class ConversationService:
     def project_by_name(self, name: str | None) -> Project | None:
         if not name:
             return None
-        return self.session.exec(
-            self.session.select(Project).where(Project.name == name)
-        ).first()
+        # Delegate so the `general` self-heal lives in one place.
+        # Lazy import: projects imports this module.
+        from cowork.services.projects import ProjectService
+
+        return ProjectService(self.session).get_or_provision_by_name_or_none(name)
 
     def update_conversation(
         self,
@@ -340,7 +477,7 @@ class ConversationService:
         topic: str | None = None,
         project_id: UUID | None = None,
     ) -> Conversation:
-        conversation = self.session.get(Conversation, conversation_id)
+        conversation = self._owned(conversation_id)
         if conversation is None:
             raise ValueError("Conversation not found")
         if topic is not None:
@@ -366,7 +503,7 @@ class ConversationService:
         Best-effort: silently no-ops if the conversation is gone (this runs
         from a turn's cleanup path, after the turn's real outcome is settled).
         """
-        conversation = self.session.get(Conversation, conversation_id)
+        conversation = self._owned(conversation_id)
         if conversation is None:
             return
         conversation.history_summary = summary
@@ -402,9 +539,30 @@ class ConversationService:
         return []
 
     def delete_conversation(self, conversation_id: UUID) -> bool:
-        conversation = self.session.get(Conversation, conversation_id)
+        """Owner-scoped delete for the request path: a member can only delete
+        their own conversation."""
+        conversation = self._owned(conversation_id)
         if conversation is None:
             return False
+        return self._delete_conversation(conversation)
+
+    def stage_delete_conversation_row(
+        self,
+        conversation: Conversation,
+        *,
+        include_org_attachments: bool,
+    ) -> ConversationDeleteStage:
+        """Stage every conversation-owned DB delete without external cleanup.
+
+        ``include_org_attachments`` has no default because its two values are
+        two different authorization decisions. True cleans every org member's
+        attachment row for this conversation's purpose, which only an
+        already-authorized org-wide cascade such as a project delete may do.
+        False keeps the delete inside the actor's own file rows, which is what
+        a direct conversation delete must ask for. A caller has to say which
+        one it is rather than inherit the owner-agnostic path by omission.
+        """
+        conversation_id = conversation.id
         messages = self.session.exec(
             self.session.select(Message)
             .where(Message.conversation_id == conversation_id)
@@ -431,13 +589,24 @@ class ConversationService:
         from cowork.services.files import (
             FileService,
             attachment_purpose,
-            remove_conversation_workspace_dir,
-            unlink_file_dirs,
         )
 
-        attachment_dirs = FileService(self.session).delete_by_purpose(
-            attachment_purpose(str(conversation_id))
-        )
+        file_service = FileService(self.session)
+        purpose = attachment_purpose(str(conversation_id))
+        if include_org_attachments:
+            attachment_dirs = file_service.delete_by_purpose_for_parent_cascade(purpose)
+        else:
+            attachment_dirs = file_service.delete_by_purpose(purpose)
+        # Three more tables point at this conversation, and unlike the rows above
+        # they are not the conversation's own data: a schedule and its runs record
+        # the conversation a run produced, and a channel binding records the one
+        # its external chat is pinned to. No foreign key in this schema declares
+        # an `ondelete`, so Postgres refuses the delete below while any of them
+        # still points here, and SQLite (desktop, and the whole test suite) runs
+        # with foreign keys off and orphans them instead. Each owning service
+        # releases its own link and keeps its rows, staged into this transaction.
+        ScheduleService(self.session).release_conversation(conversation_id)
+        ChannelBindingService(self.session).release_conversation(conversation_id)
         # anton snapshots the scratchpad namespace to
         # `<project>/.anton/scratchpad-sessions/<conversation_id>/` so variables survive
         # the pad process being replaced each turn (ENG-1124). Nothing else prunes those
@@ -449,17 +618,52 @@ class ConversationService:
         session_project_path = (
             conversation.project.path if conversation.project is not None else None
         )
+        self.session.delete(conversation)
+        return ConversationDeleteStage(
+            conversation_id=conversation_id,
+            attachment_dirs=tuple(attachment_dirs),
+            project_path=session_project_path,
+        )
+
+    @staticmethod
+    def finalize_staged_conversation_delete(
+        stage: ConversationDeleteStage,
+        *,
+        cleanup_project_files: bool = True,
+    ) -> None:
+        """Remove external state only after the staged DB transaction commits."""
+        from cowork.services.files import (
+            remove_conversation_workspace_dir,
+            unlink_file_dirs,
+        )
+
         # Its buffers and turn-index entry outlive the rows otherwise: on the
         # Redis backend /in-flight keeps naming a turn whose conversation is
         # gone, and a reused turn_id would replay a deleted turn's answer.
-        _discard_conversation_streams(conversation_id)
-        self.session.delete(conversation)
-        self.session.commit()
-        unlink_file_dirs(attachment_dirs)
-        remove_conversation_sessions(session_project_path, conversation_id)
-        # Also drop the per-conversation workspace (staged attachments +
-        # instructions on the shared mount) so it doesn't orphan there.
-        remove_conversation_workspace_dir(session_project_path, conversation_id)
+        _discard_conversation_streams(stage.conversation_id)
+        unlink_file_dirs(list(stage.attachment_dirs))
+        if cleanup_project_files:
+            remove_conversation_sessions(stage.project_path, stage.conversation_id)
+            # Also drop the per-conversation workspace (staged attachments +
+            # instructions on the shared mount) so it doesn't orphan there.
+            remove_conversation_workspace_dir(
+                stage.project_path,
+                stage.conversation_id,
+            )
+
+    def _delete_conversation(self, conversation: Conversation) -> bool:
+        try:
+            # A direct delete is the actor's own: never reach past their file
+            # rows into a peer's attachment on the same conversation.
+            stage = self.stage_delete_conversation_row(
+                conversation,
+                include_org_attachments=False,
+            )
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            raise
+        self.finalize_staged_conversation_delete(stage)
         return True
 
     def delete_turn(self, conversation_id: UUID, turn_index: int) -> int:

@@ -13,11 +13,26 @@ silently leak across builds and defeat the isolation.
 """
 
 import os
+import shutil
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 _DEFAULT_HOME = Path.home() / ".cowork"
+
+_IS_WINDOWS = os.name == "nt"
+
+# ``O_DIRECTORY`` / ``O_NOFOLLOW`` are POSIX-only and simply absent from ``os``
+# on Windows (referencing ``os.O_DIRECTORY`` there raises AttributeError). They
+# exist so a directory-relative open refuses to traverse a symlink an untrusted
+# agent pod could plant on shared multi-tenant storage — the org-mode threat
+# model (Linux, EFS mounted read-write into each pod). Windows only ever runs
+# ``tenancy_mode="local"`` (a single-user desktop sidecar), where no such pod
+# exists and nobody but the local user can plant a link, so degrading these to
+# 0 there drops a defence that has nothing left to defend. See ``PinnedDir``.
+O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
+O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 
 def cowork_home() -> Path:
@@ -67,11 +82,220 @@ def pod_local_only(local_path: Path, name: str) -> Path:
     return Path(settings.pod_scratch_dir) / name
 
 
+@dataclass(frozen=True)
+class PinnedDir:
+    """A directory pinned for symlink-safe operations on its direct children.
+
+    POSIX: ``fd`` is a directory descriptor (opened ``O_NOFOLLOW`` where the
+    directory itself is agent-reachable). Every child operation passes
+    ``dir_fd=fd``, so the kernel resolves the name against the pinned inode with
+    nothing left to swap between check and use — the shared-EFS cross-tenant
+    defence described on ``opened_subdir_nofollow``.
+
+    Windows: there is no ``dir_fd`` (and no ``O_NOFOLLOW``/``O_DIRECTORY``), and
+    the threat cannot arise — Windows only runs ``tenancy_mode="local"``, a
+    single-user desktop with no pod planting links on shared storage. So ``fd``
+    is ``None`` and each operation joins the child onto ``path``.
+
+    Callers MUST go through the ``dir_*`` helpers below rather than read ``fd``
+    or ``path`` directly, so the one platform branch stays in one place. Every
+    child *name* passed to a helper must already be a validated single path
+    component. Destructive helpers defensively repeat that direct-child check
+    beside their filesystem sink.
+    """
+
+    fd: int | None
+    path: Path
+
+    def close(self) -> None:
+        if self.fd is not None:
+            os.close(self.fd)
+
+
+def dir_open(d: PinnedDir, name: str, flags: int, mode: int = 0o777) -> int:
+    """``os.open`` a child of *d*, returning a file descriptor."""
+    if d.fd is not None:
+        return os.open(name, flags, mode, dir_fd=d.fd)
+    return os.open(d.path / name, flags, mode)
+
+
+def dir_lstat(d: PinnedDir, name: str) -> os.stat_result:
+    if d.fd is not None:
+        return os.lstat(name, dir_fd=d.fd)
+    return os.lstat(d.path / name)
+
+
+def dir_stat(
+    d: PinnedDir, name: str, *, follow_symlinks: bool = True
+) -> os.stat_result:
+    if d.fd is not None:
+        return os.stat(name, dir_fd=d.fd, follow_symlinks=follow_symlinks)
+    return os.stat(d.path / name, follow_symlinks=follow_symlinks)
+
+
+def dir_unlink(d: PinnedDir, name: str) -> None:
+    safe_name = os.path.basename(name)
+    if (
+        safe_name != name
+        or safe_name in {"", ".", ".."}
+        or "\\" in safe_name
+        or "\0" in safe_name
+    ):
+        raise ValueError("Unlink path must be a direct-child name")
+    if d.fd is not None:
+        os.unlink(safe_name, dir_fd=d.fd)
+    else:
+        os.unlink(d.path / safe_name)
+
+
+def dir_replace(d: PinnedDir, source_name: str, destination_name: str) -> None:
+    """Atomically replace one pinned direct child with another.
+
+    ``dir_rename`` maps to ``os.rename``, which refuses an existing destination
+    on Windows. A durable write always lands on a file that already exists, so
+    that path needs ``os.replace`` instead, pinned the same way so the
+    destination cannot be swapped for a link between the check and the write.
+    """
+    safe_source = os.path.basename(source_name)
+    safe_destination = os.path.basename(destination_name)
+    for candidate, original in (
+        (safe_source, source_name),
+        (safe_destination, destination_name),
+    ):
+        if (
+            candidate != original
+            or candidate in {"", ".", ".."}
+            or "\\" in candidate
+            or "\0" in candidate
+        ):
+            raise ValueError("Replace paths must be direct-child names")
+    if d.fd is not None:
+        os.replace(safe_source, safe_destination, src_dir_fd=d.fd, dst_dir_fd=d.fd)
+    else:
+        os.replace(d.path / safe_source, d.path / safe_destination)
+
+
+def dir_mkdir(d: PinnedDir, name: str) -> None:
+    if d.fd is not None:
+        os.mkdir(name, dir_fd=d.fd)
+    else:
+        os.mkdir(d.path / name)
+
+
+def dir_rmdir(d: PinnedDir, name: str) -> None:
+    safe_name = os.path.basename(name)
+    if (
+        safe_name != name
+        or safe_name in {"", ".", ".."}
+        or "\\" in safe_name
+        or "\0" in safe_name
+    ):
+        raise ValueError("Directory removal path must be a direct-child name")
+    if d.fd is not None:
+        os.rmdir(safe_name, dir_fd=d.fd)
+    else:
+        os.rmdir(d.path / safe_name)
+
+
+def dir_rmtree(d: PinnedDir, name: str) -> None:
+    safe_name = os.path.basename(name)
+    if (
+        safe_name != name
+        or safe_name in {"", ".", ".."}
+        or "\\" in safe_name
+        or "\0" in safe_name
+    ):
+        raise ValueError("Removal path must be a direct-child name")
+    if d.fd is not None:
+        shutil.rmtree(safe_name, dir_fd=d.fd)
+    else:
+        shutil.rmtree(d.path / safe_name)
+
+
+def dir_rename(
+    source: PinnedDir,
+    source_name: str,
+    destination: PinnedDir,
+    destination_name: str,
+) -> None:
+    """Rename one pinned direct child to another pinned direct child."""
+    safe_source_name = os.path.basename(source_name)
+    safe_destination_name = os.path.basename(destination_name)
+    if (
+        safe_source_name != source_name
+        or safe_destination_name != destination_name
+        or safe_source_name in {"", ".", ".."}
+        or safe_destination_name in {"", ".", ".."}
+        or "\\" in safe_source_name
+        or "\\" in safe_destination_name
+        or "\0" in safe_source_name
+        or "\0" in safe_destination_name
+    ):
+        raise ValueError("Rename paths must be direct-child names")
+    if source.fd is not None and destination.fd is not None:
+        os.rename(
+            safe_source_name,
+            safe_destination_name,
+            src_dir_fd=source.fd,
+            dst_dir_fd=destination.fd,
+        )
+    else:
+        os.rename(
+            source.path / safe_source_name,
+            destination.path / safe_destination_name,
+        )
+
+
+def dir_scandir(d: PinnedDir) -> "Iterator[os.DirEntry[str]]":
+    """Scan the direct entries of *d*. Entries expose ``.name``,
+    ``.is_symlink()`` and ``.is_dir(follow_symlinks=False)`` on both platforms."""
+    if d.fd is not None:
+        return os.scandir(d.fd)
+    return os.scandir(d.path)
+
+
+def open_pinned_child(d: PinnedDir, name: str, *, nofollow: bool = True) -> PinnedDir:
+    """Descend into direct child directory *name* of *d*, returning a new
+    ``PinnedDir`` the caller must ``close()``.
+
+    POSIX opens it (``O_NOFOLLOW`` by default, refusing a planted link) relative
+    to *d*'s descriptor; Windows just joins the path."""
+    if d.fd is None:
+        return PinnedDir(None, d.path / name)
+    flags = os.O_RDONLY | O_DIRECTORY | (O_NOFOLLOW if nofollow else 0)
+    return PinnedDir(os.open(name, flags, dir_fd=d.fd), d.path / name)
+
+
+@contextmanager
+def pinned_dir(
+    base: Path | str, *, create: bool = False, nofollow_base: bool = False
+) -> Iterator[PinnedDir]:
+    """Yield a :class:`PinnedDir` for the trusted directory *base*.
+
+    POSIX opens *base* as a directory descriptor (``O_NOFOLLOW`` when
+    *nofollow_base*, for a base an agent could itself have swapped for a link);
+    Windows carries *base* as a path with no descriptor. With *create*, *base*
+    is ``mkdir``'d (parents included) first.
+    """
+    base = Path(base)
+    if create:
+        base.mkdir(parents=True, exist_ok=True)
+    if _IS_WINDOWS:
+        yield PinnedDir(None, base)
+        return
+    fd = os.open(base, os.O_RDONLY | O_DIRECTORY | (O_NOFOLLOW if nofollow_base else 0))
+    d = PinnedDir(fd, base)
+    try:
+        yield d
+    finally:
+        d.close()
+
+
 @contextmanager
 def opened_subdir_nofollow(
     base: Path | str, *names: str, create: bool = False
-) -> Iterator[int]:
-    """Yield a directory descriptor for ``base/<names...>``, opening every
+) -> Iterator[PinnedDir]:
+    """Yield a :class:`PinnedDir` for ``base/<names...>``, opening every
     component below *base* with ``O_NOFOLLOW`` so no symlink in the chain can
     redirect the caller out of *base*'s tree.
 
@@ -83,14 +307,26 @@ def opened_subdir_nofollow(
     level is ``mkdir``'d first; the open is still ``O_NOFOLLOW``, so a link
     already squatting the name is refused, not followed.
 
-    The caller acts relative to the yielded fd (``os.open(child, dir_fd=fd)``,
-    ``shutil.rmtree(child, dir_fd=fd)``), which the kernel resolves against the
-    pinned inode with nothing left to swap between check and use. This is the
-    same defence ``ProjectService`` applies to the projects root, and closes
-    the ``safe_join`` gap where a symlinked *base* has already escaped before
-    the containment check runs. Caller must NOT close the yielded fd.
+    The caller acts relative to the yielded handle via the ``dir_*`` helpers,
+    which on POSIX pass ``dir_fd`` so the kernel resolves against the pinned
+    inode with nothing left to swap between check and use. This is the same
+    defence ``ProjectService`` applies to the projects root, and closes the
+    ``safe_join`` gap where a symlinked *base* has already escaped before the
+    containment check runs.
+
+    Windows has no ``dir_fd``/``O_NOFOLLOW`` and no shared-tenant threat (local
+    desktop only), so the handle carries ``base/<names...>`` as a plain path,
+    ``mkdir``'d level-by-level when *create*. A link planted mid-chain there
+    would be traversed, but only the single local user could plant one.
     """
-    fd = os.open(base, os.O_RDONLY | os.O_DIRECTORY)
+    base = Path(base)
+    if _IS_WINDOWS:
+        target = base.joinpath(*names)
+        if create:
+            target.mkdir(parents=True, exist_ok=True)
+        yield PinnedDir(None, target)
+        return
+    fd = os.open(base, os.O_RDONLY | O_DIRECTORY)
     try:
         for name in names:
             if create:
@@ -98,10 +334,10 @@ def opened_subdir_nofollow(
                     os.mkdir(name, dir_fd=fd)
                 except FileExistsError:
                     pass
-            nxt = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            nxt = os.open(name, os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = nxt
-        yield fd
+        yield PinnedDir(fd, base.joinpath(*names))
     finally:
         os.close(fd)
 

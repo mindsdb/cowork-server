@@ -27,4 +27,6 @@ OAUTH_SERVICES: dict[str, OAuthServiceConfig] = {
     "google-analytics": OAuthServiceConfig(engine="google_analytics_4"),
     "linear": OAuthServiceConfig(engine="linear"),
     "github": OAuthServiceConfig(engine="github"),
+    "supabase": OAuthServiceConfig(engine="supabase"),
+    "posthog": OAuthServiceConfig(engine="posthog"),
 }

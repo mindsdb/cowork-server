@@ -29,3 +29,56 @@ class TestSaveConnectionDirectReturnsUserLabel:
         # deployment. A desktop scope keeps the vault path unchanged.
         result = save_connection_direct(body, LOCAL_SCOPE)
         assert result["user_label"] == "Support"
+
+    def test_account_name_titles_a_brand_new_connections_tile(self, tmp_path, monkeypatch):
+        # ENG-2188: Electron's OAuth PKCE flow (index.ts) calls this endpoint
+        # with account_name set to the provider's fetched account/org/
+        # workspace name (e.g. Linear's workspace, Supabase's organization)
+        # but no explicit user_label — without default_label, that fell back
+        # to the generic engine id ("linear") instead of the workspace name.
+        monkeypatch.setattr(
+            "cowork.api.v1.endpoints.connectors.connections.ConnectorSettings",
+            lambda: type("S", (), {"vault_dir": str(tmp_path / "vault")})(),
+        )
+        body = DirectSaveRequest(
+            connector_id="linear",
+            method="browser_oauth_builtin",
+            name="",
+            values={
+                "access_token": "tok",
+                "account_email": "user@example.com:org-1",
+                "account_name": "Acme Workspace",
+            },
+        )
+        result = save_connection_direct(body, LOCAL_SCOPE)
+        assert result["user_label"] == "Acme Workspace"
+
+    def test_second_workspace_with_distinct_account_name_gets_its_own_tile(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "cowork.api.v1.endpoints.connectors.connections.ConnectorSettings",
+            lambda: type("S", (), {"vault_dir": str(tmp_path / "vault")})(),
+        )
+        first = DirectSaveRequest(
+            connector_id="linear",
+            method="browser_oauth_builtin",
+            name="",
+            values={
+                "access_token": "tok-1",
+                "account_email": "user@example.com:org-1",
+                "account_name": "Acme Workspace",
+            },
+        )
+        second = DirectSaveRequest(
+            connector_id="linear",
+            method="browser_oauth_builtin",
+            name="",
+            values={
+                "access_token": "tok-2",
+                "account_email": "user@example.com:org-2",
+                "account_name": "Other Workspace",
+            },
+        )
+        first_result = save_connection_direct(first, LOCAL_SCOPE)
+        second_result = save_connection_direct(second, LOCAL_SCOPE)
+        assert first_result["name"] != second_result["name"]
+        assert second_result["user_label"] == "Other Workspace"
