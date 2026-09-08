@@ -117,6 +117,28 @@ class StreamingResponse(BaseModel):
     response: Response | ResponseDelta
 
 
+class InFlightTurnResponse(BaseModel):
+    conversation_id: str
+    turn_id: int
+    latest_seq: int
+
+
+class InFlightListResponse(BaseModel):
+    in_flight: list[InFlightTurnResponse]
+
+
+class InFlightStatusResponse(BaseModel):
+    in_flight: bool
+    has_buffer: bool
+    latest_seq: int
+    turn_id: int | None
+
+
+class CancelResponse(BaseModel):
+    cancelled: bool
+    conversation_id: str
+
+
 class ResponsesRequest(BaseModel):
     input: str | list[Message] | None = Field(
         default=None, description="Input for the responses request, either a string or a list of messages"

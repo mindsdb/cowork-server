@@ -107,3 +107,16 @@ class ScheduleRunResponse(CamelResponse):
     conversation_id: UUID | None
     is_manual: bool
     created_at: datetime | None
+
+
+class ScheduleListResponse(BaseModel):
+    schedules: list[ScheduleResponse]
+
+
+class ScheduleRunListResponse(BaseModel):
+    runs: list[ScheduleRunResponse]
+
+
+class ScheduleTriggerResponse(BaseModel):
+    detail: str
+    conversation_id: UUID

@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, JsonValue
 
 from cowork.schemas.base import CamelRequest, CamelResponse
 
@@ -44,3 +44,24 @@ class ConversationListItem(CamelResponse):
     harness: str | None = None
     model: str | None = None
     reasoning_effort: str | None = None
+
+
+class ConversationListResponse(BaseModel):
+    conversations: list[ConversationListItem]
+
+
+class ConversationMessageResponse(BaseModel):
+    id: UUID
+    role: str
+    content: JsonValue
+    created_at: datetime | None
+    events: list[JsonValue]
+    harness: str = ""
+
+
+class ConversationDeleteResponse(BaseModel):
+    ok: bool
+
+
+class ConversationTurnDeleteResponse(ConversationDeleteResponse):
+    deleted: int

@@ -9,8 +9,12 @@ from cowork.db.session import get_session
 from cowork.models.project import Project
 from cowork.schemas.conversations import (
     ConversationCreateRequest,
+    ConversationDeleteResponse,
     ConversationListItem,
+    ConversationListResponse,
+    ConversationMessageResponse,
     ConversationMoveRequest,
+    ConversationTurnDeleteResponse,
     ConversationUpdateRequest,
 )
 from cowork.services.conversations import ConversationService
@@ -39,7 +43,7 @@ def _serialize_conversation(c, updated_at=None):
     })
 
 
-@router.get("/")
+@router.get("/", responses={status.HTTP_200_OK: {"model": ConversationListResponse}})
 def list_conversations(
     scoped: ScopedSessionDep,
     project_id: UUID | None = None,
@@ -59,7 +63,11 @@ def list_conversations(
     return {"conversations": [_serialize_conversation(c, updated_at=activity) for c, activity in convs]}
 
 
-@router.post("/", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/",
+    status_code=status.HTTP_201_CREATED,
+    responses={status.HTTP_201_CREATED: {"model": ConversationListItem}},
+)
 def create_conversation(body: ConversationCreateRequest, scoped: ScopedSessionDep):
     svc = ConversationService(scoped)
     project_id = body.project_id
@@ -81,7 +89,10 @@ def create_conversation(body: ConversationCreateRequest, scoped: ScopedSessionDe
     return _serialize_conversation(conversation)
 
 
-@router.get("/{conversation_id}")
+@router.get(
+    "/{conversation_id}",
+    responses={status.HTTP_200_OK: {"model": ConversationListItem}},
+)
 def get_conversation(conversation_id: UUID, scoped: ScopedSessionDep):
     svc = ConversationService(scoped)
     try:
@@ -91,7 +102,10 @@ def get_conversation(conversation_id: UUID, scoped: ScopedSessionDep):
     return _serialize_conversation(conversation, updated_at=svc.last_message_at(conversation_id))
 
 
-@router.patch("/{conversation_id}")
+@router.patch(
+    "/{conversation_id}",
+    responses={status.HTTP_200_OK: {"model": ConversationListItem}},
+)
 def update_conversation(conversation_id: UUID, body: ConversationUpdateRequest, scoped: ScopedSessionDep):
     svc = ConversationService(scoped)
     project_id = body.project_id
@@ -109,7 +123,10 @@ def update_conversation(conversation_id: UUID, body: ConversationUpdateRequest, 
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
-@router.post("/{conversation_id}/move")
+@router.post(
+    "/{conversation_id}/move",
+    responses={status.HTTP_200_OK: {"model": ConversationListItem}},
+)
 def move_conversation(conversation_id: UUID, body: ConversationMoveRequest, session: SessionDep, scoped: ScopedSessionDep):
     """Move a task to another project. With `move_objects` (default), the
     artifacts the task created are relocated into the destination project;
@@ -140,7 +157,10 @@ def move_conversation(conversation_id: UUID, body: ConversationMoveRequest, sess
     return _serialize_conversation(conversation, updated_at=svc.last_message_at(conversation_id))
 
 
-@router.get("/{conversation_id}/items")
+@router.get(
+    "/{conversation_id}/items",
+    responses={status.HTTP_200_OK: {"model": list[ConversationMessageResponse]}},
+)
 def get_messages(conversation_id: UUID, scoped: ScopedSessionDep):
     try:
         return ConversationService(scoped).get_messages(conversation_id)
@@ -148,7 +168,10 @@ def get_messages(conversation_id: UUID, scoped: ScopedSessionDep):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
-@router.delete("/{conversation_id}")
+@router.delete(
+    "/{conversation_id}",
+    responses={status.HTTP_200_OK: {"model": ConversationDeleteResponse}},
+)
 def delete_conversation(conversation_id: UUID, scoped: ScopedSessionDep):
     found = ConversationService(scoped).delete_conversation(conversation_id)
     if not found:
@@ -156,7 +179,10 @@ def delete_conversation(conversation_id: UUID, scoped: ScopedSessionDep):
     return {"ok": True}
 
 
-@router.delete("/{conversation_id}/turns/{turn_index}")
+@router.delete(
+    "/{conversation_id}/turns/{turn_index}",
+    responses={status.HTTP_200_OK: {"model": ConversationTurnDeleteResponse}},
+)
 def delete_conversation_turn(conversation_id: UUID, turn_index: int, scoped: ScopedSessionDep):
     """Delete a turn (user+assistant exchange) and everything after it.
 

@@ -25,7 +25,13 @@ from cowork.db.scoped import (
 from cowork.db.session import get_session
 from cowork.handlers.responses import ResponsesHandler, sse_from_buffer
 from cowork.principal import Principal, get_principal
-from cowork.schemas.responses import ResponsesRequest
+from cowork.schemas.responses import (
+    CancelResponse,
+    InFlightListResponse,
+    InFlightStatusResponse,
+    Response as ResponseSchema,
+    ResponsesRequest,
+)
 from cowork.streaming import RunHandle, registry
 from cowork.streaming.answers import SubmitResult, broker
 from cowork.streaming.backend import get_backend
@@ -174,7 +180,15 @@ async def options_handler():
     )
 
 
-@router.post("/")
+@router.post(
+    "/",
+    responses={
+        200: {
+            "model": ResponseSchema,
+            "content": {"text/event-stream": {"schema": {"type": "string"}}},
+        }
+    },
+)
 async def responses(
     responses_request: ResponsesRequest,
     session: SessionDep,
@@ -189,7 +203,10 @@ async def responses(
     return result
 
 
-@router.get("/in-flight-list")
+@router.get(
+    "/in-flight-list",
+    responses={200: {"model": InFlightListResponse}},
+)
 async def in_flight_list(scope: TenantScopeDep):
     """Conversations with a turn running. The renderer uses it to sync stream
     state across clients/boots. Scoped to the caller's org so it can't
@@ -223,7 +240,10 @@ async def in_flight_list(scope: TenantScopeDep):
     return {"in_flight": out}
 
 
-@router.get("/in-flight")
+@router.get(
+    "/in-flight",
+    responses={200: {"model": InFlightStatusResponse}},
+)
 async def in_flight(scope: TenantScopeDep, conversation_id: str | None = None):
     """Probe so the renderer can decide whether to open a /tail on mount.
 
@@ -258,7 +278,10 @@ class CancelRequest(BaseModel):
     conversation_id: str
 
 
-@router.post("/cancel")
+@router.post(
+    "/cancel",
+    responses={200: {"model": CancelResponse}},
+)
 async def cancel_response(req: CancelRequest, scope: TenantScopeDep):
     """Halt the in-flight producer (Stop button). Fetch-abort / tab-close
     does NOT cancel — only this does.
@@ -368,7 +391,15 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
             raise AssertionError(f"unhandled SubmitResult: {result}")
 
 
-@router.get("/tail")
+@router.get(
+    "/tail",
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "content": {"text/event-stream": {"schema": {"type": "string"}}}
+        }
+    },
+)
 async def tail_response(
     scope: TenantScopeDep,
     conversation_id: str = Query(..., description="Conversation to tail."),

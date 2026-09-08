@@ -55,6 +55,11 @@ from cowork.services.artifacts import (
     reveal_in_file_manager,
 )
 from cowork.services.projects import ProjectService
+from cowork.schemas.artifacts import (
+    ArtifactCardResponse,
+    ArtifactOpenResponse,
+    ArtifactPreviewResponse,
+)
 
 router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -601,7 +606,10 @@ def _desktop_artifact_status_for_path(path: str) -> dict:
     return dict(_BLANK_ARTIFACT_STATUS)
 
 
-@router.get("/")
+@router.get(
+    "/",
+    responses={status.HTTP_200_OK: {"model": list[ArtifactCardResponse]}},
+)
 async def list_artifacts(
     session: ScopedSessionDep,
     project_id: UUID | None = Query(default=None),
@@ -777,7 +785,11 @@ async def artifact_status(path: str = Query(..., min_length=1, max_length=4096))
     return _desktop_artifact_status_for_path(path)
 
 
-@router.get("/preview", dependencies=[Depends(require_local_tenancy)])
+@router.get(
+    "/preview",
+    dependencies=[Depends(require_local_tenancy)],
+    responses={status.HTTP_200_OK: {"model": ArtifactPreviewResponse}},
+)
 async def preview_artifact(path: str = Query(...)):
     try:
         artifact = resolve_artifact_path(path)
@@ -894,7 +906,20 @@ async def preview_asset(token: str, rel_path: str, request: Request):
     return FileResponse(target, media_type=media_type, headers=NO_CACHE_HEADERS)
 
 
-@router.get("/serve/{project_name}/{file_path:path}", dependencies=[Depends(require_local_tenancy)])
+@router.get(
+    "/serve/{project_name}/{file_path:path}",
+    dependencies=[Depends(require_local_tenancy)],
+    response_class=FileResponse,
+    responses={
+        status.HTTP_200_OK: {
+            "content": {
+                "application/octet-stream": {
+                    "schema": {"type": "string", "format": "binary"}
+                }
+            }
+        }
+    },
+)
 def serve_artifact_file(project_name: str, file_path: str, request: Request):
     """Serve a file from `<project>/.anton/artifacts/<file_path>` over
     HTTP. Stateless, origin-relative, frame-able so the in-app iframe
@@ -919,7 +944,11 @@ def serve_artifact_file(project_name: str, file_path: str, request: Request):
     return FileResponse(target, media_type=media_type, headers=NO_CACHE_HEADERS)
 
 
-@router.post("/open", dependencies=[Depends(require_local_tenancy)])
+@router.post(
+    "/open",
+    dependencies=[Depends(require_local_tenancy)],
+    responses={status.HTTP_200_OK: {"model": ArtifactOpenResponse}},
+)
 async def open_artifact(req: _PathBody):
     from cowork.services.artifacts import _org_mode, _NO_EXEC_DETAIL
     # In org mode this always refuses; see _org_mode's docstring in services/artifacts.py.
