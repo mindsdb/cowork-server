@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 from cowork.api.v1.artifact_preview import wants_comment_layer
 from cowork.common.paths import (
     O_NOFOLLOW,
+    dir_lstat,
     dir_open,
     dir_scandir,
     open_pinned_child,
@@ -196,6 +197,54 @@ def _open_pinned_draft_file(source, folder: Path, parts: tuple[str, ...]):
             detail="Artifact file not found",
         ) from exc
     return resources, fd, file_stat
+
+
+def _editable_source_selector(source, folder: Path, requested: str | None) -> str | None:
+    """Translate a request-supplied source path into the folder's own spelling.
+
+    ``None`` (or blank) leaves the choice to the service, which falls back to
+    ``metadata["primary"]`` — a value the server wrote. Anything else is the
+    same kind of request-derived string ``_open_pinned_draft_file`` refuses to
+    hand to the filesystem: it is validated into single components, each one
+    is matched against a ``dir_scandir`` pass on a pinned descriptor, and the
+    path the revision service receives is joined from the ``DirEntry`` names
+    the OS returned — never from the HTTP string. A symlink on any component
+    is refused rather than resolved, so the resolve-then-read in
+    ``resolve_source`` cannot be raced by a swap inside the artifact folder.
+    ``resolve_source`` keeps its own containment and extension checks as the
+    inner gate; this is the outer one, at the request boundary, and it is what
+    keeps ``?path=`` out of ``pathlib`` in the service layer altogether.
+    """
+    if requested is None or not requested.strip():
+        return None
+    from cowork.services.artifact_identity import opened_artifact_folder
+
+    try:
+        parts = _relative_file_parts(requested.strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid artifact source path") from exc
+    if parts[0] in _PRIVATE_DRAFT_ENTRIES:
+        raise HTTPException(status_code=422, detail="Invalid artifact source path")
+    folder_name = _artifact_folder_component(source, folder)
+    disk_parts: list[str] = []
+    try:
+        with ExitStack() as resources:
+            current = resources.enter_context(opened_artifact_folder(source, folder_name))
+            for part in parts[:-1]:
+                disk_name = _existing_draft_entry_name(current, part)
+                current = open_pinned_child(current, disk_name)
+                resources.callback(current.close)
+                disk_parts.append(disk_name)
+            disk_name = _existing_draft_entry_name(current, parts[-1])
+            if not stat.S_ISREG(dir_lstat(current, disk_name).st_mode):
+                raise OSError("draft source is not a regular file")
+            disk_parts.append(disk_name)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Artifact source not found",
+        ) from exc
+    return "/".join(disk_parts)
 
 
 def _comment_layer_from_fd(fd: int) -> HTMLResponse | None:
@@ -454,11 +503,14 @@ async def artifact_source(
     path: str | None = Query(default=None),
 ):
     """Authenticated source + revision token for Desktop and Cowork SaaS."""
-    _source, folder, metadata, capabilities = _owner_workspace(
+    source, folder, metadata, capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
+    selected = await run_in_threadpool(_editable_source_selector, source, folder, path)
     try:
-        result = await run_in_threadpool(current_workspace, folder, metadata, artifact_id, path)
+        result = await run_in_threadpool(
+            current_workspace, folder, metadata, artifact_id, selected
+        )
         repair = await run_in_threadpool(active_agent_repair, folder, result.get("path"))
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
@@ -475,11 +527,12 @@ async def update_artifact_source(
     session: ScopedSessionDep,
 ):
     """Optimistic, atomic manual edit. A stale tab receives 409, never overwrite."""
-    _source, folder, metadata, _capabilities = _owner_workspace(
+    source, folder, metadata, _capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
     scope = getattr(session, "scope", None)
     actor_id = str(scope.user_id) if scope and scope.user_id else None
+    selected = await run_in_threadpool(_editable_source_selector, source, folder, body.path)
     try:
         saved = await run_in_threadpool(
             save_source,
@@ -488,7 +541,7 @@ async def update_artifact_source(
             artifact_id,
             content=body.content,
             expected_revision_id=body.expectedRevisionId,
-            rel_path=body.path,
+            rel_path=selected,
             actor_kind="manual",
             actor_id=actor_id,
             summary=body.summary,

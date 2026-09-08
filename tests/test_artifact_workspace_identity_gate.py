@@ -285,3 +285,166 @@ def test_release_is_refused_without_owner_access(client, tmp_path, monkeypatch):
     res = client.post(_RELEASE_URL, json={"commentThreadId": "thread-1"})
 
     assert res.status_code == 403, res.text
+
+
+# ── the source path is a selector, not a path ────────────────────────────────
+# `?path=` (and the PUT body's `path`) name the file to edit. The revision
+# service resolves that name under the artifact folder, and its own checks
+# (no `..`, containment, extension allowlist) are the inner gate. The route
+# boundary is the outer one: the request string is matched against a scandir
+# pass on pinned descriptors and only the OS-returned spelling travels on —
+# the same rule every other filesystem-facing route in the file follows.
+
+_WORKSPACE_URL = "/api/v1/artifacts/workspace/local/0123456789abcdef0123456789abcdef"
+
+
+@pytest.fixture
+def editable_artifact(tmp_path, monkeypatch):
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+    from cowork.services.artifacts import ProjectArtifacts
+
+    project = tmp_path / "project"
+    base = project / ".anton" / "artifacts"
+    folder = base / "brief"
+    (folder / "docs").mkdir(parents=True)
+    (folder / "brief.md").write_text("# primary\n", encoding="utf-8")
+    (folder / "docs" / "notes.md").write_text("# nested\n", encoding="utf-8")
+    outside = tmp_path / "outside.md"
+    outside.write_text("# secret\n", encoding="utf-8")
+    (folder / "link.md").symlink_to(outside)
+    (folder / "linkdir").symlink_to(folder / "docs", target_is_directory=True)
+    source = ProjectArtifacts(
+        base=base, project_id=None, project_name="project",
+        trusted_anchor=project, root_parts=(".anton", "artifacts"),
+    )
+    metadata = {"type": "file", "primary": "brief.md"}
+    monkeypatch.setattr(
+        workspace_ep, "_owner_workspace",
+        lambda *_args: (source, folder, metadata, {}),
+    )
+    return SimpleNamespace(source=source, folder=folder, metadata=metadata)
+
+
+def test_the_service_receives_the_folders_own_spelling_not_the_request_string(
+    editable_artifact, monkeypatch,
+):
+    """Object identity, as in the draft-serving tests: the string handed to
+    `current_workspace` / `save_source` must be the one the OS returned."""
+    import asyncio
+
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+
+    received: list[object] = []
+
+    def capture_read(folder, metadata, artifact_id, rel_path=None):
+        received.append(rel_path)
+        return {"path": rel_path, "content": "", "revision": {}, "revisions": []}
+
+    def capture_save(folder, metadata, artifact_id, *, rel_path=None, **_kw):
+        received.append(rel_path)
+        # The id matches the expected one, so the route's live-artifact sync
+        # stays out of a test about which string reaches the service.
+        return {"path": rel_path, "revision": {"id": "r1"}}
+
+    monkeypatch.setattr(workspace_ep, "current_workspace", capture_read)
+    monkeypatch.setattr(workspace_ep, "active_agent_repair", lambda *_a, **_k: None)
+    monkeypatch.setattr(workspace_ep, "save_source", capture_save)
+
+    requested = "docs/notes.md"
+    asyncio.run(workspace_ep.artifact_source(
+        "local", "0123456789abcdef0123456789abcdef", session=None, path=requested,
+    ))
+    body = workspace_ep._SourceUpdateBody(
+        content="x", expectedRevisionId="r1", path=requested,
+    )
+    asyncio.run(workspace_ep.update_artifact_source(
+        "local", "0123456789abcdef0123456789abcdef", body=body, session=None,
+    ))
+
+    assert received == ["docs/notes.md", "docs/notes.md"]
+    assert all(value is not requested and value is not body.path for value in received)
+
+
+def test_no_path_leaves_the_choice_to_the_service(editable_artifact, client):
+    res = client.get(_WORKSPACE_URL)
+
+    assert res.status_code == 200, res.text
+    assert res.json()["path"] == "brief.md"
+
+
+def test_a_nested_source_is_read_and_saved_through_the_selector(editable_artifact, client):
+    res = client.get(f"{_WORKSPACE_URL}?path=docs/notes.md")
+    assert res.status_code == 200, res.text
+    assert res.json()["path"] == "docs/notes.md"
+    assert res.json()["content"] == "# nested\n"
+
+    saved = client.put(_WORKSPACE_URL, json={
+        "content": "# edited\n",
+        "expectedRevisionId": res.json()["revision"]["id"],
+        "path": "docs/notes.md",
+    })
+    assert saved.status_code == 200, saved.text
+    assert (editable_artifact.folder / "docs" / "notes.md").read_text() == "# edited\n"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "../outside.md",
+        "..%2Foutside.md",
+        "docs/../../outside.md",
+        "/etc/passwd",
+        "C:/Windows/win.ini",
+        "docs\\..\\..\\outside.md",
+        "brief.md%00.html",
+        ".revisions/manifest.json",
+    ],
+)
+def test_traversal_shapes_are_refused_before_the_service(
+    editable_artifact, client, monkeypatch, path,
+):
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("the revision service saw an unvalidated path")
+
+    monkeypatch.setattr(workspace_ep, "current_workspace", explode)
+    monkeypatch.setattr(workspace_ep, "save_source", explode)
+
+    res = client.get(f"{_WORKSPACE_URL}?path={path}")
+    assert res.status_code == 422, res.text
+
+    res = client.put(_WORKSPACE_URL, json={
+        "content": "x", "expectedRevisionId": "r1", "path": path.replace("%2F", "/").replace("%00", "\x00"),
+    })
+    assert res.status_code == 422, res.text
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "missing.md",
+        "docs/missing.md",
+        "docs",                 # a directory, not a file
+        "link.md",              # symlink to a file outside the folder
+        "linkdir/notes.md",     # symlinked directory, even though it lands inside
+    ],
+)
+def test_symlinks_and_missing_entries_are_not_found_before_the_service(
+    editable_artifact, client, monkeypatch, path,
+):
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("the revision service saw a path that was not on disk")
+
+    monkeypatch.setattr(workspace_ep, "current_workspace", explode)
+    monkeypatch.setattr(workspace_ep, "save_source", explode)
+
+    res = client.get(f"{_WORKSPACE_URL}?path={path}")
+    assert res.status_code == 404, res.text
+
+    res = client.put(_WORKSPACE_URL, json={
+        "content": "x", "expectedRevisionId": "r1", "path": path,
+    })
+    assert res.status_code == 404, res.text
