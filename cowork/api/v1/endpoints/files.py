@@ -4,13 +4,13 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse as FileContentResponse
 
-from cowork.api.v1.permissions import Open, require
+from cowork.api.v1.permissions import OpenByDesign, require
 from cowork.db.scoped import ScopedSessionDep
 from cowork.schemas.files import FileListResponse, FileResponse
 from cowork.services.files import FileService
 
 
-router = APIRouter(dependencies=[Depends(require(Open))])
+router = APIRouter(dependencies=[Depends(require(OpenByDesign))])
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED, response_model=FileResponse)

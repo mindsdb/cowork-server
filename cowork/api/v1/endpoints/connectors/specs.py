@@ -4,7 +4,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from cowork.api.v1.permissions import Open, require
+from cowork.api.v1.permissions import OpenByDesign, require
 from cowork.common.settings.app_settings import OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.connectors import (
@@ -53,7 +53,7 @@ async def list_connector_specs(
     ]
 
 
-@router.get("/{connector_id}", response_model=ConnectorSpecResponse, dependencies=[Depends(require(Open))])
+@router.get("/{connector_id}", response_model=ConnectorSpecResponse, dependencies=[Depends(require(OpenByDesign))])
 def get_connector_spec(connector_id: str):
     spec = registry.get_connector(connector_id)
     if not spec:
@@ -61,6 +61,6 @@ def get_connector_spec(connector_id: str):
     return spec
 
 
-@router.post("/match", response_model=MatchResponse, dependencies=[Depends(require(Open))])
+@router.post("/match", response_model=MatchResponse, dependencies=[Depends(require(OpenByDesign))])
 def match_connector_spec(req: MatchRequest) -> MatchResponse:
     return registry.match_connector(req.query, req.max_candidates)

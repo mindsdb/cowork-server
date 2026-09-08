@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from sqlmodel import Session
 
 from cowork.api.v1.endpoints.guards import require_local, require_local_tenancy
-from cowork.api.v1.permissions import Open, require
+from cowork.api.v1.permissions import OpenByDesign, require
 from cowork.common.paths import cowork_home
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
@@ -85,7 +85,7 @@ def _require_org_admin_for(keys, scope: TenantScope, principal: Principal | None
         )
 
 
-@router.get("/", response_model=list[SettingResponse], dependencies=[Depends(require(Open))])
+@router.get("/", response_model=list[SettingResponse], dependencies=[Depends(require(OpenByDesign))])
 def list_settings(session: SessionDep, scope: ScopeDep) -> list[SettingResponse]:
     return SettingService(session, scope).list_settings()
 
@@ -244,7 +244,7 @@ def delete_setting(key: str, session: SessionDep, scope: ScopeDep, principal: Pr
 # ── Provider validation & testing ────────────────────────────────────
 
 
-@router.post("/validate", dependencies=[Depends(require(Open))])
+@router.post("/validate", dependencies=[Depends(require(OpenByDesign))])
 def validate_settings(session: SessionDep, scope: ScopeDep):
     s = SettingService(session, scope).load()
     cs = check_config_status(s)
@@ -257,7 +257,7 @@ def validate_settings(session: SessionDep, scope: ScopeDep):
     }
 
 
-@router.get("/configured", dependencies=[Depends(require(Open))])
+@router.get("/configured", dependencies=[Depends(require(OpenByDesign))])
 def check_configured(session: SessionDep, scope: ScopeDep):
     s = SettingService(session, scope).load()
     if s.minds_api_key is not None:
@@ -276,7 +276,7 @@ def check_configured(session: SessionDep, scope: ScopeDep):
     return {"configured": False, "provider": ""}
 
 
-@router.post("/logout", dependencies=[Depends(require(Open))])
+@router.post("/logout", dependencies=[Depends(require(OpenByDesign))])
 def logout_clear_credentials(session: SessionDep, scope: ScopeDep):
     """Clear all stored credentials from the DB (desktop sign-out flow, so
     ``/health`` returns ``config_ready: false``; preferences are kept).
@@ -290,7 +290,7 @@ def logout_clear_credentials(session: SessionDep, scope: ScopeDep):
     return {"ok": True, "deleted": deleted}
 
 
-@router.get("/install-status", dependencies=[Depends(require(Open))])
+@router.get("/install-status", dependencies=[Depends(require(OpenByDesign))])
 def install_status():
     return {"antonInstalled": True, "serverDepsReady": True}
 
@@ -319,7 +319,7 @@ class _TestProvidersBody(BaseModel):
     providers: Optional[list[dict[str, Any]]] = None
 
 
-@router.post("/test-providers", dependencies=[Depends(require(Open))])
+@router.post("/test-providers", dependencies=[Depends(require(OpenByDesign))])
 async def test_providers(session: SessionDep, scope: ScopeDep, body: _TestProvidersBody | None = None):
     """Ping the given (or all stored) providers and return connectivity results.
 
@@ -357,7 +357,7 @@ class _ValidateProviderBody(CamelRequest):
     model: Optional[str] = None
 
 
-@router.post("/validate-provider", dependencies=[Depends(require(Open))])
+@router.post("/validate-provider", dependencies=[Depends(require(OpenByDesign))])
 async def validate_provider_endpoint(body: _ValidateProviderBody):
     return await validate_provider_svc(body.provider, body.api_key, body.base_url, body.model)
 
@@ -374,7 +374,7 @@ def _fill_missing(target: dict, extra: dict, *, skip: Optional[set[str]] = None)
         target.setdefault(key, value)
 
 
-@router.get("/recommended-models", dependencies=[Depends(require(Open))])
+@router.get("/recommended-models", dependencies=[Depends(require(OpenByDesign))])
 async def recommended_models(request: Request, session: SessionDep, scope: ScopeDep, refresh: bool = False):
     """Per-provider model picker options for the Settings UI.
 
@@ -646,7 +646,7 @@ def _read_env_dict() -> dict[str, str]:
     return {}
 
 
-@router.get("/raw", dependencies=[Depends(require(Open))])
+@router.get("/raw", dependencies=[Depends(require(OpenByDesign))])
 def read_raw_settings(request: Request):
     # /raw dumps the dotenv verbatim (all provider secrets) — same loopback
     # restriction as reveal-key, and desktop-only (deployment-global state).
@@ -659,7 +659,7 @@ class _RawSettingsBody(BaseModel):
     content: str
 
 
-@router.post("/raw", dependencies=[Depends(require(Open))])
+@router.post("/raw", dependencies=[Depends(require(OpenByDesign))])
 async def write_raw_settings(body: _RawSettingsBody, session: SessionDep, request: Request):
     """Merge dotenv content into ~/.cowork/.env and sync recognised keys to the DB.
 

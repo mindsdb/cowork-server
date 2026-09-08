@@ -33,12 +33,23 @@ class Permission(Protocol):
 
     async def check(self, request: Request) -> object:
         """Raise ``HTTPException`` to deny. Return the resolved identity to
-        allow — ``Open`` returns ``None`` since there is nothing to resolve."""
+        allow — ``OpenByDesign`` returns ``None`` since there is nothing to
+        resolve."""
         ...
 
 
-class Open:
-    """No identity required.
+class OpenByDesign:
+    """No identity required BY THIS ROUTE — scoped to the route, not the
+    whole request path.
+
+    In org mode, ``TrustedHeaderMiddleware`` (cowork/principal.py) still runs
+    first on every non-exempt path and, with ``identity_enforce == "enforce"``,
+    401s a caller with no valid identity headers before this dependency is
+    ever reached. So ``OpenByDesign`` here does not mean "reachable by
+    anyone, unconditionally" — it means "this route adds no identity
+    requirement of its own, on top of whatever already gated the request."
+    In local mode, or org mode's audit rollout (``identity_enforce ==
+    "audit"``), there is no such gate, and this really is unconditional.
 
     Declaring this — rather than leaving a route with no permission
     dependency at all — is what lets the CI route walker (added once every
@@ -89,8 +100,8 @@ def require(permission_cls: type[Permission]):
     ``dependency``'s own ``__signature__`` is replaced with ``check``'s
     (minus ``self``): FastAPI decides what to resolve for a dependency by
     inspecting *that callable's* signature, not the ``Permission`` class
-    behind it. Copying it now — even though ``Open``/``Authenticated`` only
-    ever need ``request`` — is what lets a later ``Permission`` (a typed
+    behind it. Copying it now — even though ``OpenByDesign``/``Authenticated``
+    only ever need ``request`` — is what lets a later ``Permission`` (a typed
     body model, a nested ``Depends(...)``) be resolved by FastAPI without
     this function changing.
     """

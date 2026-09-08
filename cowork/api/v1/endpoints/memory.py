@@ -5,7 +5,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
-from cowork.api.v1.permissions import Open, require
+from cowork.api.v1.permissions import OpenByDesign, require
 from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope
 from cowork.db.session import get_open_session
 from cowork.principal import Principal, get_principal
@@ -16,7 +16,7 @@ from cowork.schemas.memory import (
 )
 from cowork.services.memory import MemoryService
 
-router = APIRouter(dependencies=[Depends(require(Open))])
+router = APIRouter(dependencies=[Depends(require(OpenByDesign))])
 
 
 @contextmanager

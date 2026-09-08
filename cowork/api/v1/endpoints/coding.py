@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 from sqlmodel import Session
 
 from cowork.api.v1.endpoints.guards import require_local, require_local_tenancy
-from cowork.api.v1.permissions import Open, require
+from cowork.api.v1.permissions import OpenByDesign, require
 from cowork.coding.connector_capabilities import (
     ConnectorCapability,
     ConnectorCapabilityIssueRequest,
@@ -114,7 +114,7 @@ from cowork.services.settings import SettingService
 from cowork.services.skills import CodeSkillService
 
 router = APIRouter(
-    dependencies=[Depends(require_local), Depends(require_local_tenancy), Depends(require(Open))]
+    dependencies=[Depends(require_local), Depends(require_local_tenancy), Depends(require(OpenByDesign))]
 )
 logger = logging.getLogger(__name__)
 
