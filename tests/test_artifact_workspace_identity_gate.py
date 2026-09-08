@@ -7,6 +7,7 @@ signature would look tested while never running. These go over HTTP.
 from __future__ import annotations
 
 import mimetypes
+import os
 from types import SimpleNamespace
 from uuid import UUID
 
@@ -301,6 +302,11 @@ _WORKSPACE_URL = "/api/v1/artifacts/workspace/local/0123456789abcdef0123456789ab
 
 @pytest.fixture
 def editable_artifact(tmp_path, monkeypatch):
+    # Every route test below uses this fixture, and two of its entries are
+    # symlinks, so without the guard the whole group errors in setup rather
+    # than skipping where links are unavailable.
+    if not hasattr(os, "O_NOFOLLOW"):
+        pytest.skip("the fixture's symlink entries need a POSIX filesystem")
     from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
     from cowork.services.artifacts import ProjectArtifacts
 
@@ -695,3 +701,25 @@ def test_an_oversized_path_is_refused_by_the_route(editable_artifact, client, mo
     assert client.put(_WORKSPACE_URL, json={
         "content": "x", "expectedRevisionId": "r1", "path": oversized,
     }).status_code == 422
+
+
+def test_a_folder_outside_the_sources_base_is_refused(editable_artifact, tmp_path):
+    """`_artifact_folder_component` is what keeps a grant folder-specific.
+
+    Resolution hands the route a folder alongside the source that authorized
+    it. Translating any other folder to its basename would let a grant for one
+    resolved source select a same-named folder under a different one, so a
+    folder whose parent is not the source's base is refused outright.
+    """
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+
+    elsewhere = tmp_path / "elsewhere" / ".anton" / "artifacts" / "brief"
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "brief.md").write_text("# other\n", encoding="utf-8")
+
+    with pytest.raises(HTTPException) as refused:
+        workspace_ep._editable_source_selector(
+            editable_artifact.source, elsewhere, "brief.md"
+        )
+
+    assert refused.value.status_code == 404

@@ -208,8 +208,6 @@ def _open_pinned_draft_file(source, folder: Path, parts: tuple[str, ...]):
     request path is then walked the same way. Returning the ``ExitStack`` keeps
     every descriptor alive until the response has consumed the final file.
     """
-    from cowork.services.artifact_identity import opened_artifact_folder
-
     folder_name = _artifact_folder_component(source, folder)
     resources = ExitStack()
     try:
@@ -237,16 +235,23 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
     """Translate a request-supplied source path into the folder's own spelling.
 
     ``None`` (or blank) leaves the choice to the service, which falls back to
-    ``metadata["primary"]`` — a value the server wrote. Anything else is the
-    same kind of request-derived string ``_open_pinned_draft_file`` refuses to
+    ``metadata["primary"]``. That is not a trusted value either: it is read
+    from `metadata.json` inside the artifact folder, which is pod-writable on
+    shared storage, so what makes the fallback safe is the inner gate's own
+    containment, symlink and extension checks rather than where it came from.
+    Anything else is the same kind of request-derived string
+    ``_open_pinned_draft_file`` refuses to
     hand to the filesystem: it is validated into single components, each one
     is matched against a ``dir_scandir`` pass on a pinned descriptor, and the
     path the revision service receives is joined from the ``DirEntry`` names
     the OS returned — never from the HTTP string. A symlink on any component
-    is refused rather than resolved. That narrows ``resolve_source``'s
-    resolve-then-read without closing it: the service still reads by path, so
-    a swap between this walk and that read remains possible, and closing it
-    means reading from the descriptor this walk already holds.
+    is refused rather than resolved, which the inner gate does not do for an
+    intermediate directory: it resolves those and only checks containment, so
+    a link inside the folder pointing back into the folder was accepted.
+    This leaves ``resolve_source``'s own resolve-then-read window exactly as
+    it was, neither narrowed nor closed. That pair is untouched here, and
+    closing it means reading from a descriptor rather than a path, in the
+    service.
     ``resolve_source`` keeps its own containment and extension checks as the
     inner gate; this is the outer one, at the request boundary, and it is what
     keeps ``?path=`` out of ``pathlib`` in the service layer altogether.
