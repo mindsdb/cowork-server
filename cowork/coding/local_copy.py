@@ -217,11 +217,12 @@ class LocalCopyManager:
 
     @staticmethod
     def _copy_failure(subject: str, exc: OSError) -> LocalCopyError:
-        # The endpoint boundary does not log a RuntimeError, so this warning is
-        # the only operator-visible record. A full disk makes shutil.Error carry
-        # one tuple per remaining entry, so keep the first few.
-        detail = exc.args[0][:5] if exc.args and isinstance(exc.args[0], list) else exc
-        logger.warning("%s: %s", subject, detail)
+        # _call does not log a RuntimeError, so this warning is the only
+        # operator record; the destination is managed, so report the source only.
+        entries = exc.args[0] if exc.args and isinstance(exc.args[0], list) else []
+        reported = [f"{item[0]}: {item[2]}" for item in entries[:5] if isinstance(item, tuple) and len(item) == 3]
+        detail = "; ".join(reported) if reported else str(exc)
+        logger.warning("%s: %s", subject, detail, exc_info=exc)
         return LocalCopyError(f"{subject}: {detail}")
 
     @staticmethod

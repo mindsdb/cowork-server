@@ -531,13 +531,17 @@ def test_a_local_copy_that_fails_reports_the_path_it_failed_on(
         # Built here rather than in the parametrize list, which is evaluated at
         # collection time and would share one exception across the whole run.
         if failure == "collected":
-            raise shutil.Error([(target, "destination", "[Errno 28] No space left on device")])
+            raise shutil.Error([(target, "managed-destination", "[Errno 28] No space left on device")])
         raise FileNotFoundError(2, "No such file or directory", target)
 
     monkeypatch.setattr(shutil, "copytree", failing_copytree)
 
-    with pytest.raises(WorkspaceError, match="notes.txt"):
+    with pytest.raises(WorkspaceError, match="notes.txt") as raised:
         manager.prepare("copy-fail-1", str(source), allow_direct_folder=True)
+
+    # The destination is a managed path under the coding root; a caller cannot
+    # act on it, so it stays out of the message.
+    assert "managed-destination" not in str(raised.value)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="sockets and FIFOs are POSIX")
@@ -586,6 +590,25 @@ def test_handoff_refuses_a_source_entry_it_cannot_inspect(
         manager.local_copies.apply(source, prepared.workspace_path)
 
     assert (source / "notes.txt").read_text(encoding="utf-8") == "v1\n"
+
+
+def test_a_copy_error_with_shredded_arguments_still_becomes_a_task_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "plain"
+    source.mkdir()
+    (source / "notes.txt").write_text("v1\n", encoding="utf-8")
+    manager = WorkspaceManager(tmp_path / "coding")
+
+    def failing_copytree(*_args, **_kwargs):
+        # CPython's _copytree does errors.extend(err.args[0]), so a nested
+        # SameFileError shreds its message into a list of single characters.
+        raise shutil.Error(list("'/a/notes.txt' and '/b/notes.txt' are the same file"))
+
+    monkeypatch.setattr(shutil, "copytree", failing_copytree)
+
+    with pytest.raises(WorkspaceError):
+        manager.prepare("shredded-1", str(source), allow_direct_folder=True)
 
 
 def isolate_git_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
