@@ -30,3 +30,5 @@ test/unit/coverage: ## Run unit tests with coverage
 
 coverage/html: ## Generate HTML coverage report
 	$(PYTEST) --cov=cowork $(TESTS) --cov-report=html
+
+	
