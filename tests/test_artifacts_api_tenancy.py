@@ -316,6 +316,10 @@ async def _grant_draft_review(session, tmp_path, monkeypatch, *, slug="dash", or
         "cowork.services.artifact_access.provision_draft_review_access",
         fake_provision,
     )
+    monkeypatch.setattr(
+        "cowork.services.artifact_authorization_identity._allocate_or_adopt",
+        lambda *_args: card["artifactKey"],
+    )
     enabled = await workspace_ep.enable_artifact_comments(
         str(row.id), card["id"], _scoped(session, org_id)
     )
@@ -458,6 +462,58 @@ async def test_delete_by_slug_removes_the_folder(session, tmp_path, org_mode, pu
     assert not folder.exists()
 
 
+@pytest.mark.parametrize("by_id", [False, True])
+async def test_delete_revokes_with_the_verified_owner_and_tenant_before_removing_files(
+    session, tmp_path, org_mode, publish_key, monkeypatch, by_id
+):
+    row, folder = _project_with_artifact(
+        session, tmp_path, name="owned", org_id=ORG_A, slug="dash"
+    )
+    artifact_id, _metadata = ensure_full_id(folder)
+    calls = []
+
+    async def revoke(identifier, scope):
+        assert folder.exists()
+        calls.append((identifier, scope.user_id, scope.org_id))
+        return True
+
+    monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
+
+    await ep.delete_artifact_for_request(
+        _scoped(session, ORG_A), artifact_id if by_id else "dash", project_id=row.id
+    )
+
+    assert [(UUID(identifier).hex, owner, org) for identifier, owner, org in calls] == [
+        (artifact_id, USER_A, ORG_A)
+    ]
+    assert not folder.exists()
+
+
+async def test_delete_keeps_files_when_draft_authorization_is_unavailable(
+    session, tmp_path, org_mode, publish_key, monkeypatch
+):
+    from cowork.services.artifact_access import ArtifactAccessUnavailable
+
+    row, folder = _project_with_artifact(
+        session, tmp_path, name="owned", org_id=ORG_A, slug="dash"
+    )
+    artifact_id, _metadata = ensure_full_id(folder)
+
+    async def revoke(identifier, scope):
+        raise ArtifactAccessUnavailable("Could not revoke draft collaboration")
+
+    monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
+
+    with pytest.raises(HTTPException) as err:
+        await ep.delete_artifact_for_request(
+            _scoped(session, ORG_A), artifact_id, project_id=row.id
+        )
+
+    assert err.value.status_code == 503
+    assert (folder / "index.html").read_text() == "<html></html>"
+    assert (folder / "metadata.json").exists()
+
+
 async def test_delete_by_artifact_id_selects_the_exact_duplicate_slug(
     session, tmp_path, org_mode, publish_key
 ):
@@ -513,6 +569,11 @@ async def test_reviewer_cannot_delete_an_owners_artifact(
     not hidden as a 404, which would read as "already gone" to a client that is
     looking at the draft."""
     row, folder, card = await _grant_draft_review(session, tmp_path, monkeypatch)
+
+    async def revoke(identifier, scope):
+        pytest.fail("A reviewer must never reach the policy mutation")
+
+    monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
 
     with Session(session.get_bind()) as reviewer_session:
         with pytest.raises(HTTPException) as err:
