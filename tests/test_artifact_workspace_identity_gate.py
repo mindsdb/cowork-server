@@ -620,14 +620,19 @@ def mixed_case_artifact(tmp_path, monkeypatch):
 def test_a_case_mismatched_primary_reports_the_disk_spelling(mixed_case_artifact, client):
     """Both routes name the source the same way, so the journal has one key.
 
-    Runs on either kind of volume, and they arrive by different routes: a
-    case-insensitive one canonicalizes `Brief.md` to the entry it names, a
-    case-sensitive one cannot resolve it at all and the service falls back to
-    picking an editable file. Either way the client is told `brief.md` and can
-    save it, which is the property that broke when only the write side was
-    translated -- the read reported `Brief.md`, the write recorded `brief.md`,
-    and the mismatched revision id came back 409.
+    This is the property that broke when only the write side was translated:
+    the read reported `Brief.md`, the write recorded `brief.md`, and the
+    mismatched revision id came back 409 where a 404 had been.
+
+    Only a case-insensitive volume can show it. On a case-sensitive one
+    `Brief.md` names nothing, `resolve_source` refuses it, and the artifact's
+    source is unreachable through this route both before and after this
+    change -- a set-but-absent primary is not the empty primary the service
+    falls back on.
     """
+    if not _case_insensitive(mixed_case_artifact.folder):
+        pytest.skip("needs a case-insensitive volume; the mismatch cannot arise")
+
     read = client.get(_WORKSPACE_URL)
     assert read.status_code == 200, read.text
     reported = read.json()["path"]

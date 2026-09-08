@@ -298,10 +298,13 @@ def _recorded_source_selector(source, folder: Path, metadata: dict) -> str | Non
     whichever string arrived. A read under one spelling and a write under the
     other then answer 409 rather than the 404 a case-exact boundary gave.
 
-    A primary that resolves to nothing yields ``None``, which is what the
-    service already handles by picking an editable file itself. A recorded
-    value that has gone stale must not become an error the client cannot
-    clear.
+    A primary that resolves to nothing yields ``None``, which leaves the
+    service to answer for it exactly as it did before this indirection: it
+    reads the same recorded value and refuses it. Note that is a refusal, not
+    a fallback -- the service only picks a file itself when the primary is
+    *empty*, and a set-but-absent one raises. Returning ``None`` here is
+    therefore about not adding a second, earlier failure for the same cause,
+    not about rescuing stale metadata.
     """
     recorded = metadata.get("primary")
     if not isinstance(recorded, str) or not recorded.strip():
