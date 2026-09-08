@@ -7,10 +7,12 @@ signature would look tested while never running. These go over HTTP.
 from __future__ import annotations
 
 import mimetypes
+import os
 from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from cowork.api.v1 import artifact_scope
@@ -285,3 +287,444 @@ def test_release_is_refused_without_owner_access(client, tmp_path, monkeypatch):
     res = client.post(_RELEASE_URL, json={"commentThreadId": "thread-1"})
 
     assert res.status_code == 403, res.text
+
+
+# ── the source path is a selector, not a path ────────────────────────────────
+# `?path=` (and the PUT body's `path`) name the file to edit. The revision
+# service resolves that name under the artifact folder, and its own checks
+# (no `..`, containment, extension allowlist) are the inner gate. The route
+# boundary is the outer one: the request string is matched against a scandir
+# pass on pinned descriptors and only the OS-returned spelling travels on —
+# the same rule every other filesystem-facing route in the file follows.
+
+_WORKSPACE_URL = "/api/v1/artifacts/workspace/local/0123456789abcdef0123456789abcdef"
+
+
+@pytest.fixture
+def editable_artifact(tmp_path, monkeypatch):
+    # Every route test below uses this fixture, and two of its entries are
+    # symlinks, so without the guard the whole group errors in setup rather
+    # than skipping where links are unavailable.
+    if not hasattr(os, "O_NOFOLLOW"):
+        pytest.skip("the fixture's symlink entries need a POSIX filesystem")
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+    from cowork.services.artifacts import ProjectArtifacts
+
+    project = tmp_path / "project"
+    base = project / ".anton" / "artifacts"
+    folder = base / "brief"
+    (folder / "docs").mkdir(parents=True)
+    (folder / "brief.md").write_text("# primary\n", encoding="utf-8")
+    (folder / "docs" / "notes.md").write_text("# nested\n", encoding="utf-8")
+    outside = tmp_path / "outside.md"
+    outside.write_text("# secret\n", encoding="utf-8")
+    (folder / "link.md").symlink_to(outside)
+    (folder / "linkdir").symlink_to(folder / "docs", target_is_directory=True)
+    source = ProjectArtifacts(
+        base=base, project_id=None, project_name="project",
+        trusted_anchor=project, root_parts=(".anton", "artifacts"),
+    )
+    metadata = {"type": "file", "primary": "brief.md"}
+    monkeypatch.setattr(
+        workspace_ep, "_owner_workspace",
+        lambda *_args: (source, folder, metadata, {}),
+    )
+    return SimpleNamespace(source=source, folder=folder, metadata=metadata)
+
+
+def test_the_service_receives_the_resolved_path_on_both_routes(
+    editable_artifact, monkeypatch,
+):
+    """Route-level value check: both routes hand the service the same path.
+
+    Provenance is not testable here. `"/".join` builds a fresh string for any
+    multi-component path, so an `is not` against the request would hold even
+    for a selector that never consulted the disk. The two tests below cover
+    that property where it can actually fail.
+    """
+    import asyncio
+
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+
+    received: list[object] = []
+
+    def capture_read(folder, metadata, artifact_id, rel_path=None):
+        received.append(rel_path)
+        return {"path": rel_path, "content": "", "revision": {}, "revisions": []}
+
+    def capture_save(folder, metadata, artifact_id, *, rel_path=None, **_kw):
+        received.append(rel_path)
+        # The id matches the expected one, so the route's live-artifact sync
+        # stays out of a test about which string reaches the service.
+        return {"path": rel_path, "revision": {"id": "r1"}}
+
+    monkeypatch.setattr(workspace_ep, "current_workspace", capture_read)
+    monkeypatch.setattr(workspace_ep, "active_agent_repair", lambda *_a, **_k: None)
+    monkeypatch.setattr(workspace_ep, "save_source", capture_save)
+
+    requested = "docs/notes.md"
+    asyncio.run(workspace_ep.artifact_source(
+        "local", "0123456789abcdef0123456789abcdef", session=None, path=requested,
+    ))
+    body = workspace_ep._SourceUpdateBody(
+        content="x", expectedRevisionId="r1", path=requested,
+    )
+    asyncio.run(workspace_ep.update_artifact_source(
+        "local", "0123456789abcdef0123456789abcdef", body=body, session=None,
+    ))
+
+    assert received == ["docs/notes.md", "docs/notes.md"]
+
+
+def test_no_path_leaves_the_choice_to_the_service(editable_artifact, client):
+    res = client.get(_WORKSPACE_URL)
+
+    assert res.status_code == 200, res.text
+    assert res.json()["path"] == "brief.md"
+
+
+def test_a_nested_source_is_read_and_saved_through_the_selector(editable_artifact, client):
+    res = client.get(f"{_WORKSPACE_URL}?path=docs/notes.md")
+    assert res.status_code == 200, res.text
+    assert res.json()["path"] == "docs/notes.md"
+    assert res.json()["content"] == "# nested\n"
+
+    saved = client.put(_WORKSPACE_URL, json={
+        "content": "# edited\n",
+        "expectedRevisionId": res.json()["revision"]["id"],
+        "path": "docs/notes.md",
+    })
+    assert saved.status_code == 200, saved.text
+    assert (editable_artifact.folder / "docs" / "notes.md").read_text() == "# edited\n"
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "../outside.md",
+        "..%2Foutside.md",
+        "docs/../../outside.md",
+        "/etc/passwd",
+        "C:/Windows/win.ini",
+        "docs\\..\\..\\outside.md",
+        "brief.md%00.html",
+        ".revisions/manifest.json",
+    ],
+)
+def test_traversal_shapes_are_refused_before_the_service(
+    editable_artifact, client, monkeypatch, path,
+):
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("the revision service saw an unvalidated path")
+
+    monkeypatch.setattr(workspace_ep, "current_workspace", explode)
+    monkeypatch.setattr(workspace_ep, "save_source", explode)
+
+    res = client.get(f"{_WORKSPACE_URL}?path={path}")
+    assert res.status_code == 422, res.text
+
+    res = client.put(_WORKSPACE_URL, json={
+        "content": "x", "expectedRevisionId": "r1", "path": path.replace("%2F", "/").replace("%00", "\x00"),
+    })
+    assert res.status_code == 422, res.text
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "missing.md",
+        "docs/missing.md",
+        "docs",                 # a directory, not a file
+        "link.md",              # symlink to a file outside the folder
+        "linkdir/notes.md",     # symlinked directory, even though it lands inside
+    ],
+)
+def test_symlinks_and_missing_entries_are_not_found_before_the_service(
+    editable_artifact, client, monkeypatch, path,
+):
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("the revision service saw a path that was not on disk")
+
+    monkeypatch.setattr(workspace_ep, "current_workspace", explode)
+    monkeypatch.setattr(workspace_ep, "save_source", explode)
+
+    res = client.get(f"{_WORKSPACE_URL}?path={path}")
+    assert res.status_code == 404, res.text
+
+    res = client.put(_WORKSPACE_URL, json={
+        "content": "x", "expectedRevisionId": "r1", "path": path,
+    })
+    assert res.status_code == 404, res.text
+
+
+@pytest.fixture
+def readme_backed_artifact(tmp_path, monkeypatch):
+    """An artifact whose editable source is the one the service picks itself.
+
+    `metadata["primary"]` is optional, and without it `resolve_source` takes
+    the sorted-first editable file. `README.md` sorts ahead of any lowercase
+    name, so it is the source the GET reports for artifacts like this one.
+    """
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+    from cowork.services.artifacts import ProjectArtifacts
+
+    project = tmp_path / "project"
+    base = project / ".anton" / "artifacts"
+    folder = base / "brief"
+    folder.mkdir(parents=True)
+    (folder / "README.md").write_text("# readme\n", encoding="utf-8")
+    (folder / "index.html").write_text("<h1>x</h1>\n", encoding="utf-8")
+    source = ProjectArtifacts(
+        base=base, project_id=None, project_name="project",
+        trusted_anchor=project, root_parts=(".anton", "artifacts"),
+    )
+    metadata = {"type": "file"}
+    monkeypatch.setattr(
+        workspace_ep, "_owner_workspace",
+        lambda *_args: (source, folder, metadata, {}),
+    )
+    return SimpleNamespace(source=source, folder=folder, metadata=metadata)
+
+
+def test_the_path_a_get_reports_can_be_saved_back(readme_backed_artifact, client):
+    """The round trip a client actually performs: read, then save what it read.
+
+    The selector must accept every path the service is willing to report. A
+    boundary refusal the inner gate does not share makes the reported source
+    unsaveable, and the client has no other path to send.
+    """
+    read = client.get(_WORKSPACE_URL)
+    assert read.status_code == 200, read.text
+    reported = read.json()["path"]
+    assert reported == "README.md"
+
+    saved = client.put(_WORKSPACE_URL, json={
+        "content": "# edited\n",
+        "expectedRevisionId": read.json()["revision"]["id"],
+        "path": reported,
+    })
+
+    assert saved.status_code == 200, saved.text
+    assert (readme_backed_artifact.folder / "README.md").read_text() == "# edited\n"
+
+
+def test_the_names_handed_to_the_filesystem_are_the_ones_scandir_returned(
+    editable_artifact, monkeypatch,
+):
+    """Every component reaching `openat` is the object the directory scan produced.
+
+    `is not` against the request cannot show this for a multi-component path:
+    splitting the joined string yields fresh objects whatever the selector
+    then does with them. So the assertion is against the scan's own return
+    values, which a selector that skipped the scan would not have.
+    """
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+
+    from_disk = []
+    opened_names = []
+    original_entry_name = workspace_ep._existing_draft_entry_name
+    original_open_child = workspace_ep.open_pinned_child
+    original_dir_lstat = workspace_ep.dir_lstat
+
+    def entry_name(directory, requested, **kwargs):
+        name = original_entry_name(directory, requested, **kwargs)
+        from_disk.append(name)
+        return name
+
+    def open_child(directory, name):
+        opened_names.append(name)
+        return original_open_child(directory, name)
+
+    def lstat(directory, name):
+        opened_names.append(name)
+        return original_dir_lstat(directory, name)
+
+    monkeypatch.setattr(workspace_ep, "_existing_draft_entry_name", entry_name)
+    monkeypatch.setattr(workspace_ep, "open_pinned_child", open_child)
+    monkeypatch.setattr(workspace_ep, "dir_lstat", lstat)
+
+    selected = workspace_ep._editable_source_selector(
+        editable_artifact.source, editable_artifact.folder, "docs/notes.md"
+    )
+
+    assert selected == "docs/notes.md"
+    assert from_disk == ["docs", "notes.md"]
+    assert opened_names == ["docs", "notes.md"]
+    assert all(
+        opened is scanned for opened, scanned in zip(opened_names, from_disk, strict=True)
+    )
+
+
+def test_a_single_component_is_replaced_by_the_disk_name_too(editable_artifact):
+    """The case `"/".join` cannot launder.
+
+    Joining a one-element list returns that element, and splitting a string
+    with no separator returns the string itself, so a selector that skipped
+    the disk match would hand the request object straight through. Only this
+    shape distinguishes the two.
+    """
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+
+    requested = ("brief.md" + "x")[:-1]
+
+    selected = workspace_ep._editable_source_selector(
+        editable_artifact.source, editable_artifact.folder, requested
+    )
+
+    assert selected == "brief.md"
+    assert selected is not requested
+
+
+def _case_insensitive(directory: Path) -> bool:
+    """Ask the volume rather than the platform, as the selector does."""
+    probe = directory / "CaseProbe.tmp"
+    probe.write_text("x", encoding="utf-8")
+    try:
+        return (directory / "caseprobe.tmp").exists()
+    finally:
+        probe.unlink()
+
+
+@pytest.fixture
+def mixed_case_artifact(tmp_path, monkeypatch):
+    """An artifact whose recorded primary is spelled unlike its file.
+
+    `metadata.json` is written outside this service, so the two spellings can
+    differ. `resolve_source` opens by path and inherits the volume's case
+    rules, which means it reports the primary's spelling verbatim.
+    """
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+    from cowork.services.artifacts import ProjectArtifacts
+
+    project = tmp_path / "project"
+    base = project / ".anton" / "artifacts"
+    folder = base / "brief"
+    folder.mkdir(parents=True)
+    (folder / "brief.md").write_text("# primary\n", encoding="utf-8")
+    source = ProjectArtifacts(
+        base=base, project_id=None, project_name="project",
+        trusted_anchor=project, root_parts=(".anton", "artifacts"),
+    )
+    metadata = {"type": "file", "primary": "Brief.md"}
+    monkeypatch.setattr(
+        workspace_ep, "_owner_workspace",
+        lambda *_args: (source, folder, metadata, {}),
+    )
+    return SimpleNamespace(source=source, folder=folder, metadata=metadata)
+
+
+def test_a_case_mismatched_primary_reports_the_disk_spelling(mixed_case_artifact, client):
+    """Both routes name the source the same way, so the journal has one key.
+
+    This is the property that broke when only the write side was translated:
+    the read reported `Brief.md`, the write recorded `brief.md`, and the
+    mismatched revision id came back 409 where a 404 had been.
+
+    Only a case-insensitive volume can show it. On a case-sensitive one
+    `Brief.md` names nothing, `resolve_source` refuses it, and the artifact's
+    source is unreachable through this route both before and after this
+    change -- a set-but-absent primary is not the empty primary the service
+    falls back on.
+    """
+    if not _case_insensitive(mixed_case_artifact.folder):
+        pytest.skip("needs a case-insensitive volume; the mismatch cannot arise")
+
+    read = client.get(_WORKSPACE_URL)
+    assert read.status_code == 200, read.text
+    reported = read.json()["path"]
+    assert reported == "brief.md"
+
+    saved = client.put(_WORKSPACE_URL, json={
+        "content": "# edited\n",
+        "expectedRevisionId": read.json()["revision"]["id"],
+        "path": reported,
+    })
+
+    assert saved.status_code == 200, saved.text
+    assert (mixed_case_artifact.folder / "brief.md").read_text() == "# edited\n"
+
+
+def test_the_recorded_primary_is_accepted_on_a_case_insensitive_volume(
+    mixed_case_artifact, client,
+):
+    """The spelling the volume itself accepts is accepted here too.
+
+    This is the half a case-exact boundary refused. It cannot be asserted
+    where the volume is case-sensitive, because there `Brief.md` names
+    nothing and refusing it is correct.
+    """
+    if not _case_insensitive(mixed_case_artifact.folder):
+        pytest.skip("needs a case-insensitive volume; the spelling names nothing here")
+
+    res = client.get(f"{_WORKSPACE_URL}?path=Brief.md")
+
+    assert res.status_code == 200, res.text
+    assert res.json()["path"] == "brief.md"
+
+
+def test_a_case_variant_is_refused_where_the_volume_is_case_sensitive(
+    mixed_case_artifact, client,
+):
+    """The other half: accepting the volume's rules must not invent entries."""
+    if _case_insensitive(mixed_case_artifact.folder):
+        pytest.skip("needs a case-sensitive volume; the variant is a real file here")
+
+    res = client.get(f"{_WORKSPACE_URL}?path=Brief.md")
+
+    assert res.status_code == 404, res.text
+
+
+def test_a_name_absent_from_disk_is_refused_whatever_the_volume(editable_artifact):
+    """`native_case` widens the accepted spellings, never the accepted files."""
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+
+    with pytest.raises(HTTPException) as refused:
+        workspace_ep._editable_source_selector(
+            editable_artifact.source, editable_artifact.folder, "nothing-here.md"
+        )
+
+    assert refused.value.status_code == 404
+
+
+def test_an_oversized_path_is_refused_by_the_route(editable_artifact, client, monkeypatch):
+    """Both spellings of the parameter answer the same way on length."""
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("an oversized path reached the service")
+
+    monkeypatch.setattr(workspace_ep, "current_workspace", explode)
+    monkeypatch.setattr(workspace_ep, "save_source", explode)
+    oversized = "a" * 1001
+
+    assert client.get(f"{_WORKSPACE_URL}?path={oversized}").status_code == 422
+    assert client.get(f"{_WORKSPACE_URL}/revisions?path={oversized}").status_code == 422
+    assert client.put(_WORKSPACE_URL, json={
+        "content": "x", "expectedRevisionId": "r1", "path": oversized,
+    }).status_code == 422
+
+
+def test_a_folder_outside_the_sources_base_is_refused(editable_artifact, tmp_path):
+    """`_artifact_folder_component` is what keeps a grant folder-specific.
+
+    Resolution hands the route a folder alongside the source that authorized
+    it. Translating any other folder to its basename would let a grant for one
+    resolved source select a same-named folder under a different one, so a
+    folder whose parent is not the source's base is refused outright.
+    """
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+
+    elsewhere = tmp_path / "elsewhere" / ".anton" / "artifacts" / "brief"
+    elsewhere.mkdir(parents=True)
+    (elsewhere / "brief.md").write_text("# other\n", encoding="utf-8")
+
+    with pytest.raises(HTTPException) as refused:
+        workspace_ep._editable_source_selector(
+            editable_artifact.source, elsewhere, "brief.md"
+        )
+
+    assert refused.value.status_code == 404
