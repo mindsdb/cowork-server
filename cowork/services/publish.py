@@ -423,7 +423,12 @@ def publish_artifact(
         from cowork.services.artifact_identity import artifact_key, ensure_full_id
 
         artifact_id, _metadata = ensure_full_id(published_dir)
-        canonical_artifact_key = artifact_key(artifact_id)
+        if scope is not None and scope.org_mode:
+            from cowork.services.artifact_authorization_identity import publish_authorization_key
+
+            canonical_artifact_key = publish_authorization_key(artifact_id, artifacts_base, scope)
+        else:
+            canonical_artifact_key = artifact_key(artifact_id)
 
     # Markdown is rendered to a throwaway index.html that we hand to the
     # publisher; `.html` and fullstack publish their real target directly.
