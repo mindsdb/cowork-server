@@ -1,6 +1,6 @@
 """Behaviour of the ENG-2094 permission front door's two starting primitives.
 
-Exercises ``require(Open)``/``require(Authenticated)`` on a tiny scratch app
+Exercises ``require(OpenByDesign)``/``require(Authenticated)`` on a tiny scratch app
 rather than ``create_app()``, so this doesn't depend on the settings
 singleton or ``TrustedHeaderMiddleware`` — a route setting
 ``request.state.principal`` directly is enough to stand in for it.
@@ -10,7 +10,7 @@ from __future__ import annotations
 from fastapi import Depends, FastAPI
 from fastapi.testclient import TestClient
 
-from cowork.api.v1.permissions import Authenticated, Open, require
+from cowork.api.v1.permissions import Authenticated, OpenByDesign, require
 from cowork.principal import Principal
 
 PRINCIPAL = Principal(user_id="u1", org_id="o1")
@@ -19,7 +19,7 @@ PRINCIPAL = Principal(user_id="u1", org_id="o1")
 def _app() -> FastAPI:
     app = FastAPI()
 
-    @app.get("/open", dependencies=[Depends(require(Open))])
+    @app.get("/open", dependencies=[Depends(require(OpenByDesign))])
     def open_route():
         return {"ok": True}
 
@@ -54,10 +54,10 @@ def test_authenticated_route_allows_a_verified_principal():
 
 
 def test_require_stamps_permission_cls_for_the_ci_walker():
-    assert require(Open).permission_cls is Open
+    assert require(OpenByDesign).permission_cls is OpenByDesign
     assert require(Authenticated).permission_cls is Authenticated
 
 
 def test_require_is_cached_so_every_call_site_shares_one_dependency():
-    assert require(Open) is require(Open)
+    assert require(OpenByDesign) is require(OpenByDesign)
     assert require(Authenticated) is require(Authenticated)

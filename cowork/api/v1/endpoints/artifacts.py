@@ -26,7 +26,7 @@ from sqlmodel import Session
 from cowork.db.scoped import ScopedSession, ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.api.v1.endpoints.guards import require_local_tenancy
-from cowork.api.v1.permissions import Open, require
+from cowork.api.v1.permissions import OpenByDesign, require
 from cowork.api.v1.artifact_preview import (
     NO_CACHE_HEADERS,
     html_with_comment_layer,
@@ -771,14 +771,14 @@ async def delete_artifact_for_request(
         raise HTTPException(status_code=500, detail="Could not delete artifact") from e
 
 
-@router.get("/status", dependencies=[Depends(require_local_tenancy), Depends(require(Open))])
+@router.get("/status", dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
 async def artifact_status(path: str = Query(..., min_length=1, max_length=4096)):
     # Cheap published/modified/access read for the preview viewer's in-place
     # refresh. Never raises for an unknown path — returns the blank default.
     return _desktop_artifact_status_for_path(path)
 
 
-@router.get("/preview", dependencies=[Depends(require_local_tenancy), Depends(require(Open))])
+@router.get("/preview", dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
 async def preview_artifact(path: str = Query(...)):
     try:
         artifact = resolve_artifact_path(path)
@@ -799,7 +799,7 @@ class _ExportBody(BaseModel):
     format: str  # 'pdf' | 'docx' | 'html'
 
 
-@router.post("/export", dependencies=[Depends(require_local_tenancy), Depends(require(Open))])
+@router.post("/export", dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
 async def export_artifact_endpoint(req: _ExportBody):
     """Convert a document artifact (markdown/HTML) to PDF/Word/HTML, writing
     the result into the same artifact folder. Returns the new file's path so
@@ -844,7 +844,7 @@ async def export_artifact_endpoint(req: _ExportBody):
     return {"path": str(out), "filename": out.name}
 
 
-@router.post("/preview-mount", dependencies=[Depends(require_local_tenancy), Depends(require(Open))])
+@router.post("/preview-mount", dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
 async def preview_mount_endpoint(req: _PathBody, request: Request):
     try:
         artifact = resolve_artifact_path(req.path)
@@ -870,7 +870,7 @@ async def preview_mount_endpoint(req: _PathBody, request: Request):
     return payload
 
 
-@router.get("/preview-asset/{token}/{rel_path:path}", dependencies=[Depends(require_local_tenancy), Depends(require(Open))])
+@router.get("/preview-asset/{token}/{rel_path:path}", dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
 async def preview_asset(token: str, rel_path: str, request: Request):
     parent = get_preview_mount(token)
     if parent is None:
@@ -895,7 +895,7 @@ async def preview_asset(token: str, rel_path: str, request: Request):
     return FileResponse(target, media_type=media_type, headers=NO_CACHE_HEADERS)
 
 
-@router.get("/serve/{project_name}/{file_path:path}", dependencies=[Depends(require_local_tenancy), Depends(require(Open))])
+@router.get("/serve/{project_name}/{file_path:path}", dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
 def serve_artifact_file(project_name: str, file_path: str, request: Request):
     """Serve a file from `<project>/.anton/artifacts/<file_path>` over
     HTTP. Stateless, origin-relative, frame-able so the in-app iframe
@@ -920,7 +920,7 @@ def serve_artifact_file(project_name: str, file_path: str, request: Request):
     return FileResponse(target, media_type=media_type, headers=NO_CACHE_HEADERS)
 
 
-@router.post("/open", dependencies=[Depends(require_local_tenancy), Depends(require(Open))])
+@router.post("/open", dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
 async def open_artifact(req: _PathBody):
     from cowork.services.artifacts import _org_mode, _NO_EXEC_DETAIL
     # In org mode this always refuses; see _org_mode's docstring in services/artifacts.py.
@@ -981,7 +981,7 @@ def _resolve_reveal_path(path: str, session: ScopedSession) -> Path:
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Path is not in a known project or artifact directory")
 
 
-@router.post("/reveal", dependencies=[Depends(require_local_tenancy), Depends(require(Open))])
+@router.post("/reveal", dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
 async def reveal_artifact(req: _PathBody, session: ScopedSessionDep):
     target = _resolve_reveal_path(req.path, session)
     try:
@@ -1001,7 +1001,7 @@ async def reveal_artifact(req: _PathBody, session: ScopedSessionDep):
 @router.api_route(
     "/proxy/{token}/{rel_path:path}",
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
-    dependencies=[Depends(require(Open))],
+    dependencies=[Depends(require(OpenByDesign))],
 )
 async def proxy(token: str, rel_path: str, request: Request):
     """HTTP forwarder for fullstack-artifact previews.
@@ -1010,7 +1010,7 @@ async def proxy(token: str, rel_path: str, request: Request):
     `127.0.0.1:<metadata.json port>`, injects CORS, strips hop-by-hop
     headers. See `cowork.services.preview_proxy` for the body.
 
-    Open, not `require_local_tenancy` like its siblings: the token is the
+    OpenByDesign, not `require_local_tenancy` like its siblings: the token is the
     real guard here, not tenancy. `_PREVIEW_MOUNTS` (see
     `cowork.services.artifacts.get_preview_mount`) is only ever populated by
     `/preview-mount`, which IS `require_local_tenancy`-gated — so in org mode
@@ -1021,7 +1021,7 @@ async def proxy(token: str, rel_path: str, request: Request):
     return await proxy_artifact_request(token, rel_path, request)
 
 
-@router.delete("/", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_local_tenancy), Depends(require(Open))])
+@router.delete("/", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
 def delete_artifact_endpoint(path: str = Query(...)):
     try:
         from cowork.services.publish import (

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, Query
 
-from cowork.api.v1.permissions import Open, require
+from cowork.api.v1.permissions import OpenByDesign, require
 from cowork.db.scoped import ScopedSessionDep
 from cowork.services.artifact_roots import artifacts_sources_for_scan as _sources_for_scan
 from cowork.services.artifacts import list_artifacts as _list_artifacts
@@ -12,7 +12,7 @@ from cowork.services.pins import PinService
 from cowork.services.projects import ProjectService
 from cowork.services.schedules import ScheduleService
 
-router = APIRouter(dependencies=[Depends(require(Open))])
+router = APIRouter(dependencies=[Depends(require(OpenByDesign))])
 
 
 def _score(text: str, query: str) -> int:
