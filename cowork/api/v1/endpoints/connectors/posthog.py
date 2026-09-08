@@ -1,9 +1,10 @@
 """PostHog connector project discovery."""
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.services.connectors.posthog import PostHogDiscoveryError, discover_projects
 
 router = APIRouter()
@@ -15,7 +16,7 @@ class DiscoverPostHogProjectsRequest(BaseModel):
     custom_host: str | None = None
 
 
-@router.post("/projects")
+@router.post("/projects", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def discover_posthog_projects(req: DiscoverPostHogProjectsRequest) -> dict:
     try:
         projects = await discover_projects(
