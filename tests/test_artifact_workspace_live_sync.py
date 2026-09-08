@@ -10,6 +10,7 @@ from cowork.api.v1.endpoints import artifact_workspace as workspace
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.services import artifact_locks
 from cowork.services.artifact_revisions import current_source
+from cowork.services.artifacts import ProjectArtifacts
 
 
 ARTIFACT_ID = "11111111111111111111111111111111"
@@ -29,6 +30,18 @@ def artifact(tmp_path):
     metadata = {"slug": "report", "type": "html-app", "primary": "report.html"}
     (folder / "metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
     return folder, metadata
+
+
+def _source_for(folder):
+    """The route resolves a requested source path through this object's anchor."""
+    base = folder.parent
+    return ProjectArtifacts(
+        base=base,
+        project_id=None,
+        project_name="project",
+        trusted_anchor=base.parent,
+        root_parts=(base.name,),
+    )
 
 
 def _publish(folder, access):
@@ -54,7 +67,7 @@ async def test_manual_save_synchronizes_an_existing_live_artifact(artifact, monk
     monkeypatch.setattr(
         workspace,
         "_owner_workspace",
-        lambda *_args: (object(), folder, metadata, {}),
+        lambda *_args: (_source_for(folder), folder, metadata, {}),
     )
 
     async def fake_sync(session, live_folder):
@@ -86,7 +99,7 @@ async def test_noop_save_does_not_create_a_live_version(artifact, monkeypatch):
     monkeypatch.setattr(
         workspace,
         "_owner_workspace",
-        lambda *_args: (object(), folder, metadata, {}),
+        lambda *_args: (_source_for(folder), folder, metadata, {}),
     )
 
     async def unexpected_sync(*_args):
@@ -124,7 +137,7 @@ async def test_restore_synchronizes_an_existing_live_artifact(artifact, monkeypa
     monkeypatch.setattr(
         workspace,
         "_owner_workspace",
-        lambda *_args: (object(), folder, metadata, {}),
+        lambda *_args: (_source_for(folder), folder, metadata, {}),
     )
 
     async def fake_sync(session, live_folder):
@@ -277,7 +290,7 @@ async def test_publish_failure_does_not_undo_the_source_save(artifact, monkeypat
     monkeypatch.setattr(
         workspace,
         "_owner_workspace",
-        lambda *_args: (object(), folder, metadata, {}),
+        lambda *_args: (_source_for(folder), folder, metadata, {}),
     )
 
     async def failed_sync(*_args):
