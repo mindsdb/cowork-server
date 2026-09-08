@@ -85,7 +85,7 @@ def _require_org_admin_for(keys, scope: TenantScope, principal: Principal | None
         )
 
 
-@router.get("/", response_model=list[SettingResponse])
+@router.get("/", response_model=list[SettingResponse], dependencies=[Depends(require(Open))])
 def list_settings(session: SessionDep, scope: ScopeDep) -> list[SettingResponse]:
     return SettingService(session, scope).list_settings()
 
@@ -244,7 +244,7 @@ def delete_setting(key: str, session: SessionDep, scope: ScopeDep, principal: Pr
 # ── Provider validation & testing ────────────────────────────────────
 
 
-@router.post("/validate")
+@router.post("/validate", dependencies=[Depends(require(Open))])
 def validate_settings(session: SessionDep, scope: ScopeDep):
     s = SettingService(session, scope).load()
     cs = check_config_status(s)
@@ -257,7 +257,7 @@ def validate_settings(session: SessionDep, scope: ScopeDep):
     }
 
 
-@router.get("/configured")
+@router.get("/configured", dependencies=[Depends(require(Open))])
 def check_configured(session: SessionDep, scope: ScopeDep):
     s = SettingService(session, scope).load()
     if s.minds_api_key is not None:
@@ -276,7 +276,7 @@ def check_configured(session: SessionDep, scope: ScopeDep):
     return {"configured": False, "provider": ""}
 
 
-@router.post("/logout")
+@router.post("/logout", dependencies=[Depends(require(Open))])
 def logout_clear_credentials(session: SessionDep, scope: ScopeDep):
     """Clear all stored credentials from the DB (desktop sign-out flow, so
     ``/health`` returns ``config_ready: false``; preferences are kept).
@@ -290,7 +290,7 @@ def logout_clear_credentials(session: SessionDep, scope: ScopeDep):
     return {"ok": True, "deleted": deleted}
 
 
-@router.get("/install-status")
+@router.get("/install-status", dependencies=[Depends(require(Open))])
 def install_status():
     return {"antonInstalled": True, "serverDepsReady": True}
 
@@ -319,7 +319,7 @@ class _TestProvidersBody(BaseModel):
     providers: Optional[list[dict[str, Any]]] = None
 
 
-@router.post("/test-providers")
+@router.post("/test-providers", dependencies=[Depends(require(Open))])
 async def test_providers(session: SessionDep, scope: ScopeDep, body: _TestProvidersBody | None = None):
     """Ping the given (or all stored) providers and return connectivity results.
 
@@ -357,7 +357,7 @@ class _ValidateProviderBody(CamelRequest):
     model: Optional[str] = None
 
 
-@router.post("/validate-provider")
+@router.post("/validate-provider", dependencies=[Depends(require(Open))])
 async def validate_provider_endpoint(body: _ValidateProviderBody):
     return await validate_provider_svc(body.provider, body.api_key, body.base_url, body.model)
 
@@ -374,7 +374,7 @@ def _fill_missing(target: dict, extra: dict, *, skip: Optional[set[str]] = None)
         target.setdefault(key, value)
 
 
-@router.get("/recommended-models")
+@router.get("/recommended-models", dependencies=[Depends(require(Open))])
 async def recommended_models(request: Request, session: SessionDep, scope: ScopeDep, refresh: bool = False):
     """Per-provider model picker options for the Settings UI.
 

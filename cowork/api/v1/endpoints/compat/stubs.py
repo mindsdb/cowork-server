@@ -44,7 +44,7 @@ def oauth_start(service: str, body: dict[str, Any] | None = None):
 # input_file content blocks in the Responses request input field.
 # These endpoints exist as a compat bridge for the current client.
 
-attachments_router = APIRouter()
+attachments_router = APIRouter(dependencies=[Depends(require(Open))])
 
 
 def _attachment_purpose(project_name: str, session_id: str) -> str:

@@ -4,6 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlmodel import Session
 
+from cowork.api.v1.permissions import Open, require
 from cowork.db.scoped import ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.models.project import Project
@@ -16,7 +17,7 @@ from cowork.schemas.conversations import (
 from cowork.services.conversations import ConversationService
 from cowork.services.task_objects import TaskObjectService
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require(Open))])
 SessionDep = Annotated[Session, Depends(get_session)]
 
 
