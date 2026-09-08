@@ -15,8 +15,9 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.services.artifact_identity import resolve_artifact_folder
 from cowork.services.artifact_roots import artifacts_sources_for_scan
 from cowork.services.comments_proxy import forward_comments_rest, forward_comments_stream
@@ -100,7 +101,7 @@ def _local_report_id_for_request(user_dir: str, report_id: str) -> str | None:
         ) from exc
 
 
-@router.get("/{user_dir}/{report_id}/stream")
+@router.get("/{user_dir}/{report_id}/stream", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def comments_stream(user_dir: str, report_id: str, request: Request):
     # SSE — registered before the catch-all so it isn't swallowed by {subpath:path}.
     local_report_id = _local_report_id_for_request(user_dir, report_id)
@@ -116,6 +117,7 @@ async def comments_stream(user_dir: str, report_id: str, request: Request):
 @router.api_route(
     "/{user_dir}/{report_id}/{subpath:path}",
     methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
 )
 async def comments_rest(user_dir: str, report_id: str, subpath: str, request: Request):
     # threads (list/create/edit/delete), replies (add/edit/delete), status.
