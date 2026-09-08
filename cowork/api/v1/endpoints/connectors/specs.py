@@ -16,7 +16,7 @@ from cowork.schemas.connectors import (
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.specs._registry import registry
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require(OpenByDesign))])
 
 # Same alias as connections.py/oauth.py: the vault/relay choice is per-request
 # tenancy context, not a bare settings flag.
@@ -53,7 +53,7 @@ async def list_connector_specs(
     ]
 
 
-@router.get("/{connector_id}", response_model=ConnectorSpecResponse, dependencies=[Depends(require(OpenByDesign))])
+@router.get("/{connector_id}", response_model=ConnectorSpecResponse)
 def get_connector_spec(connector_id: str):
     spec = registry.get_connector(connector_id)
     if not spec:
@@ -61,6 +61,6 @@ def get_connector_spec(connector_id: str):
     return spec
 
 
-@router.post("/match", response_model=MatchResponse, dependencies=[Depends(require(OpenByDesign))])
+@router.post("/match", response_model=MatchResponse)
 def match_connector_spec(req: MatchRequest) -> MatchResponse:
     return registry.match_connector(req.query, req.max_candidates)
