@@ -90,15 +90,19 @@ class DeveloperIntegrationService:
             )
         return result
 
-    def read(self, project: CodeProject, request: SourceContextRequest) -> SourceContext:
-        connection, fields = self._connection(project, request.provider, request.connection_name)
+    def read(self, project: CodeProject | None, request: SourceContextRequest) -> SourceContext:
+        connection, fields = (
+            self._connection(project, request.provider, request.connection_name)
+            if project is not None
+            else self._account_connection(request.provider, request.connection_name)
+        )
         if request.provider == "github":
             return self._read_github(request, connection, fields)
         if request.provider == "linear":
             return self._read_linear(request, connection, fields)
         return self._read_slack(request, connection, fields)
 
-    def search(self, project: CodeProject, request: WorkItemSearchRequest) -> WorkItemPage:
+    def search(self, project: CodeProject | None, request: WorkItemSearchRequest) -> WorkItemPage:
         # Discovery is account-scoped: opening the picker must not silently
         # mutate a project. The chosen account is added to the project only
         # when the user actually links one of its work items.
@@ -127,7 +131,8 @@ class DeveloperIntegrationService:
     ) -> tuple[ProjectConnection, dict[str, Any]]:
         candidates = [item for item in self.connections.list() if item.engine == provider]
         summary = next((item for item in candidates if item.name == requested_name), None) if requested_name else None
-        summary = summary or (candidates[0] if len(candidates) == 1 else None)
+        if not requested_name and len(candidates) == 1:
+            summary = candidates[0]
         provider_label = "GitHub" if provider == "github" else provider.title()
         if summary is None:
             if candidates:

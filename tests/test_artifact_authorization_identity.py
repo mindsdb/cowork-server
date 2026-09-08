@@ -7,7 +7,7 @@ from threading import Barrier, Lock
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 import httpx
 import pytest
@@ -309,6 +309,76 @@ def test_publish_refuses_another_conversation_owner_before_allocating(
     with pytest.raises(ArtifactAccessUnavailable, match="Only the artifact owner"):
         identities.publish_authorization_key(local_id, folder.parent, peer)
     assert issuer.calls == []
+
+
+@pytest.mark.asyncio
+async def test_live_editor_sync_preserves_canonical_identity_and_refuses_peer(
+    issuer, scope, local_id, owned_artifact, monkeypatch
+):
+    from cowork.services.artifact_revisions import current_source
+
+    session, project, _conversation, folder = owned_artifact
+    await artifact_workspace.enable_artifact_comments(
+        str(project.id), local_id, session
+    )
+    canonical = identities.existing_authorization_key(local_id, scope)
+    uploads = []
+
+    def publish(source, **kwargs):
+        uploads.append((Path(source).read_text(), kwargs))
+        return {
+            "artifact_key": kwargs["artifact_key"],
+            "report_id": "report-1",
+            "view_url": "https://view.test/1",
+        }
+
+    async def mint(_self):
+        return "test-publish-key"
+
+    async def revoke(_self):
+        pass
+
+    monkeypatch.setattr("anton.publisher.publish", publish)
+    monkeypatch.setattr("cowork.services.artifact_publish_key.PublishKey.get", mint)
+    monkeypatch.setattr(
+        "cowork.services.artifact_publish_key.PublishKey.revoke", revoke
+    )
+    publish_artifact(
+        folder,
+        artifacts_base=folder.parent,
+        api_key="test-publish-key",
+        publish_url="https://view.test",
+        access={"mode": "restricted", "emails": ["reviewer@example.com"]},
+        scope=scope,
+    )
+    metadata = json.loads((folder / "metadata.json").read_text())
+    initial = current_source(folder, metadata, local_id)
+    body = artifact_workspace._SourceUpdateBody(
+        content="<html>Updated owner bytes</html>",
+        expectedRevisionId=initial["revision"]["id"],
+        path="index.html",
+    )
+    peer = TenantScope(org_mode=True, org_id=scope.org_id, user_id=str(uuid4()))
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        peer_session = ScopedSession(raw, peer)
+        with pytest.raises(HTTPException) as excinfo:
+            await artifact_workspace.update_artifact_source(
+                str(project.id), local_id, body, peer_session
+            )
+        assert excinfo.value.status_code == 403
+    assert len(uploads) == 1
+    authority_calls = len(issuer.calls)
+
+    saved = await artifact_workspace.update_artifact_source(
+        str(project.id), local_id, body, session
+    )
+    assert saved["content"] == body.content
+    assert len(uploads) == 2
+    assert uploads[-1][0] == body.content
+    assert uploads[0][1]["artifact_key"] == uploads[1][1]["artifact_key"] == canonical
+    assert uploads[0][1]["access"] == uploads[1][1]["access"]
+    assert uploads[1][1]["report_id"] == "report-1"
+    assert len(issuer.calls) == authority_calls
 
 
 def test_first_publish_allocates_before_upload_without_requiring_a_draft_grant(

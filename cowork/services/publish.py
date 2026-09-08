@@ -654,6 +654,30 @@ def unpublish_artifact(
     return {"status": "ok"}
 
 
+def published_artifact_access(artifact: Path, *, artifacts_base: Path) -> dict:
+    """Return the stored access for a live artifact, or raise when it is not live.
+
+    Credential resolution deliberately lives outside this helper. Callers can
+    therefore distinguish an unpublished draft from a publish failure before
+    minting an org turn key or asking Desktop for configured provider settings.
+    """
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
+        artifact, container_dirs=[artifacts_base]
+    )
+    published_json = published_dir / ".published.json"
+    if not published_json.is_file():
+        raise FileNotFoundError("Artifact has no publish record")
+    try:
+        published_map: dict[str, Any] = json.loads(published_json.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError("Could not read publish record") from exc
+
+    entry = published_map.get(published_key)
+    if not isinstance(entry, dict) or not entry.get("published", True) or not entry.get("report_id"):
+        raise FileNotFoundError("No published version to update")
+    return access_from_owner_side(entry)
+
+
 def update_artifact(raw_path: str) -> dict:
     """Re-publish an already-published artifact, preserving its URL and access.
 
@@ -670,20 +694,7 @@ def update_artifact(raw_path: str) -> dict:
         artifact, container_dirs=[artifacts_base]
     )
     published_json = published_dir / ".published.json"
-    if not published_json.is_file():
-        raise FileNotFoundError("Artifact has no publish record")
-    try:
-        published_map: dict[str, Any] = json.loads(published_json.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise RuntimeError("Could not read publish record") from exc
-
-    entry = published_map.get(published_key)
-    if not isinstance(entry, dict) or not entry.get("published", True) or not entry.get("report_id"):
-        raise FileNotFoundError("No published version to update")
-
-    # Rebuild the cowork→publish access shape from the stored owner-side state
-    # (single source of truth in anton.publish_access).
-    access = access_from_owner_side(entry)
+    access = published_artifact_access(artifact, artifacts_base=artifacts_base)
 
     # Delegates: reuses report_id (read from .published.json) + refreshes last_md5.
     api_key, publish_url = desktop_publish_credential()
@@ -701,7 +712,7 @@ def update_artifact(raw_path: str) -> dict:
             fresh_map[published_key] = fresh_entry
             _write_published_map(published_json, fresh_map)
     except Exception:
-        pass
+        logger.warning("Could not refresh publish mtime for %s", published_dir, exc_info=True)
 
     return result
 
