@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 
+from cowork.api.v1.permissions import Open, require
 from cowork.db.scoped import ScopedSessionDep
 from cowork.schemas.schedules import (
     DEFAULT_MODEL_SENTINEL,
@@ -14,7 +15,7 @@ from cowork.schemas.schedules import (
 )
 from cowork.services.schedules import ScheduleRunService, ScheduleService
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require(Open))])
 
 
 

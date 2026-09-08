@@ -1,11 +1,12 @@
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
+from cowork.api.v1.permissions import Open, require
 from cowork.db.scoped import ScopedSessionDep
 from cowork.schemas.pins import PinRequest
 from cowork.services.pins import PinService
 
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require(Open))])
 
 _SUPPORTED_TYPES = {"project", "conversation", "schedule"}
 
