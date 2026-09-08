@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import re
 from uuid import UUID
 
+import re2
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
@@ -18,6 +18,13 @@ from cowork.schemas.channels import (
 )
 
 _DEFAULT_THREAD_KEY = "__default__"
+
+# re2 logs pattern-compile errors to the process's raw stderr by default
+# (before absl::InitializeLog() — bypasses Python logging entirely), which
+# would misrepresent ordinary user input mistakes (a typo'd trigger_pattern)
+# as server errors in production logs.
+_QUIET_REGEX_OPTIONS = re2.Options()
+_QUIET_REGEX_OPTIONS.log_errors = False
 
 
 class BindingNotFoundError(Exception):
@@ -221,8 +228,8 @@ class ChannelBindingService:
             if not pattern:
                 raise ValueError("trigger_pattern is required when trigger_rule is 'regex'")
             try:
-                re.compile(pattern)
-            except re.error as exc:
+                re2.compile(pattern, options=_QUIET_REGEX_OPTIONS)
+            except re2.error as exc:
                 raise ValueError(f"invalid trigger_pattern regex: {exc}")
 
     def _validate_links(self, project_id: UUID | None, conversation_id: UUID | None) -> None:

@@ -1,6 +1,8 @@
 """Authenticated artifact draft editing, revisions, review access and repair routes."""
 from __future__ import annotations
 
+import asyncio
+import logging
 import mimetypes
 import ntpath
 import os
@@ -48,12 +50,16 @@ from cowork.services.artifact_revisions import (
     save_source,
 )
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
 
 _DRAFT_RESPONSE_HEADERS = {
     "Cache-Control": "private, no-store",
     "X-Content-Type-Options": "nosniff",
 }
+_LIVE_PUBLISH_TIMEOUT_S = 60.0
+_LIVE_PUBLISH_LOCK_TTL_S = _LIVE_PUBLISH_TIMEOUT_S * 3
 _PRIVATE_DRAFT_ENTRIES = {
     ".revisions",
     ".published.json",
@@ -341,6 +347,105 @@ def _owner_workspace(session, project_ref: str, artifact_id: str):
     return source, folder, metadata, capabilities
 
 
+async def _sync_live_artifact(session, folder: Path) -> bool | None:
+    """Re-publish a live artifact after an editor write.
+
+    ``None`` means the artifact is only a draft, ``True`` means its stable URL
+    was updated, and ``False`` means the source was saved but publishing failed.
+    A publish failure must not turn a committed source edit into a false save
+    failure: retrying that request with the old revision token would only create
+    a conflict. Org autopublish can retry on the next turn, while Desktop keeps
+    the artifact's modified state visible for a manual retry.
+    """
+    from cowork.services.publish import (
+        desktop_publish_credential,
+        publish_artifact,
+        published_artifact_access,
+    )
+    from cowork.services.artifact_locks import release
+
+    artifacts_base = folder.parent
+    if not await _acquire_live_publish_lock(folder):
+        logger.warning("Could not synchronize live artifact %s: publish lock busy", folder)
+        return False
+
+    key = None
+    publish_abandoned = False
+    publish_started = False
+    try:
+        try:
+            access = await run_in_threadpool(
+                published_artifact_access,
+                folder,
+                artifacts_base=artifacts_base,
+            )
+        except FileNotFoundError:
+            return None
+        except Exception:
+            logger.warning("Could not read live publish state for %s", folder, exc_info=True)
+            return False
+
+        scope = getattr(session, "scope", None)
+        if scope is not None and getattr(scope, "org_mode", False):
+            artifacts_base, publish_url, key = _owner_publish_context(session, folder)
+            api_key = await key.get()
+            if not api_key:
+                logger.warning("Could not synchronize live artifact %s: no publish key", folder)
+                return False
+        else:
+            api_key, publish_url = await run_in_threadpool(desktop_publish_credential)
+
+        publish_started = True
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    publish_artifact,
+                    folder,
+                    artifacts_base=artifacts_base,
+                    api_key=api_key,
+                    publish_url=publish_url,
+                    access=access,
+                    scope=scope,
+                ),
+                timeout=_LIVE_PUBLISH_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            publish_abandoned = True
+            logger.warning(
+                "Could not synchronize live artifact %s: publish timed out", folder
+            )
+            return False
+        return True
+    except asyncio.CancelledError:
+        publish_abandoned = publish_started
+        raise
+    except Exception:
+        logger.warning("Could not synchronize live artifact %s", folder, exc_info=True)
+        return False
+    finally:
+        if not publish_abandoned:
+            await run_in_threadpool(release, folder.parent, folder.name)
+        if key is not None and not publish_abandoned:
+            await key.revoke()
+
+
+async def _acquire_live_publish_lock(folder: Path) -> bool:
+    from cowork.services.artifact_locks import acquire
+
+    loop = asyncio.get_running_loop()
+    lock_deadline = loop.time() + _LIVE_PUBLISH_TIMEOUT_S
+    while not await run_in_threadpool(
+        acquire,
+        folder.parent,
+        folder.name,
+        ttl_s=_LIVE_PUBLISH_LOCK_TTL_S,
+    ):
+        if loop.time() >= lock_deadline:
+            return False
+        await asyncio.sleep(0.1)
+    return True
+
+
 @router.get("/workspace/{project_ref}/{artifact_id}")
 async def artifact_source(
     project_ref: str,
@@ -376,7 +481,7 @@ async def update_artifact_source(
     scope = getattr(session, "scope", None)
     actor_id = str(scope.user_id) if scope and scope.user_id else None
     try:
-        return await run_in_threadpool(
+        saved = await run_in_threadpool(
             save_source,
             folder,
             metadata,
@@ -388,6 +493,9 @@ async def update_artifact_source(
             actor_id=actor_id,
             summary=body.summary,
         )
+        if saved["revision"]["id"] != body.expectedRevisionId:
+            await _sync_live_artifact(session, folder)
+        return saved
     except RevisionConflict as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -446,11 +554,6 @@ async def artifact_review_entry(
     }
 
 
-# A share is a re-publish, so it inherits the upload's cost. Generous enough for
-# a fullstack bundle, bounded so a wedged target can't hold the request open.
-_ACCESS_PUBLISH_TIMEOUT_S = 60.0
-
-
 class _AccessBody(BaseModel):
     """The access selection, in `anton.publish_access.resolve_access` shape.
 
@@ -480,7 +583,7 @@ def _owner_publish_context(session, folder: Path):
     return (
         folder.parent,
         _publish_url(scope),
-        PublishKey(str(scope.user_id), str(scope.org_id), min_ttl_s=_ACCESS_PUBLISH_TIMEOUT_S + 60.0),
+        PublishKey(str(scope.user_id), str(scope.org_id), min_ttl_s=_LIVE_PUBLISH_TIMEOUT_S + 60.0),
     )
 
 
@@ -539,29 +642,56 @@ async def set_artifact_access(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="This artifact has no publishable file.",
         )
-    artifacts_base, publish_url, key = _owner_publish_context(session, folder)
-    api_key = await key.get()
-    if not api_key:
+    if not await _acquire_live_publish_lock(folder):
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Publishing is unavailable right now. Try again in a moment.",
+            detail="Publishing is busy right now. Try again in a moment.",
         )
+    from cowork.services.artifact_locks import release
+
+    key = None
+    publish_abandoned = False
+    publish_started = False
     try:
-        return await run_in_threadpool(
-            _publish_bundle,
-            folder,
-            artifacts_base=artifacts_base,
-            api_key=api_key,
-            publish_url=publish_url,
-            access=dict(body.access or {}),
-            scope=session.scope,
-        )
+        artifacts_base, publish_url, key = _owner_publish_context(session, folder)
+        api_key = await key.get()
+        if not api_key:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Publishing is unavailable right now. Try again in a moment.",
+            )
+        publish_started = True
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(
+                    _publish_bundle,
+                    folder,
+                    artifacts_base=artifacts_base,
+                    api_key=api_key,
+                    publish_url=publish_url,
+                    access=dict(body.access or {}),
+                    scope=session.scope,
+                ),
+                timeout=_LIVE_PUBLISH_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError as exc:
+            publish_abandoned = True
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Publishing timed out. Try again in a moment.",
+            ) from exc
+    except asyncio.CancelledError:
+        publish_abandoned = publish_started
+        raise
     except ArtifactAccessUnavailable as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    finally:
+        if not publish_abandoned:
+            await run_in_threadpool(release, folder.parent, folder.name)
 
 
 @router.post("/workspace/{project_ref}/{artifact_id}/comments-access")
@@ -663,7 +793,7 @@ async def restore_artifact_revision(
         restored = await run_in_threadpool(revision_with_content, folder, revision_id)
         scope = getattr(session, "scope", None)
         actor_id = str(scope.user_id) if scope and scope.user_id else None
-        return await run_in_threadpool(
+        saved = await run_in_threadpool(
             save_source,
             folder,
             metadata,
@@ -675,6 +805,9 @@ async def restore_artifact_revision(
             actor_id=actor_id,
             summary=f"Restored revision {restored['number']}",
         )
+        if saved["revision"]["id"] != body.expectedRevisionId:
+            await _sync_live_artifact(session, folder)
+        return saved
     except RevisionConflict as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
