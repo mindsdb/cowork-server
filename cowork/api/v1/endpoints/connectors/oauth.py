@@ -6,10 +6,9 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, sta
 from fastapi.responses import HTMLResponse
 
 from cowork.api.v1.endpoints.guards import require_local
-from cowork.api.v1.permissions import Authenticated, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope
-from cowork.principal import Principal, get_principal
 from cowork.schemas.connectors import OAuthStartRequest, OAuthStartResponse, PickerTokenResponse
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.config import OAUTH_SERVICES
@@ -21,28 +20,6 @@ from cowork.services.connectors.oauth.google import (
 )
 
 router = APIRouter()
-
-
-class AuthenticatedInOrgMode(Authenticated):
-    """``Authenticated`` in org mode; a no-op in local mode.
-
-    The picker routes below already 404 via ``_require_picker_engine`` outside
-    org mode, so checking identity unconditionally would turn that 404 into a
-    401 for a caller who was refused either way — a functional change for a
-    route local mode never legitimately reaches. This defers to that existing
-    gate instead of racing it: identity is only checked once the request is
-    actually in org mode, where the route is meant to run.
-    """
-
-    async def check(
-        self,
-        request: Request,
-        scope: TenantScope = Depends(get_tenant_scope),
-        principal: Principal | None = Depends(get_principal),
-    ) -> Principal | None:
-        if not scope.org_mode:
-            return None
-        return await super().check(request, principal=principal)
 
 # Same alias as connections.py: the vault/relay choice is per-request tenancy
 # context, not a bare settings flag — resolving it once here keeps this file

@@ -25,6 +25,7 @@ from typing import Protocol
 
 from fastapi import Depends, HTTPException, Request, status
 
+from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.principal import Principal, get_principal
 
 
@@ -72,6 +73,32 @@ class Authenticated:
         if principal is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
         return principal
+
+
+class AuthenticatedInOrgMode(Authenticated):
+    """``Authenticated`` in org mode; a no-op in local mode.
+
+    Most of cowork-server's routes are shared between local (single-user
+    desktop, no gateway, no ``Principal`` ever built) and org (multi-tenant
+    cloud) deployments. Checking identity unconditionally would 401 every
+    desktop caller of a route like that; this only enforces it once the
+    request is actually running in org mode, where a membership concept
+    exists to check in the first place.
+
+    Not a capability or resource-ownership check — same as bare
+    ``Authenticated``, a route needs a further ``Permission`` (or its own
+    in-handler logic) for anything beyond "a verified member of the org".
+    """
+
+    async def check(
+        self,
+        request: Request,
+        scope: TenantScope = Depends(get_tenant_scope),
+        principal: Principal | None = Depends(get_principal),
+    ) -> Principal | None:
+        if not scope.org_mode:
+            return None
+        return await super().check(request, principal=principal)
 
 
 @cache
