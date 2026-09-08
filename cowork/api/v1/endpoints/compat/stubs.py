@@ -14,9 +14,10 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
 
+from cowork.api.v1.permissions import Open, require
 from cowork.db.scoped import MissingTenantScopeError, ScopedSessionDep
 from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
 
@@ -27,12 +28,12 @@ logger = logging.getLogger(__name__)
 integrations_router = APIRouter()
 
 
-@integrations_router.get("")
+@integrations_router.get("", dependencies=[Depends(require(Open))])
 def list_integrations():
     return []
 
 
-@integrations_router.post("/{service}/oauth/start")
+@integrations_router.post("/{service}/oauth/start", dependencies=[Depends(require(Open))])
 def oauth_start(service: str, body: dict[str, Any] | None = None):
     return {"url": None, "error": "OAuth not yet available in cowork-server"}
 
@@ -226,7 +227,7 @@ def move_attachment_to_project(
 scratchpad_router = APIRouter()
 
 
-@scratchpad_router.post("/cancel")
+@scratchpad_router.post("/cancel", dependencies=[Depends(require(Open))])
 def cancel_scratchpad():
     return {"ok": True}
 
@@ -236,6 +237,6 @@ def cancel_scratchpad():
 browse_router = APIRouter()
 
 
-@browse_router.get("/status")
+@browse_router.get("/status", dependencies=[Depends(require(Open))])
 def browse_status():
     return {"available": False}
