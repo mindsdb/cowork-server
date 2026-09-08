@@ -35,6 +35,7 @@ from cowork.services.artifact_permissions import (
 )
 from cowork.services.comments_layer import inject_layer
 from cowork.services.artifact_revisions import (
+    JOURNAL_DIRNAME,
     RepairAlreadyPending,
     RevisionConflict,
     RevisionValidationError,
@@ -209,8 +210,10 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
     is matched against a ``dir_scandir`` pass on a pinned descriptor, and the
     path the revision service receives is joined from the ``DirEntry`` names
     the OS returned — never from the HTTP string. A symlink on any component
-    is refused rather than resolved, so the resolve-then-read in
-    ``resolve_source`` cannot be raced by a swap inside the artifact folder.
+    is refused rather than resolved. That narrows ``resolve_source``'s
+    resolve-then-read without closing it: the service still reads by path, so
+    a swap between this walk and that read remains possible, and closing it
+    means reading from the descriptor this walk already holds.
     ``resolve_source`` keeps its own containment and extension checks as the
     inner gate; this is the outer one, at the request boundary, and it is what
     keeps ``?path=`` out of ``pathlib`` in the service layer altogether.
@@ -223,7 +226,10 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
         parts = _relative_file_parts(requested.strip())
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid artifact source path") from exc
-    if parts[0] in _PRIVATE_DRAFT_ENTRIES:
+    # The journal only, matching the inner gate, and at any depth rather than
+    # just the first component. The private-listing set is a different
+    # question: it hides README.md, which is a source the service itself picks.
+    if JOURNAL_DIRNAME in parts:
         raise HTTPException(status_code=422, detail="Invalid artifact source path")
     folder_name = _artifact_folder_component(source, folder)
     disk_parts: list[str] = []

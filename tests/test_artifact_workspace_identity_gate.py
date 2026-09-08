@@ -448,3 +448,54 @@ def test_symlinks_and_missing_entries_are_not_found_before_the_service(
         "content": "x", "expectedRevisionId": "r1", "path": path,
     })
     assert res.status_code == 404, res.text
+
+
+@pytest.fixture
+def readme_backed_artifact(tmp_path, monkeypatch):
+    """An artifact whose editable source is the one the service picks itself.
+
+    `metadata["primary"]` is optional, and without it `resolve_source` takes
+    the sorted-first editable file. `README.md` sorts ahead of any lowercase
+    name, so it is the source the GET reports for artifacts like this one.
+    """
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+    from cowork.services.artifacts import ProjectArtifacts
+
+    project = tmp_path / "project"
+    base = project / ".anton" / "artifacts"
+    folder = base / "brief"
+    folder.mkdir(parents=True)
+    (folder / "README.md").write_text("# readme\n", encoding="utf-8")
+    (folder / "index.html").write_text("<h1>x</h1>\n", encoding="utf-8")
+    source = ProjectArtifacts(
+        base=base, project_id=None, project_name="project",
+        trusted_anchor=project, root_parts=(".anton", "artifacts"),
+    )
+    metadata = {"type": "file"}
+    monkeypatch.setattr(
+        workspace_ep, "_owner_workspace",
+        lambda *_args: (source, folder, metadata, {}),
+    )
+    return SimpleNamespace(source=source, folder=folder, metadata=metadata)
+
+
+def test_the_path_a_get_reports_can_be_saved_back(readme_backed_artifact, client):
+    """The round trip a client actually performs: read, then save what it read.
+
+    The selector must accept every path the service is willing to report. A
+    boundary refusal the inner gate does not share makes the reported source
+    unsaveable, and the client has no other path to send.
+    """
+    read = client.get(_WORKSPACE_URL)
+    assert read.status_code == 200, read.text
+    reported = read.json()["path"]
+    assert reported == "README.md"
+
+    saved = client.put(_WORKSPACE_URL, json={
+        "content": "# edited\n",
+        "expectedRevisionId": read.json()["revision"]["id"],
+        "path": reported,
+    })
+
+    assert saved.status_code == 200, saved.text
+    assert (readme_backed_artifact.folder / "README.md").read_text() == "# edited\n"
