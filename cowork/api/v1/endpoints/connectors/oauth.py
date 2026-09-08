@@ -6,8 +6,10 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, sta
 from fastapi.responses import HTMLResponse
 
 from cowork.api.v1.endpoints.guards import require_local
+from cowork.api.v1.permissions import Authenticated, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.principal import Principal, get_principal
 from cowork.schemas.connectors import OAuthStartRequest, OAuthStartResponse, PickerTokenResponse
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.config import OAUTH_SERVICES
@@ -19,6 +21,28 @@ from cowork.services.connectors.oauth.google import (
 )
 
 router = APIRouter()
+
+
+class AuthenticatedInOrgMode(Authenticated):
+    """``Authenticated`` in org mode; a no-op in local mode.
+
+    The picker routes below already 404 via ``_require_picker_engine`` outside
+    org mode, so checking identity unconditionally would turn that 404 into a
+    401 for a caller who was refused either way — a functional change for a
+    route local mode never legitimately reaches. This defers to that existing
+    gate instead of racing it: identity is only checked once the request is
+    actually in org mode, where the route is meant to run.
+    """
+
+    async def check(
+        self,
+        request: Request,
+        scope: TenantScope = Depends(get_tenant_scope),
+        principal: Principal | None = Depends(get_principal),
+    ) -> Principal | None:
+        if not scope.org_mode:
+            return None
+        return await super().check(request, principal=principal)
 
 # Same alias as connections.py: the vault/relay choice is per-request tenancy
 # context, not a bare settings flag — resolving it once here keeps this file
@@ -106,7 +130,7 @@ def _require_picker_engine(engine: str, *, org_mode: bool) -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No file picker for engine {engine!r}")
 
 
-@router.post("/{engine}/picker/session")
+@router.post("/{engine}/picker/session", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def create_picker_session(engine: str, scope: ScopeDep):
     """Gone: the picker is built in the SPA now, so there is no session to
     mint. Answers 410 rather than 404 so a tab still running the previous
@@ -118,7 +142,11 @@ async def create_picker_session(engine: str, scope: ScopeDep):
     )
 
 
-@router.post("/{engine}/picker/token", response_model=PickerTokenResponse)
+@router.post(
+    "/{engine}/picker/token",
+    response_model=PickerTokenResponse,
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
 async def mint_picker_token(engine: str, request: Request, scope: ScopeDep, body: dict = Body(default_factory=dict)):
     """Org-mode only. Returns a live Drive access token to the caller's own
     authenticated fetch — safe because nothing here is reachable without the

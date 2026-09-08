@@ -23,7 +23,7 @@ import inspect
 from functools import cache
 from typing import Protocol
 
-from fastapi import HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, status
 
 from cowork.principal import Principal, get_principal
 
@@ -59,10 +59,16 @@ class Authenticated:
     for a route that is inherently a multi-tenant concept (e.g. the
     organization-switch capability) rather than one shared with desktop's
     single-user local mode, which never has a principal to check.
+
+    Takes ``principal`` as a declared ``Depends(get_principal)`` rather than
+    calling that function directly on ``request``: a subclass overriding
+    ``check`` for its own reason (see ``NoStoreAuthenticated``) still gets
+    ``principal`` resolved through FastAPI's own dependency graph, which is
+    what lets a test's ``app.dependency_overrides[get_principal]`` reach it —
+    a bare function call bypasses that entirely.
     """
 
-    async def check(self, request: Request) -> Principal:
-        principal = get_principal(request)
+    async def check(self, request: Request, principal: Principal | None = Depends(get_principal)) -> Principal:
         if principal is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
         return principal
