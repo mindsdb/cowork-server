@@ -249,7 +249,9 @@ class LocalCopyManager:
         for relative in changed:
             try:
                 mode = self._safe_child(source, relative).lstat().st_mode
-            except FileNotFoundError:
+            except (FileNotFoundError, NotADirectoryError):
+                # Both mean nothing is at that path. NotADirectoryError is the
+                # file-to-directory replacement the handoff already supports.
                 continue
             except OSError as exc:
                 # This gate exists to stop handoff destroying an entry it cannot
