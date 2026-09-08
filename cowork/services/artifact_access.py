@@ -32,7 +32,10 @@ async def provision_draft_review_access(
     settings: TurnQueueSettings | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> str:
-    """Upsert owner + same-org review access and return the canonical key.
+    """Upsert owner + same-org review access for an already-issued global id.
+
+    The caller resolves agent metadata through the trusted SQL identity alias
+    before entering this helper; auth requires a matching durable binding.
 
     Only org mode has a server-established user and organization identity.
     Desktop keeps using the rule created by a restricted publish until a
@@ -74,11 +77,16 @@ async def provision_draft_review_access(
 
 async def revoke_draft_review_access(
     artifact_id: str,
+    scope: TenantScope,
     *,
     settings: TurnQueueSettings | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> bool:
-    """Remove the private-draft rule before deleting its artifact.
+    """Remove the private-draft rule after verifying the scoped caller owns it.
+
+    The caller must enforce artifact ownership before entering this helper.
+    Auth also checks this owner and organization against its durable binding;
+    knowing an artifact id alone must never authorize deleting its policy.
 
     An unconfigured deployment cannot have provisioned this rule through
     Cowork, so there is nothing to revoke. A configured but unavailable auth
@@ -86,6 +94,8 @@ async def revoke_draft_review_access(
     of leaving a comment capability orphaned after its files are gone.
     """
     access_key = draft_review_access_key(artifact_id)
+    if not scope.org_mode or not scope.user_id or not scope.org_id:
+        raise ArtifactAccessUnavailable("Draft collaboration requires a signed-in organization")
     settings = settings or TurnQueueSettings()
     if not settings.auth_internal_base_url or not settings.auth_internal_secret:
         return False
@@ -95,7 +105,11 @@ async def revoke_draft_review_access(
     try:
         response = await client.post(
             f"{settings.auth_internal_base_url.rstrip('/')}/v1/internal/artifact-access/delete/",
-            json={"artifact_id": access_key},
+            json={
+                "artifact_id": access_key,
+                "owner_keycloak_id": str(scope.user_id),
+                "organization_id": str(scope.org_id),
+            },
             headers={"X-Internal-Auth": settings.auth_internal_secret},
         )
         response.raise_for_status()

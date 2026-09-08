@@ -440,6 +440,16 @@ def read_code_project_source(project_id: str, body: SourceContextRequest, integr
     return _call(integrations.read, project, body)
 
 
+@router.post("/source-context")
+def read_code_source(body: SourceContextRequest, integrations: IntegrationsDep):
+    return _call(integrations.read, None, body)
+
+
+@router.post("/work-items/search")
+def search_code_work(body: WorkItemSearchRequest, integrations: IntegrationsDep):
+    return _call(integrations.search, None, body)
+
+
 @router.post("/projects/{project_id}/work-items/search")
 def search_code_project_work(project_id: str, body: WorkItemSearchRequest, integrations: IntegrationsDep):
     project = _call(_service().projects.get, project_id)
