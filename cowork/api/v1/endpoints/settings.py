@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from sqlmodel import Session
 
 from cowork.api.v1.endpoints.guards import require_local, require_local_tenancy
+from cowork.api.v1.permissions import Open, require
 from cowork.common.paths import cowork_home
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
@@ -645,7 +646,7 @@ def _read_env_dict() -> dict[str, str]:
     return {}
 
 
-@router.get("/raw")
+@router.get("/raw", dependencies=[Depends(require(Open))])
 def read_raw_settings(request: Request):
     # /raw dumps the dotenv verbatim (all provider secrets) — same loopback
     # restriction as reveal-key, and desktop-only (deployment-global state).
@@ -658,7 +659,7 @@ class _RawSettingsBody(BaseModel):
     content: str
 
 
-@router.post("/raw")
+@router.post("/raw", dependencies=[Depends(require(Open))])
 async def write_raw_settings(body: _RawSettingsBody, session: SessionDep, request: Request):
     """Merge dotenv content into ~/.cowork/.env and sync recognised keys to the DB.
 
