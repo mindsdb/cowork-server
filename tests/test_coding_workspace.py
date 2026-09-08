@@ -562,6 +562,32 @@ def test_handoff_refuses_to_replace_a_live_special_file_in_the_source(tmp_path: 
     assert stat.S_ISFIFO((data / "pipe.fifo").lstat().st_mode)
 
 
+def test_handoff_refuses_a_source_entry_it_cannot_inspect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "plain"
+    source.mkdir()
+    (source / "notes.txt").write_text("v1\n", encoding="utf-8")
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare("inspect-1", str(source), allow_direct_folder=True)
+    (prepared.workspace_path / "notes.txt").write_text("v2\n", encoding="utf-8")
+
+    blinded = source / "notes.txt"
+    real_lstat = Path.lstat
+
+    def refuse_lstat(self: Path):
+        if self == blinded:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_lstat(self)
+
+    monkeypatch.setattr(Path, "lstat", refuse_lstat)
+
+    with pytest.raises(LocalCopyError, match="could not be inspected"):
+        manager.local_copies.apply(source, prepared.workspace_path)
+
+    assert (source / "notes.txt").read_text(encoding="utf-8") == "v1\n"
+
+
 def isolate_git_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     """Point Git at an empty global config and forbid the guessed identity, as a fresh Windows account behaves."""
     global_config = tmp_path / "gitconfig"

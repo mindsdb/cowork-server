@@ -122,18 +122,18 @@ class LocalCopyManager:
         current_source = self._manifest(source)
         task = self._manifest(workspace)
         changed = sorted(path for path in set(before) | set(task) if before.get(path) != task.get(path))
+        # A skipped entry is in no manifest, so a task file at its path reads as
+        # a clean addition and would replace a live socket, pipe or device.
+        occupied = self._occupied_by_special(source, changed)
+        if occupied:
+            preview = ", ".join(occupied[:5])
+            suffix = "…" if len(occupied) > 5 else ""
+            raise LocalCopyError(f"Handoff stopped before changing the source; a socket, pipe or device still occupies: {preview}{suffix}")
         conflicts = [path for path in changed if current_source.get(path) != before.get(path)]
         if conflicts:
             preview = ", ".join(conflicts[:5])
             suffix = "…" if len(conflicts) > 5 else ""
             raise LocalCopyError(f"Handoff stopped before changing the source; these files changed outside the task: {preview}{suffix}")
-        # A skipped entry is in no manifest, so a task file at its path reads as
-        # a clean addition and would replace a live socket, pipe or device.
-        occupied = [path for path in changed if self._is_unsupported(self._safe_child(source, path))]
-        if occupied:
-            preview = ", ".join(occupied[:5])
-            suffix = "…" if len(occupied) > 5 else ""
-            raise LocalCopyError(f"Handoff stopped before changing the source; a socket, pipe or device still occupies: {preview}{suffix}")
         return changed
 
     def apply_checked(self, source: Path, workspace: Path, changed: list[str]) -> list[str]:
@@ -225,20 +225,41 @@ class LocalCopyManager:
         return LocalCopyError(f"{subject}: {detail}")
 
     @staticmethod
-    def _is_unsupported(path: Path) -> bool:
-        try:
-            mode = path.lstat().st_mode
-        except OSError:
-            # Missing or unstattable is no collision, and raising from inside
-            # copytree's ignore callback would abort the whole tree.
-            return False
+    def _unsupported_mode(mode: int) -> bool:
         return not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode))
 
     @staticmethod
     def _skip_unsupported(directory: str, names: list[str]) -> set[str]:
         # Sockets, FIFOs and device nodes cannot be reproduced by a copy, and
         # _manifest already ignores them, so nothing skipped here is reviewable.
-        return {name for name in names if LocalCopyManager._is_unsupported(Path(directory) / name)}
+        skipped: set[str] = set()
+        for name in names:
+            try:
+                mode = os.lstat(os.path.join(directory, name)).st_mode
+            except OSError:
+                # copytree collects per-entry failures; raising from inside its
+                # ignore callback would abort the whole tree instead.
+                continue
+            if LocalCopyManager._unsupported_mode(mode):
+                skipped.add(name)
+        return skipped
+
+    def _occupied_by_special(self, source: Path, changed: list[str]) -> list[str]:
+        occupied: list[str] = []
+        for relative in changed:
+            try:
+                mode = self._safe_child(source, relative).lstat().st_mode
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                # This gate exists to stop handoff destroying an entry it cannot
+                # describe, so an entry it cannot read has to stop it too.
+                raise LocalCopyError(
+                    f"Handoff stopped before changing the source; {relative} could not be inspected: {exc}"
+                ) from exc
+            if self._unsupported_mode(mode):
+                occupied.append(relative)
+        return occupied
 
     @staticmethod
     def _manifest(root: Path) -> dict[str, str]:
