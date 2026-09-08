@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from cowork.api.v1 import artifact_scope
@@ -523,8 +524,8 @@ def test_the_names_handed_to_the_filesystem_are_the_ones_scandir_returned(
     original_open_child = workspace_ep.open_pinned_child
     original_dir_lstat = workspace_ep.dir_lstat
 
-    def entry_name(directory, requested):
-        name = original_entry_name(directory, requested)
+    def entry_name(directory, requested, **kwargs):
+        name = original_entry_name(directory, requested, **kwargs)
         from_disk.append(name)
         return name
 
@@ -570,3 +571,127 @@ def test_a_single_component_is_replaced_by_the_disk_name_too(editable_artifact):
 
     assert selected == "brief.md"
     assert selected is not requested
+
+
+def _case_insensitive(directory: Path) -> bool:
+    """Ask the volume rather than the platform, as the selector does."""
+    probe = directory / "CaseProbe.tmp"
+    probe.write_text("x", encoding="utf-8")
+    try:
+        return (directory / "caseprobe.tmp").exists()
+    finally:
+        probe.unlink()
+
+
+@pytest.fixture
+def mixed_case_artifact(tmp_path, monkeypatch):
+    """An artifact whose recorded primary is spelled unlike its file.
+
+    `metadata.json` is written outside this service, so the two spellings can
+    differ. `resolve_source` opens by path and inherits the volume's case
+    rules, which means it reports the primary's spelling verbatim.
+    """
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+    from cowork.services.artifacts import ProjectArtifacts
+
+    project = tmp_path / "project"
+    base = project / ".anton" / "artifacts"
+    folder = base / "brief"
+    folder.mkdir(parents=True)
+    (folder / "brief.md").write_text("# primary\n", encoding="utf-8")
+    source = ProjectArtifacts(
+        base=base, project_id=None, project_name="project",
+        trusted_anchor=project, root_parts=(".anton", "artifacts"),
+    )
+    metadata = {"type": "file", "primary": "Brief.md"}
+    monkeypatch.setattr(
+        workspace_ep, "_owner_workspace",
+        lambda *_args: (source, folder, metadata, {}),
+    )
+    return SimpleNamespace(source=source, folder=folder, metadata=metadata)
+
+
+def test_a_case_mismatched_primary_reports_the_disk_spelling(mixed_case_artifact, client):
+    """Both routes name the source the same way, so the journal has one key.
+
+    Runs on either kind of volume, and they arrive by different routes: a
+    case-insensitive one canonicalizes `Brief.md` to the entry it names, a
+    case-sensitive one cannot resolve it at all and the service falls back to
+    picking an editable file. Either way the client is told `brief.md` and can
+    save it, which is the property that broke when only the write side was
+    translated -- the read reported `Brief.md`, the write recorded `brief.md`,
+    and the mismatched revision id came back 409.
+    """
+    read = client.get(_WORKSPACE_URL)
+    assert read.status_code == 200, read.text
+    reported = read.json()["path"]
+    assert reported == "brief.md"
+
+    saved = client.put(_WORKSPACE_URL, json={
+        "content": "# edited\n",
+        "expectedRevisionId": read.json()["revision"]["id"],
+        "path": reported,
+    })
+
+    assert saved.status_code == 200, saved.text
+    assert (mixed_case_artifact.folder / "brief.md").read_text() == "# edited\n"
+
+
+def test_the_recorded_primary_is_accepted_on_a_case_insensitive_volume(
+    mixed_case_artifact, client,
+):
+    """The spelling the volume itself accepts is accepted here too.
+
+    This is the half a case-exact boundary refused. It cannot be asserted
+    where the volume is case-sensitive, because there `Brief.md` names
+    nothing and refusing it is correct.
+    """
+    if not _case_insensitive(mixed_case_artifact.folder):
+        pytest.skip("needs a case-insensitive volume; the spelling names nothing here")
+
+    res = client.get(f"{_WORKSPACE_URL}?path=Brief.md")
+
+    assert res.status_code == 200, res.text
+    assert res.json()["path"] == "brief.md"
+
+
+def test_a_case_variant_is_refused_where_the_volume_is_case_sensitive(
+    mixed_case_artifact, client,
+):
+    """The other half: accepting the volume's rules must not invent entries."""
+    if _case_insensitive(mixed_case_artifact.folder):
+        pytest.skip("needs a case-sensitive volume; the variant is a real file here")
+
+    res = client.get(f"{_WORKSPACE_URL}?path=Brief.md")
+
+    assert res.status_code == 404, res.text
+
+
+def test_a_name_absent_from_disk_is_refused_whatever_the_volume(editable_artifact):
+    """`native_case` widens the accepted spellings, never the accepted files."""
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+
+    with pytest.raises(HTTPException) as refused:
+        workspace_ep._editable_source_selector(
+            editable_artifact.source, editable_artifact.folder, "nothing-here.md"
+        )
+
+    assert refused.value.status_code == 404
+
+
+def test_an_oversized_path_is_refused_by_the_route(editable_artifact, client, monkeypatch):
+    """Both spellings of the parameter answer the same way on length."""
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+
+    def explode(*_args, **_kwargs):
+        raise AssertionError("an oversized path reached the service")
+
+    monkeypatch.setattr(workspace_ep, "current_workspace", explode)
+    monkeypatch.setattr(workspace_ep, "save_source", explode)
+    oversized = "a" * 1001
+
+    assert client.get(f"{_WORKSPACE_URL}?path={oversized}").status_code == 422
+    assert client.get(f"{_WORKSPACE_URL}/revisions?path={oversized}").status_code == 422
+    assert client.put(_WORKSPACE_URL, json={
+        "content": "x", "expectedRevisionId": "r1", "path": oversized,
+    }).status_code == 422

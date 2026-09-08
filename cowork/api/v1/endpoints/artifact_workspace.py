@@ -151,7 +151,9 @@ def _artifact_folder_component(source, folder: Path) -> str:
     return name
 
 
-def _existing_draft_entry_name(directory, requested: str) -> str:
+def _existing_draft_entry_name(
+    directory, requested: str, *, native_case: bool = False
+) -> str:
     """Return the pinned directory's own name for a request selector.
 
     Validation makes ``requested`` a single component, but it still originated
@@ -159,12 +161,42 @@ def _existing_draft_entry_name(directory, requested: str) -> str:
     pinned directory and return ``DirEntry.name`` so no request-derived string
     is ever supplied to ``openat``.  A replacement after the scan remains safe:
     the subsequent descriptor-relative open uses ``O_NOFOLLOW``.
+
+    ``native_case`` also accepts a spelling the filesystem itself accepts. It
+    exists because ``resolve_source`` opens by path and so inherits the
+    volume's own case rules, and a boundary stricter than the gate behind it
+    makes a reported source unsaveable. The filesystem decides, never the
+    platform: the requested spelling has to name the same inode as the entry,
+    which on a case-sensitive volume it cannot. The name returned is still the
+    one the scan produced.
     """
+    insensitive_matches: list[str] = []
     with dir_scandir(directory) as entries:
         for entry in entries:
             if entry.name == requested:
                 return entry.name
+            if native_case and entry.name.lower() == requested.lower():
+                insensitive_matches.append(entry.name)
+    # Ambiguous only on a case-sensitive volume, where the exact match above
+    # is the only correct answer anyway.
+    if len(insensitive_matches) == 1:
+        if _names_one_inode(directory, requested, insensitive_matches[0]):
+            return insensitive_matches[0]
     raise FileNotFoundError(requested)
+
+
+def _names_one_inode(directory, requested: str, discovered: str) -> bool:
+    """Whether the filesystem resolves both spellings to the same file.
+
+    Neither stat follows a link, so a symlink whose name differs only in case
+    from a real entry compares unequal and is refused rather than matched.
+    """
+    try:
+        probe = dir_lstat(directory, requested)
+        found = dir_lstat(directory, discovered)
+    except OSError:
+        return False
+    return (probe.st_dev, probe.st_ino) == (found.st_dev, found.st_ino)
 
 
 def _open_pinned_draft_file(source, folder: Path, parts: tuple[str, ...]):
@@ -236,11 +268,11 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
         with ExitStack() as resources:
             current = resources.enter_context(opened_artifact_folder(source, folder_name))
             for part in parts[:-1]:
-                disk_name = _existing_draft_entry_name(current, part)
+                disk_name = _existing_draft_entry_name(current, part, native_case=True)
                 current = open_pinned_child(current, disk_name)
                 resources.callback(current.close)
                 disk_parts.append(disk_name)
-            disk_name = _existing_draft_entry_name(current, parts[-1])
+            disk_name = _existing_draft_entry_name(current, parts[-1], native_case=True)
             if not stat.S_ISREG(dir_lstat(current, disk_name).st_mode):
                 raise OSError("draft source is not a regular file")
             disk_parts.append(disk_name)
@@ -250,6 +282,29 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
             detail="Artifact source not found",
         ) from exc
     return "/".join(disk_parts)
+
+
+def _recorded_source_selector(source, folder: Path, metadata: dict) -> str | None:
+    """The folder's own spelling of the source `metadata` records.
+
+    Without this the two routes disagree: the request path is translated to
+    the disk spelling while an absent one leaves the service reporting
+    `metadata["primary"]` verbatim, and the revision journal is keyed by
+    whichever string arrived. A read under one spelling and a write under the
+    other then answer 409 rather than the 404 a case-exact boundary gave.
+
+    A primary that resolves to nothing yields ``None``, which is what the
+    service already handles by picking an editable file itself. A recorded
+    value that has gone stale must not become an error the client cannot
+    clear.
+    """
+    recorded = metadata.get("primary")
+    if not isinstance(recorded, str) or not recorded.strip():
+        return None
+    try:
+        return _editable_source_selector(source, folder, recorded)
+    except HTTPException:
+        return None
 
 
 def _comment_layer_from_fd(fd: int) -> HTMLResponse | None:
@@ -505,13 +560,17 @@ async def artifact_source(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     session: ScopedSessionDep,
-    path: str | None = Query(default=None),
+    path: str | None = Query(default=None, max_length=1000),
 ):
     """Authenticated source + revision token for Desktop and Cowork SaaS."""
     source, folder, metadata, capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
     selected = await run_in_threadpool(_editable_source_selector, source, folder, path)
+    if selected is None:
+        selected = await run_in_threadpool(
+            _recorded_source_selector, source, folder, metadata
+        )
     try:
         result = await run_in_threadpool(
             current_workspace, folder, metadata, artifact_id, selected
@@ -538,6 +597,10 @@ async def update_artifact_source(
     scope = getattr(session, "scope", None)
     actor_id = str(scope.user_id) if scope and scope.user_id else None
     selected = await run_in_threadpool(_editable_source_selector, source, folder, body.path)
+    if selected is None:
+        selected = await run_in_threadpool(
+            _recorded_source_selector, source, folder, metadata
+        )
     try:
         saved = await run_in_threadpool(
             save_source,
@@ -570,7 +633,7 @@ async def artifact_revisions(
     project_ref: str,
     artifact_id: ArtifactIdDep,
     session: ScopedSessionDep,
-    path: str | None = Query(default=None),
+    path: str | None = Query(default=None, max_length=1000),
 ):
     _source, folder, _metadata, _capabilities = _owner_workspace(
         session, project_ref, artifact_id
