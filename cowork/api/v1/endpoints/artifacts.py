@@ -1001,6 +1001,7 @@ async def reveal_artifact(req: _PathBody, session: ScopedSessionDep):
 @router.api_route(
     "/proxy/{token}/{rel_path:path}",
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    dependencies=[Depends(require(Open))],
 )
 async def proxy(token: str, rel_path: str, request: Request):
     """HTTP forwarder for fullstack-artifact previews.
@@ -1008,6 +1009,13 @@ async def proxy(token: str, rel_path: str, request: Request):
     Streams the request to the artifact's backend running on
     `127.0.0.1:<metadata.json port>`, injects CORS, strips hop-by-hop
     headers. See `cowork.services.preview_proxy` for the body.
+
+    Open, not `require_local_tenancy` like its siblings: the token is the
+    real guard here, not tenancy. `_PREVIEW_MOUNTS` (see
+    `cowork.services.artifacts.get_preview_mount`) is only ever populated by
+    `/preview-mount`, which IS `require_local_tenancy`-gated — so in org mode
+    this dict is permanently empty and any token 404s here regardless, by
+    construction rather than by a declared guard.
     """
     from cowork.services.preview_proxy import proxy_artifact_request
     return await proxy_artifact_request(token, rel_path, request)
