@@ -531,6 +531,7 @@ async def set_artifact_access(
     every turn, with the owner's selection in place of the first-publish default.
     """
     from cowork.services.publish import publish_artifact as _publish_bundle
+    from cowork.services.artifact_access import ArtifactAccessUnavailable
 
     _source, folder, metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
     if _artifact_primary(folder, metadata) is None:
@@ -555,6 +556,8 @@ async def set_artifact_access(
             access=dict(body.access or {}),
             scope=session.scope,
         )
+    except ArtifactAccessUnavailable as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
     except ValueError as exc:
@@ -578,12 +581,20 @@ async def enable_artifact_comments(
         provision_draft_review_access,
     )
     from cowork.services.artifact_draft_review import enable_draft_review
+    from cowork.services.artifact_authorization_identity import ensure_authorization_key
+    from cowork.services.artifact_identity import artifact_key
 
     source, folder, metadata, capabilities = _owner_workspace(session, project_ref, artifact_id)
     owner_user_id = artifact_owner_id(session, source)
     try:
-        key = await provision_draft_review_access(
+        canonical_key = await run_in_threadpool(
+            ensure_authorization_key,
             artifact_id,
+            session.scope,
+            owner_user_id=str(owner_user_id) if owner_user_id else None,
+        )
+        await provision_draft_review_access(
+            canonical_key.split("/", 1)[1],
             session.scope,
             owner_user_id=str(owner_user_id) if owner_user_id else None,
         )
@@ -610,7 +621,9 @@ async def enable_artifact_comments(
         pass
     return {
         "enabled": True,
-        "artifactKey": key,
+        # Workspace routes/cards keep the local id. The authenticated comments
+        # proxy translates it through the same durable alias used to publish.
+        "artifactKey": artifact_key(artifact_id),
         "scope": "organization",
         "capabilities": capabilities,
         "currentRevision": current_revision,
