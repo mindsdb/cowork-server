@@ -34,6 +34,7 @@ from cowork.services.artifact_permissions import (
     require_artifact_owner,
 )
 from cowork.services.comments_layer import inject_layer
+from cowork.services.artifact_identity import opened_artifact_folder
 from cowork.services.artifact_revisions import (
     JOURNAL_DIRNAME,
     RepairAlreadyPending,
@@ -220,8 +221,6 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
     """
     if requested is None or not requested.strip():
         return None
-    from cowork.services.artifact_identity import opened_artifact_folder
-
     try:
         parts = _relative_file_parts(requested.strip())
     except ValueError as exc:

@@ -325,11 +325,16 @@ def editable_artifact(tmp_path, monkeypatch):
     return SimpleNamespace(source=source, folder=folder, metadata=metadata)
 
 
-def test_the_service_receives_the_folders_own_spelling_not_the_request_string(
+def test_the_service_receives_the_resolved_path_on_both_routes(
     editable_artifact, monkeypatch,
 ):
-    """Object identity, as in the draft-serving tests: the string handed to
-    `current_workspace` / `save_source` must be the one the OS returned."""
+    """Route-level value check: both routes hand the service the same path.
+
+    Provenance is not testable here. `"/".join` builds a fresh string for any
+    multi-component path, so an `is not` against the request would hold even
+    for a selector that never consulted the disk. The two tests below cover
+    that property where it can actually fail.
+    """
     import asyncio
 
     from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
@@ -362,7 +367,6 @@ def test_the_service_receives_the_folders_own_spelling_not_the_request_string(
     ))
 
     assert received == ["docs/notes.md", "docs/notes.md"]
-    assert all(value is not requested and value is not body.path for value in received)
 
 
 def test_no_path_leaves_the_choice_to_the_service(editable_artifact, client):
@@ -499,3 +503,70 @@ def test_the_path_a_get_reports_can_be_saved_back(readme_backed_artifact, client
 
     assert saved.status_code == 200, saved.text
     assert (readme_backed_artifact.folder / "README.md").read_text() == "# edited\n"
+
+
+def test_the_names_handed_to_the_filesystem_are_the_ones_scandir_returned(
+    editable_artifact, monkeypatch,
+):
+    """Every component reaching `openat` is the object the directory scan produced.
+
+    `is not` against the request cannot show this for a multi-component path:
+    splitting the joined string yields fresh objects whatever the selector
+    then does with them. So the assertion is against the scan's own return
+    values, which a selector that skipped the scan would not have.
+    """
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+
+    from_disk = []
+    opened_names = []
+    original_entry_name = workspace_ep._existing_draft_entry_name
+    original_open_child = workspace_ep.open_pinned_child
+    original_dir_lstat = workspace_ep.dir_lstat
+
+    def entry_name(directory, requested):
+        name = original_entry_name(directory, requested)
+        from_disk.append(name)
+        return name
+
+    def open_child(directory, name):
+        opened_names.append(name)
+        return original_open_child(directory, name)
+
+    def lstat(directory, name):
+        opened_names.append(name)
+        return original_dir_lstat(directory, name)
+
+    monkeypatch.setattr(workspace_ep, "_existing_draft_entry_name", entry_name)
+    monkeypatch.setattr(workspace_ep, "open_pinned_child", open_child)
+    monkeypatch.setattr(workspace_ep, "dir_lstat", lstat)
+
+    selected = workspace_ep._editable_source_selector(
+        editable_artifact.source, editable_artifact.folder, "docs/notes.md"
+    )
+
+    assert selected == "docs/notes.md"
+    assert from_disk == ["docs", "notes.md"]
+    assert opened_names == ["docs", "notes.md"]
+    assert all(
+        opened is scanned for opened, scanned in zip(opened_names, from_disk, strict=True)
+    )
+
+
+def test_a_single_component_is_replaced_by_the_disk_name_too(editable_artifact):
+    """The case `"/".join` cannot launder.
+
+    Joining a one-element list returns that element, and splitting a string
+    with no separator returns the string itself, so a selector that skipped
+    the disk match would hand the request object straight through. Only this
+    shape distinguishes the two.
+    """
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+
+    requested = ("brief.md" + "x")[:-1]
+
+    selected = workspace_ep._editable_source_selector(
+        editable_artifact.source, editable_artifact.folder, requested
+    )
+
+    assert selected == "brief.md"
+    assert selected is not requested
