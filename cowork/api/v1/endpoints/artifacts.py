@@ -27,7 +27,7 @@ from cowork.db.scoped import ScopedSession, ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.api.v1.endpoints.guards import require_local_tenancy
 from cowork.api.v1.artifact_preview import (
-    NO_CACHE_HEADERS,
+    artifact_response_headers,
     html_with_comment_layer,
     wants_comment_layer,
 )
@@ -901,7 +901,7 @@ async def preview_asset(token: str, rel_path: str, request: Request):
         resp = await run_in_threadpool(html_with_comment_layer, target)
         if resp is not None:
             return resp
-    return FileResponse(target, media_type=media_type, headers=NO_CACHE_HEADERS)
+    return FileResponse(target, media_type=media_type, headers=artifact_response_headers(media_type))
 
 
 @router.get("/serve/{project_name}/{file_path:path}", dependencies=[Depends(require_local_tenancy)])
@@ -926,7 +926,7 @@ def serve_artifact_file(project_name: str, file_path: str, request: Request):
         resp = html_with_comment_layer(target)
         if resp is not None:
             return resp
-    return FileResponse(target, media_type=media_type, headers=NO_CACHE_HEADERS)
+    return FileResponse(target, media_type=media_type, headers=artifact_response_headers(media_type))
 
 
 @router.post("/open", dependencies=[Depends(require_local_tenancy)])
