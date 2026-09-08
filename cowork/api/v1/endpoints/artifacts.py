@@ -726,12 +726,22 @@ async def delete_artifact_for_request(
             ArtifactAccessUnavailable,
             revoke_draft_review_access,
         )
+        from cowork.services.artifact_authorization_identity import existing_authorization_key
         try:
             if expected_artifact_id is None:
                 expected_artifact_id = await run_in_threadpool(
                     _artifact_id_for_folder, source, folder_name
                 )
-            await revoke_draft_review_access(expected_artifact_id)
+            canonical_key = await run_in_threadpool(
+                existing_authorization_key,
+                expected_artifact_id,
+                scope,
+                owner_user_id=str(scope.user_id),
+            )
+            # A historical grant may predate the SQL alias. The auth delete
+            # checks its existing owner binding and never creates one.
+            authorization_id = canonical_key.split("/", 1)[1] if canonical_key else expected_artifact_id
+            await revoke_draft_review_access(authorization_id, scope)
         except ArtifactAccessUnavailable as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

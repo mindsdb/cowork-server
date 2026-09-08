@@ -175,6 +175,23 @@ async def test_owner_reads_back_the_email_list_a_card_would_withhold(as_owner):
     assert out["accessEmails"] == ["a@example.com"]
 
 
+async def test_identity_service_failure_does_not_report_a_successful_share(
+    as_owner, publish_context, monkeypatch,
+):
+    from cowork.services.artifact_access import ArtifactAccessUnavailable
+
+    def unavailable(*_args, **_kwargs):
+        raise ArtifactAccessUnavailable("Could not establish artifact authorization")
+
+    monkeypatch.setattr("cowork.services.publish.publish_artifact", unavailable)
+    with pytest.raises(HTTPException) as excinfo:
+        await aw.set_artifact_access(
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+        )
+    assert excinfo.value.status_code == 503
+    assert not (as_owner / ".published.json").exists()
+
+
 async def test_owner_reads_back_an_owner_only_artifact(as_owner):
     (as_owner / ".published.json").write_text(json.dumps({
         "report.html": {

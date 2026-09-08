@@ -431,8 +431,25 @@ answer 403 instead, because to a client already looking at the draft a 404 would
 read as deleted. The artifacts list is unaffected either way: a co-member's
 artifact never appears in it, so review starts from the link the owner shares.
 
-Both of those decide from a resolved path and the route then opens that path, so
-the decision is carried to the open rather than trusted afterwards: every
+Org-mode artifact authorization uses a separate server-owned identity. An agent
+can edit `metadata.json`, so its local UUID cannot reserve a global comment key.
+The `artifact_identities` SQL table binds each `(organization, local UUID)` to
+its immutable owner and an auth-issued canonical key. Draft grants, publishing,
+and policy deletion use that key; the comments REST/SSE proxy translates the
+unchanged local UI key through the same table. Read requests never allocate.
+Existing identities are adopted only when auth confirms a matching durable
+owner and organization binding. New issuance uses a persisted random request ID
+so concurrent calls and lost replies cannot allocate different identities.
+
+This requires auth's internal `artifact-access/claim/` and `allocate/` endpoints
+and the matching services publisher ownership checks. Apply auth's ownership
+history migration before enabling new policy writes, then deploy these clients
+with the coordinated ENG-2262 changes. Authorization failures preserve files
+and stop sharing. SQL aliases survive artifact deletion and schema downgrades;
+they are ownership history, not a cache that can be cleared during rollback.
+
+Filesystem authorization decisions start with a resolved path. The route carries
+that decision through opening the file: every
 component below the project directory is opened `O_NOFOLLOW`, and a symlink
 planted anywhere in the chain is refused. A pod mounts its own workspace
 read-write, so without that a swapped directory component between the check and
