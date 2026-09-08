@@ -4,6 +4,7 @@ import os
 import random
 import shutil
 import socket
+import stat
 import subprocess
 from pathlib import Path
 
@@ -11,6 +12,7 @@ import pytest
 
 from cowork.coding import workspace as workspace_module
 from cowork.coding.contracts import WorkspaceKind
+from cowork.coding.local_copy import LocalCopyError
 from cowork.coding.workspace import GitIdentityMissingError, GitRunner, GitUnavailableError, WorkspaceError, WorkspaceManager
 from cowork.coding.workspace_key import managed_key
 from cowork.common.settings.app_settings import get_app_settings
@@ -536,6 +538,28 @@ def test_a_local_copy_that_fails_reports_the_path_it_failed_on(
 
     with pytest.raises(WorkspaceError, match="notes.txt"):
         manager.prepare("copy-fail-1", str(source), allow_direct_folder=True)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="sockets and FIFOs are POSIX")
+def test_handoff_refuses_to_replace_a_live_special_file_in_the_source(tmp_path: Path) -> None:
+    source = tmp_path / "plain"
+    data = source / "data"
+    data.mkdir(parents=True)
+    bind_socket(data / "cli.sock")
+    os.mkfifo(data / "pipe.fifo")
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare("collide-1", str(source), allow_direct_folder=True)
+
+    # Neither entry was copied, so a task file at the same path looks like a
+    # clean addition to every manifest.
+    (prepared.workspace_path / "data" / "cli.sock").write_text("agent output\n", encoding="utf-8")
+    (prepared.workspace_path / "data" / "pipe.fifo").write_text("agent output\n", encoding="utf-8")
+
+    with pytest.raises(LocalCopyError, match="cli.sock"):
+        manager.local_copies.apply(source, prepared.workspace_path)
+
+    assert stat.S_ISSOCK((data / "cli.sock").lstat().st_mode)
+    assert stat.S_ISFIFO((data / "pipe.fifo").lstat().st_mode)
 
 
 def isolate_git_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:

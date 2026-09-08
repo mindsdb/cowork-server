@@ -127,6 +127,13 @@ class LocalCopyManager:
             preview = ", ".join(conflicts[:5])
             suffix = "…" if len(conflicts) > 5 else ""
             raise LocalCopyError(f"Handoff stopped before changing the source; these files changed outside the task: {preview}{suffix}")
+        # A skipped entry is in no manifest, so a task file at its path reads as
+        # a clean addition and would replace a live socket, pipe or device.
+        occupied = [path for path in changed if self._is_unsupported(self._safe_child(source, path))]
+        if occupied:
+            preview = ", ".join(occupied[:5])
+            suffix = "…" if len(occupied) > 5 else ""
+            raise LocalCopyError(f"Handoff stopped before changing the source; a socket, pipe or device still occupies: {preview}{suffix}")
         return changed
 
     def apply_checked(self, source: Path, workspace: Path, changed: list[str]) -> list[str]:
@@ -218,20 +225,20 @@ class LocalCopyManager:
         return LocalCopyError(f"{subject}: {detail}")
 
     @staticmethod
+    def _is_unsupported(path: Path) -> bool:
+        try:
+            mode = path.lstat().st_mode
+        except OSError:
+            # Missing or unstattable is no collision, and raising from inside
+            # copytree's ignore callback would abort the whole tree.
+            return False
+        return not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode))
+
+    @staticmethod
     def _skip_unsupported(directory: str, names: list[str]) -> set[str]:
         # Sockets, FIFOs and device nodes cannot be reproduced by a copy, and
         # _manifest already ignores them, so nothing skipped here is reviewable.
-        unsupported: set[str] = set()
-        for name in names:
-            try:
-                mode = os.lstat(os.path.join(directory, name)).st_mode
-            except OSError:
-                # Leave it to copytree, which collects per-entry failures
-                # instead of aborting the whole tree the way a raise here would.
-                continue
-            if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode)):
-                unsupported.add(name)
-        return unsupported
+        return {name for name in names if LocalCopyManager._is_unsupported(Path(directory) / name)}
 
     @staticmethod
     def _manifest(root: Path) -> dict[str, str]:
