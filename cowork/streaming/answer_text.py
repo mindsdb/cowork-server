@@ -18,8 +18,15 @@ def accumulate_answer_text(collected: list[str], event_type: str, data: dict) ->
     already streamed rather than continuing it. The formatter emits it only
     immediately before that replacement text, so this never empties an
     accumulator it does not go on to refill.
+
+    `response.answer_restore` undoes one reset, carrying the text back with it.
+    A continuation normally narrates before its first tool call, so the delta
+    that spent the boundary is not always the promised answer; when the turn
+    hands back instead, the answer that was already read has to return.
     """
     if event_type == "response.output_text.delta":
         collected.append(data.get("delta", ""))
     elif event_type == "response.answer_reset":
         collected.clear()
+    elif event_type == "response.answer_restore":
+        collected.insert(0, data.get("text", ""))

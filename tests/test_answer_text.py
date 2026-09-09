@@ -48,3 +48,21 @@ def test_other_events_do_not_touch_the_answer():
 
 def test_a_delta_without_text_contributes_nothing():
     assert _feed([("response.output_text.delta", {})]) == ""
+
+
+def test_a_restore_returns_the_answer_a_reset_set_aside():
+    """A hand-back means the continuation never delivered its replacement."""
+    assert _feed([
+        ("response.output_text.delta", {"delta": "THE ANSWER THE USER READ"}),
+        ("response.answer_reset", {"item_id": "msg-1"}),
+        ("response.output_text.delta", {"delta": "Checking."}),
+        ("response.answer_restore", {"text": "THE ANSWER THE USER READ"}),
+        ("response.output_text.delta", {"delta": " Giving up."}),
+    ]) == "THE ANSWER THE USER READChecking. Giving up."
+
+
+def test_a_restore_without_text_is_inert():
+    assert _feed([
+        ("response.output_text.delta", {"delta": "kept"}),
+        ("response.answer_restore", {}),
+    ]) == "kept"

@@ -17,6 +17,8 @@ from anton.core.llm.provider import (
     StreamComplete,
     StreamTaskProgress,
     StreamTextDelta,
+    StreamToolUseEnd,
+    StreamToolUseStart,
     ToolCall,
 )
 
@@ -145,18 +147,71 @@ async def test_whitespace_alone_does_not_spend_the_boundary():
     assert [p["type"] for p in payloads].count("response.answer_reset") == 0
 
 
-async def test_a_handback_leaves_a_later_continuation_free_to_replace():
-    """Cancelling the boundary must not disable the mechanism for the rest of
-    the turn — the verifier can force another continuation afterwards."""
-    _, completed = await _drain([
-        StreamTextDelta(text="FIRST"),
+async def test_a_handback_gives_back_the_answer_the_boundary_set_aside():
+    """The common shape, and the one a cancel alone cannot cover.
+
+    A continuation narrates before its first tool call, so that narration spends
+    the boundary — and if the turn then hands back instead of answering, the
+    answer the user had already read is gone from the transcript and from the
+    history the next turn is rebuilt from. The hand-back has to give it back.
+    """
+    payloads, completed = await _drain([
+        StreamTextDelta(text="THE ANSWER THE USER READ"),
         _round_end(),
         _BOUNDARY,
+        StreamTextDelta(text="Let me double-check the file."),
+        StreamToolUseStart(id="t1", name="scratchpad"),
+        StreamToolUseEnd(id="t1"),
+        _round_end(stop_reason="tool_use"),
         _HANDBACK,
-        StreamTextDelta(text="HANDBACK TEXT"),
+        StreamTextDelta(text="I ran out of budget; shall I continue?"),
+        _round_end(),
+    ])
+    assert "THE ANSWER THE USER READ" in completed
+    assert completed.endswith("I ran out of budget; shall I continue?")
+    types = [p["type"] for p in payloads]
+    assert types.count("response.answer_reset") == 1
+    assert types.count("response.answer_restore") == 1
+    restore = next(p for p in payloads if p["type"] == "response.answer_restore")
+    assert restore["text"] == "THE ANSWER THE USER READ"
+    # Ordered so a client replaying the stream lands in the same place.
+    assert types.index("response.answer_reset") < types.index("response.answer_restore")
+
+
+async def test_a_delivered_replacement_is_never_given_back():
+    """The restore is for a boundary the turn failed to honour. A continuation
+    that answers keeps its replacement, and nothing returns."""
+    payloads, completed = await _drain([
+        StreamTextDelta(text="SUPERSEDED"),
         _round_end(),
         _BOUNDARY,
+        StreamTextDelta(text="Checking."),
+        StreamToolUseStart(id="t1", name="scratchpad"),
+        StreamToolUseEnd(id="t1"),
+        _round_end(stop_reason="tool_use"),
         StreamTextDelta(text="REPLACEMENT"),
         _round_end(),
     ])
-    assert completed == "REPLACEMENT"
+    assert "SUPERSEDED" not in completed
+    assert completed.endswith("REPLACEMENT")
+    assert [p["type"] for p in payloads].count("response.answer_restore") == 0
+
+
+async def test_a_second_boundary_sets_aside_the_answer_it_supersedes():
+    """The stash tracks the current answer, not the turn's first one, so a
+    hand-back after two continuations returns the second attempt."""
+    payloads, _ = await _drain([
+        StreamTextDelta(text="FIRST"),
+        _round_end(),
+        _BOUNDARY,
+        StreamTextDelta(text="SECOND"),
+        _round_end(),
+        _BOUNDARY,
+        StreamTextDelta(text="THIRD"),
+        _round_end(),
+        _HANDBACK,
+        StreamTextDelta(text="giving up"),
+        _round_end(),
+    ])
+    restore = next(p for p in payloads if p["type"] == "response.answer_restore")
+    assert restore["text"] == "SECOND"

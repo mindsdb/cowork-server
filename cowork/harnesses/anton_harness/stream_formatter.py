@@ -194,6 +194,9 @@ async def format_responses_stream(
     # itself, because a continuation that never speaks (stopped, failed, or all
     # tool calls) must leave the answer the user already read standing.
     superseded_pending = False
+    # What the last spent boundary set aside, returned if the turn hands back
+    # instead of delivering the replacement it promised.
+    superseded_stash = ""
 
     def _event(event_type: str, data: dict) -> str:
         # Wall-clock millisecond stamp on every event. The renderer
@@ -238,6 +241,12 @@ async def format_responses_stream(
             # there leaves a blank message where the user had read a real one.
             if superseded_pending and event.text.strip():
                 superseded_pending = False
+                # Held, not dropped. A continuation normally narrates before its
+                # first tool call, so this text is not always the standalone
+                # answer it promised; if it hands back instead, the answer that
+                # was already read has to come back rather than be lost from the
+                # transcript and from the history the next turn is rebuilt from.
+                superseded_stash = "".join(collected_text)
                 collected_text.clear()
                 # The armed paragraph break belongs between two rounds of the
                 # answer being discarded, not in front of its replacement.
@@ -359,11 +368,23 @@ async def format_responses_stream(
             if phase_str == "continuation":
                 superseded_pending = True
             # anton gave up and is explaining instead of continuing. Its
-            # diagnosis is an extra message, not a replacement: the answer the
-            # continuation failed to improve on is still the only real content
-            # the turn produced, and the next turn's history is rebuilt from it.
+            # diagnosis is an extra message, not a replacement, so an unspent
+            # boundary is dropped and a spent one gives its text back — the
+            # answer the continuation failed to improve on is still the only
+            # real content the turn produced, and the next turn's history is
+            # rebuilt from it.
             elif phase_str == "handback":
                 superseded_pending = False
+                if superseded_stash:
+                    collected_text.insert(0, superseded_stash)
+                    seq += 1
+                    yield _event("response.answer_restore", {
+                        "type": "response.answer_restore",
+                        "sequence_number": seq,
+                        "item_id": msg_id,
+                        "text": superseded_stash,
+                    })
+                    superseded_stash = ""
             is_scratchpad_phase = phase_str in ("scratchpad_start", "scratchpad_done")
             # ENG-1537: the rate-limit notice must never be throttled away. It
             # fires once per wait and is the ONLY thing distinguishing a
