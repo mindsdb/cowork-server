@@ -781,6 +781,10 @@ async def delete_artifact_for_request(
         raise HTTPException(status_code=500, detail="Could not delete artifact") from e
 
 
+# The routes below (through delete_artifact_endpoint) are OpenByDesign for a shared,
+# standalone reason: require_local_tenancy 403s them outright in org mode, so
+# they only ever run on desktop, where there is no multi-tenant identity
+# concept to check in the first place.
 @router.get("/status", dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
 async def artifact_status(path: str = Query(..., min_length=1, max_length=4096)):
     # Cheap published/modified/access read for the preview viewer's in-place

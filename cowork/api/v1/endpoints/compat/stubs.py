@@ -17,7 +17,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
 
-from cowork.api.v1.permissions import OpenByDesign, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.db.scoped import MissingTenantScopeError, ScopedSessionDep
 from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
 
@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 integrations_router = APIRouter()
 
 
+# OpenByDesign, standalone reason: both routes below return a hardcoded stub
+# value, ignoring their input entirely — there is nothing caller identity
+# could change or expose.
 @integrations_router.get("", dependencies=[Depends(require(OpenByDesign))])
 def list_integrations():
     return []
@@ -44,7 +47,12 @@ def oauth_start(service: str, body: dict[str, Any] | None = None):
 # input_file content blocks in the Responses request input field.
 # These endpoints exist as a compat bridge for the current client.
 
-attachments_router = APIRouter(dependencies=[Depends(require(OpenByDesign))])
+# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
+# whenever org mode has no org in scope. Declaring it too makes the
+# requirement visible to a route walker instead of something only
+# discoverable by reading scoped.py.
+attachments_router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
 def _attachment_purpose(project_name: str, session_id: str) -> str:
@@ -227,6 +235,7 @@ def move_attachment_to_project(
 scratchpad_router = APIRouter()
 
 
+# OpenByDesign, standalone reason: hardcoded stub response, nothing to expose.
 @scratchpad_router.post("/cancel", dependencies=[Depends(require(OpenByDesign))])
 def cancel_scratchpad():
     return {"ok": True}
@@ -237,6 +246,7 @@ def cancel_scratchpad():
 browse_router = APIRouter()
 
 
+# OpenByDesign, standalone reason: hardcoded stub response, nothing to expose.
 @browse_router.get("/status", dependencies=[Depends(require(OpenByDesign))])
 def browse_status():
     return {"available": False}

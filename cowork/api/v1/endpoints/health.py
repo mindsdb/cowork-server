@@ -92,6 +92,10 @@ def _minds_runtime_credential_required(
 # COWORK_SERVER_OWNER. The app adopts an already-running server only when
 # this matches its own token, so one OS user's app can't drive another
 # user's sidecar on a shared loopback port (ENG-439). Empty when unset.
+#
+# OpenByDesign, standalone reason (not "the middleware exempts it": this is
+# the pre-auth readiness probe every client polls before it can authenticate
+# at all.
 @router.get("/", response_model=dict, dependencies=[Depends(require(OpenByDesign))])
 def health() -> dict:
     settings = get_user_settings()
