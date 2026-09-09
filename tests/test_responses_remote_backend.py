@@ -1316,3 +1316,31 @@ async def test_a_second_history_frame_replaces_rather_than_appends(monkeypatch):
     )
 
     assert saved["tool_rows"] == _TOOL_ROWS
+
+
+@pytest.mark.asyncio
+async def test_a_forced_continuation_persists_only_the_replacement(monkeypatch):
+    """The pod's continuation boundary must reach persistence, not just the live
+    stream: the reloaded conversation has to show what the user saw."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    handler._remote_memory = lambda session, conv_id: {}
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "SUPERSEDED"}
+        yield "turn_step", {
+            "step": "progress",
+            "phase": "continuation",
+            "message": "Task incomplete — continuing (1/3)...",
+        }
+        yield "turn_delta", {"text": "REPLACEMENT"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert saved["assistant"] == "REPLACEMENT"
