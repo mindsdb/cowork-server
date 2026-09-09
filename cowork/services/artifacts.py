@@ -882,7 +882,12 @@ def resolve_artifact_path(
     raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
 
-def _artifact_root_for(path: Path, *, session: "ScopedSession | None" = None) -> Path:
+def _artifact_root_for(
+    path: Path,
+    *,
+    session: "ScopedSession | None" = None,
+    containers: set[str] | None = None,
+) -> Path:
     """Climb from an artifact file to the folder that holds its
     `metadata.json` — the artifact root.
 
@@ -895,8 +900,13 @@ def _artifact_root_for(path: Path, *, session: "ScopedSession | None" = None) ->
     bounded by the registered artifact container dirs
     (`<base>/.anton/artifacts/`) so a metadata-less tree can't send us
     climbing into the rest of the disk. Falls back to `path.parent`.
+
+    `containers` is for callers that climb many files under roots they have
+    already resolved: deriving the set costs a database read now, and this runs
+    once per file in the publish picker.
     """
-    containers = {str(d.resolve()) for d in _artifact_dirs_for_scope(session)}
+    if containers is None:
+        containers = {str(d.resolve()) for d in _artifact_dirs_for_scope(session)}
     current = path.parent.resolve()
     while True:
         if (current / "metadata.json").is_file():
@@ -1729,7 +1739,9 @@ def html_artifacts(session: "ScopedSession | None" = None) -> list[dict]:
     seen: set[str] = set()
     seen_roots: set[str] = set()
     fullstack_types = _fullstack_types()
-    for art_root in _artifact_dirs_for_scope(session):
+    roots = _artifact_dirs_for_scope(session)
+    containers = {str(d.resolve()) for d in roots}
+    for art_root in roots:
         if not art_root.exists():
             continue
         candidates = [p for ext in ("*.html", "*.md") for p in art_root.rglob(ext)]
@@ -1739,7 +1751,7 @@ def html_artifacts(session: "ScopedSession | None" = None) -> list[dict]:
                 continue
 
             # Group fullstack apps by their artifact root — one entry per app.
-            artifact_root = _artifact_root_for(path, session=session)
+            artifact_root = _artifact_root_for(path, containers=containers)
             meta = _load_metadata(artifact_root) if (artifact_root / "metadata.json").is_file() else None
             if (meta or {}).get("type") in fullstack_types:
                 root_key = str(artifact_root.resolve())
