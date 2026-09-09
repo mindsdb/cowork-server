@@ -713,6 +713,32 @@ def _project_artifacts_base(
     return base if base.is_dir() else None
 
 
+def _external_source_for_path(
+    path: Path, session: "ScopedSession | None" = None
+) -> "ProjectArtifacts | None":
+    """The adopted-folder source whose artifacts dir holds `path`, if any.
+
+    A serve URL for such a folder cannot be rediscovered by scanning, and its
+    basename is not its project name, so callers holding only a path need the
+    source itself to build one.
+    """
+    if session is None or _org_mode():
+        return None
+    from cowork.services.artifact_roots import _sources_outside_the_projects_root
+
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return None
+    for source in _sources_outside_the_projects_root(session):
+        try:
+            resolved.relative_to(Path(source.base).resolve())
+        except (ValueError, OSError):
+            continue
+        return source
+    return None
+
+
 def serve_url_for(
     path: str | Path,
     *,
@@ -1565,7 +1591,7 @@ def preview_artifact(path: Path) -> dict:
     }
 
 
-async def mount_preview(path: Path) -> dict:
+async def mount_preview(path: Path, *, session: "ScopedSession | None" = None) -> dict:
     """Register an artifact for iframe preview.
 
     Two payload shapes share a `kind` discriminator:
@@ -1580,7 +1606,7 @@ async def mount_preview(path: Path) -> dict:
     # primary file's parent — fullstack apps keep their frontend in a
     # `static/` subdir. Resolve it explicitly for all backend lookups so
     # we read the `port` from the root, not from `static/`.
-    root = _artifact_root_for(path)
+    root = _artifact_root_for(path, session=session)
 
     # Backend+frontend artifacts: detect them by a `port` field in the
     # root's metadata.json. The iframe will load through our proxy
@@ -1640,13 +1666,18 @@ async def mount_preview(path: Path) -> dict:
         raise ValueError("Preview mount is only available for HTML artifacts")
     token = hashlib.sha256(str(parent).encode("utf-8")).hexdigest()[:16]
     _PREVIEW_MOUNTS[token] = parent
+    _external = _external_source_for_path(path, session)
 
     return {
         "kind": "static",
         "token": token,
         "entry": path.name,
         "relUrl": f"/artifacts/preview-asset/{token}/{path.name}",
-        "serveUrl": serve_url_for(path),
+        "serveUrl": serve_url_for(
+            path,
+            artifacts_base=_external.base if _external else None,
+            project_name=_external.project_name if _external else None,
+        ),
         # Route through _published_url_for so a soft-deleted (published=False)
         # record reports an empty URL — matching the artifact grid and the
         # fullstack branch, instead of surfacing a dead 4nton.ai link.
