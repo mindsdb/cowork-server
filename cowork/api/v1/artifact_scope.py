@@ -10,7 +10,6 @@ from fastapi import HTTPException, status
 from cowork.db.scoped import ScopedSession
 from cowork.services.artifact_roots import (
     artifacts_sources_for_project,
-    artifacts_sources_for_scan,
     artifacts_sources_for_scope,
 )
 from cowork.services.artifacts import _org_mode
@@ -53,10 +52,9 @@ def artifact_sources_for_request(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Unknown project",
             ) from exc
+    sources = artifacts_sources_for_scope(session)
     if _org_mode():
-        return artifacts_sources_for_scope(session)
-
-    sources = artifacts_sources_for_scan()
+        return sources
     if project_path is not None:
         wanted = os.path.normpath(os.path.expanduser(project_path))
         sources = [source for source in sources if _project_dir_matches(source, wanted)]
@@ -103,7 +101,7 @@ def _sources_for_project_ref(
     if project_ref == "local":
         if _org_mode():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown project")
-        return artifacts_sources_for_scan()
+        return artifacts_sources_for_scope(session)
     # Recover the project id from a tenant-scoped database row before artifact
     # root discovery.  The request value is used only for an in-memory equality
     # check; the UUID passed into the filesystem-facing source resolver is the
