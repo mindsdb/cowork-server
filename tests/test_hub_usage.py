@@ -158,6 +158,15 @@ def test_unlimited_grant_passes_through_as_minus_one(calls):
     assert _fetch().free_tokens.limit == -1
 
 
+def test_auth_null_limit_is_unlimited_not_no_grant(calls):
+    # Auth's actual wire shape for an unlimited allowance: null limit, null remaining.
+    calls.answers[svc.ENTITLEMENTS_PATH] = {"included_tokens": {"limit": None, "used": 30, "remaining": None}}
+    tokens = _fetch().free_tokens
+    assert tokens.limit == -1
+    assert tokens.remaining == -1
+    assert tokens.used == 30
+
+
 def test_the_cache_is_per_caller_not_per_org(calls):
     """Two people in one org must not see each other's allowance or owner flag."""
     calls.answers[svc.ENTITLEMENTS_PATH] = ENTITLEMENTS
