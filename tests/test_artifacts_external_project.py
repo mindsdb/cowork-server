@@ -6,6 +6,7 @@ folder and they then disappear from the artifact list and do not serve.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -337,7 +338,7 @@ def test_the_artifacts_route_lists_an_adopted_folder(projects_root, tmp_path):
 
 
 def test_published_state_still_returns_the_blank_default_when_the_database_errors(
-    engine, tmp_path, monkeypatch
+    engine, tmp_path, monkeypatch, caplog
 ):
     """Its contract is to answer for any path, never to raise. Resolving through
     the project row put a database read in the way, and the agent's own
@@ -365,12 +366,21 @@ def test_published_state_still_returns_the_blank_default_when_the_database_error
     # resolution above still has to succeed.
     monkeypatch.setattr(publish_service, "_artifact_dirs_for_scope", _locked)
 
-    assert published_state(str(primary), _scoped(engine)) == {
-        "report_id": "",
-        "url": "",
-        "published": False,
-    }
-    assert published_owner_state(str(primary), _scoped(engine)) == {}
+    with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
+        assert published_state(str(primary), _scoped(engine)) == {
+            "report_id": "",
+            "url": "",
+            "published": False,
+        }
+        assert published_owner_state(str(primary), _scoped(engine)) == {}
+
+    # Blank is what the contract promises, but an outage must not be silent:
+    # without this it is indistinguishable from an artifact that is simply
+    # not published.
+    assert [r.msg for r in caplog.records].count(
+        "Could not resolve artifact roots for %s"
+    ) == 2
+    assert all("database is locked" in r.exc_text for r in caplog.records)
 
 
 def test_a_relative_path_in_two_roots_is_reported_as_ambiguous(engine, tmp_path):

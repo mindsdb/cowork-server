@@ -881,8 +881,16 @@ def published_state(raw_path: str, session: "ScopedSession | None" = None) -> di
     # resolve_artifact_path raises (not returns None) for paths outside a known
     # artifacts dir, so guard the whole resolution — the documented contract is
     # to return the blank default for any unresolvable path, never to raise.
+    # Split from the path resolution below because the two failures need
+    # different responses: an unresolvable path is the ordinary case this
+    # returns blank for, a database that did not answer is an outage that
+    # would otherwise be reported as "not published".
     try:
         containers = _artifact_dirs_for_scope(session)
+    except Exception:
+        logger.warning("Could not resolve artifact roots for %s", raw_path, exc_info=True)
+        return dict(blank)
+    try:
         artifact = resolve_artifact_path(raw_path, allow_dir=True, session=session)
     except Exception:
         return dict(blank)
@@ -909,8 +917,15 @@ def published_owner_state(
     `publish_artifact`. Returns {} for any unresolvable/absent record. Unlike
     `published_state`, exposes the access fields (mode/access_password/emails/
     org_allowed) needed to preserve access on re-publish."""
+    # See `published_state`: a database failure is not an unresolvable path, and
+    # an empty record here tells the comments route the artifact has no cloud
+    # thread rather than that the lookup failed.
     try:
         containers = _artifact_dirs_for_scope(session)
+    except Exception:
+        logger.warning("Could not resolve artifact roots for %s", raw_path, exc_info=True)
+        return {}
+    try:
         artifact = resolve_artifact_path(raw_path, allow_dir=True, session=session)
     except Exception:
         return {}
