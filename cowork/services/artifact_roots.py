@@ -215,6 +215,26 @@ def artifacts_sources_for_scope(session: ScopedSession) -> list[ProjectArtifacts
     ]
 
 
+def artifacts_sources_for_desktop_paths(
+    session: ScopedSession | None = None,
+) -> list[ProjectArtifacts]:
+    """The scan, plus desktop projects pointed at a folder the user chose.
+
+    For the path-addressed surface — status, the `project_path` list, search,
+    comments — which resolves by filesystem path rather than by project id and
+    so cannot use `artifacts_sources_for_project`.
+
+    Org mode returns the scan untouched, deliberately and not as a side effect
+    of `directory_is_external`: `/api/v1/search` carries no tenancy guard, and
+    widening it there would enumerate every project of the organization. That
+    is a separate decision from this one.
+    """
+    sources = artifacts_sources_for_scan()
+    if session is None or _org_mode():
+        return sources
+    return sources + _sources_outside_the_projects_root(session)
+
+
 def _sources_outside_the_projects_root(
     session: ScopedSession,
 ) -> list[ProjectArtifacts]:
