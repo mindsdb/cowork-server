@@ -46,7 +46,7 @@ from cowork.services.artifacts import (
 # session factory and the FastAPI dependency graph, and this module is imported
 # from the harness turn path where that is dead weight.
 if TYPE_CHECKING:
-    from cowork.db.scoped import TenantScope
+    from cowork.db.scoped import ScopedSession, TenantScope
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +149,9 @@ def _write_published_map(published_json: Path, published_map: dict[str, Any]) ->
             pass
 
 
-def desktop_artifact_and_base(raw_path: str, session=None) -> tuple[Path, Path]:
+def desktop_artifact_and_base(
+    raw_path: str, session: "ScopedSession | None" = None
+) -> tuple[Path, Path]:
     """(artifact, artifacts_base) for a desktop request path.
 
     Split from credential resolution so callers can validate cheap, local things
@@ -179,7 +181,9 @@ def desktop_publish_credential() -> tuple[str, str]:
     return api_key, publish_url
 
 
-def desktop_publish_context(raw_path: str, session=None) -> tuple[Path, Path, str, str]:
+def desktop_publish_context(
+    raw_path: str, session: "ScopedSession | None" = None
+) -> tuple[Path, Path, str, str]:
     """(artifact, artifacts_base, api_key, publish_url) for the desktop path.
 
     Keeps the pre-existing behavior - path resolution against the registered
@@ -239,7 +243,7 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
     return publish_url, api_key
 
 
-def list_publishable(session=None) -> dict:
+def list_publishable(session: "ScopedSession | None" = None) -> dict:
     settings = get_user_settings()
     state = _load_state()
     publish_url, api_key = _resolve_publish_endpoint(settings)
@@ -679,7 +683,7 @@ def published_artifact_access(artifact: Path, *, artifacts_base: Path) -> dict:
     return access_from_owner_side(entry)
 
 
-def update_artifact(raw_path: str, session=None) -> dict:
+def update_artifact(raw_path: str, session: "ScopedSession | None" = None) -> dict:
     """Re-publish an already-published artifact, preserving its URL and access.
 
     `publish_artifact` reuses the stored report_id (→ the lambda mints a new
@@ -718,7 +722,9 @@ def update_artifact(raw_path: str, session=None) -> dict:
     return result
 
 
-def _resolve_report_id(raw_path: str, session=None) -> tuple[Path, str, str]:
+def _resolve_report_id(
+    raw_path: str, session: "ScopedSession | None" = None
+) -> tuple[Path, str, str]:
     """Resolve (published_json_path, published_key, report_id) for an artifact.
 
     Raises FileNotFoundError when the artifact has no live publish record.
@@ -751,7 +757,7 @@ def _publisher_http_detail(exc: Exception) -> str:
         return body or str(exc)
 
 
-def list_versions(raw_path: str, session=None) -> dict:
+def list_versions(raw_path: str, session: "ScopedSession | None" = None) -> dict:
     """List the publish history (versions) of a live artifact.
 
     Returns {reportId, currentMd5, artifactType, versions: [...]} with versions
@@ -801,7 +807,9 @@ def list_versions(raw_path: str, session=None) -> dict:
     }
 
 
-def activate_version(raw_path: str, md5: str, session=None) -> dict:
+def activate_version(
+    raw_path: str, md5: str, session: "ScopedSession | None" = None
+) -> dict:
     """Roll the live URL back to an existing version (flips current_md5).
 
     On success, rewrites `.published.json` so the `modified` badge reflects the
@@ -860,7 +868,7 @@ def activate_version(raw_path: str, md5: str, session=None) -> dict:
     }
 
 
-def published_state(raw_path: str, session=None) -> dict:
+def published_state(raw_path: str, session: "ScopedSession | None" = None) -> dict:
     """Owner-side publish state for an artifact path, resolved exactly the way
     `publish_artifact` resolves it (so the chat tool and the GUI never disagree
     on where `.published.json` lives).
@@ -894,7 +902,9 @@ def published_state(raw_path: str, session=None) -> dict:
     }
 
 
-def published_owner_state(raw_path: str, session=None) -> dict:
+def published_owner_state(
+    raw_path: str, session: "ScopedSession | None" = None
+) -> dict:
     """Raw owner-side `.published.json` entry, resolved exactly like
     `publish_artifact`. Returns {} for any unresolvable/absent record. Unlike
     `published_state`, exposes the access fields (mode/access_password/emails/
