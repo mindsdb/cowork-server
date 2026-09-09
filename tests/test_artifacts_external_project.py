@@ -129,6 +129,67 @@ def test_an_in_root_project_is_still_found_by_the_scan(engine):
     assert base.resolve() in bases
 
 
+# -- path resolution ---------------------------------------------------------
+
+
+def test_a_path_inside_an_adopted_folder_resolves_with_a_session(engine, tmp_path):
+    """The path-addressed surface, which cannot use `artifacts_sources_for_project`
+    because it is given a filesystem path and no project id."""
+    from cowork.services.artifacts import resolve_artifact_path
+
+    folder = tmp_path / "Documents" / "notes"
+    folder.mkdir(parents=True)
+    artifact = _artifacts_dir(folder) / "dash"
+    artifact.mkdir()
+    primary = artifact / "index.html"
+    primary.write_text("<html></html>")
+    ProjectService(_scoped(engine)).create_project("notes", path=folder)
+
+    resolved = resolve_artifact_path(str(primary), session=_scoped(engine))
+    assert resolved == primary.resolve()
+
+
+def test_the_same_path_is_refused_without_a_session(engine, tmp_path):
+    """Callers that hold no session keep the old behavior, so nothing that
+    resolves by scan today starts resolving by row behind their back."""
+    from cowork.services.artifacts import resolve_artifact_path
+
+    folder = tmp_path / "Documents" / "notes"
+    folder.mkdir(parents=True)
+    artifact = _artifacts_dir(folder) / "dash"
+    artifact.mkdir()
+    primary = artifact / "index.html"
+    primary.write_text("<html></html>")
+    ProjectService(_scoped(engine)).create_project("notes", path=folder)
+
+    with pytest.raises(FileNotFoundError):
+        resolve_artifact_path(str(primary))
+
+
+def test_the_artifact_root_climb_stops_at_an_adopted_container(engine, tmp_path):
+    """The container set bounds the climb. It is empty for an adopted folder
+    without the widening, and a `metadata.json` the user happens to keep in
+    their own folder then becomes the artifact root — handing every sibling
+    file in that folder to whatever reads the root."""
+    from cowork.services.artifacts import _artifact_root_for
+
+    folder = tmp_path / "Documents" / "notes"
+    folder.mkdir(parents=True)
+    # A file of the user's own, above the artifacts dir. An unbounded climb
+    # walks up to it; a bounded one never leaves `.anton/artifacts/`.
+    (folder / "metadata.json").write_text("{}")
+    base = _artifacts_dir(folder)
+    loose = base / "stray"
+    loose.mkdir()
+    primary = loose / "index.html"
+    primary.write_text("<html></html>")
+    ProjectService(_scoped(engine)).create_project("notes", path=folder)
+
+    root = _artifact_root_for(primary, session=_scoped(engine))
+    assert root == loose.resolve()
+    assert root != folder.resolve()
+
+
 # -- serving -----------------------------------------------------------------
 
 

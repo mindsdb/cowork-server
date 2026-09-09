@@ -233,6 +233,32 @@ def _scan_artifact_dirs() -> list[Path]:
     return list(dirs.values())
 
 
+def _artifact_dirs_for_scope(session: "ScopedSession | None" = None) -> list[Path]:
+    """Every `.anton/artifacts` dir a desktop caller can address by path.
+
+    The scan only sees direct children of the projects root, so a project
+    pointed at a folder the user chose has to come from its row. Without a
+    session, or in org mode, this IS the scan: callers that legitimately hold
+    no session keep today's behavior, and the org path is resolved by
+    `artifact_roots.artifacts_sources_for_scope` rather than by any scan.
+    """
+    dirs = _scan_artifact_dirs()
+    if session is None or _org_mode():
+        return dirs
+    # Imported here because `artifact_roots` imports this module at module
+    # level; the same cycle `_external_project_artifacts_base` works around.
+    from cowork.services.artifact_roots import _sources_outside_the_projects_root
+
+    known = {str(d.resolve(strict=False)) for d in dirs}
+    for source in _sources_outside_the_projects_root(session):
+        base = Path(source.base)
+        if str(base.resolve(strict=False)) in known:
+            continue
+        known.add(str(base.resolve(strict=False)))
+        dirs.append(base)
+    return dirs
+
+
 def _iter_artifact_folders(project_path: str | None = None) -> Iterator[Path]:
     """Yield artifact folders containing readable metadata.json."""
     roots: list[Path]
@@ -734,7 +760,9 @@ def serve_url_for(
     return ""
 
 
-def _candidate_relative_artifacts(raw_path: str) -> list[Path]:
+def _candidate_relative_artifacts(
+    raw_path: str, *, session: "ScopedSession | None" = None
+) -> list[Path]:
     text = (raw_path or "").strip().replace("\\", "/")
     while text.startswith("./"):
         text = text[2:]
@@ -744,7 +772,7 @@ def _candidate_relative_artifacts(raw_path: str) -> list[Path]:
     if text.startswith("artifacts/"):
         text = text[len("artifacts/"):]
     matches: dict[str, Path] = {}
-    for art_root in _scan_artifact_dirs():
+    for art_root in _artifact_dirs_for_scope(session):
         try:
             target = (art_root / text).resolve()
             target.relative_to(art_root.resolve())
@@ -755,7 +783,12 @@ def _candidate_relative_artifacts(raw_path: str) -> list[Path]:
     return list(matches.values())
 
 
-def resolve_artifact_path(raw_path: str, *, allow_dir: bool = False) -> Path | None:
+def resolve_artifact_path(
+    raw_path: str,
+    *,
+    allow_dir: bool = False,
+    session: "ScopedSession | None" = None,
+) -> Path | None:
     """Turn an artifact request path into an absolute path on disk.
 
     Returns None if invalid, or the resolved Path if found.
@@ -778,7 +811,7 @@ def resolve_artifact_path(raw_path: str, *, allow_dir: bool = False) -> Path | N
 
     if target.is_absolute():
         resolved = target.resolve()
-        for art_root in _scan_artifact_dirs():
+        for art_root in _artifact_dirs_for_scope(session):
             try:
                 resolved.relative_to(art_root.resolve())
             except ValueError:
@@ -789,7 +822,7 @@ def resolve_artifact_path(raw_path: str, *, allow_dir: bool = False) -> Path | N
                 return resolved
         raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
-    matches = _candidate_relative_artifacts(raw_path)
+    matches = _candidate_relative_artifacts(raw_path, session=session)
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
@@ -797,7 +830,7 @@ def resolve_artifact_path(raw_path: str, *, allow_dir: bool = False) -> Path | N
     raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
 
-def _artifact_root_for(path: Path) -> Path:
+def _artifact_root_for(path: Path, *, session: "ScopedSession | None" = None) -> Path:
     """Climb from an artifact file to the folder that holds its
     `metadata.json` — the artifact root.
 
@@ -811,7 +844,7 @@ def _artifact_root_for(path: Path) -> Path:
     (`<base>/.anton/artifacts/`) so a metadata-less tree can't send us
     climbing into the rest of the disk. Falls back to `path.parent`.
     """
-    containers = {str(d.resolve()) for d in _scan_artifact_dirs()}
+    containers = {str(d.resolve()) for d in _artifact_dirs_for_scope(session)}
     current = path.parent.resolve()
     while True:
         if (current / "metadata.json").is_file():
