@@ -264,7 +264,9 @@ class _DesktopSourceCatalogEntry:
     source: object
 
 
-def _desktop_registered_path_catalog(session=None) -> tuple[_DesktopSourceCatalogEntry, ...]:
+def _desktop_registered_path_catalog(
+    session: ScopedSession | None = None,
+) -> tuple[_DesktopSourceCatalogEntry, ...]:
     """Build the complete legacy source catalog without an HTTP selector."""
     return tuple(
         _DesktopSourceCatalogEntry(
@@ -502,7 +504,9 @@ def _pinned_loose_match(
     return None
 
 
-def _desktop_artifact_status_for_path(path: str, session=None) -> dict:
+def _desktop_artifact_status_for_path(
+    path: str, session: ScopedSession | None = None
+) -> dict:
     """Match a legacy path only against entries scanned from discovered roots.
 
     The request is reduced to a string lookup key. Every card and folder key is
