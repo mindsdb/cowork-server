@@ -36,6 +36,30 @@ def projects_root(tmp_path, monkeypatch):
     get_app_settings.cache_clear()
 
 
+@pytest.fixture(autouse=True)
+def _remove_adopted_rows():
+    """Adopting writes into the process-wide database from tests/conftest.py.
+
+    Left behind, those rows are visible to every later test that resolves
+    artifact roots for real, and they make the names here have to be unique
+    across the whole suite.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.session import get_open_session
+    from cowork.models.project import Project
+    from sqlmodel import select
+
+    uri = get_app_settings().database.uri
+    with get_open_session(uri) as s:
+        before = {row.id for row in s.exec(select(Project)).all()}
+    yield
+    with get_open_session(uri) as s:
+        for row in s.exec(select(Project)).all():
+            if row.id not in before:
+                s.delete(row)
+        s.commit()
+
+
 def _client():
     """`base_url` sets `scope["server"]`, `client` the peer; both gates read them."""
     from fastapi.testclient import TestClient
@@ -157,14 +181,10 @@ def test_open_accepts_an_artifact_in_a_chosen_folder(projects_root, tmp_path, mo
 
 
 def test_reveal_accepts_an_artifact_in_a_chosen_folder(projects_root, tmp_path, monkeypatch):
-    from cowork.services import artifacts as artifacts_service
-
-    revealed = []
-    monkeypatch.setattr(
-        artifacts_service, "reveal_in_file_manager", lambda p: revealed.append(Path(p))
-    )
     from cowork.api.v1.endpoints import artifacts as artifacts_ep
 
+    revealed = []
+    # Patched in the endpoint module, which binds the name at import.
     monkeypatch.setattr(
         artifacts_ep, "reveal_in_file_manager", lambda p: revealed.append(Path(p))
     )
