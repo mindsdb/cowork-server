@@ -167,6 +167,11 @@ def test_auth_null_limit_is_unlimited_not_no_grant(calls):
     assert tokens.used == 30
 
 
+def test_a_missing_limit_is_still_no_grant(calls):
+    calls.answers[svc.ENTITLEMENTS_PATH] = {"included_tokens": {"used": 30}}
+    assert _fetch().free_tokens.limit == 0
+
+
 def test_the_cache_is_per_caller_not_per_org(calls):
     """Two people in one org must not see each other's allowance or owner flag."""
     calls.answers[svc.ENTITLEMENTS_PATH] = ENTITLEMENTS
