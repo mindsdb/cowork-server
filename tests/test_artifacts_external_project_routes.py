@@ -93,8 +93,10 @@ def _artifact_in(folder: Path, slug: str = "dash", *, artifact_id: str = ARTIFAC
 def _adopt(client, folder: Path, name: str):
     """Point a project at a folder the user already has, over the wire.
 
-    Names must be unique across the whole suite: the HTTP tests share one
-    process-wide database, and adopting refuses a name already taken.
+    Adopting refuses a name already taken, and these tests share one
+    process-wide database, so names must be unique within a test run.
+    `_remove_adopted_rows` drops each row afterwards, so they do not have to be
+    unique against tests that ran before.
     """
     created = client.post(
         "/api/v1/projects/", json={"name": name, "path": str(folder)}
