@@ -121,7 +121,8 @@ class ProjectService:
     def ensure_general_for_scope(self) -> Project | None:
         """The caller's default project, provisioned on demand.
 
-        Desktop keeps the seeded GENERAL row. Org mode gives each org its own row
+        Desktop keeps the seeded GENERAL row, re-pointed when the projects root
+        has moved since it was seeded. Org mode gives each org its own row
         and directory: one seeded id can't serve N tenants (the first org claimed
         it, the rest got None → 404). Idempotent — called on every request.
         """
@@ -129,6 +130,7 @@ class ProjectService:
         if not scope.org_mode or scope.org_id is None:
             project = self.session.get(Project, GENERAL_PROJECT_ID)
             if project is not None:
+                self._repoint_if_stale(project, keep_populated=False)
                 self.ensure_dir_exists(project)
             return project
 
@@ -232,22 +234,31 @@ class ProjectService:
         except OSError:
             return False
 
-    def _repoint_if_stale(self, project: Project) -> None:
-        """Move a row off a pre-org-keyed path when that path holds nothing.
+    def _repoint_if_stale(
+        self, project: Project, *, keep_populated: bool = True
+    ) -> None:
+        """Move a row whose path sits outside the caller's projects root.
 
-        Such rows point at `<root>/<name>`, which ensure_dir_exists won't
-        recreate, so they resolve to a missing directory forever. A path with
-        content stays put — swapping in an empty dir would strand the org's work.
-        An empty directory is not content, so it moves.
+        Such a path is one ensure_dir_exists won't recreate, so the row resolves
+        to a missing directory forever: an org row seeded before org-keying, or
+        the desktop `general` row after the projects root moves.
+
+        `keep_populated` leaves a path holding content where it is, so an org's
+        work is never swapped for an empty directory. The desktop caller passes
+        False, because a turn recreates `skills/` under the row's path on every
+        run, so that path is never empty once the project has been used.
         """
         current = Path(project.path)
         if self._in_scoped_root(current):
-            return  # already org-keyed
+            return  # already inside the current root
         try:
-            if current.is_dir() and any(current.iterdir()):
-                return  # real content — leave it where it is
+            populated = current.is_dir() and any(current.iterdir())
         except OSError:
-            return
+            if keep_populated:
+                return
+            populated = False
+        if keep_populated and populated:
+            return  # real content — leave it where it is
         new_path = str(self._project_path(project.name))
         # Core UPDATE, not session.add: the flush hook stamps created_by on any row
         # where it is None, which would attribute the org's system project to
@@ -258,7 +269,15 @@ class ProjectService:
         )
         raw.commit()
         raw.refresh(project)
-        logger.info("re-pointed %r off a pre-org-keyed path: %s", project.name, current)
+        logger.info("re-pointed %r off a stale path: %s", project.name, current)
+        if populated:
+            # WARNING because the bytes are the user's and nothing in the app
+            # points at them any more.
+            logger.warning(
+                "%r left content behind at %s; it is no longer listed",
+                project.name,
+                current,
+            )
 
     def ensure_dir_exists(self, project: Project) -> None:
         """Recreate a missing directory for a project the caller owns.
