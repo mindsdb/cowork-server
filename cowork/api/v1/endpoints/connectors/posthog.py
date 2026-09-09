@@ -4,10 +4,10 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 
-from cowork.api.v1.permissions import OpenByDesign, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.services.connectors.posthog import PostHogDiscoveryError, discover_projects
 
-router = APIRouter(dependencies=[Depends(require(OpenByDesign))])
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
 class DiscoverPostHogProjectsRequest(BaseModel):
