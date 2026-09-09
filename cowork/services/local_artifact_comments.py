@@ -18,7 +18,7 @@ from cowork.services.artifact_identity import (
     resolve_artifact_folder,
 )
 from cowork.services.artifact_lock import artifact_lock
-from cowork.services.artifact_roots import artifacts_sources_for_scan
+from cowork.services.artifact_roots import artifacts_sources_for_desktop_paths
 
 _VIEWER = {"user_id": "desktop-owner", "email": "You", "role": "owner"}
 _CAPABILITIES = {
@@ -35,9 +35,11 @@ def _now() -> str:
 class LocalArtifactComments:
     """Small atomic journal with the same response shape as inference comments."""
 
-    def __init__(self, artifact_id: str) -> None:
+    def __init__(self, artifact_id: str, session=None) -> None:
         try:
-            _, folder, _ = resolve_artifact_folder(artifacts_sources_for_scan(), artifact_id)
+            _, folder, _ = resolve_artifact_folder(
+                artifacts_sources_for_desktop_paths(session), artifact_id
+            )
         except ArtifactIdentityConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (FileNotFoundError, ValueError) as exc:
@@ -221,8 +223,10 @@ class LocalArtifactComments:
         return self._mutate(mutation)
 
 
-async def handle_local_comments(request: Request, artifact_id: str, subpath: str):
-    service = LocalArtifactComments(artifact_id)
+async def handle_local_comments(
+    request: Request, artifact_id: str, subpath: str, session=None
+):
+    service = LocalArtifactComments(artifact_id, session)
     parts = [part for part in subpath.split("/") if part]
     method = request.method.upper()
     try:
@@ -254,8 +258,8 @@ async def handle_local_comments(request: Request, artifact_id: str, subpath: str
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown comment operation")
 
 
-def local_comments_stream(artifact_id: str) -> StreamingResponse:
-    service = LocalArtifactComments(artifact_id)
+def local_comments_stream(artifact_id: str, session=None) -> StreamingResponse:
+    service = LocalArtifactComments(artifact_id, session)
 
     async def events():
         previous = {

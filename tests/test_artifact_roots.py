@@ -189,6 +189,14 @@ def test_sources_for_scope_falls_back_to_the_scan_in_desktop_mode(session, monke
         "cowork.services.artifact_roots.artifacts_sources_for_scan",
         lambda: called.append(1) or [],
     )
+    # The adopted-folder half reads real rows, and this suite shares one
+    # process-wide database with every test that adopts a folder over HTTP.
+    # Stubbed so the assertion below is about the scan, not about whichever
+    # projects happen to exist by the time this runs.
+    monkeypatch.setattr(
+        "cowork.services.artifact_roots._sources_outside_the_projects_root",
+        lambda _session: [],
+    )
 
     assert artifacts_sources_for_scope(ScopedSession(session, LOCAL_SCOPE)) == []
     assert called == [1]
@@ -234,7 +242,9 @@ def test_the_unfiltered_scan_yields_nothing_for_an_org_project(session, tmp_path
 
     `artifacts_sources_for_scan` is this module's third public resolver and the
     only one taking no session, so it applies no org filter and no owner filter.
-    `/api/v1/search` calls it unconditionally, in every tenancy mode.
+    `/api/v1/search` reaches it through `artifacts_sources_for_desktop_paths`,
+    which adds desktop projects pointed at a chosen folder and in org mode
+    returns this scan unchanged. So the scan is still what search sees here.
 
     Nothing leaks today, for two reasons and neither of them is a check. It
     walks `_projects_root()`, which is deliberately unkeyed and so empty in org
