@@ -259,6 +259,32 @@ def _artifact_dirs_for_scope(session: "ScopedSession | None" = None) -> list[Pat
     return dirs
 
 
+def _project_dirs_for_scope(session: "ScopedSession | None" = None) -> list[Path]:
+    """Registered project directories, plus folders the user chose, all resolved.
+
+    `_registered_project_dirs` resolves what it returns and callers match against
+    it with bare set membership, so a row path has to be resolved here too: on
+    macOS an adopted folder under /var reaches this as /private/var and would
+    simply fail to match.
+    """
+    dirs = _registered_project_dirs()
+    if session is None or _org_mode():
+        return dirs
+    from cowork.services.artifact_roots import _sources_outside_the_projects_root
+
+    known = {str(d) for d in dirs}
+    for source in _sources_outside_the_projects_root(session):
+        anchor = source.trusted_anchor
+        if anchor is None:
+            continue
+        project_dir = Path(anchor).resolve(strict=False)
+        if str(project_dir) in known:
+            continue
+        known.add(str(project_dir))
+        dirs.append(project_dir)
+    return dirs
+
+
 def _iter_artifact_folders(project_path: str | None = None) -> Iterator[Path]:
     """Yield artifact folders containing readable metadata.json."""
     roots: list[Path]
@@ -1644,7 +1670,7 @@ async def mount_preview(path: Path, *, session: "ScopedSession | None" = None) -
         root_token = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
         _PREVIEW_MOUNTS[root_token] = root
         running, launch_detail, current_port = await _ensure_backend_running(
-            root, backend_port
+            root, backend_port, session
         )
         return {
             "kind": "proxy",
@@ -1773,7 +1799,9 @@ def _probe_port(port: int, *, timeout: float = 0.3) -> bool:
         return False
 
 
-def _resolve_project_root(artifact_dir: Path) -> Path | None:
+def _resolve_project_root(
+    artifact_dir: Path, session: "ScopedSession | None" = None
+) -> Path | None:
     """The registered project root that owns this artifact dir, if any.
 
     `artifact_dir` is the parent of the primary file (e.g.
@@ -1786,7 +1814,7 @@ def _resolve_project_root(artifact_dir: Path) -> Path | None:
         artifact_resolved = artifact_dir.resolve()
     except OSError:
         return None
-    registered = _registered_project_dirs()
+    registered = _project_dirs_for_scope(session)
     for parent in (artifact_resolved, *artifact_resolved.parents):
         if parent in registered:
             return parent
@@ -1794,7 +1822,7 @@ def _resolve_project_root(artifact_dir: Path) -> Path | None:
 
 
 async def _ensure_backend_running(
-    artifact_dir: Path, port: int
+    artifact_dir: Path, port: int, session: "ScopedSession | None" = None
 ) -> tuple[bool, str, int]:
     """Bring up the artifact's backend if it isn't already listening.
 
@@ -1819,11 +1847,11 @@ async def _ensure_backend_running(
     async with _launch_lock(slug):
         if _probe_port(port):
             return True, "already_running", port
-        return await _launch_backend_locked(artifact_dir, slug)
+        return await _launch_backend_locked(artifact_dir, slug, session)
 
 
 async def _launch_backend_locked(
-    artifact_dir: Path, slug: str
+    artifact_dir: Path, slug: str, session: "ScopedSession | None" = None
 ) -> tuple[bool, str, int]:
     """Spawn the artifact's backend via anton's shared launcher.
 
@@ -1838,7 +1866,7 @@ async def _launch_backend_locked(
 
     from cowork.services.scratchpad_runtime import WorkspaceScopedPool
 
-    project_root = _resolve_project_root(artifact_dir)
+    project_root = _resolve_project_root(artifact_dir, session)
     if project_root is None:
         return False, "Artifact is not in a registered project.", 0
 

@@ -399,3 +399,50 @@ def test_comments_resolve_an_artifact_in_a_chosen_folder(projects_root, tmp_path
 
     assert res.status_code == 200, res.text
     assert (artifact / ".revisions").is_dir()
+
+
+def test_a_fullstack_backend_can_launch_from_a_chosen_folder(
+    projects_root, tmp_path, monkeypatch
+):
+    """Auto-launch answers 200 with a launchError rather than an error status,
+    so the failure surfaced as a preview that silently never came up. The launch
+    itself is stubbed; what is under test is that the artifact's owning project
+    is found at all."""
+    from cowork.services import artifacts as artifacts_service
+
+    client = _client()
+    folder = tmp_path / "Documents" / "routes-fullstack"
+    folder.mkdir(parents=True)
+    artifact = folder / ".anton" / "artifacts" / "app"
+    artifact.mkdir(parents=True)
+    (artifact / "index.html").write_text("<html></html>")
+    (artifact / "metadata.json").write_text(
+        json.dumps(
+            {
+                "id": "cccccccc-cccc-4ccc-8ccc-cccccccccc03",
+                "slug": "app",
+                "name": "Adopted fullstack",
+                "primary": "index.html",
+                "type": "fullstack",
+                "port": 51999,
+            }
+        )
+    )
+    _adopt(client, folder, "routes-fullstack")
+
+    monkeypatch.setattr(artifacts_service, "_probe_port", lambda port, **kw: False)
+
+    res = client.post(
+        "/api/v1/artifacts/preview-mount", json={"path": str(artifact / "index.html")}
+    )
+
+    assert res.status_code == 200, res.text
+    payload = res.json()
+    assert payload["kind"] == "proxy"
+    # The real launcher runs and may well fail for want of a scratchpad venv.
+    # What must not come back is the refusal that means the project was never
+    # found, which is all an adopted folder could ever get before.
+    assert payload.get("launchError") != "Artifact is not in a registered project."
+    # It fails at the backend script instead, which is a stage past resolution.
+    assert "backend script not found" in (payload.get("launchError") or "")
+    assert artifacts_service._resolve_project_root(artifact) is None
