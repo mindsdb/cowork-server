@@ -83,8 +83,9 @@ def _parse_free_tokens(payload: Any) -> Optional[HubFreeTokens]:
     if not isinstance(included, dict):
         return None
     # Auth sends ``limit: null`` (and ``remaining: null``) for an unlimited
-    # allowance; the desktop reads -1 as unlimited and 0 as no grant.
-    limit = -1 if included.get("limit") is None else _int(included["limit"])
+    # allowance; the desktop reads -1 as unlimited and 0 or absent as no grant.
+    raw_limit = included.get("limit", 0)
+    limit = -1 if raw_limit is None else _int(raw_limit)
     used = _int(included.get("used"))
     if limit < 0:
         remaining = -1  # uncapped: nothing to count down
