@@ -306,7 +306,7 @@ def _desktop_artifacts_for_project_path(session, project_path: str) -> list[dict
     retained in that catalog keeps ``project_id=None``, preserving local draft
     URLs and card addressing.
     """
-    catalog = _desktop_registered_path_catalog()
+    catalog = _desktop_registered_path_catalog(session)
     if not project_path or "\x00" in project_path:
         return []
     requested = os.path.normpath(os.path.expanduser(project_path))
@@ -616,7 +616,7 @@ async def list_artifacts(
         # Local requests that carry both parameters have always preferred the
         # UUID. Do not let the ignored compatibility field enter resolution.
         if project_id is None:
-            catalog = _desktop_registered_path_catalog()
+            catalog = _desktop_registered_path_catalog(session)
             if not project_path or "\x00" in project_path:
                 return []
             requested = os.path.normpath(os.path.expanduser(project_path))
