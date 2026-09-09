@@ -2,10 +2,14 @@
 call it here (ENG-2094).
 
 Ported from mindshub_inference's front door (ENG-1564, minds/api/v1/permissions.py)
-— same shape, starting with only the two primitives every route can already
-use. A capability check against auth's resolved org_role/permissions[] (never
-the raw X-User-Roles header) lands once ENG-2094's transport decision — header
-injection vs. an entitlements call — is picked.
+— same shape, starting with only the primitives every route can already use.
+ENG-2094's AC1 wants each route's declaration to be one of three things: a
+capability, an FGA relation, or an explicit public marker carrying its own
+one-line reason (``OpenByDesign``, below). Bare identity — ``Authenticated``/
+``AuthenticatedInOrgMode`` — is none of those three; it is what a route gets
+before its real capability check exists, not a resting place. A capability
+check against auth's now-live entitlements (``GET /v1/entitlements/me/``,
+ENG-2088) is what those routes actually need to move to.
 
 ``require(permission)`` turns a ``Permission`` class into a FastAPI dependency
 a route declares directly, e.g. ``principal: Principal = Depends(require(Authenticated))``,
@@ -25,6 +29,7 @@ from typing import Protocol
 
 from fastapi import Depends, HTTPException, Request, status
 
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.principal import Principal, get_principal
 
 
@@ -39,17 +44,23 @@ class Permission(Protocol):
 
 
 class OpenByDesign:
-    """No identity required BY THIS ROUTE — scoped to the route, not the
-    whole request path.
+    """No identity required — and that has to be true on its own, not
+    because some other layer in front of the route happens to check it.
 
-    In org mode, ``TrustedHeaderMiddleware`` (cowork/principal.py) still runs
-    first on every non-exempt path and, with ``identity_enforce == "enforce"``,
-    401s a caller with no valid identity headers before this dependency is
-    ever reached. So ``OpenByDesign`` here does not mean "reachable by
-    anyone, unconditionally" — it means "this route adds no identity
-    requirement of its own, on top of whatever already gated the request."
-    In local mode, or org mode's audit rollout (``identity_enforce ==
-    "audit"``), there is no such gate, and this really is unconditional.
+    Each use site needs a one-line reason that stands without reference to
+    ``TrustedHeaderMiddleware`` (cowork/principal.py) or any other layer: a
+    health probe infra must reach with zero auth, a webhook verified by its
+    own signature, a route whose real credential is a token in the URL
+    rather than a principal. "the middleware already checks this" is not a
+    valid reason. That was this class's original criterion, and it
+    misclassified routes that merely lacked their own check yet: the
+    middleware only guarantees identity when ``identity_enforce ==
+    "enforce"``, so justifying ``OpenByDesign`` that way describes a fact
+    about a *different component's* current configuration, not anything
+    true about the route itself. If the route would be a problem the moment
+    the middleware were removed or misconfigured, it is not
+    ``OpenByDesign`` — it needs ``Authenticated``/``AuthenticatedInOrgMode``
+    or a capability check instead.
 
     Declaring this — rather than leaving a route with no permission
     dependency at all — is what lets the CI route walker (added once every
@@ -83,6 +94,36 @@ class Authenticated:
         if principal is None:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
         return principal
+
+
+class AuthenticatedInOrgMode(Authenticated):
+    """``Authenticated`` in org mode; a no-op in local mode.
+
+    Reads ``get_app_settings().tenancy_mode`` directly rather than depending
+    on ``get_tenant_scope``: several tests build a minimal app around one
+    router and override ``get_tenant_scope`` to ``None`` for concerns that
+    have nothing to do with tenancy (e.g. ``tests/test_coding_service.py``),
+    which would crash this check on ``None.org_mode`` if it shared that
+    dependency.
+
+    Enforces on ``tenancy_mode`` alone, not ``identity_enforce``: every real
+    deployment (dev/staging/prod) pins ``identity_enforce=enforce``, so the
+    org-mode audit rollout where this would be stricter than the middleware
+    is not a state any of them run in today. Revisit if that changes.
+
+    A floor, not a finish line: ENG-2094's AC1 wants a capability, an FGA
+    relation, or a public marker — bare identity is none of those. Now that
+    ENG-2088's entitlements are live (``GET /v1/entitlements/me/``), a route
+    declared with this should eventually move to a real capability check;
+    this is what a route gets before that check exists.
+    """
+
+    async def check(
+        self, request: Request, principal: Principal | None = Depends(get_principal)
+    ) -> Principal | None:
+        if get_app_settings().tenancy_mode != "org":
+            return None
+        return await super().check(request, principal=principal)
 
 
 @cache
