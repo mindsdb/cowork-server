@@ -89,7 +89,7 @@ def resolve_comments_route(user_dir: str, report_id: str, *, session=None) -> tu
         )
     except Exception:
         return None
-    scope = cloud_comments_scope(published_owner_state(str(folder)))
+    scope = cloud_comments_scope(published_owner_state(str(folder), session))
     if not scope:
         return None
     upstream_user_dir, _, upstream_report_id = scope.partition("/")

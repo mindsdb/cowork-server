@@ -12,9 +12,12 @@ a project row with.
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
+
+from cowork.services import publish as publish_service
 
 ARTIFACT_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccc01"
 
@@ -204,3 +207,103 @@ def test_status_keeps_the_published_pill_for_a_chosen_folder(projects_root, tmp_
 
     assert res.status_code == 200, res.text
     assert res.json()["publishedUrl"] == "https://4nton.ai/a/uuid-status"
+
+
+# -- publish, unpublish, delete ----------------------------------------------
+
+
+def _published_record(artifact: Path, report_id: str = "uuid-pub"):
+    (artifact / ".published.json").write_text(
+        json.dumps(
+            {
+                "index.html": {
+                    "report_id": report_id,
+                    "url": f"https://4nton.ai/a/{report_id}",
+                    "last_md5": "old",
+                    "published": True,
+                    "mode": "public",
+                    "published_mtime": 1,
+                }
+            }
+        )
+    )
+
+
+def test_publish_resolves_an_artifact_in_a_chosen_folder(
+    projects_root, tmp_path, monkeypatch
+):
+    """The upload is stubbed. What is under test is that the artifact and its
+    artifacts base resolve at all, which is where publish refused before."""
+    from cowork.api.v1.endpoints import publish as publish_ep
+
+    seen = {}
+
+    def _fake_publish(artifact, *, artifacts_base, api_key, publish_url, **kwargs):
+        seen["artifact"] = Path(artifact)
+        seen["base"] = Path(artifacts_base)
+        return {"url": "https://4nton.ai/a/uuid-pub", "md5": "abc"}
+
+    monkeypatch.setattr(publish_ep, "_publish", _fake_publish)
+    monkeypatch.setattr(
+        publish_service, "desktop_publish_credential", lambda: ("key", "https://4nton.ai")
+    )
+
+    client = _client()
+    _project, folder, artifact = _adopted(client, tmp_path, "routes-publish")
+    primary = artifact / "index.html"
+
+    res = client.post("/api/v1/publish/", json={"path": str(primary)})
+
+    assert res.status_code == 200, res.text
+    assert seen["artifact"] == primary.resolve()
+    assert seen["base"] == (folder / ".anton" / "artifacts").resolve()
+
+
+def test_unpublish_resolves_an_artifact_in_a_chosen_folder(
+    projects_root, tmp_path, monkeypatch
+):
+    from cowork.api.v1.endpoints import publish as publish_ep
+
+    seen = {}
+
+    def _fake_unpublish(artifact, *, artifacts_base, api_key, publish_url):
+        seen["artifact"] = Path(artifact)
+        return {"status": "ok"}
+
+    monkeypatch.setattr(publish_ep, "_unpublish", _fake_unpublish)
+    monkeypatch.setattr(
+        publish_service, "desktop_publish_credential", lambda: ("key", "https://4nton.ai")
+    )
+
+    client = _client()
+    _project, _folder, artifact = _adopted(client, tmp_path, "routes-unpublish")
+    primary = artifact / "index.html"
+    _published_record(artifact)
+
+    res = client.request(
+        "DELETE", "/api/v1/publish/", params={"path": str(primary)}
+    )
+
+    assert res.status_code == 200, res.text
+    assert seen["artifact"] == primary.resolve()
+
+
+def test_delete_by_path_removes_an_artifact_in_a_chosen_folder(
+    projects_root, tmp_path, monkeypatch
+):
+    from cowork.api.v1.endpoints import artifacts as artifacts_ep
+
+    monkeypatch.setattr(
+        artifacts_ep, "_delete_artifact", lambda artifact, **kw: shutil.rmtree(artifact)
+    )
+    monkeypatch.setattr(
+        publish_service, "desktop_publish_credential", lambda: ("key", "https://4nton.ai")
+    )
+
+    client = _client()
+    _project, _folder, artifact = _adopted(client, tmp_path, "routes-delete")
+
+    res = client.request("DELETE", "/api/v1/artifacts/", params={"path": str(artifact)})
+
+    assert res.status_code == 204, res.text
+    assert not artifact.exists()
