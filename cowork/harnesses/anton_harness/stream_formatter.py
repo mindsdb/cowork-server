@@ -83,6 +83,9 @@ PHASE_LABELS = {
     # The completion verifier forced a continuation; the text after this
     # replaces the answer streamed before it.
     "continuation": "Continuing",
+    # The turn is handing back with an explanation instead of continuing, so
+    # the text after it adds to the answer rather than replacing it.
+    "handback": "Wrapping up",
 }
 
 PROGRESS_THROTTLE = 0.25  # seconds
@@ -230,7 +233,10 @@ async def format_responses_stream(
 
     async for event in event_stream:
         if isinstance(event, StreamTextDelta):
-            if superseded_pending and event.text:
+            # `.strip()`, not truthiness: a lone newline is text enough to
+            # satisfy the latch and not enough to be an answer, so spending it
+            # there leaves a blank message where the user had read a real one.
+            if superseded_pending and event.text.strip():
                 superseded_pending = False
                 collected_text.clear()
                 # The armed paragraph break belongs between two rounds of the
@@ -352,6 +358,12 @@ async def format_responses_stream(
             # rate-limited like any other, but the reset it implies is not.
             if phase_str == "continuation":
                 superseded_pending = True
+            # anton gave up and is explaining instead of continuing. Its
+            # diagnosis is an extra message, not a replacement: the answer the
+            # continuation failed to improve on is still the only real content
+            # the turn produced, and the next turn's history is rebuilt from it.
+            elif phase_str == "handback":
+                superseded_pending = False
             is_scratchpad_phase = phase_str in ("scratchpad_start", "scratchpad_done")
             # ENG-1537: the rate-limit notice must never be throttled away. It
             # fires once per wait and is the ONLY thing distinguishing a

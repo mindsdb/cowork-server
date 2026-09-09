@@ -17,6 +17,7 @@ from anton.core.llm.provider import (
     StreamComplete,
     StreamTaskProgress,
     StreamTextDelta,
+    ToolCall,
 )
 
 from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
@@ -24,6 +25,8 @@ from cowork.harnesses.anton_harness.stream_formatter import format_responses_str
 _BOUNDARY = StreamTaskProgress(
     phase="continuation", message="Task incomplete — continuing (1/3)..."
 )
+#: anton gives up and explains instead of continuing, so nothing supersedes.
+_HANDBACK = StreamTaskProgress(phase="handback", message="")
 
 
 async def _drain(events):
@@ -100,3 +103,60 @@ async def test_a_throttled_progress_notice_cannot_suppress_the_boundary():
     ])
     assert completed == "REPLACEMENT"
     assert [p["type"] for p in payloads].count("response.output_text.reset") == 1
+
+
+async def test_a_handback_after_the_boundary_does_not_replace_the_answer():
+    """A continuation can run its rounds, produce no answer of its own, and hand
+    back instead: budget gone, round cap hit, verifier stuck. The diagnosis it
+    streams then is an additional message, not a replacement — dropping the
+    answer for it loses the only real content the turn produced, from the bubble
+    and from the persisted message the next turn's history is rebuilt from.
+    """
+    payloads, completed = await _drain([
+        StreamTextDelta(text="THE ANSWER THE USER READ"),
+        _round_end(),
+        _BOUNDARY,
+        # The continuation's rounds only call tools, so it never speaks.
+        StreamComplete(response=LLMResponse(
+            content="", tool_calls=[ToolCall(id="t1", name="scratchpad", input={})],
+            stop_reason="tool_use",
+        )),
+        _HANDBACK,
+        StreamTextDelta(text="I could not finish; shall I continue?"),
+        _round_end(),
+    ])
+    assert "THE ANSWER THE USER READ" in completed
+    assert completed.endswith("I could not finish; shall I continue?")
+    assert [p["type"] for p in payloads].count("response.output_text.reset") == 0
+
+
+async def test_whitespace_alone_does_not_spend_the_boundary():
+    """`"\\n"` is text enough to satisfy a truthiness check and not enough to be
+    an answer. Spending the boundary on it persists a blank message where the
+    user had read a real one."""
+    payloads, completed = await _drain([
+        StreamTextDelta(text="THE ANSWER THE USER READ"),
+        _round_end(),
+        _BOUNDARY,
+        StreamTextDelta(text="\n"),
+        _round_end(),
+    ])
+    assert "THE ANSWER THE USER READ" in completed
+    assert [p["type"] for p in payloads].count("response.output_text.reset") == 0
+
+
+async def test_a_handback_leaves_a_later_continuation_free_to_replace():
+    """Cancelling the boundary must not disable the mechanism for the rest of
+    the turn — the verifier can force another continuation afterwards."""
+    _, completed = await _drain([
+        StreamTextDelta(text="FIRST"),
+        _round_end(),
+        _BOUNDARY,
+        _HANDBACK,
+        StreamTextDelta(text="HANDBACK TEXT"),
+        _round_end(),
+        _BOUNDARY,
+        StreamTextDelta(text="REPLACEMENT"),
+        _round_end(),
+    ])
+    assert completed == "REPLACEMENT"
