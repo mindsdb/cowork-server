@@ -130,13 +130,12 @@ class ProjectService:
         if not scope.org_mode or scope.org_id is None:
             project = self.session.get(Project, GENERAL_PROJECT_ID)
             if project is not None:
-                # Keyed off the deployment, not this branch: system-scoped
-                # background work reaches here on an org deployment too, and
-                # that org's seeded row must keep the content guard.
-                self._repoint_if_stale(
-                    project,
-                    keep_populated=get_app_settings().tenancy_mode == "org",
-                )
+                # Defensive, and keyed off the deployment rather than this
+                # branch: no caller reaches here on an org deployment today,
+                # but this row is NULL-org, so re-pointing it from a local
+                # scope would write it outside every org partition.
+                if get_app_settings().tenancy_mode != "org":
+                    self._repoint_if_stale(project, keep_populated=False)
                 self.ensure_dir_exists(project)
             return project
 

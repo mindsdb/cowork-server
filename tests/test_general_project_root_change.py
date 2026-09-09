@@ -176,6 +176,20 @@ def test_a_scaffold_only_old_directory_still_re_points(roots, engine, monkeypatc
     assert Path(project.path).parent.resolve() == new.resolve()
 
 
+def test_an_org_deployment_never_re_points_the_seeded_row(roots, engine, monkeypatch):
+    """The seeded row carries no org. Re-pointing it from a local-scoped caller
+    on an org deployment would write it outside every org partition, because
+    `scoped_storage_root` returns the base verbatim for a scope with no org."""
+    old, new = roots
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    _point_at(monkeypatch, new)
+
+    project = ProjectService(_scoped(engine)).ensure_general_for_scope()
+
+    assert project is not None
+    assert Path(project.path) == old / GENERAL_PROJECT
+
+
 def test_the_artifacts_routes_agree_after_the_root_moves(roots, monkeypatch):
     """Through HTTP, not the resolver. Neither artifacts route provisions the
     default project, so the resolver tests above cannot show that the re-point
