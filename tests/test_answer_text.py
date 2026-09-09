@@ -22,7 +22,7 @@ def test_deltas_accumulate_in_order():
 def test_a_reset_drops_the_answer_it_supersedes():
     assert _feed([
         ("response.output_text.delta", {"delta": "SUPERSEDED"}),
-        ("response.output_text.reset", {"item_id": "msg-1"}),
+        ("response.answer_reset", {"item_id": "msg-1"}),
         ("response.output_text.delta", {"delta": "REPLACEMENT"}),
     ]) == "REPLACEMENT"
 
@@ -31,9 +31,9 @@ def test_repeated_resets_each_drop_only_the_previous_attempt():
     """The verifier can force several continuations in one turn."""
     assert _feed([
         ("response.output_text.delta", {"delta": "FIRST"}),
-        ("response.output_text.reset", {}),
+        ("response.answer_reset", {}),
         ("response.output_text.delta", {"delta": "SECOND"}),
-        ("response.output_text.reset", {}),
+        ("response.answer_reset", {}),
         ("response.output_text.delta", {"delta": "THIRD"}),
     ]) == "THIRD"
 

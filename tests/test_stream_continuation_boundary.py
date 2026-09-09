@@ -3,7 +3,7 @@
 anton's completion verifier can judge a turn incomplete and force a
 continuation, which streams a fresh answer into the same output item as the one
 it supersedes — so the client reads the answer, then reads it again. The
-formatter turns that boundary into one `response.output_text.reset`, but only
+formatter turns that boundary into one `response.answer_reset`, but only
 once replacement text actually exists: a continuation that never speaks must
 leave the answer the user already read intact.
 """
@@ -66,10 +66,10 @@ async def test_the_replacement_supersedes_the_answer_it_replaces():
     assert completed == "REPLACEMENT"
 
     types = [p["type"] for p in payloads]
-    assert types.count("response.output_text.reset") == 1, (
+    assert types.count("response.answer_reset") == 1, (
         f"expected exactly one reset; event types were {types}"
     )
-    reset = types.index("response.output_text.reset")
+    reset = types.index("response.answer_reset")
     # Immediately before the replacement text, so the bubble is never empty.
     assert types[reset + 1] == "response.output_text.delta"
     assert payloads[reset + 1]["delta"] == "REPLACEMENT"
@@ -87,7 +87,7 @@ async def test_a_boundary_with_no_replacement_changes_nothing():
         _BOUNDARY,
     ])
     assert completed == "THE ANSWER THE USER READ"
-    assert [p["type"] for p in payloads].count("response.output_text.reset") == 0
+    assert [p["type"] for p in payloads].count("response.answer_reset") == 0
 
 
 async def test_a_throttled_progress_notice_cannot_suppress_the_boundary():
@@ -102,7 +102,7 @@ async def test_a_throttled_progress_notice_cannot_suppress_the_boundary():
         _round_end(),
     ])
     assert completed == "REPLACEMENT"
-    assert [p["type"] for p in payloads].count("response.output_text.reset") == 1
+    assert [p["type"] for p in payloads].count("response.answer_reset") == 1
 
 
 async def test_a_handback_after_the_boundary_does_not_replace_the_answer():
@@ -127,7 +127,7 @@ async def test_a_handback_after_the_boundary_does_not_replace_the_answer():
     ])
     assert "THE ANSWER THE USER READ" in completed
     assert completed.endswith("I could not finish; shall I continue?")
-    assert [p["type"] for p in payloads].count("response.output_text.reset") == 0
+    assert [p["type"] for p in payloads].count("response.answer_reset") == 0
 
 
 async def test_whitespace_alone_does_not_spend_the_boundary():
@@ -142,7 +142,7 @@ async def test_whitespace_alone_does_not_spend_the_boundary():
         _round_end(),
     ])
     assert "THE ANSWER THE USER READ" in completed
-    assert [p["type"] for p in payloads].count("response.output_text.reset") == 0
+    assert [p["type"] for p in payloads].count("response.answer_reset") == 0
 
 
 async def test_a_handback_leaves_a_later_continuation_free_to_replace():

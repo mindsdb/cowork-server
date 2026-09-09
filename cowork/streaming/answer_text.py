@@ -13,7 +13,7 @@ from __future__ import annotations
 def accumulate_answer_text(collected: list[str], event_type: str, data: dict) -> None:
     """Apply one formatter event to an answer-text accumulator, in place.
 
-    `response.output_text.reset` drops everything before it: anton's completion
+    `response.answer_reset` drops everything before it: anton's completion
     verifier forced a continuation, so the text that follows replaces the answer
     already streamed rather than continuing it. The formatter emits it only
     immediately before that replacement text, so this never empties an
@@ -21,5 +21,5 @@ def accumulate_answer_text(collected: list[str], event_type: str, data: dict) ->
     """
     if event_type == "response.output_text.delta":
         collected.append(data.get("delta", ""))
-    elif event_type == "response.output_text.reset":
+    elif event_type == "response.answer_reset":
         collected.clear()

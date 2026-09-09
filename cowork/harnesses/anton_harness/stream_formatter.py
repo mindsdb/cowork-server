@@ -5,7 +5,7 @@ Emits typed events:
     response.created            (with conversation_id)
     response.in_progress        (thought/tool activity, carries thought_role)
     response.output_text.delta  (assistant text deltas)
-    response.output_text.reset  (drop the text so far; the next delta replaces it)
+    response.answer_reset       (drop the answer so far; the next delta replaces it)
     response.completed          (final response object)
     response.failed             (error)
 """
@@ -245,8 +245,8 @@ async def format_responses_stream(
                 round_had_text = False
                 text_tail = ""
                 seq += 1
-                yield _event("response.output_text.reset", {
-                    "type": "response.output_text.reset",
+                yield _event("response.answer_reset", {
+                    "type": "response.answer_reset",
                     "sequence_number": seq,
                     "item_id": msg_id,
                 })
