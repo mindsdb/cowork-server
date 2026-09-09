@@ -5,6 +5,7 @@ Emits typed events:
     response.created            (with conversation_id)
     response.in_progress        (thought/tool activity, carries thought_role)
     response.output_text.delta  (assistant text deltas)
+    response.output_text.reset  (drop the text so far; the next delta replaces it)
     response.completed          (final response object)
     response.failed             (error)
 """
@@ -79,6 +80,9 @@ PHASE_LABELS = {
     # A skill draft the pod reported was rejected, or trimmed a sibling file —
     # see `remote_skill_draft_result` (cowork/services/task_objects.py).
     "skill_draft_dropped": "Skill draft",
+    # The completion verifier forced a continuation; the text after this
+    # replaces the answer streamed before it.
+    "continuation": "Continuing",
 }
 
 PROGRESS_THROTTLE = 0.25  # seconds
@@ -181,6 +185,12 @@ async def format_responses_stream(
     round_break = False
     round_had_text = False
     text_tail = ""
+    # anton's completion verifier can force a continuation, whose text replaces
+    # the answer streamed before it instead of continuing it. Latched when that
+    # boundary arrives and spent on the next text delta — never at the boundary
+    # itself, because a continuation that never speaks (stopped, failed, or all
+    # tool calls) must leave the answer the user already read standing.
+    superseded_pending = False
 
     def _event(event_type: str, data: dict) -> str:
         # Wall-clock millisecond stamp on every event. The renderer
@@ -220,6 +230,20 @@ async def format_responses_stream(
 
     async for event in event_stream:
         if isinstance(event, StreamTextDelta):
+            if superseded_pending and event.text:
+                superseded_pending = False
+                collected_text.clear()
+                # The armed paragraph break belongs between two rounds of the
+                # answer being discarded, not in front of its replacement.
+                round_break = False
+                round_had_text = False
+                text_tail = ""
+                seq += 1
+                yield _event("response.output_text.reset", {
+                    "type": "response.output_text.reset",
+                    "sequence_number": seq,
+                    "item_id": msg_id,
+                })
             text = event.text
             if round_break:
                 if text_tail and not text_tail.endswith("\n\n"):
@@ -324,6 +348,10 @@ async def format_responses_stream(
             # under PROGRESS_THROTTLE — dropping a scratchpad_done
             # would leave the cell stuck in_progress in the UI.
             phase_str = event.phase or ""
+            # Latched ahead of the throttling below: this notice is
+            # rate-limited like any other, but the reset it implies is not.
+            if phase_str == "continuation":
+                superseded_pending = True
             is_scratchpad_phase = phase_str in ("scratchpad_start", "scratchpad_done")
             # ENG-1537: the rate-limit notice must never be throttled away. It
             # fires once per wait and is the ONLY thing distinguishing a
