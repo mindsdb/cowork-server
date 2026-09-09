@@ -307,3 +307,16 @@ def test_delete_by_path_removes_an_artifact_in_a_chosen_folder(
 
     assert res.status_code == 204, res.text
     assert not artifact.exists()
+
+
+def test_the_publishable_list_includes_a_chosen_folder(projects_root, tmp_path):
+    """The publish picker built its list from the scan, so a project pointed at
+    a chosen folder simply had nothing to offer."""
+    client = _client()
+    _adopted(client, tmp_path, "routes-publishable")
+
+    res = client.get("/api/v1/publish/")
+
+    assert res.status_code == 200, res.text
+    listed = [Path(a["path"]) for a in res.json()["artifacts"]]
+    assert any(p.name == "index.html" and "routes-publishable" in str(p) for p in listed)

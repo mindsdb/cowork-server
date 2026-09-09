@@ -64,8 +64,8 @@ class _ActivateBody(BaseModel):
 
 
 @router.get("/")
-async def list_publishable_endpoint():
-    return list_publishable()
+async def list_publishable_endpoint(session: ScopedSessionDep):
+    return list_publishable(session)
 
 
 @router.post("/")

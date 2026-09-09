@@ -1690,7 +1690,7 @@ def get_preview_mount(token: str) -> Path | None:
     return _PREVIEW_MOUNTS.get(token)
 
 
-def html_artifacts() -> list[dict]:
+def html_artifacts(session: "ScopedSession | None" = None) -> list[dict]:
     """List every publishable file (HTML + Markdown) under every project's
     artifacts tree.
 
@@ -1703,7 +1703,7 @@ def html_artifacts() -> list[dict]:
     seen: set[str] = set()
     seen_roots: set[str] = set()
     fullstack_types = _fullstack_types()
-    for art_root in _scan_artifact_dirs():
+    for art_root in _artifact_dirs_for_scope(session):
         if not art_root.exists():
             continue
         candidates = [p for ext in ("*.html", "*.md") for p in art_root.rglob(ext)]
@@ -1713,7 +1713,7 @@ def html_artifacts() -> list[dict]:
                 continue
 
             # Group fullstack apps by their artifact root — one entry per app.
-            artifact_root = _artifact_root_for(path)
+            artifact_root = _artifact_root_for(path, session=session)
             meta = _load_metadata(artifact_root) if (artifact_root / "metadata.json").is_file() else None
             if (meta or {}).get("type") in fullstack_types:
                 root_key = str(artifact_root.resolve())
