@@ -23,7 +23,9 @@ def artifact(tmp_path: Path, monkeypatch):
     folder.mkdir()
 
     state: dict = {"entry": {}}
-    monkeypatch.setattr(router, "artifacts_sources_for_scan", lambda: [])
+    monkeypatch.setattr(
+        router, "artifacts_sources_for_desktop_paths", lambda _session=None: []
+    )
     monkeypatch.setattr(
         router, "resolve_artifact_folder", lambda _sources, _aid: (object(), folder, {})
     )

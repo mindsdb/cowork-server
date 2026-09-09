@@ -80,10 +80,12 @@ def _adopt(client, folder: Path, name: str):
     return created.json()
 
 
-def _adopted(client, tmp_path: Path, name: str, *, slug: str = "dash"):
+def _adopted(
+    client, tmp_path: Path, name: str, *, slug: str = "dash", artifact_id: str = ARTIFACT_ID
+):
     folder = tmp_path / "Documents" / name
     folder.mkdir(parents=True)
-    artifact = _artifact_in(folder, slug)
+    artifact = _artifact_in(folder, slug, artifact_id=artifact_id)
     project = _adopt(client, folder, name)
     return project, folder, artifact
 
@@ -366,3 +368,34 @@ def test_the_project_path_list_carries_the_row_name_not_the_basename(
     assert cards[0]["serveUrl"] == (
         f"/api/v1/artifacts/serve/{project_name}/dash/index.html"
     )
+
+
+def test_search_finds_an_artifact_in_a_chosen_folder(projects_root, tmp_path):
+    """Search held a scoped session and resolved artifact roots without it."""
+    client = _client()
+    _adopted(client, tmp_path, "routes-search")
+
+    res = client.get("/api/v1/search", params={"q": "Adopted dashboard"})
+
+    assert res.status_code == 200, res.text
+    results = res.json()["results"]
+    titles = [r.get("title") for r in results if r.get("type") == "artifact"]
+    assert "Adopted dashboard" in titles
+
+
+def test_comments_resolve_an_artifact_in_a_chosen_folder(projects_root, tmp_path):
+    """The local journal resolves the artifact folder to decide where threads
+    live, and refused a chosen folder with a 404 that read as a missing artifact."""
+    client = _client()
+    comment_artifact_id = "cccccccc-cccc-4ccc-8ccc-cccccccccc02"
+    _project, _folder, artifact = _adopted(
+        client, tmp_path, "routes-comments", slug="notes", artifact_id=comment_artifact_id
+    )
+
+    # "artifact" is the canonical desktop namespace; anything else proxies out.
+    res = client.get(
+        f"/api/v1/artifact-comments/artifact/{comment_artifact_id}/threads"
+    )
+
+    assert res.status_code == 200, res.text
+    assert (artifact / ".revisions").is_dir()

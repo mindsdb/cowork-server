@@ -20,7 +20,7 @@ from starlette.concurrency import run_in_threadpool
 
 from cowork.db.scoped import ScopedSessionDep
 from cowork.services.artifact_identity import resolve_artifact_folder
-from cowork.services.artifact_roots import artifacts_sources_for_scan
+from cowork.services.artifact_roots import artifacts_sources_for_desktop_paths
 from cowork.services.comments_proxy import forward_comments_rest, forward_comments_stream
 from cowork.services.comments_scope import cloud_comments_scope
 from cowork.services.local_artifact_comments import handle_local_comments, local_comments_stream
@@ -85,7 +85,7 @@ def resolve_comments_route(user_dir: str, report_id: str, *, session=None) -> tu
         return None
     try:
         _source, folder, _metadata = resolve_artifact_folder(
-            artifacts_sources_for_scan(), artifact_id
+            artifacts_sources_for_desktop_paths(session), artifact_id
         )
     except Exception:
         return None
@@ -127,7 +127,9 @@ async def comments_stream(user_dir: str, report_id: str, request: Request, sessi
         # ``route is None`` is possible only in desktop's canonical namespace,
         # where the boundary helper always returns a UUID.
         assert local_report_id is not None
-        return local_comments_stream(local_report_id)
+        return await run_in_threadpool(
+            local_comments_stream, local_report_id, session
+        )
     return await forward_comments_stream(request, route[0], route[1])
 
 
@@ -141,5 +143,5 @@ async def comments_rest(user_dir: str, report_id: str, subpath: str, request: Re
     route = await run_in_threadpool(resolve_comments_route, user_dir, report_id, session=session)
     if route is None:
         assert local_report_id is not None
-        return await handle_local_comments(request, local_report_id, subpath)
+        return await handle_local_comments(request, local_report_id, subpath, session)
     return await forward_comments_rest(request, route[0], route[1], subpath)
