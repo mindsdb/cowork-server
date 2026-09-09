@@ -130,7 +130,13 @@ class ProjectService:
         if not scope.org_mode or scope.org_id is None:
             project = self.session.get(Project, GENERAL_PROJECT_ID)
             if project is not None:
-                self._repoint_if_stale(project, keep_populated=False)
+                # Keyed off the deployment, not this branch: system-scoped
+                # background work reaches here on an org deployment too, and
+                # that org's seeded row must keep the content guard.
+                self._repoint_if_stale(
+                    project,
+                    keep_populated=get_app_settings().tenancy_mode == "org",
+                )
                 self.ensure_dir_exists(project)
             return project
 
@@ -244,20 +250,20 @@ class ProjectService:
         the desktop `general` row after the projects root moves.
 
         `keep_populated` leaves a path holding content where it is, so an org's
-        work is never swapped for an empty directory. The desktop caller passes
-        False, because a turn recreates `skills/` under the row's path on every
-        run, so that path is never empty once the project has been used.
+        work is never swapped for an empty directory; an unreadable path counts
+        as holding content. Local deployments pass False, because a turn
+        recreates `skills/` under the row's path on every run, so that path is
+        never empty once the project has been used.
         """
         current = Path(project.path)
         if self._in_scoped_root(current):
             return  # already inside the current root
+        known_empty = False
         try:
-            populated = current.is_dir() and any(current.iterdir())
+            known_empty = not current.is_dir() or not any(current.iterdir())
         except OSError:
-            if keep_populated:
-                return
-            populated = False
-        if keep_populated and populated:
+            pass  # unreadable counts as holding content, never as empty
+        if keep_populated and not known_empty:
             return  # real content — leave it where it is
         new_path = str(self._project_path(project.name))
         # Core UPDATE, not session.add: the flush hook stamps created_by on any row
@@ -270,11 +276,12 @@ class ProjectService:
         raw.commit()
         raw.refresh(project)
         logger.info("re-pointed %r off a stale path: %s", project.name, current)
-        if populated:
-            # WARNING because the bytes are the user's and nothing in the app
-            # points at them any more.
+        if not known_empty:
+            # The whole workspace moves with the row, not just artifacts:
+            # instructions, memory and skills all resolve from this path.
             logger.warning(
-                "%r left content behind at %s; it is no longer listed",
+                "%r no longer reads its artifacts, memory or instructions from "
+                "%s; that directory was left in place",
                 project.name,
                 current,
             )
