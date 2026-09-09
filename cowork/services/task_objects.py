@@ -382,6 +382,7 @@ def cards_for_slugs(
     *,
     project_id: str | None = None,
     project_name: str = "",
+    lint_status_by_slug: dict[str, str] | None = None,
 ) -> list[dict]:
     """Inline-chat card payloads for the given slugs, order preserved.
 
@@ -393,6 +394,13 @@ def cards_for_slugs(
     how the client addresses an artifact in org mode (project + slug); a card
     without them would fall back to the path-based endpoints, which org mode
     fails closed. Best-effort per slug: an unreadable artifact is skipped.
+
+    `lint_status_by_slug` (ENG-1204) is overlaid onto the card AFTER
+    `card_for_folder` builds it, never read from disk: it is the harness's
+    own in-memory, per-turn verdict (`ChatSession.artifact_lint_status`),
+    not a fact `metadata.json` carries. A slug absent from the mapping (or
+    a None mapping) gets no `lintStatus` key at all — omitted, not `None`,
+    so the client can't confuse "never checked" with a real value.
     """
     from cowork.services.artifacts import card_for_folder
 
@@ -415,6 +423,10 @@ def cards_for_slugs(
             logger.warning("Could not build inline card for artifact %r", slug, exc_info=True)
             continue
         if card is not None:
+            if lint_status_by_slug:
+                status = lint_status_by_slug.get(slug)
+                if status:
+                    card["lintStatus"] = status
             cards.append(card)
     return cards
 
@@ -448,6 +460,7 @@ async def publish_and_card_turn_artifacts(
     scope,
     project_id: str | None = None,
     project_name: str = "",
+    lint_status_by_slug: dict[str, str] | None = None,
 ) -> list[dict]:
     """Reconcile publishes for this turn, then build the cards to emit.
 
@@ -488,6 +501,7 @@ async def publish_and_card_turn_artifacts(
     return cards_for_slugs(
         artifacts_base, sorted(carded),
         project_id=project_id, project_name=project_name,
+        lint_status_by_slug=lint_status_by_slug,
     )
 
 
