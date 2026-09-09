@@ -169,7 +169,13 @@ def _sources_for(
     """One `ProjectArtifacts` per root. They all carry the SAME project identity:
     a conversation is where the bytes happen to live, not a thing the client
     addresses artifacts by, so cards stay project-addressed in both modes."""
+    from cowork.services.projects import ProjectService
+
     project_path = Path(project.path)
+    # The same truth as the scope resolver's: a serve URL for an adopted
+    # folder cannot be rediscovered by scanning, and this is the resolver the
+    # desktop rail reaches (it addresses artifacts by project id).
+    external = ProjectService(session).directory_is_external(project)
     sources: list[ProjectArtifacts] = []
     for base in _project_artifact_bases(
         project.path, session, include_other_members=include_other_members
@@ -181,6 +187,7 @@ def _sources_for(
                 project_name=project.name,
                 trusted_anchor=project_path,
                 root_parts=base.relative_to(project_path).parts,
+                external=external,
             )
         )
     return sources
@@ -195,7 +202,9 @@ def artifacts_sources_for_scope(session: ScopedSession) -> list[ProjectArtifacts
     desktop list is unchanged.
     """
     if not _org_mode():
-        return artifacts_sources_for_scan()
+        return artifacts_sources_for_scan() + _sources_outside_the_projects_root(
+            session
+        )
 
     from cowork.services.projects import ProjectService
 
@@ -204,6 +213,49 @@ def artifacts_sources_for_scope(session: ScopedSession) -> list[ProjectArtifacts
         for project in ProjectService(session).list_projects()
         for source in _sources_for(session, project)
     ]
+
+
+def _sources_outside_the_projects_root(
+    session: ScopedSession,
+) -> list[ProjectArtifacts]:
+    """Desktop projects pointed at a folder the user chose.
+
+    The scan above only sees direct children of the projects root, so an
+    adopted folder is invisible to it and has to come from its row.
+
+    `project_name` is the row's name, not the folder's basename. Those were the
+    same string for every project the scan can see, and they are not once a
+    folder is adopted: adopting `~/Documents/notes` while `notes` is taken
+    gives a row named `notes-2` over a directory named `notes`.
+    """
+    from cowork.services.projects import ProjectService
+
+    service = ProjectService(session)
+    sources: list[ProjectArtifacts] = []
+    for project in service.list_projects():
+        if not service.directory_is_external(project):
+            continue
+        project_path = Path(project.path)
+        # Same refusal as the scan: a linked root must not become an
+        # authorization source.
+        if not _storage_components_are_safe(project_path, may_be_absent=False):
+            continue
+        base = _artifacts_base(project.path)
+        if not _is_real_directory(base):
+            continue
+        sources.append(
+            ProjectArtifacts(
+                base=base,
+                # None keeps desktop cards path-addressed, exactly as the scan
+                # leaves them; adopting a folder must not change addressing.
+                project_id=None,
+                project_name=project.name,
+                trusted_anchor=project_path,
+                root_parts=_ARTIFACTS_SUBPATH,
+                external=True,
+            )
+        )
+    return sources
 
 
 def artifacts_sources_for_project(
