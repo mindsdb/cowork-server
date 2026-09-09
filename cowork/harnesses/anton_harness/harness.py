@@ -604,6 +604,7 @@ class AntonHarness:
             scope=turn_scope,
             project_id=str(conv_project_id) if conv_project_id else None,
             project_name=conv_project_name,
+            lint_status_by_slug=getattr(session, "artifact_lint_status", None),
         )
         for card in cards:
             yield ArtifactCreated(card)
