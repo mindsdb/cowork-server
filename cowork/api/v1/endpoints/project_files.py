@@ -24,6 +24,8 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
@@ -66,7 +68,15 @@ from cowork.services.shared_resources import (
 
 
 logger = logging.getLogger(__name__)
-router = APIRouter()
+
+# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
+# whenever org mode has no org in scope. Declaring it too makes the
+# requirement visible to a route walker instead of something only
+# discoverable by reading scoped.py. (preview_asset checks a mount token
+# instead of taking ScopedSessionDep, but the token is scoped per-mount, not
+# a bypass, so it needs nothing of its own here.)
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 ANTON_INSTRUCTIONS_FILENAME = "anton.md"
 TEXT_MAX_BYTES = 2 * 1024 * 1024  # 2 MiB
