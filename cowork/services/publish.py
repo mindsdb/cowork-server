@@ -874,13 +874,14 @@ def published_state(raw_path: str, session=None) -> dict:
     # artifacts dir, so guard the whole resolution — the documented contract is
     # to return the blank default for any unresolvable path, never to raise.
     try:
+        containers = _artifact_dirs_for_scope(session)
         artifact = resolve_artifact_path(raw_path, allow_dir=True, session=session)
     except Exception:
         return dict(blank)
     if artifact is None:
         return dict(blank)
     _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
-        artifact, _artifact_dirs_for_scope(session)
+        artifact, containers
     )
     entry = _load_published_map(published_dir).get(published_key)
     if not isinstance(entry, dict):
@@ -899,13 +900,14 @@ def published_owner_state(raw_path: str, session=None) -> dict:
     `published_state`, exposes the access fields (mode/access_password/emails/
     org_allowed) needed to preserve access on re-publish."""
     try:
+        containers = _artifact_dirs_for_scope(session)
         artifact = resolve_artifact_path(raw_path, allow_dir=True, session=session)
     except Exception:
         return {}
     if artifact is None:
         return {}
     _t, published_dir, published_key, _fs = _resolve_publish_target(
-        artifact, _artifact_dirs_for_scope(session)
+        artifact, containers
     )
     entry = _load_published_map(published_dir).get(published_key)
     return entry if isinstance(entry, dict) else {}

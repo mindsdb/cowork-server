@@ -334,3 +334,40 @@ def test_the_artifacts_route_lists_an_adopted_folder(projects_root, tmp_path):
     served = client.get(card["serveUrl"])
     assert served.status_code == 200, served.text
     assert served.text == "<html></html>"
+
+
+def test_published_state_still_returns_the_blank_default_when_the_database_errors(
+    engine, tmp_path, monkeypatch
+):
+    """Its contract is to answer for any path, never to raise. Resolving through
+    the project row put a database read in the way, and the agent's own
+    `publish_or_preview` calls this with no guard of its own.
+
+    The path has to resolve, or the run never reaches the read under test.
+    """
+    from cowork.services import publish as publish_service
+    from cowork.services.publish import published_owner_state, published_state
+
+    folder = tmp_path / "Documents" / "notes"
+    folder.mkdir(parents=True)
+    artifact = _artifacts_dir(folder) / "dash"
+    artifact.mkdir()
+    primary = artifact / "index.html"
+    primary.write_text("<html></html>")
+    (artifact / "metadata.json").write_text("{}")
+    ProjectService(_scoped(engine)).create_project("notes", path=folder)
+
+    def _locked(_session=None):
+        raise RuntimeError("database is locked")
+
+    # Patched in `publish`, which binds the name at import; patching it in
+    # `artifacts` would leave this binding pointing at the real one, and the
+    # resolution above still has to succeed.
+    monkeypatch.setattr(publish_service, "_artifact_dirs_for_scope", _locked)
+
+    assert published_state(str(primary), _scoped(engine)) == {
+        "report_id": "",
+        "url": "",
+        "published": False,
+    }
+    assert published_owner_state(str(primary), _scoped(engine)) == {}
