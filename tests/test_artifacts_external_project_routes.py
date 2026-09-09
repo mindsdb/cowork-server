@@ -480,3 +480,26 @@ def test_the_agent_publish_tool_resolves_a_chosen_folder(
     assert result["view_url"] == "https://4nton.ai/a/uuid-tool"
     assert seen["artifact"] == (artifact / "index.html").resolve()
     assert seen["base"] == (folder / ".anton" / "artifacts").resolve()
+
+
+def test_the_agent_publish_tool_opens_no_session_in_org_mode(monkeypatch):
+    """LOCAL_SCOPE disables org filtering, so a session opened under it would
+    read every tenant's rows. A folder can only be adopted on a local
+    deployment, so org mode must not open one at all."""
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db import session as db_session
+    from cowork.harnesses.anton_harness import tools
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    monkeypatch.setattr(
+        db_session,
+        "get_open_session",
+        lambda *a, **kw: pytest.fail("org mode opened an unfiltered local session"),
+    )
+
+    try:
+        with tools._desktop_scope() as scope:
+            assert scope is None
+    finally:
+        get_app_settings.cache_clear()

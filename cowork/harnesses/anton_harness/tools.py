@@ -33,20 +33,28 @@ logger = logging.getLogger(__name__)
 
 @contextmanager
 def _desktop_scope():
-    """A local scoped session for the desktop publish path.
+    """A local scoped session for the desktop publish path, or None in org mode.
 
     The publish service resolves an artifact through the project row so a folder
     the user chose is addressable, and this tool runs outside any request, so it
-    has to open its own. Desktop only: org publishing goes through the turn key
-    and never reaches these helpers.
+    has to open its own.
+
+    Org mode yields None and opens nothing. LOCAL_SCOPE disables org filtering,
+    so a session opened under it would read every tenant's rows; a folder can
+    only be adopted on a local deployment, so there is nothing there to find.
+    The same refusal guards the sibling reader in services/skill_links.py.
     """
     from cowork.common.settings.app_settings import get_app_settings
-    from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
-    from cowork.db.session import get_engine, get_session_factory
 
-    factory = get_session_factory(get_engine(get_app_settings().database.uri))
-    with factory() as session:
-        yield ScopedSession(session, LOCAL_SCOPE)
+    if get_app_settings().tenancy_mode == "org":
+        yield None
+        return
+
+    from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+    from cowork.db.session import get_open_session
+
+    with get_open_session() as raw:
+        yield ScopedSession(raw, LOCAL_SCOPE)
 
 
 def _published_state(raw_path: str) -> dict:
