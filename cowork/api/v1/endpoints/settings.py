@@ -646,12 +646,16 @@ def _read_env_dict() -> dict[str, str]:
     return {}
 
 
-@router.get("/raw", dependencies=[Depends(require(OpenByDesign))])
-def read_raw_settings(request: Request):
+# OpenByDesign, standalone reason: what protects /raw is require_local
+# (loopback-only) and require_local_tenancy (desktop-only, 403s in org
+# mode), not identity.
+@router.get(
+    "/raw",
+    dependencies=[Depends(require_local_tenancy), Depends(require_local), Depends(require(OpenByDesign))],
+)
+def read_raw_settings():
     # /raw dumps the dotenv verbatim (all provider secrets) — same loopback
     # restriction as reveal-key, and desktop-only (deployment-global state).
-    require_local_tenancy()
-    require_local(request)
     return _read_env_dict()
 
 
@@ -659,8 +663,11 @@ class _RawSettingsBody(BaseModel):
     content: str
 
 
-@router.post("/raw", dependencies=[Depends(require(OpenByDesign))])
-async def write_raw_settings(body: _RawSettingsBody, session: SessionDep, request: Request):
+@router.post(
+    "/raw",
+    dependencies=[Depends(require_local_tenancy), Depends(require_local), Depends(require(OpenByDesign))],
+)
+async def write_raw_settings(body: _RawSettingsBody, session: SessionDep):
     """Merge dotenv content into ~/.cowork/.env and sync recognised keys to the DB.
 
     Uses key-level merge (not full overwrite) because callers like the
@@ -673,8 +680,6 @@ async def write_raw_settings(body: _RawSettingsBody, session: SessionDep, reques
     path writes settings (onboarding, OAuth token refresh, etc.)."""
     # Writing the dotenv lands provider secrets on disk and syncs them into
     # global settings rows — loopback-only, and desktop-only.
-    require_local_tenancy()
-    require_local(request)
 
     from cowork.migrations import sync_env_vars_to_db
 

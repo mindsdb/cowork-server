@@ -4,13 +4,18 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse as FileContentResponse
 
-from cowork.api.v1.permissions import OpenByDesign, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSessionDep
 from cowork.schemas.files import FileListResponse, FileResponse
 from cowork.services.files import FileService
 
 
-router = APIRouter(dependencies=[Depends(require(OpenByDesign))])
+# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
+# whenever org mode has no org in scope. Declaring it too makes the
+# requirement visible to a route walker instead of something only
+# discoverable by reading scoped.py.
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED, response_model=FileResponse)

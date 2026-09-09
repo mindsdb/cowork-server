@@ -4,7 +4,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from cowork.api.v1.permissions import OpenByDesign, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.common.settings.app_settings import OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.connectors import (
@@ -16,14 +16,21 @@ from cowork.schemas.connectors import (
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.specs._registry import registry
 
-router = APIRouter(dependencies=[Depends(require(OpenByDesign))])
+router = APIRouter()
 
 # Same alias as connections.py/oauth.py: the vault/relay choice is per-request
 # tenancy context, not a bare settings flag.
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
-@router.get("/", response_model=list[ConnectorMetadataResponse])
+# AuthenticatedInOrgMode, not OpenByDesign: in org mode this forwards to
+# auth_proxy.proxy_catalogue, the same "relies on the request already having
+# passed identity enforcement" shape as oauth.py/connections.py.
+@router.get(
+    "/",
+    response_model=list[ConnectorMetadataResponse],
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
 async def list_connector_specs(
     scope: ScopeDep,
     request: Request,
@@ -53,7 +60,11 @@ async def list_connector_specs(
     ]
 
 
-@router.get("/{connector_id}", response_model=ConnectorSpecResponse)
+# OpenByDesign, standalone reason: static connector registry lookup, no
+# tenant data, no secrets — identical response for every caller.
+@router.get(
+    "/{connector_id}", response_model=ConnectorSpecResponse, dependencies=[Depends(require(OpenByDesign))]
+)
 def get_connector_spec(connector_id: str):
     spec = registry.get_connector(connector_id)
     if not spec:
@@ -61,6 +72,6 @@ def get_connector_spec(connector_id: str):
     return spec
 
 
-@router.post("/match", response_model=MatchResponse)
+@router.post("/match", response_model=MatchResponse, dependencies=[Depends(require(OpenByDesign))])
 def match_connector_spec(req: MatchRequest) -> MatchResponse:
     return registry.match_connector(req.query, req.max_candidates)

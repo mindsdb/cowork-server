@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-from cowork.api.v1.permissions import OpenByDesign, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope, scoped_storage_root
 from cowork.schemas.connectors import (
@@ -38,8 +38,12 @@ router = APIRouter()
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
+# AuthenticatedInOrgMode: in org mode this forwards to auth_proxy.proxy_catalogue,
+# no DB check of its own.
+# Confirmed: auth's own /v1/oauth/catalogue view requires authentication
+# (IsAuthenticated) independently of anything cowork-server does.
 @router.get(
-    "/", response_model=list[ConnectionSummaryResponse], dependencies=[Depends(require(OpenByDesign))]
+    "/", response_model=list[ConnectionSummaryResponse], dependencies=[Depends(require(AuthenticatedInOrgMode))]
 )
 async def list_connections(scope: ScopeDep, request: Request):
     if scope.org_mode:
@@ -68,8 +72,12 @@ async def list_connections(scope: ScopeDep, request: Request):
 _ORG_CONNECTION_DETAIL_FIELDS = ("account_email", "token_type", "scope", "expires_at", "status")
 
 
+# AuthenticatedInOrgMode: in org mode this forwards to
+# auth_proxy.proxy_connection_detail, no DB check of its own.
+# Confirmed: auth's own /v1/oauth/{engine}/{name} view requires authentication
+# (IsAuthenticated) independently of anything cowork-server does.
 @router.get(
-    "/{engine}/{name}", response_model=ConnectionDetailResponse, dependencies=[Depends(require(OpenByDesign))]
+    "/{engine}/{name}", response_model=ConnectionDetailResponse, dependencies=[Depends(require(AuthenticatedInOrgMode))]
 )
 async def get_connection(engine: str, name: str, scope: ScopeDep, request: Request):
     if scope.org_mode:
@@ -162,8 +170,12 @@ def _persist_direct_connection(
     return {"ok": True, "name": slug, "label": slug, "user_label": user_label}
 
 
+# AuthenticatedInOrgMode: in org mode this forwards to auth_proxy.proxy_delete,
+# no DB check of its own.
+# Confirmed: auth's own /v1/oauth/{engine}/{name} view requires authentication
+# (IsAuthenticated) independently of anything cowork-server does.
 @router.delete(
-    "/{engine}/{name}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require(OpenByDesign))]
+    "/{engine}/{name}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require(AuthenticatedInOrgMode))]
 )
 async def delete_connection(engine: str, name: str, scope: ScopeDep, request: Request):
     if scope.org_mode:
@@ -232,7 +244,11 @@ def patch_connection_token(engine: str, name: str, body: PatchTokenBody, scope: 
     return {"ok": True}
 
 
-@router.patch("/{engine}/{name}/picked-files", dependencies=[Depends(require(OpenByDesign))])
+# AuthenticatedInOrgMode: in org mode this forwards to auth_proxy.proxy_picked_files,
+# no DB check of its own.
+# Confirmed: auth's own /v1/oauth/{engine}/{name}/picked-files view requires
+# authentication (IsAuthenticated) independently of anything cowork-server does.
+@router.patch("/{engine}/{name}/picked-files", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def patch_picked_files(engine: str, name: str, body: PatchPickedFilesBody, scope: ScopeDep, request: Request):
     """Merge Google-Picker-granted files into the connection's persisted
     `_picked_files` list. Called right after the user picks files —

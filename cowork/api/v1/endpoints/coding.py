@@ -113,6 +113,9 @@ from cowork.services.providers import cached_minds_models
 from cowork.services.settings import SettingService
 from cowork.services.skills import CodeSkillService
 
+# OpenByDesign, standalone reason: require_local + require_local_tenancy make
+# this desktop-and-loopback-only; there is no multi-tenant identity concept 
+# to check here.
 router = APIRouter(
     dependencies=[Depends(require_local), Depends(require_local_tenancy), Depends(require(OpenByDesign))]
 )

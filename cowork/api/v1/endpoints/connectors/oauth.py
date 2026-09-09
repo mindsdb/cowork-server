@@ -6,7 +6,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, sta
 from fastapi.responses import HTMLResponse
 
 from cowork.api.v1.endpoints.guards import require_local
-from cowork.api.v1.permissions import OpenByDesign, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.connectors import OAuthStartRequest, OAuthStartResponse, PickerTokenResponse
@@ -30,11 +30,16 @@ router = APIRouter()
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
+# AuthenticatedInOrgMode: in org mode this forwards to auth_proxy.proxy_start,
+# which relies on the caller already being identified — there's no DB check
+# of its own to fall back on here.
+# Confirmed: auth's own /v1/oauth/{service}/start view requires authentication
+# (IsAuthenticated) independently of anything cowork-server does.
 @router.post(
     "/{service}/start",
     response_model=OAuthStartResponse,
     response_model_by_alias=True,
-    dependencies=[Depends(require(OpenByDesign))],
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
 )
 async def start_oauth(service: str, request: Request, scope: ScopeDep,
                        body: OAuthStartRequest = Body(default_factory=OAuthStartRequest)):
@@ -76,14 +81,20 @@ def get_oauth_credentials(engine: str, request: Request):
     return response
 
 
-@router.get("/catalogue", dependencies=[Depends(require(OpenByDesign))])
+# AuthenticatedInOrgMode: in org mode this forwards to auth_proxy.proxy_catalogue.
+# Confirmed: auth's own /v1/oauth/catalogue view requires authentication
+# (IsAuthenticated) independently of anything cowork-server does.
+@router.get("/catalogue", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def oauth_catalogue(request: Request, scope: ScopeDep):
     if scope.org_mode:
         return await auth_proxy.proxy_catalogue(request, OAuthSettings())
     return {"items": oauth_service.get_catalogue(ConnectorSettings(), OAuthSettings(), scope=scope)}
 
 
-@router.get("/status", dependencies=[Depends(require(OpenByDesign))])
+# AuthenticatedInOrgMode: in org mode this forwards to auth_proxy.proxy_status.
+# Confirmed: auth's own /v1/oauth/status view requires authentication
+# (IsAuthenticated) independently of anything cowork-server does.
+@router.get("/status", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def oauth_status(request: Request, scope: ScopeDep, state: str = Query(...)):
     settings = OAuthSettings()
     if scope.org_mode:
@@ -112,7 +123,9 @@ def _require_picker_engine(engine: str, *, org_mode: bool) -> None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No file picker for engine {engine!r}")
 
 
-@router.post("/{engine}/picker/session", dependencies=[Depends(require(OpenByDesign))])
+# AuthenticatedInOrgMode: org-mode-only surface (_require_picker_engine 404s
+# outside org mode), no DB check of its own.
+@router.post("/{engine}/picker/session", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def create_picker_session(engine: str, scope: ScopeDep):
     """Gone: the picker is built in the SPA now, so there is no session to
     mint. Answers 410 rather than 404 so a tab still running the previous
@@ -124,10 +137,14 @@ async def create_picker_session(engine: str, scope: ScopeDep):
     )
 
 
+# AuthenticatedInOrgMode: forwards to auth_proxy.proxy_token, no DB check of
+# its own.
+# Confirmed: auth's own /v1/oauth/{engine}/token view requires authentication
+# (IsAuthenticated) independently of anything cowork-server does.
 @router.post(
     "/{engine}/picker/token",
     response_model=PickerTokenResponse,
-    dependencies=[Depends(require(OpenByDesign))],
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
 )
 async def mint_picker_token(engine: str, request: Request, scope: ScopeDep, body: dict = Body(default_factory=dict)):
     """Org-mode only. Returns a live Drive access token to the caller's own
