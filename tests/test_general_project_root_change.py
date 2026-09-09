@@ -198,30 +198,13 @@ def test_the_default_guard_still_declines_a_populated_directory(
     assert Path(project.path).resolve() == populated.resolve()
 
 
-@pytest.fixture()
-def restore_seeded_general():
-    """The run's shared database seeds `general` once, so re-pointing it through
-    the route would leak into every later test."""
-    from cowork.common.settings.app_settings import get_app_settings
-    from cowork.db.session import get_engine
-
-    shared = get_engine(get_app_settings().database.uri)
-    with Session(shared) as read:
-        original = read.get(Project, GENERAL_PROJECT_ID).path
-    yield
-    with Session(shared) as write:
-        row = write.get(Project, GENERAL_PROJECT_ID)
-        row.path = original
-        write.add(row)
-        write.commit()
-
-
-def test_the_artifacts_routes_agree_after_the_root_moves(
-    roots, restore_seeded_general, monkeypatch
-):
+def test_the_artifacts_routes_agree_after_the_root_moves(roots, monkeypatch):
     """Through HTTP, not the resolver. Neither artifacts route provisions the
     default project, so the resolver tests above cannot show that the re-point
     is reachable from a request.
+
+    This re-points the run's shared seeded row; `keep_seeded_general_path` in
+    conftest puts it back.
     """
     _, new = roots
     _point_at(monkeypatch, new)

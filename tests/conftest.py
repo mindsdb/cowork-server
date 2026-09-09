@@ -59,6 +59,37 @@ def db_schema():
 
 
 @pytest.fixture(autouse=True)
+def keep_seeded_general_path():
+    """Put the seeded ``general`` row's path back after each test.
+
+    The row is seeded once for the whole run, but the default-project resolver
+    re-points it onto whatever ``COWORK_PROJECTS_DIR`` currently names. A test
+    that moves the root and then reaches a route therefore leaves the row
+    pointing inside its own ``tmp_path``, which pytest deletes, and every later
+    test that resolves ``general`` from settings instead of from the row sees
+    the two disagree.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.session import get_engine
+    from cowork.models.project import Project
+    from cowork.services.projects import GENERAL_PROJECT_ID
+
+    engine = get_engine(get_app_settings().database.uri)
+    with Session(engine) as read:
+        seeded = read.get(Project, GENERAL_PROJECT_ID)
+        original = seeded.path if seeded is not None else None
+    yield
+    if original is None:
+        return
+    with Session(engine) as write:
+        row = write.get(Project, GENERAL_PROJECT_ID)
+        if row is not None and row.path != original:
+            row.path = original
+            write.add(row)
+            write.commit()
+
+
+@pytest.fixture(autouse=True)
 def close_coding_services():
     yield
     from coding_service_fakes import close_services
