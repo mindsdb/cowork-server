@@ -114,7 +114,9 @@ def test_local_comments_id_is_canonical_before_identity_lookup(monkeypatch):
     value = uuid4()
     seen = {}
     monkeypatch.setattr(comments, "_org_mode", lambda: False)
-    monkeypatch.setattr(comments, "artifacts_sources_for_scan", lambda: [])
+    monkeypatch.setattr(
+        comments, "artifacts_sources_for_desktop_paths", lambda _session=None: []
+    )
 
     def resolve(_sources, artifact_id):
         seen["artifact_id"] = artifact_id
