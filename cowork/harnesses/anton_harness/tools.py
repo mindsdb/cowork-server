@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 import uuid
@@ -30,11 +31,31 @@ import uuid
 logger = logging.getLogger(__name__)
 
 
+@contextmanager
+def _desktop_scope():
+    """A local scoped session for the desktop publish path.
+
+    The publish service resolves an artifact through the project row so a folder
+    the user chose is addressable, and this tool runs outside any request, so it
+    has to open its own. Desktop only: org publishing goes through the turn key
+    and never reaches these helpers.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+    from cowork.db.session import get_engine, get_session_factory
+
+    factory = get_session_factory(get_engine(get_app_settings().database.uri))
+    with factory() as session:
+        yield ScopedSession(session, LOCAL_SCOPE)
+
+
 def _published_state(raw_path: str) -> dict:
     """Delegate to the publish service so the tool and GUI agree on where
     `.published.json` lives. Imported lazily to avoid a startup import cycle."""
     from cowork.services.publish import published_state
-    return published_state(raw_path)
+
+    with _desktop_scope() as session:
+        return published_state(raw_path, session)
 
 
 def _publish_artifact(raw_path: str, access: dict | None = None) -> dict:
@@ -45,7 +66,10 @@ def _publish_artifact(raw_path: str, access: dict | None = None) -> dict:
     """
     from cowork.services.publish import desktop_publish_context, publish_artifact
 
-    artifact, artifacts_base, api_key, publish_url = desktop_publish_context(raw_path)
+    with _desktop_scope() as session:
+        artifact, artifacts_base, api_key, publish_url = desktop_publish_context(
+            raw_path, session
+        )
     return publish_artifact(
         artifact, artifacts_base=artifacts_base,
         api_key=api_key, publish_url=publish_url, access=access,
@@ -57,7 +81,9 @@ def _published_owner_state(raw_path: str) -> dict:
     tool can preserve prior access on re-publish. Lazily imported to avoid a
     startup import cycle."""
     from cowork.services.publish import published_owner_state
-    return published_owner_state(raw_path)
+
+    with _desktop_scope() as session:
+        return published_owner_state(raw_path, session)
 
 
 def _access_from_state(entry: dict) -> dict:

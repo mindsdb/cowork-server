@@ -446,3 +446,37 @@ def test_a_fullstack_backend_can_launch_from_a_chosen_folder(
     # It fails at the backend script instead, which is a stage past resolution.
     assert "backend script not found" in (payload.get("launchError") or "")
     assert artifacts_service._resolve_project_root(artifact) is None
+
+
+# -- the agent's own publish tool --------------------------------------------
+
+
+def test_the_agent_publish_tool_resolves_a_chosen_folder(
+    projects_root, tmp_path, monkeypatch
+):
+    """Not one of the routes, but the same refusal: the tool the agent calls
+    after writing an artifact runs outside any request and so held no session,
+    leaving the agent unable to publish what it had just written."""
+    from cowork.harnesses.anton_harness import tools
+    from cowork.services import publish as publish_service
+
+    seen = {}
+
+    def _fake_publish(artifact, *, artifacts_base, api_key, publish_url, access=None):
+        seen["artifact"] = Path(artifact)
+        seen["base"] = Path(artifacts_base)
+        return {"view_url": "https://4nton.ai/a/uuid-tool"}
+
+    monkeypatch.setattr(publish_service, "publish_artifact", _fake_publish)
+    monkeypatch.setattr(
+        publish_service, "desktop_publish_credential", lambda: ("key", "https://4nton.ai")
+    )
+
+    client = _client()
+    _project, folder, artifact = _adopted(client, tmp_path, "routes-agent-tool")
+
+    result = tools._publish_artifact(str(artifact / "index.html"))
+
+    assert result["view_url"] == "https://4nton.ai/a/uuid-tool"
+    assert seen["artifact"] == (artifact / "index.html").resolve()
+    assert seen["base"] == (folder / ".anton" / "artifacts").resolve()
