@@ -371,3 +371,33 @@ def test_published_state_still_returns_the_blank_default_when_the_database_error
         "published": False,
     }
     assert published_owner_state(str(primary), _scoped(engine)) == {}
+
+
+def test_a_relative_path_in_two_roots_is_reported_as_ambiguous(engine, tmp_path):
+    """The one behavior change an allocated project can see. Widening the root
+    set widens this ambiguity: a relative path that matched one root before can
+    match two once any folder is adopted, and the caller is told to send an
+    absolute path rather than being handed an arbitrary one of them."""
+    from cowork.services.artifacts import resolve_artifact_path
+
+    # The service holds the session; letting it go detaches the row.
+    svc = ProjectService(_scoped(engine))
+    allocated = svc.create_project("reports")
+    allocated_dash = _artifacts_dir(Path(allocated.path)) / "dash"
+    allocated_dash.mkdir()
+    (allocated_dash / "index.html").write_text("<html></html>")
+
+    adopted = tmp_path / "Documents" / "old-work"
+    adopted.mkdir(parents=True)
+    adopted_dash = _artifacts_dir(adopted) / "dash"
+    adopted_dash.mkdir()
+    (adopted_dash / "index.html").write_text("<html></html>")
+    ProjectService(_scoped(engine)).create_project("old-work", path=adopted)
+
+    with pytest.raises(ValueError, match="multiple project artifact roots"):
+        resolve_artifact_path("dash/index.html", session=_scoped(engine))
+
+    # Without the adopted root in play the same relative path still resolves.
+    assert resolve_artifact_path("dash/index.html") == (
+        allocated_dash / "index.html"
+    ).resolve()
