@@ -239,12 +239,12 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
     return publish_url, api_key
 
 
-def list_publishable() -> dict:
+def list_publishable(session=None) -> dict:
     settings = get_user_settings()
     state = _load_state()
     publish_url, api_key = _resolve_publish_endpoint(settings)
     return {
-        "artifacts": html_artifacts(),
+        "artifacts": html_artifacts(session),
         "publishReady": bool(api_key),
         "publishUrl": publish_url,
         "history": state.get("publish_history", [])[:40],
