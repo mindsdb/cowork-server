@@ -320,3 +320,49 @@ def test_the_publishable_list_includes_a_chosen_folder(projects_root, tmp_path):
     assert res.status_code == 200, res.text
     listed = [Path(a["path"]) for a in res.json()["artifacts"]]
     assert any(p.name == "index.html" and "routes-publishable" in str(p) for p in listed)
+
+
+def test_the_project_path_list_is_not_empty_for_a_chosen_folder(projects_root, tmp_path):
+    """Older desktop builds address the list by path. It returned 200 with an
+    empty body, so the project read as having produced nothing at all."""
+    client = _client()
+    project, folder, _artifact = _adopted(client, tmp_path, "routes-bypath")
+
+    res = client.get("/api/v1/artifacts/", params={"project_path": str(folder)})
+
+    assert res.status_code == 200, res.text
+    cards = res.json()
+    assert [c["title"] for c in cards] == ["Adopted dashboard"]
+    assert cards[0]["serveUrl"] == (
+        f"/api/v1/artifacts/serve/{project['name']}/dash/index.html"
+    )
+
+
+def test_the_project_path_list_carries_the_row_name_not_the_basename(
+    projects_root, tmp_path
+):
+    """Adopting a folder whose basename is already taken gives a row name that
+    differs from it, and the serve URL has to follow the row rather than the
+    directory the artifacts happen to sit in."""
+    client = _client()
+    taken = client.post("/api/v1/projects/", json={"name": "routes-clash"})
+    assert taken.status_code == 201, taken.text
+
+    folder = tmp_path / "elsewhere" / "routes-clash"
+    folder.mkdir(parents=True)
+    _artifact_in(folder)
+    created = client.post(
+        "/api/v1/projects/", json={"name": "routes-clash-2", "path": str(folder)}
+    )
+    assert created.status_code == 201, created.text
+    project_name = created.json()["name"]
+    assert project_name != folder.name
+
+    res = client.get("/api/v1/artifacts/", params={"project_path": str(folder)})
+
+    assert res.status_code == 200, res.text
+    cards = res.json()
+    assert len(cards) == 1
+    assert cards[0]["serveUrl"] == (
+        f"/api/v1/artifacts/serve/{project_name}/dash/index.html"
+    )
