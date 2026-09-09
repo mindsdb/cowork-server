@@ -12,11 +12,13 @@ from pathlib import Path
 from uuid import uuid4
 
 import pytest
+from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.models.project import Project
+from cowork.server import create_app
 from cowork.services.artifact_roots import (
     artifacts_sources_for_project,
     artifacts_sources_for_scope,
@@ -194,3 +196,63 @@ def test_the_default_guard_still_declines_a_populated_directory(
     ProjectService(session)._repoint_if_stale(project)
 
     assert Path(project.path).resolve() == populated.resolve()
+
+
+@pytest.fixture()
+def restore_seeded_general():
+    """The run's shared database seeds `general` once, so re-pointing it through
+    the route would leak into every later test."""
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.session import get_engine
+
+    shared = get_engine(get_app_settings().database.uri)
+    with Session(shared) as read:
+        original = read.get(Project, GENERAL_PROJECT_ID).path
+    yield
+    with Session(shared) as write:
+        row = write.get(Project, GENERAL_PROJECT_ID)
+        row.path = original
+        write.add(row)
+        write.commit()
+
+
+def test_the_artifacts_routes_agree_after_the_root_moves(
+    roots, restore_seeded_general, monkeypatch
+):
+    """Through HTTP, not the resolver. Neither artifacts route provisions the
+    default project, so the resolver tests above cannot show that the re-point
+    is reachable from a request.
+    """
+    _, new = roots
+    _point_at(monkeypatch, new)
+
+    # base_url sets scope["server"], which the chosen-folder gate reads.
+    client = TestClient(
+        create_app(), base_url="http://127.0.0.1:26866", client=("127.0.0.1", 54321)
+    )
+    listed = client.get("/api/v1/projects/")
+    assert listed.status_code == 200, listed.text
+    general = next(p for p in listed.json() if p["name"] == GENERAL_PROJECT)
+    assert Path(general["path"]).parent.resolve() == new.resolve()
+
+    _write_artifact(
+        Path(general["path"]) / ".anton" / "artifacts", "moved-dash", "Moved dashboard"
+    )
+
+    by_id = client.get(f"/api/v1/artifacts/?project_id={general['id']}")
+    assert by_id.status_code == 200, by_id.text
+    unfiltered = client.get("/api/v1/artifacts/")
+    assert unfiltered.status_code == 200, unfiltered.text
+
+    # The unparameterized listing spans every project in the shared database,
+    # so it is checked for containment; the resolver tests pin equality.
+    assert {c["title"] for c in by_id.json()} == {"Moved dashboard"}
+    card = next(c for c in by_id.json() if c["title"] == "Moved dashboard")
+    twin = next(c for c in unfiltered.json() if c["title"] == "Moved dashboard")
+
+    # The panel resolved a serve URL through the scan, which cannot see a stale
+    # root, so a stale row served every card an unusable URL.
+    assert card["serveUrl"] == twin["serveUrl"]
+    served = client.get(card["serveUrl"])
+    assert served.status_code == 200, served.text
+    assert served.text == "<html></html>"
