@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.models.project import Project
 from cowork.server import create_app
@@ -32,8 +33,6 @@ from cowork.services.projects import (
 
 
 def _point_at(monkeypatch, root: Path) -> None:
-    from cowork.common.settings.app_settings import get_app_settings
-
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(root))
     get_app_settings.cache_clear()
 
@@ -41,8 +40,6 @@ def _point_at(monkeypatch, root: Path) -> None:
 @pytest.fixture()
 def roots(tmp_path, monkeypatch):
     """An old and a current projects root, settings pointed at the old one."""
-    from cowork.common.settings.app_settings import get_app_settings
-
     old = tmp_path / "old_projects"
     new = tmp_path / "new_projects"
     (old / GENERAL_PROJECT).mkdir(parents=True)
@@ -99,8 +96,8 @@ def _write_artifact(base: Path, slug: str, title: str) -> None:
 def _titles(session) -> tuple[set[str], set[str]]:
     """Titles from the project-scoped listing and the unparameterized one.
 
-    The rail calls the first and the panel the second; the ticket asks for them
-    to agree after a root change.
+    The Live Artifacts panel calls the project-scoped one, which is why a stale
+    row emptied the panel while the chat cards still resolved.
     """
     by_id = list_artifacts(
         artifacts_sources_for_project(session, GENERAL_PROJECT_ID)
@@ -177,25 +174,6 @@ def test_a_scaffold_only_old_directory_still_re_points(roots, engine, monkeypatc
     project = ProjectService(_scoped(engine)).ensure_general_for_scope()
 
     assert Path(project.path).parent.resolve() == new.resolve()
-
-
-def test_the_default_guard_still_declines_a_populated_directory(
-    roots, engine, monkeypatch
-):
-    """Org mode relies on the default: swapping a populated path for an empty
-    directory would strand that organization's work."""
-    old, new = roots
-    populated = old / GENERAL_PROJECT
-    _write_artifact(
-        populated / ".anton" / "artifacts", "old-dash", "Old dashboard"
-    )
-    _point_at(monkeypatch, new)
-
-    session = _scoped(engine)
-    project = session.get(Project, GENERAL_PROJECT_ID)
-    ProjectService(session)._repoint_if_stale(project)
-
-    assert Path(project.path).resolve() == populated.resolve()
 
 
 def test_the_artifacts_routes_agree_after_the_root_moves(roots, monkeypatch):

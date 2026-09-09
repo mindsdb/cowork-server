@@ -62,12 +62,15 @@ def db_schema():
 def keep_seeded_general_path():
     """Put the seeded ``general`` row's path back after each test.
 
-    The row is seeded once for the whole run, but the default-project resolver
-    re-points it onto whatever ``COWORK_PROJECTS_DIR`` currently names. A test
-    that moves the root and then reaches a route therefore leaves the row
-    pointing inside its own ``tmp_path``, which pytest deletes, and every later
-    test that resolves ``general`` from settings instead of from the row sees
-    the two disagree.
+    The default-project resolver writes on a read path: it re-points this row
+    onto whatever ``COWORK_PROJECTS_DIR`` currently names, so a test that moves
+    the root and then reaches a route leaves the row inside its own
+    ``tmp_path``, which pytest deletes. Later tests that resolve ``general``
+    from settings rather than from the row then disagree with it.
+
+    This repairs leakage only, at teardown. The write itself is asserted in
+    tests/test_general_project_root_change.py, so hiding it here costs no
+    coverage.
     """
     from cowork.common.settings.app_settings import get_app_settings
     from cowork.db.session import get_engine
