@@ -16,7 +16,7 @@ import asyncio
 import json
 import logging
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -29,6 +29,9 @@ class _RecBuffer:
     def __init__(self) -> None:
         self.frames: list[str] = []
         self.closed: str | None = None
+        # The seal reads this to decide whether the turn already terminated;
+        # without it the guard takes its getattr default and never fires.
+        self.is_closed = False
 
     @property
     def latest_seq(self) -> int:
@@ -40,6 +43,7 @@ class _RecBuffer:
 
     async def close(self, reason, extra=None):
         self.closed = reason
+        self.is_closed = True
 
 
 def _failing_handler(monkeypatch, saved: dict, exc: Exception):
@@ -142,6 +146,12 @@ def test_a_curated_inprocess_failure_carries_the_id_too(monkeypatch):
     payload = _failed_payload(saved)
     assert payload["code"] != "anton_error"
     assert payload["request_id"]
+    # The id is set after five branches that each REASSIGN extra, so assert the
+    # curated affordances survive beside it: a reorder in either direction then
+    # fails here instead of silently dropping one of the two. Keys, not values —
+    # both depend on which provider the settings resolve to.
+    assert "reconnectable" in payload
+    assert "provider_label" in payload
 
 
 @pytest.mark.parametrize("attrs, expected", [
@@ -163,6 +173,24 @@ def test_formatter_renders_the_request_context(attrs, expected):
         setattr(record, key, value)
 
     assert formatter.format(record) == f"cowork.test{expected} turn failed"
+
+
+def test_a_turn_that_escapes_every_except_seals_with_the_same_id(monkeypatch):
+    # A BaseException misses both except clauses, so the buffer is never
+    # closed and the finally-seal is the only thing that terminates the
+    # stream. That frame is the user's sole reference for the worst failure
+    # the path has.
+    saved: dict = {}
+    handler = _failing_handler(monkeypatch, saved, KeyboardInterrupt())
+    buffer = _RecBuffer()
+
+    with pytest.raises(KeyboardInterrupt):
+        _run(handler, buffer)
+
+    assert buffer.closed == "error"
+    sealed = json.loads(buffer.frames[-1].split("data: ", 1)[1])
+    assert sealed["code"] == "anton_error"
+    UUID(sealed["request_id"])
 
 
 def test_the_console_formatter_renders_the_request_context(monkeypatch):
