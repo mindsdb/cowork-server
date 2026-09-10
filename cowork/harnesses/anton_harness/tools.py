@@ -853,8 +853,8 @@ def build_cowork_label_connection_tool():
 
 # Anton has no native skill-write tool; before this, the skill-creator flow was
 # prompt-only, so editing an existing skill let the agent hunt down and mutate
-# the live store in place. This tool gives anton the same structured draft-claim
-# hermes has: it stages the skill under `.anton/skill_drafts/` (surfaced as a
+# the live store in place. This tool gives anton a structured draft-claim:
+# it stages the skill under `.anton/skill_drafts/` (surfaced as a
 # card, never auto-saved) and, when a skill of that name is already saved,
 # pre-seeds the folder with its stored contents so an edit starts from — and
 # Save upserts back — the saved version.

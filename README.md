@@ -14,8 +14,6 @@ uv tool install cowork-server
 cowork-server
 ```
 
-The Hermes harness is an optional extra: `uv tool install 'cowork-server[hermes]'`. It cannot be installed alongside anton-agent 2.26.9.3.1rc2 or later because hermes-agent pins openai 2.x and anton needs openai 3.x.
-
 The server starts on `http://127.0.0.1:26866`. Confirm with:
 
 ```sh
@@ -27,8 +25,6 @@ curl http://127.0.0.1:26866/api/v1/health/
 ```sh
 # Run from source (auto-manages virtualenv + deps)
 uv run cowork-server
-# With the Hermes harness
-uv run --extra hermes cowork-server
 ```
 
 When running alongside the Electron app in dev mode, the app spawns the server automatically — no manual start needed. The Electron app looks for a sibling `cowork-server/` directory by convention (override with `COWORK_SERVER_DIR`).
@@ -102,14 +98,14 @@ cowork/
   schemas/            # Pydantic request/response schemas
   db/                 # Database session and migrations
   common/             # Shared utilities, settings
-  harnesses/          # Agent adapters (Anton, Hermes, etc.)
+  harnesses/          # Agent adapters (Anton)
 ```
 
 The server is designed to be **agent-agnostic** — core features (projects, conversations, files) are shared across agents, while agent-specific behavior lives in harness adapters. See [docs/DESIGN.md](docs/DESIGN.md) for the full architectural rationale.
 
 ### Harness system
 
-A **harness** adapts an external agent library (Anton, Hermes, etc.) to the cowork-server interface. All harnesses implement the `HarnessProvider` protocol (`harnesses/base.py`), which exposes streaming responses, skill sync, and memory operations. The active harness is selected via the `harness` user setting. To add a new agent, implement the protocol and register it with the `@register` decorator.
+A **harness** adapts an external agent library (Anton today) to the cowork-server interface. All harnesses implement the `HarnessProvider` protocol (`harnesses/base.py`), which exposes streaming responses, skill sync, and memory operations. The active harness is selected via the `harness` user setting. To add a new agent, implement the protocol and register it with the `@register` decorator.
 
 ### Streaming & scheduling
 
@@ -618,14 +614,13 @@ Environment variables fall into two namespaces:
 | `COWORK_VAULT_DIR` | `~/.cowork/data-vault` | Connector credential vault |
 | `COWORK_HUB_WORKSPACES_FORCE_ON` | `false` | Development override that turns the MindsHub workspace surfaces on where no Statsig rule targets you. ON only, so it can never switch them off and never escape the kill switch. The switch itself is auth's `authorization_ui` gate; see "The MindsHub workspace selector" above. Never set in a deployed environment. |
 
-**Harness-level** (`ANTON_*`, `HERMES_*`) — configure a specific agent harness. These are read by the harness adapter, not by cowork-server core. They use the harness prefix because the upstream agent libraries (anton, hermes-agent) define them:
+**Harness-level** (`ANTON_*`) — configure a specific agent harness. These are read by the harness adapter, not by cowork-server core. They use the harness prefix because the upstream agent library (anton) defines them:
 
 | Variable | Harness | Description |
 |----------|---------|-------------|
 | `ANTON_PUBLISH_URL` | Anton | Artifact publish endpoint |
 | `ANTON_SKILLS_ROOT_DIR` | Anton | Skill file storage |
 | `ANTON_GLOBAL_MEMORY_ROOT_DIR` | Anton | Global memory files |
-| `HERMES_HOME` / `HERMES_ROOT_DIR` | Hermes | Hermes data root |
 
 In Docker/Lightsail deployments, the container also receives `ANTON_MINDS_API_KEY`, `ANTON_OPENAI_API_KEY`, etc. — these are consumed by the Anton agent library directly (not by cowork-server settings), and are injected by the provisioning lambda via cloud-init user-data.
 
