@@ -395,7 +395,7 @@ def cards_for_slugs(
     without them would fall back to the path-based endpoints, which org mode
     fails closed. Best-effort per slug: an unreadable artifact is skipped.
 
-    `lint_status_by_slug` (ENG-1204) is overlaid onto the card AFTER
+    `lint_status_by_slug` is overlaid onto the card AFTER
     `card_for_folder` builds it, never read from disk: it is the harness's
     own in-memory, per-turn verdict (`ChatSession.artifact_lint_status`),
     not a fact `metadata.json` carries. A slug absent from the mapping (or

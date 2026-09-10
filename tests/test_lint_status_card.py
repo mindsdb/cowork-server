@@ -1,5 +1,5 @@
 """`cards_for_slugs` overlays the harness's in-memory lint verdict onto the
-card it builds from disk (ENG-1204) — never read from metadata.json, since
+card it builds from disk — never read from metadata.json, since
 `ChatSession.artifact_lint_status` is per-turn and anton no longer persists
 any lint result to disk.
 """
