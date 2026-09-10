@@ -1645,10 +1645,16 @@ class ResponsesHandler:
             # unsupported image) surfaces its curated message with a 400;
             # anything else stays a generic 500 so provider internals never
             # leak. (cowork PR #156.)
+            # Minted here rather than up front like the streaming twin: this
+            # path has no seal to feed, so a successful turn needs no id.
+            corr = str(uuid4())
             friendly = friendly_turn_error(exc)
             if friendly is not None:
                 code, message = friendly
-                logger.info("[responses] user-facing turn error: %s", exc)
+                logger.info(
+                    "[responses] user-facing turn error: %s", exc,
+                    extra={"request_id": corr},
+                )
                 if code == CONTENT_RECOVERY_CODE:
                     # ENG-1992: see the streaming path's twin for the full
                     # rationale — repair the conversation's stored history
@@ -1659,24 +1665,30 @@ class ResponsesHandler:
                             "[responses] content validation error on conversation %s — "
                             "repaired %d message(s) with image content: %s",
                             conversation_id, len(repaired), exc,
+                            extra={"request_id": corr},
                         )
                     except Exception:
                         logger.exception(
                             "[responses] failed to repair conversation %s after content validation error",
-                            conversation_id,
+                            conversation_id, extra={"request_id": corr},
                         )
                 # The ladder already produced a code; carry it instead of dropping
                 # it here. Same wire shape the streaming twin emits.
                 raise HTTPException(
                     status_code=400,
-                    detail=response_failed_payload(message, code),
+                    detail=response_failed_payload(message, code, request_id=corr),
                 )
-            logger.exception("[responses] turn failed")
+            logger.exception(
+                "[responses] turn failed for conversation %s correlation_id=%s",
+                conversation_id, corr, extra={"request_id": corr},
+            )
             # Same shape as the 400 above: one body for every turn failure, so a
             # caller never has to branch on status to know how to read `detail`.
             raise HTTPException(
                 status_code=500,
-                detail=response_failed_payload(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE),
+                detail=response_failed_payload(
+                    GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
+                ),
             )
 
         assistant_text = "".join(collected_text)
