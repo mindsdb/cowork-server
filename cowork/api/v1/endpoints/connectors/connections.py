@@ -8,8 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-from cowork.api.v1.endpoints.guards import require_local
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackOnly, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope, scoped_storage_root
 from cowork.schemas.connectors import (
@@ -104,13 +103,13 @@ async def get_connection(engine: str, name: str, scope: ScopeDep, request: Reque
     return record
 
 
-# OpenByDesign, standalone reason: what protects this route is require_local
-# below — confirmed the only callers are Electron's main process and a
-# renderer path gated behind !host.isWeb, both loopback-only.
+# LoopbackOnly: the callers are Electron's main process and a renderer path
+# gated behind !host.isWeb, both over 127.0.0.1, and the route writes vault
+# credentials with no principal to attribute them to.
 @router.post(
     "/save",
     response_model=DirectSaveResponse,
-    dependencies=[Depends(require_local), Depends(require(OpenByDesign))],
+    dependencies=[Depends(require(LoopbackOnly))],
 )
 def save_connection_direct(body: DirectSaveRequest, scope: ScopeDep):
     """Persist credentials to the vault without running a probe.
@@ -122,17 +121,15 @@ def save_connection_direct(body: DirectSaveRequest, scope: ScopeDep):
     return _persist_direct_connection(body, scope, dict(body.values))
 
 
-# OpenByDesign, defensive classification: an antontron caller audit found no
-# caller anywhere (not the client, not cowork-server's own submissions flow,
-# which persists developer credentials by calling the service functions
-# directly rather than over HTTP to this route). Classified loopback-only to
-# match its sibling /save on the theory that if this is reachable at all, it
-# is by the same Electron-only flow — TODO: confirm whether this route is
-# actually dead and can be removed, or find its real caller.
+# LoopbackOnly: the caller is Code's connector setup panel
+# (cowork src/renderer/cowork/code/CodeConnectorsView.tsx, through
+# api.js validateAndSaveConnector), and Code mode only exists on desktop
+# (host.ts: codeModeAvailable = isElectron && bridge.codeModeAvailable), so
+# every call is loopback. Same restriction as its sibling /save.
 @router.post(
     "/validate-and-save",
     response_model=DirectSaveResponse,
-    dependencies=[Depends(require_local), Depends(require(OpenByDesign))],
+    dependencies=[Depends(require(LoopbackOnly))],
 )
 def validate_and_save_developer_connection(body: DirectSaveRequest, scope: ScopeDep):
     """Validate a Code developer-tool credential before storing it.
@@ -225,14 +222,10 @@ class PatchTokenBody(BaseModel):
     status: str | None = None
 
 
-# OpenByDesign, standalone reason: what protects this route is require_local
-# below — confirmed the only caller is Electron main's token-refresh.ts,
-# always loopback (the in-body 501 for org mode, below, is a second,
+# LoopbackOnly: the only caller is Electron main's token-refresh.ts, always
+# over 127.0.0.1 (the in-body 501 for org mode, below, is a second,
 # independent belt-and-suspenders check).
-@router.patch(
-    "/{engine}/{name}/token",
-    dependencies=[Depends(require_local), Depends(require(OpenByDesign))],
-)
+@router.patch("/{engine}/{name}/token", dependencies=[Depends(require(LoopbackOnly))])
 def patch_connection_token(engine: str, name: str, body: PatchTokenBody, scope: ScopeDep):
     """Partially update token fields on a vault entry.
 

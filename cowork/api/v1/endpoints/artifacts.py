@@ -25,8 +25,7 @@ from sqlmodel import Session
 
 from cowork.db.scoped import ScopedSession, ScopedSessionDep
 from cowork.db.session import get_session
-from cowork.api.v1.endpoints.guards import require_local_tenancy
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, OpenByDesign, require
 from cowork.api.v1.artifact_preview import (
     artifact_response_headers,
     html_with_comment_layer,
@@ -789,18 +788,21 @@ async def delete_artifact_for_request(
         raise HTTPException(status_code=500, detail="Could not delete artifact") from e
 
 
-# The routes below (through delete_artifact_endpoint) are OpenByDesign for a shared,
-# standalone reason: require_local_tenancy 403s them outright in org mode, so
-# they only ever run on desktop, where there is no multi-tenant identity
-# concept to check in the first place.
-@router.get("/status", dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
+# The routes below (through delete_artifact_endpoint) are DesktopOnly, which
+# IS the require_local_tenancy guard: it 403s them outright in org mode, so they only
+# ever run on desktop, where there is no multi-tenant identity concept to
+# check in the first place. /proxy is the exception and says so at its own
+# definition. A comment covering a range of routes only holds while the range
+# does; each route carries the declaration itself, so inserting one here
+# cannot inherit this paragraph by accident.
+@router.get("/status", dependencies=[Depends(require(DesktopOnly))])
 async def artifact_status(path: str = Query(..., min_length=1, max_length=4096)):
     # Cheap published/modified/access read for the preview viewer's in-place
     # refresh. Never raises for an unknown path — returns the blank default.
     return _desktop_artifact_status_for_path(path)
 
 
-@router.get("/preview", dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
+@router.get("/preview", dependencies=[Depends(require(DesktopOnly))])
 async def preview_artifact(path: str = Query(...)):
     try:
         artifact = resolve_artifact_path(path)
@@ -821,13 +823,13 @@ class _ExportBody(BaseModel):
     format: str  # 'pdf' | 'docx' | 'html'
 
 
-@router.post("/export", dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
+@router.post("/export", dependencies=[Depends(require(DesktopOnly))])
 async def export_artifact_endpoint(req: _ExportBody):
     """Convert a document artifact (markdown/HTML) to PDF/Word/HTML, writing
     the result into the same artifact folder. Returns the new file's path so
     the client can open or download it.
 
-    The route-level `require_local_tenancy` is broader than the pdf/docx refusal
+    The route-level `DesktopOnly` is broader than the pdf/docx refusal
     inside: it takes `req.path`, an absolute server path, and nothing in an org
     deployment can say which organization that path belongs to. The inner check
     stays because it is the one the direct-call tests exercise, and because it
@@ -866,7 +868,7 @@ async def export_artifact_endpoint(req: _ExportBody):
     return {"path": str(out), "filename": out.name}
 
 
-@router.post("/preview-mount", dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
+@router.post("/preview-mount", dependencies=[Depends(require(DesktopOnly))])
 async def preview_mount_endpoint(req: _PathBody, request: Request):
     try:
         artifact = resolve_artifact_path(req.path)
@@ -892,7 +894,7 @@ async def preview_mount_endpoint(req: _PathBody, request: Request):
     return payload
 
 
-@router.get("/preview-asset/{token}/{rel_path:path}", dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
+@router.get("/preview-asset/{token}/{rel_path:path}", dependencies=[Depends(require(DesktopOnly))])
 async def preview_asset(token: str, rel_path: str, request: Request):
     parent = get_preview_mount(token)
     if parent is None:
@@ -919,7 +921,7 @@ async def preview_asset(token: str, rel_path: str, request: Request):
 
 @router.get(
     "/serve/{project_name}/{file_path:path}",
-    dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))],
+    dependencies=[Depends(require(DesktopOnly))],
 )
 def serve_artifact_file(
     project_name: str,
@@ -950,7 +952,7 @@ def serve_artifact_file(
     return FileResponse(target, media_type=media_type, headers=artifact_response_headers(media_type))
 
 
-@router.post("/open", dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
+@router.post("/open", dependencies=[Depends(require(DesktopOnly))])
 async def open_artifact(req: _PathBody):
     from cowork.services.artifacts import _org_mode, _NO_EXEC_DETAIL
     # In org mode this always refuses; see _org_mode's docstring in services/artifacts.py.
@@ -1011,7 +1013,7 @@ def _resolve_reveal_path(path: str, session: ScopedSession) -> Path:
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Path is not in a known project or artifact directory")
 
 
-@router.post("/reveal", dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
+@router.post("/reveal", dependencies=[Depends(require(DesktopOnly))])
 async def reveal_artifact(req: _PathBody, session: ScopedSessionDep):
     target = _resolve_reveal_path(req.path, session)
     try:
@@ -1040,10 +1042,10 @@ async def proxy(token: str, rel_path: str, request: Request):
     `127.0.0.1:<metadata.json port>`, injects CORS, strips hop-by-hop
     headers. See `cowork.services.preview_proxy` for the body.
 
-    OpenByDesign, not `require_local_tenancy` like its siblings: the token is the
+    OpenByDesign, not `DesktopOnly` like its siblings: the token is the
     real guard here, not tenancy. `_PREVIEW_MOUNTS` (see
     `cowork.services.artifacts.get_preview_mount`) is only ever populated by
-    `/preview-mount`, which IS `require_local_tenancy`-gated — so in org mode
+    `/preview-mount`, which IS `DesktopOnly` — so in org mode
     this dict is permanently empty and any token 404s here regardless, by
     construction rather than by a declared guard.
     """
@@ -1051,7 +1053,7 @@ async def proxy(token: str, rel_path: str, request: Request):
     return await proxy_artifact_request(token, rel_path, request)
 
 
-@router.delete("/", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
+@router.delete("/", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require(DesktopOnly))])
 def delete_artifact_endpoint(path: str = Query(...)):
     try:
         from cowork.services.publish import (
