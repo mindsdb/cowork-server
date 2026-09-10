@@ -30,6 +30,13 @@ logger = logging.getLogger(__name__)
 # ENG-576 ("MindsHub failed its last test" / "Invalid API key" false-negatives).
 MINDS_PROBE_MODEL = "mindshub_air"
 
+# Marks a request as a connectivity/health-check probe so the Traces list can
+# hide it by default (ENG-2310). Read by mindshub_inference on the
+# /chat/completions path; it is our own header and means nothing to a non-Minds
+# endpoint, so it is only ever sent to a Minds host.
+MINDS_REQUEST_KIND_HEADER = "X-Minds-Request-Kind"
+MINDS_REQUEST_KIND_PROBE = "probe"
+
 
 def minds_chat_base_url(minds_url: str) -> str:
     """Derive the OpenAI-compatible chat base URL from a raw minds_url.
@@ -985,7 +992,11 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
             # false-negatives + token cost.)
             return await _chat_probe(
                 f"{chat_url}/chat/completions",
-                {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                {
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                    MINDS_REQUEST_KIND_HEADER: MINDS_REQUEST_KIND_PROBE,
+                },
                 MINDS_PROBE_MODEL,
             )
     except httpx.HTTPError as e:
@@ -1041,7 +1052,11 @@ async def validate_minds(api_key: str, base_url: str = "") -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.post(
                 f"{chat_base}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    MINDS_REQUEST_KIND_HEADER: MINDS_REQUEST_KIND_PROBE,
+                },
                 json={"model": MINDS_PROBE_MODEL, "max_tokens": 20,
                       "messages": [{"role": "user", "content": "ping"}]},
             )
@@ -1082,12 +1097,15 @@ async def validate_openai_compatible(api_key: str, base_url: str = "https://api.
                                    "messages": [{"role": "user", "content": "ping"}]}
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        # Stamp the connectivity-probe marker on the MindsHub fallback only — the
+        # same host-gated reasoning as the token cap above. It is our own header,
+        # meaningless to an arbitrary endpoint, and only MindsHub reads it to hide
+        # the probe from the Traces list (ENG-2310).
+        if is_minds_host(normalized):
+            headers[MINDS_REQUEST_KIND_HEADER] = MINDS_REQUEST_KIND_PROBE
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            r = await client.post(
-                chat_url,
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json=payload,
-            )
+            r = await client.post(chat_url, headers=headers, json=payload)
             if r.status_code in (200, 201):
                 return {"ok": True}
             msg = _provider_error_message(r)
