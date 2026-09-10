@@ -77,15 +77,12 @@ def test_require_local_rejects_non_loopback(host):
     assert exc.value.status_code == 403
 
 
-def test_reveal_key_blocks_non_local_before_db():
-    from cowork.api.v1.endpoints.settings import reveal_key
-    from cowork.db.scoped import LOCAL_SCOPE
-
-    # The guard is the first statement, so a non-local caller is rejected before
-    # the session/DB is ever touched — session=None is safe here.
-    with pytest.raises(HTTPException) as exc:
-        reveal_key("openai", session=None, scope=LOCAL_SCOPE, request=_request("203.0.113.7"))
-    assert exc.value.status_code == 403
+def test_reveal_key_blocks_non_local():
+    # require_local is a declared dependency now (not called in the handler
+    # body), so this goes through the real router — a bare handler call would
+    # no longer prove anything is enforced.
+    resp = _raw_client(local=False).get("/api/v1/settings/reveal-key/openai")
+    assert resp.status_code == 403
 
 
 def _raw_client(*, local: bool) -> "TestClient":
