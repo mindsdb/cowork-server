@@ -187,6 +187,52 @@ async def test_produce_remote_passes_project_memory_to_turnqueue(monkeypatch):
     assert captured["memory"] == expected
 
 
+@pytest.mark.asyncio
+async def test_produce_remote_passes_started_at_to_turnqueue(monkeypatch):
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    handler._remote_started_at = lambda session, conv_id: "2026-09-01T08:15:00"
+    captured = {}
+
+    async def fake_replies(**kwargs):
+        captured.update(kwargs)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(),
+        input_text="hi",
+        original_content="hi",
+        model="anton",
+        harness_id="anton",
+        buffer=_FakeBuffer(),
+    )
+
+    assert captured["started_at"] == "2026-09-01T08:15:00"
+
+
+def test_remote_started_at_reads_created_at_and_degrades_to_none(monkeypatch):
+    from datetime import datetime
+
+    class Service:
+        def __init__(self, session):
+            pass
+
+        def get_conversation(self, conv_id):
+            return SimpleNamespace(created_at=datetime(2026, 9, 1, 8, 15))
+
+    monkeypatch.setattr(responses_mod, "ConversationService", Service)
+    assert ResponsesHandler._remote_started_at(object(), uuid4()) == "2026-09-01T08:15:00"
+
+    class Missing(Service):
+        def get_conversation(self, conv_id):
+            raise ValueError("Conversation not found")
+
+    monkeypatch.setattr(responses_mod, "ConversationService", Missing)
+    assert ResponsesHandler._remote_started_at(object(), uuid4()) is None
+
+
 def test_persist_turn_memory_refetches_under_project_lock(monkeypatch):
     import cowork.services.shared_resources as shared_resources
 
