@@ -10,6 +10,7 @@ Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```sh
 # Install and run
+
 uv tool install cowork-server
 cowork-server
 ```
@@ -48,6 +49,157 @@ uv run pytest
 ```
 
 Tests use an isolated in-memory database and temporary directories — no side effects on your local `~/.cowork/` data.
+
+Post-deploy integration runs use the target cluster's self-hosted runner. Dev
+and staging obtain the fixed `cowork` test suite through auth's cluster-only
+service URL. Production must not mutate that shared `@emailsink.dev` identity
+while the fixed password remains committed. The production test path therefore
+accepts a dedicated `COWORK_TEST_API_KEY` secret, a reviewed
+`COWORK_TEST_USER_EMAIL` variable on the non-staff `@mindshub.ai` domain, and
+the immutable dedicated organization id in `COWORK_TEST_ORG_ID`. The suite
+resolves and matches that principal and organization through production auth,
+and refuses an employee-classified or Hub-admin identity before testing. A
+missing or mismatched identity fails the required prod run instead of falling
+back to provisioning or reporting skipped tests. Standing-identity mode also
+requires the test target to be exactly `https://cowork.mindshub.ai` before the
+first network call, so a changed environment file or workflow cannot send the
+production key to another origin.
+
+Do not store or use `COWORK_TEST_API_KEY` yet, or configure its paired email and
+organization id for a production run. The live `prod` GitHub Environment has no
+protection rules or deployment-branch policy. Although `publish.yml` refuses to
+enter its production build/deploy job from a non-main ref, a manually selected
+branch runs that branch's workflow text and can remove the check. Workflow code
+is therefore defense in depth, not the authority that protects an Environment
+secret.
+
+Before `COWORK_TEST_API_KEY` is stored or used, or any production evidence run
+starts, the `prod` Environment must have a nonempty required-reviewer rule with
+`prevent_self_review: true`, `can_admins_bypass: false`, and a selected-branches
+deployment policy whose only entry is the `main` branch, created as an exact
+Branch rule (no tag, wildcard, or second branch rule). Verify the live settings
+without reading any secret value:
+
+```sh
+gh api repos/mindsdb/cowork-server/environments/prod \
+  --jq '
+    [.protection_rules[]?
+      | select(.type == "required_reviewers")
+      | {
+          prevent_self_review,
+          reviewers: [.reviewers[]?
+            | {type, name: (.reviewer.login // .reviewer.slug)}]
+        }] as $required_reviewers
+    | {
+        can_admins_bypass,
+        required_reviewers: $required_reviewers,
+        deployment_branch_policy
+      }
+  '
+gh api 'repos/mindsdb/cowork-server/environments/prod/deployment-branch-policies?per_page=100' \
+  --jq '[.branch_policies[] | {name, type}]'
+```
+
+The first command must show exactly one required-reviewer rule with at least one
+named reviewer and `prevent_self_review: true`, plus `can_admins_bypass: false`,
+`protected_branches: false`, and `custom_branch_policies: true`. The second must
+print exactly `[{"name":"main","type":"branch"}]`. Only after both checks pass
+may an operator store `COWORK_TEST_API_KEY`, `COWORK_TEST_USER_EMAIL`, and
+`COWORK_TEST_ORG_ID` on that Environment. Evidence must come from a fresh
+main-branch run started after the
+protection was active, with `run_attempt: 1`; an eligible reviewer other than the
+run's `actor` and `triggering_actor` must approve its `prod` Environment gate. A
+rerun of an attempt that began before protection does not count. Keeping the
+values at Environment scope prevents non-prod jobs from receiving them, but that
+scope is safe only when these Environment controls are active.
+
+#### Nightly production read-only smoke
+
+The production nightly runs at `43 7 * * *` on `mdb-prod`. It uses the same
+guarded standing identity, but selects only
+`tests/integration/test_production_read_only.py`. That selection is GET-only:
+it reads health, conversations, schedules, files, and pins. It never
+provisions an identity and does not create conversations, schedules, files,
+artifacts, or model turns. The broad integration target excludes the
+`production_read_only` marker, so release and staging callers cannot include
+this production-only selection by accident.
+
+Failures and the next recovery use the shared engineering-channel notifier.
+The nightly is an alert, not a release gate. Review any new endpoint in
+`READ_ONLY_ENDPOINTS` together with
+`tests/test_production_read_only_workflow.py`, which rejects mutating HTTP calls
+and pins the complete request list.
+
+The unattended nightly cannot reference the existing `prod` Environment.
+That Environment must retain its required-reviewer gate for production deploys,
+and GitHub pauses every job that references such an Environment until a reviewer
+approves it. The monitor instead uses a dedicated `prod-read-only` Environment
+with unique `COWORK_PROD_READ_ONLY_API_KEY`,
+`COWORK_PROD_READ_ONLY_USER_EMAIL`, and
+`COWORK_PROD_READ_ONLY_ORG_ID` inputs. Unique names prevent a missing
+Environment value from falling back to a repository or organization credential.
+
+Before promoting this workflow to `main`, an operator must create
+`prod-read-only` with no required-reviewer or wait-timer rule and a custom
+deployment policy whose only entry is the exact `main` branch. The repository's
+`main` protection must continue to require a pull-request approval, resolve
+review conversations, and apply to administrators. These controls let the
+scheduled job start without weakening the separately protected `prod`
+Environment:
+
+```bash
+gh api --method PUT repos/mindsdb/cowork-server/environments/prod-read-only \
+  --input - <<'JSON'
+{
+  "wait_timer": 0,
+  "prevent_self_review": false,
+  "reviewers": [],
+  "deployment_branch_policy": {
+    "protected_branches": false,
+    "custom_branch_policies": true
+  }
+}
+JSON
+gh api --method POST \
+  repos/mindsdb/cowork-server/environments/prod-read-only/deployment-branch-policies \
+  -f name=main -f type=branch
+```
+
+Only after those controls exist may the operator copy the already reviewed
+standing identity into the dedicated names. The commands prompt for the secret
+and variable values and do not print them:
+
+```bash
+gh secret set COWORK_PROD_READ_ONLY_API_KEY \
+  --repo mindsdb/cowork-server --env prod-read-only
+gh variable set COWORK_PROD_READ_ONLY_USER_EMAIL \
+  --repo mindsdb/cowork-server --env prod-read-only
+gh variable set COWORK_PROD_READ_ONLY_ORG_ID \
+  --repo mindsdb/cowork-server --env prod-read-only
+```
+
+Verify policy and names without reading credential values:
+
+```bash
+gh api repos/mindsdb/cowork-server/environments/prod-read-only \
+  --jq '{protection_rules, deployment_branch_policy}'
+gh api \
+  'repos/mindsdb/cowork-server/environments/prod-read-only/deployment-branch-policies?per_page=100' \
+  --jq '[.branch_policies[] | {name, type}]'
+gh api repos/mindsdb/cowork-server/branches/main/protection \
+  --jq '{required_pull_request_reviews, enforce_admins, required_conversation_resolution}'
+gh secret list --repo mindsdb/cowork-server --env prod-read-only \
+  | rg '^COWORK_PROD_READ_ONLY_API_KEY\b'
+gh variable list --repo mindsdb/cowork-server --env prod-read-only \
+  | rg '^COWORK_PROD_READ_ONLY_(USER_EMAIL|ORG_ID)\b'
+```
+
+The Environment response must have no `required_reviewers` or `wait_timer`
+entry and must enable only custom branch policies. The branch-policy response
+must be exactly `[{"name":"main","type":"branch"}]`. The branch-protection
+response must show at least one required approval, administrator enforcement,
+and required conversation resolution. Do not dispatch or enable the schedule
+until every check passes and the cowork-server#472 prerequisite has landed.
 
 ### Logging
 
