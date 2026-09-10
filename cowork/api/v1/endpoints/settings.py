@@ -85,6 +85,10 @@ def _require_org_admin_for(keys, scope: TenantScope, principal: Principal | None
         )
 
 
+# OpenByDesign, standalone reason: SettingService masks every sensitive
+# field to null (_to_response, cowork/services/settings.py) and a caller
+# with no scope only ever sees the deployment's global fallback row, never
+# another org's config.
 @router.get("/", response_model=list[SettingResponse], dependencies=[Depends(require(OpenByDesign))])
 def list_settings(session: SessionDep, scope: ScopeDep) -> list[SettingResponse]:
     return SettingService(session, scope).list_settings()
@@ -244,6 +248,10 @@ def delete_setting(key: str, session: SessionDep, scope: ScopeDep, principal: Pr
 # ── Provider validation & testing ────────────────────────────────────
 
 
+# OpenByDesign, standalone reason: returns provider/model names and a
+# readiness flag, never a key value; a caller with no scope only sees the
+# deployment's global fallback config (SettingService.load, no scope ->
+# global rows only).
 @router.post("/validate", dependencies=[Depends(require(OpenByDesign))])
 def validate_settings(session: SessionDep, scope: ScopeDep):
     s = SettingService(session, scope).load()
@@ -257,6 +265,9 @@ def validate_settings(session: SessionDep, scope: ScopeDep):
     }
 
 
+# OpenByDesign, standalone reason: returns only a provider name and a
+# configured boolean, never a key value; same global-fallback bound as
+# validate_settings above.
 @router.get("/configured", dependencies=[Depends(require(OpenByDesign))])
 def check_configured(session: SessionDep, scope: ScopeDep):
     s = SettingService(session, scope).load()
@@ -276,6 +287,9 @@ def check_configured(session: SessionDep, scope: ScopeDep):
     return {"configured": False, "provider": ""}
 
 
+# OpenByDesign, standalone reason: a no-op in org mode (credentials are
+# org-owned there, see docstring below); only ever clears the local desktop
+# install's own credentials.
 @router.post("/logout", dependencies=[Depends(require(OpenByDesign))])
 def logout_clear_credentials(session: SessionDep, scope: ScopeDep):
     """Clear all stored credentials from the DB (desktop sign-out flow, so
@@ -290,6 +304,8 @@ def logout_clear_credentials(session: SessionDep, scope: ScopeDep):
     return {"ok": True, "deleted": deleted}
 
 
+# OpenByDesign, standalone reason: hardcoded stub response, nothing to
+# expose.
 @router.get("/install-status", dependencies=[Depends(require(OpenByDesign))])
 def install_status():
     return {"antonInstalled": True, "serverDepsReady": True}
@@ -319,6 +335,10 @@ class _TestProvidersBody(BaseModel):
     providers: Optional[list[dict[str, Any]]] = None
 
 
+# OpenByDesign for now, not a clean standalone reason: resolve_stored_key
+# below can be pinged at a caller-supplied host (mindsUrl), which is a real
+# exposure this permission alone doesn't fix. Flagged, not solved, here —
+# needs its own fix rather than a classification change.
 @router.post("/test-providers", dependencies=[Depends(require(OpenByDesign))])
 async def test_providers(session: SessionDep, scope: ScopeDep, body: _TestProvidersBody | None = None):
     """Ping the given (or all stored) providers and return connectivity results.
@@ -357,6 +377,8 @@ class _ValidateProviderBody(CamelRequest):
     model: Optional[str] = None
 
 
+# OpenByDesign, standalone reason: operates entirely on caller-supplied
+# provider/api_key/base_url/model, never a stored value.
 @router.post("/validate-provider", dependencies=[Depends(require(OpenByDesign))])
 async def validate_provider_endpoint(body: _ValidateProviderBody):
     return await validate_provider_svc(body.provider, body.api_key, body.base_url, body.model)
@@ -374,6 +396,10 @@ def _fill_missing(target: dict, extra: dict, *, skip: Optional[set[str]] = None)
         target.setdefault(key, value)
 
 
+# OpenByDesign, standalone reason: the org-mode live overlay requires both
+# the caller's own bearer and scope.org_id (fetch_org_model_catalog below);
+# with neither, this falls back to the static, non-tenant
+# RECOMMENDED_MODELS/RECOMMENDED_PAIR catalog only.
 @router.get("/recommended-models", dependencies=[Depends(require(OpenByDesign))])
 async def recommended_models(request: Request, session: SessionDep, scope: ScopeDep, refresh: bool = False):
     """Per-provider model picker options for the Settings UI.
