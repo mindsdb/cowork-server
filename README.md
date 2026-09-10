@@ -390,8 +390,9 @@ All endpoints live under `/api/v1/`. Key resource groups:
 
 ### The MindsHub workspace selector
 
-`/api/v1/hub/workspaces` backs the workspace selector at the top of the desktop
-app's sidebar. A **MindsHub Workspace** is an org-internal container that owns hub
+`/api/v1/hub/workspaces` backs the workspace selector at the bottom of Cowork's
+sidebar, which Cowork draws only when the listing carries two or more
+workspaces: one workspace means nowhere to move to. A **MindsHub Workspace** is an org-internal container that owns hub
 resources (API keys, artifacts, model entitlements) and lives in the auth
 service. It has nothing to do with the filesystem directories this repo calls
 workspaces, which is why the stored key is `hub_workspace_id`.
