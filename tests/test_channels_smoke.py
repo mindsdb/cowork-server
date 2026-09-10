@@ -689,19 +689,21 @@ def test_whatsapp_send_attachment(monkeypatch, tmp_path):
 
 
 def test_channels_harness_selection_and_pinning(monkeypatch):
-    from cowork.common.settings.user_settings import get_user_settings
+    import cowork.common.settings.user_settings as user_settings_mod
 
     anton_harness = FakeHarness()
-    hermes_harness = FakeHarness()
+    other_harness = FakeHarness()
+    registered = {"anton", "other"}
 
     def fake_get_harness(name):
         if name == "anton":
             return anton_harness
-        if name == "hermes":
-            return hermes_harness
+        if name == "other" and "other" in registered:
+            return other_harness
         raise ValueError(name)
 
     monkeypatch.setattr(runtime_mod, "get_harness", fake_get_harness)
+    monkeypatch.setattr(user_settings_mod, "_harness_options", lambda: ["anton", "other"])
 
     registry = PluginRegistry()
     load_first_party_plugins(registry)
@@ -734,33 +736,45 @@ def test_channels_harness_selection_and_pinning(monkeypatch):
         finally:
             s.close()
 
-    set_channels_harness("hermes")
+    set_channels_harness("other")
     turn(700, 200)
-    assert harnesses_of(700) == ["hermes"] and hermes_harness.inputs
+    assert harnesses_of(700) == ["other"] and other_harness.inputs
 
     # Flipping the setting must never switch an existing conversation: pinned.
     set_channels_harness("anton")
     turn(700, 201)
-    assert harnesses_of(700) == ["hermes"]
+    assert harnesses_of(700) == ["other"]
 
     # New conversations follow the current setting.
     turn(701, 202)
     assert harnesses_of(701) == ["anton"]
 
-    # Unregistered name falls back to the default rather than failing the turn.
+    # Unknown name in the setting resolves to the default rather than failing the turn.
     set_channels_harness("ghost")
     turn(702, 203)
     assert harnesses_of(702) == ["anton"]
 
+    # A conversation pinned to a harness that has since been removed keeps
+    # working on the default; its history keeps the old tag.
+    registered.discard("other")
+    turn(700, 204)
+    assert harnesses_of(700) == ["anton", "other"]
 
-def test_channel_agent_endpoint_validates_and_persists():
+
+def test_channel_agent_endpoint_validates_and_persists(monkeypatch):
     import pytest
     from fastapi import HTTPException
 
+    import cowork.api.v1.endpoints.channels as channels_ep
+    import cowork.common.settings.user_settings as user_settings_mod
     from cowork.api.v1.endpoints.channels import get_channel_agent, set_channel_agent
     from cowork.common.settings.user_settings import get_user_settings
     from cowork.schemas.channels import ChannelAgentUpdateRequest
     from cowork.services.settings import SettingService
+
+    # A second registered harness, so the switch is observable.
+    monkeypatch.setattr(channels_ep, "available_harness_ids", lambda: ["anton", "other"])
+    monkeypatch.setattr(user_settings_mod, "_harness_options", lambda: ["anton", "other"])
 
     session = get_open_session()
     scoped = ScopedSession(session, LOCAL_SCOPE)
@@ -770,11 +784,11 @@ def test_channel_agent_endpoint_validates_and_persists():
             set_channel_agent(ChannelAgentUpdateRequest(harness="ghost"), session, scoped, None)
         assert exc.value.status_code == 400
 
-        resp = set_channel_agent(ChannelAgentUpdateRequest(harness="hermes"), session, scoped, None)
-        assert resp.harness == "hermes"
-        assert "anton" in resp.options and "hermes" in resp.options
-        assert get_channel_agent(scoped).harness == "hermes"
-        assert get_user_settings().channels_harness == "hermes"
+        resp = set_channel_agent(ChannelAgentUpdateRequest(harness="other"), session, scoped, None)
+        assert resp.harness == "other"
+        assert resp.options == ["anton", "other"]
+        assert get_channel_agent(scoped).harness == "other"
+        assert get_user_settings().channels_harness == "other"
     finally:
         session.close()
 

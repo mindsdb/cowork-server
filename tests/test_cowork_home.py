@@ -15,7 +15,6 @@ from cowork.common.settings.app_settings import (
     get_app_settings,
 )
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
-from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
 
 
 def test_cowork_home_defaults_to_dot_cowork(monkeypatch):
@@ -68,8 +67,6 @@ _PER_RESOURCE_OVERRIDES = [
     "COWORK_VAULT_DIR",
     "CONNECTOR_VAULT_DIR",
     "COWORK_STREAMS_DIR",
-    "HERMES_ROOT_DIR",
-    "HERMES_HOME",
     "ANTON_SKILLS_ROOT_DIR",
 ]
 
@@ -92,7 +89,6 @@ def test_all_settings_paths_derive_from_cowork_home(monkeypatch, tmp_path):
     assert Path(StreamSettings(_env_file=None).dir) == home / "streams"
     assert Path(OAuthSettings(_env_file=None).state_path) == home / "oauth_state.json"
     assert Path(AntonHarnessSettings(_env_file=None).skills_root_dir) == home / "anton" / "skills"
-    assert Path(HermesHarnessSettings(_env_file=None).root_dir) == home / "hermes"
 
     get_app_settings.cache_clear()
 
