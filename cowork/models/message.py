@@ -36,7 +36,7 @@ class Message(BaseSQLModel, table=True):
     )
     harness: str | None = Field(
         default=None,
-        description="Harness/agent that generated this message (e.g. 'anton', 'hermes')",
+        description="Harness/agent that generated this message (e.g. 'anton', 'claude-code')",
     )
     # Authorship only — tenancy is scoped via the conversation (roots-only rule).
     created_by: str | None = Field(default=None, max_length=36, description="User who authored the message; NULL on local/desktop rows")
