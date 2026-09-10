@@ -256,7 +256,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 workspace_rel_path: str = "projects/general",
                                 correlation_id: str | None = None,
                                 llm: dict | None = None,
-                                disabled: list[dict] | None = None):
+                                disabled: list[dict] | None = None,
+                                started_at: str | None = None):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
 
     Yields turn_delta / turn_step / turn_memory in arrival order and ends with
@@ -322,6 +323,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # Absent entirely (not an empty dict) when there's nothing to
               # offer — see _mint_oauth_block's docstring for why.
               **({"oauth": oauth_block} if oauth_block else {}),
+              # Conversation creation time, ISO 8601. The pod is fresh every
+              # turn and would otherwise stamp today's date into the system
+              # prompt, changing the cached prefix at midnight.
+              **({"started_at": started_at} if started_at else {}),
               # Trace attribution for the pod (ENG-1459). The remote turn runs in
               # a scratchpad pod that has no cowork-server installed, so nothing
               # there can derive the surface, this server's version, or its
