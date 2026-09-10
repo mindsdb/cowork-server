@@ -72,6 +72,9 @@ def get_connector_spec(connector_id: str):
     return spec
 
 
+# OpenByDesign, standalone reason: registry.match_connector is a stateless
+# static-registry token match, no tenant data, no secrets — identical
+# response for every caller.
 @router.post("/match", response_model=MatchResponse, dependencies=[Depends(require(OpenByDesign))])
 def match_connector_spec(req: MatchRequest) -> MatchResponse:
     return registry.match_connector(req.query, req.max_candidates)
