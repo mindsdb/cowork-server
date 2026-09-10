@@ -6,6 +6,7 @@ Emits typed events:
     response.in_progress        (thought/tool activity, carries thought_role)
     response.output_text.delta  (assistant text deltas)
     response.answer_reset       (drop the answer so far; the next delta replaces it)
+    response.answer_restore     (a hand-back gives back the answer a reset dropped)
     response.completed          (final response object)
     response.failed             (error)
 """
