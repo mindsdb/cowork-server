@@ -2,8 +2,8 @@
 
 Who owns a published artifact on view.mindshub.ai is decided by the token used to
 upload it: `html_upload` takes `owner_keycloak_id` from the token and folds
-`md5(user_id)[:9]` into the URL. So publishing on a user's behalf requires a turn
-key minted for that user.
+`md5(user_id)[:9]` into the URL. So publishing on a user's behalf requires an artifact-publish
+key minted for that user. It grants no model execution.
 
 Three properties, each one load-bearing:
 
@@ -74,6 +74,7 @@ class PublishKey:
                 correlation_id=self._instance_id,
                 ttl_seconds=ttl,
                 settings=settings,
+                purpose="artifact_publish",
             )
         except Exception:
             logger.warning(

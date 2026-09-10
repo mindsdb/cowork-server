@@ -70,7 +70,11 @@ def test_write_sanitizes_each_component_at_the_filesystem_boundary(
         SimpleNamespace(scope=LOCAL_SCOPE),
     )
 
-    assert sanitized == ["project", "nested", "notes.txt", "nested"]
+    assert sanitized[:4] == ["project", "nested", "notes.txt", "nested"]
+    # The replacement and cleanup helpers also sanitize their direct children.
+    temporary = sanitized[4]
+    assert temporary.startswith(".cowork-file-") and temporary.endswith(".tmp")
+    assert sanitized[4:] == [temporary, "notes.txt", temporary]
     assert opened == [(base, ("nested",), {"create": True})]
     assert (base / "nested" / "notes.txt").read_text(encoding="utf-8") == "hello"
     assert result["path"] == "nested/notes.txt"

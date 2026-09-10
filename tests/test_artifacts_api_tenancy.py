@@ -765,3 +765,6 @@ async def test_desktop_project_path_that_matches_nothing_yields_nothing(
     )
 
     assert cards == []
+
+
+pytestmark = pytest.mark.usefixtures("granted_product_permissions")

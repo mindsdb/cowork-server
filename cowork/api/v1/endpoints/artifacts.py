@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlmodel import Session
 
+from cowork.services.product_permissions import require_product_permission
 from cowork.db.scoped import ScopedSession, ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.api.v1.endpoints.guards import require_local_tenancy
@@ -668,6 +669,8 @@ async def delete_artifact_for_request(
     # This helper is also called directly by internal/test code, so retain the
     # same concrete parsing boundary the HTTP adapter applies above. In
     # particular, no request-derived string can select a project path.
+    await require_product_permission(session.scope, "artifact.manage")
+
     project_id = UUID(str(project_id))
 
     # New clients address deletion by artifact id. Keep the slug fallback for

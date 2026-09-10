@@ -72,6 +72,9 @@ from cowork.db.scoped import ScopedSession, TenantScope, scope_from_principal
 from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
+from cowork.services.product_permissions import (
+    ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
+)
 from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectService
 from cowork.services.skills import SkillService
@@ -265,6 +268,8 @@ class ResponsesHandler:
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
+
+        await require_product_permission(self.scope, "product.execute")
 
         # A per-conversation harness pick (Coding Mode's composer pill)
         # overrides the account default for THIS call only — mirrors the
@@ -526,8 +531,10 @@ class ResponsesHandler:
             finally:
                 reset_trace_context(trace_token)
             return decision, turn_llm
+        except (ProductPermissionDenied, ProductPermissionUnavailable):
+            raise
         except Exception:
-            # Any gate-path failure (history query, mint, settings) fails open.
+            # Non-authorization routing failures may delegate to the agent.
             logger.exception("[responses] routing gate failed — delegating")
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
