@@ -6,8 +6,9 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Depends, Request, Response
 
+from cowork.api.v1.permissions import OpenByDesign, require
 from cowork.channels.plugin import ChannelPlugin
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, TenantScope, scope_for_org
 from cowork.db.session import get_open_session
@@ -209,6 +210,9 @@ def _add_webhook_route(
         methods=methods,
         name=f"channel_{channel_type}_webhook_{route_name or 'default'}",
         include_in_schema=False,
+        # OpenByDesign, standalone reason: verified by bridge.verify_signature
+        # above, the platform's own signature — not a Cowork principal.
+        dependencies=[Depends(require(OpenByDesign))],
     )
 
 

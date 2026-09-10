@@ -6,7 +6,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, sta
 from fastapi.responses import HTMLResponse
 
 from cowork.api.v1.endpoints.guards import require_local
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.connectors import OAuthStartRequest, OAuthStartResponse, PickerTokenResponse
@@ -56,13 +56,16 @@ async def start_oauth(service: str, request: Request, scope: ScopeDep,
     return oauth_service.start(service, OAuthSettings(), client_id=body.client_id, client_secret=body.client_secret, extra_fields=body.extra_fields)
 
 
-@router.get("/{engine}/credentials")
-def get_oauth_credentials(engine: str, request: Request):
+# OpenByDesign, standalone reason: what protects this route is require_local
+# below — returns a raw client_secret, same loopback restriction as the
+# settings reveal-key and /raw endpoints (ENG-868).
+@router.get(
+    "/{engine}/credentials",
+    dependencies=[Depends(require_local), Depends(require(OpenByDesign))],
+)
+def get_oauth_credentials(engine: str):
     """Return client_id and client_secret for a builtin-OAuth engine.
     Called by Electron main process only — never exposed to the renderer."""
-    # Returns a raw client_secret — same loopback restriction as the settings
-    # reveal-key and /raw endpoints (ENG-868).
-    require_local(request)
     service_id = _ENGINE_TO_SERVICE.get(engine)
     if service_id is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown OAuth engine: {engine!r}")
@@ -107,7 +110,11 @@ async def oauth_status(request: Request, scope: ScopeDep, state: str = Query(...
     return outcome
 
 
-@router.get("/{service}/callback", response_class=HTMLResponse)
+# OpenByDesign, standalone reason: this is the OAuth provider's own redirect
+# target (Google/GitHub send the user's browser here with code/state/error)
+# — there is no principal to check by construction, same as auth's own
+# OAuthCallbackView.
+@router.get("/{service}/callback", response_class=HTMLResponse, dependencies=[Depends(require(OpenByDesign))])
 def oauth_callback(service: str, code: str = "", state: str = "", error: str = ""):
     if service not in OAUTH_SERVICES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown OAuth service: {service!r}")

@@ -26,7 +26,7 @@ from sqlmodel import Session
 from cowork.db.scoped import ScopedSession, ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.api.v1.endpoints.guards import require_local_tenancy
-from cowork.api.v1.permissions import OpenByDesign, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.api.v1.artifact_preview import (
     artifact_response_headers,
     html_with_comment_layer,
@@ -602,7 +602,10 @@ def _desktop_artifact_status_for_path(path: str) -> dict:
     return dict(_BLANK_ARTIFACT_STATUS)
 
 
-@router.get("/")
+# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
+# whenever org mode has no org in scope.
+@router.get("/", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def list_artifacts(
     session: ScopedSessionDep,
     project_id: UUID | None = Query(default=None),
@@ -647,7 +650,12 @@ async def list_artifacts(
 
 
 
-@router.delete("/{slug}", status_code=status.HTTP_204_NO_CONTENT)
+# AuthenticatedInOrgMode, declared explicitly: same ScopedSessionDep
+# fail-closed reasoning as list_artifacts above.
+@router.delete(
+    "/{slug}", status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
 async def delete_artifact_by_slug(
     slug: str,
     session: ScopedSessionDep,
