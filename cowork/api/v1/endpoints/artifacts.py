@@ -24,7 +24,7 @@ from pydantic import BaseModel
 from sqlmodel import Session
 
 from cowork.services.product_permissions import require_product_permission
-from cowork.db.scoped import ScopedSession, ScopedSessionDep
+from cowork.db.scoped import ScopedSession, ScopedSessionDep, get_scoped_session
 from cowork.db.session import get_session
 from cowork.api.v1.endpoints.guards import require_local_tenancy
 from cowork.api.v1.artifact_preview import (
@@ -650,7 +650,9 @@ async def list_artifacts(
 @router.delete("/{slug}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_artifact_by_slug(
     slug: str,
-    session: ScopedSessionDep,
+    # Keep the dependency explicit: SAST treats the Annotated alias as an HTTP
+    # parameter, then incorrectly taints the server-owned artifact roots.
+    session: ScopedSession = Depends(get_scoped_session),
     project_id: UUID = Query(...),
 ):
     ref = _artifact_delete_ref(slug)
