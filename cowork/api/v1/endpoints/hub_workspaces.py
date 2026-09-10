@@ -7,9 +7,8 @@ A MindsHub Workspace is an org-internal container that owns hub resources and
 lives in the auth service. It is unrelated to the filesystem directories this
 repo calls workspaces; the stored key is ``hub_workspace_id`` for that reason.
 
-Cowork draws no selector today, so nothing in the app calls either route. Both
-are retained, with their tests, for when a Cowork resource is workspace-scoped
-and the surface returns. Everything below describes what they do when called.
+The listing is answered whatever its length. Whether a client draws a control
+is the client's decision, and Cowork's is to draw nothing below two rows.
 
 **This selector changes what the client shows, not what a turn is billed to.**
 Which workspace a usage row carries is decided by the credential the turn
