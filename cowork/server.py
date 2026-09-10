@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import MutableHeaders
 
+from cowork.api.v1.route_walker import undeclared_routes
 from cowork.api.v1.router import api_router as v1_router
 from starlette.responses import JSONResponse
 
@@ -322,6 +323,15 @@ def create_app() -> FastAPI:
     app.include_router(v1_router)
 
     _install_channels(app, channel_webhook_paths)
+
+    # ENG-2094: every route must declare a Permission (require(...)) so a
+    # walker can tell "open on purpose" from "someone forgot the line" — see
+    # route_walker.py and its docstring. Boot-time, not just CI, so a gap
+    # can't reach any environment undetected.
+    gaps = undeclared_routes(app)
+    if gaps:
+        names = ", ".join(f"{sorted(route.methods)} {route.path}" for route in gaps)
+        raise RuntimeError(f"routes with no declared Permission (ENG-2094): {names}")
 
     logger.info("Cowork application created successfully")
     return app
