@@ -135,13 +135,15 @@ def _cache_key(*, org_id: str, user_id: str, bearer_token: str) -> _CacheKey:
     return (_auth_v1(), org_id or "", user_id or "", digest)
 
 
-def _sweep(cache: dict[_CacheKey, tuple[Any, ...]]) -> None:
+def _sweep(cache: dict[_CacheKey, tuple[Any, ...]], *, max_ttl_s: float = _MAX_TTL_S) -> None:
     """Drop entries no TTL could still consider fresh.
 
-    Indexes the timestamp rather than unpacking, because the two caches carry
-    different tuple widths and this has to serve both.
+    Indexes the timestamp rather than unpacking, because the caches carry
+    different tuple widths and this has to serve all of them. ``max_ttl_s`` is
+    the caller's own longest TTL, so a cache on shorter TTLs than this module's
+    (``hub_usage``) is swept on its own clock rather than held to this one.
     """
-    cutoff = time.monotonic() - _MAX_TTL_S
+    cutoff = time.monotonic() - max_ttl_s
     for key in [k for k, entry in cache.items() if entry[0] < cutoff]:
         del cache[key]
 
@@ -341,3 +343,12 @@ def reset_caches_for_tests() -> None:
     """Drop both caches so each test starts from a known state."""
     _gate_cache.clear()
     _listing_cache.clear()
+
+
+# Public names for what ``hub_usage`` shares with this module: the auth
+# transport, and the per-credential cache key and sweep, so the two caches agree
+# on what a caller is. Same functions; the underscore versions stay for this
+# module's own callers.
+get_auth_json = _get_json
+cache_key = _cache_key
+sweep_cache = _sweep
