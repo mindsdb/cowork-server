@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field, StringConstraints
 from sqlmodel import Session
 from starlette.responses import JSONResponse
 
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.common.logger import setup_logging
 from cowork.db.scoped import (
     MissingTenantScopeError,
@@ -36,7 +37,14 @@ from cowork.turnqueue.redis_client import cancel_flag_key, get_redis
 
 logger = setup_logging()
 
-router = APIRouter()
+# AuthenticatedInOrgMode, declared explicitly: every route below already
+# fails closed on its own — _require_streaming_scope (this module) raises
+# MissingTenantScopeError -> 401 exactly like ScopedSession, and POST / builds
+# its own ScopedSession inside ResponsesHandler. Declaring it too makes the
+# requirement visible to a route walker instead of something only
+# discoverable by reading those fail-closed checks. options_handler carries
+# its own OpenByDesign instead, below.
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 SessionDep = Annotated[Session, Depends(get_session)]
 TenantScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
@@ -162,7 +170,9 @@ _SSE_HEADERS = {
 }
 
 
-@router.options("/")
+# OpenByDesign, standalone reason: hardcoded CORS-preflight response, no
+# identity or data involved.
+@router.options("/", dependencies=[Depends(require(OpenByDesign))])
 async def options_handler():
     return JSONResponse(
         content={"message": "OK"},
