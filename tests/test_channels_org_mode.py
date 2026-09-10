@@ -183,7 +183,9 @@ def test_set_channel_agent_write_does_not_leak_to_other_orgs(monkeypatch):
 
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
     get_app_settings.cache_clear()
-    monkeypatch.setattr(channels_ep, "available_harness_ids", lambda: ["anton", "hermes"])
+    import cowork.common.settings.user_settings as user_settings_mod
+    monkeypatch.setattr(channels_ep, "available_harness_ids", lambda: ["anton", "other"])
+    monkeypatch.setattr(user_settings_mod, "_harness_options", lambda: ["anton", "other"])
 
     session = get_open_session()
     scope_a = TenantScope(org_mode=True, org_id=ORG_A)
@@ -191,11 +193,11 @@ def test_set_channel_agent_write_does_not_leak_to_other_orgs(monkeypatch):
     admin = Principal(user_id=USER_A, org_id=ORG_A, roles=frozenset({"manage-organization"}))
     try:
         result = channels_ep.set_channel_agent(
-            ChannelAgentUpdateRequest(harness="hermes"), session, scoped_a, admin
+            ChannelAgentUpdateRequest(harness="other"), session, scoped_a, admin
         )
-        assert result.harness == "hermes"
-        assert get_user_settings(TenantScope(org_mode=True, org_id=ORG_A)).channels_harness == "hermes"
-        assert get_user_settings(TenantScope(org_mode=True, org_id=ORG_B)).channels_harness != "hermes"
+        assert result.harness == "other"
+        assert get_user_settings(TenantScope(org_mode=True, org_id=ORG_A)).channels_harness == "other"
+        assert get_user_settings(TenantScope(org_mode=True, org_id=ORG_B)).channels_harness != "other"
     finally:
         SettingService(session, scope_a).delete_setting("channels_harness")
         session.close()
