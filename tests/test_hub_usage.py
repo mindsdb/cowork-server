@@ -172,6 +172,25 @@ def test_a_missing_limit_is_still_no_grant(calls):
     assert _fetch().free_tokens.limit == 0
 
 
+def test_an_explicit_zero_limit_stays_no_grant(calls):
+    """An org auth reports as not free-grant-eligible: limit 0, and 0 it stays.
+
+    The third of the three shapes ``limit`` arrives in, and the one that pins the
+    unlimited reading from running the other way. Auth computes
+    ``effective_limit = limit if organization.free_grant_eligible else 0``, so a
+    real zero is a deliberate answer rather than a missing field, and the desktop
+    reads it as no allowance to fall back on. Were it ever to read as uncapped, a
+    caller with an empty wallet would be told MindsHub Air can carry the task and
+    every turn would fail instead.
+    """
+    calls.answers[svc.ENTITLEMENTS_PATH] = {"included_tokens": {"limit": 0, "used": 0, "remaining": 0}}
+
+    tokens = _fetch().free_tokens
+
+    assert tokens.limit == 0
+    assert tokens.remaining == 0
+
+
 def test_the_cache_is_per_caller_not_per_org(calls):
     """Two people in one org must not see each other's allowance or owner flag."""
     calls.answers[svc.ENTITLEMENTS_PATH] = ENTITLEMENTS
