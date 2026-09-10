@@ -20,13 +20,14 @@ class _FakeSession:
 
 
 def _fake_handler(monkeypatch, *, persist_turn_memory=None, remote_artifacts_context=None):
-    """Replace ResponsesHandler with a stand-in exposing only the 4 methods
+    """Replace ResponsesHandler with a stand-in exposing only the 5 methods
     remote_turn_events calls, resolved at call time like every other name here."""
     monkeypatch.setattr(remote_turn_mod, "ResponsesHandler", type(
         "FakeResponsesHandler", (), {
             "_remote_artifacts_context": staticmethod(remote_artifacts_context or (lambda s, c: None)),
             "_remote_history": staticmethod(lambda s, c: []),
             "_remote_workspace": staticmethod(lambda s, c: {}),
+            "_remote_started_at": staticmethod(lambda s, c: None),
             "_persist_turn_memory": staticmethod(persist_turn_memory or (lambda s, c, e: None)),
         },
     ))
