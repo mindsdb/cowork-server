@@ -388,18 +388,14 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/hub/workspaces` | Which MindsHub workspace this person is working in |
 | `/hub/usage` | The caller's free monthly tokens, balance, auto top up and credit spend, for the desktop's usage warnings |
 
-### The MindsHub workspaces route
+### The MindsHub workspace selector
 
-`/api/v1/hub/workspaces` answers the MindsHub workspace listing. A **MindsHub
-Workspace** is an org-internal container that owns hub resources (API keys,
-artifacts, model entitlements) and lives in the auth service. It has nothing to
-do with the filesystem directories this repo calls workspaces, which is why the
-stored key is `hub_workspace_id`.
-
-**Cowork no longer calls it.** The route backed a selector at the top of Cowork's
-sidebar. That selector is retained but drawn nowhere, because no Cowork resource
-is workspace-scoped yet. The route, everything described below, and the tests
-are unchanged. It simply has no caller in the app today.
+`/api/v1/hub/workspaces` backs the workspace selector at the bottom of Cowork's
+sidebar, which Cowork draws only when the listing carries two or more
+workspaces: one workspace means nowhere to move to. A **MindsHub Workspace** is an org-internal container that owns hub
+resources (API keys, artifacts, model entitlements) and lives in the auth
+service. It has nothing to do with the filesystem directories this repo calls
+workspaces, which is why the stored key is `hub_workspace_id`.
 
 Five things about it are worth knowing before changing it.
 
@@ -431,9 +427,8 @@ reads it from there. One gate governs the console and Cowork rather than two tha
 can disagree, and Cowork holds no Statsig client and no SDK key. Every answer
 short of a definite yes reads as off: no bearer, auth unreachable, a version of
 auth with no gates field, or the gate off. `COWORK_HUB_WORKSPACES_FORCE_ON` is an
-ON-only development override for exercising the route where no rule targets you;
-it cannot switch the route off, so it cannot escape the kill switch. It turns on
-no Cowork surface now that the app draws none.
+ON-only development override for walking the surface where no rule targets you;
+it cannot switch the surface off, so it cannot escape the kill switch.
 
 **Both caches are keyed on the credential, not just the caller.** Auth answers
 the listing and the gate per caller: an owner or admin sees every workspace in
@@ -775,7 +770,7 @@ Environment variables fall into two namespaces:
 | `COWORK_SKILLS_DIR` | `~/.cowork/skills` | Skills store root (local mode only) |
 | `COWORK_MEMORY_DIR` | `~/.cowork/memory` | Memory store root (local mode only) |
 | `COWORK_VAULT_DIR` | `~/.cowork/data-vault` | Connector credential vault |
-| `COWORK_HUB_WORKSPACES_FORCE_ON` | `false` | Development override that answers the MindsHub workspace route as enabled where no Statsig rule targets you. ON only, so it can never switch it off and never escape the kill switch. It turns on no Cowork surface, because Cowork draws none. The switch itself is auth's `authorization_ui` gate; see "The MindsHub workspaces route" above. Never set in a deployed environment. |
+| `COWORK_HUB_WORKSPACES_FORCE_ON` | `false` | Development override that turns the MindsHub workspace surfaces on where no Statsig rule targets you. ON only, so it can never switch them off and never escape the kill switch. The switch itself is auth's `authorization_ui` gate; see "The MindsHub workspace selector" above. Never set in a deployed environment. |
 
 **Harness-level** (`ANTON_*`, `HERMES_*`) — configure a specific agent harness. These are read by the harness adapter, not by cowork-server core. They use the harness prefix because the upstream agent libraries (anton, hermes-agent) define them:
 
