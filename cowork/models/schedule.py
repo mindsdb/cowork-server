@@ -1,10 +1,8 @@
-from __future__ import annotations
-
 from datetime import datetime
 from uuid import UUID
 
 import sqlalchemy as sa
-from sqlmodel import Field
+from sqlmodel import Field, Relationship
 
 from cowork.models.base import BaseSQLModel
 
@@ -21,7 +19,14 @@ class Schedule(BaseSQLModel, table=True):
         description="UTC datetime of next scheduled execution",
     )
     enabled: bool = Field(default=True, description="Whether the schedule is active")
-    project_id: UUID = Field(foreign_key="projects.id", description="Project context for execution")
+    project_id: UUID = Field(
+        sa_column=sa.Column(
+            sa.Uuid(),
+            sa.ForeignKey("projects.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        description="Project context for execution",
+    )
     model: str = Field(description="Model identifier to use for execution")
     last_run_at: datetime | None = Field(
         default=None,
@@ -38,11 +43,26 @@ class Schedule(BaseSQLModel, table=True):
     org_id: str | None = Field(default=None, index=True, max_length=36, description="Owning organization; NULL on local/desktop rows")
     created_by: str | None = Field(default=None, max_length=36, description="User who created the row; NULL on local/desktop rows")
 
+    # Deleting a schedule takes its runs with it. Delete-orphan makes the ORM
+    # issue the child DELETEs before the parent regardless of backend (SQLite
+    # runs without FK enforcement); the schedule_id ON DELETE CASCADE below is
+    # the backstop for a run the scheduler inserts concurrently under Postgres.
+    runs: list["ScheduleRun"] = Relationship(
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
+
 
 class ScheduleRun(BaseSQLModel, table=True):
     __tablename__ = "schedule_runs"
 
-    schedule_id: UUID = Field(foreign_key="schedules.id", description="Parent schedule")
+    schedule_id: UUID = Field(
+        sa_column=sa.Column(
+            sa.Uuid(),
+            sa.ForeignKey("schedules.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+        description="Parent schedule",
+    )
     started_at: datetime = Field(
         sa_type=sa.DateTime(timezone=True),  # type: ignore
         description="UTC datetime when the run started",

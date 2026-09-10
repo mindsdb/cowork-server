@@ -15,6 +15,8 @@ uv tool install cowork-server
 cowork-server
 ```
 
+The Hermes harness is an optional extra: `uv tool install 'cowork-server[hermes]'`. It cannot be installed alongside anton-agent 2.26.9.3.1rc2 or later because hermes-agent pins openai 2.x and anton needs openai 3.x.
+
 The server starts on `http://127.0.0.1:26866`. Confirm with:
 
 ```sh
@@ -26,6 +28,8 @@ curl http://127.0.0.1:26866/api/v1/health/
 ```sh
 # Run from source (auto-manages virtualenv + deps)
 uv run cowork-server
+# With the Hermes harness
+uv run --extra hermes cowork-server
 ```
 
 When running alongside the Electron app in dev mode, the app spawns the server automatically — no manual start needed. The Electron app looks for a sibling `cowork-server/` directory by convention (override with `COWORK_SERVER_DIR`).
@@ -222,6 +226,22 @@ reusable in [mindsdb/github-actions](https://github.com/mindsdb/github-actions)
 workflows: PyPI trusted publishing matches the OIDC claim on the workflow
 filename and does not support reusable workflows.
 
+### Nightly staging integration
+
+The cowork-server maintainers own the deployed integration signal and its
+staging prerequisites. [`nightly-staging-integration.yml`](.github/workflows/nightly-staging-integration.yml)
+runs every day at 06:41 UTC and can also be dispatched by hand. It calls the
+same `tests-integration.yml` reusable workflow as a deployment on `mdb-dev`,
+then reports a failure or the first recovery through the shared
+engineering-channel notifier. It is a standalone monitor and never gates a
+publish, release, or deployment.
+
+The suite may create and delete test conversations, schedules, files, and agent
+turns in staging. The fixed test tenant is reserved for the `cowork` suite, and
+the workflow sets `COWORK_REQUIRE_INTEGRATION=true` for staging so a missing
+target, identity source, replica, or port-forward fails instead of becoming a
+green skip.
+
 In the packaged Electron app, a background updater checks PyPI on every launch and upgrades automatically (with rollback on failure). See [`server-updater.ts`](https://github.com/mindsdb/cowork/blob/main/src/main/server-updater.ts) in the frontend repo.
 
 ## Architecture
@@ -252,6 +272,8 @@ A background **scheduler** loop polls the database every 30 seconds for due sche
 ## Data Layer
 
 Data lives in two places: a **SQLite database** for structured records and the **filesystem** for project files and agent workspaces. Understanding both is essential.
+
+> The `~/.cowork` paths below are the default (prod) home. The desktop app runs one of several build channels, each with its own isolated home (`~/.cowork-dev`, `~/.cowork-stable`, etc.) selected via `COWORK_HOME`. See the [Cowork frontend README → Build Channels](https://github.com/mindsdb/cowork#build-channels) for the full mapping.
 
 ### SQLite database
 
@@ -364,6 +386,7 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/settings` | User preferences and API keys |
 | `/runtime-credential` | Desktop hand-over of the MindsHub credential (write-only, loopback, local mode) |
 | `/hub/workspaces` | Which MindsHub workspace this person is working in |
+| `/hub/usage` | The caller's free monthly tokens, balance, auto top up and credit spend, for the desktop's usage warnings |
 
 ### The MindsHub workspace selector
 
@@ -563,8 +586,25 @@ answer 403 instead, because to a client already looking at the draft a 404 would
 read as deleted. The artifacts list is unaffected either way: a co-member's
 artifact never appears in it, so review starts from the link the owner shares.
 
-Both of those decide from a resolved path and the route then opens that path, so
-the decision is carried to the open rather than trusted afterwards: every
+Org-mode artifact authorization uses a separate server-owned identity. An agent
+can edit `metadata.json`, so its local UUID cannot reserve a global comment key.
+The `artifact_identities` SQL table binds each `(organization, local UUID)` to
+its immutable owner and an auth-issued canonical key. Draft grants, publishing,
+and policy deletion use that key; the comments REST/SSE proxy translates the
+unchanged local UI key through the same table. Read requests never allocate.
+Existing identities are adopted only when auth confirms a matching durable
+owner and organization binding. New issuance uses a persisted random request ID
+so concurrent calls and lost replies cannot allocate different identities.
+
+This requires auth's internal `artifact-access/claim/` and `allocate/` endpoints
+and the matching services publisher ownership checks. Apply auth's ownership
+history migration before enabling new policy writes, then deploy these clients
+with the coordinated ENG-2262 changes. Authorization failures preserve files
+and stop sharing. SQL aliases survive artifact deletion and schema downgrades;
+they are ownership history, not a cache that can be cleared during rollback.
+
+Filesystem authorization decisions start with a resolved path. The route carries
+that decision through opening the file: every
 component below the project directory is opened `O_NOFOLLOW`, and a symlink
 planted anywhere in the chain is refused. A pod mounts its own workspace
 read-write, so without that a swapped directory component between the check and

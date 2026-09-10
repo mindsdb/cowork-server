@@ -12,7 +12,7 @@ from cowork.common.logger import get_logger
 from cowork.db.session import get_open_session
 from cowork.models.schedule import Schedule
 from cowork.schedule_timing import count_missed_occurrences, next_future_occurrence
-from cowork.schemas.schedules import Cadence, RunStatus
+from cowork.schemas.schedules import Cadence, RunStatus, resolve_schedule_model
 from cowork.services.schedules import ScheduleRunService, ScheduleService
 from cowork.streaming.registry import registry
 
@@ -222,8 +222,12 @@ async def execute_schedule(
         # trigger produced a turn from timestamps.
         trigger = "manual" if is_manual else "cron"
         request = ResponsesRequest(
+            # `schedule.model` is the "default" sentinel for every task the UI
+            # creates, not a servable id. Resolve it to None so the harness
+            # applies the account's configured default models instead of
+            # overriding every role with the literal string (ENG-2353).
             input=schedule.prompt,
-            model=schedule.model,
+            model=resolve_schedule_model(schedule.model),
             stream=True,
             conversation=str(conversation_id),
             trace_tags=["scheduled_task", f"trigger:{trigger}"],
