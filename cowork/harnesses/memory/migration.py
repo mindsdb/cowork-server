@@ -1,8 +1,7 @@
 """
-This module performs a one-time migration of harness-local memory files into 
-the shared canonical store.
-At the moment this was written, only Anton and Hermes were supported as harnesses.
-As a result, only the memory files for these two harnesses are migrated.
+One-time migrations of legacy harness-local memory files into the shared
+canonical store. The Hermes source paths stay listed so an install upgrading
+straight from a pre-migration build still gets that content merged.
 """
 
 from __future__ import annotations
@@ -21,6 +20,12 @@ from cowork.models.setting import Setting
 logger = logging.getLogger(__name__)
 
 _MEMORY_MIGRATION_SENTINEL = "_memory_migrated"
+_HERMES_RETIRE_SENTINEL = "_hermes_memory_retired"
+
+_HERMES_MEMORY_FILES: list[tuple[Path, MemorySlot]] = [
+    (cowork_home() / "hermes/memories/USER.md", MemorySlot.PROFILE),
+    (cowork_home() / "hermes/memories/MEMORY.md", MemorySlot.LESSONS),
+]
 
 _MIGRATION_SOURCES: list[tuple[Path, MemorySlot]] = [
     (cowork_home() / "anton/memory/rules.md", MemorySlot.RULES),
@@ -75,19 +80,40 @@ def migrate_harness_memory_to_shared(session: Session) -> bool:
         for source, _ in entries:
             logger.info("Migrated %s → %s", source, slot.value)
 
-    # Hermes memory files block symlink creation while they exist as real files.
-    from cowork.harnesses.memory.adapter import get_memory_adapter
-
-    adapter = get_memory_adapter("hermes")
-    if adapter is not None:
-        for link_path in adapter.RUNTIME_SYMLINKS:
-            if link_path.is_file() and not link_path.is_symlink():
-                link_path.unlink()
-                logger.info(
-                    "Removed legacy Hermes memory file %s (content in canonical store)",
-                    link_path,
-                )
-
     session.add(Setting(key=_MEMORY_MIGRATION_SENTINEL, value="1"))
+    session.commit()
+    return True
+
+
+def retire_hermes_memory(session: Session) -> bool:
+    """Fold divergent Hermes memory copies into the canonical store.
+
+    On Windows without symlink permission the layout step copied the canonical
+    file into the Hermes paths, and Hermes then wrote to the copy. The Hermes
+    harness is gone, so nothing reads those copies again; append any content
+    not already in the canonical slot. Symlinks already point at the canonical
+    file and are skipped. Source files are never modified or deleted.
+    Returns True if it ran, False if the sentinel says it already did.
+    """
+    if session.exec(
+        select(Setting).where(Setting.key == _HERMES_RETIRE_SENTINEL)
+    ).first() is not None:
+        return False
+
+    store = GlobalMemoryStore()
+    for source, slot in _HERMES_MEMORY_FILES:
+        if source.is_symlink() or not source.is_file():
+            continue
+        incoming = source.read_text(encoding="utf-8")
+        if not incoming.strip():
+            continue
+        existing = store.read(slot).strip()
+        have = {p.strip() for p in existing.split("\n\n") if p.strip()}
+        new_parts = [p.strip() for p in incoming.split("\n\n") if p.strip() and p.strip() not in have]
+        if new_parts:
+            store.write(slot, "\n\n".join(([existing] if existing else []) + new_parts))
+            logger.info("Merged Hermes memory %s → %s", source, slot.value)
+
+    session.add(Setting(key=_HERMES_RETIRE_SENTINEL, value="1"))
     session.commit()
     return True
