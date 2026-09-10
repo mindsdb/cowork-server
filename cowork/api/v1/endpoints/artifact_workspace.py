@@ -1142,8 +1142,28 @@ async def serve_private_draft(
     ``Annotated[..., Query()] = False`` rather than ``= Query(False)`` so a
     direct call (the tests') gets a real ``False``, not the ``Query`` object.
     """
+    # Parse before taking basename so a path ending in a valid UUID is rejected,
+    # never silently accepted. Keep the recognized sanitizer at this filesystem
+    # boundary; SAST does not model the UUID dependency or catalog lookup.
+    if project_ref == "local":
+        project_selector = "local"
+    else:
+        try:
+            project_selector = os.path.basename(str(UUID(project_ref)))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid project",
+            ) from exc
+    try:
+        artifact_selector = os.path.basename(UUID(artifact_id).hex)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid artifact identity",
+        ) from exc
     source, folder, metadata, _is_own = review_artifact_for_request(
-        session, project_ref, artifact_id
+        session, project_selector, artifact_selector
     )
     try:
         parts = _relative_file_parts(rel_path)
