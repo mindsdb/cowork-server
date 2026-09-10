@@ -8,11 +8,24 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from cowork.api.v1.endpoints import hub_usage as ep
+from cowork.api.v1.router import api_router
 from cowork.db.scoped import TenantScope
-from cowork.principal import HEADER_HUB_CREDENTIAL
+from cowork.principal import HEADER_HUB_CREDENTIAL, Principal, get_principal
 from cowork.services import hub_usage as svc
+
+PATH = "/api/v1/hub/usage/"
+PRINCIPAL = Principal(user_id="user-a", org_id="org-a")
+
+
+def _client(principal: Principal | None) -> TestClient:
+    app = FastAPI()
+    app.include_router(api_router)
+    app.dependency_overrides[get_principal] = lambda: principal
+    return TestClient(app)
 
 ENTITLEMENTS = {
     "included_tokens": {"limit": 5_000_000, "used": 4_380_000, "remaining": 620_000},
@@ -60,6 +73,15 @@ def _clean_cache():
     svc.reset_cache_for_tests()
     yield
     svc.reset_cache_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _reset_app_settings():
+    from cowork.common.settings.app_settings import get_app_settings
+
+    get_app_settings.cache_clear()
+    yield
+    get_app_settings.cache_clear()
 
 
 @pytest.fixture
@@ -308,3 +330,47 @@ def test_the_route_answers_the_same_view_the_service_does(calls):
 
     assert view.reachable is True
     assert view.balance.usd == 8.42
+
+
+# ── permission wiring (ENG-2094): the bare-function tests above never touch
+# FastAPI's dependency graph, so they can't prove AuthenticatedInOrgMode is
+# actually declared on the route — these go through the real router instead.
+
+
+def test_route_requires_identity_in_org_mode(monkeypatch):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+
+    resp = _client(principal=None).get(PATH)
+
+    assert resp.status_code == 401
+
+
+def test_route_allows_an_authenticated_member_in_org_mode(monkeypatch):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+
+    async def _fake(path, bearer_token):
+        return {svc.ENTITLEMENTS_PATH: ENTITLEMENTS, svc.WALLET_PATH: WALLET}.get(path)
+
+    monkeypatch.setattr(svc, "get_auth_json", _fake)
+
+    resp = _client(principal=PRINCIPAL).get(
+        PATH, headers={HEADER_HUB_CREDENTIAL: "Bearer jwt-abc"}
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["balance"]["usd"] == 8.42
+
+
+def test_route_is_unchanged_in_local_mode_with_no_principal(monkeypatch):
+    # tenancy_mode defaults to "local" — no COWORK_TENANCY_MODE set.
+    async def _fake(path, bearer_token):
+        return {svc.ENTITLEMENTS_PATH: ENTITLEMENTS, svc.WALLET_PATH: WALLET}.get(path)
+
+    monkeypatch.setattr(svc, "get_auth_json", _fake)
+
+    resp = _client(principal=None).get(
+        PATH, headers={HEADER_HUB_CREDENTIAL: "Bearer jwt-abc"}
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["balance"]["usd"] == 8.42
