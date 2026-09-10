@@ -129,9 +129,9 @@ def test_inprocess_failure_puts_the_id_on_the_log_record(monkeypatch, caplog):
 
 
 def test_a_curated_inprocess_failure_carries_the_id_too(monkeypatch):
-    # The id is a log lookup key, so a failure we DO recognise should not be
-    # harder to trace. The client decides where to show it and renders it on
-    # the generic card alone.
+    # Every failure carries the id so the payload shape stays uniform, and the
+    # client renders it on the generic card alone. The log line is a separate
+    # matter: this branch logs below the floor the deployed environments run at.
     from anton.core.llm.provider import ProviderAuthError
 
     saved: dict = {}

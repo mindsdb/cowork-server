@@ -1572,10 +1572,11 @@ class ResponsesHandler:
                     logger.exception("[responses] could not resolve provider for overload error")
             # Set after the branches above, each of which REPLACES `extra`
             # rather than adding to it — seeding it earlier would survive only
-            # the unmapped path. Carried on every failure, not just that one:
-            # the id is a log lookup key, so a curated failure should not be
-            # harder to trace. The client decides where to show it, and renders
-            # it on the generic card alone.
+            # the unmapped path. Carried on every failure so the payload shape
+            # stays uniform, but only the unmapped branch logs above the
+            # WARNING floor the deployed environments run at, so a curated
+            # failure is not traceable there. The client renders it on the
+            # generic card alone, so there is nothing to quote for one anyway.
             extra["request_id"] = corr
             failed = response_failed_payload(message, code, **extra)
             await buffer.append("sse", {"sse": response_failed_sse(message, code, **extra)})
