@@ -28,7 +28,7 @@ from cowork.db.session import get_session
 from cowork.api.v1.endpoints.guards import require_local_tenancy
 from cowork.api.v1.permissions import OpenByDesign, require
 from cowork.api.v1.artifact_preview import (
-    NO_CACHE_HEADERS,
+    artifact_response_headers,
     html_with_comment_layer,
     wants_comment_layer,
 )
@@ -906,15 +906,23 @@ async def preview_asset(token: str, rel_path: str, request: Request):
         resp = await run_in_threadpool(html_with_comment_layer, target)
         if resp is not None:
             return resp
-    return FileResponse(target, media_type=media_type, headers=NO_CACHE_HEADERS)
+    return FileResponse(target, media_type=media_type, headers=artifact_response_headers(media_type))
 
 
-@router.get("/serve/{project_name}/{file_path:path}", dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
-def serve_artifact_file(project_name: str, file_path: str, request: Request):
+@router.get(
+    "/serve/{project_name}/{file_path:path}",
+    dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))],
+)
+def serve_artifact_file(
+    project_name: str,
+    file_path: str,
+    request: Request,
+    session: ScopedSessionDep,
+):
     """Serve a file from `<project>/.anton/artifacts/<file_path>` over
     HTTP. Stateless, origin-relative, frame-able so the in-app iframe
     and new-tab open both work in web deployments."""
-    base = _project_artifacts_base(project_name)
+    base = _project_artifacts_base(project_name, session)
     if base is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Unknown project")
     try:
@@ -931,7 +939,7 @@ def serve_artifact_file(project_name: str, file_path: str, request: Request):
         resp = html_with_comment_layer(target)
         if resp is not None:
             return resp
-    return FileResponse(target, media_type=media_type, headers=NO_CACHE_HEADERS)
+    return FileResponse(target, media_type=media_type, headers=artifact_response_headers(media_type))
 
 
 @router.post("/open", dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
