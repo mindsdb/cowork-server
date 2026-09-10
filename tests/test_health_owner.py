@@ -268,3 +268,31 @@ def test_health_serves_a_real_looking_id_unchanged():
 
     with patch.object(anton.analytics, "get_installation_id", return_value="a1b2c3d4e5f60718"):
         assert health._anton_install_id() == "a1b2c3d4e5f60718"
+
+
+# ─── /live: liveness that can't be taken down by a dependency ──────
+
+
+def test_live_survives_a_database_outage():
+    """The liveness probe must answer even when Postgres is unreachable — the
+    2026-09-09 incident was `/health` (which opens a DB session) wired to both
+    liveness and readiness, so a DB outage got read as "the process is dead"
+    and Kubernetes killed both replicas.
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from cowork.api.v1.endpoints import health
+
+    app = FastAPI()
+    app.include_router(health.router, prefix="/api/v1/health")
+    client = TestClient(app)
+
+    def _raise():
+        raise RuntimeError("database unreachable")
+
+    with patch.object(health, "get_user_settings", side_effect=_raise):
+        res = client.get("/api/v1/health/live")
+
+    assert res.status_code == 200
+    assert res.json() == {"status": "ok"}
