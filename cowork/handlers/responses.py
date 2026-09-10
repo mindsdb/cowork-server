@@ -32,6 +32,7 @@ from cowork.handlers.response_routing import (
 )
 from cowork.harnesses.anton_harness.stream_formatter import SkillCreated, format_responses_stream
 from cowork.streaming import TurnLifecycle, new_buffer, registry, sse_frame
+from cowork.streaming.answer_text import accumulate_answer_text
 from cowork.streaming.backend import get_backend
 from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
@@ -1036,8 +1037,7 @@ class ResponsesHandler:
             # at_ms is stamped at receipt (the pod sends no timestamps), so
             # replayed durations are approximate under consumer lag.
             collected_events.append(data)
-            if event_type == "response.output_text.delta":
-                collected_text.append(data.get("delta", ""))
+            accumulate_answer_text(collected_text, event_type, data)
 
         producer_scope: TenantScope | None = None
         producer_session: ScopedSession | None = None
@@ -1355,8 +1355,7 @@ class ResponsesHandler:
                 turn_rows[:] = data.get("rows") or []
                 return
             collected_events.append(data)
-            if event_type == "response.output_text.delta":
-                collected_text.append(data.get("delta", ""))
+            accumulate_answer_text(collected_text, event_type, data)
 
         def persist() -> None:
             nonlocal persisted
@@ -1597,8 +1596,7 @@ class ResponsesHandler:
                 turn_rows[:] = data.get("rows") or []
                 return
             collected_events.append(data)
-            if event_type == "response.output_text.delta":
-                collected_text.append(data.get("delta", ""))
+            accumulate_answer_text(collected_text, event_type, data)
 
         try:
             async for _ in self._get_harness().formatter(stream, model, event_sink):
