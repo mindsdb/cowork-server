@@ -792,7 +792,7 @@ class AppSettings(Settings):
         default="anton",
         validation_alias=AliasChoices("COWORK_CHANNELS_HARNESS"),
         description=(
-            "Harness that serves channel conversations (e.g. 'anton', 'hermes'). "
+            "Harness that serves channel conversations (e.g. 'anton'). "
             "Applies to NEW channel conversations only — existing ones stay pinned "
             "to the harness that first served them. Independent of the UI harness "
             "selection, which never applies to channels."

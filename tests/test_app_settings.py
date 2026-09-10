@@ -112,35 +112,47 @@ def test_app_settings_rejects_invalid_tenancy_mode(monkeypatch):
         AppSettings(_env_file=None)
 
 
-def test_hermes_hidden_from_harness_options_in_org_mode(monkeypatch):
+def test_single_tenant_harness_hidden_from_options_in_org_mode(monkeypatch):
     from cowork.common.settings.app_settings import get_app_settings
     from cowork.common.settings.user_settings import _harness_options
-    import cowork.harnesses.anton_harness.harness  # noqa: F401  register anton
-    import cowork.harnesses.hermes_harness.harness  # noqa: F401  register hermes
+    from cowork.harnesses.base import _registry, register
+
+    @register
+    class _SingleTenant:
+        id = "single-tenant-test"
+        label = "Single tenant"
+        supports_org_mode = False
 
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
     get_app_settings.cache_clear()
     try:
         options = _harness_options()
         assert "anton" in options
-        assert "hermes" not in options
+        assert _SingleTenant.id not in options
     finally:
+        _registry.pop(_SingleTenant.id, None)
         get_app_settings.cache_clear()
 
 
-def test_hermes_available_in_local_mode(monkeypatch):
+def test_single_tenant_harness_available_in_local_mode(monkeypatch):
     from cowork.common.settings.app_settings import get_app_settings
     from cowork.common.settings.user_settings import _harness_options
-    import cowork.harnesses.anton_harness.harness  # noqa: F401
-    import cowork.harnesses.hermes_harness.harness  # noqa: F401
+    from cowork.harnesses.base import _registry, register
+
+    @register
+    class _SingleTenant:
+        id = "single-tenant-test"
+        label = "Single tenant"
+        supports_org_mode = False
 
     monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
     get_app_settings.cache_clear()
     try:
         options = _harness_options()
         assert "anton" in options
-        assert "hermes" in options
+        assert _SingleTenant.id in options
     finally:
+        _registry.pop(_SingleTenant.id, None)
         get_app_settings.cache_clear()
 
 

@@ -41,7 +41,6 @@ from cowork.common.settings.user_settings import (
 from cowork.models.setting import Setting
 from cowork.models.skill import META_CREATED_AT, META_DISPLAY_NAME, Skill, SkillLegacy
 from cowork.services.settings import SettingService
-from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
 from cowork.services.skills import BUILTIN_SKILLS_VERSION, SkillService
 
 logger = logging.getLogger(__name__)
@@ -225,11 +224,6 @@ def seed_builtin_skills(session: Session) -> bool:
     current = int(row.value) if row is not None and row.value.isdigit() else 0
     if current >= BUILTIN_SKILLS_VERSION:
         return False
-
-    # remove symlink to global skills if exists
-    link = Path(HermesHarnessSettings().root_dir) / "skills"
-    if link.is_symlink():
-        link.unlink()
 
     store = SkillService()
     copied = store._copy_builtin_skills()
