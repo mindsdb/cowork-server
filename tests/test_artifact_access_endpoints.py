@@ -83,7 +83,7 @@ def publish_context(monkeypatch):
     monkeypatch.setattr("cowork.services.artifact_publish_key.PublishKey", FakeKey)
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("granted_product_permissions")]
 
 
 async def test_setting_access_republishes_with_the_chosen_audience(

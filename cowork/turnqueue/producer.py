@@ -17,11 +17,13 @@ import uuid
 from cowork.build_info import KEY_ANTON_VERSION, build_trace_metadata, surface
 from cowork.handlers.turn_errors import WORKER_UNRESPONSIVE_TYPE_NAME, remote_turn_error
 from cowork.services.providers import minds_chat_base_url
+from cowork.db.scoped import TenantScope
+from cowork.services.product_permissions import require_product_permission
 from cowork.turnqueue.auth_keys import list_active_connections, mint_turn_key
 from cowork.turnqueue.models import TurnJob, TurnReply
 from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.redis_client import cancel_flag_key, get_redis
-from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host
+from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host, get_app_settings
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +267,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     when the worker goes quiet past the idle timeout).
     `correlation_id`/`llm` reuse a turn key the routing gate already minted."""
     settings = TurnQueueSettings()
+    await require_product_permission(TenantScope(org_mode=get_app_settings().tenancy_mode == "org" or bool(org_id), org_id=org_id, user_id=user_id), "product.execute")
     r = get_redis()
     corr = correlation_id or _new_correlation_id()
     # A flag left by an earlier turn would cancel this one on its first line.
@@ -276,8 +279,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # a valid minds alias, independent of any harness's built-in default.
     if not model:
         from cowork.common.settings.user_settings import get_user_settings
-        from cowork.db.scoped import TenantScope
-        scope = TenantScope(org_mode=bool(org_id), org_id=org_id, user_id=user_id)
+        scope = TenantScope(org_mode=get_app_settings().tenancy_mode == "org" or bool(org_id), org_id=org_id, user_id=user_id)
         model = get_user_settings(scope).resolved_planning_model
 
     # Independent network round trips (llm's turn-key mint, oauth's active-

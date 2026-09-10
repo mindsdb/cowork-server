@@ -16,9 +16,9 @@ from cowork.services.artifact_publish_key import MAX_PUBLISH_KEY_TTL_S, PublishK
 def mint_calls(monkeypatch):
     calls = []
 
-    async def fake_mint(*, user_id, org_id, correlation_id, ttl_seconds, settings):
+    async def fake_mint(*, user_id, org_id, correlation_id, ttl_seconds, settings, purpose):
         calls.append({"user_id": user_id, "org_id": org_id,
-                      "instance_id": correlation_id, "ttl_seconds": ttl_seconds})
+                      "instance_id": correlation_id, "ttl_seconds": ttl_seconds, "purpose": purpose})
         return "turnkey-1"
 
     monkeypatch.setattr("cowork.services.artifact_publish_key.mint_turn_key", fake_mint)
@@ -57,6 +57,7 @@ async def test_mint_carries_user_and_org_from_scope(mint_calls):
 
     assert mint_calls[0]["user_id"] == "u-1"
     assert mint_calls[0]["org_id"] == "o-1"
+    assert mint_calls[0]["purpose"] == "artifact_publish"
 
 
 async def test_instance_id_is_a_fresh_uuid_not_a_turn_id(mint_calls):

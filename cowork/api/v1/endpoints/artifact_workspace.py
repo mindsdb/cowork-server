@@ -28,6 +28,7 @@ from cowork.common.paths import (
 )
 from cowork.api.v1.artifact_scope import review_artifact_for_request
 from cowork.db.scoped import ScopedSessionDep
+from cowork.services.product_permissions import has_product_permission, require_product_permission
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
     artifact_owner_id,
@@ -563,6 +564,19 @@ async def _acquire_live_publish_lock(folder: Path) -> bool:
     return True
 
 
+async def _current_capabilities(session, capabilities: dict) -> dict:
+    if not capabilities["canEdit"]:
+        return capabilities
+    can_edit = await has_product_permission(session.scope, "artifact.manage")
+    can_execute = await has_product_permission(session.scope, "product.execute")
+    return {
+        **capabilities,
+        "canEdit": can_edit,
+        "canAddressWithAgent": capabilities["canAddressWithAgent"] and can_edit and can_execute,
+        "canResolveComments": capabilities["canResolveComments"] and can_edit,
+    }
+
+
 @router.get("/workspace/{project_ref}/{artifact_id}")
 async def artifact_source(
     project_ref: str,
@@ -584,6 +598,7 @@ async def artifact_source(
             current_workspace, folder, metadata, artifact_id, selected
         )
         repair = await run_in_threadpool(active_agent_repair, folder, result.get("path"))
+        capabilities = await _current_capabilities(session, capabilities)
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -599,6 +614,7 @@ async def update_artifact_source(
     session: ScopedSessionDep,
 ):
     """Optimistic, atomic manual edit. A stale tab receives 409, never overwrite."""
+    await require_product_permission(session.scope, "artifact.manage")
     source, folder, metadata, _capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
@@ -668,7 +684,7 @@ async def artifact_review_entry(
     source, folder, metadata, _is_own = review_artifact_for_request(
         session, project_ref, artifact_id
     )
-    capabilities = artifact_capabilities(session, source)
+    capabilities = await _current_capabilities(session, artifact_capabilities(session, source))
     current_revision = None
     try:
         draft = await run_in_threadpool(current_source, folder, metadata, artifact_id)
@@ -762,6 +778,7 @@ async def set_artifact_access(
     shared URL survives the change. This is the same call autopublish makes on
     every turn, with the owner's selection in place of the first-publish default.
     """
+    await require_product_permission(session.scope, "artifact.manage")
     from cowork.services.publish import publish_artifact as _publish_bundle
     from cowork.services.artifact_access import ArtifactAccessUnavailable
 
@@ -835,6 +852,7 @@ async def enable_artifact_comments(
     workspace to the organization, which is the owner's call to make. A
     reviewer's client calls the `review` GET above instead.
     """
+    await require_product_permission(session.scope, "artifact.manage")
     from cowork.services.artifact_access import (
         ArtifactAccessUnavailable,
         provision_draft_review_access,
@@ -844,6 +862,7 @@ async def enable_artifact_comments(
     from cowork.services.artifact_identity import artifact_key
 
     source, folder, metadata, capabilities = _owner_workspace(session, project_ref, artifact_id)
+    capabilities = await _current_capabilities(session, capabilities)
     owner_user_id = artifact_owner_id(session, source)
     try:
         canonical_key = await run_in_threadpool(
@@ -915,6 +934,7 @@ async def restore_artifact_revision(
     body: _RestoreBody,
     session: ScopedSessionDep,
 ):
+    await require_product_permission(session.scope, "artifact.manage")
     _source, folder, metadata, _capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
@@ -955,6 +975,8 @@ async def request_agent_repair(
     body: _AgentRepairBody,
     session: ScopedSessionDep,
 ):
+    await require_product_permission(session.scope, "artifact.manage")
+    await require_product_permission(session.scope, "product.execute")
     _source, folder, metadata, _capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
@@ -1019,6 +1041,7 @@ async def release_agent_repairs_for_comment(
     the comments route forwards to inference in org mode and carries no tenant
     scope, so only here can one call serve both desktop and cloud.
     """
+    await require_product_permission(session.scope, "artifact.manage")
     _source, folder, _metadata, _capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
@@ -1042,6 +1065,7 @@ async def cancel_queued_agent_repair(
     body: _RepairCancelBody | None = None,
 ):
     """Release a queued repair, or discard a ready one the owner is done with."""
+    await require_product_permission(session.scope, "artifact.manage")
     _source, folder, _metadata, _capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
@@ -1066,6 +1090,7 @@ async def decide_agent_repair(
     body: _RepairDecisionBody,
     session: ScopedSessionDep,
 ):
+    await require_product_permission(session.scope, "artifact.manage")
     _source, folder, metadata, _capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )

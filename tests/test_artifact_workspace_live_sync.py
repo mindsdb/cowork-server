@@ -311,3 +311,6 @@ async def test_publish_failure_does_not_undo_the_source_save(artifact, monkeypat
 
     assert saved["content"] == "<html>saved locally</html>"
     assert (folder / "report.html").read_text(encoding="utf-8") == "<html>saved locally</html>"
+
+
+pytestmark = pytest.mark.usefixtures("granted_product_permissions")

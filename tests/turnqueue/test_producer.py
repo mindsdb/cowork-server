@@ -49,6 +49,32 @@ def _reply(kind, data):
     return {"payload": json.dumps({"correlation_id": "r", "kind": kind, "data": data})}
 
 
+async def test_default_model_uses_the_verified_hosted_scope(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from cowork.common.settings import user_settings
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(prod, "get_app_settings", lambda: SimpleNamespace(tenancy_mode="org"))
+    monkeypatch.setattr(prod, "_mint_oauth_block", AsyncMock(return_value=None))
+
+    def current_settings(scope):
+        assert scope.org_mode is True
+        assert scope.org_id == "org-verified"
+        assert scope.user_id == "user-verified"
+        return SimpleNamespace(resolved_planning_model="minds-default")
+
+    monkeypatch.setattr(user_settings, "get_user_settings", current_settings)
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="org-verified", user_id="user-verified",
+        input_text="hi", model=None,
+    ))
+    job = json.loads(fake.added[0][1]["payload"])
+    assert job["params"]["model"] == "minds-default"
+
+
 async def _drain(gen):
     """Exhaust the reply generator, returning its (kind, data) yields.
     Nothing happens (no mint, no XADD) before the first __anext__."""
@@ -564,3 +590,6 @@ async def test_turn_history_reaches_the_caller(monkeypatch):
     items = await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
     assert items == [("turn_history", {"rows": rows}), ("turn_completed", {})]
+
+
+pytestmark = pytest.mark.usefixtures("granted_product_permissions")
