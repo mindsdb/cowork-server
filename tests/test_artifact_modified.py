@@ -35,6 +35,41 @@ def test_content_mtime_empty_folder_is_zero(tmp_path: Path):
     assert _content_mtime(tmp_path) == 0
 
 
+def test_prepare_artifact_card_walks_folder_once(tmp_path: Path, monkeypatch):
+    """the card builder must walk an artifact's folder exactly once,
+    not once per helper (files, mtime, is_live) it used to call separately."""
+    import cowork.services.artifacts as artifacts_mod
+
+    artifact_id = "12345678-1234-5678-1234-567812345678"
+    (tmp_path / "index.html").write_text("<h1>hi</h1>", encoding="utf-8")
+    meta = {"id": artifact_id, "type": "html-app", "primary": "index.html"}
+    (tmp_path / "metadata.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    calls = []
+    original = artifacts_mod._user_files_with_mtimes
+
+    def counting_walker(folder):
+        calls.append(folder)
+        return original(folder)
+
+    monkeypatch.setattr(artifacts_mod, "_user_files_with_mtimes", counting_walker)
+
+    prepared = artifacts_mod._prepare_artifact_card(
+        tmp_path,
+        0,
+        artifact_id=artifact_id,
+        meta=meta,
+        published_map={},
+        project_id=None,
+        project_name="proj",
+        pinned_folder=None,
+        pinned_root=None,
+    )
+
+    assert prepared is not None
+    assert len(calls) == 1
+
+
 # ---------------------------------------------------------------------------
 # Task 2: compute_publish_md5
 # ---------------------------------------------------------------------------
