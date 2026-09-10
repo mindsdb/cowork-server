@@ -1573,10 +1573,10 @@ class ResponsesHandler:
             # Set after the branches above, each of which REPLACES `extra`
             # rather than adding to it — seeding it earlier would survive only
             # the unmapped path. Carried on every failure so the payload shape
-            # stays uniform, but only the unmapped branch logs above the
-            # WARNING floor the deployed environments run at, so a curated
-            # failure is not traceable there. The client renders it on the
-            # generic card alone, so there is nothing to quote for one anyway.
+            # stays uniform, but only the unmapped branch tags its log line
+            # with the id, so a curated failure can reach the log with nothing
+            # to match a quoted reference against. The client renders it on
+            # the generic card alone, so there is nothing to quote for one.
             extra["request_id"] = corr
             failed = response_failed_payload(message, code, **extra)
             await buffer.append("sse", {"sse": response_failed_sse(message, code, **extra)})

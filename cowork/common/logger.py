@@ -114,7 +114,7 @@ def setup_file_logging(log_dir: str = "logs", max_bytes: int = 10485760, backup_
     # CustomFormatter, not logging.Formatter: it is what defines
     # %(request_context)s, and it renders an empty string for the records that
     # carry no request_id — which is most of them. A plain Formatter would
-    # raise KeyError on every such line.
+    # raise ValueError on every such line.
     all_logs_handler.setFormatter(
         CustomFormatter(
             "%(asctime)s [%(levelname)8s] %(name)s%(request_context)s "
