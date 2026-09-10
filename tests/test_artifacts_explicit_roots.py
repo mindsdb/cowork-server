@@ -8,6 +8,7 @@ artifact's project from its filesystem path.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from uuid import UUID
 
@@ -431,3 +432,36 @@ def test_delete_artifact_rejects_folder_outside_the_given_root(source, tmp_path)
         a.delete_artifact(outside, artifacts_base=source.base, api_key="k",
                           publish_url="https://api.staging.mindshub.ai")
     assert outside.exists()
+
+
+def test_list_artifacts_caps_before_building_cards(source, monkeypatch):
+    """ENG-2436: the 80-item cap is applied before card work, not after —
+    building a card for every one of 500 artifacts before slicing is the load
+    this fixes. Also asserts the surviving 80 are the newest by mtime."""
+    names = []
+    for i in range(500):
+        slug = f"artifact-{i:03d}"
+        folder = _make_artifact(
+            source.base, slug,
+            files={"index.html": "<html></html>"},
+            meta={"slug": slug, "name": slug, "type": "html-app"},
+        )
+        mtime = 1_000_000 + i  # strictly increasing: higher i == newer
+        os.utime(folder / "metadata.json", (mtime, mtime))
+        names.append((mtime, slug))
+
+    build_calls = []
+    original = a._listed_card_for_pinned_folder
+
+    def counting_builder(folder, idx, **kwargs):
+        build_calls.append(folder)
+        return original(folder, idx, **kwargs)
+
+    monkeypatch.setattr(a, "_listed_card_for_pinned_folder", counting_builder)
+
+    cards = a.list_artifacts([source])
+
+    assert len(build_calls) <= 80
+    assert len(cards) <= 80
+    expected_slugs = [slug for _, slug in sorted(names, reverse=True)[:80]]
+    assert [c["slug"] for c in cards] == expected_slugs

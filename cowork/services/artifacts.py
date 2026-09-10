@@ -1479,14 +1479,20 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
     never discovers them, because a filesystem scan cannot tell which tenant is
     asking. The 80-item cap is pre-existing but matters more in org mode, where
     `sources` spans every project of the organization instead of one tree.
+
+    Two passes so the cap is applied before card work, not after: a collect
+    pass opens each artifact once and reads only its `metadata.json` mtime (no
+    card built), then a build pass walks the sorted candidates and stops once
+    80 cards have been produced. Known cosmetic change: `bg` used to be
+    assigned in scan order and only then sorted; it now follows sort order.
     """
-    cards: list[dict] = []
     from cowork.services.artifact_identity import (
         _opened_child_directory,
         opened_artifact_root,
     )
 
-    for source in sources:
+    candidates: list[tuple[float, int, str, ProjectArtifacts]] = []
+    for source_idx, source in enumerate(sources):
         try:
             with opened_artifact_root(source) as root:
                 with dir_scandir(root) as entries:
@@ -1512,36 +1518,42 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                 for child_name in sorted(child_names):
                     try:
                         with _opened_child_directory(root, child_name) as pinned_folder:
-                            folder = root.path / child_name
-                            card = _listed_card_for_pinned_folder(
-                                folder,
-                                len(cards),
-                                project_id=source.project_id,
-                                project_name=source.project_name,
-                                pinned_folder=pinned_folder,
-                                pinned_root=root,
-                                artifacts_base=(
-                                    source.base if source.external else None
-                                ),
-                            )
-                            if card is None:
-                                continue
                             try:
-                                card["_sortTs"] = dir_stat(
-                                    pinned_folder, "metadata.json"
-                                ).st_mtime
+                                mtime = dir_stat(pinned_folder, "metadata.json").st_mtime
                             except OSError:
-                                card["_sortTs"] = 0.0
-                            cards.append(card)
+                                mtime = 0.0
+                            candidates.append((mtime, source_idx, child_name, source))
                     except (OSError, ValueError):
                         continue
         except (OSError, ValueError):
             continue
 
-    cards.sort(key=lambda c: c["_sortTs"], reverse=True)
-    for c in cards:
-        c.pop("_sortTs", None)
-    return cards[:80]
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+
+    cards: list[dict] = []
+    for _mtime, _source_idx, child_name, source in candidates:
+        if len(cards) >= 80:
+            break
+        try:
+            with opened_artifact_root(source) as root:
+                with _opened_child_directory(root, child_name) as pinned_folder:
+                    folder = root.path / child_name
+                    card = _listed_card_for_pinned_folder(
+                        folder,
+                        len(cards),
+                        project_id=source.project_id,
+                        project_name=source.project_name,
+                        pinned_folder=pinned_folder,
+                        pinned_root=root,
+                        artifacts_base=(source.base if source.external else None),
+                    )
+                    if card is None:
+                        continue
+                    cards.append(card)
+        except (OSError, ValueError):
+            continue
+
+    return cards
 
 
 def preview_artifact(path: Path) -> dict:
