@@ -9,8 +9,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
-from cowork.api.v1.endpoints.guards import require_local_tenancy
-from cowork.api.v1.permissions import OpenByDesign, require
+from cowork.api.v1.permissions import DesktopOnly, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 
 from cowork.services.publish import (
@@ -27,7 +26,7 @@ from cowork.services.publish import (
 # The whole publish surface is desktop-only: it addresses artifacts by absolute
 # server path and resolves the credential from stored provider settings, neither of
 # which exists in an org deployment. Auto-publish is the org path instead.
-router = APIRouter(dependencies=[Depends(require_local_tenancy), Depends(require(OpenByDesign))])
+router = APIRouter(dependencies=[Depends(require(DesktopOnly))])
 
 
 class _AccessBody(BaseModel):

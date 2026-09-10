@@ -93,9 +93,10 @@ def _minds_runtime_credential_required(
 # this matches its own token, so one OS user's app can't drive another
 # user's sidecar on a shared loopback port (ENG-439). Empty when unset.
 #
-# OpenByDesign, standalone reason (not "the middleware exempts it": this is
-# the pre-auth readiness probe every client polls before it can authenticate
-# at all.
+# OpenByDesign, standalone reason: this is the pre-auth readiness probe every
+# client polls before it can authenticate at all, so it has to answer with no
+# credential of any kind. Not "the middleware exempts it" — that the middleware
+# also lists it in _EXEMPT_PATHS follows from this, rather than justifying it.
 @router.get("/", response_model=dict, dependencies=[Depends(require(OpenByDesign))])
 def health() -> dict:
     settings = get_user_settings()
