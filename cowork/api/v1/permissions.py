@@ -30,7 +30,7 @@ from typing import Protocol
 from fastapi import Depends, HTTPException, Request, status
 
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.principal import Principal, get_principal
+from cowork.principal import Principal, can_manage_org, get_principal
 
 
 class Permission(Protocol):
@@ -124,6 +124,23 @@ class AuthenticatedInOrgMode(Authenticated):
         if get_app_settings().tenancy_mode != "org":
             return None
         return await super().check(request, principal=principal)
+
+
+class AuthenticatedOrgAdmin(AuthenticatedInOrgMode):
+    """``AuthenticatedInOrgMode``, plus org-admin standing in org mode.
+
+    Configuring a shared resource on behalf of the whole org (channels,
+    org-scoped settings) is admin-owned; a no-op in local mode, same split as
+    ``AuthenticatedInOrgMode``.
+    """
+
+    async def check(
+        self, request: Request, principal: Principal | None = Depends(get_principal)
+    ) -> Principal | None:
+        principal = await super().check(request, principal=principal)
+        if get_app_settings().tenancy_mode == "org" and not can_manage_org(principal):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="requires an org admin")
+        return principal
 
 
 @cache
