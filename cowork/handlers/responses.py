@@ -1390,7 +1390,10 @@ class ResponsesHandler:
                     tool_rows=turn_rows,
                 )
             except Exception:
-                logger.exception("[responses] failed to persist turn for conversation %s", conv_id)
+                logger.exception(
+                    "[responses] failed to persist turn for conversation %s", conv_id,
+                    extra={"request_id": corr},
+                )
 
         try:
             conv = ConversationService(producer_session).get_conversation(conv_id)
@@ -1468,12 +1471,12 @@ class ResponsesHandler:
                     logger.warning(
                         "[responses] content validation error on conversation %s — "
                         "repaired %d message(s) with image content: %s",
-                        conv_id, len(repaired), exc,
+                        conv_id, len(repaired), exc, extra={"request_id": corr},
                     )
                 except Exception:
                     logger.exception(
                         "[responses] failed to repair conversation %s after content validation error",
-                        conv_id,
+                        conv_id, extra={"request_id": corr},
                     )
             # For an auth failure, tell the client which provider failed so it
             # offers the right action: "Reconnect" only for MindsHub (we can
@@ -1497,7 +1500,10 @@ class ResponsesHandler:
                         message = auth_error_detail(provider.label, reconnectable)
                         extra = {"reconnectable": reconnectable, "provider_label": provider.label}
                 except Exception:
-                    logger.exception("[responses] could not resolve provider for auth error")
+                    logger.exception(
+                        "[responses] could not resolve provider for auth error",
+                        extra={"request_id": corr},
+                    )
             elif code in MODEL_UNAVAILABLE_CODES:
                 # The model was rejected (legacy 403 gate, or a 404 for a model
                 # the provider can't serve): tell the client WHICH model so the
@@ -1537,7 +1543,10 @@ class ResponsesHandler:
                         # non-desktop consumers; no cowork code reads it.
                         extra = {"retry_after": _after, "retry_at": retry_at_instant(_after)}
                 except Exception:
-                    logger.exception("[responses] could not resolve the retry hint")
+                    logger.exception(
+                        "[responses] could not resolve the retry hint",
+                        extra={"request_id": corr},
+                    )
             elif code == PROVIDER_OVERLOADED_CODE:
                 # Transient-incident timeout (ENG-673): give the card the failing
                 # model AND the active provider, and flag whether the user is
@@ -1569,7 +1578,10 @@ class ResponsesHandler:
                     extra["provider_label"] = provider.label
                     extra["reconnectable"] = provider == Provider.MINDS_CLOUD
                 except Exception:
-                    logger.exception("[responses] could not resolve provider for overload error")
+                    logger.exception(
+                        "[responses] could not resolve provider for overload error",
+                        extra={"request_id": corr},
+                    )
             # Set after the branches above, each of which REPLACES `extra`
             # rather than adding to it — seeding it earlier would survive only
             # the unmapped path. Carried on every failure so the payload shape

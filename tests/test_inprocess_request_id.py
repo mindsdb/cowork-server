@@ -68,6 +68,12 @@ def _failing_handler(monkeypatch, saved: dict, exc: Exception):
         def save_assistant_turn(self, conv_id, text, events, harness=None, tool_rows=None):
             saved["events"] = events
 
+        def repair_image_content(self, conv_id):
+            # Without this the content-recovery branch takes its repair-FAILED
+            # path, which logs a different line than the one under test.
+            saved["repaired"] = True
+            return [uuid4()]
+
     class FakeSession:
         def close(self):
             pass
@@ -114,6 +120,11 @@ def test_inprocess_failure_carries_a_request_id(monkeypatch):
     assert streamed["request_id"] == request_id
 
 
+def _deployed_records(caplog):
+    """The records staging and prod would actually emit, which run at WARNING."""
+    return [record for record in caplog.records if record.levelno >= logging.WARNING]
+
+
 def test_inprocess_failure_puts_the_id_on_the_log_record(monkeypatch, caplog):
     # Not just in the message text: the formatter builds %(request_context)s
     # from this attribute, so an id only in the text leaves that placeholder
@@ -125,10 +136,33 @@ def test_inprocess_failure_puts_the_id_on_the_log_record(monkeypatch, caplog):
         _run(handler, _RecBuffer())
 
     request_id = _failed_payload(saved)["request_id"]
-    assert any(
-        getattr(record, "request_id", None) == request_id
-        for record in caplog.records
-        if record.levelno >= logging.WARNING
+    deployed = _deployed_records(caplog)
+    assert deployed
+    assert all(getattr(record, "request_id", None) == request_id for record in deployed)
+
+
+def test_a_content_recovery_failure_tags_its_deployed_log_lines(monkeypatch, caplog):
+    # Content recovery is the curated failure that logs at WARNING, so unlike
+    # the other curated codes it IS emitted in staging and prod — and its line
+    # is the one that explains the turn. An untagged line there is a reference
+    # the user quotes that matches nothing.
+    saved: dict = {}
+    handler = _failing_handler(
+        monkeypatch, saved,
+        RuntimeError("Invalid value: 'image_url'. Supported values are: 'input_image'"),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="cowork.handlers.responses"):
+        _run(handler, _RecBuffer())
+
+    payload = _failed_payload(saved)
+    assert payload["code"] == "content_recovery"
+    assert saved.get("repaired"), "the repair ran, so the WARNING under test fired"
+    deployed = _deployed_records(caplog)
+    assert deployed
+    assert all(
+        getattr(record, "request_id", None) == payload["request_id"]
+        for record in deployed
     )
 
 
