@@ -40,20 +40,18 @@ class CustomFormatter(logging.Formatter):
 
     Both render as an empty string when absent, which is what lets a format
     string reference ``%(request_context)s`` unconditionally — the vast
-    majority of records carry neither.
+    majority of records carry neither. An explicitly ``None`` value counts as
+    absent.
     """
 
     def format(self, record):
-        # Add extra context to the record
-        if hasattr(record, "user_id"):
-            record.user_context = f"[User:{record.user_id}]"
-        else:
-            record.user_context = ""
+        # None is absent, not a value: a producer with no id to offer still
+        # passes the key, and ``[Req:None]`` is worse than no prefix at all.
+        user_id = getattr(record, "user_id", None)
+        record.user_context = f"[User:{user_id}]" if user_id is not None else ""
 
-        if hasattr(record, "request_id"):
-            record.request_context = f"[Req:{record.request_id}]"
-        else:
-            record.request_context = ""
+        request_id = getattr(record, "request_id", None)
+        record.request_context = f"[Req:{request_id}]" if request_id is not None else ""
 
         return super().format(record)
 

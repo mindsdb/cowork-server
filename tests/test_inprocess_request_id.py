@@ -147,10 +147,13 @@ def test_a_curated_inprocess_failure_carries_the_id_too(monkeypatch):
 @pytest.mark.parametrize("attrs, expected", [
     ({"request_id": "corr-abc"}, "[Req:corr-abc]"),
     ({}, ""),
+    ({"request_id": None}, ""),
 ])
 def test_formatter_renders_the_request_context(attrs, expected):
     # The placeholder has to survive a record that carries no request_id,
     # which is nearly all of them — a plain logging.Formatter would raise.
+    # An explicit None is one of those: the seal passes it for a producer
+    # that has no correlation id to offer.
     formatter = CustomFormatter("%(name)s%(request_context)s %(message)s")
     record = logging.LogRecord(
         name="cowork.test", level=logging.ERROR, pathname=__file__, lineno=1,
