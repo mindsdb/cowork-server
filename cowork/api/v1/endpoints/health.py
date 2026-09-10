@@ -126,3 +126,10 @@ def health() -> dict:
         "aid": "" if _org_mode else _anton_install_id(),
         **settings.config_status,
     }
+
+
+@router.get("/live", response_model=dict)
+def live() -> dict:
+    """Liveness only: the process answers. No database, no filesystem, no settings —
+    a probe that can fail for an external reason turns a dependency outage into a pod kill."""
+    return {"status": "ok"}
