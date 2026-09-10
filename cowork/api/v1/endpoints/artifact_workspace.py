@@ -27,7 +27,7 @@ from cowork.common.paths import (
     open_pinned_child,
 )
 from cowork.api.v1.artifact_scope import review_artifact_for_request
-from cowork.db.scoped import ScopedSessionDep
+from cowork.db.scoped import ScopedSession, ScopedSessionDep, get_scoped_session
 from cowork.services.product_permissions import has_product_permission, require_product_permission
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
@@ -1124,7 +1124,9 @@ async def serve_private_draft(
     artifact_id: ArtifactIdDep,
     rel_path: str,
     request: Request,
-    session: ScopedSessionDep,
+    # Spell out the dependency so SAST does not treat the server-created
+    # session (and the artifact roots it discovers) as an HTTP parameter.
+    session: ScopedSession = Depends(get_scoped_session),
     download: Annotated[bool, Query()] = False,
 ):
     """Authenticated draft preview with project/org containment and relative assets.

@@ -12,6 +12,7 @@ from cowork.api.v1 import artifact_scope
 from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
 from cowork.api.v1.endpoints import artifacts as artifacts_ep
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import LOCAL_SCOPE, get_scoped_session
 
 
 PROJECT_ID = UUID("22222222-2222-4222-8222-222222222222")
@@ -26,6 +27,43 @@ def client(monkeypatch):
     get_app_settings.cache_clear()
     yield TestClient(create_app())
     get_app_settings.cache_clear()
+
+
+@pytest.mark.parametrize("route", ["draft", "delete"])
+def test_session_comes_from_dependency_and_cannot_be_supplied_in_query(
+    client, monkeypatch, route,
+):
+    scoped_session = SimpleNamespace(scope=LOCAL_SCOPE)
+    client.app.dependency_overrides[get_scoped_session] = lambda: scoped_session
+    seen = []
+
+    def capture(session, *_args, **_kwargs):
+        seen.append(session)
+        raise HTTPException(status_code=404, detail="No artifact in test catalog")
+
+    async def capture_delete(session, *args, **kwargs):
+        return capture(session, *args, **kwargs)
+
+    params = {"session": "../../untrusted"}
+    if route == "draft":
+        monkeypatch.setattr(workspace_ep, "review_artifact_for_request", capture)
+        method = "get"
+        path = f"/api/v1/artifacts/drafts/local/{ARTIFACT_ID.hex}/index.html"
+        schema_path = "/api/v1/artifacts/drafts/{project_ref}/{artifact_id}/{rel_path}"
+    else:
+        monkeypatch.setattr(artifacts_ep, "delete_artifact_for_request", capture_delete)
+        method = "delete"
+        path = f"/api/v1/artifacts/{ARTIFACT_ID.hex}"
+        schema_path = "/api/v1/artifacts/{slug}"
+        params["project_id"] = str(PROJECT_ID)
+
+    response = client.request(method, path, params=params)
+
+    assert response.status_code == 404, response.text
+    assert len(seen) == 1
+    assert seen[0] is scoped_session
+    operation = client.app.openapi()["paths"][schema_path][method]
+    assert all(parameter["name"] != "session" for parameter in operation["parameters"])
 
 
 @pytest.mark.parametrize(
