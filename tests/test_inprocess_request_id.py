@@ -21,7 +21,7 @@ from uuid import uuid4
 import pytest
 
 import cowork.handlers.responses as responses_mod
-from cowork.common.logger import CustomFormatter
+from cowork.common.logger import CustomFormatter, setup_console_handler
 from cowork.handlers.responses import ResponsesHandler
 
 
@@ -163,3 +163,25 @@ def test_formatter_renders_the_request_context(attrs, expected):
         setattr(record, key, value)
 
     assert formatter.format(record) == f"cowork.test{expected} turn failed"
+
+
+def test_the_console_formatter_renders_the_request_context(monkeypatch):
+    # The console stream is the one the desktop captures into the log tail its
+    # help modal offers to copy, so an id that renders only on a file handler
+    # is an id the person reporting the failure never gets to quote.
+    monkeypatch.setenv("RICH_LOGGING", "false")
+    formatter = setup_console_handler().formatter
+
+    def record(**attrs):
+        rec = logging.LogRecord(
+            name="cowork.test", level=logging.ERROR, pathname=__file__, lineno=1,
+            msg="turn failed", args=(), exc_info=None,
+        )
+        for key, value in attrs.items():
+            setattr(rec, key, value)
+        return rec
+
+    assert "[Req:corr-abc]" in formatter.format(record(request_id="corr-abc"))
+    # The same formatter still has to render the records that carry no id,
+    # which is nearly all of them.
+    assert "[Req:" not in formatter.format(record())

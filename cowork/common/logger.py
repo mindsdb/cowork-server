@@ -57,15 +57,28 @@ class CustomFormatter(logging.Formatter):
 
 
 def get_colored_formatter():
-    """Get a colored formatter if colorlog is available"""
+    """The console handler's formatter, colored when colorlog is installed.
+
+    Both branches derive from CustomFormatter because both reference
+    ``%(request_context)s``, and only a CustomFormatter defines it — a plain
+    Formatter raises per record, which logging swallows into a dropped line.
+    The console is the stream the desktop captures into the log tail it offers
+    to copy, so an id rendered only on a file handler reaches nobody: file
+    logging is off unless ENABLE_FILE_LOGGING is exported, which nothing in
+    the stack does.
+    """
     if not HAS_COLORLOG:
-        return logging.Formatter(
-            "%(asctime)s [%(levelname)0s] %(name)s: %(message)s",
+        return CustomFormatter(
+            "%(asctime)s [%(levelname)0s] %(name)s%(request_context)s: %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
 
-    return colorlog.ColoredFormatter(
-        "%(log_color)s%(asctime)s [%(levelname)0s] %(name)s: %(message)s%(reset)s",
+    class _ColoredCustomFormatter(CustomFormatter, colorlog.ColoredFormatter):
+        """Inherits the context injection so the two branches cannot drift."""
+
+    return _ColoredCustomFormatter(
+        "%(log_color)s%(asctime)s [%(levelname)0s] %(name)s%(request_context)s: "
+        "%(message)s%(reset)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         log_colors={
             "DEBUG": "cyan",
