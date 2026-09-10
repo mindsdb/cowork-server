@@ -20,10 +20,9 @@ Three properties, each one load-bearing:
   turn's correlation id is not even reachable here: the harness does not receive
   one.
 
-`get()` returns None on any failure — a missing key means "skip publishing this
-turn", never a TypeError inside the publisher. A failed mint is not retried within
-one reconciliation: the cause (missing internal secret, unreachable auth) will not
-clear in the next few hundred milliseconds.
+`get()` preserves permission denials and authority outages for manual publishing.
+Best-effort callers handle those errors at their own boundary. Other failures
+return None. A failed mint is not retried within one reconciliation.
 """
 from __future__ import annotations
 
@@ -31,6 +30,7 @@ import logging
 import uuid
 
 from cowork.common.settings.app_settings import TurnQueueSettings
+from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 from cowork.turnqueue.auth_keys import mint_turn_key, revoke_turn_key
 
 logger = logging.getLogger(__name__)
@@ -51,14 +51,17 @@ class PublishKey:
         self._instance_id = str(uuid.uuid4())
         self._key: str | None = None
         self._attempted = False
+        self._permission_error: ProductPermissionDenied | ProductPermissionUnavailable | None = None
 
     @property
     def instance_id(self) -> str:
         return self._instance_id
 
     async def get(self) -> str | None:
-        """The publish credential, minting it on first use. None on failure."""
+        """Mint once, preserving typed authority failures on subsequent calls too."""
         if self._attempted:
+            if self._permission_error is not None:
+                raise self._permission_error
             return self._key
         self._attempted = True
         settings = TurnQueueSettings()
@@ -76,6 +79,9 @@ class PublishKey:
                 settings=settings,
                 purpose="artifact_publish",
             )
+        except (ProductPermissionDenied, ProductPermissionUnavailable) as exc:
+            self._permission_error = exc
+            raise
         except Exception:
             logger.warning(
                 "artifact_autopublish result=no_key reason=mint_failed instance_id=%s",

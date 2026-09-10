@@ -22,6 +22,23 @@ def test_turn_reply_parses_and_validates():
     assert reply.data["text"] == "hi"
 
 
+@pytest.mark.parametrize("mode", ["persistent", "ephemeral"])
+def test_v2_job_preserves_explicit_workspace_authority(mode):
+    job = TurnJob(op="anton_turn_v2", conversation_id="c", correlation_id="r",
+                  reply_stream="scratchpad:reply:c", params={"workspace_mode": mode})
+    assert TurnJob.model_validate_json(job.model_dump_json()).params["workspace_mode"] == mode
+
+
+@pytest.mark.parametrize("params", [{}, {"workspace_mode": None}, {"workspace_mode": True},
+                                    {"workspace_mode": "unknown"}])
+def test_v2_job_rejects_missing_or_invalid_workspace_authority(params):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="requires a persistent or ephemeral workspace_mode"):
+        TurnJob(op="anton_turn_v2", conversation_id="c", correlation_id="r",
+                reply_stream="scratchpad:reply:c", params=params)
+
+
 def test_turn_reply_accepts_every_kind_the_controller_publishes():
     """Hand-synced with scratchpad-controller's ScratchpadReplyPayload. The reply
     loop validates each entry unguarded, so a kind missing here fails the whole

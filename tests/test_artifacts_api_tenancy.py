@@ -462,6 +462,46 @@ async def test_delete_by_slug_removes_the_folder(session, tmp_path, org_mode, pu
     assert not folder.exists()
 
 
+@pytest.mark.parametrize("stage", ["mint", "unpublish"])
+@pytest.mark.parametrize("status", [403, 503])
+async def test_delete_preserves_authority_failures_and_keeps_artifact_files(
+    session, tmp_path, org_mode, monkeypatch, stage, status,
+):
+    import io
+    from urllib.error import HTTPError
+    from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
+
+    row, folder = _project_with_artifact(
+        session, tmp_path, name="publish-denied", org_id=ORG_A, slug="dash"
+    )
+    record = {"index.html": {"report_id": "rid", "published": True}}
+    (folder / ".published.json").write_text(json.dumps(record))
+    error_type = ProductPermissionDenied if status == 403 else ProductPermissionUnavailable
+
+    async def mint(**kwargs):
+        if stage == "mint":
+            raise error_type()
+        return "artifact-key"
+
+    async def revoke(*args, **kwargs):
+        return True
+
+    def unpublish(*args, **kwargs):
+        assert stage == "unpublish", "Mint denial must stop before unpublishing"
+        body = {"code": "permission_denied"} if status == 403 else {"error": "Auth unavailable"}
+        raise HTTPError("https://publish.example/delete/rid", status, "Rejected", {},
+                        io.BytesIO(json.dumps(body).encode()))
+
+    monkeypatch.setattr("cowork.services.artifact_publish_key.mint_turn_key", mint)
+    monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
+    monkeypatch.setattr("anton.publisher.unpublish", unpublish)
+    with pytest.raises(error_type) as error:
+        await ep.delete_artifact_for_request(_scoped(session, ORG_A), "dash", project_id=row.id)
+    assert error.value.status_code == status
+    assert (folder / "index.html").read_text() == "<html></html>"
+    assert json.loads((folder / ".published.json").read_text()) == record
+
+
 @pytest.mark.parametrize("by_id", [False, True])
 async def test_delete_revokes_with_the_verified_owner_and_tenant_before_removing_files(
     session, tmp_path, org_mode, publish_key, monkeypatch, by_id
