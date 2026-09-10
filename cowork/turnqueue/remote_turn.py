@@ -51,6 +51,7 @@ async def remote_turn_events(
     new_slugs: list[str] = []
     touched_slugs: set[str] = set()
     turn_scope = None
+    artifact_writes_allowed = False
 
     try:
         async for kind, data in stream_remote_replies(
@@ -65,7 +66,9 @@ async def remote_turn_events(
             correlation_id=correlation_id,
             llm=llm,
         ):
-            if kind == "turn_delta":
+            if kind == "progress" and data.get("phase") == "workspace_authorized":
+                artifact_writes_allowed = data.get("workspace_mode") == "persistent"
+            elif kind == "turn_delta":
                 yield StreamTextDelta(text=data.get("text", ""))
             elif kind == "turn_step":
                 for event in step_stream_events(data):
@@ -88,13 +91,13 @@ async def remote_turn_events(
                 code = data.get("code") or GENERIC_TURN_ERROR_CODE
                 raise RemoteTurnFailed(code, message)
     finally:
-        if artifacts is not None:
+        if artifacts is not None and artifact_writes_allowed:
             new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
                 artifacts[0], conv_id, artifacts[2], artifacts[1],
                 before_slugs, before_mtimes,
             )
 
-    if artifacts is not None:
+    if artifacts is not None and artifact_writes_allowed:
         for card in await publish_and_card_turn_artifacts(
             artifacts[1],
             new_slugs=new_slugs,

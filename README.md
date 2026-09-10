@@ -748,6 +748,53 @@ key, so main's `validateMinds` has no live caller today, and it is the
 openai-compatible and anthropic validators there that a packaged build actually
 runs.
 
+### Organization permission enforcement
+
+Hosted turn admission checks `product.execute` through auth's internal
+`POST /internal/permissions/authorize/` endpoint. This applies to free and paid
+models, stored provider credentials, direct responses, remote queue submission
+and scheduled runs. Schedules resolve the acting identity from the stored owner
+and check it before creating a conversation. Queue submission rechecks current
+access even when reusing a previously minted credential.
+
+The request contains the server-resolved user and organization IDs and one
+permission. It uses the existing `COWORK_TURN_AUTH_INTERNAL_BASE_URL` and
+`COWORK_TURN_AUTH_INTERNAL_SECRET`; customer headers cannot choose that host or
+credential. A confirmed denial returns `403` with `permission_denied`. Missing
+configuration, malformed replies, transport errors and service authentication
+failures return `503` with `permission_unavailable`. Authorization failures never
+fall through to another model or delegated execution. Local desktop mode retains
+its single-user behavior.
+
+Artifact source edits, publishing/access changes, deletion, revision restoration
+and repair management require `artifact.manage` as well as existing artifact
+ownership. Starting an agent repair also requires `product.execute`. Capability
+responses reflect these current grants. Generic project-file writes and deletes
+apply the artifact grant to artifact storage paths too. Writes atomically replace
+the selected directory entry, preserving the existing file mode where descriptor
+chmod is available. This detaches a pre-existing hardlink so editing an ordinary
+file cannot modify protected artifact bytes through the same inode. Failed writes
+leave the original file intact and remove the temporary file.
+
+Remote turns use the `anton_turn_v2` controller operation and declare their
+workspace authority. The controller checks `artifact.manage` again when it
+dequeues the turn. Without that grant, it mounts saved conversation files read
+only and runs the agent in a temporary copy. All workspace edits in that turn
+are temporary, including ordinary files; nothing is copied back or published.
+The controller replaces warm workers when their storage authority is unsuitable.
+Cowork requires the controller's verified workspace acknowledgement before
+accepting worker output, and indexes artifacts only for persistent workspaces.
+Deploy the companion scratchpad-controller change before enabling this producer;
+older controllers fail these turns with `permission_unavailable`.
+
+Publishing uses a separate `artifact_publish` mint purpose. It requires artifact
+management without granting model execution. Execution mints retain their own
+purpose and credential type; the publisher uses a fresh instance ID and never
+hands its credential to an inference client. Deploy auth's decision/purpose APIs
+and the publisher's artifact-only authentication path before this server change.
+Keep these admission checks in place during rollback while restrictive custom
+roles remain assigned. No new customer or staff permission grants are introduced.
+
 ## Configuration
 
 Configuration is read from the database (`UserSettings` table) and can be managed through the Settings UI in the desktop app or via `PUT /api/v1/settings/`.
