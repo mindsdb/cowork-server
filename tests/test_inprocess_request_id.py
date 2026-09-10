@@ -193,11 +193,14 @@ def test_a_turn_that_escapes_every_except_seals_with_the_same_id(monkeypatch):
     UUID(sealed["request_id"])
 
 
-def test_the_console_formatter_renders_the_request_context(monkeypatch):
+@pytest.mark.parametrize("rich_logging", ["false", "true"])
+def test_the_console_formatter_renders_the_request_context(monkeypatch, rich_logging):
     # The console stream is the one the desktop captures into the log tail its
     # help modal offers to copy, so an id that renders only on a file handler
-    # is an id the person reporting the failure never gets to quote.
-    monkeypatch.setenv("RICH_LOGGING", "false")
+    # is an id the person reporting the failure never gets to quote. Both
+    # branches of setup_console_handler have to carry it; rich is installed,
+    # so RICH_LOGGING is one env var from being the live one.
+    monkeypatch.setenv("RICH_LOGGING", rich_logging)
     formatter = setup_console_handler().formatter
 
     def record(**attrs):

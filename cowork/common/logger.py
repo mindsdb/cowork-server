@@ -152,7 +152,11 @@ def setup_console_handler():
             rich_tracebacks=True,
             tracebacks_show_locals=True,
         )
-        handler.setFormatter(logging.Formatter("[%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        # CustomFormatter for the same reason the other branch uses one: this
+        # is a console stream too, and the desktop tails it.
+        handler.setFormatter(CustomFormatter(
+            "[%(name)s]%(request_context)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
+        ))
     else:
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(get_colored_formatter())
