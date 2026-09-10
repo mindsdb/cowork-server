@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from sqlmodel import Session
 
 from cowork.api.v1.endpoints.guards import require_local, require_local_tenancy
-from cowork.api.v1.permissions import OpenByDesign, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.common.paths import cowork_home
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
@@ -184,7 +184,14 @@ async def _reject_unservable_models(
             )
 
 
-@router.put("/")
+# AuthenticatedInOrgMode, declared explicitly: SettingService's write path
+# already fails closed on its own (_require_writable -> MissingTenantScopeError
+# -> 401, cowork/services/settings.py) whenever org mode has no org in scope.
+# Declaring it too makes the requirement visible to a route walker. Org-admin
+# gating on org-scoped keys stays in _require_org_admin_for below — it's
+# conditional on which keys are in the request body, not a blanket per-route
+# check a declared dependency can express.
+@router.put("/", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def bulk_upsert_settings(
     body: SettingsBulkUpsertRequest,
     session: SessionDep,
@@ -212,7 +219,9 @@ async def bulk_upsert_settings(
     return {"updated": updated}
 
 
-@router.put("/{key}", response_model=SettingResponse)
+# AuthenticatedInOrgMode, declared explicitly: same _require_writable
+# fail-closed reasoning as bulk_upsert_settings above.
+@router.put("/{key}", response_model=SettingResponse, dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def upsert_setting(
     key: str,
     body: SettingUpsertRequest,
@@ -230,7 +239,9 @@ async def upsert_setting(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
-@router.delete("/{key}")
+# AuthenticatedInOrgMode, declared explicitly: same _require_writable
+# fail-closed reasoning as bulk_upsert_settings above.
+@router.delete("/{key}", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 def delete_setting(key: str, session: SessionDep, scope: ScopeDep, principal: PrincipalDep):
     _require_org_admin_for([key], scope, principal)
     try:
@@ -311,10 +322,13 @@ def install_status():
     return {"antonInstalled": True, "serverDepsReady": True}
 
 
-@router.get("/reveal-key/{name}")
-def reveal_key(name: str, session: SessionDep, scope: ScopeDep, request: Request):
-    # reveal-key returns an unmasked provider secret — loopback only (ENG-457).
-    require_local(request)
+# OpenByDesign, standalone reason: what protects this route is require_local
+# below — returns an unmasked provider secret, loopback only (ENG-457).
+@router.get(
+    "/reveal-key/{name}",
+    dependencies=[Depends(require_local), Depends(require(OpenByDesign))],
+)
+def reveal_key(name: str, session: SessionDep, scope: ScopeDep):
     name_map = {
         "anthropic": Provider.ANTHROPIC,
         "openai": Provider.OPENAI,
