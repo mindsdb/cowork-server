@@ -39,6 +39,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlmodel import Session
 
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
 from cowork.principal import hub_credential
@@ -57,7 +58,13 @@ from cowork.services.settings import SettingService
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+# AuthenticatedInOrgMode, declared explicitly: both routes have no local check
+# of their own — they rely on authorization_ui_enabled() calling auth's
+# GET /v1/entitlements/me/ with the caller's bearer, which fails closed (no
+# gate = not enabled) on a missing/invalid bearer just as much as on the gate
+# being off. Declaring it too makes the requirement visible to a route walker
+# instead of something only discoverable by reading that fail-closed call.
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 SessionDep = Annotated[Session, Depends(get_session)]
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
