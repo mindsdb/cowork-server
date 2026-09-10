@@ -292,25 +292,48 @@ def origin_conversation_id(meta: dict | None) -> str:
     return str(first.get("conversation") or "")
 
 
-def _user_files(folder: Path) -> list[Path]:
-    """All non-housekeeping files inside an artifact folder, sorted by mtime desc."""
-    out: list[Path] = []
+def _user_files_with_mtimes(folder: Path) -> list[tuple[Path, int]]:
+    """All non-housekeeping files inside an artifact folder, paired with their
+    mtime in nanoseconds, sorted by mtime desc.
+
+    One `os.scandir` pass: `DirEntry.is_file(follow_symlinks=False)` and
+    `DirEntry.stat(follow_symlinks=False)` are served from the entry the
+    kernel already returned, so each file is stat'd once instead of the
+    two-to-four times separate `rglob`/`is_file`/`is_symlink`/`stat` calls cost.
+    """
+    out: list[tuple[Path, int]] = []
+
+    def _walk(dir_path: Path, top: str | None) -> None:
+        try:
+            entries = list(os.scandir(dir_path))
+        except OSError:
+            return
+        for entry in entries:
+            entry_top = top if top is not None else entry.name
+            if entry_top in _HOUSEKEEPING_FILES:
+                continue
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    _walk(Path(entry.path), entry_top)
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                mtime_ns = entry.stat(follow_symlinks=False).st_mtime_ns
+            except OSError:
+                continue
+            out.append((Path(entry.path), mtime_ns))
+
     try:
-        for p in folder.rglob("*"):
-            if not p.is_file() or p.is_symlink():
-                continue
-            rel = p.relative_to(folder)
-            top = rel.parts[0] if rel.parts else ""
-            if top in _HOUSEKEEPING_FILES:
-                continue
-            out.append(p)
+        _walk(folder, None)
     except OSError:
         return []
-    try:
-        out.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    except OSError:
-        pass
+    out.sort(key=lambda item: item[1], reverse=True)
     return out
+
+
+def _user_files(folder: Path) -> list[Path]:
+    """All non-housekeeping files inside an artifact folder, sorted by mtime desc."""
+    return [p for p, _ in _user_files_with_mtimes(folder)]
 
 
 def _pick_primary(
@@ -417,7 +440,8 @@ def _content_mtime(folder: Path) -> int:
     gate for the `modified` badge.
     """
     try:
-        return int(max((p.stat().st_mtime for p in _user_files(folder)), default=0.0))
+        max_ns = max((ns for _, ns in _user_files_with_mtimes(folder)), default=0)
+        return max_ns // 1_000_000_000
     except OSError:
         return 0
 
@@ -437,7 +461,7 @@ def content_mtime_ns(folder: Path) -> int:
     to notice two edits that landed in the same second.
     """
     try:
-        return max((p.stat().st_mtime_ns for p in _user_files(folder)), default=0)
+        return max((ns for _, ns in _user_files_with_mtimes(folder)), default=0)
     except OSError:
         return 0
 
@@ -1130,7 +1154,8 @@ def _prepare_artifact_card(
     io_root = _pinned_directory_path(pinned_root) if pinned_root else None
     if io_folder is None or (pinned_root is not None and io_root is None):
         return None
-    files = _user_files(io_folder)
+    files_with_mtimes = _user_files_with_mtimes(io_folder)
+    files = [p for p, _ in files_with_mtimes]
     primary = _pick_primary(
         io_folder,
         files,
@@ -1149,17 +1174,19 @@ def _prepare_artifact_card(
     kind = KIND_BY_TYPE.get(artifact_type) or KIND_BY_EXT.get(primary_ext, "File")
     is_live = False
     if primary is not None:
-        try:
-            is_live = (time.time() - primary.stat().st_mtime) < 300
-        except OSError:
-            is_live = False
+        # `primary_hint` can point at a file `_user_files` skipped (e.g. a
+        # housekeeping name); fall back to not-live rather than re-stat'ing.
+        primary_mtime_ns = next((ns for p, ns in files_with_mtimes if p == primary), None)
+        if primary_mtime_ns is not None:
+            is_live = (time.time() - primary_mtime_ns / 1_000_000_000) < 300
 
     # Max mtime across the artifact's content files — a precise
     # "content changed" signal for the renderer's preview viewer to
     # cache-bust/reload on (ENG-375), and the cheap gate for `modified`.
     # Named `mtime_seconds` so it does not shadow the module-level
-    # `content_mtime` alias other services import.
-    mtime_seconds = _content_mtime(io_folder)
+    # `content_mtime` alias other services import. Derived from the single
+    # walk above (already sorted mtime desc) instead of walking again.
+    mtime_seconds = (files_with_mtimes[0][1] // 1_000_000_000) if files_with_mtimes else 0
 
     card = {
         # The one identity: drafts, published versions, revisions, comments
