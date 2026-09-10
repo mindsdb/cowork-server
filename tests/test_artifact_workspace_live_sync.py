@@ -313,4 +313,34 @@ async def test_publish_failure_does_not_undo_the_source_save(artifact, monkeypat
     assert (folder / "report.html").read_text(encoding="utf-8") == "<html>saved locally</html>"
 
 
+@pytest.mark.parametrize("status", [403, 503])
+async def test_source_save_survives_live_publish_authority_failure(artifact, monkeypatch, status):
+    from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
+
+    folder, metadata = artifact
+    _publish(folder, {"mode": "public"})
+    original = current_source(folder, metadata, ARTIFACT_ID)
+    monkeypatch.setattr(
+        workspace, "_owner_workspace",
+        lambda *_args: (_source_for(folder), folder, metadata, {}),
+    )
+
+    async def reject(**kwargs):
+        raise (ProductPermissionDenied if status == 403 else ProductPermissionUnavailable)()
+
+    monkeypatch.setattr("cowork.services.artifact_publish_key.mint_turn_key", reject)
+    saved = await workspace.update_artifact_source(
+        "project-1", ARTIFACT_ID,
+        workspace._SourceUpdateBody(
+            content="<html>saved locally</html>",
+            expectedRevisionId=original["revision"]["id"], path="report.html",
+        ),
+        _Session(),
+    )
+    assert saved["content"] == "<html>saved locally</html>"
+    assert (folder / "report.html").read_text() == "<html>saved locally</html>"
+    assert artifact_locks.acquire(folder.parent, folder.name, ttl_s=60)
+    artifact_locks.release(folder.parent, folder.name)
+
+
 pytestmark = pytest.mark.usefixtures("granted_product_permissions")

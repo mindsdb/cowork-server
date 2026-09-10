@@ -1072,6 +1072,7 @@ class ResponsesHandler:
             new_slugs: list[str] = []
             touched_slugs: set[str] = set()
             turn_scope = None
+            artifact_writes_allowed = False
             # Off the loop: this reads the project's memory slots off the shared
             # mount, and one worker serves every other request on this process
             # while a blocking EFS round trip is in flight.
@@ -1099,7 +1100,9 @@ class ResponsesHandler:
                     llm=(turn_llm or {}).get("llm"),
                     disabled=disabled,
                 ):
-                    if kind == "turn_delta":
+                    if kind == "progress" and data.get("phase") == "workspace_authorized":
+                        artifact_writes_allowed = data.get("workspace_mode") == "persistent"
+                    elif kind == "turn_delta":
                         yield StreamTextDelta(text=data.get("text", ""))
                     elif kind == "turn_step":
                         for event in step_stream_events(data):
@@ -1159,7 +1162,7 @@ class ResponsesHandler:
                 # an artifact the worker wrote is recorded even when the turn
                 # failed or was stopped, and it is synchronous because an await
                 # in a generator's finally is skipped on cancellation.
-                if artifacts is not None:
+                if artifacts is not None and artifact_writes_allowed:
                     new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
                         artifacts[0], conv_id, artifacts[2], artifacts[1],
                         before_slugs, before_mtimes,
@@ -1168,7 +1171,7 @@ class ResponsesHandler:
             # Clean completion only — a raise inside the try skips this, matching
             # the in-process path where Stop/error produce no cards and the next
             # turn in the project heals the publish.
-            if artifacts is not None:
+            if artifacts is not None and artifact_writes_allowed:
                 for card in await publish_and_card_turn_artifacts(
                     artifacts[1],
                     new_slugs=new_slugs,

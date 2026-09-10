@@ -622,6 +622,17 @@ chmod is available. This detaches a pre-existing hardlink so editing an ordinary
 file cannot modify protected artifact bytes through the same inode. Failed writes
 leave the original file intact and remove the temporary file.
 
+Remote turns use the `anton_turn_v2` controller operation and declare their
+workspace authority. The controller checks `artifact.manage` again when it
+dequeues the turn. Without that grant, it mounts saved conversation files read
+only and runs the agent in a temporary copy. All workspace edits in that turn
+are temporary, including ordinary files; nothing is copied back or published.
+The controller replaces warm workers when their storage authority is unsuitable.
+Cowork requires the controller's verified workspace acknowledgement before
+accepting worker output, and indexes artifacts only for persistent workspaces.
+Deploy the companion scratchpad-controller change before enabling this producer;
+older controllers fail these turns with `permission_unavailable`.
+
 Publishing uses a separate `artifact_publish` mint purpose. It requires artifact
 management without granting model execution. Execution mints retain their own
 purpose and credential type; the publisher uses a fresh instance ID and never

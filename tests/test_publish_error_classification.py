@@ -145,3 +145,16 @@ def test_real_gateway_timeout_is_still_framed_as_connection_failure(tmp_path, mo
     msg = str(exc_info.value)
     assert "Connection failed" in msg
     assert "504" in msg
+
+
+@pytest.mark.parametrize("body", [b'{"code":"internal_secret_invalid"}', b'not json', b'[]'])
+def test_an_unconfirmed_publisher_403_is_not_a_permission_denial(tmp_path, monkeypatch, body):
+    import io
+
+    page = tmp_path / "report.html"
+    page.write_text("<html></html>")
+    upstream = urllib.error.HTTPError("https://publish.example/upload", 403, "Forbidden", {}, io.BytesIO(body))
+    _wire_publish(monkeypatch, tmp_path, page, "report.html", publish_side_effect=upstream)
+    with pytest.raises(RuntimeError) as error:
+        publish.publish_artifact(page, artifacts_base=tmp_path, api_key="key", publish_url="https://4nton.ai")
+    assert "HTTP 403" in str(error.value)

@@ -132,6 +132,25 @@ async def test_failed_mint_is_not_retried_within_one_reconciliation(monkeypatch)
     assert len(attempts) == 1
 
 
+@pytest.mark.parametrize("status", [403, 503])
+async def test_authority_failure_keeps_its_type_without_retrying(monkeypatch, status):
+    from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
+
+    error_type = ProductPermissionDenied if status == 403 else ProductPermissionUnavailable
+    attempts = []
+
+    async def reject(**kwargs):
+        attempts.append(kwargs)
+        raise error_type()
+
+    monkeypatch.setattr("cowork.services.artifact_publish_key.mint_turn_key", reject)
+    key = PublishKey("u-1", "o-1", min_ttl_s=60)
+    for _ in range(2):
+        with pytest.raises(error_type):
+            await key.get()
+    assert len(attempts) == 1
+
+
 async def test_revoke_targets_the_minted_instance_id(mint_calls, revoke_calls):
     key = PublishKey("u-1", "o-1", min_ttl_s=60)
     await key.get()

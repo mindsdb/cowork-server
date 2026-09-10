@@ -18,6 +18,7 @@ from cowork.build_info import KEY_ANTON_VERSION, build_trace_metadata, surface
 from cowork.handlers.turn_errors import WORKER_UNRESPONSIVE_TYPE_NAME, remote_turn_error
 from cowork.services.providers import minds_chat_base_url
 from cowork.db.scoped import TenantScope
+from cowork.services import product_permissions
 from cowork.services.product_permissions import require_product_permission
 from cowork.turnqueue.auth_keys import list_active_connections, mint_turn_key
 from cowork.turnqueue.models import TurnJob, TurnReply
@@ -267,7 +268,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     when the worker goes quiet past the idle timeout).
     `correlation_id`/`llm` reuse a turn key the routing gate already minted."""
     settings = TurnQueueSettings()
-    await require_product_permission(TenantScope(org_mode=get_app_settings().tenancy_mode == "org" or bool(org_id), org_id=org_id, user_id=user_id), "product.execute")
+    scope = TenantScope(org_mode=get_app_settings().tenancy_mode == "org" or bool(org_id), org_id=org_id, user_id=user_id)
+    await require_product_permission(scope, "product.execute")
+    workspace_mode = (
+        "persistent" if await product_permissions.has_product_permission(scope, "artifact.manage") else "ephemeral"
+    )
     r = get_redis()
     corr = correlation_id or _new_correlation_id()
     # A flag left by an earlier turn would cancel this one on its first line.
@@ -319,6 +324,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         else None
     )
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
+              "workspace_mode": workspace_mode,
               "model": model, "history": history or [], "llm": llm_block,
               **({"memory": memory_block} if memory_block else {}),
               # Absent entirely (not an empty dict) when there's nothing to
@@ -334,7 +340,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     params = _fit_request(params, conversation_id)
 
     job = TurnJob(
-        op="anton_turn",
+        # An older controller rejects this operation instead of silently
+        # ignoring workspace_mode and granting a writable persistent mount.
+        op="anton_turn_v2",
         conversation_id=conversation_id,
         correlation_id=corr,
         reply_stream=reply_stream,
@@ -357,6 +365,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     )
 
     last_id = "0-0"
+    authorized_workspace_mode = None
     idle_timeout = settings.reply_idle_timeout_seconds
     last_reply_at = time.monotonic()
     while True:
@@ -387,7 +396,30 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                 last_reply_at = time.monotonic()
                 kind = reply.kind
                 data = reply.data or {}
+                if kind == "progress" and data.get("phase") == "workspace_authorized":
+                    resolved_mode = data.get("workspace_mode")
+                    if (
+                        resolved_mode not in ("persistent", "ephemeral")
+                        or (workspace_mode == "ephemeral" and resolved_mode != "ephemeral")
+                        or (authorized_workspace_mode is not None and resolved_mode != authorized_workspace_mode)
+                    ):
+                        yield "turn_failed", _workspace_permission_failure()
+                        return
+                    authorized_workspace_mode = resolved_mode
+                    yield "progress", {"phase": "workspace_authorized", "workspace_mode": resolved_mode}
+                    continue
+                if kind == "error" or (
+                    kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill", "turn_history", "turn_completed")
+                    and authorized_workspace_mode is None
+                ):
+                    # Unsupported v2 operations and missing mount-policy
+                    # acknowledgements are terminal, never a fallback turn.
+                    yield "turn_failed", _workspace_permission_failure()
+                    return
                 if kind == "turn_failed":
+                    if data.get("code") == "permission_unavailable":
+                        yield "turn_failed", _workspace_permission_failure()
+                        return
                     # Classify once; the SSE frame and the persisted events
                     # log must carry the same (code, message).
                     code, message = remote_turn_error(data.get("error"))
@@ -401,3 +433,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                     yield kind, data
                 if kind in ("turn_completed", "turn_failed"):
                     return
+
+
+def _workspace_permission_failure() -> dict:
+    """Keep worker policy failures on the same unavailable contract as admission."""
+    return {
+        "error": "WorkspacePermissionUnavailable: worker storage authority could not be verified",
+        **product_permissions.ProductPermissionUnavailable().detail,
+    }
