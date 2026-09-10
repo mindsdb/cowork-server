@@ -93,17 +93,19 @@ def run_dev_setup() -> None:
         # affected users already passed it).
         backfill_minds_url(session)
 
-    # Migrate harness-local memory into ~/.cowork/memory, then wire runtime
-    # symlinks. Desktop-only: both write the unkeyed root; org-mode memory is
-    # org-first under the shared root and created on demand.
-    import cowork.harnesses  # noqa: F401 — registers memory adapters
-
+    # Migrate harness-local memory into ~/.cowork/memory, then create the
+    # canonical slot files. Desktop-only: both write the unkeyed root; org-mode
+    # memory is org-first under the shared root and created on demand.
     if settings.tenancy_mode != "org":
-        from cowork.harnesses.memory.migration import migrate_harness_memory_to_shared
+        from cowork.harnesses.memory.migration import (
+            migrate_harness_memory_to_shared,
+            retire_hermes_memory,
+        )
         from cowork.harnesses.memory.runtime import ensure_all_layouts
 
         with SQLSession(engine) as session:
             migrate_harness_memory_to_shared(session)
+            retire_hermes_memory(session)
 
         ensure_all_layouts()
 

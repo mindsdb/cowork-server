@@ -270,8 +270,8 @@ class ResponsesHandler:
         # overrides the account default for THIS call only — mirrors the
         # per-conversation model override below. Ignored (not raised) when it
         # doesn't name a currently-registered/available harness: a stale
-        # client cache (e.g. Hermes got uninstalled since the picker last
-        # loaded) must never fail the turn, it just falls back to the
+        # client cache (a harness removed since the picker last loaded)
+        # must never fail the turn, it just falls back to the
         # account default. self.harness stays None either way — still lazy,
         # only self.harness_name (which harness _get_harness() will build)
         # changes here.

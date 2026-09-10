@@ -421,10 +421,10 @@ async def format_responses_stream(
 
         elif isinstance(event, StreamReasoningDelta):
             # The model's own reasoning text — NOT part of the final answer.
-            # Shape matches hermes_harness's existing thought.progress +
-            # subtype convention exactly, so the frontend's ephemeral
-            # "current thought" handling (responseStreamAdapter.js) picks
-            # this up identically without any client-side change.
+            # Shape follows the thought.progress + subtype convention the
+            # frontend's ephemeral "current thought" handling
+            # (responseStreamAdapter.js) already understands, so no
+            # client-side change is needed.
             seq += 1
             yield _event("response.in_progress", {
                 "type": "response.in_progress",
