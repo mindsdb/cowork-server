@@ -8,7 +8,8 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.endpoints.guards import require_local
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope, scoped_storage_root
 from cowork.schemas.connectors import (
@@ -103,7 +104,14 @@ async def get_connection(engine: str, name: str, scope: ScopeDep, request: Reque
     return record
 
 
-@router.post("/save", response_model=DirectSaveResponse)
+# OpenByDesign, standalone reason: what protects this route is require_local
+# below — confirmed the only callers are Electron's main process and a
+# renderer path gated behind !host.isWeb, both loopback-only.
+@router.post(
+    "/save",
+    response_model=DirectSaveResponse,
+    dependencies=[Depends(require_local), Depends(require(OpenByDesign))],
+)
 def save_connection_direct(body: DirectSaveRequest, scope: ScopeDep):
     """Persist credentials to the vault without running a probe.
     Used after an OAuth PKCE flow (Electron main-process PKCE) where the
@@ -114,7 +122,18 @@ def save_connection_direct(body: DirectSaveRequest, scope: ScopeDep):
     return _persist_direct_connection(body, scope, dict(body.values))
 
 
-@router.post("/validate-and-save", response_model=DirectSaveResponse)
+# OpenByDesign, defensive classification: an antontron caller audit found no
+# caller anywhere (not the client, not cowork-server's own submissions flow,
+# which persists developer credentials by calling the service functions
+# directly rather than over HTTP to this route). Classified loopback-only to
+# match its sibling /save on the theory that if this is reachable at all, it
+# is by the same Electron-only flow — TODO: confirm whether this route is
+# actually dead and can be removed, or find its real caller.
+@router.post(
+    "/validate-and-save",
+    response_model=DirectSaveResponse,
+    dependencies=[Depends(require_local), Depends(require(OpenByDesign))],
+)
 def validate_and_save_developer_connection(body: DirectSaveRequest, scope: ScopeDep):
     """Validate a Code developer-tool credential before storing it.
 
@@ -206,7 +225,14 @@ class PatchTokenBody(BaseModel):
     status: str | None = None
 
 
-@router.patch("/{engine}/{name}/token")
+# OpenByDesign, standalone reason: what protects this route is require_local
+# below — confirmed the only caller is Electron main's token-refresh.ts,
+# always loopback (the in-body 501 for org mode, below, is a second,
+# independent belt-and-suspenders check).
+@router.patch(
+    "/{engine}/{name}/token",
+    dependencies=[Depends(require_local), Depends(require(OpenByDesign))],
+)
 def patch_connection_token(engine: str, name: str, body: PatchTokenBody, scope: ScopeDep):
     """Partially update token fields on a vault entry.
 
@@ -270,7 +296,21 @@ async def patch_picked_files(engine: str, name: str, body: PatchPickedFilesBody,
     return {"ok": True, "files": merged}
 
 
-@router.delete("/{engine}/{name}/picked-files/{file_id}")
+# AuthenticatedInOrgMode, defensive classification: an antontron caller audit
+# confirmed this is reachable from both desktop and hosted web (no isElectron/
+# isWeb guard, see useGoogleDrivePicker.js). This declares the identity floor
+# only — it does NOT fix the actual gap: unlike patch_picked_files above, this
+# route has no org-mode branch and unconditionally hits the local vault via
+# ConnectionsService, and auth_proxy has no "remove one picked file" call to
+# forward to (only proxy_picked_files's merge/union semantics and proxy_delete
+# for the whole connection). TODO: an org-mode caller here likely gets a 404
+# against the wrong (local, non-durable) vault instead of actually un-picking
+# the file — needs a real auth-service endpoint before it can work correctly
+# in org mode, same class of gap as test_providers's stored-key issue.
+@router.delete(
+    "/{engine}/{name}/picked-files/{file_id}",
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
 def delete_picked_file(engine: str, name: str, file_id: str, project: str, scope: ScopeDep):
     """Untag one file from `project` — the "un-pick" counterpart to
     patch_picked_files, used by the Project files rail's delete action on
