@@ -1,11 +1,10 @@
 """Cowork's first response-routing decision.
 
 This is deliberately a server-owned front gate: a direct decision skips Anton
-initialization (and, hosted, the remote turn dispatch) entirely.  Anton has an
-equivalent in-process gate (``anton.core.llm.thalamus``), but it is off unless
-the harness passes ``router_enabled``, so today this is the only gate a turn
-meets.  A direct decision is only valid for a text-only conversational turn;
-every uncertain or unsupported shape delegates to Anton.
+initialization (and, hosted, the remote turn dispatch) entirely.  It is the
+only gate a turn meets: Anton has no routing gate of its own.  A direct
+decision is only valid for a text-only conversational turn; every uncertain or
+unsupported shape delegates to Anton.
 """
 from __future__ import annotations
 
@@ -45,8 +44,8 @@ _GATE_IDLE_SECONDS = 5.0
 # on time rather than on tokens; both outcomes are `delegated_agentic`.
 _GATE_TOTAL_SECONDS = 10.0
 
-# Kept server-local so the route does not depend on Anton's private execution
-# module. The contract mirrors the existing two-action thalamus gate.
+# The two-action contract (answer, or call `delegate`) is this module's own.
+# It was once mirrored from a gate inside Anton, which no longer exists.
 ACTION_RESPOND = "respond"
 _DELEGATE_TOOL = {
     "name": "delegate",
@@ -193,11 +192,12 @@ class RouteDecision:
 def _condense_content(content) -> str | None:
     """Flatten one message body to the gate's text view; None when it has none.
 
-    Tool blocks collapse to one-line markers, the same ones anton's
-    ``condense_history`` uses. Dropping the row instead (the previous behavior)
-    hid that work happened at all, and a follow-up to a tool-derived answer is
-    the case most likely to need tools again — so the gate must see the marker
-    even though it never needs the payload.
+    Tool blocks collapse to one-line markers, the format defined below in this
+    function and owned here now that Anton has no gate of its own to mirror.
+    Dropping the row instead (the previous behavior) hid that work happened at
+    all, and a follow-up to a tool-derived answer is the case most likely to
+    need tools again — so the gate must see the marker even though it never
+    needs the payload.
     """
     if isinstance(content, str):
         return content
