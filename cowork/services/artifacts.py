@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator
@@ -1531,11 +1532,30 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
     candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
 
     cards: list[dict] = []
-    for _mtime, _source_idx, child_name, source in candidates:
-        if len(cards) >= 80:
-            break
-        try:
-            with opened_artifact_root(source) as root:
+    # One root open per source, not per surviving candidate: opening a root is
+    # itself an openat+stat per path component (worse in org mode, where it's
+    # <project>/.anton/artifacts), so re-opening it per card would multiply
+    # that cost back in right after the collect pass paid it once.
+    with ExitStack() as build_roots:
+        opened_roots: dict[int, PinnedDir | None] = {}
+
+        def _root_for(source_idx: int, source: ProjectArtifacts) -> PinnedDir | None:
+            if source_idx not in opened_roots:
+                try:
+                    opened_roots[source_idx] = build_roots.enter_context(
+                        opened_artifact_root(source)
+                    )
+                except (OSError, ValueError):
+                    opened_roots[source_idx] = None
+            return opened_roots[source_idx]
+
+        for _mtime, source_idx, child_name, source in candidates:
+            if len(cards) >= 80:
+                break
+            root = _root_for(source_idx, source)
+            if root is None:
+                continue
+            try:
                 with _opened_child_directory(root, child_name) as pinned_folder:
                     folder = root.path / child_name
                     card = _listed_card_for_pinned_folder(
@@ -1550,8 +1570,8 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                     if card is None:
                         continue
                     cards.append(card)
-        except (OSError, ValueError):
-            continue
+            except (OSError, ValueError):
+                continue
 
     return cards
 

@@ -465,3 +465,39 @@ def test_list_artifacts_caps_before_building_cards(source, monkeypatch):
     assert len(cards) <= 80
     expected_slugs = [slug for _, slug in sorted(names, reverse=True)[:80]]
     assert [c["slug"] for c in cards] == expected_slugs
+
+
+def test_list_artifacts_opens_each_root_once_in_the_build_pass(source, monkeypatch):
+    """ENG-2436 follow-up: the build pass must open a source's root once, not
+    once per surviving candidate — opening a root is an openat+stat per path
+    component (worse in org mode, where it's <project>/.anton/artifacts), so
+    re-opening it per card multiplies back the cost the two-pass cap just paid
+    once for."""
+    from contextlib import contextmanager
+
+    for i in range(200):
+        slug = f"artifact-{i:03d}"
+        folder = _make_artifact(
+            source.base, slug,
+            files={"index.html": "<html></html>"},
+            meta={"slug": slug, "name": slug, "type": "html-app"},
+        )
+        mtime = 1_000_000 + i
+        os.utime(folder / "metadata.json", (mtime, mtime))
+
+    open_calls = []
+    original = artifact_identity.opened_artifact_root
+
+    @contextmanager
+    def counting_open(src):
+        open_calls.append(src)
+        with original(src) as root:
+            yield root
+
+    monkeypatch.setattr(artifact_identity, "opened_artifact_root", counting_open)
+
+    cards = a.list_artifacts([source])
+
+    assert len(cards) == 80
+    # One open for the collect pass, one for the build pass — not one per card.
+    assert len(open_calls) == 2
