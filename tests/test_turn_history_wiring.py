@@ -111,7 +111,7 @@ def test_in_process_paths_id_check_before_persisting(persister):
     assert "reject_unreplayable_tool_rows(" in _norm(persister)
 
 
-def test_the_in_process_guard_is_not_the_pod_sanitizer(persister=None):
+def test_the_in_process_guard_is_not_the_pod_sanitizer():
     """The two must not be collapsed into one. Asserted on the remote path so
     a well-meaning simplification that routes everything through a single
     function fails here rather than silently truncating desktop tool output."""
