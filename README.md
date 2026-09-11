@@ -388,6 +388,39 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/hub/workspaces` | Which MindsHub workspace this person is working in |
 | `/hub/usage` | The caller's free monthly tokens, balance, auto top up and credit spend, for the desktop's usage warnings |
 
+### Declaring who may call a route
+
+Every route declares its permission at its own definition, and `create_app()`
+refuses to start if one does not (ENG-2094). Adding a route means picking the
+class that names the credential the route actually takes:
+
+| Declaration | The credential is |
+|-------------|-------------------|
+| `OpenByDesign` | nothing at all. Pinned route by route, with a written reason, in `tests/test_open_by_design_pin.py` |
+| `LoopbackOnly` | the caller being on this machine (`require_local`) |
+| `DesktopOnly` | not org mode (`require_local_tenancy` 403s the route there) |
+| `LoopbackDesktopOnly` | both of the above |
+| `PlatformSignature` | the calling platform's HMAC over the body (channel webhooks) |
+| `Authenticated` | a verified `Principal` |
+| `AuthenticatedInOrgMode` | a verified `Principal`, in org mode only; a no-op on desktop |
+| `AuthenticatedOrgAdmin` | ... plus org-admin standing |
+
+```python
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+
+@router.get("/thing", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+```
+
+Declare it on the `APIRouter` when every route on it takes the same
+credential, with one exception: never declare `OpenByDesign` on a router.
+FastAPI *adds* a route-level `dependencies=[...]` to its router's rather than
+replacing it, so a router carrying the open marker hands it to every route
+added later, and the walker cannot tell that apart from a deliberate choice.
+Every other class refuses, so inheriting one is safe.
+
+`COWORK_TENANCY_MODE=org python -m scripts.dump_routes` prints the current
+surface with each route's declaration.
+
 ### The MindsHub workspace selector
 
 `/api/v1/hub/workspaces` backs the workspace selector at the bottom of Cowork's
@@ -747,6 +780,53 @@ MindsHub onboarding path signs in through Keycloak rather than validating a past
 key, so main's `validateMinds` has no live caller today, and it is the
 openai-compatible and anthropic validators there that a packaged build actually
 runs.
+
+### Organization permission enforcement
+
+Hosted turn admission checks `product.execute` through auth's internal
+`POST /internal/permissions/authorize/` endpoint. This applies to free and paid
+models, stored provider credentials, direct responses, remote queue submission
+and scheduled runs. Schedules resolve the acting identity from the stored owner
+and check it before creating a conversation. Queue submission rechecks current
+access even when reusing a previously minted credential.
+
+The request contains the server-resolved user and organization IDs and one
+permission. It uses the existing `COWORK_TURN_AUTH_INTERNAL_BASE_URL` and
+`COWORK_TURN_AUTH_INTERNAL_SECRET`; customer headers cannot choose that host or
+credential. A confirmed denial returns `403` with `permission_denied`. Missing
+configuration, malformed replies, transport errors and service authentication
+failures return `503` with `permission_unavailable`. Authorization failures never
+fall through to another model or delegated execution. Local desktop mode retains
+its single-user behavior.
+
+Artifact source edits, publishing/access changes, deletion, revision restoration
+and repair management require `artifact.manage` as well as existing artifact
+ownership. Starting an agent repair also requires `product.execute`. Capability
+responses reflect these current grants. Generic project-file writes and deletes
+apply the artifact grant to artifact storage paths too. Writes atomically replace
+the selected directory entry, preserving the existing file mode where descriptor
+chmod is available. This detaches a pre-existing hardlink so editing an ordinary
+file cannot modify protected artifact bytes through the same inode. Failed writes
+leave the original file intact and remove the temporary file.
+
+Remote turns use the `anton_turn_v2` controller operation and declare their
+workspace authority. The controller checks `artifact.manage` again when it
+dequeues the turn. Without that grant, it mounts saved conversation files read
+only and runs the agent in a temporary copy. All workspace edits in that turn
+are temporary, including ordinary files; nothing is copied back or published.
+The controller replaces warm workers when their storage authority is unsuitable.
+Cowork requires the controller's verified workspace acknowledgement before
+accepting worker output, and indexes artifacts only for persistent workspaces.
+Deploy the companion scratchpad-controller change before enabling this producer;
+older controllers fail these turns with `permission_unavailable`.
+
+Publishing uses a separate `artifact_publish` mint purpose. It requires artifact
+management without granting model execution. Execution mints retain their own
+purpose and credential type; the publisher uses a fresh instance ID and never
+hands its credential to an inference client. Deploy auth's decision/purpose APIs
+and the publisher's artifact-only authentication path before this server change.
+Keep these admission checks in place during rollback while restrictive custom
+roles remain assigned. No new customer or staff permission grants are introduced.
 
 ## Configuration
 

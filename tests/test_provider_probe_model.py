@@ -12,6 +12,8 @@ import asyncio
 import cowork.services.providers as providers
 from cowork.services.providers import (
     MINDS_PROBE_MODEL,
+    MINDS_REQUEST_KIND_HEADER,
+    MINDS_REQUEST_KIND_PROBE,
     is_minds_host,
     ping_provider,
     validate_minds,
@@ -34,7 +36,7 @@ class _CapturingClient:
         return False
 
     async def post(self, url, headers=None, json=None):
-        _CapturingClient.captured = {"url": url, "json": json}
+        _CapturingClient.captured = {"url": url, "json": json, "headers": headers or {}}
         return _Resp(200)
 
     async def get(self, url, headers=None):
@@ -228,3 +230,39 @@ def test_a_non_minds_probe_sends_no_token_cap(monkeypatch):
     _patch(monkeypatch)
     asyncio.run(validate_provider("openai-compatible", "sk_x", "https://api.openai.com/v1", "o3"))
     assert "max_tokens" not in _CapturingClient.captured["json"]
+
+
+# ── The connectivity-probe marker for the Traces list ──────
+#
+# Every MindsHub probe hits the real /chat/completions path under the user's key,
+# so it persists as an ordinary trace and is noise in the list. Each sender
+# stamps X-Minds-Request-Kind: probe so the list can hide them by default. The
+# marker is MindsHub-only — our own header, sent to no arbitrary endpoint.
+
+
+def test_ping_provider_stamps_probe_kind_header(monkeypatch):
+    _patch(monkeypatch)
+    asyncio.run(ping_provider({"type": "minds-cloud", "apiKey": "mdb_x"}))
+    assert _CapturingClient.captured["headers"].get(MINDS_REQUEST_KIND_HEADER) == MINDS_REQUEST_KIND_PROBE
+
+
+def test_validate_minds_stamps_probe_kind_header(monkeypatch):
+    _patch(monkeypatch)
+    asyncio.run(validate_minds("mdb_x", "https://api.mindshub.ai"))
+    assert _CapturingClient.captured["headers"].get(MINDS_REQUEST_KIND_HEADER) == MINDS_REQUEST_KIND_PROBE
+
+
+def test_minds_fallback_stamps_probe_kind_header(monkeypatch):
+    # The omitted-model MindsHub fallback routes through validate_openai_compatible,
+    # so it must carry the marker too.
+    _patch(monkeypatch)
+    asyncio.run(validate_provider("openai-compatible", "mdb_x", "https://api.mindshub.ai/v1", None))
+    assert _CapturingClient.captured["headers"].get(MINDS_REQUEST_KIND_HEADER) == MINDS_REQUEST_KIND_PROBE
+
+
+def test_non_minds_probe_does_not_stamp_probe_kind_header(monkeypatch):
+    # The marker is our own header and means nothing to a third-party endpoint, so
+    # a non-MindsHub probe must not send it.
+    _patch(monkeypatch)
+    asyncio.run(validate_provider("openai-compatible", "sk_x", "https://api.openai.com/v1", "gpt-4o"))
+    assert MINDS_REQUEST_KIND_HEADER not in _CapturingClient.captured["headers"]
