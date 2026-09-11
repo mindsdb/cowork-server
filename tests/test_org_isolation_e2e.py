@@ -185,6 +185,8 @@ def test_shared_resource_authorization_and_contract_through_http(client):
         "canRename": True,
         "canDelete": True,
         "canEditInstructions": True,
+        # Org deployments never adopt a folder, so this is always False there.
+        "directoryIsExternal": False,
     }
 
     denied = client.patch(

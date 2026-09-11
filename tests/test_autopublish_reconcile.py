@@ -297,6 +297,24 @@ async def test_no_key_available_publishes_nothing(base, enabled, published, monk
     assert published == []
 
 
+@pytest.mark.parametrize("status", [403, 503])
+async def test_authority_failure_skips_autopublish_and_releases_lock(
+    base, enabled, published, monkeypatch, status,
+):
+    from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
+
+    async def reject(**kwargs):
+        raise (ProductPermissionDenied if status == 403 else ProductPermissionUnavailable)()
+
+    monkeypatch.setattr("cowork.services.artifact_publish_key.mint_turn_key", reject)
+    _make(base, "rep", files={"report.html": "<html></html>"},
+          meta={"slug": "rep", "type": "html-app"})
+    assert await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"}) == set()
+    assert published == []
+    assert locks.acquire(base, "rep", ttl_s=60)
+    locks.release(base, "rep")
+
+
 # ── phases, ordering, budget ──────────────────────────────────────────────
 
 async def test_untouched_unpublished_artifact_is_picked_up_by_phase_two(base, enabled, key, published):

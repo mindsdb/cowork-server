@@ -248,6 +248,29 @@ def test_unpublish_other_error_propagates(artifact, monkeypatch):
                              publish_url="https://api.staging.mindshub.ai")
 
 
+@pytest.mark.parametrize("status", [403, 503])
+def test_unpublish_preserves_authority_status_and_the_publish_record(artifact, monkeypatch, status):
+    import io
+    from urllib.error import HTTPError
+    from fastapi import HTTPException
+
+    folder, base = artifact
+    record = {"report.html": {"report_id": "rid", "published": True}}
+    (folder / ".published.json").write_text(json.dumps(record))
+
+    def reject(*args, **kwargs):
+        body = {"code": "permission_denied"} if status == 403 else {"error": "Auth unavailable"}
+        raise HTTPError("https://publish.example/delete/rid", status, "Rejected", {},
+                        io.BytesIO(json.dumps(body).encode()))
+
+    monkeypatch.setattr("anton.publisher.unpublish", reject)
+    with pytest.raises(HTTPException) as error:
+        p.unpublish_artifact(folder, artifacts_base=base, api_key="k",
+                             publish_url="https://publish.example")
+    assert error.value.status_code == status
+    assert json.loads((folder / ".published.json").read_text()) == record
+
+
 def test_agent_publish_tool_wrapper_still_works(artifact, monkeypatch):
     """The agent's publish_or_preview tool goes through this wrapper.
 

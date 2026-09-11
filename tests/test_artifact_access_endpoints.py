@@ -12,6 +12,7 @@ co-member. This route can.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -19,6 +20,7 @@ from fastapi import HTTPException
 
 from cowork.api.v1.endpoints import artifact_workspace as aw
 from cowork.db.scoped import TenantScope
+from cowork.services import artifact_locks
 
 ORG_SCOPE = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
 ARTIFACT_ID = "11111111-1111-1111-1111-111111111111"
@@ -81,7 +83,7 @@ def publish_context(monkeypatch):
     monkeypatch.setattr("cowork.services.artifact_publish_key.PublishKey", FakeKey)
 
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("granted_product_permissions")]
 
 
 async def test_setting_access_republishes_with_the_chosen_audience(
@@ -113,6 +115,91 @@ async def test_sharing_publicly_is_passed_through_verbatim(
     )
 
     assert publish_calls[0]["access"] == {"mode": "public"}
+
+
+async def test_audience_change_waits_for_an_inflight_live_sync(
+    as_owner, publish_calls, publish_context,
+):
+    assert artifact_locks.acquire(as_owner.parent, as_owner.name, ttl_s=60) is True
+    task = asyncio.create_task(
+        aw.set_artifact_access(
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "restricted"}), _Session(),
+        )
+    )
+
+    try:
+        await asyncio.sleep(0.05)
+        assert publish_calls == []
+    finally:
+        artifact_locks.release(as_owner.parent, as_owner.name)
+
+    await task
+    assert publish_calls[0]["access"] == {"mode": "restricted"}
+    assert artifact_locks.acquire(as_owner.parent, as_owner.name, ttl_s=60) is True
+    artifact_locks.release(as_owner.parent, as_owner.name)
+
+
+@pytest.mark.parametrize("status", [403, 503])
+async def test_share_preserves_mint_failure_after_waiting_for_publish_lock(
+    as_owner, publish_calls, monkeypatch, status,
+):
+    from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
+
+    error_type = ProductPermissionDenied if status == 403 else ProductPermissionUnavailable
+    admitted = asyncio.Event()
+
+    async def allow_initial_check(scope, permission):
+        admitted.set()
+
+    async def reject_mint(**kwargs):
+        raise error_type()
+
+    monkeypatch.setattr(aw, "require_product_permission", allow_initial_check)
+    monkeypatch.setattr("cowork.services.artifact_publish_key.mint_turn_key", reject_mint)
+    assert artifact_locks.acquire(as_owner.parent, as_owner.name, ttl_s=60)
+    task = asyncio.create_task(aw.set_artifact_access(
+        "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+    ))
+    try:
+        await admitted.wait()
+    finally:
+        artifact_locks.release(as_owner.parent, as_owner.name)
+    with pytest.raises(error_type) as error:
+        await task
+    assert error.value.status_code == status
+    assert publish_calls == []
+    assert artifact_locks.acquire(as_owner.parent, as_owner.name, ttl_s=60)
+    artifact_locks.release(as_owner.parent, as_owner.name)
+
+
+@pytest.mark.parametrize("status", [403, 503])
+async def test_share_preserves_authority_failure_from_the_artifact_consumer(
+    as_owner, publish_context, monkeypatch, status,
+):
+    import io
+    from urllib.error import HTTPError
+
+    body = {"code": "permission_denied"} if status == 403 else {"error": "Auth unavailable"}
+
+    def reject(*args, **kwargs):
+        raise HTTPError("https://publish.example/upload", status, "Rejected", {},
+                        io.BytesIO(json.dumps(body).encode()))
+
+    monkeypatch.setattr("anton.publisher.publish", reject)
+    monkeypatch.setattr("cowork.services.publish.vault_for_scope", lambda scope: object())
+    monkeypatch.setattr(
+        "cowork.services.artifact_authorization_identity.publish_authorization_key",
+        lambda *args: "owner/artifact",
+    )
+    with pytest.raises(HTTPException) as error:
+        await aw.set_artifact_access(
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+        )
+    assert error.value.status_code == status
+    assert error.value.detail["code"] == ("permission_denied" if status == 403 else "permission_unavailable")
+    assert not (as_owner / ".published.json").exists()
+    assert artifact_locks.acquire(as_owner.parent, as_owner.name, ttl_s=60)
+    artifact_locks.release(as_owner.parent, as_owner.name)
 
 
 async def test_a_non_owner_cannot_change_access(monkeypatch, publish_calls, publish_context):
@@ -173,6 +260,25 @@ async def test_owner_reads_back_the_email_list_a_card_would_withhold(as_owner):
 
     assert out["accessMode"] == "restricted"
     assert out["accessEmails"] == ["a@example.com"]
+
+
+async def test_identity_service_failure_does_not_report_a_successful_share(
+    as_owner, publish_context, monkeypatch,
+):
+    from cowork.services.artifact_access import ArtifactAccessUnavailable
+
+    def unavailable(*_args, **_kwargs):
+        raise ArtifactAccessUnavailable("Could not establish artifact authorization")
+
+    monkeypatch.setattr("cowork.services.publish.publish_artifact", unavailable)
+    with pytest.raises(HTTPException) as excinfo:
+        await aw.set_artifact_access(
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+        )
+    assert excinfo.value.status_code == 503
+    assert not (as_owner / ".published.json").exists()
+    assert artifact_locks.acquire(as_owner.parent, as_owner.name, ttl_s=60) is True
+    artifact_locks.release(as_owner.parent, as_owner.name)
 
 
 async def test_owner_reads_back_an_owner_only_artifact(as_owner):

@@ -230,3 +230,31 @@ def test_app_settings_rejects_invalid_organization_switch_enabled(monkeypatch):
 
     with pytest.raises(ValidationError):
         AppSettings(_env_file=None)
+
+
+def test_identity_enforce_defaults_to_enforce(monkeypatch):
+    """ENG-2094 AC6: a dropped env var must not reopen the no-principal path.
+
+    The rollout mode has to be asked for by name. Without this the default is
+    one edit away from flipping and nothing goes red — the permission front
+    door 401s an anonymous org-mode caller, but TrustedHeaderMiddleware is
+    what stops one reaching a route declared OpenByDesign at all.
+    """
+    monkeypatch.delenv("COWORK_IDENTITY_ENFORCE", raising=False)
+
+    assert AppSettings(_env_file=None).identity_enforce == "enforce"
+
+
+def test_identity_enforce_audit_must_be_asked_for_by_name(monkeypatch):
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "audit")
+    assert AppSettings(_env_file=None).identity_enforce == "audit"
+
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "off")
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None)
+
+
+def test_organization_boundary_mode_defaults_to_enforce(monkeypatch):
+    monkeypatch.delenv("COWORK_ORGANIZATION_BOUNDARY_MODE", raising=False)
+
+    assert AppSettings(_env_file=None).organization_boundary_mode == "enforce"

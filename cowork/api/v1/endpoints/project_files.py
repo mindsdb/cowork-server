@@ -12,6 +12,7 @@ import os
 import secrets
 import stat
 import time
+from collections import deque
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -24,12 +25,15 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
     dir_lstat,
     dir_mkdir,
     dir_open,
+    dir_replace,
     dir_rmtree,
     dir_scandir,
     dir_unlink,
@@ -57,6 +61,7 @@ from cowork.schemas.project_files import (
 from cowork.schemas.shared_resources import MutableResourceCapabilities
 from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
 from cowork.services.projects import ProjectService
+from cowork.services.product_permissions import require_product_permission
 from cowork.services.shared_resources import (
     PROJECT,
     PROJECT_INSTRUCTIONS,
@@ -66,7 +71,15 @@ from cowork.services.shared_resources import (
 
 
 logger = logging.getLogger(__name__)
-router = APIRouter()
+
+# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
+# whenever org mode has no org in scope. Declaring it too makes the
+# requirement visible to a route walker instead of something only
+# discoverable by reading scoped.py. (preview_asset checks a mount token
+# instead of taking ScopedSessionDep, but the token is scoped per-mount, not
+# a bypass, so it needs nothing of its own here.)
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 ANTON_INSTRUCTIONS_FILENAME = "anton.md"
 TEXT_MAX_BYTES = 2 * 1024 * 1024  # 2 MiB
@@ -575,6 +588,62 @@ def _safe_relpath(rel: str | _ValidatedProjectPath, base: Path) -> Path:
     return candidate
 
 
+#: A project directory Cowork allocated holds the agent's own output, so its
+#: size is bounded by what the agent wrote. A folder the user chose can be a
+#: repository or a home directory, and one request used to materialise every
+#: path beneath it with a stat and a resolve each before returning anything.
+_MAX_LISTED_FILES = 2000
+
+#: Entries examined, as opposed to returned. The cap above counts files the
+#: caller may actually see, so on its own an unreadable subtree could still be
+#: walked without limit before any of them were found.
+_MAX_EXAMINED_ENTRIES = 50_000
+
+
+@dataclass
+class _WalkBudget:
+    """Whether the entry ceiling, rather than the file cap, stopped the walk."""
+
+    exhausted: bool = False
+
+
+def _iter_project_files(base: Path, budget: _WalkBudget) -> Iterator[Path]:
+    """Candidate files under `base`, breadth-first, bounded by entries seen.
+
+    Breadth-first so a truncated listing shows the user's own top-level files
+    instead of whatever a depth-first walk reached inside the first large
+    subdirectory it happened to enter.
+
+    A symlinked directory is neither descended into nor listed, which is what
+    `Path.rglob` did: it yielded the link itself and the caller skipped it as a
+    directory. Every desktop project has `skills/<slug>` directory symlinks
+    from `reconcile_project`, so descending would spend the budget on trees
+    whose entries `_file_meta` then discards for resolving outside `base`.
+    """
+    queue: deque[Path] = deque([base])
+    examined = 0
+    while queue:
+        try:
+            entries = sorted(queue.popleft().iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            examined += 1
+            if examined > _MAX_EXAMINED_ENTRIES:
+                budget.exhausted = True
+                return
+            try:
+                if entry.is_symlink():
+                    if entry.is_dir():
+                        continue
+                elif entry.is_dir():
+                    queue.append(entry)
+                    continue
+            except OSError:
+                continue
+            yield entry
+
+
 def _file_meta(p: Path, base: Path) -> dict[str, Any] | None:
     try:
         st = p.stat()
@@ -636,6 +705,33 @@ def _require_workspace_access(target: Path, base: Path, scoped: ScopedSession) -
         raise HTTPException(status_code=404, detail="File not found")
     if not _conversation_workspace_ok(rel, scoped):
         raise HTTPException(status_code=404, detail="File not found")
+
+
+async def _authorize_artifact_file_mutation(
+    path: ProjectMutationPathDep, scoped: ScopedSessionDep,
+) -> None:
+    """Protect artifact bytes reached through the generic file adapter.
+
+    Mutations reject symlinks at every path component. Case-folding also covers
+    the supported case-insensitive desktop filesystems. Artifact storage and
+    its parent directories stay behind the same grant.
+    """
+    parts = tuple(part.casefold() for part in path.parts)
+    if parts[0] == CONVERSATIONS_DIRNAME:
+        if len(parts) == 1:
+            await require_product_permission(scoped.scope, "artifact.manage")
+            return
+        if len(parts) == 2:
+            try:
+                UUID(parts[1])
+            except ValueError:
+                return
+            await require_product_permission(scoped.scope, "artifact.manage")
+            return
+        parts = parts[2:]
+    artifact_root = (".anton", "artifacts")
+    if parts[:2] == artifact_root or parts == artifact_root[:1]:
+        await require_product_permission(scoped.scope, "artifact.manage")
 
 
 def _require_workspace_path(path: _ValidatedProjectPath, scoped: ScopedSession) -> None:
@@ -782,22 +878,32 @@ def _write_bytes_at_project_root(
                 raise HTTPException(status_code=404, detail="File not found")
             if stat.S_ISDIR(existing.st_mode):
                 raise HTTPException(status_code=400, detail="Path is a directory")
-        fd = dir_open(
-            parent,
-            name,
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | O_NOFOLLOW,
-            0o644,
-        )
+        # Replacing the entry detaches any pre-existing hardlink. Truncating
+        # its inode could edit protected artifact bytes through an ordinary name.
+        temporary = f".cowork-file-{secrets.token_hex(12)}.tmp"
+        mode = stat.S_IMODE(existing.st_mode) if existing is not None else 0o644
+        fd = dir_open(parent, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, mode)
         try:
-            remaining = memoryview(data)
-            while remaining:
-                written = os.write(fd, remaining)
-                if written == 0:
-                    raise OSError("project file write made no progress")
-                remaining = remaining[written:]
-            return os.fstat(fd)
+            try:
+                if existing is not None and hasattr(os, "fchmod"):
+                    os.fchmod(fd, mode)
+                remaining = memoryview(data)
+                while remaining:
+                    written = os.write(fd, remaining)
+                    if written == 0:
+                        raise OSError("project file write made no progress")
+                    remaining = remaining[written:]
+                result = os.fstat(fd)
+            finally:
+                os.close(fd)
+            dir_replace(parent, temporary, name)
+            return result
         finally:
-            os.close(fd)
+            try:
+                dir_unlink(parent, temporary)
+            except FileNotFoundError:
+                pass
+
 
 
 def _write_project_bytes(
@@ -1006,14 +1112,32 @@ def list_project_files(
     base = _project_dir(project_name, scoped)
     files: list[dict[str, Any]] = []
     _conv_cache: dict = {}
-    for p in sorted(base.rglob("*")):
-        if p.is_dir():
-            continue
+    budget = _WalkBudget()
+    truncated = False
+    for p in _iter_project_files(base, budget):
         meta = _file_meta(p, base)
-        if meta and _conversation_workspace_ok(meta["path"], scoped, _conv_cache):
-            files.append(meta)
+        if not (meta and _conversation_workspace_ok(meta["path"], scoped, _conv_cache)):
+            continue
+        # Counted after the filters, not before: budgeting candidates let a
+        # subtree the caller cannot see (another member's conversation
+        # workspace) spend the whole listing on rows that are then dropped.
+        if len(files) >= _MAX_LISTED_FILES:
+            truncated = True
+            break
+        files.append(meta)
+    truncated = truncated or budget.exhausted
+    # The walk yields shallowest first, so the response is re-sorted by path.
+    # Sibling prefixes order slightly differently from the old `sorted()` over
+    # Path objects, which compared parts rather than the joined string.
+    files.sort(key=lambda f: f["path"])
 
     anton_rel = _anton_md_path(base).relative_to(base).as_posix()
+    # Resolved from disk, not from the capped walk: a truncated listing would
+    # otherwise report a real anton.md as synthetic with size 0.
+    if truncated and not any(f["path"] == anton_rel for f in files):
+        instructions_meta = _file_meta(_anton_md_path(base), base)
+        if instructions_meta:
+            files.append(instructions_meta)
     if not any(f["path"] == anton_rel for f in files):
         files.insert(
             0,
@@ -1039,7 +1163,10 @@ def list_project_files(
         )
     )
 
-    return {"files": files}
+    response: dict[str, Any] = {"files": files}
+    if truncated:
+        response["truncated"] = True
+    return response
 
 
 @router.get(
@@ -1116,6 +1243,7 @@ def read_project_file(
 @router.put(
     "/{project_name}/files/{path:path}",
     response_model=ProjectFileWriteResponse,
+    dependencies=[Depends(_authorize_artifact_file_mutation)],
     response_model_exclude_unset=True,
 )
 def write_project_file(
@@ -1340,6 +1468,7 @@ async def upload_project_files(
 @router.delete(
     "/{project_name}/files/{path:path}",
     response_model=ProjectFileDeleteResponse,
+    dependencies=[Depends(_authorize_artifact_file_mutation)],
 )
 def delete_project_file(
     project_name: str,
