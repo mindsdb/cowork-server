@@ -69,7 +69,9 @@ from cowork.handlers.turn_errors import (
     retry_at_instant,
     response_failed_sse,
 )
-from cowork.db.scoped import ScopedSession, TenantScope, scope_from_principal
+from cowork.db.scoped import (
+    MissingTenantScopeError, ScopedSession, TenantScope, scope_from_principal,
+)
 from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
@@ -584,10 +586,10 @@ class ResponsesHandler:
         route: RouteDecision,
     ) -> AsyncGenerator[str, None] | Response:
         """Return the router model's direct answer without initializing Anton."""
-        # One id for the turn, not one per consumer: both halves of this
-        # producer quote it on a failure, and on the Redis backend record_turn
-        # indexes the turn under the same value, so a Reference a user reports
-        # resolves in the log and in the turn index alike.
+        # One id for the turn, not one per consumer: both halves quote it on a
+        # failure. The streaming half additionally hands it to record_turn on
+        # the Redis backend, so there the Reference a user reports resolves in
+        # the turn index too; the non-streaming half leaves only the log line.
         corr = f"direct-{uuid4()}"
         if not request.stream:
             try:
@@ -604,6 +606,11 @@ class ResponsesHandler:
                 ConversationService(self.scoped).save_assistant_turn(
                     conversation_id, text, events, harness="cowork-direct",
                 )
+            except MissingTenantScopeError:
+                # Org-scoped data touched without an org in scope is a 401 by
+                # deliberate classification (server.py). It is a RuntimeError,
+                # so the blanket clause below would answer 500 instead.
+                raise
             except Exception:
                 # Without this the escape reaches the client as Starlette's bare
                 # 500: no body, no code, no id. Same shape the delegated
