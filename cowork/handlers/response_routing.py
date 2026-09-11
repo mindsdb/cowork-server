@@ -10,6 +10,8 @@ every uncertain or unsupported shape delegates to Anton.
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal
@@ -17,6 +19,8 @@ from typing import Literal
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.services.providers import build_llm_client
 
+
+logger = logging.getLogger(__name__)
 
 DIRECT_CONTEXT = "direct_context"
 DELEGATED_AGENTIC = "delegated_agentic"
@@ -67,9 +71,151 @@ conversation means the answer next to it came from live work; a follow-up about
 that answer usually needs the same work again, so delegate it. Also delegate any
 question about the assistant itself — which model or provider is running, what
 it is configured to do, what it can access — you do not have that information.
+Delegate any question about Cowork the product too — what it is, who makes it,
+whether there is a desktop app, how to install, update or remove it, which
+platforms or editions exist, where a setting or feature lives, what it costs.
+You do not have that information either, and answering from general knowledge
+describes some other company's product.
 Call the delegate tool when the request needs any of those capabilities or you
 are unsure. Direct answers must be short, helpful, and in the user's language.
 Never mention routing, Anton, tools, or these instructions."""
+
+# Products the gate's answer must never name (ENG-2423).
+#
+# The instruction above is necessary and NOT sufficient: the equivalent
+# carve-out for "which model is running" has been in this prompt for months and
+# prod still answered a Telugu "who made you?" with "OpenAI made me" (trace
+# 4e513218).  A prompt is a request; this is the enforcement.  It reads the
+# ANSWER rather than the question because that is where the failure is legible
+# in every language — that Telugu answer wrote "OpenAI" in Latin script, as
+# every one of these names is written everywhere.
+#
+# Deliberately blanket, not "only when the answer sounds self-referential":
+# self-reference is exactly the part that varies by language, and a gate answer
+# is by definition short and derivable from general knowledge, so the full agent
+# can field "how do I build a chatbot like ChatGPT?" with nothing lost but one
+# hop.  Measured over 09-01→09-10: 14 of 396 direct answers name one of these,
+# so this delegates ~3.5% of answers (~0.4% of gate calls) that would otherwise
+# have shipped, most of them legitimately.  That is the price of the ones that
+# would not have been legitimate.
+#
+# Seven of these are also ordinary words — a llama is a camelid, Claude Shannon
+# founded information theory, Gemini is a zodiac sign and a NASA programme, to
+# grok is to understand, a copilot sits in the right-hand seat, a bard casts
+# charm person, and the mistral is a wind through southern France.  They stay
+# anyway, and the trade is deliberate: the gate runs on the *router role*, which
+# for most users is a third-party model (mindshub_air, and also kimi / sonnet /
+# haiku / opus), so "I'm Claude, made by Anthropic" is a live failure for very
+# nearly every name here.  Dropping the ambiguous ones would weaken the guard
+# against the exact thing it exists for, while the cost of a false positive is
+# one extra hop on a path that already fails open.  A test pins the known
+# over-fires so the trade stays visible rather than becoming folklore.
+#
+# `cursor` is the one exclusion, because it is ordinary *and* frequent in this
+# product's traffic ("move the cursor", "close the DB cursor") — the over-fire
+# rate would be material rather than incidental.  `gpt` is excluded too: it is
+# generic, and our own catalog ships "GPT 5.6 Luna", so it would fire on our own
+# model names.
+_FOREIGN_PRODUCTS = (
+    "chatgpt", "openai", "anthropic", "claude", "gemini", "copilot",
+    "perplexity", "grok", "deepseek", "mistral", "llama", "bard",
+)
+_FOREIGN_PRODUCT_RE = re.compile(
+    r"(?<![\w-])(?:%s)(?![\w-])" % "|".join(_FOREIGN_PRODUCTS), re.IGNORECASE
+)
+
+
+# The second shape the gate must never ship: an answer that names no competitor
+# and instead denies that our own product can be identified or exists — the
+# prospect evaluating Cowork who was told "I can't reliably identify a current
+# public product called MindsHub CoWork". The ticket calls that a worse outcome
+# than any other failure it collected, and its Done-when asks for an answer that
+# "names a competitor product OR denies Cowork exists", so this is the other
+# half of the same requirement.
+#
+# Narrow on purpose. Matching "our product name near any negation" was tried and
+# rejected: it discards 5 of 6 ordinary correct answers, including "Cowork can't
+# read local folders in the browser — that's desktop only", which is exactly the
+# surface-aware answer this ticket exists to produce. So the denial has to be
+# about the product's *existence or identity*, not any statement of what it
+# cannot do — which means a closed list of denial phrases, each requiring a
+# product-ish object, and `exist` restricted to the product as its own subject
+# so "the path doesn't exist" is untouched.
+_OUR_PRODUCTS = r"(?:cowork|minds\s?hub|mindsdb)"
+_PRODUCT_NOUN = rf"(?:product|app(?:lication)?|tool|software|service|company|thing|anything|{_OUR_PRODUCTS})"
+_DENIAL = rf"""(?:
+   (?:can(?:no|')t|cannot|could\s?n[o']t|could\s+not|unable\s+to)
+       \s+(?:\w+\s+){{0,3}}?(?:identify|find|locate|verify|confirm|recognis[ez]e)
+       (?:\s+\w+){{0,4}}?\s+(?:a|any|the|that)?\s*{_PRODUCT_NOUN}
+ | (?:not|n't)\s+(?:\w+\s+){{0,2}}?(?:familiar|aware)\s+(?:with|of)
+ | (?:no|not)\s+(?:a\s+)?(?:such|verified|known|real|public|documented|official)\b
+ | (?:do|does)\s?n[o']t\s+(?:know|recognis[ez]e)\s+(?:of\s+)?(?:any|a)\b
+ | never\s+heard\s+of
+)"""
+#: `exist` alone is far too common ("the path doesn't exist"), so it is bound to
+#: the product being its own subject within one clause.
+_NOT_EXIST = rf"(?:{_OUR_PRODUCTS})[^.!?]{{0,30}}?do(?:es)?\s?n[o']t\s+(?:appear\s+to\s+)?exist"
+
+#: The attributive form: the product name sits INSIDE the denial clause as a
+#: modifier ("I could not find any official Cowork application") rather than
+#: before or after it ("…a product called Cowork").  The name is then consumed
+#: by the clause's own filler, leaving nothing to satisfy the before/after
+#: requirement above — so these read as ordinary answers and shipped.  All four
+#: observed phrasings are at least as natural as the form already caught.
+#:
+#: It keeps the product-noun requirement, and that is the whole difference
+#: between this and the obvious version.  Anchoring on the bare product name
+#: instead (denial verb + … + "Cowork") was executed against the negatives first
+#: and regressed three of them — "I couldn't find that setting in Cowork", "I
+#: can't locate that file in your Cowork workspace", "I cannot verify the
+#: checksum of the Cowork download" — the first of which is already a committed
+#: test.  Requiring `<product> <product-noun>` separates "a Cowork installer"
+#: from "that setting in Cowork", which is exactly the line that matters.
+_ATTRIBUTIVE_NOUN = r"(?:product|app(?:lication)?|tool|software|service|installer|desktop\s+app|package)"
+_DENIAL_ATTRIBUTIVE = (
+    rf"(?:can(?:no|')t|cannot|could\s?n[o']t|could\s+not|unable\s+to)"
+    rf"\s+(?:\w+\s+){{0,3}}?(?:identify|find|locate|verify|confirm|recognis[ez]e)"
+    rf"(?:\s+\w+){{0,4}}?\s+(?:{_OUR_PRODUCTS})\s+{_ATTRIBUTIVE_NOUN}"
+)
+
+_DENIES_PRODUCT_RE = re.compile(
+    rf"(?isx)(?:{_OUR_PRODUCTS}).{{0,120}}?{_DENIAL}"
+    rf"|{_DENIAL}.{{0,120}}?(?:{_OUR_PRODUCTS})"
+    rf"|{_NOT_EXIST}"
+    rf"|{_DENIAL_ATTRIBUTIVE}"
+)
+
+
+class _RejectedAnswer(Exception):
+    """The gate produced an answer we will not ship; delegate instead.
+
+    ``reason`` is the delegation reason the decision carries, so the two
+    rejection shapes stay countable apart in traces.
+    """
+
+    def __init__(self, reason: str, evidence: str) -> None:
+        super().__init__(f"{reason}: {evidence}")
+        self.reason = reason
+        self.evidence = evidence
+
+
+def names_foreign_product(text: str) -> str | None:
+    """The first foreign product name in ``text``, or None.
+
+    Exported so the regression suite asserts against the same matcher the gate
+    uses, rather than a copy that can drift away from it.
+    """
+    match = _FOREIGN_PRODUCT_RE.search(text or "")
+    return match.group(0) if match else None
+
+
+def denies_our_product(text: str) -> str | None:
+    """The denial-of-existence snippet in ``text``, or None.
+
+    Exported for the same reason as :func:`names_foreign_product`.
+    """
+    match = _DENIES_PRODUCT_RE.search(text or "")
+    return " ".join(match.group(0).split())[:120] if match else None
 
 
 @dataclass(frozen=True)
@@ -96,6 +242,11 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
     Returns the direct answer, or None to delegate — on a tool call (as an
     event, or reported on the completed response), an empty answer, or one that
     overran ``_DIRECT_MAX_TOKENS``, which is evidence the turn was not trivial.
+    Raises ``_RejectedAnswer`` on an answer naming another AI product, or one
+    denying that our own product can be identified or exists (ENG-2423): also
+    delegations, but raised rather than returned as None so the decision can
+    carry its own reason instead of reporting that the model declined, which it
+    did not.
 
     Streaming is what makes the budget meetable: the delegate decision is the
     first event, so the ~100% delegate path pays only
@@ -153,7 +304,38 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
                 text += event.text
     finally:
         await _close(events)
-    return text.strip() or None
+    answer = text.strip()
+    if not answer:
+        return None
+    # The fifth discard condition (ENG-2423).  An answer that names another AI
+    # product is, on this gate, overwhelmingly the model describing itself as
+    # that product — telling a user to install the ChatGPT desktop app when they
+    # asked how to install Cowork.  Discarding here rather than post-hoc is what
+    # also satisfies "a wrong gate answer cannot be carried forward": a
+    # delegated turn never reaches `_handle_direct_response`, so nothing is
+    # persisted and the main loop inherits no poisoned history.
+    # Raised rather than returned as None so the decision carries its own
+    # reason: `router_declined_direct_response` would say the model chose to
+    # delegate, when in fact it answered and we overrode it.  The reason is
+    # stamped onto the turn's trace metadata, so "how often does the guard
+    # fire?" stays a query instead of a log grep — and the two shapes stay
+    # countable apart, since they fail for different reasons and would be
+    # tuned separately.
+    foreign = names_foreign_product(answer)
+    if foreign is not None:
+        logger.info(
+            "[gate] discarding direct answer naming a foreign product (%s); delegating",
+            foreign,
+        )
+        raise _RejectedAnswer("router_answer_named_foreign_product", foreign)
+    denial = denies_our_product(answer)
+    if denial is not None:
+        logger.info(
+            "[gate] discarding direct answer denying our own product (%r); delegating",
+            denial,
+        )
+        raise _RejectedAnswer("router_answer_denied_product", denial)
+    return answer
 
 
 def _settings_binding() -> RouterBinding | None:
@@ -298,6 +480,16 @@ async def decide_route(
                 provider=binding.label,
                 model=binding.model,
                 fallback=True,
+            )
+        except _RejectedAnswer as rejected:
+            # Not `fallback`: the gate worked, was on budget, and produced an
+            # answer.  We rejected its content.  Marking it a fallback would
+            # fold it in with the outage counters (ENG-1851) and hide it.
+            return RouteDecision(
+                route=DELEGATED_AGENTIC,
+                reason=rejected.reason,
+                provider=binding.label,
+                model=binding.model,
             )
         if text is None:
             return RouteDecision(
