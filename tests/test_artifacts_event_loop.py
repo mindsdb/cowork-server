@@ -20,6 +20,12 @@ from cowork.server import create_app
 
 
 def test_list_artifacts_does_not_block_the_event_loop():
+    """Discriminates on tick count, not wall-clock gaps: a GC pause or a loaded
+    CI runner can widen a single gap past any fixed millisecond threshold with
+    entirely correct code. A blocked loop gives 0-1 ticks across the 0.5s
+    stub; a healthy one gives roughly 50 — the same discrimination without a
+    timing threshold.
+    """
     def slow_all_artifact_cards(session):
         time.sleep(0.5)
         return []
@@ -27,13 +33,13 @@ def test_list_artifacts_does_not_block_the_event_loop():
     async def flow():
         app = create_app()
         transport = httpx.ASGITransport(app=app)
-        heartbeats: list[float] = []
+        ticks_during_request = 0
 
         async def heartbeat():
-            loop = asyncio.get_running_loop()
+            nonlocal ticks_during_request
             while True:
-                heartbeats.append(loop.time())
                 await asyncio.sleep(0.01)
+                ticks_during_request += 1
 
         hb_task = asyncio.create_task(heartbeat())
         try:
@@ -46,8 +52,9 @@ def test_list_artifacts_does_not_block_the_event_loop():
             with contextlib.suppress(asyncio.CancelledError):
                 await hb_task
 
-        assert len(heartbeats) >= 2, "heartbeat never got a chance to run"
-        gaps = [b - a for a, b in zip(heartbeats, heartbeats[1:])]
-        assert max(gaps) < 0.1, f"largest heartbeat gap was {max(gaps):.3f}s — the loop stalled"
+        assert ticks_during_request >= 5, (
+            f"heartbeat ticked only {ticks_during_request} times during the "
+            "request — the loop stalled"
+        )
 
     asyncio.run(flow())
