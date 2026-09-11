@@ -393,3 +393,45 @@ async def test_direct_turn_seal_quotes_the_same_id(monkeypatch):
     assert len(sealed) == 1
     assert sealed[0]["request_id"] == corr
     assert buffer.closed == "error"
+
+
+@pytest.mark.asyncio
+async def test_non_streaming_direct_failure_answers_with_a_quotable_500(monkeypatch):
+    """The other half of the direct producer. A client that omits `stream`
+    lands here, and an escape used to reach the user as a bare 500 with no
+    body at all — nothing to read, let alone quote."""
+    from fastapi import HTTPException
+
+    from cowork.handlers.response_routing import DIRECT_CONTEXT, RouteDecision
+
+    handler = object.__new__(ResponsesHandler)
+    handler.scoped = object()
+
+    def _boom(conv_id, text, events, harness=None):
+        raise RuntimeError("direct answer could not be persisted")
+
+    monkeypatch.setattr(
+        responses_mod,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            save_user_message=lambda cid, content: SimpleNamespace(id=uuid4()),
+            save_assistant_turn=_boom,
+        ),
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        await handler._handle_direct_response(
+            request=SimpleNamespace(stream=False),
+            conversation_id=UUID("d27d3533-2e4e-4021-bb5a-6e238245974c"),
+            turn_id=1,
+            original_content="Hello",
+            route=RouteDecision(
+                route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text="Hi.",
+            ),
+        )
+
+    assert caught.value.status_code == 500
+    # Same body shape the delegated non-streaming path emits, so a caller
+    # never has to branch on which producer answered.
+    assert caught.value.detail["code"] == "anton_error"
+    assert caught.value.detail["request_id"]
