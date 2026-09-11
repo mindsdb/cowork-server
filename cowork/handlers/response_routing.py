@@ -155,10 +155,34 @@ _DENIAL = rf"""(?:
 #: `exist` alone is far too common ("the path doesn't exist"), so it is bound to
 #: the product being its own subject within one clause.
 _NOT_EXIST = rf"(?:{_OUR_PRODUCTS})[^.!?]{{0,30}}?do(?:es)?\s?n[o']t\s+(?:appear\s+to\s+)?exist"
+
+#: The attributive form: the product name sits INSIDE the denial clause as a
+#: modifier ("I could not find any official Cowork application") rather than
+#: before or after it ("…a product called Cowork").  The name is then consumed
+#: by the clause's own filler, leaving nothing to satisfy the before/after
+#: requirement above — so these read as ordinary answers and shipped.  All four
+#: observed phrasings are at least as natural as the form already caught.
+#:
+#: It keeps the product-noun requirement, and that is the whole difference
+#: between this and the obvious version.  Anchoring on the bare product name
+#: instead (denial verb + … + "Cowork") was executed against the negatives first
+#: and regressed three of them — "I couldn't find that setting in Cowork", "I
+#: can't locate that file in your Cowork workspace", "I cannot verify the
+#: checksum of the Cowork download" — the first of which is already a committed
+#: test.  Requiring `<product> <product-noun>` separates "a Cowork installer"
+#: from "that setting in Cowork", which is exactly the line that matters.
+_ATTRIBUTIVE_NOUN = r"(?:product|app(?:lication)?|tool|software|service|installer|desktop\s+app|package)"
+_DENIAL_ATTRIBUTIVE = (
+    rf"(?:can(?:no|')t|cannot|could\s?n[o']t|could\s+not|unable\s+to)"
+    rf"\s+(?:\w+\s+){{0,3}}?(?:identify|find|locate|verify|confirm|recognis[ez]e)"
+    rf"(?:\s+\w+){{0,4}}?\s+(?:{_OUR_PRODUCTS})\s+{_ATTRIBUTIVE_NOUN}"
+)
+
 _DENIES_PRODUCT_RE = re.compile(
     rf"(?isx)(?:{_OUR_PRODUCTS}).{{0,120}}?{_DENIAL}"
     rf"|{_DENIAL}.{{0,120}}?(?:{_OUR_PRODUCTS})"
     rf"|{_NOT_EXIST}"
+    rf"|{_DENIAL_ATTRIBUTIVE}"
 )
 
 

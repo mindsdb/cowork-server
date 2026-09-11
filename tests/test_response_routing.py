@@ -1144,6 +1144,14 @@ def test_denial_matcher_catches_the_prospect_failure():
         "I've never heard of Cowork by MindsDB.",
         "I could not find any product by that name — MindsHub Cowork does not appear to exist.",
         "There's no such app as MindsHub Cowork that I know of.",
+        # Attributive: the name sits INSIDE the denial clause as a modifier,
+        # so it is consumed by the clause's filler and the before/after rule
+        # cannot see it. At least as natural as the "called Cowork" form.
+        "I could not find any official Cowork application.",
+        "I couldn't find any Cowork app.",
+        "I could not locate a Cowork installer.",
+        "I was unable to verify the Cowork product.",
+        "I couldn't find any MindsHub Cowork software anywhere.",
     ):
         assert denies_our_product(denial) is not None, denial
 
@@ -1168,6 +1176,13 @@ def test_denial_matcher_leaves_true_statements_about_cowork_alone():
         "I couldn't find that setting in Cowork — try Settings → Agent Harness.",
         "Cowork can't identify the file encoding automatically; specify it.",
         "The Cowork desktop app is not available from the Mac App Store.",
+        # These three separate the attributive rule from the obvious version of
+        # it. Anchoring on the bare product name instead of `<product> <noun>`
+        # fires on all three, and the first is a real answer shape.
+        "I couldn't find that setting in Cowork — try Settings → Agent Harness.",
+        "I can't locate that file in your Cowork workspace.",
+        "I cannot verify the checksum of the Cowork download you pasted.",
+        "I couldn't find the Cowork log file you asked about.",
     ):
         assert denies_our_product(true_statement) is None, true_statement
 
