@@ -231,6 +231,32 @@ def test_general_repoints_a_legacy_unkeyed_path_with_no_content(db, tmp_path):
     assert Path(general.path).is_dir()
 
 
+def test_general_keeps_a_legacy_path_it_cannot_read(db, tmp_path, monkeypatch):
+    """An unreadable directory is not an empty one. A disconnected mount or a
+    folder the process cannot list must not read as "no content" and cost the
+    org the path its work is on."""
+    a = _svc(db, _scope(ORG_A))
+    legacy = tmp_path / "projects" / GENERAL_PROJECT
+    legacy.mkdir(parents=True)
+    raw = _raw(db)
+    raw.add(Project(name=GENERAL_PROJECT, path=str(legacy), is_active=False, org_id=ORG_A))
+    raw.commit()
+
+    readable = Path.iterdir
+
+    def refuse(self):
+        if self == legacy:
+            raise OSError(116, "Stale file handle")
+        return readable(self)
+
+    monkeypatch.setattr(Path, "iterdir", refuse)
+
+    general = a.ensure_general_for_scope()
+
+    assert general is not None
+    assert Path(general.path) == legacy
+
+
 def test_general_keeps_a_legacy_path_that_still_has_content(db, tmp_path):
     """The mirror case: a dir with real content must not be abandoned."""
     a = _svc(db, _scope(ORG_A))
