@@ -63,6 +63,7 @@ async def remote_turn_events(
             turn_id=turn_id,
             history=ResponsesHandler._remote_history(session, conv_id),
             **ResponsesHandler._remote_workspace(session, conv_id),
+            started_at=ResponsesHandler._remote_started_at(session, conv_id),
             correlation_id=correlation_id,
             llm=llm,
         ):

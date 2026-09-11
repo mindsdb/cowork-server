@@ -233,6 +233,41 @@ async def test_oversized_request_sheds_whole_project_memory_first(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stream_remote_replies_forwards_started_at_only_when_known(monkeypatch):
+    # The pod renders this as the fixed "conversation started" date. Absent
+    # entirely when unknown so an older controller sees no new key.
+    fake = FakeRedis(replies=[
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+    ])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    async def fake_mint(**kw):
+        return "mdb_turnkey"
+
+    monkeypatch.setattr(prod, "mint_turn_key", fake_mint)
+
+    async def fake_list_active_connections(**kw):
+        return []
+
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        started_at="2026-09-01T08:15:00",
+    ))
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+
+    with_it = json.loads(fake.added[0][1]["payload"])["params"]
+    without = json.loads(fake.added[1][1]["payload"])["params"]
+    assert with_it["started_at"] == "2026-09-01T08:15:00"
+    assert "started_at" not in without
+
+
+@pytest.mark.asyncio
 async def test_stream_remote_replies_attaches_oauth_block_with_the_llm_turn_key(monkeypatch):
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
