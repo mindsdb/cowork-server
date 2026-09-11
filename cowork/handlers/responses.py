@@ -32,6 +32,7 @@ from cowork.handlers.response_routing import (
 )
 from cowork.harnesses.anton_harness.stream_formatter import SkillCreated, format_responses_stream
 from cowork.streaming import TurnLifecycle, new_buffer, registry, sse_frame
+from cowork.streaming.answer_text import accumulate_answer_text
 from cowork.streaming.backend import get_backend
 from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
@@ -72,6 +73,9 @@ from cowork.db.scoped import ScopedSession, TenantScope, scope_from_principal
 from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
+from cowork.services.product_permissions import (
+    ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
+)
 from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectService
 from cowork.services.skills import SkillService
@@ -265,6 +269,8 @@ class ResponsesHandler:
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
+
+        await require_product_permission(self.scope, "product.execute")
 
         # A per-conversation harness pick (Coding Mode's composer pill)
         # overrides the account default for THIS call only — mirrors the
@@ -526,8 +532,10 @@ class ResponsesHandler:
             finally:
                 reset_trace_context(trace_token)
             return decision, turn_llm
+        except (ProductPermissionDenied, ProductPermissionUnavailable):
+            raise
         except Exception:
-            # Any gate-path failure (history query, mint, settings) fails open.
+            # Non-authorization routing failures may delegate to the agent.
             logger.exception("[responses] routing gate failed — delegating")
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
@@ -1036,8 +1044,7 @@ class ResponsesHandler:
             # at_ms is stamped at receipt (the pod sends no timestamps), so
             # replayed durations are approximate under consumer lag.
             collected_events.append(data)
-            if event_type == "response.output_text.delta":
-                collected_text.append(data.get("delta", ""))
+            accumulate_answer_text(collected_text, event_type, data)
 
         producer_scope: TenantScope | None = None
         producer_session: ScopedSession | None = None
@@ -1065,6 +1072,7 @@ class ResponsesHandler:
             new_slugs: list[str] = []
             touched_slugs: set[str] = set()
             turn_scope = None
+            artifact_writes_allowed = False
             # Off the loop: this reads the project's memory slots off the shared
             # mount, and one worker serves every other request on this process
             # while a blocking EFS round trip is in flight.
@@ -1092,7 +1100,9 @@ class ResponsesHandler:
                     llm=(turn_llm or {}).get("llm"),
                     disabled=disabled,
                 ):
-                    if kind == "turn_delta":
+                    if kind == "progress" and data.get("phase") == "workspace_authorized":
+                        artifact_writes_allowed = data.get("workspace_mode") == "persistent"
+                    elif kind == "turn_delta":
                         yield StreamTextDelta(text=data.get("text", ""))
                     elif kind == "turn_step":
                         for event in step_stream_events(data):
@@ -1152,7 +1162,7 @@ class ResponsesHandler:
                 # an artifact the worker wrote is recorded even when the turn
                 # failed or was stopped, and it is synchronous because an await
                 # in a generator's finally is skipped on cancellation.
-                if artifacts is not None:
+                if artifacts is not None and artifact_writes_allowed:
                     new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
                         artifacts[0], conv_id, artifacts[2], artifacts[1],
                         before_slugs, before_mtimes,
@@ -1161,7 +1171,7 @@ class ResponsesHandler:
             # Clean completion only — a raise inside the try skips this, matching
             # the in-process path where Stop/error produce no cards and the next
             # turn in the project heals the publish.
-            if artifacts is not None:
+            if artifacts is not None and artifact_writes_allowed:
                 for card in await publish_and_card_turn_artifacts(
                     artifacts[1],
                     new_slugs=new_slugs,
@@ -1355,8 +1365,7 @@ class ResponsesHandler:
                 turn_rows[:] = data.get("rows") or []
                 return
             collected_events.append(data)
-            if event_type == "response.output_text.delta":
-                collected_text.append(data.get("delta", ""))
+            accumulate_answer_text(collected_text, event_type, data)
 
         def persist() -> None:
             nonlocal persisted
@@ -1597,8 +1606,7 @@ class ResponsesHandler:
                 turn_rows[:] = data.get("rows") or []
                 return
             collected_events.append(data)
-            if event_type == "response.output_text.delta":
-                collected_text.append(data.get("delta", ""))
+            accumulate_answer_text(collected_text, event_type, data)
 
         try:
             async for _ in self._get_harness().formatter(stream, model, event_sink):

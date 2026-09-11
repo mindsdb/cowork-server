@@ -33,6 +33,7 @@ from cowork.common.paths import (
     dir_lstat,
     dir_mkdir,
     dir_open,
+    dir_replace,
     dir_rmtree,
     dir_scandir,
     dir_unlink,
@@ -60,6 +61,7 @@ from cowork.schemas.project_files import (
 from cowork.schemas.shared_resources import MutableResourceCapabilities
 from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
 from cowork.services.projects import ProjectService
+from cowork.services.product_permissions import require_product_permission
 from cowork.services.shared_resources import (
     PROJECT,
     PROJECT_INSTRUCTIONS,
@@ -705,6 +707,33 @@ def _require_workspace_access(target: Path, base: Path, scoped: ScopedSession) -
         raise HTTPException(status_code=404, detail="File not found")
 
 
+async def _authorize_artifact_file_mutation(
+    path: ProjectMutationPathDep, scoped: ScopedSessionDep,
+) -> None:
+    """Protect artifact bytes reached through the generic file adapter.
+
+    Mutations reject symlinks at every path component. Case-folding also covers
+    the supported case-insensitive desktop filesystems. Artifact storage and
+    its parent directories stay behind the same grant.
+    """
+    parts = tuple(part.casefold() for part in path.parts)
+    if parts[0] == CONVERSATIONS_DIRNAME:
+        if len(parts) == 1:
+            await require_product_permission(scoped.scope, "artifact.manage")
+            return
+        if len(parts) == 2:
+            try:
+                UUID(parts[1])
+            except ValueError:
+                return
+            await require_product_permission(scoped.scope, "artifact.manage")
+            return
+        parts = parts[2:]
+    artifact_root = (".anton", "artifacts")
+    if parts[:2] == artifact_root or parts == artifact_root[:1]:
+        await require_product_permission(scoped.scope, "artifact.manage")
+
+
 def _require_workspace_path(path: _ValidatedProjectPath, scoped: ScopedSession) -> None:
     """Authorize a validated lexical path before an fd-relative mutation.
 
@@ -849,22 +878,32 @@ def _write_bytes_at_project_root(
                 raise HTTPException(status_code=404, detail="File not found")
             if stat.S_ISDIR(existing.st_mode):
                 raise HTTPException(status_code=400, detail="Path is a directory")
-        fd = dir_open(
-            parent,
-            name,
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | O_NOFOLLOW,
-            0o644,
-        )
+        # Replacing the entry detaches any pre-existing hardlink. Truncating
+        # its inode could edit protected artifact bytes through an ordinary name.
+        temporary = f".cowork-file-{secrets.token_hex(12)}.tmp"
+        mode = stat.S_IMODE(existing.st_mode) if existing is not None else 0o644
+        fd = dir_open(parent, temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW, mode)
         try:
-            remaining = memoryview(data)
-            while remaining:
-                written = os.write(fd, remaining)
-                if written == 0:
-                    raise OSError("project file write made no progress")
-                remaining = remaining[written:]
-            return os.fstat(fd)
+            try:
+                if existing is not None and hasattr(os, "fchmod"):
+                    os.fchmod(fd, mode)
+                remaining = memoryview(data)
+                while remaining:
+                    written = os.write(fd, remaining)
+                    if written == 0:
+                        raise OSError("project file write made no progress")
+                    remaining = remaining[written:]
+                result = os.fstat(fd)
+            finally:
+                os.close(fd)
+            dir_replace(parent, temporary, name)
+            return result
         finally:
-            os.close(fd)
+            try:
+                dir_unlink(parent, temporary)
+            except FileNotFoundError:
+                pass
+
 
 
 def _write_project_bytes(
@@ -1204,6 +1243,7 @@ def read_project_file(
 @router.put(
     "/{project_name}/files/{path:path}",
     response_model=ProjectFileWriteResponse,
+    dependencies=[Depends(_authorize_artifact_file_mutation)],
     response_model_exclude_unset=True,
 )
 def write_project_file(
@@ -1428,6 +1468,7 @@ async def upload_project_files(
 @router.delete(
     "/{project_name}/files/{path:path}",
     response_model=ProjectFileDeleteResponse,
+    dependencies=[Depends(_authorize_artifact_file_mutation)],
 )
 def delete_project_file(
     project_name: str,

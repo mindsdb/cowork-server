@@ -9,6 +9,10 @@ on:
       deploy-env:
         required: true
         type: string
+      runner:
+        description: Self-hosted runner in the deployment's cluster
+        required: true
+        type: string
 
 defaults:
   run:
@@ -18,7 +22,7 @@ jobs:
   integration-tests:
     # Needs cluster access: the second-replica test port-forwards to individual
     # pods, since the load balancer is free to send both requests to the same one.
-    runs-on: mdb-dev
+    runs-on: ${{ inputs.runner }}
     environment:
       name: ${{ inputs.deploy-env }}
     steps:
@@ -44,19 +48,21 @@ jobs:
       # is mounted there (it exists only where auth's `ephemeral` setting is on),
       # so no secret is needed and each run gets a fresh throwaway tenant.
       #
-      # dev/staging/prod: the dev route is deliberately not mounted there, so
+      # dev/staging: the dev route is deliberately not mounted there, so
       # identity comes from auth's internal provisioning endpoint with the
-      # dedicated secret. It provisions the fixed `cowork` suite: one
-      # @emailsink.dev tenant reused across runs. The hostnames come from a
-      # committed env file rather than GitHub Environment variables, so a change
-      # is a reviewable diff (same as mindshub_inference).
+      # dedicated secret. It provisions the fixed `cowork` suite. Prod uses a
+      # separately managed standing identity: mutating the shared emailsink
+      # account there is disabled while its fixture password remains committed.
+      # Hostnames come from a committed
+      # env file rather than GitHub Environment variables, so a change is a
+      # reviewable diff (same as mindshub_inference).
       #
       # That provisioning call goes to auth's Service over cluster DNS, not to
-      # the public host. Cloudflare Access fronts auth.<env>.mindshub.ai/v1/internal*
-      # and answers the POST with an HTML error page before it reaches Django.
-      # The runner is in the environment's cluster, so the Service's fully
+      # the public host. After the internal-edge cutover, Cloudflare
+      # Access rejects that public POST before it reaches Django. The caller
+      # passes a runner in the deployment's cluster, so the Service's fully
       # qualified name needs no Cloudflare credential and no extra Kubernetes
-      # permission, matching auth's own tests-integration.yml and the
+      # permission. This matches auth's tests-integration.yml and the
       # auth.<env>.svc.cluster.local address our chart already gives the ingress.
       - name: Resolve the target and the identity source
         env:
@@ -83,7 +89,11 @@ jobs:
             set +a
             {
               echo "COWORK_BASE_URL=${COWORK_BASE_URL}"
-              echo "TEST_USER_PROVISION_URL=${COWORK_AUTH_INTERNAL_BASE_URL}/v1/internal/test-users/"
+              if [[ "$DEPLOY_ENV" == "prod" ]]; then
+                echo "COWORK_TEST_IDENTITY_MODE=standing"
+              else
+                echo "TEST_USER_PROVISION_URL=${COWORK_AUTH_INTERNAL_BASE_URL}/v1/internal/test-users/"
+              fi
             } >> "$GITHUB_ENV"
           fi
 
@@ -101,21 +111,21 @@ jobs:
         run: |
           set -euo pipefail
           # PR envs and permanent envs both deploy into a namespace named
-          # after the env.
+          # after the env. The caller supplies the matching cluster runner;
+          # staging uses mdb-dev and prod uses mdb-prod.
           ns="$DEPLOY_ENV"
           # Which namespaces make a missing replica or a dead port-forward a
-          # real defect rather than a known gap in the environment. This job
-          # always runs on mdb-dev, so the only namespaces it reaches are
-          # newdev's, and `<env>-gha-runner-deploy` carries both `pods list` and
-          # `create pods/portforward` in them. `prod` is on newprod and lists
-          # nothing from here. A `pr-*` namespace is served by
-          # `<env>-gha-runner-prenv`, which is read-only by design. Neither gap
-          # is about the change being shipped, so neither goes red. A PR
+          # real defect rather than a known gap in the environment. Permanent
+          # jobs run inside their target cluster, where `<env>-gha-runner-deploy`
+          # carries both `pods list` and `create pods/portforward`. A `pr-*`
+          # namespace is served by `<env>-gha-runner-prenv`, which is read-only
+          # by design. That gap is unrelated to the change being shipped, so it
+          # does not go red. A PR
           # environment also runs one replica, pinned by argocd-envs in
           # parent/templates/cowork-server-app.yaml, so it lands in the one-pod
           # branch below rather than the port-forward one.
           case "$ns" in
-            dev|staging) enforce=true ;;
+            dev|staging|prod) enforce=true ;;
             *)           enforce=false ;;
           esac
           # The same answer, handed to pytest. A post-deploy test with no target
@@ -134,9 +144,9 @@ jobs:
           )
           if [[ "${#pods[@]}" -lt 2 ]]; then
             # Not the same thing, and the messages should not read the same.
-            # Zero means this runner cannot see that namespace's pods at all:
-            # the job is pinned to mdb-dev, so on the prod release path it lists
-            # nothing and has never exercised the cross-replica behaviour.
+            # Zero means the environment's own runner cannot see that
+            # namespace's pods at all, so it has not exercised cross-replica
+            # behaviour.
             if [[ "${#pods[@]}" -eq 0 ]]; then
               detail="No cowork-server pods visible in $ns from this runner."
             else
@@ -175,10 +185,9 @@ jobs:
           # work, and warn where it is known not to.
           #
           # Reaching here means two pods were listed, so in practice only a
-          # deploy namespace gets this far: a PR environment runs one replica and
-          # `prod` lists nothing from a runner pinned to mdb-dev. The guard below
-          # is there for the day one of those changes, and it is right on its own
-          # terms, because `<env>-gha-runner-prenv` is read-only and does not
+          # deploy namespace gets this far: a PR environment runs one replica.
+          # The guard below is there for the day that changes, and it is right on
+          # its own terms, because `<env>-gha-runner-prenv` is read-only and does not
           # carry `create pods/portforward`, so a PR environment with two pods
           # still could not forward to them.
           echo "::warning::port-forwards to ${pods[0]} and ${pods[1]} never answered ${health}."
@@ -192,7 +201,25 @@ jobs:
                "--as=system:serviceaccount:infrastructure:<env>-gha-runner"
           exit 1
 
-      - name: Run integration tests
+      - name: Run integration tests (non-prod)
+        if: inputs.deploy-env != 'prod'
         env:
           TEST_USER_PROVISION_SECRET: ${{ secrets.TEST_USER_PROVISION_SECRET }}
+        run: make test/integration
+
+      - name: Run integration tests (prod)
+        if: inputs.deploy-env == 'prod'
+        env:
+          # Configure these only after the prod GitHub Environment has a
+          # nonempty reviewer rule, prevents self-review, disables admin bypass,
+          # and allows exactly one `main` Branch rule. Production evidence must
+          # use a fresh attempt 1 started after protection and approved by an
+          # eligible reviewer other than both its actor and triggering actor.
+          # Auth then resolves the key's ids and verifies the configured
+          # controlled-domain email and dedicated organization live.
+          # The caller's main-ref check is defense in depth; Environment settings
+          # are the credential boundary. See README.md for the exact checks.
+          COWORK_TEST_API_KEY: ${{ secrets.COWORK_TEST_API_KEY }}
+          COWORK_TEST_USER_EMAIL: ${{ vars.COWORK_TEST_USER_EMAIL }}
+          COWORK_TEST_ORG_ID: ${{ vars.COWORK_TEST_ORG_ID }}
         run: make test/integration
