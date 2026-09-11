@@ -236,13 +236,12 @@ def _auth_failure_provider(settings, role: str | None) -> Provider | None:
     if role == "coding":
         return settings.resolved_coding_provider
     if role == "router":
-        # Defensive, and not reachable today: every router call site swallows a
-        # confirmed refusal rather than propagating it — `summarize()` at
-        # anton/core/session.py:2366, `gate()` inside `_gate_turn` at
-        # anton/core/session.py:3515, and `_route_decision` below. The turn
-        # falls back to planning instead, which `tests/test_thalamus.py` pins in
-        # anton. Kept so a future propagating router path attributes the card to
-        # the provider that actually failed rather than defaulting to planning.
+        # Defensive, and not reachable today: both router call sites swallow a
+        # confirmed refusal rather than propagating it — anton's `summarize()`,
+        # whose `test_failed_summarize_reports_no_compaction` pins the fallback,
+        # and `_route_decision` below. Kept so a future propagating router path
+        # attributes the card to the provider that actually failed rather than
+        # defaulting to planning.
         return settings.resolved_router_provider
     if role == "planning":
         return settings.resolved_planning_provider
