@@ -28,7 +28,10 @@ from starlette.types import ASGIApp
 logger = logging.getLogger(__name__)
 
 # Paths that are always accessible without a token (health probe + CORS preflight).
-_EXEMPT_PATHS = frozenset({"/api/v1/health", "/api/v1/health/"})
+_EXEMPT_PATHS = frozenset({
+    "/api/v1/health", "/api/v1/health/",
+    "/api/v1/health/live",
+})
 
 
 class BearerTokenMiddleware(BaseHTTPMiddleware):
