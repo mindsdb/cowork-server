@@ -312,7 +312,8 @@ def _user_files_with_mtimes(folder: Path) -> list[tuple[Path, int]]:
         while stack:
             dir_path, top = stack.pop()
             try:
-                entries = list(os.scandir(dir_path))
+                with os.scandir(dir_path) as it:
+                    entries = list(it)
             except OSError:
                 continue
             for entry in entries:
@@ -330,10 +331,7 @@ def _user_files_with_mtimes(folder: Path) -> list[tuple[Path, int]]:
                     continue
                 out.append((Path(entry.path), mtime_ns))
 
-    try:
-        _walk(folder, None)
-    except OSError:
-        return []
+    _walk(folder, None)
     out.sort(key=lambda item: item[1], reverse=True)
     return out
 
