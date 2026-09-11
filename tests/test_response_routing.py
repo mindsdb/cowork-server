@@ -307,7 +307,7 @@ async def test_route_request_runs_gate_under_org_scope(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_route_request_scrubs_secrets_from_history_and_current_prompt(monkeypatch):
-    """ENG-2105: the gate reads history straight from storage, bypassing the
+    """the gate reads history straight from storage, bypassing the
     scrub a normal turn gets via AntonHarness._stamp_message/_scrub_user_input.
     A secret typed in an earlier turn, or in the current message, must not
     reach `decide_route` (and from there the gate's LLM) unmasked."""

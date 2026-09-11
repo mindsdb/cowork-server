@@ -13,6 +13,7 @@ from sqlmodel import Session
 
 from cowork.build_info import build_trace_metadata
 from cowork.common.chat_session import in_process_agent_allowed
+from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings
 from cowork.common.settings.user_settings import (
     Provider,
@@ -25,6 +26,7 @@ from cowork.harnesses.base import available_harness_ids, get_harness
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
+    _MAX_HISTORY_MESSAGES,
     RouteDecision,
     RouterBinding,
     decide_route,
@@ -488,18 +490,16 @@ class ResponsesHandler:
         if reason:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
         try:
-            # Scrub credentials (ENG-2105): this history bypasses the normal
-            # turn's _scrub_user_input/_stamp_message pass.
-            from anton.utils.datasources import scrub_credentials
-
-            history = []
-            for message in ConversationService(self.scoped).get_ordered_messages(conversation_id):
-                if message.role not in {"user", "assistant"}:
-                    continue
-                om = message.to_openai_message().model_dump()
-                if isinstance(om.get("content"), str) and om["content"]:
-                    om["content"] = scrub_credentials(om["content"])
-                history.append(om)
+            # Scrub credentials: this history bypasses the normal turn's
+            # _scrub_user_input/_stamp_message pass. Bounded to the rows
+            # decide_route can actually use (_text_history keeps at most
+            # _MAX_HISTORY_MESSAGES) so scrubbing doesn't pay for the whole
+            # conversation on every gated turn.
+            ordered = [
+                m for m in ConversationService(self.scoped).get_ordered_messages(conversation_id)
+                if m.role in {"user", "assistant"}
+            ][-_MAX_HISTORY_MESSAGES:]
+            history = [scrubbed_openai_dump(m) for m in ordered]
             history.append({
                 "role": "user",
                 "content": scrub_credentials(self._prompt_text(harness_input)),
@@ -991,11 +991,13 @@ class ResponsesHandler:
 
     @staticmethod
     def _remote_history(session, conv_id) -> list[dict]:
-        """Prior user/assistant messages in canonical order, as OpenAI-shaped
-        dicts (mode="json": the payload gets json.dumps'd into the Redis job)."""
+        """Prior user/assistant messages in canonical order, as OpenAI-shaped,
+        scrubbed dicts (mode="json": the payload gets json.dumps'd into the
+        Redis job). The pod's harness only scrubs the current turn's input,
+        never this replayed history, so it must arrive already clean."""
         ordered = ConversationService(session).get_ordered_messages(conv_id)
         return [
-            m.to_openai_message().model_dump(mode="json")
+            scrubbed_openai_dump(m, mode="json")
             for m in ordered
             if m.role in {"user", "assistant"}
         ]
