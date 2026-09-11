@@ -194,11 +194,12 @@ async def _seal_unterminated_buffer(
     absent flag as already-terminated so a stub can't trigger a spurious second
     terminal.
 
-    ``request_id`` is the producing turn's own correlation id — the remote
-    one for ``_produce_remote``, the locally minted one for ``_run_turn``.
-    This is the hardest-failing turn (one that escaped every named ``except``),
-    so it's exactly the one a user is most likely to report. Still optional:
-    the direct/channel producers have no such id to offer.
+    ``request_id`` is the producing turn's own correlation id — the remote one
+    for ``_produce_remote``, the locally minted one for ``_run_turn``, the
+    caller's ``direct-`` id for ``_produce_direct``. This is the hardest-failing
+    turn (one that escaped every named ``except``), so it's exactly the one a
+    user is most likely to report. Still optional: the channel producers have no
+    such id to offer.
     """
     if lifecycle.discarded or getattr(buffer, "is_closed", True):
         return
@@ -1607,10 +1608,12 @@ class ResponsesHandler:
             # Set after the branches above, each of which REPLACES `extra`
             # rather than adding to it — seeding it earlier would survive only
             # the unmapped path. Carried on every failure so the payload shape
-            # stays uniform, but only the unmapped branch tags its log line
-            # with the id, so a curated failure can reach the log with nothing
-            # to match a quoted reference against. The client renders it on
-            # the generic card alone, so there is nothing to quote for one.
+            # stays uniform. Both branches tag their log line with the id, but
+            # only the unmapped one does so above the deployed level floor:
+            # the curated line is INFO and staging/prod run at WARNING, so a
+            # curated failure's id can reach the log with nothing to match. The
+            # client renders it on the generic card alone, so there is nothing
+            # to quote for one anyway.
             extra["request_id"] = corr
             failed = response_failed_payload(message, code, **extra)
             await buffer.append("sse", {"sse": response_failed_sse(message, code, **extra)})
