@@ -955,3 +955,127 @@ async def test_a_direct_decision_carries_the_whole_answer(monkeypatch):
 
     assert decision.route == DIRECT_CONTEXT
     assert decision.text == "Forty-two."
+
+
+# ── ENG-2423: the gate must not ship another company's product ───────────────
+
+
+def test_foreign_product_matcher_catches_the_observed_prod_failures():
+    """The three answers this guard exists for, pasted from prod traces.
+
+    Pasted rather than paraphrased: the Telugu one is the whole argument for
+    reading the ANSWER instead of the question, and a hand-typed approximation
+    would not prove the matcher survives a non-Latin script around a Latin name.
+    """
+    from cowork.handlers.response_routing import names_foreign_product
+
+    # trace a2db4f78 — "how do i install this on my pc"
+    assert names_foreign_product(
+        "If you mean the ChatGPT desktop app:\n- **Windows:** Open Settings"
+    ) == "ChatGPT"
+    # trace 7249ac36 — "how do i unstall you on my computer"
+    assert names_foreign_product(
+        "Download it from https://chatgpt.com/download/ and drag it to Trash"
+    ) == "chatgpt"
+    # trace 4e513218 — Telugu "who made you?", answered in Telugu, brand in Latin
+    assert names_foreign_product(
+        "కాదు 😊 నన్ను **OpenAI** తయారు చేసింది. కానీ నాతో మాట్లాడేది నువ్వే కదా!"
+    ) == "OpenAI"
+
+
+def test_foreign_product_matcher_does_not_fire_on_ordinary_answers():
+    """The guard delegates ~3.5% of answers; it must not delegate far more.
+
+    Every string here is a real or realistic gate answer that must still ship.
+    `cursor` and `llamas` guard the two ways a careless matcher over-fires:
+    an ordinary English noun in the list, and a listed name as a substring.
+    """
+    from cowork.handlers.response_routing import names_foreign_product
+
+    for benign in (
+        "Move the cursor to the end of the line, then press Enter.",
+        "Close the DB cursor in a finally block so the connection returns to the pool.",
+        "Llamas and alpacas are both camelids.",
+        "A network engineer can use AI to analyse logs, alerts and packet captures.",
+        "I'm Cowork, an AI assistant that can analyse data and build things.",
+        "Sure — paste the sequence and I'll predict the next value.",
+    ):
+        assert names_foreign_product(benign) is None, benign
+
+
+@pytest.mark.asyncio
+async def test_gate_answer_naming_a_foreign_product_is_discarded_and_delegated():
+    """The enforcement: the model answered, and we override it.
+
+    Asserts the whole contract, because each half is separately load-bearing:
+    the turn delegates (so the user never sees it), `text` is empty (so
+    `_handle_direct_response` cannot persist it into history — Done-when #4),
+    the reason is its own (so the guard is countable in traces), and it is NOT
+    a fallback (so it stays out of the ENG-1851 outage counters).
+    """
+    provider = _Client(
+        _response(content="If you mean the ChatGPT desktop app, open Settings → Apps.")
+    )
+
+    decision = await decide_route(
+        history=[{"role": "user", "content": "how do i install this on my pc"}],
+        has_non_text_input=False,
+        has_attachments=False,
+        has_disabled_connections=False,
+        binding=RouterBinding(provider=provider, model="minds-free", label="minds_cloud"),
+    )
+
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.reason == "router_answer_named_foreign_product"
+    assert decision.text == ""
+    assert decision.fallback is False
+    assert decision.model == "minds-free"
+
+
+@pytest.mark.asyncio
+async def test_clean_direct_answer_still_ships():
+    """The guard must not swallow the 96.5% it was not built for."""
+    provider = _Client(_response(content="Yes — press Cmd+K to open the palette."))
+
+    decision = await decide_route(
+        history=[{"role": "user", "content": "is there a shortcut?"}],
+        has_non_text_input=False,
+        has_attachments=False,
+        has_disabled_connections=False,
+        binding=RouterBinding(provider=provider, model="minds-free", label="minds_cloud"),
+    )
+
+    assert decision.route == DIRECT_CONTEXT
+    assert decision.text == "Yes — press Cmd+K to open the palette."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "question, answer",
+    [
+        ("how do i install this on my pc", "Install the ChatGPT desktop app from chatgpt.com."),
+        ("how do i uninstall you", "Drag ChatGPT from Applications to the Trash."),
+        ("who made you?", "I was made by OpenAI."),
+        ("what is MindsHub Cowork?", "I can't identify it; you may mean Claude or Gemini."),
+        ("¿quién te creó?", "Fui creado por OpenAI."),
+        ("你是什么产品？", "我是 ChatGPT，由 OpenAI 开发。"),
+    ],
+)
+async def test_product_identity_questions_never_answer_with_a_competitor(question, answer):
+    """Done-when #5: the product-identity question set.
+
+    Multilingual on purpose — the prod failure this guard exists for was in
+    Telugu, and an English-only suite is exactly the suite that missed it.
+    """
+    provider = _Client(_response(content=answer))
+
+    decision = await decide_route(
+        history=[{"role": "user", "content": question}],
+        has_non_text_input=False,
+        has_attachments=False,
+        has_disabled_connections=False,
+        binding=RouterBinding(provider=provider, model="minds-free", label="minds_cloud"),
+    )
+
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.text == ""
