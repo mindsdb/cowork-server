@@ -1,4 +1,10 @@
-"""Validate the turn-history rows a semi-trusted pod sent us (ENG-1808).
+"""Validate the turn-history rows before they are persisted.
+
+Two entry points with deliberately different strictness:
+`sanitize_turn_history_rows` for rows a semi-trusted pod sent us
+(ENG-1808), and `reject_unreplayable_tool_rows` for rows this server
+produced in-process (ENG-2420) — see that function for why the pod's
+size budgets are not applied to the in-process path.
 
 The pod runs tenant code, and these rows land in two places that make sloppy
 input expensive: the `messages` table, and the LLM history replayed on every
@@ -72,6 +78,57 @@ def _cap_tool_result(block: dict) -> dict:
         f"[tool output omitted: {size} bytes over the "
         f"{_MAX_RESULT_BYTES}-byte replay cap]"
     )}
+
+
+def reject_unreplayable_tool_rows(rows: list[dict]) -> list[dict]:
+    """Id-check rows this server produced in-process, or `[]` to fall back.
+
+    ENG-2420: anton could build a `tool_use` block with an EMPTY id. Persisting
+    one poisons the conversation permanently — every later turn replays it and
+    the provider rejects the whole request with
+    ``400 Invalid 'input[N].call_id': empty string``. The pod path has been
+    immune since ENG-1808, because `sanitize_turn_history_rows` already rejects
+    a non-string-or-empty id; the in-process path assigned `data["rows"]`
+    straight through, which is why the same anton bug was permanent on desktop
+    and merely lost one turn's tool detail on the web.
+
+    Deliberately NOT `sanitize_turn_history_rows` itself. That function also
+    enforces the 16 KiB per-result and 256 KiB per-turn budgets written for a
+    semi-trusted pod payload, and its own docstring says the placeholder is
+    expected to fire "on ordinary large cell output". The in-process path has
+    never been subject to those budgets, and desktop is exactly where large
+    local-data cell output happens — adopting them wholesale to fix an id bug
+    would silently start truncating good tool detail. This checks only what
+    ENG-2420 can break.
+
+    All-or-nothing, for the same reason ENG-1808 gives: tool_use/tool_result
+    pairing is a property of the SET, so dropping one bad row would leave an
+    orphan and make every later turn fail — the outcome being prevented. An
+    empty result replays text-only, which is a degradation the in-process
+    harness already applies after a mid-turn compaction.
+    """
+    if not isinstance(rows, list):
+        return _reject("in-process payload is %s, not a list", type(rows).__name__)
+    for row in rows:
+        if not isinstance(row, dict):
+            return _reject("in-process row is %s, not a dict", type(row).__name__)
+        want = _BLOCK_FOR_ROLE.get(row.get("role")) if isinstance(row.get("role"), str) else None
+        if want is None:
+            return _reject("in-process row has unexpected role %r", row.get("role"))
+        content = row.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != want:
+                continue
+            block_id = block.get(_ID_FIELD[want])
+            if not isinstance(block_id, str) or not block_id:
+                return _reject(
+                    "in-process %s block carries %s as its %s — refusing to "
+                    "persist a turn that would 400 on every later replay (ENG-2420)",
+                    want, type(block_id).__name__, _ID_FIELD[want],
+                )
+    return rows
 
 
 def sanitize_turn_history_rows(rows: object) -> list[dict]:

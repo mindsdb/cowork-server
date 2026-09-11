@@ -47,7 +47,10 @@ from cowork.schemas.responses import (
     ResponsesRequest,
     Role,
 )
-from cowork.handlers._turn_history import sanitize_turn_history_rows
+from cowork.handlers._turn_history import (
+    reject_unreplayable_tool_rows,
+    sanitize_turn_history_rows,
+)
 from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
     CONTENT_RECOVERY_CODE,
@@ -1385,7 +1388,10 @@ class ResponsesHandler:
             # Tool block-rows are for LLM-history persistence, not UI replay —
             # keep them out of the events log the client rebuilds from.
             if event_type == "response.turn_history":
-                turn_rows[:] = data.get("rows") or []
+                # Id-checked even though we produced these ourselves: an
+                # unreplayable id here is permanent for the conversation, and
+                # the installed anton can be older than this server (ENG-2420).
+                turn_rows[:] = reject_unreplayable_tool_rows(data.get("rows") or [])
                 return
             collected_events.append(data)
             accumulate_answer_text(collected_text, event_type, data)
@@ -1656,7 +1662,10 @@ class ResponsesHandler:
 
         def event_sink(event_type: str, data: dict) -> None:
             if event_type == "response.turn_history":
-                turn_rows[:] = data.get("rows") or []
+                # Id-checked even though we produced these ourselves: an
+                # unreplayable id here is permanent for the conversation, and
+                # the installed anton can be older than this server (ENG-2420).
+                turn_rows[:] = reject_unreplayable_tool_rows(data.get("rows") or [])
                 return
             collected_events.append(data)
             accumulate_answer_text(collected_text, event_type, data)
