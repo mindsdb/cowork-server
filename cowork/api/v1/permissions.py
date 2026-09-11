@@ -77,6 +77,20 @@ class OpenByDesign:
     """No identity required — and that has to be true on its own, not
     because some other layer in front of the route happens to check it.
 
+    The odd name in this file, on purpose. Every other class here is named
+    after the credential the route takes: ``LoopbackOnly`` is a network
+    position, ``PlatformSignature`` is an HMAC, ``Authenticated`` is a
+    ``Principal``. The absence of a credential has no name, so this one is
+    named after the assertion instead — that the route is open because
+    someone decided it, not because a line went missing. That is also the
+    whole job: this class checks nothing and refuses nobody, it exists only
+    to be distinguishable from a route nobody declared.
+
+    Keep the name in step with auth, which exported it first (ENG-1563) and
+    pins its own open set under it. ENG-2094's premise is one vocabulary
+    across the four services, and a fourth service renaming it unilaterally
+    is how that stops being true.
+
     Each use site needs a one-line reason that stands without reference to
     ``TrustedHeaderMiddleware`` (cowork/principal.py) or any other layer: a
     health probe infra must reach with zero auth, a webhook verified by its
