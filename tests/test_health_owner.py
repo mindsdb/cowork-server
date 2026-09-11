@@ -345,3 +345,55 @@ def test_live_reachable_without_identity_in_org_mode_end_to_end(monkeypatch):
 
     assert res.status_code == 200
     assert res.json() == {"status": "ok"}
+
+
+def test_live_answers_even_when_the_threadpool_is_saturated():
+    """`live()` must be `async def`: a sync endpoint runs through anyio's
+    default thread limiter, the same pool `run_in_threadpool` now feeds slow
+    artifact scans into. Saturate that pool with two long "scans" and confirm
+    the probe still answers immediately instead of queuing behind them
+    (ENG-2436: 40 concurrent slow scans would otherwise reproduce the
+    2026-09-09 outage through a different door).
+    """
+    import asyncio
+    import contextlib
+    import time
+
+    import anyio
+    import httpx
+    from fastapi import FastAPI
+
+    from cowork.api.v1.endpoints import health
+
+    app = FastAPI()
+    app.include_router(health.router, prefix="/api/v1/health")
+
+    async def flow():
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        original_tokens = limiter.total_tokens
+        limiter.total_tokens = 2
+        occupiers = []
+        try:
+            async def occupy():
+                await anyio.to_thread.run_sync(time.sleep, 2)
+
+            occupiers = [asyncio.create_task(occupy()) for _ in range(2)]
+            await asyncio.sleep(0.1)  # let both actually acquire a limiter token
+
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                start = time.monotonic()
+                res = await client.get("/api/v1/health/live")
+                elapsed = time.monotonic() - start
+
+            assert res.status_code == 200
+            assert elapsed < 1.0, f"took {elapsed:.3f}s — queued behind the saturated pool"
+        finally:
+            limiter.total_tokens = original_tokens
+            for task in occupiers:
+                task.cancel()
+            for task in occupiers:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+    asyncio.run(flow())

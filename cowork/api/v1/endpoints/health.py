@@ -129,7 +129,12 @@ def health() -> dict:
 
 
 @router.get("/live", response_model=dict)
-def live() -> dict:
+async def live() -> dict:
     """Liveness only: the process answers. No database, no filesystem, no settings —
-    a probe that can fail for an external reason turns a dependency outage into a pod kill."""
+    a probe that can fail for an external reason turns a dependency outage into a pod kill.
+
+    `async def`, not `def`: a sync endpoint runs through Starlette's threadpool,
+    the same pool `run_in_threadpool` feeds artifact scans into, so a sync
+    `live()` would queue behind a saturated pool instead of answering directly.
+    """
     return {"status": "ok"}
