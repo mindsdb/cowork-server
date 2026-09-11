@@ -11,15 +11,22 @@ webhook routers (`_install_channels` in `cowork/server.py`) that an org
 deployment never exposes, so running this without `COWORK_TENANCY_MODE=org`
 set dumps a superset of the surface the map's cowork section is scoped to.
 
-Columns (`path, methods, checks`) match auth's, mindshub_inference's, and
-mindshub_services's dump_routes.py. Cowork-server's real gate for org-mode
-deployments is `TrustedHeaderMiddleware` (cowork/principal.py), registered
-globally when COWORK_TENANCY_MODE=org -- middleware wraps every route
-uniformly and isn't visible to per-route Depends() introspection at all, so
-`checks` here is even less informative on its own than inference's: it only
-shows a route's own `Depends()` chain (e.g. `get_principal`, which reads the
-identity the middleware already built), not the middleware gate itself or
-any in-handler role check like `can_manage_org`.
+Columns (`path, methods, permission, checks`). The first three match auth's,
+mindshub_inference's, and mindshub_services's dump_routes.py; `checks` is
+cowork-server's own and lists the rest of the route's `Depends()` chain.
+
+`permission` is the ENG-2094 declaration -- the `Permission` class the route
+passed to `require()`, read off the `permission_cls` stamp the dependency
+carries. That is what AC7 re-derives the map's cowork-server section from, so
+it has to name the class rather than the closure `require()` returns; a route
+can list more than one, since a route-level `dependencies=[...]` is added to
+its router's rather than substituted for it.
+
+`checks` still under-reports what actually gates a request. The org-mode
+identity gate is `TrustedHeaderMiddleware` (cowork/principal.py), registered
+globally when COWORK_TENANCY_MODE=org, and middleware wraps every route
+uniformly rather than appearing in per-route `Depends()` introspection. Nor
+does either column show an in-handler role check like `can_manage_org`.
 """
 
 from __future__ import annotations
@@ -27,30 +34,43 @@ from __future__ import annotations
 import csv
 import sys
 
-from fastapi.routing import APIRoute
+from fastapi.routing import APIRoute, APIWebSocketRoute
 
+from cowork.api.v1.route_walker import declared_permissions, route_key
 from cowork.server import app
 
+Route = APIRoute | APIWebSocketRoute
 
-def dependency_names(route: APIRoute) -> list[str]:
-    return [getattr(dep.call, "__qualname__", str(dep.call)) for dep in route.dependant.dependencies]
+
+def dependency_names(route: Route) -> list[str]:
+    """Every dependency on the route EXCEPT its permission declaration, which
+    gets its own column."""
+    return [
+        getattr(dep.call, "__qualname__", str(dep.call))
+        for dep in route.dependant.dependencies
+        if getattr(dep.call, "permission_cls", None) is None
+    ]
 
 
 def main() -> None:
     rows = []
     for route in app.routes:
-        if not isinstance(route, APIRoute):
+        # APIWebSocketRoute too: it carries a declaration the same way an
+        # APIRoute does, so leaving it out would under-report the surface.
+        if not isinstance(route, (APIRoute, APIWebSocketRoute)):
             continue
+        path, methods = route_key(route)
         rows.append(
             {
-                "path": route.path,
-                "methods": ",".join(sorted(route.methods - {"HEAD"})),
+                "path": path,
+                "methods": ",".join(m for m in methods if m != "HEAD"),
+                "permission": ",".join(cls.__name__ for cls in declared_permissions(route)),
                 "checks": ",".join(dependency_names(route)),
             }
         )
-    rows.sort(key=lambda r: r["path"])
+    rows.sort(key=lambda r: (r["path"], r["methods"]))
 
-    writer = csv.DictWriter(sys.stdout, fieldnames=["path", "methods", "checks"])
+    writer = csv.DictWriter(sys.stdout, fieldnames=["path", "methods", "permission", "checks"])
     writer.writeheader()
     writer.writerows(rows)
 

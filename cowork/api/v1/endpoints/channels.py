@@ -6,6 +6,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlmodel import Session
 
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, AuthenticatedOrgAdmin, require
 from cowork.db.scoped import ScopedSession, ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.schemas.channels import (
@@ -34,31 +35,23 @@ from cowork.services.channel_lifecycle import (
     ChannelLifecycleService,
     LifecycleNotImplementedError,
 )
-from cowork.db.scoped import TenantScope
-from cowork.principal import Principal, can_manage_org, get_principal
 from cowork.services.channels import ChannelConfigService, UnknownChannelError
 from cowork.harnesses.base import available_harness_ids
 
-router = APIRouter()
+# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
+# whenever org mode has no org in scope. Declaring it too makes the
+# requirement visible to a route walker instead of something only
+# discoverable by reading scoped.py. The 6 routes that configure a channel
+# (credentials, lifecycle, the shared channel agent) additionally require
+# AuthenticatedOrgAdmin — see each route's own dependency.
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 SessionDep = Annotated[Session, Depends(get_session)]
-PrincipalDep = Annotated[Principal | None, Depends(get_principal)]
 
 
 def _live_adapters(request: Request):
     return getattr(request.app.state, "channel_adapters", None)
-
-
-def _require_org_admin(scope: TenantScope, principal: Principal | None) -> None:
-    """Configuring channels — credentials, lifecycle, or the shared channel
-    agent — is admin-owned in org mode, the same rule settings.py's
-    _require_org_admin_for applies to org settings writes. Checked before any
-    other gate (readiness, unknown-channel, ...): who may act comes first."""
-    if scope.org_mode and not can_manage_org(principal):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="configuring channels requires an org admin",
-        )
 
 
 def _require_org_ready(channel_type: str) -> None:
@@ -111,17 +104,15 @@ def get_channel_agent(scoped: ScopedSessionDep) -> ChannelAgentResponse:
     return ChannelAgentResponse(harness=current, options=available_harness_ids())
 
 
-@router.put("/agent", response_model=ChannelAgentResponse)
+@router.put("/agent", response_model=ChannelAgentResponse, dependencies=[Depends(require(AuthenticatedOrgAdmin))])
 def set_channel_agent(
     body: ChannelAgentUpdateRequest, session: SessionDep, scoped: ScopedSessionDep,
-    principal: PrincipalDep,
 ) -> ChannelAgentResponse:
     # channels_harness is ORG-marked, so SettingService routes this write to
     # the caller's own org row — two orgs never share or overwrite each other's.
     from cowork.common.settings.user_settings import get_user_settings
     from cowork.services.settings import SettingService
 
-    _require_org_admin(scoped.scope, principal)
     options = available_harness_ids()
     harness = (body.harness or "").strip()
     if harness not in options:
@@ -149,15 +140,17 @@ def get_config(channel_type: str, scoped: ScopedSessionDep) -> ChannelConfigResp
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"unknown channel: {channel_type}")
 
 
-@router.put("/{channel_type}/config", response_model=ChannelConfigResponse)
+@router.put(
+    "/{channel_type}/config",
+    response_model=ChannelConfigResponse,
+    dependencies=[Depends(require(AuthenticatedOrgAdmin))],
+)
 async def set_config(
     channel_type: str,
     body: ChannelConfigUpdateRequest,
     request: Request,
     scoped: ScopedSessionDep,
-    principal: PrincipalDep,
 ) -> ChannelConfigResponse:
-    _require_org_admin(scoped.scope, principal)
     _require_org_ready(channel_type)
     try:
         result = ChannelConfigService(scoped).set_config(channel_type, body.values)
@@ -173,11 +166,14 @@ async def set_config(
     return result
 
 
-@router.delete("/{channel_type}/config", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{channel_type}/config",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require(AuthenticatedOrgAdmin))],
+)
 async def delete_config(
-    channel_type: str, request: Request, scoped: ScopedSessionDep, principal: PrincipalDep
+    channel_type: str, request: Request, scoped: ScopedSessionDep
 ) -> None:
-    _require_org_admin(scoped.scope, principal)
     _require_org_ready(channel_type)
     try:
         deleted = ChannelConfigService(scoped).delete_config(channel_type)
@@ -195,12 +191,15 @@ async def delete_config(
     await _reconcile_ingress(request, channel_type, scoped.scope.org_id)
 
 
-@router.post("/{channel_type}/reload", response_model=ChannelReloadResponse)
+@router.post(
+    "/{channel_type}/reload",
+    response_model=ChannelReloadResponse,
+    dependencies=[Depends(require(AuthenticatedOrgAdmin))],
+)
 async def reload_channel(
-    channel_type: str, request: Request, scoped: ScopedSessionDep, principal: PrincipalDep
+    channel_type: str, request: Request, scoped: ScopedSessionDep
 ) -> ChannelReloadResponse:
     """Rebuild a channel's live adapter from its currently stored config."""
-    _require_org_admin(scoped.scope, principal)
     _require_org_ready(channel_type)
     try:
         ChannelConfigService(scoped).get_config(channel_type)
@@ -217,7 +216,15 @@ async def reload_channel(
 @router.post("/{channel_type}/test-connection", response_model=ChannelTestConnectionResponse)
 async def test_connection(channel_type: str, scoped: ScopedSessionDep) -> ChannelTestConnectionResponse:
     """Calls the platform to check the STORED credentials actually
-    authenticate — not admin-gated, since it reads but never writes."""
+    authenticate.
+
+    Member-level, not ``AuthenticatedOrgAdmin`` like its five configure
+    siblings: it does write — a successful probe stamps
+    ``external_account_id`` on the org's ChannelInstallation via
+    ``set_external_account_id`` (cowork/services/channels.py) — but nothing
+    written is caller-supplied. The value is whatever the org's own stored
+    credentials resolve to at the platform, so a member can confirm the
+    connection without being able to change what it points at."""
     try:
         result = await ChannelConfigService(scoped).test_connection(channel_type)
     except UnknownChannelError:
@@ -266,11 +273,14 @@ def _lifecycle_service(request: Request, scoped: ScopedSession) -> ChannelLifecy
     return ChannelLifecycleService(scoped, adapters)
 
 
-@router.post("/{channel_type}/setup", response_model=ChannelLifecycleResponse)
+@router.post(
+    "/{channel_type}/setup",
+    response_model=ChannelLifecycleResponse,
+    dependencies=[Depends(require(AuthenticatedOrgAdmin))],
+)
 async def setup_channel(
-    channel_type: str, request: Request, scoped: ScopedSessionDep, principal: PrincipalDep
+    channel_type: str, request: Request, scoped: ScopedSessionDep
 ) -> ChannelLifecycleResponse:
-    _require_org_admin(scoped.scope, principal)
     _require_org_ready(channel_type)
     svc = _lifecycle_service(request, scoped)
     try:
@@ -288,11 +298,14 @@ async def setup_channel(
     return ChannelLifecycleResponse(channel_type=channel_type, action="setup", active=result.active, detail=result.detail)
 
 
-@router.post("/{channel_type}/teardown", response_model=ChannelLifecycleResponse)
+@router.post(
+    "/{channel_type}/teardown",
+    response_model=ChannelLifecycleResponse,
+    dependencies=[Depends(require(AuthenticatedOrgAdmin))],
+)
 async def teardown_channel(
-    channel_type: str, request: Request, scoped: ScopedSessionDep, principal: PrincipalDep
+    channel_type: str, request: Request, scoped: ScopedSessionDep
 ) -> ChannelLifecycleResponse:
-    _require_org_admin(scoped.scope, principal)
     _require_org_ready(channel_type)
     svc = _lifecycle_service(request, scoped)
     try:

@@ -27,6 +27,7 @@ from cowork.common.paths import (
     open_pinned_child,
 )
 from cowork.api.v1.artifact_scope import review_artifact_for_request
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSession, ScopedSessionDep, get_scoped_session
 from cowork.services.product_permissions import has_product_permission, require_product_permission
 from cowork.services.artifact_permissions import (
@@ -56,7 +57,12 @@ from cowork.services.artifact_revisions import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
+# whenever org mode has no org in scope. Declaring it too makes the
+# requirement visible to a route walker instead of something only
+# discoverable by reading scoped.py.
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 _DRAFT_RESPONSE_HEADERS = {
     "Cache-Control": "private, no-store",
