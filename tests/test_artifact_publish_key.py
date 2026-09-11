@@ -16,9 +16,9 @@ from cowork.services.artifact_publish_key import MAX_PUBLISH_KEY_TTL_S, PublishK
 def mint_calls(monkeypatch):
     calls = []
 
-    async def fake_mint(*, user_id, org_id, correlation_id, ttl_seconds, settings):
+    async def fake_mint(*, user_id, org_id, correlation_id, ttl_seconds, settings, purpose):
         calls.append({"user_id": user_id, "org_id": org_id,
-                      "instance_id": correlation_id, "ttl_seconds": ttl_seconds})
+                      "instance_id": correlation_id, "ttl_seconds": ttl_seconds, "purpose": purpose})
         return "turnkey-1"
 
     monkeypatch.setattr("cowork.services.artifact_publish_key.mint_turn_key", fake_mint)
@@ -57,6 +57,7 @@ async def test_mint_carries_user_and_org_from_scope(mint_calls):
 
     assert mint_calls[0]["user_id"] == "u-1"
     assert mint_calls[0]["org_id"] == "o-1"
+    assert mint_calls[0]["purpose"] == "artifact_publish"
 
 
 async def test_instance_id_is_a_fresh_uuid_not_a_turn_id(mint_calls):
@@ -128,6 +129,25 @@ async def test_failed_mint_is_not_retried_within_one_reconciliation(monkeypatch)
     await key.get()
     await key.get()
 
+    assert len(attempts) == 1
+
+
+@pytest.mark.parametrize("status", [403, 503])
+async def test_authority_failure_keeps_its_type_without_retrying(monkeypatch, status):
+    from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
+
+    error_type = ProductPermissionDenied if status == 403 else ProductPermissionUnavailable
+    attempts = []
+
+    async def reject(**kwargs):
+        attempts.append(kwargs)
+        raise error_type()
+
+    monkeypatch.setattr("cowork.services.artifact_publish_key.mint_turn_key", reject)
+    key = PublishKey("u-1", "o-1", min_ttl_s=60)
+    for _ in range(2):
+        with pytest.raises(error_type):
+            await key.get()
     assert len(attempts) == 1
 
 

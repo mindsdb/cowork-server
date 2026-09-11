@@ -47,6 +47,7 @@ async def test_turn_delta_becomes_a_stream_text_delta(monkeypatch):
     _fake_handler(monkeypatch)
 
     async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
         yield "turn_delta", {"text": "hi"}
         yield "turn_completed", {}
 
@@ -68,6 +69,7 @@ async def test_turn_failed_raises_with_the_workers_code_and_message(monkeypatch)
     _fake_handler(monkeypatch)
 
     async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
         yield "turn_failed", {"code": "anton_error", "message": "boom"}
 
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
@@ -87,6 +89,7 @@ async def test_turn_failed_falls_back_to_the_generic_message_and_code(monkeypatc
     _fake_handler(monkeypatch)
 
     async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
         yield "turn_failed", {}
 
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
@@ -114,6 +117,7 @@ async def test_turn_history_mutates_the_callers_turn_rows_list(monkeypatch):
     ]
 
     async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
         yield "turn_history", {"rows": rows}
         yield "turn_completed", {}
 
@@ -134,6 +138,7 @@ async def test_turn_memory_calls_persist_turn_memory(monkeypatch):
     _fake_handler(monkeypatch, persist_turn_memory=lambda s, c, e: calls.append(e))
 
     async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
         yield "turn_memory", {"entries": [{"key": "likes", "value": "pizza"}]}
         yield "turn_completed", {}
 
@@ -152,6 +157,7 @@ async def test_no_artifacts_context_skips_indexing_without_error(monkeypatch):
     _fake_handler(monkeypatch)
 
     async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
         yield "turn_completed", {}
 
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
@@ -163,3 +169,33 @@ async def test_no_artifacts_context_skips_indexing_without_error(monkeypatch):
 
     assert failure is None
     assert events == []
+
+
+@pytest.mark.parametrize("workspace_mode", [None, "ephemeral", "persistent"])
+@pytest.mark.parametrize("failed", [False, True])
+async def test_only_authorized_persistent_turns_touch_saved_artifacts(monkeypatch, workspace_mode, failed):
+    from unittest.mock import AsyncMock, Mock
+    from cowork.services import task_objects
+
+    context = (object(), object(), "project", "Project")
+    _fake_handler(monkeypatch, remote_artifacts_context=lambda *_: context)
+    monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_: (set(), {}))
+    index = Mock(return_value=([], set(), None))
+    publish = AsyncMock(return_value=[])
+    monkeypatch.setattr(task_objects, "index_turn_artifacts", index)
+    monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", publish)
+
+    async def replies(**kwargs):
+        if workspace_mode is not None:
+            yield "progress", {"phase": "workspace_authorized", "workspace_mode": workspace_mode}
+        yield "turn_delta", {"text": "model still runs"}
+        yield ("turn_failed" if failed else "turn_completed"), {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+    events, _ = await _drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org", user_id="user",
+        input_text="run", model="m", turn_rows=[],
+    ))
+    assert events[0].text == "model still runs"
+    assert index.call_count == int(workspace_mode == "persistent")
+    assert publish.await_count == int(workspace_mode == "persistent" and not failed)
