@@ -13,6 +13,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import MutableHeaders
 
+from cowork.api.v1.route_walker import contradictory_routes, route_key, undeclared_routes
 from cowork.api.v1.router import api_router as v1_router
 from starlette.responses import JSONResponse
 
@@ -323,8 +324,70 @@ def create_app() -> FastAPI:
 
     _install_channels(app, channel_webhook_paths)
 
+    # ENG-2094: every route must declare a Permission (require(...)) so a
+    # walker can tell "open on purpose" from "someone forgot the line" — see
+    # route_walker.py and its docstring. Boot-time, not just CI, so a gap
+    # can't reach any environment undetected.
+    gaps = undeclared_routes(app)
+    if gaps:
+        # route_key, not route.methods: APIWebSocketRoute has no .methods, so
+        # reading it here would raise AttributeError over the top of the
+        # message that names the offending route.
+        names = ", ".join(f"{list(methods)} {path}" for path, methods in map(route_key, gaps))
+        raise RuntimeError(f"routes with no declared Permission (ENG-2094): {names}")
+
+    contradictions = contradictory_routes(app)
+    if contradictions:
+        names = ", ".join(f"{list(methods)} {path}" for path, methods in map(route_key, contradictions))
+        raise RuntimeError(
+            "routes declaring OpenByDesign alongside an identity Permission (ENG-2094): "
+            f"{names} — a route-level dependency is ADDED to its router's, never substituted for it, "
+            "so the stricter check still runs and the route is not open"
+        )
+
+    _warn_if_the_front_door_outranks_the_identity_layer(app)
+
     logger.info("Cowork application created successfully")
     return app
+
+
+def _warn_if_the_front_door_outranks_the_identity_layer(app: FastAPI) -> None:
+    """Say out loud when the audit rollback lever has stopped covering things.
+
+    ``identity_enforce=audit`` tells TrustedHeaderMiddleware to log a missing
+    principal and let the request through. The ENG-2094 permission classes do
+    not read that flag — deliberately, see AuthenticatedInOrgMode's docstring
+    — so in org mode they still 401 every route that requires identity. That
+    is the right layering and the wrong surprise: an operator who reaches for
+    audit to unblock traffic would get a 401 storm from a layer the flag never
+    named. Naming the count at boot is what turns that into a decision instead
+    of an incident.
+
+    A warning rather than a refusal: no deployment runs this state, and a boot
+    failure over a combination nothing uses buys less than it costs.
+    """
+    settings = get_app_settings()
+    if settings.tenancy_mode != "org" or settings.identity_enforce == "enforce":
+        return
+
+    from fastapi.routing import APIRoute, APIWebSocketRoute
+
+    from cowork.api.v1.permissions import Authenticated
+    from cowork.api.v1.route_walker import declared_permissions
+
+    still_enforcing = sum(
+        1
+        for route in app.routes
+        if isinstance(route, (APIRoute, APIWebSocketRoute))
+        and any(issubclass(cls, Authenticated) for cls in declared_permissions(route))
+    )
+    logger.warning(
+        "identity_enforce=%s applies to TrustedHeaderMiddleware only. %d route(s) "
+        "declare a Permission that requires identity and will still answer 401 "
+        "without it (ENG-2094). Audit mode is not a full rollback in org tenancy.",
+        settings.identity_enforce,
+        still_enforcing,
+    )
 
 
 def _install_channels(app: FastAPI, webhook_paths: set[str]) -> None:
