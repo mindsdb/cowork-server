@@ -545,6 +545,12 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
     # Grouping metadata for the picker:
     #   modelProviders id → the provider serving the model ("anthropic"), which
     #                  decides its section.
+    #   modelCurrentVersions
+    #                  moving alias id → the pinned alias resolving what it resolves
+    #                  today. Keyed by the MOVING alias, unlike the two below, because
+    #                  that is the row holding the answer. It is what separates a pin
+    #                  that froze the CURRENT model from one that froze an older one,
+    #                  which `modelFamilies` cannot: both are simply "not the head".
     #   modelFamilies  id → the moving alias the model belongs to. Dense for every
     #                  model MindsHub describes, and equal to the id on a moving
     #                  alias, so `families[id] == id` marks a model "latest" and
@@ -562,6 +568,11 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
     # tags every BYOK model "latest", including dated snapshots that never move.
     model_providers: dict[str, str] = {}
     model_families: dict[str, str] = {}
+    # Sparse on purpose, unlike the two above: absent means "no row is known to be
+    # this alias's current pin", which is the correct reading both for a gateway
+    # that predates the field and for a moving alias that genuinely has no twin
+    # (`mindshub_air`). A consumer must not read absence as "the first pin wins".
+    model_current_versions: dict[str, str] = {}
 
     # Every model id MindsHub listed, whether or not it described it. The custom
     # endpoint overlay below reserves these ids for the grouping maps.
@@ -647,6 +658,7 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         model_labels.update(live_labels)
         model_providers.update(listing.providers)
         model_families.update(listing.families)
+        model_current_versions.update(listing.current_versions)
         minds_ids.update(live or ())
 
     # Overlay a configured custom OpenAI-compatible endpoint the same way as
@@ -745,6 +757,7 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         "modelLabels": model_labels,
         "modelProviders": model_providers,
         "modelFamilies": model_families,
+        "modelCurrentVersions": model_current_versions,
         "gate": gate,
     }
 

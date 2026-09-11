@@ -11,7 +11,16 @@ from cowork.db.scoped import LOCAL_SCOPE
 from _fakes import FakeRequest
 
 
-def _listing(ids, efforts=None, enabled=None, labels=None, providers=None, families=None, role_defaults=None):
+def _listing(
+    ids,
+    efforts=None,
+    enabled=None,
+    labels=None,
+    providers=None,
+    families=None,
+    current_versions=None,
+    role_defaults=None,
+):
     """A MindsModelListing with everything a test doesn't care about left empty.
 
     Keeps a stub to the fields under test while still returning the real named
@@ -27,6 +36,7 @@ def _listing(ids, efforts=None, enabled=None, labels=None, providers=None, famil
         labels or {},
         providers or {},
         families or {},
+        current_versions or {},
         role_defaults or {},
     )
 

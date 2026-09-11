@@ -113,6 +113,58 @@ def test_a_pinned_row_keeps_the_family_it_names(monkeypatch):
     assert listing.families == {"sonnet": "sonnet", "sonnet-4-5": "sonnet"}
 
 
+def test_the_moving_alias_names_the_pin_that_currently_matches_it(monkeypatch):
+    """`current_version` is the third state `family` cannot express (ENG-2629).
+
+    A same-model twin and an older version both carry a `family`, so `families`
+    alone makes them indistinguishable — and the app's fallback for "not the head"
+    is to call the row an older version, which of the two is the wrong guess.
+    """
+    _serve(
+        monkeypatch,
+        {
+            "data": [
+                _row("gpt", provider="openai", current_version="gpt-6-astra"),
+                _row("gpt-6-astra", provider="openai", family="gpt"),
+                _row("gpt-5-6-sol", provider="openai", family="gpt"),
+            ]
+        },
+    )
+
+    listing = asyncio.run(fetch_minds_models(_URL, _KEY))
+
+    # Keyed by the MOVING alias, so the two pins are told apart by asking the head.
+    assert listing.current_versions == {"gpt": "gpt-6-astra"}
+    assert listing.families == {"gpt": "gpt", "gpt-6-astra": "gpt", "gpt-5-6-sol": "gpt"}
+
+
+def test_a_moving_alias_with_no_current_version_is_simply_absent(monkeypatch):
+    """Absent, not blank: no row is claimed to be this alias's current pin.
+
+    Two different situations read the same way here on purpose — a gateway that
+    predates the field, and `mindshub_air`, which genuinely has no twin. Both mean
+    the app must not promote some other pin into the role.
+    """
+    _serve(
+        monkeypatch,
+        {"data": [_row("mindshub_air", provider="openai"), _row("sonnet", provider="anthropic")]},
+    )
+
+    listing = asyncio.run(fetch_minds_models(_URL, _KEY))
+
+    assert listing.current_versions == {}
+
+
+@pytest.mark.parametrize("junk", [None, 42, "", "   ", [], {}])
+def test_junk_current_version_is_treated_as_absent(monkeypatch, junk):
+    """Same rule the other string fields follow: junk is "didn't publish it"."""
+    _serve(monkeypatch, {"data": [_row("gpt", provider="openai", current_version=junk)]})
+
+    listing = asyncio.run(fetch_minds_models(_URL, _KEY))
+
+    assert listing.current_versions == {}
+
+
 def test_a_gateway_that_publishes_no_metadata_yields_empty_maps(monkeypatch):
     """A plain OpenAI-compatible endpoint, or a MindsHub older than these fields.
 

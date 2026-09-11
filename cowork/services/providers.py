@@ -204,7 +204,7 @@ _MINDS_MODELS_TIMEOUT_S = 6.0
 class MindsModelListing(NamedTuple):
     """What one `/v1/models` fetch yields, keyed by model id where it's a map.
 
-    A named tuple rather than a plain tuple because the picker needs six pieces
+    A named tuple rather than a plain tuple because the picker needs seven pieces
     of this, and positional unpacking of five same-typed dicts is a silent
     field-order bug waiting to happen in a stubbed test.
 
@@ -229,6 +229,20 @@ class MindsModelListing(NamedTuple):
     # what the picker tags "latest"; anything else names the moving alias this
     # row is a frozen version of.
     families: dict[str, str]
+    # Moving alias -> the pinned alias resolving what it resolves TODAY. The
+    # picker's third state: ``families`` marks a row frozen but cannot say whether
+    # it froze the CURRENT model or an older one, and those are opposite claims —
+    # without this the picker calls `gpt-6-astra` an older version of GPT-6 Astra
+    # (ENG-2629). Keyed by the MOVING alias, so a frozen row asks
+    # ``current_versions.get(families[id]) == id``. Empty when the gateway does not
+    # publish it, which reads correctly as "no row is known to be the current pin".
+    #
+    # Placed beside ``families`` rather than appended, because the two are read
+    # together and a reader looking for the version story should find both here.
+    # That makes every positional construction a compile-time break instead of a
+    # silent field-order bug, which is what the tests' own ``_listing`` helper
+    # exists to catch.
+    current_versions: dict[str, str]
     # Agent role -> the model id the catalog declares as that role's default,
     # inverted from the per-row ``default_for`` list. Keyed by role rather than by
     # model id, unlike every other map here, because that is the question asked of
@@ -253,7 +267,7 @@ def _empty_listing() -> MindsModelListing:
     objects means one in-place write downstream would corrupt the cached failure
     of every gateway at once. Nothing mutates them today.
     """
-    return MindsModelListing(None, {}, {}, {}, {}, {}, {})
+    return MindsModelListing(None, {}, {}, {}, {}, {}, {}, {})
 
 
 # Keyed by (base_url, tenant): tenant is the org id for an org-scoped catalog
@@ -404,6 +418,7 @@ async def fetch_minds_models(
     labels: dict[str, str] = {}
     providers: dict[str, str] = {}
     families: dict[str, str] = {}
+    current_versions: dict[str, str] = {}
     role_defaults: dict[str, str] = {}
 
     def _text(row: dict, key: str) -> Optional[str]:
@@ -449,6 +464,13 @@ async def fetch_minds_models(
         if label := _text(row, "label"):
             labels[model_id] = label
         family = _text(row, "family")
+        # Recorded against the MOVING alias that published it, which is this row.
+        # Absent on every pinned row and on a moving alias with no pinned twin, and
+        # absent is the safe reading: no row is claimed to be the current pin, so
+        # the picker falls back to today's two-state behaviour rather than
+        # promoting an arbitrary row.
+        if current := _text(row, "current_version"):
+            current_versions[model_id] = current
         if provider := _text(row, "provider"):
             providers[model_id] = provider
             # Defaulted to the id so the map is dense for every model this gateway
@@ -478,7 +500,14 @@ async def fetch_minds_models(
                 role_defaults.setdefault(role, model_id)
     return _remember(
         MindsModelListing(
-            (ids or None), efforts, enabled, labels, providers, families, role_defaults
+            (ids or None),
+            efforts,
+            enabled,
+            labels,
+            providers,
+            families,
+            current_versions,
+            role_defaults,
         )
     )
 
