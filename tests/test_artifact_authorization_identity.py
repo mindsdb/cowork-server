@@ -515,3 +515,6 @@ def test_identity_migration_preserves_aliases_across_application_rollback():
                 assert "artifact_identities" in inspect(connection).get_table_names()
     finally:
         engine.dispose()
+
+
+pytestmark = pytest.mark.usefixtures("granted_product_permissions")

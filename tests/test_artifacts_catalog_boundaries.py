@@ -43,7 +43,7 @@ async def test_project_route_basename_sanitizes_before_artifact_root_discovery(
         seen["card_sources"] = sources
         return []
 
-    session = SimpleNamespace()
+    session = SimpleNamespace(scope=SimpleNamespace(org_mode=False))
     seen["session"] = session
     monkeypatch.setattr(artifacts.os.path, "basename", sanitize)
     monkeypatch.setattr(artifacts, "_scoped_project_sources", discover)
@@ -221,7 +221,7 @@ async def test_legacy_delete_scans_only_roots_selected_by_the_server_catalog(
 
     with pytest.raises(ScanReached):
         await artifacts.delete_artifact_for_request(
-            SimpleNamespace(), "legacy-report", project_id=str(request_id)
+            SimpleNamespace(scope=SimpleNamespace(org_mode=False)), "legacy-report", project_id=str(request_id)
         )
 
     assert seen == {"sources": [source], "folder_name": "legacy-report"}
@@ -256,10 +256,13 @@ async def test_identity_delete_passes_catalog_project_and_canonical_artifact_ids
 
     with pytest.raises(ResolutionReached):
         await artifacts.delete_artifact_for_request(
-            SimpleNamespace(), str(artifact_id), project_id=str(request_project_id)
+            SimpleNamespace(scope=SimpleNamespace(org_mode=False)), str(artifact_id), project_id=str(request_project_id)
         )
 
     assert seen == {
         "project_ref": str(server_project_id),
         "artifact_id": artifact_id.hex,
     }
+
+
+pytestmark = pytest.mark.usefixtures("granted_product_permissions")
