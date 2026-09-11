@@ -1185,12 +1185,9 @@ def _prepare_artifact_card(
         if primary_mtime_ns is not None:
             is_live = (time.time() - primary_mtime_ns / 1_000_000_000) < 300
 
-    # Max mtime across the artifact's content files — a precise
-    # "content changed" signal for the renderer's preview viewer to
-    # cache-bust/reload on (ENG-375), and the cheap gate for `modified`.
-    # Named `mtime_seconds` so it does not shadow the module-level
-    # `content_mtime` alias other services import. Derived from the single
-    # walk above (already sorted mtime desc) instead of walking again.
+    # `mtime_seconds` (not `content_mtime`, which shadows the module alias) is
+    # the cache-bust/`modified`-gate signal, taken from the single walk above
+    # — already sorted mtime desc, so this is its first entry.
     mtime_seconds = (files_with_mtimes[0][1] // 1_000_000_000) if files_with_mtimes else 0
 
     card = {
@@ -1488,8 +1485,7 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
     Two passes so the cap is applied before card work, not after: a collect
     pass opens each artifact once and reads only its `metadata.json` mtime (no
     card built), then a build pass walks the sorted candidates and stops once
-    80 cards have been produced. Known cosmetic change: `bg` used to be
-    assigned in scan order and only then sorted; it now follows sort order.
+    80 cards have been produced.
     """
     from cowork.services.artifact_identity import (
         _opened_child_directory,
