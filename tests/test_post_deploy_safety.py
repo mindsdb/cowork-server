@@ -1,5 +1,11 @@
 """Regression tests for post-deploy test helpers that must fail safely."""
 
+import json
+
+import httpx
+import pytest
+
+from cowork.handlers.turn_errors import response_failed_sse
 from tests.integration import test_post_deploy
 
 
@@ -36,6 +42,29 @@ def test_identity_repr_never_renders_the_api_key():
     assert "mdb_do-not-print-me" not in rendered
     assert "'api_key': '***'" in rendered
     assert "user-1" in rendered
+
+
+@pytest.mark.parametrize("event", ["response.failed", "error"])
+def test_failed_turn_assertion_includes_the_server_explanation(event):
+    message = "Your current permissions could not be verified. Try again."
+    code = "permission_unavailable"
+    if event == "response.failed":
+        failure = response_failed_sse(message, code)
+    else:
+        payload = json.dumps({"code": code, "message": message})
+        failure = f"event: error\ndata: {payload}\n\n"
+    body = "event: response.created\ndata: {}\n\n" + failure
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200, text=body, headers={"Content-Type": "text/event-stream"},
+        )
+    )
+
+    with httpx.Client(base_url="https://cowork.example", transport=transport) as api:
+        with pytest.raises(AssertionError, match="turn did not complete") as error:
+            test_post_deploy.test_a_turn_runs_end_to_end(api, "conversation-1")
+
+    assert f"code={code!r} message={message!r}" in str(error.value)
 
 
 def test_peer_probe_retries_until_the_shared_index_is_visible(monkeypatch):
