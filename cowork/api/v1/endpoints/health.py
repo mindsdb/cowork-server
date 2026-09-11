@@ -134,7 +134,10 @@ def health() -> dict:
     }
 
 
-@router.get("/live", response_model=dict)
+# OpenByDesign, standalone reason: the kubelet sends this one with no identity
+# headers and has nowhere to get any, so a route that demanded a credential
+# would answer 401 to every probe and get the pod killed.
+@router.get("/live", response_model=dict, dependencies=[Depends(require(OpenByDesign))])
 async def live() -> dict:
     """Liveness only: the process answers. No database, no filesystem, no settings —
     a probe that can fail for an external reason turns a dependency outage into a pod kill.
