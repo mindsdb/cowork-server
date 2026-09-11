@@ -69,7 +69,9 @@ from cowork.handlers.turn_errors import (
     retry_at_instant,
     response_failed_sse,
 )
-from cowork.db.scoped import ScopedSession, TenantScope, scope_from_principal
+from cowork.db.scoped import (
+    MissingTenantScopeError, ScopedSession, TenantScope, scope_from_principal,
+)
 from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
@@ -194,11 +196,12 @@ async def _seal_unterminated_buffer(
     absent flag as already-terminated so a stub can't trigger a spurious second
     terminal.
 
-    ``request_id`` is the producing turn's own correlation id — the remote
-    one for ``_produce_remote``, the locally minted one for ``_run_turn``.
-    This is the hardest-failing turn (one that escaped every named ``except``),
-    so it's exactly the one a user is most likely to report. Still optional:
-    the direct/channel producers have no such id to offer.
+    ``request_id`` is the producing turn's own correlation id — the remote one
+    for ``_produce_remote``, the locally minted one for ``_run_turn``, the
+    caller's ``direct-`` id for ``_produce_direct``. This is the hardest-failing
+    turn (one that escaped every named ``except``), so it's exactly the one a
+    user is most likely to report. Every producer that reaches this now has one;
+    the parameter stays optional only so a test double can omit it.
     """
     if lifecycle.discarded or getattr(buffer, "is_closed", True):
         return
@@ -583,20 +586,46 @@ class ResponsesHandler:
         route: RouteDecision,
     ) -> AsyncGenerator[str, None] | Response:
         """Return the router model's direct answer without initializing Anton."""
+        # One id for the turn, not one per consumer: both halves quote it on a
+        # failure. The streaming half additionally hands it to record_turn on
+        # the Redis backend, so there the Reference a user reports resolves in
+        # the turn index too; the non-streaming half leaves only the log line.
+        corr = f"direct-{uuid4()}"
         if not request.stream:
-            text = route.text
-            user_message = ConversationService(self.scoped).save_user_message(
-                conversation_id, original_content,
-            )
-            events = [{
-                "type": "response.output_text.delta",
-                "delta": text,
-                "response_route": route.route,
-                "response_route_reason": route.reason,
-            }, {"type": "response.completed"}]
-            ConversationService(self.scoped).save_assistant_turn(
-                conversation_id, text, events, harness="cowork-direct",
-            )
+            try:
+                text = route.text
+                user_message = ConversationService(self.scoped).save_user_message(
+                    conversation_id, original_content,
+                )
+                events = [{
+                    "type": "response.output_text.delta",
+                    "delta": text,
+                    "response_route": route.route,
+                    "response_route_reason": route.reason,
+                }, {"type": "response.completed"}]
+                ConversationService(self.scoped).save_assistant_turn(
+                    conversation_id, text, events, harness="cowork-direct",
+                )
+            except MissingTenantScopeError:
+                # Org-scoped data touched without an org in scope is a 401 by
+                # deliberate classification (server.py). It is a RuntimeError,
+                # so the blanket clause below would answer 500 instead.
+                raise
+            except Exception:
+                # Without this the escape reaches the client as Starlette's bare
+                # 500: no body, no code, no id. Same shape the delegated
+                # non-streaming path raises, so a caller reads one body whichever
+                # producer answered.
+                logger.exception(
+                    "[responses] direct turn failed for conversation %s correlation_id=%s",
+                    conversation_id, corr, extra={"request_id": corr},
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=response_failed_payload(
+                        GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
+                    ),
+                )
             return Response(
                 status=ResponseStatus.completed,
                 model=route.model,
@@ -618,6 +647,7 @@ class ResponsesHandler:
                 original_content=original_content,
                 route=route,
                 buffer=buffer,
+                request_id=corr,
             ),
             lifecycle=lifecycle,
         )
@@ -630,7 +660,7 @@ class ResponsesHandler:
             await record_turn(
                 str(conversation_id),
                 turn_id=turn_id,
-                correlation_id=f"direct-{uuid4()}",
+                correlation_id=corr,
                 org_id=self.scoped.scope.org_id,
                 user_id=self.scoped.scope.user_id,
             )
@@ -644,13 +674,18 @@ class ResponsesHandler:
         original_content,
         route: RouteDecision,
         buffer,
+        request_id: str,
     ) -> None:
         """Persist and emit a direct answer using the normal detached lifecycle.
 
         The full answer exists up front — the gate does not return until its
         stream ends — so persistence happens before any frame is emitted: the
         client can never see a completed turn the DB does not have, and no
-        pending row is needed."""
+        pending row is needed.
+
+        ``request_id`` is the turn's correlation id, minted by the caller so
+        that on the Redis backend the same value reaches ``record_turn``'s
+        index entry."""
         producer_session = None
         try:
             producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
@@ -699,11 +734,15 @@ class ResponsesHandler:
                 return
             await buffer.close("cancelled")
         except Exception:
-            logger.exception("[responses] direct turn failed for conversation %s", conv_id)
-            await buffer.append("sse", {"sse": response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
+            logger.exception(
+                "[responses] direct turn failed for conversation %s correlation_id=%s",
+                conv_id, request_id, extra={"request_id": request_id},
+            )
+            await buffer.append("sse", {"sse": response_failed_sse(
+                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)})
             await buffer.close("error")
         finally:
-            await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
+            await _seal_unterminated_buffer(buffer, lifecycle, conv_id, request_id=request_id)
             if producer_session is not None:
                 producer_session.close()
 
@@ -1610,10 +1649,12 @@ class ResponsesHandler:
             # Set after the branches above, each of which REPLACES `extra`
             # rather than adding to it — seeding it earlier would survive only
             # the unmapped path. Carried on every failure so the payload shape
-            # stays uniform, but only the unmapped branch tags its log line
-            # with the id, so a curated failure can reach the log with nothing
-            # to match a quoted reference against. The client renders it on
-            # the generic card alone, so there is nothing to quote for one.
+            # stays uniform. Both branches tag their log line with the id, but
+            # only the unmapped one does so above the deployed level floor:
+            # the curated line is INFO and staging/prod run at WARNING, so a
+            # curated failure's id can reach the log with nothing to match. The
+            # client renders it on the generic card alone, so there is nothing
+            # to quote for one anyway.
             extra["request_id"] = corr
             failed = response_failed_payload(message, code, **extra)
             await buffer.append("sse", {"sse": response_failed_sse(message, code, **extra)})
