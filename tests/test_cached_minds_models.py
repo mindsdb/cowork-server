@@ -17,7 +17,7 @@ def clear_cache():
 def _listing(ids):
     return providers.MindsModelListing(
         ids=ids, efforts={"gpt": {"efforts": ["low", "max"], "default": "low"}} if ids else {},
-        enabled={}, labels={}, providers={}, families={}, role_defaults={},
+        enabled={}, labels={}, providers={}, families={}, current_versions={}, role_defaults={},
     )
 
 

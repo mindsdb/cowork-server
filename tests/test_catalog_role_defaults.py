@@ -302,7 +302,7 @@ def _stub_listing(monkeypatch, *, ids, enabled=None, role_defaults=None):
     from cowork.services.providers import MindsModelListing
 
     async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
-        return MindsModelListing(ids, {}, enabled or {}, {}, {}, {}, role_defaults or {})
+        return MindsModelListing(ids, {}, enabled or {}, {}, {}, {}, {}, role_defaults or {})
 
     monkeypatch.setattr(endpoint, "fetch_minds_models", fake_fetch)
 
