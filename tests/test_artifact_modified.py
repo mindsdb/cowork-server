@@ -2,9 +2,10 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 
-from cowork.services.artifacts import _content_mtime
+from cowork.services.artifacts import _content_mtime, _user_files_with_mtimes
 
 
 def _touch(path: Path, mtime: float) -> None:
@@ -33,6 +34,51 @@ def test_content_mtime_empty_folder_is_zero(tmp_path: Path):
         json.dumps({"id": "a", "type": "mixed"}), encoding="utf-8"
     )
     assert _content_mtime(tmp_path) == 0
+
+
+def _rmtree_iterative(root: Path) -> None:
+    """Non-recursive rmtree: `shutil.rmtree` itself recurses per directory
+    level, so it blows the same limit on a tree deep enough to test _walk."""
+    dirs = [root]
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        for entry in os.scandir(current):
+            if entry.is_dir(follow_symlinks=False):
+                child = Path(entry.path)
+                stack.append(child)
+                dirs.append(child)
+            else:
+                os.remove(entry.path)
+    for d in reversed(dirs):
+        os.rmdir(d)
+
+
+def test_user_files_with_mtimes_survives_a_deep_tree(tmp_path: Path):
+    """ENG-2436 follow-up: a folder deep enough to exceed the recursion limit
+    must not 500 the whole artifact list. `Path.mkdir(parents=True)` is itself
+    recursive and would blow up building the fixture, so build depth-first with
+    one `os.mkdir` per level instead. Torn down the same way afterwards —
+    pytest's own tmp_path cleanup uses `shutil.rmtree`, which would otherwise
+    hit the very RecursionError this test exists to rule out.
+    """
+    depth = sys.getrecursionlimit() + 200
+    root = tmp_path / "deep"
+    root.mkdir()
+    current = root
+    for _ in range(depth):
+        # A single-char component name keeps the path well under PATH_MAX at
+        # this depth; the tree's depth is what matters here, not its names.
+        current = current / "d"
+        os.mkdir(current)
+    bottom_file = current / "index.html"
+    bottom_file.write_text("<h1>deep</h1>", encoding="utf-8")
+
+    try:
+        files = [p for p, _ in _user_files_with_mtimes(root)]
+        assert bottom_file in files
+    finally:
+        _rmtree_iterative(root)
 
 
 def test_prepare_artifact_card_walks_folder_once(tmp_path: Path, monkeypatch):

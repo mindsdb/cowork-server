@@ -304,25 +304,31 @@ def _user_files_with_mtimes(folder: Path) -> list[tuple[Path, int]]:
     """
     out: list[tuple[Path, int]] = []
 
-    def _walk(dir_path: Path, top: str | None) -> None:
-        try:
-            entries = list(os.scandir(dir_path))
-        except OSError:
-            return
-        for entry in entries:
-            entry_top = top if top is not None else entry.name
-            if entry_top in _HOUSEKEEPING_FILES:
-                continue
+    def _walk(start: Path, start_top: str | None) -> None:
+        # Explicit stack, not recursion: a folder deep enough to exhaust the
+        # call stack raises RecursionError, which is not an OSError and would
+        # otherwise escape every handler in the card builder above this.
+        stack: list[tuple[Path, str | None]] = [(start, start_top)]
+        while stack:
+            dir_path, top = stack.pop()
             try:
-                if entry.is_dir(follow_symlinks=False):
-                    _walk(Path(entry.path), entry_top)
-                    continue
-                if not entry.is_file(follow_symlinks=False):
-                    continue
-                mtime_ns = entry.stat(follow_symlinks=False).st_mtime_ns
+                entries = list(os.scandir(dir_path))
             except OSError:
                 continue
-            out.append((Path(entry.path), mtime_ns))
+            for entry in entries:
+                entry_top = top if top is not None else entry.name
+                if entry_top in _HOUSEKEEPING_FILES:
+                    continue
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append((Path(entry.path), entry_top))
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    mtime_ns = entry.stat(follow_symlinks=False).st_mtime_ns
+                except OSError:
+                    continue
+                out.append((Path(entry.path), mtime_ns))
 
     try:
         _walk(folder, None)
