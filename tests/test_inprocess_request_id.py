@@ -396,7 +396,7 @@ async def test_direct_turn_seal_quotes_the_same_id(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_non_streaming_direct_failure_answers_with_a_quotable_500(monkeypatch):
+async def test_non_streaming_direct_failure_answers_with_a_quotable_500(monkeypatch, caplog):
     """The other half of the direct producer. A client that omits `stream`
     lands here, and an escape used to reach the user as a bare 500 with no
     body at all — nothing to read, let alone quote."""
@@ -419,7 +419,8 @@ async def test_non_streaming_direct_failure_answers_with_a_quotable_500(monkeypa
         ),
     )
 
-    with pytest.raises(HTTPException) as caught:
+    with caplog.at_level(logging.WARNING, logger="cowork.handlers.responses"), \
+            pytest.raises(HTTPException) as caught:
         await handler._handle_direct_response(
             request=SimpleNamespace(stream=False),
             conversation_id=UUID("d27d3533-2e4e-4021-bb5a-6e238245974c"),
@@ -434,4 +435,8 @@ async def test_non_streaming_direct_failure_answers_with_a_quotable_500(monkeypa
     # Same body shape the delegated non-streaming path emits, so a caller
     # never has to branch on which producer answered.
     assert caught.value.detail["code"] == "anton_error"
-    assert caught.value.detail["request_id"]
+    quoted = caught.value.detail["request_id"]
+    assert quoted.startswith("direct-")
+    # This half never calls record_turn, so the log line is the ONLY place the
+    # quoted Reference resolves. Pin it on the record, not just in the text.
+    assert [r for r in caplog.records if getattr(r, "request_id", None) == quoted]
