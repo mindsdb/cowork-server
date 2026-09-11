@@ -250,3 +250,146 @@ def test_the_console_formatter_renders_the_request_context(monkeypatch, rich_log
     # The same formatter still has to render the records that carry no id,
     # which is nearly all of them.
     assert "[Req:" not in formatter.format(record())
+
+
+# --- the direct-answer producer -------------------------------------------
+#
+# The gate can answer without delegating to the agent. That producer failed
+# generically with no id at all, so a user whose direct answer broke had the
+# same nothing-to-quote problem the delegated paths had fixed.
+#
+# The id is NOT minted inside the producer: the caller already mints one for
+# `record_turn`, and the turn index exists so a replica can find the turn by
+# that id. Two ids would give the user a Reference that matches the log line
+# and nothing in the index.
+
+
+class _RaisingOnceBuffer(_RecBuffer):
+    """Fails the first append so the producer's except body raises.
+
+    That is what makes the `finally` seal the branch actually under test: the
+    normal failure path closes the buffer, and the seal's `is_closed` guard
+    then makes it a no-op.
+    """
+
+    def __init__(self, fail_on: int) -> None:
+        super().__init__()
+        self.calls = 0
+        self.fail_on = fail_on
+
+    async def append(self, type_, data):
+        self.calls += 1
+        if self.calls == self.fail_on:
+            raise RuntimeError("buffer append failed")
+        return await super().append(type_, data)
+
+
+def _direct_handler(monkeypatch, *, on_save_assistant):
+    handler = object.__new__(ResponsesHandler)
+    handler.principal = object()
+    handler.scoped = SimpleNamespace(scope=SimpleNamespace(org_id="org-1", user_id="user-1"))
+
+    monkeypatch.setattr(responses_mod, "get_open_session", lambda: SimpleNamespace(close=lambda: None))
+    monkeypatch.setattr(
+        responses_mod, "ScopedSession", lambda session, scope: SimpleNamespace(close=lambda: None)
+    )
+    monkeypatch.setattr(responses_mod, "scope_from_principal", lambda principal: object())
+    monkeypatch.setattr(
+        responses_mod,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            save_user_message=lambda cid, content, pending=False: SimpleNamespace(id=uuid4()),
+            save_assistant_turn=on_save_assistant,
+        ),
+    )
+    return handler
+
+
+def _failed_frames(buffer) -> list[dict]:
+    out = []
+    for frame in buffer.frames:
+        payload = json.loads(frame.split("data: ", 1)[1])
+        if payload.get("type") == "response.failed":
+            out.append(payload)
+    return out
+
+
+@pytest.mark.asyncio
+async def test_direct_turn_failure_quotes_the_id_the_turn_index_holds(monkeypatch, caplog):
+    """The frame, the log record and `record_turn` all carry ONE id."""
+    from cowork.handlers.response_routing import DIRECT_CONTEXT, RouteDecision
+
+    def _boom(conv_id, text, events, harness=None):
+        raise RuntimeError("direct answer could not be persisted")
+
+    handler = _direct_handler(monkeypatch, on_save_assistant=_boom)
+    buffer = _RecBuffer()
+    recorded: dict = {}
+
+    async def fake_start(**kwargs):
+        # Run the producer for real instead of discarding it; the failure
+        # branch is the whole point.
+        await kwargs["producer_coro"]
+        return SimpleNamespace(buffer=buffer)
+
+    async def fake_record(conversation_id, **kwargs):
+        recorded.update(kwargs)
+
+    monkeypatch.setattr(responses_mod, "new_buffer", lambda _cid, _turn_id: buffer)
+    monkeypatch.setattr(responses_mod.registry, "start", fake_start)
+    monkeypatch.setattr(responses_mod, "get_backend", lambda: "redis")
+    monkeypatch.setattr(responses_mod, "record_turn", fake_record)
+
+    conv_id = UUID("d27d3533-2e4e-4021-bb5a-6e238245974c")
+    with caplog.at_level(logging.WARNING, logger="cowork.handlers.responses"):
+        await handler._handle_direct_response(
+            request=SimpleNamespace(stream=True),
+            conversation_id=conv_id,
+            turn_id=3,
+            original_content="Hello",
+            route=RouteDecision(
+                route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text="Hi.",
+            ),
+        )
+
+    failed = _failed_frames(buffer)
+    assert len(failed) == 1
+    quoted = failed[0]["request_id"]
+    assert quoted, "the generic direct failure must carry an id to quote"
+    # The id the user reads is the id the turn index holds, not a second one.
+    assert quoted == recorded["correlation_id"]
+
+    tagged = [r for r in caplog.records if getattr(r, "request_id", None) == quoted]
+    assert tagged, "the failure must reach the log as a record attribute, not just message text"
+
+
+@pytest.mark.asyncio
+async def test_direct_turn_seal_quotes_the_same_id(monkeypatch):
+    """A failure that escapes the except body still seals with the turn's id."""
+    from cowork.handlers.response_routing import DIRECT_CONTEXT, RouteDecision
+
+    def _boom(conv_id, text, events, harness=None):
+        raise RuntimeError("direct answer could not be persisted")
+
+    handler = _direct_handler(monkeypatch, on_save_assistant=_boom)
+    # First append is the except body's failure frame; the seal's own append
+    # is the second and succeeds.
+    buffer = _RaisingOnceBuffer(fail_on=1)
+    corr = "direct-11111111-2222-3333-4444-555555555555"
+
+    with pytest.raises(RuntimeError):
+        await handler._produce_direct(
+            lifecycle=SimpleNamespace(discarded=False),
+            conv_id=UUID("d27d3533-2e4e-4021-bb5a-6e238245974c"),
+            original_content="Hello",
+            route=RouteDecision(
+                route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text="Hi.",
+            ),
+            buffer=buffer,
+            request_id=corr,
+        )
+
+    sealed = _failed_frames(buffer)
+    assert len(sealed) == 1
+    assert sealed[0]["request_id"] == corr
+    assert buffer.closed == "error"

@@ -606,6 +606,10 @@ class ResponsesHandler:
         # turn_id comes from handle(): same numbering as the delegated path.
         buffer = new_buffer(str(conversation_id), turn_id)
         lifecycle = TurnLifecycle()
+        # One id for the turn, not one per consumer: the producer quotes it on
+        # a failure and record_turn indexes the turn under it, so a Reference a
+        # user reports resolves in both the log and the turn index.
+        corr = f"direct-{uuid4()}"
         handle = await registry.start(
             conversation_id=str(conversation_id),
             turn_id=turn_id,
@@ -618,6 +622,7 @@ class ResponsesHandler:
                 original_content=original_content,
                 route=route,
                 buffer=buffer,
+                request_id=corr,
             ),
             lifecycle=lifecycle,
         )
@@ -630,7 +635,7 @@ class ResponsesHandler:
             await record_turn(
                 str(conversation_id),
                 turn_id=turn_id,
-                correlation_id=f"direct-{uuid4()}",
+                correlation_id=corr,
                 org_id=self.scoped.scope.org_id,
                 user_id=self.scoped.scope.user_id,
             )
@@ -644,13 +649,17 @@ class ResponsesHandler:
         original_content,
         route: RouteDecision,
         buffer,
+        request_id: str | None = None,
     ) -> None:
         """Persist and emit a direct answer using the normal detached lifecycle.
 
         The full answer exists up front — the gate does not return until its
         stream ends — so persistence happens before any frame is emitted: the
         client can never see a completed turn the DB does not have, and no
-        pending row is needed."""
+        pending row is needed.
+
+        ``request_id`` is the turn's correlation id, minted by the caller so
+        the same value reaches ``record_turn``'s index entry."""
         producer_session = None
         try:
             producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
@@ -699,11 +708,15 @@ class ResponsesHandler:
                 return
             await buffer.close("cancelled")
         except Exception:
-            logger.exception("[responses] direct turn failed for conversation %s", conv_id)
-            await buffer.append("sse", {"sse": response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
+            logger.exception(
+                "[responses] direct turn failed for conversation %s correlation_id=%s",
+                conv_id, request_id, extra={"request_id": request_id},
+            )
+            await buffer.append("sse", {"sse": response_failed_sse(
+                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)})
             await buffer.close("error")
         finally:
-            await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
+            await _seal_unterminated_buffer(buffer, lifecycle, conv_id, request_id=request_id)
             if producer_session is not None:
                 producer_session.close()
 
