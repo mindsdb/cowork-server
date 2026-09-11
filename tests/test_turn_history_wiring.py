@@ -87,6 +87,39 @@ def test_remote_path_gates_rows_on_a_clean_finish():
     assert src.count("persist(clean=True)") == 1
 
 
+IN_PROCESS_PERSISTERS = [
+    pytest.param(r.ResponsesHandler._run_turn, id="in-process-streaming"),
+    pytest.param(r.ResponsesHandler._collect, id="in-process-non-streaming"),
+    pytest.param(rt.AntonChannelRuntime._run_anton, id="channels"),
+]
+
+
+@pytest.mark.parametrize("persister", IN_PROCESS_PERSISTERS)
+def test_in_process_paths_id_check_before_persisting(persister):
+    """ENG-2420: an empty tool-call id persisted here poisons the conversation
+    permanently — every later turn replays it and the provider rejects the
+    whole request.
+
+    Pinned for the same reason this file exists at all: reverting all three of
+    these call sites to `data.get("rows") or []` left the entire unit suite
+    green, because the behavioural tests that exercise these rows end to end
+    only ever use well-formed ids (review: pnewsam on #520).
+
+    Deliberately NOT `sanitize_turn_history_rows` — that one also enforces the
+    pod's 16 KiB / 256 KiB budgets, which this path has never been subject to.
+    """
+    assert "reject_unreplayable_tool_rows(" in _norm(persister)
+
+
+def test_the_in_process_guard_is_not_the_pod_sanitizer(persister=None):
+    """The two must not be collapsed into one. Asserted on the remote path so
+    a well-meaning simplification that routes everything through a single
+    function fails here rather than silently truncating desktop tool output."""
+    for p in (r.ResponsesHandler._run_turn, r.ResponsesHandler._collect,
+              rt.AntonChannelRuntime._run_anton):
+        assert "sanitize_turn_history_rows(" not in _norm(p)
+
+
 def test_remote_path_sanitizes_before_persisting():
     """The pod is semi-trusted; unvalidated rows must not reach the DB."""
     src = _norm(r.ResponsesHandler._produce_remote)

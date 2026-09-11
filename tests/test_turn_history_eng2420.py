@@ -13,6 +13,8 @@ The size budgets are deliberately NOT adopted here; the second half of this
 file is what stops someone "simplifying" this into a call to the pod sanitizer.
 """
 
+import copy
+
 from cowork.handlers._turn_history import (
     _MAX_RESULT_BYTES,
     _MAX_TURN_BYTES,
@@ -31,8 +33,12 @@ def _pair(uid="t1", result="BODY"):
 
 
 def test_a_clean_pair_passes_through_unchanged():
+    # Snapshot first: the function returns the SAME list object on success, so
+    # `== rows` would compare an object with itself and pass even if a future
+    # refactor mutated the rows in place (review: pnewsam on #520).
     rows = _pair()
-    assert reject_unreplayable_tool_rows(rows) == rows
+    before = copy.deepcopy(rows)
+    assert reject_unreplayable_tool_rows(rows) == before
 
 
 def test_an_empty_tool_use_id_drops_the_whole_turn():
@@ -78,7 +84,8 @@ def test_an_oversize_tool_result_is_kept_verbatim():
     that budget to fix an id bug would silently truncate good tool detail."""
     big = "x" * (_MAX_RESULT_BYTES * 2)
     rows = _pair(result=big)
-    assert reject_unreplayable_tool_rows(rows) == rows
+    before = copy.deepcopy(rows)
+    assert reject_unreplayable_tool_rows(rows) == before
     # ...and this is exactly what the pod sanitizer would have done instead:
     assert sanitize_turn_history_rows(rows)[1]["content"][0]["content"] != big
 
@@ -91,5 +98,6 @@ def test_an_oversize_turn_is_kept_whole():
     rows = []
     for i in range(40):
         rows += _pair(f"t{i}", result=chunk)
-    assert reject_unreplayable_tool_rows(rows) == rows
+    before = copy.deepcopy(rows)
+    assert reject_unreplayable_tool_rows(rows) == before
     assert sanitize_turn_history_rows(rows) == []

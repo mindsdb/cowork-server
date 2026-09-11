@@ -80,7 +80,7 @@ def _cap_tool_result(block: dict) -> dict:
     )}
 
 
-def reject_unreplayable_tool_rows(rows: list[dict]) -> list[dict]:
+def reject_unreplayable_tool_rows(rows: object) -> list[dict]:
     """Id-check rows this server produced in-process, or `[]` to fall back.
 
     ENG-2420: anton could build a `tool_use` block with an EMPTY id. Persisting
@@ -106,6 +106,12 @@ def reject_unreplayable_tool_rows(rows: list[dict]) -> list[dict]:
     orphan and make every later turn fail — the outcome being prevented. An
     empty result replays text-only, which is a degradation the in-process
     harness already applies after a mid-turn compaction.
+
+    `rows: object`, like its sibling: both call sites feed it
+    `data.get("rows") or []` off an untyped dict, and the first statement here
+    is an isinstance check. Declaring `list[dict]` claimed a guarantee the
+    function does not have and its own tests deliberately violate
+    (review: pnewsam on cowork-server#520).
     """
     if not isinstance(rows, list):
         return _reject("in-process payload is %s, not a list", type(rows).__name__)

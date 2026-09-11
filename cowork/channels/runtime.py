@@ -546,7 +546,7 @@ class AntonChannelRuntime:
             # Tool block-rows are for LLM-history persistence, not UI replay —
             # keep them out of the events log (mirrors handlers/responses.py).
             if event_type == "response.turn_history":
-                # See the matching note in handlers/responses.py (ENG-2420).
+                # Id-checked even in-process; see handlers/responses.py (ENG-2420).
                 turn_rows[:] = reject_unreplayable_tool_rows(data.get("rows") or [])
                 return
             events.append(data)
