@@ -198,8 +198,8 @@ async def _seal_unterminated_buffer(
     for ``_produce_remote``, the locally minted one for ``_run_turn``, the
     caller's ``direct-`` id for ``_produce_direct``. This is the hardest-failing
     turn (one that escaped every named ``except``), so it's exactly the one a
-    user is most likely to report. Still optional: the channel producers have no
-    such id to offer.
+    user is most likely to report. Every producer that reaches this now has one;
+    the parameter stays optional only so a test double can omit it.
     """
     if lifecycle.discarded or getattr(buffer, "is_closed", True):
         return
@@ -584,20 +584,41 @@ class ResponsesHandler:
         route: RouteDecision,
     ) -> AsyncGenerator[str, None] | Response:
         """Return the router model's direct answer without initializing Anton."""
+        # One id for the turn, not one per consumer: both halves of this
+        # producer quote it on a failure, and on the Redis backend record_turn
+        # indexes the turn under the same value, so a Reference a user reports
+        # resolves in the log and in the turn index alike.
+        corr = f"direct-{uuid4()}"
         if not request.stream:
-            text = route.text
-            user_message = ConversationService(self.scoped).save_user_message(
-                conversation_id, original_content,
-            )
-            events = [{
-                "type": "response.output_text.delta",
-                "delta": text,
-                "response_route": route.route,
-                "response_route_reason": route.reason,
-            }, {"type": "response.completed"}]
-            ConversationService(self.scoped).save_assistant_turn(
-                conversation_id, text, events, harness="cowork-direct",
-            )
+            try:
+                text = route.text
+                user_message = ConversationService(self.scoped).save_user_message(
+                    conversation_id, original_content,
+                )
+                events = [{
+                    "type": "response.output_text.delta",
+                    "delta": text,
+                    "response_route": route.route,
+                    "response_route_reason": route.reason,
+                }, {"type": "response.completed"}]
+                ConversationService(self.scoped).save_assistant_turn(
+                    conversation_id, text, events, harness="cowork-direct",
+                )
+            except Exception:
+                # Without this the escape reaches the client as Starlette's bare
+                # 500: no body, no code, no id. Same shape the delegated
+                # non-streaming path raises, so a caller reads one body whichever
+                # producer answered.
+                logger.exception(
+                    "[responses] direct turn failed for conversation %s correlation_id=%s",
+                    conversation_id, corr, extra={"request_id": corr},
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=response_failed_payload(
+                        GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
+                    ),
+                )
             return Response(
                 status=ResponseStatus.completed,
                 model=route.model,
@@ -607,10 +628,6 @@ class ResponsesHandler:
         # turn_id comes from handle(): same numbering as the delegated path.
         buffer = new_buffer(str(conversation_id), turn_id)
         lifecycle = TurnLifecycle()
-        # One id for the turn, not one per consumer: the producer quotes it on
-        # a failure and record_turn indexes the turn under it, so a Reference a
-        # user reports resolves in both the log and the turn index.
-        corr = f"direct-{uuid4()}"
         handle = await registry.start(
             conversation_id=str(conversation_id),
             turn_id=turn_id,
@@ -650,7 +667,7 @@ class ResponsesHandler:
         original_content,
         route: RouteDecision,
         buffer,
-        request_id: str | None = None,
+        request_id: str,
     ) -> None:
         """Persist and emit a direct answer using the normal detached lifecycle.
 
@@ -660,7 +677,8 @@ class ResponsesHandler:
         pending row is needed.
 
         ``request_id`` is the turn's correlation id, minted by the caller so
-        the same value reaches ``record_turn``'s index entry."""
+        that on the Redis backend the same value reaches ``record_turn``'s
+        index entry."""
         producer_session = None
         try:
             producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))

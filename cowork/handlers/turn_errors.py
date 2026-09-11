@@ -1139,7 +1139,7 @@ def response_failed_payload(
     every remote-backend and in-process failure regardless of code, including
     the fully generic ``anton_error`` bucket, so a user report of "An
     unexpected error occurred" can still be pinned to this turn's server-side
-    logs. The channel producers have none to offer and omit it.
+    logs. Every producer that builds this payload sets one.
     """
     payload = {"type": "response.failed", "code": code, "error": error}
     if reconnectable is not None:
