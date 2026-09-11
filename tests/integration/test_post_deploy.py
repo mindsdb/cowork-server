@@ -357,9 +357,10 @@ def _stream_turn(
     """POST a turn and drain its SSE response, returning the event names.
 
     Pass ``failures`` to also collect the reason from any ``response.failed`` /
-    ``error`` event (its ``data:`` line carries ``code`` + ``message``) — a bare
-    "did not complete" is unactionable in CI, and the reason is what says whether
-    the pod never mounted, the worker timed out, or the model was unavailable.
+    ``error`` event (its ``data:`` line carries ``code`` + ``error`` or
+    ``message``) — a bare "did not complete" is unactionable in CI, and the
+    reason says whether the pod never mounted, the worker timed out, or the
+    model was unavailable.
     """
     events: list[str] = []
     current: str | None = None
@@ -382,8 +383,9 @@ def _stream_turn(
                 raw = line.removeprefix("data:").strip()
                 try:
                     payload = json.loads(raw)
+                    message = payload.get("error") or payload.get("message")
                     failures.append(
-                        f"code={payload.get('code')!r} message={payload.get('message')!r}"
+                        f"code={payload.get('code')!r} message={message!r}"
                     )
                 except (ValueError, AttributeError):
                     failures.append(raw[:300])
