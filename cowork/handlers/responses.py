@@ -194,18 +194,18 @@ async def _seal_unterminated_buffer(
     absent flag as already-terminated so a stub can't trigger a spurious second
     terminal.
 
-    ``request_id`` is the remote producer's own correlation id, passed by
-    ``_produce_remote`` only — this is the hardest-failing turn (one that
-    escaped every named ``except``), so it's exactly the one a user is most
-    likely to report; omitted (``None``) by the in-process/direct producers,
-    which have no such id to offer.
+    ``request_id`` is the producing turn's own correlation id — the remote
+    one for ``_produce_remote``, the locally minted one for ``_run_turn``.
+    This is the hardest-failing turn (one that escaped every named ``except``),
+    so it's exactly the one a user is most likely to report. Still optional:
+    the direct/channel producers have no such id to offer.
     """
     if lifecycle.discarded or getattr(buffer, "is_closed", True):
         return
     logger.error(
         "[responses] turn for conversation %s (correlation_id=%s) ended without a "
         "terminal record; sealing the buffer so the client releases its stream slot",
-        conv_id, request_id,
+        conv_id, request_id, extra={"request_id": request_id},
     )
     try:
         await buffer.append("sse", {"sse": response_failed_sse(
@@ -1263,6 +1263,7 @@ class ResponsesHandler:
             logger.warning(
                 "[responses] remote turn reported a failure for conversation %s "
                 "correlation_id=%s code=%s", conv_id, corr, code,
+                extra={"request_id": corr},
             )
             collected_events.append(response_failed_payload(message, code, request_id=corr))
             await buffer.append("sse", {"sse": response_failed_sse(message, code, request_id=corr)})
@@ -1296,7 +1297,7 @@ class ResponsesHandler:
         except Exception:
             logger.exception(
                 "[responses] remote turn failed for conversation %s correlation_id=%s",
-                conv_id, corr,
+                conv_id, corr, extra={"request_id": corr},
             )
             collected_events.append(response_failed_payload(
                 GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr))
@@ -1357,6 +1358,12 @@ class ResponsesHandler:
         # Send time captured before the turn
         sent_at = datetime.now(timezone.utc)
         pending_message_id: UUID | None = None
+        # The in-process twin of _produce_remote's correlation id. Minted up
+        # front so the failure branch and the seal below attach the SAME id the
+        # log line carries. This path has no pod and so no correlation id of its
+        # own to reuse — a desktop turn's only trace is the local log, which is
+        # exactly the report this id exists to make possible.
+        corr = str(uuid4())
 
         def event_sink(event_type: str, data: dict) -> None:
             # Tool block-rows are for LLM-history persistence, not UI replay —
@@ -1392,7 +1399,10 @@ class ResponsesHandler:
                     tool_rows=turn_rows,
                 )
             except Exception:
-                logger.exception("[responses] failed to persist turn for conversation %s", conv_id)
+                logger.exception(
+                    "[responses] failed to persist turn for conversation %s", conv_id,
+                    extra={"request_id": corr},
+                )
 
         try:
             conv = ConversationService(producer_session).get_conversation(conv_id)
@@ -1445,10 +1455,20 @@ class ResponsesHandler:
             friendly = friendly_turn_error(exc, model_info=model_info)
             if friendly is not None:
                 code, message = friendly
-                logger.info("[responses] user-facing turn error: %s", exc)
+                logger.info(
+                    "[responses] user-facing turn error: %s", exc,
+                    extra={"request_id": corr},
+                )
             else:
                 code, message = GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
-                logger.exception("[responses] turn failed for conversation %s", conv_id)
+                # WARNING or above is the floor the deployed environments run
+                # at, and this is the branch whose message tells the user
+                # nothing — so the id has to survive that level or the
+                # Reference they quote resolves to no line.
+                logger.exception(
+                    "[responses] turn failed for conversation %s correlation_id=%s",
+                    conv_id, corr, extra={"request_id": corr},
+                )
             if code == CONTENT_RECOVERY_CODE:
                 # ENG-1992: the provider permanently rejected an image block in
                 # this conversation's stored history — repair the DATA once,
@@ -1460,12 +1480,12 @@ class ResponsesHandler:
                     logger.warning(
                         "[responses] content validation error on conversation %s — "
                         "repaired %d message(s) with image content: %s",
-                        conv_id, len(repaired), exc,
+                        conv_id, len(repaired), exc, extra={"request_id": corr},
                     )
                 except Exception:
                     logger.exception(
                         "[responses] failed to repair conversation %s after content validation error",
-                        conv_id,
+                        conv_id, extra={"request_id": corr},
                     )
             # For an auth failure, tell the client which provider failed so it
             # offers the right action: "Reconnect" only for MindsHub (we can
@@ -1489,7 +1509,10 @@ class ResponsesHandler:
                         message = auth_error_detail(provider.label, reconnectable)
                         extra = {"reconnectable": reconnectable, "provider_label": provider.label}
                 except Exception:
-                    logger.exception("[responses] could not resolve provider for auth error")
+                    logger.exception(
+                        "[responses] could not resolve provider for auth error",
+                        extra={"request_id": corr},
+                    )
             elif code in MODEL_UNAVAILABLE_CODES:
                 # The model was rejected (legacy 403 gate, or a 404 for a model
                 # the provider can't serve): tell the client WHICH model so the
@@ -1529,7 +1552,10 @@ class ResponsesHandler:
                         # non-desktop consumers; no cowork code reads it.
                         extra = {"retry_after": _after, "retry_at": retry_at_instant(_after)}
                 except Exception:
-                    logger.exception("[responses] could not resolve the retry hint")
+                    logger.exception(
+                        "[responses] could not resolve the retry hint",
+                        extra={"request_id": corr},
+                    )
             elif code == PROVIDER_OVERLOADED_CODE:
                 # Transient-incident timeout (ENG-673): give the card the failing
                 # model AND the active provider, and flag whether the user is
@@ -1561,14 +1587,25 @@ class ResponsesHandler:
                     extra["provider_label"] = provider.label
                     extra["reconnectable"] = provider == Provider.MINDS_CLOUD
                 except Exception:
-                    logger.exception("[responses] could not resolve provider for overload error")
+                    logger.exception(
+                        "[responses] could not resolve provider for overload error",
+                        extra={"request_id": corr},
+                    )
+            # Set after the branches above, each of which REPLACES `extra`
+            # rather than adding to it — seeding it earlier would survive only
+            # the unmapped path. Carried on every failure so the payload shape
+            # stays uniform, but only the unmapped branch tags its log line
+            # with the id, so a curated failure can reach the log with nothing
+            # to match a quoted reference against. The client renders it on
+            # the generic card alone, so there is nothing to quote for one.
+            extra["request_id"] = corr
             failed = response_failed_payload(message, code, **extra)
             await buffer.append("sse", {"sse": response_failed_sse(message, code, **extra)})
             collected_events.append(failed)
             persist()
             await buffer.close("error")
         finally:
-            await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
+            await _seal_unterminated_buffer(buffer, lifecycle, conv_id, request_id=corr)
             producer_session.close()
 
     @staticmethod
@@ -1616,10 +1653,16 @@ class ResponsesHandler:
             # unsupported image) surfaces its curated message with a 400;
             # anything else stays a generic 500 so provider internals never
             # leak. (cowork PR #156.)
+            # Minted here rather than up front like the streaming twin: this
+            # path has no seal to feed, so a successful turn needs no id.
+            corr = str(uuid4())
             friendly = friendly_turn_error(exc)
             if friendly is not None:
                 code, message = friendly
-                logger.info("[responses] user-facing turn error: %s", exc)
+                logger.info(
+                    "[responses] user-facing turn error: %s", exc,
+                    extra={"request_id": corr},
+                )
                 if code == CONTENT_RECOVERY_CODE:
                     # ENG-1992: see the streaming path's twin for the full
                     # rationale — repair the conversation's stored history
@@ -1630,24 +1673,30 @@ class ResponsesHandler:
                             "[responses] content validation error on conversation %s — "
                             "repaired %d message(s) with image content: %s",
                             conversation_id, len(repaired), exc,
+                            extra={"request_id": corr},
                         )
                     except Exception:
                         logger.exception(
                             "[responses] failed to repair conversation %s after content validation error",
-                            conversation_id,
+                            conversation_id, extra={"request_id": corr},
                         )
                 # The ladder already produced a code; carry it instead of dropping
                 # it here. Same wire shape the streaming twin emits.
                 raise HTTPException(
                     status_code=400,
-                    detail=response_failed_payload(message, code),
+                    detail=response_failed_payload(message, code, request_id=corr),
                 )
-            logger.exception("[responses] turn failed")
+            logger.exception(
+                "[responses] turn failed for conversation %s correlation_id=%s",
+                conversation_id, corr, extra={"request_id": corr},
+            )
             # Same shape as the 400 above: one body for every turn failure, so a
             # caller never has to branch on status to know how to read `detail`.
             raise HTTPException(
                 status_code=500,
-                detail=response_failed_payload(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE),
+                detail=response_failed_payload(
+                    GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
+                ),
             )
 
         assistant_text = "".join(collected_text)
