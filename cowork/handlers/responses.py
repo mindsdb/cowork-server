@@ -817,6 +817,21 @@ class ResponsesHandler:
                     )
 
     @staticmethod
+    def _remote_started_at(session: ScopedSession, conv_id: UUID) -> str | None:
+        """The conversation's creation time as ISO 8601, for the pod's fixed
+        "conversation started" prompt line. Mirrors what the in-process path
+        passes as `started_at`. A lookup failure degrades to None (today's
+        date in the pod) rather than failing the turn."""
+        try:
+            created_at = getattr(
+                ConversationService(session).get_conversation(conv_id), "created_at", None
+            )
+            return created_at.isoformat() if created_at is not None else None
+        except Exception:
+            logger.exception("[responses] failed to resolve started_at for conversation %s", conv_id)
+            return None
+
+    @staticmethod
     def _remote_workspace(session: ScopedSession, conv_id: UUID) -> dict:
         """The conversation's project as a path relative to the org root.
 
@@ -1096,6 +1111,7 @@ class ResponsesHandler:
                     # travels as a bounded, sheddable wire block.
                     memory=memory,
                     **self._remote_workspace(producer_session, conv_id),
+                    started_at=self._remote_started_at(producer_session, conv_id),
                     correlation_id=corr,
                     llm=(turn_llm or {}).get("llm"),
                     disabled=disabled,
