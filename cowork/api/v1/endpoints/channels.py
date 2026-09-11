@@ -216,7 +216,15 @@ async def reload_channel(
 @router.post("/{channel_type}/test-connection", response_model=ChannelTestConnectionResponse)
 async def test_connection(channel_type: str, scoped: ScopedSessionDep) -> ChannelTestConnectionResponse:
     """Calls the platform to check the STORED credentials actually
-    authenticate — not admin-gated, since it reads but never writes."""
+    authenticate.
+
+    Member-level, not ``AuthenticatedOrgAdmin`` like its five configure
+    siblings: it does write — a successful probe stamps
+    ``external_account_id`` on the org's ChannelInstallation via
+    ``set_external_account_id`` (cowork/services/channels.py) — but nothing
+    written is caller-supplied. The value is whatever the org's own stored
+    credentials resolve to at the platform, so a member can confirm the
+    connection without being able to change what it points at."""
     try:
         result = await ChannelConfigService(scoped).test_connection(channel_type)
     except UnknownChannelError:

@@ -9,8 +9,7 @@ read the resolved credential, under the same loopback guard it always had.
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
-from cowork.api.v1.endpoints.guards import require_local, require_local_tenancy
-from cowork.api.v1.permissions import OpenByDesign, require
+from cowork.api.v1.permissions import LoopbackDesktopOnly, require
 from cowork.common.settings.runtime_credential import (
     clear_minds_credential,
     set_minds_credential,
@@ -21,9 +20,7 @@ from cowork.common.settings.runtime_credential import (
 # this accepts a bearer token and a network-exposed deployment must not let a
 # remote peer choose which credential the agent spends; desktop-only because an
 # org pod is handed a per-turn credential and has no use for a stored one.
-router = APIRouter(
-    dependencies=[Depends(require_local), Depends(require_local_tenancy), Depends(require(OpenByDesign))]
-)
+router = APIRouter(dependencies=[Depends(require(LoopbackDesktopOnly))])
 
 
 class MindsCredentialBody(BaseModel):

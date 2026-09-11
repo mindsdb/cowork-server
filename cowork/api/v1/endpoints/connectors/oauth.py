@@ -5,8 +5,7 @@ from typing import Annotated
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
 
-from cowork.api.v1.endpoints.guards import require_local
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackOnly, OpenByDesign, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.connectors import OAuthStartRequest, OAuthStartResponse, PickerTokenResponse
@@ -56,13 +55,10 @@ async def start_oauth(service: str, request: Request, scope: ScopeDep,
     return oauth_service.start(service, OAuthSettings(), client_id=body.client_id, client_secret=body.client_secret, extra_fields=body.extra_fields)
 
 
-# OpenByDesign, standalone reason: what protects this route is require_local
-# below — returns a raw client_secret, same loopback restriction as the
-# settings reveal-key and /raw endpoints (ENG-868).
-@router.get(
-    "/{engine}/credentials",
-    dependencies=[Depends(require_local), Depends(require(OpenByDesign))],
-)
+# LoopbackOnly: returns a raw client_secret, so the credential is the caller
+# being on this machine — same restriction as settings reveal-key and /raw
+# (ENG-868).
+@router.get("/{engine}/credentials", dependencies=[Depends(require(LoopbackOnly))])
 def get_oauth_credentials(engine: str):
     """Return client_id and client_secret for a builtin-OAuth engine.
     Called by Electron main process only — never exposed to the renderer."""
