@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 MINDS_PROBE_MODEL = "mindshub_air"
 
 # Marks a request as a connectivity/health-check probe so the Traces list can
-# hide it by default (ENG-2310). Read by mindshub_inference on the
+# hide it by default. Read by mindshub_inference on the
 # /chat/completions path; it is our own header and means nothing to a non-Minds
 # endpoint, so it is only ever sent to a Minds host.
 MINDS_REQUEST_KIND_HEADER = "X-Minds-Request-Kind"
@@ -1101,7 +1101,7 @@ async def validate_openai_compatible(api_key: str, base_url: str = "https://api.
         # Stamp the connectivity-probe marker on the MindsHub fallback only — the
         # same host-gated reasoning as the token cap above. It is our own header,
         # meaningless to an arbitrary endpoint, and only MindsHub reads it to hide
-        # the probe from the Traces list (ENG-2310).
+        # the probe from the Traces list.
         if is_minds_host(normalized):
             headers[MINDS_REQUEST_KIND_HEADER] = MINDS_REQUEST_KIND_PROBE
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:

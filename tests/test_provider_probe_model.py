@@ -232,7 +232,7 @@ def test_a_non_minds_probe_sends_no_token_cap(monkeypatch):
     assert "max_tokens" not in _CapturingClient.captured["json"]
 
 
-# ── The connectivity-probe marker for the Traces list (ENG-2310) ──────
+# ── The connectivity-probe marker for the Traces list ──────
 #
 # Every MindsHub probe hits the real /chat/completions path under the user's key,
 # so it persists as an ordinary trace and is noise in the list. Each sender
