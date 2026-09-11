@@ -995,7 +995,6 @@ def test_foreign_product_matcher_does_not_fire_on_ordinary_answers():
     for benign in (
         "Move the cursor to the end of the line, then press Enter.",
         "Close the DB cursor in a finally block so the connection returns to the pool.",
-        "Llamas and alpacas are both camelids.",
         "A network engineer can use AI to analyse logs, alerts and packet captures.",
         "I'm Cowork, an AI assistant that can analyse data and build things.",
         "Sure — paste the sequence and I'll predict the next value.",
@@ -1059,13 +1058,26 @@ async def test_clean_direct_answer_still_ships():
         ("what is MindsHub Cowork?", "I can't identify it; you may mean Claude or Gemini."),
         ("¿quién te creó?", "Fui creado por OpenAI."),
         ("你是什么产品？", "我是 ChatGPT，由 OpenAI 开发。"),
+        # The denial shape — names no competitor, denies us instead. Before the
+        # denial matcher these two shipped straight to the user.
+        (
+            "what is MindsHub Cowork?",
+            "I can't reliably identify a current public product called MindsHub "
+            "CoWork from the name alone.",
+        ),
+        (
+            "is there a cowork desktop app?",
+            "There is no verified Cowork desktop app that I could find.",
+        ),
     ],
 )
 async def test_product_identity_questions_never_answer_with_a_competitor(question, answer):
     """Done-when #5: the product-identity question set.
 
-    Multilingual on purpose — the prod failure this guard exists for was in
-    Telugu, and an English-only suite is exactly the suite that missed it.
+    Covers both shapes the Done-when names — "names a competitor product **or**
+    denies Cowork exists". Multilingual on purpose: the prod failure this guard
+    exists for was in Telugu, and an English-only suite is exactly the suite
+    that missed it.
     """
     provider = _Client(_response(content=answer))
 
@@ -1079,3 +1091,107 @@ async def test_product_identity_questions_never_answer_with_a_competitor(questio
 
     assert decision.route == DELEGATED_AGENTIC
     assert decision.text == ""
+
+
+@pytest.mark.parametrize(
+    "sentence, name",
+    [
+        ("A llama is a South American camelid.", "llama"),
+        ("Claude Shannon founded information theory in 1948.", "Claude"),
+        ("Gemini is a zodiac sign and also a 1960s NASA programme.", "Gemini"),
+        ("To grok something means to understand it deeply.", "grok"),
+        ("The copilot sits in the right-hand seat.", "copilot"),
+        ("The bard in your party can cast charm person.", "bard"),
+        ("The mistral is a cold wind through southern France.", "mistral"),
+    ],
+)
+def test_known_over_fires_are_accepted_and_pinned(sentence, name):
+    """Seven names in the list are also ordinary words, and DO fire.
+
+    Pinned rather than fixed, deliberately. The gate runs on the router role,
+    which for most users is a third-party model, so "I'm Claude, made by
+    Anthropic" is a live failure for nearly every name here — dropping the
+    ambiguous ones would weaken the guard against the exact thing it exists for.
+    The cost is one extra hop on a path that already fails open.
+
+    This test exists so the trade is visible in the suite instead of surfacing
+    later as a surprise. If someone narrows the matcher, this test should be
+    updated deliberately — not deleted to make it pass.
+
+    (An earlier version of the benign test asserted on "Llamas", whose trailing
+    boundary excludes it, and so proved nothing about the singular.)
+    """
+    from cowork.handlers.response_routing import names_foreign_product
+
+    assert names_foreign_product(sentence) == name
+
+
+def test_denial_matcher_catches_the_prospect_failure():
+    """The ticket's worst-outcome case, and the shape the name list cannot see.
+
+    These answers name no competitor at all — they deny our product exists.
+    Done-when #5 asks for both shapes; the name list only covers one.
+    """
+    from cowork.handlers.response_routing import denies_our_product
+
+    for denial in (
+        # trace dd8f8dc9 — the prospect evaluating Cowork for their own SaaS
+        "I can't reliably identify a current public product called MindsHub CoWork "
+        "from the name alone.",
+        "There is no verified Cowork desktop app that I could find.",
+        "I'm not familiar with a product called Cowork.",
+        "I'm not aware of any tool called MindsHub Cowork.",
+        "I've never heard of Cowork by MindsDB.",
+        "I could not find any product by that name — MindsHub Cowork does not appear to exist.",
+        "There's no such app as MindsHub Cowork that I know of.",
+    ):
+        assert denies_our_product(denial) is not None, denial
+
+
+def test_denial_matcher_leaves_true_statements_about_cowork_alone():
+    """The reason this matcher is narrow rather than "product name near a negation".
+
+    That naive form was measured discarding 5 of these 6 — including the
+    browser/desktop one, which is precisely the surface-aware answer ENG-2423
+    exists to produce. Saying what Cowork cannot do is not denying Cowork.
+    """
+    from cowork.handlers.response_routing import denies_our_product
+
+    for true_statement in (
+        "Cowork doesn't support that file type yet.",
+        "Cowork can't read local folders in the browser — that's desktop only.",
+        "No, Cowork does not need an API key for that.",
+        "MindsHub Cowork is not the same product as MindsDB's SQL engine.",
+        "I can't run that without connecting a data source in Cowork first.",
+        "There is no Linux beta for Cowork at the moment.",
+        "Cowork can't open that file because the path doesn't exist.",
+        "I couldn't find that setting in Cowork — try Settings → Agent Harness.",
+        "Cowork can't identify the file encoding automatically; specify it.",
+        "The Cowork desktop app is not available from the Mac App Store.",
+    ):
+        assert denies_our_product(true_statement) is None, true_statement
+
+
+@pytest.mark.asyncio
+async def test_answer_denying_our_product_is_discarded_with_its_own_reason():
+    """Countable apart from the naming shape: they fail differently and would
+    be tuned separately."""
+    provider = _Client(
+        _response(
+            content="I can't reliably identify a current public product called "
+                    "MindsHub CoWork from the name alone."
+        )
+    )
+
+    decision = await decide_route(
+        history=[{"role": "user", "content": "what is MindsHub Cowork?"}],
+        has_non_text_input=False,
+        has_attachments=False,
+        has_disabled_connections=False,
+        binding=RouterBinding(provider=provider, model="minds-free", label="minds_cloud"),
+    )
+
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.reason == "router_answer_denied_product"
+    assert decision.text == ""
+    assert decision.fallback is False
