@@ -388,6 +388,39 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/hub/workspaces` | Which MindsHub workspace this person is working in |
 | `/hub/usage` | The caller's free monthly tokens, balance, auto top up and credit spend, for the desktop's usage warnings |
 
+### Declaring who may call a route
+
+Every route declares its permission at its own definition, and `create_app()`
+refuses to start if one does not (ENG-2094). Adding a route means picking the
+class that names the credential the route actually takes:
+
+| Declaration | The credential is |
+|-------------|-------------------|
+| `OpenByDesign` | nothing at all. Pinned route by route, with a written reason, in `tests/test_open_by_design_pin.py` |
+| `LoopbackOnly` | the caller being on this machine (`require_local`) |
+| `DesktopOnly` | not org mode (`require_local_tenancy` 403s the route there) |
+| `LoopbackDesktopOnly` | both of the above |
+| `PlatformSignature` | the calling platform's HMAC over the body (channel webhooks) |
+| `Authenticated` | a verified `Principal` |
+| `AuthenticatedInOrgMode` | a verified `Principal`, in org mode only; a no-op on desktop |
+| `AuthenticatedOrgAdmin` | ... plus org-admin standing |
+
+```python
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+
+@router.get("/thing", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+```
+
+Declare it on the `APIRouter` when every route on it takes the same
+credential, with one exception: never declare `OpenByDesign` on a router.
+FastAPI *adds* a route-level `dependencies=[...]` to its router's rather than
+replacing it, so a router carrying the open marker hands it to every route
+added later, and the walker cannot tell that apart from a deliberate choice.
+Every other class refuses, so inheriting one is safe.
+
+`COWORK_TENANCY_MODE=org python -m scripts.dump_routes` prints the current
+surface with each route's declaration.
+
 ### The MindsHub workspace selector
 
 `/api/v1/hub/workspaces` backs the workspace selector at the bottom of Cowork's

@@ -7,6 +7,7 @@ import io
 from contextlib import redirect_stdout
 from types import SimpleNamespace
 
+from cowork.api.v1.permissions import OpenByDesign, require
 from scripts.dump_routes import dependency_names, main
 
 
@@ -37,6 +38,14 @@ class TestDependencyNames:
             "_dep_get_tenant_scope",
         ]
 
+    def test_skips_the_permission_declaration(self):
+        # The ENG-2094 declaration gets its own `permission` column, so
+        # repeating it in `checks` would say the same thing twice under a name
+        # that does not identify which Permission it was.
+        assert dependency_names(_route(require(OpenByDesign), _dep_get_principal)) == [
+            "_dep_get_principal"
+        ]
+
     def test_falls_back_to_str_when_no_qualname(self):
         # A callable instance has no __qualname__ of its own (only its class
         # does), so this exercises the getattr fallback.
@@ -58,11 +67,24 @@ class TestMain:
         rows = list(csv.DictReader(io.StringIO(buf.getvalue())))
 
         assert rows, "dump produced no rows"
-        assert set(rows[0].keys()) == {"path", "methods", "checks"}
+        assert set(rows[0].keys()) == {"path", "methods", "permission", "checks"}
 
         health_rows = [r for r in rows if r["path"] == "/api/v1/health/"]
         assert health_rows, "expected /api/v1/health/ in the dump"
         assert health_rows[0]["methods"] == "GET"
+
+    def test_every_row_names_its_permission_class(self):
+        # ENG-2094 AC7 re-derives the map's cowork-server section from the
+        # declarations, so the column has to name the Permission rather than
+        # the closure require() returns.
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            main()
+        rows = list(csv.DictReader(io.StringIO(buf.getvalue())))
+
+        undeclared = [r["path"] for r in rows if not r["permission"]]
+        assert undeclared == [], f"routes with no permission in the dump: {undeclared}"
+        assert "dependency" not in {r["permission"] for r in rows}
 
     def test_no_duplicate_path_method_pairs(self):
         buf = io.StringIO()

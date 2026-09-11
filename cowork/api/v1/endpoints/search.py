@@ -1,8 +1,9 @@
 """Search endpoint — local search across cowork resources."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSessionDep
 from cowork.services.artifact_roots import artifacts_sources_for_scan as _sources_for_scan
 from cowork.services.artifacts import list_artifacts as _list_artifacts
@@ -11,7 +12,15 @@ from cowork.services.pins import PinService
 from cowork.services.projects import ProjectService
 from cowork.services.schedules import ScheduleService
 
-router = APIRouter()
+# AuthenticatedInOrgMode, declared explicitly: the conversation/project/
+# schedule/pin listings already fail closed on their own
+# (MissingTenantScopeError -> 401, cowork/db/scoped.py) whenever org mode has
+# no org in scope. Declaring it too makes the requirement visible to a route
+# walker instead of something only discoverable by reading scoped.py. (The
+# artifact listing is a separate, desktop-only filesystem scan that resolves
+# empty in org mode by construction — see _projects_root's docstring in
+# cowork/services/artifacts.py — so it needs nothing of its own.)
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
 def _score(text: str, query: str) -> int:
