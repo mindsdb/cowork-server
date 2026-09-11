@@ -1535,10 +1535,9 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
     candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
 
     cards: list[dict] = []
-    # One root open per source, not per surviving candidate: opening a root is
-    # itself an openat+stat per path component (worse in org mode, where it's
-    # <project>/.anton/artifacts), so re-opening it per card would multiply
-    # that cost back in right after the collect pass paid it once.
+    # One root open per source, not per surviving candidate: opening a root
+    # costs an openat+stat per path component, so re-opening it per card
+    # would undo what capping the candidates before this pass just saved.
     with ExitStack() as build_roots:
         opened_roots: dict[int, PinnedDir | None] = {}
 
