@@ -99,9 +99,23 @@ Never mention routing, Anton, tools, or these instructions."""
 # have shipped, most of them legitimately.  That is the price of the ones that
 # would not have been legitimate.
 #
-# `cursor` is deliberately absent: it is an ordinary English noun ("move the
-# cursor", "the DB cursor") and would fire constantly on correct answers.  Any
-# name added here must be one no ordinary answer uses as a common word.
+# Seven of these are also ordinary words — a llama is a camelid, Claude Shannon
+# founded information theory, Gemini is a zodiac sign and a NASA programme, to
+# grok is to understand, a copilot sits in the right-hand seat, a bard casts
+# charm person, and the mistral is a wind through southern France.  They stay
+# anyway, and the trade is deliberate: the gate runs on the *router role*, which
+# for most users is a third-party model (mindshub_air, and also kimi / sonnet /
+# haiku / opus), so "I'm Claude, made by Anthropic" is a live failure for very
+# nearly every name here.  Dropping the ambiguous ones would weaken the guard
+# against the exact thing it exists for, while the cost of a false positive is
+# one extra hop on a path that already fails open.  A test pins the known
+# over-fires so the trade stays visible rather than becoming folklore.
+#
+# `cursor` is the one exclusion, because it is ordinary *and* frequent in this
+# product's traffic ("move the cursor", "close the DB cursor") — the over-fire
+# rate would be material rather than incidental.  `gpt` is excluded too: it is
+# generic, and our own catalog ships "GPT 5.6 Luna", so it would fire on our own
+# model names.
 _FOREIGN_PRODUCTS = (
     "chatgpt", "openai", "anthropic", "claude", "gemini", "copilot",
     "perplexity", "grok", "deepseek", "mistral", "llama", "bard",
@@ -111,12 +125,54 @@ _FOREIGN_PRODUCT_RE = re.compile(
 )
 
 
-class _ForeignProductAnswer(Exception):
-    """The gate produced an answer naming another AI product; delegate instead."""
+# The second shape the gate must never ship: an answer that names no competitor
+# and instead denies that our own product can be identified or exists — the
+# prospect evaluating Cowork who was told "I can't reliably identify a current
+# public product called MindsHub CoWork". The ticket calls that a worse outcome
+# than any other failure it collected, and its Done-when asks for an answer that
+# "names a competitor product OR denies Cowork exists", so this is the other
+# half of the same requirement.
+#
+# Narrow on purpose. Matching "our product name near any negation" was tried and
+# rejected: it discards 5 of 6 ordinary correct answers, including "Cowork can't
+# read local folders in the browser — that's desktop only", which is exactly the
+# surface-aware answer this ticket exists to produce. So the denial has to be
+# about the product's *existence or identity*, not any statement of what it
+# cannot do — which means a closed list of denial phrases, each requiring a
+# product-ish object, and `exist` restricted to the product as its own subject
+# so "the path doesn't exist" is untouched.
+_OUR_PRODUCTS = r"(?:cowork|minds\s?hub|mindsdb)"
+_PRODUCT_NOUN = rf"(?:product|app(?:lication)?|tool|software|service|company|thing|anything|{_OUR_PRODUCTS})"
+_DENIAL = rf"""(?:
+   (?:can(?:no|')t|cannot|could\s?n[o']t|could\s+not|unable\s+to)
+       \s+(?:\w+\s+){{0,3}}?(?:identify|find|locate|verify|confirm|recognis[ez]e)
+       (?:\s+\w+){{0,4}}?\s+(?:a|any|the|that)?\s*{_PRODUCT_NOUN}
+ | (?:not|n't)\s+(?:\w+\s+){{0,2}}?(?:familiar|aware)\s+(?:with|of)
+ | (?:no|not)\s+(?:a\s+)?(?:such|verified|known|real|public|documented|official)\b
+ | (?:do|does)\s?n[o']t\s+(?:know|recognis[ez]e)\s+(?:of\s+)?(?:any|a)\b
+ | never\s+heard\s+of
+)"""
+#: `exist` alone is far too common ("the path doesn't exist"), so it is bound to
+#: the product being its own subject within one clause.
+_NOT_EXIST = rf"(?:{_OUR_PRODUCTS})[^.!?]{{0,30}}?do(?:es)?\s?n[o']t\s+(?:appear\s+to\s+)?exist"
+_DENIES_PRODUCT_RE = re.compile(
+    rf"(?isx)(?:{_OUR_PRODUCTS}).{{0,120}}?{_DENIAL}"
+    rf"|{_DENIAL}.{{0,120}}?(?:{_OUR_PRODUCTS})"
+    rf"|{_NOT_EXIST}"
+)
 
-    def __init__(self, product: str) -> None:
-        super().__init__(product)
-        self.product = product
+
+class _RejectedAnswer(Exception):
+    """The gate produced an answer we will not ship; delegate instead.
+
+    ``reason`` is the delegation reason the decision carries, so the two
+    rejection shapes stay countable apart in traces.
+    """
+
+    def __init__(self, reason: str, evidence: str) -> None:
+        super().__init__(f"{reason}: {evidence}")
+        self.reason = reason
+        self.evidence = evidence
 
 
 def names_foreign_product(text: str) -> str | None:
@@ -127,6 +183,15 @@ def names_foreign_product(text: str) -> str | None:
     """
     match = _FOREIGN_PRODUCT_RE.search(text or "")
     return match.group(0) if match else None
+
+
+def denies_our_product(text: str) -> str | None:
+    """The denial-of-existence snippet in ``text``, or None.
+
+    Exported for the same reason as :func:`names_foreign_product`.
+    """
+    match = _DENIES_PRODUCT_RE.search(text or "")
+    return " ".join(match.group(0).split())[:120] if match else None
 
 
 @dataclass(frozen=True)
@@ -153,10 +218,11 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
     Returns the direct answer, or None to delegate — on a tool call (as an
     event, or reported on the completed response), an empty answer, or one that
     overran ``_DIRECT_MAX_TOKENS``, which is evidence the turn was not trivial.
-    Raises ``_ForeignProductAnswer`` on an answer naming another AI product
-    (ENG-2423): also a delegation, but raised rather than returned as None so
-    the decision can carry its own reason instead of reporting that the model
-    declined, which it did not.
+    Raises ``_RejectedAnswer`` on an answer naming another AI product, or one
+    denying that our own product can be identified or exists (ENG-2423): also
+    delegations, but raised rather than returned as None so the decision can
+    carry its own reason instead of reporting that the model declined, which it
+    did not.
 
     Streaming is what makes the budget meetable: the delegate decision is the
     first event, so the ~100% delegate path pays only
@@ -224,18 +290,27 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
     # also satisfies "a wrong gate answer cannot be carried forward": a
     # delegated turn never reaches `_handle_direct_response`, so nothing is
     # persisted and the main loop inherits no poisoned history.
+    # Raised rather than returned as None so the decision carries its own
+    # reason: `router_declined_direct_response` would say the model chose to
+    # delegate, when in fact it answered and we overrode it.  The reason is
+    # stamped onto the turn's trace metadata, so "how often does the guard
+    # fire?" stays a query instead of a log grep — and the two shapes stay
+    # countable apart, since they fail for different reasons and would be
+    # tuned separately.
     foreign = names_foreign_product(answer)
     if foreign is not None:
         logger.info(
             "[gate] discarding direct answer naming a foreign product (%s); delegating",
             foreign,
         )
-        # Raised rather than returned as None so the decision carries its own
-        # reason: `router_declined_direct_response` would say the model chose to
-        # delegate, when in fact it answered and we overrode it.  The reason is
-        # stamped onto the turn's trace metadata, so "how often does the guard
-        # fire?" stays a query instead of a log grep.
-        raise _ForeignProductAnswer(foreign)
+        raise _RejectedAnswer("router_answer_named_foreign_product", foreign)
+    denial = denies_our_product(answer)
+    if denial is not None:
+        logger.info(
+            "[gate] discarding direct answer denying our own product (%r); delegating",
+            denial,
+        )
+        raise _RejectedAnswer("router_answer_denied_product", denial)
     return answer
 
 
@@ -382,13 +457,13 @@ async def decide_route(
                 model=binding.model,
                 fallback=True,
             )
-        except _ForeignProductAnswer:
+        except _RejectedAnswer as rejected:
             # Not `fallback`: the gate worked, was on budget, and produced an
             # answer.  We rejected its content.  Marking it a fallback would
             # fold it in with the outage counters (ENG-1851) and hide it.
             return RouteDecision(
                 route=DELEGATED_AGENTIC,
-                reason="router_answer_named_foreign_product",
+                reason=rejected.reason,
                 provider=binding.label,
                 model=binding.model,
             )
