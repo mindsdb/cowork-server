@@ -56,7 +56,10 @@ HEADER_ORG_RELOAD = "X-Cowork-Organization-Reload"
 OrganizationBoundaryMode = Literal["audit", "enforce"]
 
 # Always reachable without identity; channel webhooks are added by create_app().
-_EXEMPT_PATHS = frozenset({"/api/v1/health", "/api/v1/health/"})
+_EXEMPT_PATHS = frozenset({
+    "/api/v1/health", "/api/v1/health/",
+    "/api/v1/health/live",
+})
 
 
 @dataclass(frozen=True)

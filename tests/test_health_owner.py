@@ -296,3 +296,52 @@ def test_live_survives_a_database_outage():
 
     assert res.status_code == 200
     assert res.json() == {"status": "ok"}
+
+
+# ─── /live must stay reachable without identity (ENG-2436 follow-up) ─────────
+#
+# The identity middleware exempts paths by exact string match, not prefix, so
+# a new health route is invisible to it unless added by name in both places
+# (cowork/principal.py and cowork/auth_middleware.py). Missed once already:
+# org deployments 401ed the kubelet's liveness probe and got CrashLoopBackOff'd
+# while readiness (which *was* exempt) kept them taking traffic until killed.
+
+
+def test_every_health_route_is_reachable_without_identity():
+    """Derived from the router, not hardcoded — so the next health route added
+    without updating both exempt-path sets fails this instead of prod."""
+    from cowork.api.v1.endpoints import health
+    from cowork.principal import _EXEMPT_PATHS as PRINCIPAL_EXEMPT
+    from cowork.auth_middleware import _EXEMPT_PATHS as BEARER_EXEMPT
+
+    paths = {
+        f"/api/v1/health{r.path}".rstrip("/") or "/api/v1/health"
+        for r in health.router.routes
+    }
+    for base in paths:
+        for spelling in {base, base + "/"}:
+            assert spelling in PRINCIPAL_EXEMPT or spelling.rstrip("/") in PRINCIPAL_EXEMPT
+            assert spelling in BEARER_EXEMPT or spelling.rstrip("/") in BEARER_EXEMPT
+
+
+def test_live_reachable_without_identity_in_org_mode_end_to_end(monkeypatch):
+    """End-to-end: an org deployment with identity enforcement on must still
+    answer the liveness probe with no identity headers at all — the exact
+    setup that 401ed before the exempt-path fix.
+    """
+    from fastapi.testclient import TestClient
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.server import create_app
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "enforce")
+    get_app_settings.cache_clear()
+    try:
+        client = TestClient(create_app())
+        res = client.get("/api/v1/health/live")
+    finally:
+        get_app_settings.cache_clear()
+
+    assert res.status_code == 200
+    assert res.json() == {"status": "ok"}
