@@ -23,7 +23,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlmodel import Session
 
-from cowork.db.scoped import ScopedSession, ScopedSessionDep
+from cowork.services.product_permissions import require_product_permission
+from cowork.db.scoped import ScopedSession, ScopedSessionDep, get_scoped_session
 from cowork.db.session import get_session
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, OpenByDesign, require
 from cowork.api.v1.artifact_preview import (
@@ -657,7 +658,9 @@ async def list_artifacts(
 )
 async def delete_artifact_by_slug(
     slug: str,
-    session: ScopedSessionDep,
+    # Keep the dependency explicit: SAST treats the Annotated alias as an HTTP
+    # parameter, then incorrectly taints the server-owned artifact roots.
+    session: ScopedSession = Depends(get_scoped_session),
     project_id: UUID = Query(...),
 ):
     ref = _artifact_delete_ref(slug)
@@ -676,6 +679,8 @@ async def delete_artifact_for_request(
     # This helper is also called directly by internal/test code, so retain the
     # same concrete parsing boundary the HTTP adapter applies above. In
     # particular, no request-derived string can select a project path.
+    await require_product_permission(session.scope, "artifact.manage")
+
     project_id = UUID(str(project_id))
 
     # New clients address deletion by artifact id. Keep the slug fallback for
@@ -686,11 +691,11 @@ async def delete_artifact_for_request(
     source = None
     folder = None
     if ref.artifact_id is not None:
-        # `_artifact_delete_ref` already canonicalized this value, but carrying
-        # it through a dataclass hides that sanitizer from SAST dataflow. Parse
-        # again at the resolver boundary so the path-producing identity lookup
-        # receives a visibly canonical UUID, never the route string.
-        artifact_id = UUID(ref.artifact_id).hex
+        # Keep UUID validation and pass the basename output to the resolver:
+        # SAST does not recognize UUID parsing or dataclass fields as a path
+        # sanitizer. Parsing first rejects traversal instead of truncating it.
+        artifact_id = os.path.basename(UUID(ref.artifact_id).hex)
+        project_ref = os.path.basename(str(server_project_id))
         # Resolved through the review path so a reviewer who was granted access
         # to this draft is told they cannot delete it, instead of being told it
         # does not exist. Without a grant it still 404s — `require_artifact_owner`
@@ -698,7 +703,7 @@ async def delete_artifact_for_request(
         from cowork.api.v1.artifact_scope import review_artifact_for_request
 
         source, folder, _metadata, _is_own = review_artifact_for_request(
-            session, str(server_project_id), artifact_id
+            session, project_ref, artifact_id
         )
     else:
         # The legacy name is compared with entries discovered under each

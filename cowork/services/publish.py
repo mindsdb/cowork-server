@@ -60,6 +60,25 @@ class PublisherUnavailable(RuntimeError):
     """
 
 
+def raise_publish_permission_error(exc: Exception) -> None:
+    """Preserve the artifact consumer's explicit authority result through wrappers."""
+    from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
+
+    if isinstance(exc, (ProductPermissionDenied, ProductPermissionUnavailable)):
+        raise exc
+    if not isinstance(exc, urllib.error.HTTPError):
+        return
+    if exc.code == 503:
+        raise ProductPermissionUnavailable() from exc
+    if exc.code == 403:
+        try:
+            body = json.loads(exc.read(65_536))
+        except (OSError, ValueError):
+            return
+        if isinstance(body, dict) and body.get("code") == "permission_denied":
+            raise ProductPermissionDenied() from exc
+
+
 def _cowork_state_dir() -> Path:
     base = os.environ.get("ANTON_COWORK_STATE_DIR")
     if base:
@@ -461,6 +480,7 @@ def publish_artifact(
             vault=vault_for_scope(scope),
         )
     except Exception as exc:
+        raise_publish_permission_error(exc)
         logger.exception("Publishing failed")
         # Only network/HTTP failures get the "Connection failed" framing — a
         # gateway timeout (e.g. a fullstack artifact whose deps take too long
@@ -628,6 +648,7 @@ def unpublish_artifact(
             ssl_verify=ssl_verify,
         )
     except Exception as exc:
+        raise_publish_permission_error(exc)
         msg = str(exc) or "Unpublishing failed."
         if "404" in msg or "not found" in msg.lower():
             # Already gone upstream, OR still alive under another owner's prefix
