@@ -1,7 +1,7 @@
 """MindsHub usage, read on behalf of the caller.
 
 Three auth reads behind one route: ``GET /v1/entitlements/me/`` for the free
-monthly allowance, ``GET /v1/wallet/`` for the paid balance and auto top up, and
+Air allowance, ``GET /v1/wallet/`` for the paid balance and auto top up, and
 ``GET /v1/usage/summary/`` for what the period's credit spend adds up to (the
 same figure the console's "Credit spend this period" shows).
 The desktop shows them above the composer and in Settings so a person sees
@@ -37,6 +37,10 @@ from cowork.services.hub_workspaces import cache_key, get_auth_json, sweep_cache
 logger = logging.getLogger(__name__)
 
 ENTITLEMENTS_PATH = "/entitlements/me/"
+
+# The allowance is reported out of this, because auth publishes a proportion
+# and not a size. Desktop builds that predate ``percentRemaining`` divide by it.
+_PROPORTION_LIMIT = 100.0
 WALLET_PATH = "/wallet/"
 # No ``group_by``: auth collapses the breakdown into one totals-only bucket, and
 # ``totals`` is summed over every row before paging either way. Only ``totals``,
@@ -69,35 +73,50 @@ def _usd(value: Any) -> Optional[float]:
         return None
 
 
-def _int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
 def _parse_free_tokens(payload: Any) -> Optional[HubFreeTokens]:
+    """Read the allowance as a proportion.
+
+    ``included_percent_remaining`` is the canonical field and the only one read.
+    The deprecated ``included_tokens`` object is deliberately ignored: it used
+    to carry the allowance size, auth has withdrawn that, and dividing by a
+    withdrawn limit reads as 0% used and draws a full bar for an account that
+    has nothing left.
+
+    The three states older desktop builds branch on are preserved in ``limit``:
+    -1 uncapped, 0 no grant, 100 a live allowance.
+    """
     if not isinstance(payload, dict):
         return None
-    included = payload.get("included_tokens")
-    if not isinstance(included, dict):
+
+    resets_at = payload.get("next_refresh_at") if isinstance(payload.get("next_refresh_at"), str) else None
+
+    # A server that never sends the canonical field predates it, and there is no
+    # honest allowance to report: the absolute it would have sent instead has
+    # been withdrawn. Reporting nothing beats inventing a proportion, and beats
+    # guessing "uncapped", which would tell a caller with an empty wallet that
+    # Air can carry the task while every turn fails.
+    if "included_percent_remaining" not in payload:
         return None
-    # Auth sends ``limit: null`` (and ``remaining: null``) for an unlimited
-    # allowance; the desktop reads -1 as unlimited and 0 or absent as no grant.
-    raw_limit = included.get("limit", 0)
-    limit = -1 if raw_limit is None else _int(raw_limit)
-    used = _int(included.get("used"))
-    if limit < 0:
-        remaining = -1  # uncapped: nothing to count down
-    elif included.get("remaining") is not None:
-        remaining = _int(included["remaining"])
-    else:
-        remaining = max(0, limit - used)
+
+    # An explicit denial is the only thing that means "no grant"; a server that
+    # does not send the flag has not said so.
+    if payload.get("free_grant_eligible") is False:
+        return HubFreeTokens(percent_remaining=0.0, limit=0, used=0, remaining=0, resets_at=resets_at)
+
+    percent = payload.get("included_percent_remaining")
+    if percent is None:
+        # Uncapped: nothing to count down, and nothing for a bar to show.
+        return HubFreeTokens(percent_remaining=None, limit=-1, used=0, remaining=-1, resets_at=resets_at)
+    if not isinstance(percent, (int, float)) or isinstance(percent, bool):
+        return None
+
+    percent = max(0.0, min(100.0, float(percent)))
     return HubFreeTokens(
-        limit=limit,
-        used=used,
-        remaining=remaining,
-        resets_at=payload.get("next_refresh_at") if isinstance(payload.get("next_refresh_at"), str) else None,
+        percent_remaining=percent,
+        limit=_PROPORTION_LIMIT,
+        used=_PROPORTION_LIMIT - percent,
+        remaining=percent,
+        resets_at=resets_at,
     )
 
 

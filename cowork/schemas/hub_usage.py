@@ -6,11 +6,25 @@ from cowork.schemas.base import CamelResponse
 
 
 class HubFreeTokens(CamelResponse):
-    """The free monthly MindsHub Air allowance. ``limit`` -1 means uncapped."""
+    """The free MindsHub Air allowance, as a proportion.
 
-    limit: int = 0
-    used: int = 0
-    remaining: int = 0
+    Auth does not publish the size of the allowance, so there is no token count
+    to relay. ``percentRemaining`` is the figure to read.
+
+    ``limit``/``used``/``remaining`` stay for desktop builds that predate
+    ``percentRemaining``. They carry the same proportion out of a ``limit`` of
+    100, so a client dividing ``remaining`` by ``limit`` still gets the right
+    ratio. ``limit`` -1 still means uncapped and 0 still means no grant, so the
+    branches those builds already take are unchanged. They are floats because a
+    caller with 0.4% left has not run out, and rounding that to zero would read
+    as exhausted.
+    """
+
+    # None when the allowance is uncapped, so there is nothing to count down.
+    percent_remaining: Optional[float] = None
+    limit: float = 0
+    used: float = 0
+    remaining: float = 0
     # When the allowance refreshes, as auth's opaque ISO string. Formatted on
     # the client, which is the only side that knows the viewer's timezone.
     resets_at: Optional[str] = None

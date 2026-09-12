@@ -28,7 +28,7 @@ def _client(principal: Principal | None) -> TestClient:
     return TestClient(app)
 
 ENTITLEMENTS = {
-    "included_tokens": {"limit": 5_000_000, "used": 4_380_000, "remaining": 620_000},
+    "included_percent_remaining": 12.4,
     "next_refresh_at": "2026-09-11T00:00:00Z",
     "is_billing_owner": True,
     "feature_gates": {},
@@ -119,8 +119,9 @@ def test_both_reads_land_in_one_view(calls):
 
     assert view.reachable is True
     assert view.is_billing_owner is True
-    assert view.free_tokens.remaining == 620_000
-    assert view.free_tokens.limit == 5_000_000
+    assert view.free_tokens.percent_remaining == 12.4
+    assert view.free_tokens.remaining == 12.4
+    assert view.free_tokens.limit == 100
     assert view.free_tokens.resets_at == "2026-09-11T00:00:00Z"
     assert view.balance.usd == 8.42
     assert view.balance.alert == "low"
@@ -150,7 +151,7 @@ def test_a_wallet_the_caller_cannot_see_still_leaves_free_tokens(calls):
     view = _fetch()
 
     assert view.reachable is True
-    assert view.free_tokens.remaining == 620_000
+    assert view.free_tokens.percent_remaining == 12.4
     assert view.balance is None
     assert view.auto_top_up is None
 
@@ -170,42 +171,87 @@ def test_auto_top_up_status_falls_back_to_the_flags(calls):
     assert _fetch().auto_top_up.status == "payment_failed"
 
 
-def test_remaining_is_derived_when_auth_omits_it(calls):
-    calls.answers[svc.ENTITLEMENTS_PATH] = {"included_tokens": {"limit": 100, "used": 30}}
-    assert _fetch().free_tokens.remaining == 70
+def test_the_proportion_is_reported_out_of_one_hundred(calls):
+    """Auth publishes no allowance size, so the compatibility triple is a ratio.
 
+    A desktop build that predates ``percentRemaining`` divides ``remaining`` by
+    ``limit``; out of 100 that lands on the same figure the percentage carries.
+    """
+    calls.answers[svc.ENTITLEMENTS_PATH] = {"included_percent_remaining": 70.0}
 
-def test_unlimited_grant_passes_through_as_minus_one(calls):
-    calls.answers[svc.ENTITLEMENTS_PATH] = {"included_tokens": {"limit": -1, "used": 30, "remaining": -1}}
-    assert _fetch().free_tokens.limit == -1
-
-
-def test_auth_null_limit_is_unlimited_not_no_grant(calls):
-    # Auth's actual wire shape for an unlimited allowance: null limit, null remaining.
-    calls.answers[svc.ENTITLEMENTS_PATH] = {"included_tokens": {"limit": None, "used": 30, "remaining": None}}
     tokens = _fetch().free_tokens
+
+    assert tokens.percent_remaining == 70.0
+    assert tokens.limit == 100
+    assert tokens.used == 30
+    assert tokens.remaining == 70
+
+
+def test_a_fractional_percentage_is_not_rounded_to_exhausted(calls):
+    """0.4% of the allowance is still a usable turn for a cache-heavy caller.
+
+    Rounding it to zero would draw the exhausted state for an account that can
+    still work, which is the failure the percentage was introduced to prevent.
+    """
+    calls.answers[svc.ENTITLEMENTS_PATH] = {"included_percent_remaining": 0.4}
+
+    tokens = _fetch().free_tokens
+
+    assert tokens.remaining == 0.4
+    assert tokens.remaining > 0
+
+
+def test_the_deprecated_counters_are_ignored(calls):
+    """The old object is no longer read, whatever it happens to carry.
+
+    It used to hold the allowance size. Dividing by a withdrawn limit reads as
+    0% used and draws a full untouched bar for an account with nothing left.
+    """
+    calls.answers[svc.ENTITLEMENTS_PATH] = {
+        "included_percent_remaining": 25.0,
+        "included_tokens": {"limit": 6_500_000, "used": 1_000_000, "remaining": 5_500_000},
+    }
+
+    tokens = _fetch().free_tokens
+
+    assert tokens.percent_remaining == 25.0
+    assert tokens.limit == 100
+
+
+def test_a_null_percentage_is_unlimited_not_no_grant(calls):
+    # Auth's wire shape for an unlimited allowance: the percentage is null,
+    # because there is nothing to count down.
+    calls.answers[svc.ENTITLEMENTS_PATH] = {"included_percent_remaining": None}
+    tokens = _fetch().free_tokens
+    assert tokens.percent_remaining is None
     assert tokens.limit == -1
     assert tokens.remaining == -1
-    assert tokens.used == 30
 
 
-def test_a_missing_limit_is_still_no_grant(calls):
-    calls.answers[svc.ENTITLEMENTS_PATH] = {"included_tokens": {"used": 30}}
-    assert _fetch().free_tokens.limit == 0
+def test_a_server_without_the_percentage_reports_no_allowance(calls):
+    """Nothing honest is left to report, so report nothing rather than guess.
+
+    The absolute this server would have sent has been withdrawn. Guessing
+    "uncapped" would tell a caller with an empty wallet that Air can carry the
+    task while every turn fails.
+    """
+    calls.answers[svc.ENTITLEMENTS_PATH] = {"included_tokens": {"limit": 100, "used": 30}}
+
+    assert _fetch().free_tokens is None
 
 
-def test_an_explicit_zero_limit_stays_no_grant(calls):
+def test_an_ineligible_org_stays_no_grant(calls):
     """An org auth reports as not free-grant-eligible: limit 0, and 0 it stays.
 
-    The third of the three shapes ``limit`` arrives in, and the one that pins the
-    unlimited reading from running the other way. Auth computes
-    ``effective_limit = limit if organization.free_grant_eligible else 0``, so a
-    real zero is a deliberate answer rather than a missing field, and the desktop
-    reads it as no allowance to fall back on. Were it ever to read as uncapped, a
-    caller with an empty wallet would be told MindsHub Air can carry the task and
-    every turn would fail instead.
+    The one state the percentage cannot express on its own, because an
+    exhausted allowance and an absent one both read 0%. Were it ever to read as
+    uncapped, a caller with an empty wallet would be told MindsHub Air can carry
+    the task and every turn would fail instead.
     """
-    calls.answers[svc.ENTITLEMENTS_PATH] = {"included_tokens": {"limit": 0, "used": 0, "remaining": 0}}
+    calls.answers[svc.ENTITLEMENTS_PATH] = {
+        "included_percent_remaining": 0.0,
+        "free_grant_eligible": False,
+    }
 
     tokens = _fetch().free_tokens
 
@@ -266,8 +312,8 @@ def test_expired_entries_are_swept_rather_than_held_for_the_process_lifetime(cal
     assert len(svc._cache) == 1, "the departed caller's entry was never dropped"
 
 
-def test_an_uncapped_grant_with_no_remaining_field_is_not_zero(calls):
-    calls.answers[svc.ENTITLEMENTS_PATH] = {"included_tokens": {"limit": -1, "used": 30}}
+def test_an_uncapped_grant_reports_no_countdown(calls):
+    calls.answers[svc.ENTITLEMENTS_PATH] = {"included_percent_remaining": None}
     assert _fetch().free_tokens.remaining == -1
 
 
