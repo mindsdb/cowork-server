@@ -373,7 +373,7 @@ class _TestProvidersBody(BaseModel):
 _BODY_SUPPLIED_URL_FIELD = {"openai-compatible": "baseUrl", "minds-cloud": "mindsUrl"}
 
 
-def _origin(url: str) -> str:
+def _origin(url: object) -> str:
     """``scheme://host[:port]`` for ``url``, or ``""`` when it names no host.
 
     The guard below compares origins rather than whole URL strings, because
@@ -387,12 +387,31 @@ def _origin(url: str) -> str:
     prefix, where ``https://api.mindshub.ai@evil.test`` reads as host
     ``evil.test``; ``is_minds_host`` in the same module parses for that
     reason.
+
+    Answers ``""`` for anything it cannot parse, because both callers hand it
+    untrusted text and neither can absorb an exception. The body field is
+    whatever the caller sent; a ``providers_json`` card holds whatever was
+    stored. Four shapes reach here that ``urlsplit`` will not take: a
+    non-string, an unbalanced ``[``, a port that is not an integer in range,
+    and a netloc that NFKC-normalizes into a delimiter. Each has to read as
+    "no origin", which refuses a caller's URL and drops a stored one from the
+    allowlist instead of 500-ing the whole batch. ``is_minds_host`` guards the
+    same call for the same reason and says so.
     """
-    parts = urlsplit((url or "").strip())
-    if not parts.hostname:
+    if not isinstance(url, str):
         return ""
-    port = f":{parts.port}" if parts.port else ""
-    return f"{parts.scheme.lower()}://{parts.hostname}{port}"
+    try:
+        parts = urlsplit(url.strip())
+        hostname = parts.hostname
+        port = parts.port
+    except ValueError:
+        return ""
+    if not hostname:
+        return ""
+    # `is not None`, not truthiness: port 0 names a different listener from a
+    # URL that carries no port at all.
+    suffix = f":{port}" if port is not None else ""
+    return f"{parts.scheme.lower()}://{hostname}{suffix}"
 
 
 def _stored_origins_for(settings: UserSettings, ptype: str) -> set[str]:
@@ -404,10 +423,16 @@ def _stored_origins_for(settings: UserSettings, ptype: str) -> set[str]:
     included too, since a config written before the cards existed only has
     those.
     """
-    urls = set()
+    origins = set()
     try:
         cards = json.loads(settings.providers_json or "[]")
     except (ValueError, TypeError):
+        cards = []
+    # Decoding is not the same as getting a list to walk: `json.loads("null")`
+    # succeeds and hands back None, and a bare number decodes to an int. Both
+    # are storable, because providers_json is a plain string setting with no
+    # shape validation on write.
+    if not isinstance(cards, list):
         cards = []
     field = _BODY_SUPPLIED_URL_FIELD.get(ptype)
     for card in cards:
@@ -418,16 +443,18 @@ def _stored_origins_for(settings: UserSettings, ptype: str) -> set[str]:
         # plain string setting with no shape validation on write.
         if (card.get("type") or "").replace("_", "-") != ptype:
             continue
-        urls.add(card.get(field) or "")
+        # Parse on the way in, not on the way out: a card's URL is whatever
+        # was stored, and an unhashable one never even reaches a set.
+        origins.add(_origin(card.get(field)))
     if ptype == "openai-compatible":
-        urls.add(settings.openai_base_url or "")
+        origins.add(_origin(settings.openai_base_url))
     if ptype == "minds-cloud":
-        urls.add(settings.minds_url or "")
+        origins.add(_origin(settings.minds_url))
         # A minds-cloud ping that omits mindsUrl goes here (``ping_provider``,
         # cowork/services/providers.py), so naming this host is a destination
         # the caller already reaches, not a new one.
-        urls.add(default_minds_api_host())
-    return {o for o in (_origin(u) for u in urls) if o}
+        origins.add(_origin(default_minds_api_host()))
+    return {o for o in origins if o}
 
 
 # AuthenticatedInOrgMode, and a URL check underneath it. The permission stops
@@ -482,8 +509,12 @@ async def test_providers(session: SessionDep, scope: ScopeDep, body: _TestProvid
         pingable.append(p)
 
     statuses, details = await ping_providers(pingable)
-    statuses.update({ptype: "fail" for ptype in refused})
-    details.update(refused)
+    for ptype, reason in refused.items():
+        # setdefault, not update: ping_providers keys by type, so two cards of
+        # one type collapse into a single slot. Overwriting would report a card
+        # that pinged perfectly well as failed.
+        statuses.setdefault(ptype, "fail")
+        details.setdefault(ptype, reason)
     return {"providerStatus": statuses, "providerStatusDetails": details}
 
 
@@ -496,9 +527,10 @@ def _foreign_ping_url_field(settings: UserSettings, provider: dict[str, Any]) ->
     substituted is the whole deployment's. Sending it to an arbitrary
     ``baseUrl``/``mindsUrl`` would hand it to whoever asked. Omitting the URL
     is fine and keeps the ``/test-providers`` body the Settings UI already
-    sends working: the ping then falls back to the stored value or the vendor
-    default. A URL that is present but names no host is refused, since there
-    is nothing to compare.
+    sends working: ``ping_provider`` then sends a minds-cloud probe to the
+    vendor host, and answers ``missing base URL`` for an openai-compatible one
+    rather than reaching for the stored value. A URL that is present but names
+    no host is refused, since there is nothing to compare.
     """
     raw_type = provider.get("type")
     ptype = raw_type.replace("_", "-") if isinstance(raw_type, str) else ""
@@ -508,9 +540,9 @@ def _foreign_ping_url_field(settings: UserSettings, provider: dict[str, Any]) ->
     supplied = provider.get(field)
     if supplied is None or supplied == "":
         return None
-    # The body is `list[dict[str, Any]]`, so both of these arrive as whatever
-    # the caller sent. A non-string cannot be compared to a stored origin, so
-    # it is refused rather than raising out of the endpoint.
+    # The body is `list[dict[str, Any]]`, so this arrives as whatever the
+    # caller sent. A non-string names no origin, so refuse it here rather than
+    # leaning on _origin to say the same thing one call further down.
     if not isinstance(supplied, str):
         return field
     if _origin(supplied) in _stored_origins_for(settings, ptype):

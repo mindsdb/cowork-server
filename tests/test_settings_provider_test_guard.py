@@ -16,6 +16,11 @@ Settings UI sends the same host without it, and both callers send every
 configured provider in one request, so raising would blank the other
 providers' status dots.
 
+``_origin`` answering ``""`` instead of raising is the third such choice.
+``urlsplit`` rejects several URLs a caller can send and an operator can store,
+and this endpoint has no ``except`` to catch one, so each of those was a 500
+until the parse was guarded.
+
 These drive the endpoint function directly: the substitution happens before
 ``ping_providers``, and stubbing that out is what keeps the test from making a
 real outbound request.
@@ -276,3 +281,114 @@ def test_a_card_with_a_null_type_does_not_crash(monkeypatch, pinged):
     _test_providers([{"type": "minds-cloud", "apiKey": "***", "mindsUrl": STORED_MINDS_URL}])
 
     assert [p["apiKey"] for p in pinged] == [STORED_KEY]
+
+
+@pytest.mark.parametrize(
+    "supplied",
+    [
+        "https://mdb.ai:notaport",    # parses; the `port` property raises
+        "https://mdb.ai:99999",       # an integer, but not a port
+        "http://[::1",                # unbalanced bracket; urlsplit itself raises
+        "https://\uff03evil.test",    # NFKC-normalizes into a '#'; urlsplit raises
+    ],
+)
+def test_a_url_the_parser_rejects_is_refused_rather_than_raised(stored, pinged, supplied):
+    """Each of these left the endpoint as a ValueError before the parse guard.
+
+    ``urlsplit`` raises from three separate places — the call, the ``hostname``
+    property and the ``port`` property — and ``test_providers`` catches
+    nothing, so any signed-in member could turn a masked-key probe into a 500.
+    A URL the parser will not take names no origin, which is a refusal.
+    """
+    result = _test_providers([{"type": "minds-cloud", "apiKey": "***", "mindsUrl": supplied}])
+
+    assert result["providerStatus"]["minds-cloud"] == "fail"
+    assert REFUSAL in result["providerStatusDetails"]["minds-cloud"]
+    assert pinged == []
+
+
+@pytest.mark.parametrize(
+    "poisoned",
+    ["https://minds.internal:notaport", "https://minds.internal:99999", "http://[::1"],
+)
+def test_a_stored_url_the_parser_rejects_still_answers(monkeypatch, pinged, poisoned):
+    """The same crash fires on the allowlist side, with no hostile request.
+
+    ``_stored_origins_for`` maps ``_origin`` over every saved URL before it
+    compares anything, so one typo in ``minds_url`` took the Settings screen
+    down for every member until somebody rewrote the row. Nothing validates
+    these fields on write.
+    """
+    _deployment(monkeypatch, minds_api_key=STORED_KEY, minds_url=poisoned)
+
+    result = _test_providers(
+        [
+            {"type": "minds-cloud", "apiKey": "***", "mindsUrl": STORED_MINDS_URL},
+            {"type": "anthropic", "apiKey": "***"},
+        ]
+    )
+
+    assert result["providerStatus"]["minds-cloud"] == "fail"
+    assert result["providerStatus"]["anthropic"] == "ok", "one bad stored row must not blank the batch"
+
+
+def test_a_stored_card_url_that_is_not_a_string_still_answers(monkeypatch, pinged):
+    # providers_json has no shape validation on write, so a card's baseUrl can
+    # be an object; `card.get(field) or ""` hands a truthy non-string straight
+    # to the parser.
+    _deployment(
+        monkeypatch,
+        minds_api_key=STORED_KEY,
+        providers_json='[{"type": "openai-compatible", "baseUrl": {"host": "oc.internal"}}]',
+        openai_base_url="https://oc.internal",
+    )
+
+    _test_providers([{"type": "openai-compatible", "apiKey": "***", "baseUrl": "https://oc.internal"}])
+
+    assert [p["apiKey"] for p in pinged] == [STORED_KEY]
+
+
+@pytest.mark.parametrize("stored_json", ["null", "1", "true", '"a bare string"'])
+def test_a_providers_json_that_decodes_to_a_non_list_still_answers(monkeypatch, pinged, stored_json):
+    # Decoding is not the same as having a list to walk: json.loads("null")
+    # succeeds and returns None, and the `for` that followed sat outside the
+    # try meant to cover it.
+    _deployment(
+        monkeypatch,
+        minds_api_key=STORED_KEY,
+        minds_url=STORED_MINDS_URL,
+        providers_json=stored_json,
+    )
+
+    _test_providers([{"type": "minds-cloud", "apiKey": "***", "mindsUrl": STORED_MINDS_URL}])
+
+    assert [p["apiKey"] for p in pinged] == [STORED_KEY]
+
+
+def test_an_explicit_port_zero_is_not_the_stored_host(stored, pinged):
+    # Port 0 is its own listener, so dropping it on falsiness made
+    # https://mdb.ai:0 compare equal to the stored https://mdb.ai.
+    result = _test_providers([{"type": "minds-cloud", "apiKey": "***", "mindsUrl": "https://mdb.ai:0"}])
+
+    assert result["providerStatus"]["minds-cloud"] == "fail"
+    assert pinged == []
+
+
+def test_a_refusal_does_not_overwrite_a_sibling_of_the_same_type(monkeypatch, pinged):
+    """Two cards of one type share a single slot in the response.
+
+    ``ping_providers`` keys by type, so a refusal that overwrote would report a
+    card which pinged perfectly well as failed — the same blanked dot this
+    endpoint already refuses to produce across types.
+    """
+    _deployment(monkeypatch, minds_api_key=STORED_KEY, minds_url=STORED_MINDS_URL, providers_json="[]")
+
+    result = _test_providers(
+        [
+            {"type": "minds-cloud", "apiKey": "***", "mindsUrl": STORED_MINDS_URL},
+            {"type": "minds-cloud", "apiKey": "***", "mindsUrl": ATTACKER_URL},
+        ]
+    )
+
+    assert result["providerStatus"]["minds-cloud"] == "ok"
+    assert [p["apiKey"] for p in pinged] == [STORED_KEY], "only the allowed card was pinged"
