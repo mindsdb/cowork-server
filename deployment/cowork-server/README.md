@@ -59,20 +59,41 @@ Kubernetes-Foundational-Services. See the `networkPolicy` block in `values.yaml`
 for the two selector checks to run alongside it, since getting either one wrong
 drops every real request without failing the release.
 
-## Browser organization rollout
+## Browser organization boundary
 
-Keep `COWORK_ORGANIZATION_SWITCH_ENABLED=false` while changing the request
-boundary. Deploy `COWORK_ORGANIZATION_BOUNDARY_MODE=audit` first and inspect the
-`organization boundary` warnings for old web clients. Then deploy `enforce` to
-every replica, confirm the capability reports
-`expectedOrganizationEnforced: true` and `enabled: false`, and only then enable
-switching in a separate rollout. Do not combine boundary enforcement and picker
-enablement in one deployment.
+Every environment refuses a browser request whose tab names a different
+organization than the auth gateway resolved: 426 for a missing
+`X-Cowork-Expected-Organization-Id`, 409 for a malformed or mismatched one. This
+is not configurable. An overlay that still carries the retired
+`COWORK_ORGANIZATION_BOUNDARY_MODE` key boots normally and ignores it, so a
+stale entry is safe to leave and safe to delete.
 
-Pull-request environments use the code's fail-closed `enforce` default because
-they do not load a long-lived environment overlay. Deploy this server preview
-only with the capability-aware Cowork client image; an older client does not
-send the expected-organization header and receives 426.
+`COWORK_ORGANIZATION_SWITCH_ENABLED` shows or hides the organization picker. It
+is the product enable and the lever to reach for first, because it is a values
+entry the pipeline reapplies on every deploy. To hide the picker, set it to
+`false` and roll the pods. `COWORK_IDENTITY_ENFORCE=audit` also hides the
+picker, by dropping `expectedOrganizationEnforced` from the capability, but it
+reopens the no-principal path and leaves the boundary refusing anyway, so it is
+never the right lever here.
+
+To back the boundary itself out, roll the release back; there is no value to
+edit. Find the revision that predates the change and roll to it:
+
+```bash
+helm history cowork-server -n <namespace>
+helm rollback cowork-server <revision> -n <namespace> --wait
+```
+
+**That rollback lasts only until the next deploy into the namespace, and nobody
+has to trigger one.** A push to `main` fires `sync-main-to-staging.yml`, which
+pushes `staging`, which fires `publish-staging.yml` and its `helm upgrade`. So
+an unrelated hotfix puts the boundary back hours later. Hold the rollback by
+freezing the branch through `staging-freeze.yml`, or revert the commit and let
+the pipeline deploy the revert, which is the only backout that survives a
+redeploy.
+
+Deploy this server only with the capability-aware Cowork client image. An older
+client does not send the expected-organization header and receives 426.
 
 ## Configuration
 

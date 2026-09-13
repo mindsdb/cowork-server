@@ -181,28 +181,23 @@ def test_turn_queue_settings_is_remote(monkeypatch):
     assert TurnQueueSettings().is_remote is False  # default is "inprocess"
 
 
-def test_app_settings_organization_boundary_defaults_to_enforce(monkeypatch):
-    monkeypatch.delenv("COWORK_ORGANIZATION_BOUNDARY_MODE", raising=False)
+def test_stale_organization_boundary_mode_env_var_is_inert(monkeypatch):
+    """A leftover overlay entry loads and changes nothing.
+
+    The expected-organization fence has no mode any more. An environment that
+    still carries the old key must neither reopen the fail-open path nor stop
+    the pod booting, because an overlay can outlive a deploy. Deleting the field
+    is what makes the key inert: AppSettings sets no ``env_prefix`` and gives
+    every field an explicit ``validation_alias``, so the environment source only
+    looks up names a field still claims. ``extra`` does not enter into it for an
+    environment variable, which is how an overlay delivers this one; it decides
+    only what happens to an unknown key arriving in a ``.env`` file.
+    """
+    monkeypatch.setenv("COWORK_ORGANIZATION_BOUNDARY_MODE", "audit")
 
     settings = AppSettings(_env_file=None)
 
-    assert settings.organization_boundary_mode == "enforce"
-
-
-@pytest.mark.parametrize("mode", ["audit", "enforce"])
-def test_app_settings_reads_organization_boundary_mode(monkeypatch, mode):
-    monkeypatch.setenv("COWORK_ORGANIZATION_BOUNDARY_MODE", mode)
-
-    settings = AppSettings(_env_file=None)
-
-    assert settings.organization_boundary_mode == mode
-
-
-def test_app_settings_rejects_invalid_organization_boundary_mode(monkeypatch):
-    monkeypatch.setenv("COWORK_ORGANIZATION_BOUNDARY_MODE", "strict")
-
-    with pytest.raises(ValidationError):
-        AppSettings(_env_file=None)
+    assert not hasattr(settings, "organization_boundary_mode")
 
 
 def test_app_settings_organization_switch_defaults_to_disabled(monkeypatch):
@@ -252,9 +247,3 @@ def test_identity_enforce_audit_must_be_asked_for_by_name(monkeypatch):
     monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "off")
     with pytest.raises(ValidationError):
         AppSettings(_env_file=None)
-
-
-def test_organization_boundary_mode_defaults_to_enforce(monkeypatch):
-    monkeypatch.delenv("COWORK_ORGANIZATION_BOUNDARY_MODE", raising=False)
-
-    assert AppSettings(_env_file=None).organization_boundary_mode == "enforce"
