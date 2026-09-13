@@ -545,19 +545,30 @@ cannot retarget that in-flight operation.
 There is no setting that relaxes this. The boundary once had an `audit` position
 that logged a violation and served the request anyway; it and the staged rollout
 it existed for are gone. An environment that still carries the retired
-`COWORK_ORGANIZATION_BOUNDARY_MODE` key boots normally and ignores it, because
-`AppSettings.model_config` sets `extra="ignore"`. Pinned by
+`COWORK_ORGANIZATION_BOUNDARY_MODE` key boots normally and ignores it. Deleting
+the field is what makes it unreadable: `AppSettings` sets no `env_prefix` and
+gives every field an explicit `validation_alias`, so the environment source only
+looks up names a field still claims. `extra="ignore"` only decides what happens
+to an unknown key arriving in a `.env` file, which is not how the overlays
+deliver this one. Both halves are pinned, the settings half by
 `tests/test_app_settings.py::test_stale_organization_boundary_mode_env_var_is_inert`
-and `tests/test_principal.py::test_no_environment_variable_reopens_the_organization_boundary`.
+and the request half by
+`tests/test_principal.py::test_no_environment_variable_reopens_the_organization_boundary`.
 
 `GET /api/v1/capabilities/organization-switch` is authenticated and returns
 protocol version 1. It reports `expectedOrganizationEnforced: true` when org
-tenancy and identity enforcement are both active, which is what makes the
-boundary reachable. It reports `enabled: true` when those hold and
+tenancy and identity enforcement are both active. Identity enforcement is in
+that answer because the picker should stay hidden while identity is only
+audited, not because it gates the boundary: `TrustedHeaderMiddleware` runs the
+boundary for every browser JWT request it builds a `Principal` for, under org
+tenancy alone. It reports `enabled: true` when those hold and
 `COWORK_ORGANIZATION_SWITCH_ENABLED=true`.
 
 `COWORK_ORGANIZATION_SWITCH_ENABLED` is the product enable for the picker, not a
-safety switch, and it is the only way to hide the picker without a rebuild.
+safety switch, and it is the lever to reach for to hide the picker without a
+rebuild. `COWORK_IDENTITY_ENFORCE=audit` hides it too, by dropping
+`expectedOrganizationEnforced`, but it reopens the no-principal path and leaves
+the boundary refusing anyway.
 
 Inside one organization, two different rules apply, and which one you get
 depends on the resource:

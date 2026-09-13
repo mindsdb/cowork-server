@@ -48,10 +48,8 @@ deployment:
     - name: COWORK_IDENTITY_ENFORCE
       value: "enforce"
 
-    # The expected-organization boundary always refuses a browser request whose
-    # tab names a different organization than the gateway resolved. This is the
-    # product enable for the picker, and the only way to hide it without a
-    # rebuild.
+    # Shows the organization picker. The expected-organization boundary refuses
+    # a mismatched tab whatever this says; see README.md.
     - name: COWORK_ORGANIZATION_SWITCH_ENABLED
       value: "true"
 

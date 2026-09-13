@@ -282,9 +282,6 @@ def test_browser_jwt_expected_organization_is_uuid_normalized():
     assert res.json()["org_id"] == ORG_ID
 
 
-
-
-
 def _assert_organization_boundary_rejection(response, status_code: int) -> None:
     assert response.status_code == status_code
     assert response.json() == {
@@ -309,10 +306,15 @@ def test_no_environment_variable_reopens_the_organization_boundary(monkeypatch):
     """The old mode key cannot bring the pass-through branch back.
 
     TrustedHeaderMiddleware reads no setting for the fence, so an environment
-    still carrying the retired key gets the same refusal. The cache is cleared
-    around the request so a re-wired mode would genuinely be read: without that,
-    settings loaded before the monkeypatch and the test passed against an
-    implementation that had the audit branch back.
+    still carrying the retired key gets the same refusal. The cache clears are
+    aimed at one re-wiring in particular, a middleware that reads
+    ``get_app_settings()`` itself: without them the settings load before the
+    monkeypatch and this passes against that broken build. They do nothing for
+    the shipped code, which never reads settings on this path. Restoring the
+    original shape instead, a constructor keyword defaulting to ``"enforce"``,
+    is caught by
+    ``test_app_settings.py::test_stale_organization_boundary_mode_env_var_is_inert``,
+    because that shape needs the AppSettings field back.
     """
     monkeypatch.setenv("COWORK_ORGANIZATION_BOUNDARY_MODE", "audit")
     get_app_settings.cache_clear()

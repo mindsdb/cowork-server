@@ -69,9 +69,12 @@ is not configurable. An overlay that still carries the retired
 stale entry is safe to leave and safe to delete.
 
 `COWORK_ORGANIZATION_SWITCH_ENABLED` shows or hides the organization picker. It
-is the product enable and the only lever that changes browser organization
-behavior without a rebuild. To hide the picker, set it to `false` and roll the
-pods.
+is the product enable and the lever to reach for first, because it is a values
+entry the pipeline reapplies on every deploy. To hide the picker, set it to
+`false` and roll the pods. `COWORK_IDENTITY_ENFORCE=audit` also hides the
+picker, by dropping `expectedOrganizationEnforced` from the capability, but it
+reopens the no-principal path and leaves the boundary refusing anyway, so it is
+never the right lever here.
 
 To back the boundary itself out, roll the release back; there is no value to
 edit. Find the revision that predates the change and roll to it:
@@ -80,6 +83,14 @@ edit. Find the revision that predates the change and roll to it:
 helm history cowork-server -n <namespace>
 helm rollback cowork-server <revision> -n <namespace> --wait
 ```
+
+**That rollback lasts only until the next deploy into the namespace, and nobody
+has to trigger one.** A push to `main` fires `sync-main-to-staging.yml`, which
+pushes `staging`, which fires `publish-staging.yml` and its `helm upgrade`. So
+an unrelated hotfix puts the boundary back hours later. Hold the rollback by
+freezing the branch through `staging-freeze.yml`, or revert the commit and let
+the pipeline deploy the revert, which is the only backout that survives a
+redeploy.
 
 Deploy this server only with the capability-aware Cowork client image. An older
 client does not send the expected-organization header and receives 426.

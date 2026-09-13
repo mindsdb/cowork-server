@@ -186,8 +186,12 @@ def test_stale_organization_boundary_mode_env_var_is_inert(monkeypatch):
 
     The expected-organization fence has no mode any more. An environment that
     still carries the old key must neither reopen the fail-open path nor stop
-    the pod booting, because an overlay can outlive a deploy. ``extra="ignore"``
-    on AppSettings.model_config is what makes the key inert.
+    the pod booting, because an overlay can outlive a deploy. Deleting the field
+    is what makes the key inert: AppSettings sets no ``env_prefix`` and gives
+    every field an explicit ``validation_alias``, so the environment source only
+    looks up names a field still claims. ``extra`` does not enter into it for an
+    environment variable, which is how an overlay delivers this one; it decides
+    only what happens to an unknown key arriving in a ``.env`` file.
     """
     monkeypatch.setenv("COWORK_ORGANIZATION_BOUNDARY_MODE", "audit")
 
