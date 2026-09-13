@@ -60,11 +60,12 @@ deployment:
     - name: COWORK_IDENTITY_ENFORCE
       value: "enforce"
 
-    # Keep browser switching dark while the boundary is observed in audit.
-    - name: COWORK_ORGANIZATION_BOUNDARY_MODE
-      value: "audit"
+    # The expected-organization boundary always refuses a browser request whose
+    # tab names a different organization than the gateway resolved. This is the
+    # product enable for the picker, and the only way to hide it without a
+    # rebuild.
     - name: COWORK_ORGANIZATION_SWITCH_ENABLED
-      value: "false"
+      value: "true"
 
     - name: COWORK_TURN_MINDS_BASE_URL
       value: "https://api.mindshub.ai/v1"
