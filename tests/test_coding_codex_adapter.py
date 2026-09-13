@@ -934,6 +934,27 @@ def test_steer_relays_the_codex_error_when_it_answers_in_time() -> None:
         engine_session.steer("turn-1", "Change direction")
 
 
+def test_codex_is_an_optional_extra_and_reports_itself_missing_plainly(monkeypatch) -> None:
+    import tomllib
+
+    from cowork.coding.engines import codex as codex_module
+
+    pyproject = tomllib.load(open("pyproject.toml", "rb"))
+    project = pyproject["project"]
+    assert not any(dep.startswith("openai-codex") for dep in project["dependencies"]), "openai-codex must stay out of the core install"
+    extra = project["optional-dependencies"]["code"]
+    assert any(dep.startswith("openai-codex==") for dep in extra)
+    # Developer checkouts get the same runtime through a default dependency group.
+    assert pyproject["dependency-groups"]["code"] == extra
+    assert "code" in pyproject["tool"]["uv"]["default-groups"]
+
+    monkeypatch.setattr(codex_module.importlib.util, "find_spec", lambda name: None)
+    capabilities = codex_module.CodexEngine().capabilities()
+
+    assert capabilities.available is False
+    assert capabilities.reason == "Code Mode components are not installed on this computer yet."
+
+
 def test_a_finished_turn_reaps_its_command_trees_but_keeps_codex_helpers(monkeypatch) -> None:
     """WIN-QA-007: the app-server stays open between turns, so the turn's own
     processes must be ended when it completes, without touching the MCP servers
