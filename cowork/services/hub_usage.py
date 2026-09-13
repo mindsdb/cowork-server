@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from typing import Any, Optional
 
@@ -37,16 +38,16 @@ from cowork.services.hub_workspaces import cache_key, get_auth_json, sweep_cache
 logger = logging.getLogger(__name__)
 
 ENTITLEMENTS_PATH = "/entitlements/me/"
-
-# The allowance is reported out of this, because auth publishes a proportion
-# and not a size. Desktop builds that predate ``percentRemaining`` divide by it.
-_PROPORTION_LIMIT = 100.0
 WALLET_PATH = "/wallet/"
 # No ``group_by``: auth collapses the breakdown into one totals-only bucket, and
 # ``totals`` is summed over every row before paging either way. Only ``totals``,
 # ``range`` and ``meta`` are read here, so the console's per-model query would
 # fetch up to 200 rows to discard.
 USAGE_SUMMARY_PATH = "/usage/summary/"
+
+# The allowance is reported out of this, because auth publishes a proportion
+# and not a size. Desktop builds that predate ``percentRemaining`` divide by it.
+_PROPORTION_LIMIT = 100.0
 
 # Short on purpose. A top up made in the console should show up in the desktop
 # within a poll or two, and a failed read should be retried soon.
@@ -107,10 +108,21 @@ def _parse_free_tokens(payload: Any) -> Optional[HubFreeTokens]:
     if percent is None:
         # Uncapped: nothing to count down, and nothing for a bar to show.
         return HubFreeTokens(percent_remaining=None, limit=-1, used=0, remaining=-1, resets_at=resets_at)
+    # Fail closed on anything that is not a real number. ``NaN`` would survive
+    # the clamp below as 100.0, because every comparison against it is false,
+    # and hand the caller a full allowance on a malformed body. A JSON integer
+    # too large for a float raises rather than clamping, which would take the
+    # whole usage route down with it.
     if not isinstance(percent, (int, float)) or isinstance(percent, bool):
         return None
+    try:
+        percent = float(percent)
+    except (OverflowError, ValueError):
+        return None
+    if not math.isfinite(percent):
+        return None
 
-    percent = max(0.0, min(100.0, float(percent)))
+    percent = max(0.0, min(100.0, percent))
     return HubFreeTokens(
         percent_remaining=percent,
         limit=_PROPORTION_LIMIT,

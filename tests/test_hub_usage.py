@@ -259,6 +259,53 @@ def test_an_ineligible_org_stays_no_grant(calls):
     assert tokens.remaining == 0
 
 
+def test_an_exhausted_but_eligible_org_is_not_the_same_as_an_ineligible_one(calls):
+    """Both read 0%, and only ``limit`` tells them apart.
+
+    This is the pair the ineligible branch exists for. An org that spent its
+    allowance keeps a limit of 100, so the desktop draws an empty bar and says
+    it refills; an org that never had one reports 0 and the desktop draws no
+    bar at all. Collapsing them would promise a refill that never comes.
+    """
+    calls.answers[svc.ENTITLEMENTS_PATH] = {
+        "included_percent_remaining": 0.0,
+        "free_grant_eligible": True,
+    }
+
+    tokens = _fetch().free_tokens
+
+    assert tokens.percent_remaining == 0.0
+    assert tokens.limit == 100
+    assert tokens.remaining == 0
+
+
+@pytest.mark.parametrize(
+    "percent",
+    [float("nan"), float("inf"), float("-inf"), "12.4", True, 10**400],
+    ids=["nan", "inf", "-inf", "string", "bool", "int-too-large-for-a-float"],
+)
+def test_a_percentage_that_is_not_a_real_number_reports_no_allowance(calls, percent):
+    """Fail closed rather than clamp.
+
+    ``NaN`` is the dangerous one: every comparison against it is false, so the
+    clamp would pass it through as a full 100% allowance on a malformed body.
+    An integer too large for a float is the other end — it raises in the
+    conversion, which would take the whole usage route down rather than degrade.
+    """
+    calls.answers[svc.ENTITLEMENTS_PATH] = {"included_percent_remaining": percent}
+
+    assert _fetch().free_tokens is None
+
+
+def test_a_percentage_outside_the_range_is_clamped_rather_than_trusted(calls):
+    calls.answers[svc.ENTITLEMENTS_PATH] = {"included_percent_remaining": 140.0}
+
+    tokens = _fetch().free_tokens
+
+    assert tokens.percent_remaining == 100.0
+    assert tokens.used == 0.0
+
+
 def test_the_cache_is_per_caller_not_per_org(calls):
     """Two people in one org must not see each other's allowance or owner flag."""
     calls.answers[svc.ENTITLEMENTS_PATH] = ENTITLEMENTS
@@ -405,6 +452,30 @@ def test_route_allows_an_authenticated_member_in_org_mode(monkeypatch):
 
     assert resp.status_code == 200
     assert resp.json()["balance"]["usd"] == 8.42
+
+
+def test_the_wire_carries_the_camel_cased_percentage_the_desktop_reads(monkeypatch):
+    """The canonical field, pinned on the body rather than on the model.
+
+    Every other allowance test reads the service's return value, where the field
+    could be renamed, dropped from ``CamelResponse`` or never serialised and
+    still pass. This is the name the desktop actually reads off the wire.
+    """
+
+    async def _fake(path, bearer_token):
+        return {svc.ENTITLEMENTS_PATH: ENTITLEMENTS, svc.WALLET_PATH: WALLET}.get(path)
+
+    monkeypatch.setattr(svc, "get_auth_json", _fake)
+
+    body = _client(principal=None).get(
+        PATH, headers={HEADER_HUB_CREDENTIAL: "Bearer jwt-abc"}
+    ).json()
+
+    assert body["freeTokens"]["percentRemaining"] == 12.4
+    # The compatibility triple ships beside it, out of 100, for desktop builds
+    # that predate the percentage.
+    assert body["freeTokens"]["limit"] == 100
+    assert body["freeTokens"]["remaining"] == 12.4
 
 
 def test_route_is_unchanged_in_local_mode_with_no_principal(monkeypatch):
