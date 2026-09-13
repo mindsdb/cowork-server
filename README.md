@@ -778,6 +778,22 @@ listing probe, so a MindsHub host configured through that card is health-checked
 against a route MindsHub does not deploy everywhere; those routes answer 404 or 401
 even for a valid key, which is the reason the `minds-cloud` type does not use one.
 
+An `apiKey` of `""` or `"***"` on that route means "use the stored one", which is
+how the Settings UI re-tests a provider it only ever received masked. A stored key
+only goes to a host this deployment saved: the provider cards in `providers_json`,
+the scalar `openai_base_url`/`minds_url`, and the vendor host an omitted `mindsUrl`
+already reaches. The comparison is on origin (`scheme://host[:port]`), not the whole
+URL, because the question is which party receives the key; that also means a stored
+URL carrying a path still matches a body sending the host alone. A URL the guard
+cannot parse names no origin, so it is refused rather than raising. Omitting the URL
+stays legal: a `minds-cloud` probe then goes to the vendor host, and an
+`openai-compatible` one answers `missing base URL`, which is what it did before this
+guard. A key the caller supplied may go anywhere, since nothing stored is at risk.
+
+A refused provider comes back `fail` with its reason and is never pinged, rather
+than failing the whole request. Callers send every configured provider in one call,
+so refusing the request would blank the other providers' dots over one bad URL.
+
 Every MindsHub-bound chat probe caps the completion at `max_tokens: 20`, not 1:
 some models refuse a 1-token budget and fail the probe for a perfectly good key
 (see `_chat_probe`). The cap is not sent to a non-MindsHub endpoint, because

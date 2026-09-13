@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Annotated, Any, Optional
+from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlmodel import Session
@@ -58,6 +59,7 @@ from cowork.common.settings.app_settings import (
     DIRECT_EFFORT_CATALOG,
     RECOMMENDED_MODELS,
     RECOMMENDED_PAIR,
+    default_minds_api_host,
 )
 from cowork.common.settings.user_settings import (
     Provider,
@@ -371,7 +373,48 @@ class _TestProvidersBody(BaseModel):
 _BODY_SUPPLIED_URL_FIELD = {"openai-compatible": "baseUrl", "minds-cloud": "mindsUrl"}
 
 
-def _stored_urls_for(settings: UserSettings, ptype: str) -> set[str]:
+def _origin(url: object) -> str:
+    """``scheme://host[:port]`` for ``url``, or ``""`` when it names no host.
+
+    The guard below compares origins rather than whole URL strings, because
+    the question it asks is which party receives the key, and that is the
+    host. Comparing whole strings refused hosts this deployment does reach:
+    a stored URL may carry a path where the body sends the host alone, which
+    is what ``minds_url`` does whenever no row was written and
+    ``default_minds_url`` supplies ``<host>/v1``. ``minds_chat_base_url``
+    (cowork/services/providers.py) resolves both spellings to the same
+    request, so they were never two targets. Parsing also defeats a userinfo
+    prefix, where ``https://api.mindshub.ai@evil.test`` reads as host
+    ``evil.test``; ``is_minds_host`` in the same module parses for that
+    reason.
+
+    Answers ``""`` for anything it cannot parse, because both callers hand it
+    untrusted text and neither can absorb an exception. The body field is
+    whatever the caller sent; a ``providers_json`` card holds whatever was
+    stored. Four shapes reach here that ``urlsplit`` will not take: a
+    non-string, an unbalanced ``[``, a port that is not an integer in range,
+    and a netloc that NFKC-normalizes into a delimiter. Each has to read as
+    "no origin", which refuses a caller's URL and drops a stored one from the
+    allowlist instead of 500-ing the whole batch. ``is_minds_host`` guards the
+    same call for the same reason and says so.
+    """
+    if not isinstance(url, str):
+        return ""
+    try:
+        parts = urlsplit(url.strip())
+        hostname = parts.hostname
+        port = parts.port
+    except ValueError:
+        return ""
+    if not hostname:
+        return ""
+    # `is not None`, not truthiness: port 0 names a different listener from a
+    # URL that carries no port at all.
+    suffix = f":{port}" if port is not None else ""
+    return f"{parts.scheme.lower()}://{hostname}{suffix}"
+
+
+def _stored_origins_for(settings: UserSettings, ptype: str) -> set[str]:
     """Every ping target this deployment has actually stored for ``ptype``.
 
     The provider cards in ``providers_json`` are what the Settings UI edits
@@ -380,28 +423,43 @@ def _stored_urls_for(settings: UserSettings, ptype: str) -> set[str]:
     included too, since a config written before the cards existed only has
     those.
     """
-    urls = set()
+    origins = set()
     try:
         cards = json.loads(settings.providers_json or "[]")
     except (ValueError, TypeError):
+        cards = []
+    # Decoding is not the same as getting a list to walk: `json.loads("null")`
+    # succeeds and hands back None, and a bare number decodes to an int. Both
+    # are storable, because providers_json is a plain string setting with no
+    # shape validation on write.
+    if not isinstance(cards, list):
         cards = []
     field = _BODY_SUPPLIED_URL_FIELD.get(ptype)
     for card in cards:
         if not isinstance(card, dict):
             continue
-        if card.get("type", "").replace("_", "-") != ptype:
+        # `.get(key, "")` hands back a stored null rather than the default,
+        # and a card carrying `"type": null` is storable: providers_json is a
+        # plain string setting with no shape validation on write.
+        if (card.get("type") or "").replace("_", "-") != ptype:
             continue
-        urls.add((card.get(field) or "").strip().rstrip("/"))
+        # Parse on the way in, not on the way out: a card's URL is whatever
+        # was stored, and an unhashable one never even reaches a set.
+        origins.add(_origin(card.get(field)))
     if ptype == "openai-compatible":
-        urls.add((settings.openai_base_url or "").strip().rstrip("/"))
+        origins.add(_origin(settings.openai_base_url))
     if ptype == "minds-cloud":
-        urls.add((settings.minds_url or "").strip().rstrip("/"))
-    return {u for u in urls if u}
+        origins.add(_origin(settings.minds_url))
+        # A minds-cloud ping that omits mindsUrl goes here (``ping_provider``,
+        # cowork/services/providers.py), so naming this host is a destination
+        # the caller already reaches, not a new one.
+        origins.add(_origin(default_minds_api_host()))
+    return {o for o in origins if o}
 
 
 # AuthenticatedInOrgMode, and a URL check underneath it. The permission stops
 # an anonymous caller spending the deployment's stored keys on probes;
-# _reject_foreign_ping_url below stops ANY caller, member included, choosing
+# _foreign_ping_url_field below stops ANY caller, member included, choosing
 # the host a stored key is sent to. Two layers because they answer different
 # questions and the second one is the one that was missing.
 @router.post("/test-providers", dependencies=[Depends(require(AuthenticatedInOrgMode))])
@@ -432,38 +490,64 @@ async def test_providers(session: SessionDep, scope: ScopeDep, body: _TestProvid
         if s.minds_api_key is not None:
             providers.append({"type": "minds-cloud", "apiKey": "", "mindsUrl": s.minds_url})
 
+    pingable: list[dict[str, Any]] = []
+    refused: dict[str, str] = {}
     for p in providers:
-        if p.get("apiKey") not in ("***", ""):
-            continue
-        _reject_foreign_ping_url(s, p)
-        p["apiKey"] = resolve_stored_key(s, p.get("type", ""))
+        if p.get("apiKey") in ("***", ""):
+            field = _foreign_ping_url_field(s, p)
+            if field is not None:
+                # Refusing the request outright would blank every other
+                # provider's status dot, because both callers send the whole
+                # configured list in one call. ping_provider already reports
+                # per provider, so this joins its results as an ordinary
+                # failure and the refused provider is never pinged at all.
+                refused[p.get("type", "")] = (
+                    f"cannot test a stored key against a {field} this deployment has not saved"
+                )
+                continue
+            p["apiKey"] = resolve_stored_key(s, p.get("type", ""))
+        pingable.append(p)
 
-    statuses, details = await ping_providers(providers)
+    statuses, details = await ping_providers(pingable)
+    for ptype, reason in refused.items():
+        # setdefault, not update: ping_providers keys by type, so two cards of
+        # one type collapse into a single slot. Overwriting would report a card
+        # that pinged perfectly well as failed.
+        statuses.setdefault(ptype, "fail")
+        details.setdefault(ptype, reason)
     return {"providerStatus": statuses, "providerStatusDetails": details}
 
 
-def _reject_foreign_ping_url(settings: UserSettings, provider: dict[str, Any]) -> None:
-    """Refuse to send a STORED key to a host the caller named.
+def _foreign_ping_url_field(settings: UserSettings, provider: dict[str, Any]) -> str | None:
+    """The body field aiming a STORED key at a host this deployment never saved.
 
-    ``settings`` rows are deployment-global (``settings`` is in
+    Returns the field name to refuse on, or ``None`` when the ping may go
+    ahead. ``settings`` rows are deployment-global (``settings`` is in
     ``_TENANCY_DEFERRED_TABLES``, cowork/db/scoped.py), so the key being
     substituted is the whole deployment's. Sending it to an arbitrary
     ``baseUrl``/``mindsUrl`` would hand it to whoever asked. Omitting the URL
     is fine and keeps the ``/test-providers`` body the Settings UI already
-    sends working: the ping then falls back to the stored value or the vendor
-    default.
+    sends working: ``ping_provider`` then sends a minds-cloud probe to the
+    vendor host, and answers ``missing base URL`` for an openai-compatible one
+    rather than reaching for the stored value. A URL that is present but names
+    no host is refused, since there is nothing to compare.
     """
-    ptype = (provider.get("type") or "").replace("_", "-")
+    raw_type = provider.get("type")
+    ptype = raw_type.replace("_", "-") if isinstance(raw_type, str) else ""
     field = _BODY_SUPPLIED_URL_FIELD.get(ptype)
     if field is None:
-        return
-    supplied = (provider.get(field) or "").strip().rstrip("/")
-    if not supplied or supplied in _stored_urls_for(settings, ptype):
-        return
-    raise HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail=f"cannot test a stored key against a {field} this deployment has not saved",
-    )
+        return None
+    supplied = provider.get(field)
+    if supplied is None or supplied == "":
+        return None
+    # The body is `list[dict[str, Any]]`, so this arrives as whatever the
+    # caller sent. A non-string names no origin, so refuse it here rather than
+    # leaning on _origin to say the same thing one call further down.
+    if not isinstance(supplied, str):
+        return field
+    if _origin(supplied) in _stored_origins_for(settings, ptype):
+        return None
+    return field
 
 
 class _ValidateProviderBody(CamelRequest):
