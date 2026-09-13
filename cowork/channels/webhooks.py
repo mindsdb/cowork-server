@@ -6,8 +6,9 @@ from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, Depends, Request, Response
 
+from cowork.api.v1.permissions import PlatformSignature, require
 from cowork.channels.plugin import ChannelPlugin
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession, TenantScope, scope_for_org
 from cowork.db.session import get_open_session
@@ -209,6 +210,15 @@ def _add_webhook_route(
         methods=methods,
         name=f"channel_{channel_type}_webhook_{route_name or 'default'}",
         include_in_schema=False,
+        # PlatformSignature: the message path is verified by
+        # bridge.verify_signature above, the platform's own signature over the
+        # body, not a Cowork principal. Two branches answer before that check
+        # and both are deliberate: a platform handshake (Slack
+        # url_verification) has to succeed before any signing secret is
+        # stored, so there is nothing to verify with yet, and it only echoes
+        # the challenge the platform sent; an inbound with no live adapter
+        # 204s without reading the payload.
+        dependencies=[Depends(require(PlatformSignature))],
     )
 
 

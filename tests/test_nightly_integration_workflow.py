@@ -28,6 +28,7 @@ def test_nightly_workflow_calls_staging_suite_and_reports_its_result():
     uses: ./.github/workflows/tests-integration.yml
     with:
       deploy-env: staging
+      runner: mdb-dev
     secrets: inherit
 """
         in workflow
@@ -50,20 +51,29 @@ def test_nightly_workflow_calls_staging_suite_and_reports_its_result():
     )
 
 
-def test_nightly_workflow_passes_only_inputs_the_suite_defines():
-    # actionlint rejects the whole workflow-lint job over an input the callee
-    # does not declare, so the caller's `with:` block is checked here too.
+def test_integration_callers_supply_the_suite_input_contract():
+    # New required inputs must reach every caller, including scheduled runs.
     # `yaml.safe_load` reads the `on:` key as the boolean True.
-    caller = yaml.safe_load(NIGHTLY_WORKFLOW.read_text(encoding="utf-8"))
     suite = yaml.safe_load(INTEGRATION_SUITE.read_text(encoding="utf-8"))
+    inputs = suite[True]["workflow_call"]["inputs"]
+    defined = set(inputs)
+    required = {name for name, spec in inputs.items() if spec.get("required")}
+    callers = []
 
-    passed = set(caller["jobs"]["integration"]["with"])
-    defined = set(suite[True]["workflow_call"]["inputs"])
+    for path in sorted(INTEGRATION_SUITE.parent.glob("*.y*ml")):
+        workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+        for job_id, job in workflow.get("jobs", {}).items():
+            if job.get("uses") != "./.github/workflows/tests-integration.yml":
+                continue
+            caller = f"{path.name}:{job_id}"
+            callers.append(caller)
+            passed = set(job.get("with", {}))
+            missing = required - passed
+            unknown = passed - defined
+            assert not missing, f"{caller} is missing required inputs {sorted(missing)}"
+            assert not unknown, f"{caller} passes undefined inputs {sorted(unknown)}"
 
-    assert not passed - defined, (
-        f"nightly caller passes {sorted(passed - defined)}, "
-        f"which tests-integration.yml does not define"
-    )
+    assert callers, "no callers of tests-integration.yml found"
 
 
 def test_required_integration_prerequisite_fails_in_staging(monkeypatch):
