@@ -201,6 +201,43 @@ jobs:
                "--as=system:serviceaccount:infrastructure:<env>-gha-runner"
           exit 1
 
+      # Name every empty prod input at once, here, rather than letting the
+      # session-scoped identity fixture report the same absence once per test.
+      # The suite's own report is seven identical setup errors four seconds into
+      # pytest, which reads as a broken test suite rather than as unset
+      # configuration. Reads the values only to test them for emptiness and
+      # never prints one. Mirrors mindshub_services' scripts/check_integration_inputs.sh.
+      #
+      # Deliberately ABOVE the non-prod step: tests/test_integration_workflow.py
+      # slices this file between the two run steps and asserts the prod key name
+      # does not appear in that window.
+      - name: Check the prod standing-identity inputs
+        if: inputs.deploy-env == 'prod'
+        env:
+          COWORK_TEST_API_KEY: ${{ secrets.COWORK_TEST_API_KEY }}
+          COWORK_TEST_USER_EMAIL: ${{ vars.COWORK_TEST_USER_EMAIL }}
+          COWORK_TEST_ORG_ID: ${{ vars.COWORK_TEST_ORG_ID }}
+        run: |
+          set -euo pipefail
+          # Accumulated as a string: an empty array under `set -u` is an error on
+          # bash 3.2, which is what a developer running this locally may have.
+          missing=""
+          for name in COWORK_TEST_API_KEY COWORK_TEST_USER_EMAIL COWORK_TEST_ORG_ID; do
+            if [ -z "${!name:-}" ]; then
+              missing="${missing}${missing:+, }${name}"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Required prod integration inputs are empty: ${missing}." \
+                 "Set them on the 'prod' GitHub Environment: COWORK_TEST_API_KEY is a" \
+                 "secret, COWORK_TEST_USER_EMAIL and COWORK_TEST_ORG_ID are variables." \
+                 "Protect that Environment first - a nonempty required-reviewer rule," \
+                 "prevent self-review, admin bypass disabled, and exactly one 'main'" \
+                 "branch rule. See README.md for the exact checks."
+            exit 1
+          fi
+          echo "All required prod integration inputs are present."
+
       - name: Run integration tests (non-prod)
         if: inputs.deploy-env != 'prod'
         env:
