@@ -95,9 +95,11 @@ def test_remote_history_scrubs_secrets(monkeypatch):
 
 def test_remote_history_scrubs_a_registered_vault_secret_by_value(monkeypatch, tmp_path, request):
     """A DSN password has no key-shape for _SECRET_KEY_PATTERN to match, so it
-    only gets redacted if register_vault_secrets() ran register_secret_vars()
-    against this vault before the history is scrubbed. Without step 3's call
-    site (the channel path's caller) this reaches the Redis job in the clear."""
+    only gets redacted by exact value, which register_secret_vars() makes
+    possible. This pins the mechanism `_remote_history` relies on, given that
+    registration already happened — both handle() (step 2) and
+    remote_turn_events (step 3) depend on it, but this test exercises neither
+    call site's wiring."""
     from anton.core.datasources.data_vault import LocalDataVault
     from cowork.common.history_scrub import register_vault_secrets
     from cowork.db.scoped import LOCAL_SCOPE
@@ -109,9 +111,12 @@ def test_remote_history_scrubs_a_registered_vault_secret_by_value(monkeypatch, t
         "user": "svc", "password": "hunter2xyz",
     })
 
-    # register_vault_secrets sets process-global DS_* env vars (anton's
-    # registry, not test-scoped) — clear them so this leaves no residue for
+    # register_vault_secrets populates anton's process-global DS_* registry
+    # (env vars and/or a context-scoped value map, depending on the anton
+    # version), not test-scoped — reset both so this leaves no residue for
     # later tests in the same session.
+    from anton.utils.datasources import _reset_registered_ds_vars
+    request.addfinalizer(_reset_registered_ds_vars)
     request.addfinalizer(vault.clear_ds_env)
 
     register_vault_secrets(LOCAL_SCOPE)
