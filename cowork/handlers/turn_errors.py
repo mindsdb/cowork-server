@@ -373,6 +373,45 @@ WORKER_UNRESPONSIVE_MESSAGE = (
     "side rather than a problem with your request. Try again in a moment."
 )
 
+# The exception-shaped type name the producer writes when the worker answers an
+# error frame instead of running the turn. `cowork.turnqueue.producer` builds
+# the wire string from this constant so the two cannot drift apart.
+WORKER_VERSION_SKEW_TYPE_NAME = "TurnWorkerVersionSkew"
+
+# Wire-level code for "the worker refused the job it was handed" — an op it
+# does not implement, or a payload it cannot parse. Split from
+# permission_unavailable because the two need opposite next steps: this one is
+# a deploy-ordering fault of ours and nothing the caller can act on. It shared
+# permission_unavailable until 2026-09-14, when a controller pinned one release
+# behind cowork-server rejected every `anton_turn_v2` job and the resulting
+# outage told users their permissions could not be verified.
+WORKER_VERSION_SKEW_CODE = "worker_version_skew"
+
+# Deliberately silent on what happened to the user's data. The server cannot
+# see whether the worker wrote anything before it refused, so a "nothing was
+# changed" reassurance here would be a claim this side cannot stand behind.
+WORKER_VERSION_SKEW_MESSAGE = (
+    "This task couldn't start: the service rejected the request. That's a "
+    "fault on our side rather than a problem with your request. Try again, and "
+    "contact support if it keeps happening."
+)
+
+# Wire-level code for "the worker never confirmed the workspace it was granted".
+# Distinct from worker_version_skew: the worker understood the job and answered,
+# but claimed a mount policy the server did not grant, or streamed content
+# before acknowledging one at all. The turn is stopped either way.
+WORKSPACE_POLICY_VIOLATION_CODE = "workspace_policy_violation"
+
+# Also silent on state, and for a sharper reason: this code fires on a worker
+# that already acknowledged one policy, so artifacts it wrote may have been
+# indexed before the violation was caught (the indexing pass in
+# `cowork.handlers.responses` runs on every exit, failures included).
+WORKSPACE_POLICY_VIOLATION_MESSAGE = (
+    "This task's workspace couldn't be confirmed, so it was stopped. That's a "
+    "fault on our side rather than a problem with your request. Please contact "
+    "support if it keeps happening."
+)
+
 
 def is_image_format_error(exc: Exception) -> bool:
     """Detect the Anthropic 400 raised when an image reaches the model as

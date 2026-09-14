@@ -15,7 +15,15 @@ import time
 import uuid
 
 from cowork.build_info import KEY_ANTON_VERSION, build_trace_metadata, surface
-from cowork.handlers.turn_errors import WORKER_UNRESPONSIVE_TYPE_NAME, remote_turn_error
+from cowork.handlers.turn_errors import (
+    WORKER_UNRESPONSIVE_TYPE_NAME,
+    WORKER_VERSION_SKEW_CODE,
+    WORKER_VERSION_SKEW_MESSAGE,
+    WORKER_VERSION_SKEW_TYPE_NAME,
+    WORKSPACE_POLICY_VIOLATION_CODE,
+    WORKSPACE_POLICY_VIOLATION_MESSAGE,
+    remote_turn_error,
+)
 from cowork.services.providers import minds_chat_base_url
 from cowork.db.scoped import TenantScope
 from cowork.services import product_permissions
@@ -408,18 +416,42 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                         or (workspace_mode == "ephemeral" and resolved_mode != "ephemeral")
                         or (authorized_workspace_mode is not None and resolved_mode != authorized_workspace_mode)
                     ):
-                        yield "turn_failed", _workspace_permission_failure()
+                        logger.error(
+                            "Remote turn claimed an ungranted mount policy conversation=%s "
+                            "correlation_id=%s granted=%s acknowledged=%s claimed=%s",
+                            conversation_id, corr, workspace_mode,
+                            authorized_workspace_mode, resolved_mode,
+                        )
+                        yield "turn_failed", _workspace_policy_violation()
                         return
                     authorized_workspace_mode = resolved_mode
                     yield "progress", {"phase": "workspace_authorized", "workspace_mode": resolved_mode}
                     continue
-                if kind == "error" or (
+                if kind == "error":
+                    # The worker refused the job instead of running it: an op it
+                    # does not implement, or a payload it cannot parse. That is
+                    # a deploy-ordering fault on our side and says nothing about
+                    # the caller's authority, so it must not borrow the
+                    # permission contract below. Terminal, never a fallback turn.
+                    logger.error(
+                        "Remote turn rejected by worker conversation=%s correlation_id=%s error=%s",
+                        conversation_id, corr, data.get("error"),
+                    )
+                    yield "turn_failed", _worker_version_skew(data.get("error"))
+                    return
+                if (
                     kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill", "turn_history", "turn_completed")
                     and authorized_workspace_mode is None
                 ):
-                    # Unsupported v2 operations and missing mount-policy
-                    # acknowledgements are terminal, never a fallback turn.
-                    yield "turn_failed", _workspace_permission_failure()
+                    # Content before any mount policy was acknowledged. The
+                    # worker never confirmed the workspace it was granted, so
+                    # nothing it sends may reach the caller's stream. Terminal.
+                    logger.error(
+                        "Remote turn sent %s before acknowledging its workspace "
+                        "conversation=%s correlation_id=%s granted=%s",
+                        kind, conversation_id, corr, workspace_mode,
+                    )
+                    yield "turn_failed", _workspace_policy_violation()
                     return
                 if kind == "turn_failed":
                     if data.get("code") == "permission_unavailable":
@@ -441,8 +473,41 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
 
 
 def _workspace_permission_failure() -> dict:
-    """Keep worker policy failures on the same unavailable contract as admission."""
+    """Keep a relayed authority failure on the same contract as admission.
+
+    Reserved for the one case that genuinely is about authority: a worker that
+    reports ``permission_unavailable`` for itself. A worker that refuses the
+    job, or that never acknowledges its workspace, gets its own code below —
+    both used to land here, which is how a version skew reached users as a
+    permissions problem.
+    """
     return {
         "error": "WorkspacePermissionUnavailable: worker storage authority could not be verified",
         **product_permissions.ProductPermissionUnavailable().detail,
+    }
+
+
+def _workspace_policy_violation() -> dict:
+    """The worker answered, but not with the mount policy the server granted."""
+    return {
+        "error": (
+            "WorkspacePolicyViolation: worker did not acknowledge the granted mount policy"
+        ),
+        "code": WORKSPACE_POLICY_VIOLATION_CODE,
+        "message": WORKSPACE_POLICY_VIOLATION_MESSAGE,
+    }
+
+
+def _worker_version_skew(error: str | None) -> dict:
+    """The worker refused the job: an op or payload this fleet cannot serve.
+
+    The worker's own text rides on ``error`` for the log and the persisted
+    events row, never on ``message`` — the caller gets fixed copy, because the
+    wire text can name internal ops and carry a stderr tail.
+    """
+    detail = (error or "").strip() or "the worker rejected the turn request"
+    return {
+        "error": f"{WORKER_VERSION_SKEW_TYPE_NAME}: {detail}",
+        "code": WORKER_VERSION_SKEW_CODE,
+        "message": WORKER_VERSION_SKEW_MESSAGE,
     }

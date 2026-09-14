@@ -664,13 +664,17 @@ async def test_workspace_authority_is_sent_and_acknowledged_before_turn_events(m
     ]
 
 
-@pytest.mark.parametrize("reply", [
-    ("error", {"error": "unsupported op 'anton_turn_v2'"}),
-    ("turn_delta", {"text": "must not be shown"}),
-    ("turn_completed", {}),
-    ("turn_failed", {"code": "permission_unavailable", "error": "private authority detail"}),
+@pytest.mark.parametrize("reply,expected_code", [
+    # A refused op is a deploy-ordering fault, not an authority answer. It
+    # reported permission_unavailable until ENG-2127.
+    (("error", {"error": "unsupported op 'anton_turn_v2'"}), "worker_version_skew"),
+    (("turn_delta", {"text": "must not be shown"}), "workspace_policy_violation"),
+    (("turn_completed", {}), "workspace_policy_violation"),
+    # The one case that genuinely is about authority keeps the old contract.
+    (("turn_failed", {"code": "permission_unavailable", "error": "private authority detail"}),
+     "permission_unavailable"),
 ])
-async def test_worker_without_verified_storage_policy_fails_terminally(monkeypatch, reply):
+async def test_worker_without_verified_storage_policy_fails_terminally(monkeypatch, reply, expected_code):
     fake = FakeRedis([("scratchpad:reply:conv-1", _reply(*reply))], workspace_mode=None)
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
@@ -679,8 +683,71 @@ async def test_worker_without_verified_storage_policy_fails_terminally(monkeypat
     ), include_policy=True)
     assert len(items) == 1
     assert items[0][0] == "turn_failed"
-    assert items[0][1]["code"] == "permission_unavailable"
+    assert items[0][1]["code"] == expected_code
     assert "private authority detail" not in items[0][1]["message"]
+
+
+@pytest.mark.parametrize("kind,data", [
+    ("error", {"error": "unsupported op 'anton_turn_v2'"}),
+    ("turn_delta", {"text": "must not be shown"}),
+])
+async def test_a_refused_job_never_blames_the_callers_permissions(monkeypatch, kind, data):
+    """The whole point of ENG-2127: neither of these is about the caller.
+
+    A worker that refuses the op and a worker that skips its mount-policy
+    acknowledgement both used to render "Your current permissions could not be
+    verified. Try again.", which sent the 2026-09-14 outage to the wrong team
+    and told users to retry something that could never succeed.
+    """
+    fake = FakeRedis([("scratchpad:reply:conv-1", _reply(kind, data))], workspace_mode=None)
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"
+    ), include_policy=True)
+    failure = items[0][1]
+    assert failure["code"] != "permission_unavailable"
+    assert "permission" not in failure["message"].lower()
+    assert "role" not in failure["message"].lower()
+
+
+async def test_an_error_frame_is_terminal_even_after_the_workspace_is_authorized(monkeypatch):
+    """An error frame ends the turn wherever it arrives in the stream.
+
+    The authorized case is the one a refactor breaks silently: ``error`` is in
+    neither the yield list nor the terminal list, so a branch that loses its
+    ``return`` drops the frame, keeps blocking on xread, and turns a rejected
+    job into a turn that hangs until the idle timeout.
+    """
+    fake = FakeRedis([
+        ("scratchpad:reply:conv-1", _reply("error", {"error": "unsupported op 'anton_turn_v2'"})),
+        ("scratchpad:reply:conv-1", _reply("turn_delta", {"text": "must not be shown"})),
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+    ], workspace_mode="persistent")
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"
+    ), include_policy=True)
+    assert items[0] == ("progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"})
+    assert items[-1][0] == "turn_failed"
+    assert items[-1][1]["code"] == "worker_version_skew"
+    assert not any(kind == "turn_completed" for kind, _ in items)
+
+
+async def test_the_workers_rejection_text_is_logged_but_never_shown(monkeypatch):
+    """Operators need the op name to spot a skew; callers must not see it."""
+    fake = FakeRedis([
+        ("scratchpad:reply:conv-1", _reply("error", {"error": "unsupported op 'anton_turn_v2'"})),
+    ], workspace_mode=None)
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"
+    ), include_policy=True)
+    failure = items[0][1]
+    assert "anton_turn_v2" in failure["error"]
+    assert "anton_turn_v2" not in failure["message"]
 
 
 @pytest.mark.parametrize("resolved_mode", [None, True, "unknown", "persistent"])
@@ -699,7 +766,7 @@ async def test_worker_cannot_upgrade_or_malform_execution_only_policy(monkeypatc
     ), include_policy=True)
     assert len(items) == 1
     assert items[0][0] == "turn_failed"
-    assert items[0][1]["code"] == "permission_unavailable"
+    assert items[0][1]["code"] == "workspace_policy_violation"
 
 
 async def test_worker_cannot_change_an_acknowledged_mount_policy(monkeypatch):
@@ -713,7 +780,7 @@ async def test_worker_cannot_change_an_acknowledged_mount_policy(monkeypatch):
     ), include_policy=True)
     assert items[0] == ("progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"})
     assert items[1][0] == "turn_failed"
-    assert items[1][1]["code"] == "permission_unavailable"
+    assert items[1][1]["code"] == "workspace_policy_violation"
 
 
 async def test_artifact_authority_outage_stops_before_queue_side_effects(monkeypatch):
