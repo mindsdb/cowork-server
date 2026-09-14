@@ -1635,6 +1635,14 @@ def test_wire_code_inventory_matches_the_renderer_contract():
         # anton_error because the two need opposite next steps: this one is ours
         # to fix, and reads as an agent bug while it shares that code.
         "worker_unresponsive",
+        # ENG-2127 — the worker refused the job (an op it does not implement).
+        # Split off permission_unavailable, which told users their permissions
+        # could not be verified for the whole of the 2026-09-14 outage.
+        "worker_version_skew",
+        # ENG-2127 — the worker answered without acknowledging the mount policy
+        # it was granted. Also split off permission_unavailable: the caller's
+        # authority was never in question on this path either.
+        "workspace_policy_violation",
         "anton_error",
     }
 
