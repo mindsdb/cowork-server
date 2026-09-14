@@ -4,7 +4,7 @@ import pytest
 from sqlmodel import Session, SQLModel, create_engine
 
 from cowork.common.settings.app_settings import AppSettings, MemorySettings
-from cowork.harnesses.memory.migration import migrate_harness_memory_to_shared, retire_hermes_memory
+from cowork.harnesses.memory.migration import migrate_harness_memory_to_shared
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.harnesses.memory.store import GlobalMemoryStore
 from cowork.models.setting import Setting
@@ -106,52 +106,3 @@ def test_migration_combines_multiple_sources_for_same_slot(
 
     assert store.read(MemorySlot.PROFILE).strip() == "Anton profile note\n\nHermes user prefs"
     assert store.read(MemorySlot.LESSONS).strip() == "Anton lesson\n\nHermes lesson"
-
-
-def _hermes_files(monkeypatch, hermes_dir):
-    monkeypatch.setattr(
-        "cowork.harnesses.memory.migration._HERMES_MEMORY_FILES",
-        [
-            (hermes_dir / "USER.md", MemorySlot.PROFILE),
-            (hermes_dir / "MEMORY.md", MemorySlot.LESSONS),
-        ],
-    )
-
-
-def test_retire_merges_divergent_real_copies_without_touching_them(
-    db_session, memory_root, tmp_path, monkeypatch
-):
-    # Windows without symlink permission: the layout step copied the canonical
-    # file, Hermes then appended to the copy. Only the new paragraphs come over.
-    store = GlobalMemoryStore(root=memory_root)
-    store.write(MemorySlot.PROFILE, "canonical profile")
-    hermes_dir = tmp_path / "hermes" / "memories"
-    hermes_dir.mkdir(parents=True)
-    user_text = "canonical profile\n\nHermes-only note\n"
-    (hermes_dir / "USER.md").write_text(user_text, encoding="utf-8")
-    (hermes_dir / "MEMORY.md").write_text("Hermes lesson\n", encoding="utf-8")
-    _hermes_files(monkeypatch, hermes_dir)
-
-    assert retire_hermes_memory(db_session) is True
-
-    assert store.read(MemorySlot.PROFILE).strip() == "canonical profile\n\nHermes-only note"
-    assert store.read(MemorySlot.LESSONS).strip() == "Hermes lesson"
-    assert (hermes_dir / "USER.md").read_text(encoding="utf-8") == user_text
-    assert retire_hermes_memory(db_session) is False
-
-
-def test_retire_skips_symlinks_and_identical_copies(db_session, memory_root, tmp_path, monkeypatch):
-    store = GlobalMemoryStore(root=memory_root)
-    store.write(MemorySlot.PROFILE, "profile")
-    store.write(MemorySlot.LESSONS, "same lesson")
-    hermes_dir = tmp_path / "hermes" / "memories"
-    hermes_dir.mkdir(parents=True)
-    (hermes_dir / "USER.md").symlink_to(memory_root / "profile.md")
-    (hermes_dir / "MEMORY.md").write_text("same lesson\n", encoding="utf-8")
-    _hermes_files(monkeypatch, hermes_dir)
-
-    assert retire_hermes_memory(db_session) is True
-
-    assert store.read(MemorySlot.PROFILE).strip() == "profile"
-    assert store.read(MemorySlot.LESSONS).strip() == "same lesson"
-    assert (hermes_dir / "USER.md").is_symlink()
