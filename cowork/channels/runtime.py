@@ -34,6 +34,7 @@ from cowork.services.channels import ChannelConfigService, resolve_installation_
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.skills import SkillService
+from cowork.streaming.answer_text import accumulate_answer_text
 from cowork.turnqueue.remote_turn import RemoteTurnFailed, remote_turn_events
 
 log = logging.getLogger(__name__)
@@ -547,8 +548,7 @@ class AntonChannelRuntime:
                 turn_rows[:] = data.get("rows") or []
                 return
             events.append(data)
-            if event_type == "response.output_text.delta":
-                collected.append(data.get("delta", ""))
+            accumulate_answer_text(collected, event_type, data)
 
         stream = await self._turn_stream(
             harness, harness_id, scoped, conversation, blocks, text, channel_context, turn_rows,

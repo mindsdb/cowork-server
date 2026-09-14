@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 
 from cowork.api.v1 import artifact_scope
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import LOCAL_SCOPE
 
 
 @pytest.fixture
@@ -327,7 +328,7 @@ def editable_artifact(tmp_path, monkeypatch):
     metadata = {"type": "file", "primary": "brief.md"}
     monkeypatch.setattr(
         workspace_ep, "_owner_workspace",
-        lambda *_args: (source, folder, metadata, {}),
+        lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True}),
     )
     return SimpleNamespace(source=source, folder=folder, metadata=metadata)
 
@@ -364,13 +365,13 @@ def test_the_service_receives_the_resolved_path_on_both_routes(
 
     requested = "docs/notes.md"
     asyncio.run(workspace_ep.artifact_source(
-        "local", "0123456789abcdef0123456789abcdef", session=None, path=requested,
+        "local", "0123456789abcdef0123456789abcdef", session=SimpleNamespace(scope=LOCAL_SCOPE), path=requested,
     ))
     body = workspace_ep._SourceUpdateBody(
         content="x", expectedRevisionId="r1", path=requested,
     )
     asyncio.run(workspace_ep.update_artifact_source(
-        "local", "0123456789abcdef0123456789abcdef", body=body, session=None,
+        "local", "0123456789abcdef0123456789abcdef", body=body, session=SimpleNamespace(scope=LOCAL_SCOPE),
     ))
 
     assert received == ["docs/notes.md", "docs/notes.md"]
@@ -485,7 +486,7 @@ def readme_backed_artifact(tmp_path, monkeypatch):
     metadata = {"type": "file"}
     monkeypatch.setattr(
         workspace_ep, "_owner_workspace",
-        lambda *_args: (source, folder, metadata, {}),
+        lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True}),
     )
     return SimpleNamespace(source=source, folder=folder, metadata=metadata)
 
@@ -612,7 +613,7 @@ def mixed_case_artifact(tmp_path, monkeypatch):
     metadata = {"type": "file", "primary": "Brief.md"}
     monkeypatch.setattr(
         workspace_ep, "_owner_workspace",
-        lambda *_args: (source, folder, metadata, {}),
+        lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True}),
     )
     return SimpleNamespace(source=source, folder=folder, metadata=metadata)
 

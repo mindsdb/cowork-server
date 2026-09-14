@@ -781,10 +781,10 @@ def test_channel_agent_endpoint_validates_and_persists(monkeypatch):
     try:
         # Unknown harness is rejected, not persisted.
         with pytest.raises(HTTPException) as exc:
-            set_channel_agent(ChannelAgentUpdateRequest(harness="ghost"), session, scoped, None)
+            set_channel_agent(ChannelAgentUpdateRequest(harness="ghost"), session, scoped)
         assert exc.value.status_code == 400
 
-        resp = set_channel_agent(ChannelAgentUpdateRequest(harness="other"), session, scoped, None)
+        resp = set_channel_agent(ChannelAgentUpdateRequest(harness="other"), session, scoped)
         assert resp.harness == "other"
         assert resp.options == ["anton", "other"]
         assert get_channel_agent(scoped).harness == "other"

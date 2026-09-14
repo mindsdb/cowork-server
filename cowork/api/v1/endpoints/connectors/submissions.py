@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session
 
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.handlers.probe import ProbeHandler
@@ -18,7 +19,12 @@ from cowork.schemas.connectors import ConnectorField, SubmitFormRequest
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import store
 
-router = APIRouter()
+# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
+# whenever org mode has no org in scope. Declaring it too makes the
+# requirement visible to a route walker instead of something only
+# discoverable by reading scoped.py.
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 SessionDep = Annotated[Session, Depends(get_session)]
 
 

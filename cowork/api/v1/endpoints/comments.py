@@ -15,9 +15,10 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from starlette.concurrency import run_in_threadpool
 
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSessionDep
 from cowork.services.artifact_identity import resolve_artifact_folder
 from cowork.services.artifact_roots import artifacts_sources_for_scan
@@ -26,7 +27,7 @@ from cowork.services.comments_scope import cloud_comments_scope
 from cowork.services.local_artifact_comments import handle_local_comments, local_comments_stream
 from cowork.services.publish import published_owner_state
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 #: First segment of the canonical `artifact/<uuid>` key. Only a key in that
 #: shape names a local artifact; anything else is already a cloud scope.

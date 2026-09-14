@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackOnly, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope, scoped_storage_root
 from cowork.schemas.connectors import (
@@ -37,7 +38,13 @@ router = APIRouter()
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
-@router.get("/", response_model=list[ConnectionSummaryResponse])
+# AuthenticatedInOrgMode: in org mode this forwards to auth_proxy.proxy_catalogue,
+# no DB check of its own.
+# Confirmed: auth's own /v1/oauth/catalogue view requires authentication
+# (IsAuthenticated) independently of anything cowork-server does.
+@router.get(
+    "/", response_model=list[ConnectionSummaryResponse], dependencies=[Depends(require(AuthenticatedInOrgMode))]
+)
 async def list_connections(scope: ScopeDep, request: Request):
     if scope.org_mode:
         # No durable local vault to read in org mode — same forwarded-
@@ -65,7 +72,13 @@ async def list_connections(scope: ScopeDep, request: Request):
 _ORG_CONNECTION_DETAIL_FIELDS = ("account_email", "token_type", "scope", "expires_at", "status")
 
 
-@router.get("/{engine}/{name}", response_model=ConnectionDetailResponse)
+# AuthenticatedInOrgMode: in org mode this forwards to
+# auth_proxy.proxy_connection_detail, no DB check of its own.
+# Confirmed: auth's own /v1/oauth/{engine}/{name} view requires authentication
+# (IsAuthenticated) independently of anything cowork-server does.
+@router.get(
+    "/{engine}/{name}", response_model=ConnectionDetailResponse, dependencies=[Depends(require(AuthenticatedInOrgMode))]
+)
 async def get_connection(engine: str, name: str, scope: ScopeDep, request: Request):
     if scope.org_mode:
         # ENG-2097: this used to call proxy_token, whose fixed response
@@ -90,7 +103,14 @@ async def get_connection(engine: str, name: str, scope: ScopeDep, request: Reque
     return record
 
 
-@router.post("/save", response_model=DirectSaveResponse)
+# LoopbackOnly: the callers are Electron's main process and a renderer path
+# gated behind !host.isWeb, both over 127.0.0.1, and the route writes vault
+# credentials with no principal to attribute them to.
+@router.post(
+    "/save",
+    response_model=DirectSaveResponse,
+    dependencies=[Depends(require(LoopbackOnly))],
+)
 def save_connection_direct(body: DirectSaveRequest, scope: ScopeDep):
     """Persist credentials to the vault without running a probe.
     Used after an OAuth PKCE flow (Electron main-process PKCE) where the
@@ -101,7 +121,16 @@ def save_connection_direct(body: DirectSaveRequest, scope: ScopeDep):
     return _persist_direct_connection(body, scope, dict(body.values))
 
 
-@router.post("/validate-and-save", response_model=DirectSaveResponse)
+# LoopbackOnly: the caller is Code's connector setup panel
+# (cowork src/renderer/cowork/code/CodeConnectorsView.tsx, through
+# api.js validateAndSaveConnector), and Code mode only exists on desktop
+# (host.ts: codeModeAvailable = isElectron && bridge.codeModeAvailable), so
+# every call is loopback. Same restriction as its sibling /save.
+@router.post(
+    "/validate-and-save",
+    response_model=DirectSaveResponse,
+    dependencies=[Depends(require(LoopbackOnly))],
+)
 def validate_and_save_developer_connection(body: DirectSaveRequest, scope: ScopeDep):
     """Validate a Code developer-tool credential before storing it.
 
@@ -157,7 +186,13 @@ def _persist_direct_connection(
     return {"ok": True, "name": slug, "label": slug, "user_label": user_label}
 
 
-@router.delete("/{engine}/{name}", status_code=status.HTTP_204_NO_CONTENT)
+# AuthenticatedInOrgMode: in org mode this forwards to auth_proxy.proxy_delete,
+# no DB check of its own.
+# Confirmed: auth's own /v1/oauth/{engine}/{name} view requires authentication
+# (IsAuthenticated) independently of anything cowork-server does.
+@router.delete(
+    "/{engine}/{name}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require(AuthenticatedInOrgMode))]
+)
 async def delete_connection(engine: str, name: str, scope: ScopeDep, request: Request):
     if scope.org_mode:
         # No local vault to delete from in org mode — same forwarded-
@@ -187,7 +222,10 @@ class PatchTokenBody(BaseModel):
     status: str | None = None
 
 
-@router.patch("/{engine}/{name}/token")
+# LoopbackOnly: the only caller is Electron main's token-refresh.ts, always
+# over 127.0.0.1 (the in-body 501 for org mode, below, is a second,
+# independent belt-and-suspenders check).
+@router.patch("/{engine}/{name}/token", dependencies=[Depends(require(LoopbackOnly))])
 def patch_connection_token(engine: str, name: str, body: PatchTokenBody, scope: ScopeDep):
     """Partially update token fields on a vault entry.
 
@@ -225,7 +263,11 @@ def patch_connection_token(engine: str, name: str, body: PatchTokenBody, scope: 
     return {"ok": True}
 
 
-@router.patch("/{engine}/{name}/picked-files")
+# AuthenticatedInOrgMode: in org mode this forwards to auth_proxy.proxy_picked_files,
+# no DB check of its own.
+# Confirmed: auth's own /v1/oauth/{engine}/{name}/picked-files view requires
+# authentication (IsAuthenticated) independently of anything cowork-server does.
+@router.patch("/{engine}/{name}/picked-files", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def patch_picked_files(engine: str, name: str, body: PatchPickedFilesBody, scope: ScopeDep, request: Request):
     """Merge Google-Picker-granted files into the connection's persisted
     `_picked_files` list. Called right after the user picks files —
@@ -247,7 +289,21 @@ async def patch_picked_files(engine: str, name: str, body: PatchPickedFilesBody,
     return {"ok": True, "files": merged}
 
 
-@router.delete("/{engine}/{name}/picked-files/{file_id}")
+# AuthenticatedInOrgMode, defensive classification: an antontron caller audit
+# confirmed this is reachable from both desktop and hosted web (no isElectron/
+# isWeb guard, see useGoogleDrivePicker.js). This declares the identity floor
+# only — it does NOT fix the actual gap: unlike patch_picked_files above, this
+# route has no org-mode branch and unconditionally hits the local vault via
+# ConnectionsService, and auth_proxy has no "remove one picked file" call to
+# forward to (only proxy_picked_files's merge/union semantics and proxy_delete
+# for the whole connection). TODO: an org-mode caller here likely gets a 404
+# against the wrong (local, non-durable) vault instead of actually un-picking
+# the file — needs a real auth-service endpoint before it can work correctly
+# in org mode, same class of gap as test_providers's stored-key issue.
+@router.delete(
+    "/{engine}/{name}/picked-files/{file_id}",
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
 def delete_picked_file(engine: str, name: str, file_id: str, project: str, scope: ScopeDep):
     """Untag one file from `project` — the "un-pick" counterpart to
     patch_picked_files, used by the Project files rail's delete action on
