@@ -178,6 +178,7 @@ class HermesHarness:
         # callers always pass an attached instance; fail fast rather than
         # silently fall back to a scrambled, replay-breaking history.
         from sqlalchemy.orm import object_session
+        from cowork.common.history_scrub import scrubbed_openai_dump
         from cowork.db.scoped import adopt_scoped_session
         from cowork.services.conversations import ConversationService, _is_tool_row
 
@@ -193,8 +194,10 @@ class HermesHarness:
         # Drop tool rows: they hold anton's Anthropic-format tool_use/tool_result
         # blocks, which are invalid in hermes' OpenAI history. hermes emits none
         # of its own, so this only skips foreign rows from an anton→hermes switch.
+        # Scrubbed: hermes only scrubs the current turn's input, never this
+        # replayed history.
         history = [
-            msg.to_openai_message().model_dump()
+            scrubbed_openai_dump(msg)
             for msg in _ordered
             if msg.role in {"user", "assistant"} and not _is_tool_row(msg.content)
         ]

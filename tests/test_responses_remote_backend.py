@@ -62,6 +62,37 @@ def _kwargs(**overrides) -> dict:
     return base
 
 
+def test_remote_history_scrubs_secrets(monkeypatch):
+    """The pod's harness scrubs only the CURRENT turn's input, never the
+    replayed history it gets handed — so `_remote_history` must scrub before
+    the payload is json.dumps'd into the Redis job."""
+    leaked_key = "sk-" + "a" * 30
+
+    def _msg(role, content):
+        return SimpleNamespace(
+            role=role,
+            to_openai_message=lambda: SimpleNamespace(
+                model_dump=lambda **kw: {"role": role, "content": content}
+            ),
+        )
+
+    rows = [_msg("user", f"my key is {leaked_key}")]
+
+    class FakeConversationService:
+        def __init__(self, session):
+            pass
+
+        def get_ordered_messages(self, conv_id):
+            return rows
+
+    monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
+
+    history = ResponsesHandler._remote_history(object(), uuid4())
+
+    assert leaked_key not in json.dumps(history)
+    assert "[REDACTED_API_KEY]" in history[0]["content"]
+
+
 def test_remote_backend_selected(monkeypatch):
     monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")
 
