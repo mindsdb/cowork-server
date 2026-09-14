@@ -168,14 +168,22 @@ def _persist_direct_connection(
         # a genuinely new connection; it can never clobber a label the user
         # already set on a reconnect (see persist_connection's default_label
         # docs). Mirrors the same wiring in oauth/google.py's callback(),
-        # the analogous save path for a non-Electron (web) OAuth flow.
+        # the analogous save path for a non-Electron (web) OAuth flow —
+        # including the account_email fallback: none of the Google-family
+        # scopes (Drive/Calendar/Ads/Analytics/Gmail) include profile/openid,
+        # so account_name is never populated for them, and without this
+        # fallback the label defaults to the bare engine id, de-duplicated
+        # with a trailing counter on a second account ("gmail 2") — a label
+        # that leaks into the tile subtitle next to the email.
+        account_name = str(values.get("account_name") or "").strip()
+        account_email = str(values.get("account_email") or "").strip()
         slug = persist_connection(
             body.connector_id,
             body.method,
             body.name,
             values,
             replace_existing=body.replace_existing,
-            default_label=str(values.get("account_name") or "").strip() or None,
+            default_label=account_name or account_email or None,
             vault=vault,
         )
     except Exception:
