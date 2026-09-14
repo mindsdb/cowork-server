@@ -93,6 +93,55 @@ def test_remote_history_scrubs_secrets(monkeypatch):
     assert "[REDACTED_API_KEY]" in history[0]["content"]
 
 
+def test_remote_history_scrubs_a_registered_vault_secret_by_value(monkeypatch, tmp_path, request):
+    """A DSN password has no key-shape for _SECRET_KEY_PATTERN to match, so it
+    only gets redacted if register_vault_secrets() ran register_secret_vars()
+    against this vault before the history is scrubbed. Without step 3's call
+    site (the channel path's caller) this reaches the Redis job in the clear."""
+    from anton.core.datasources.data_vault import LocalDataVault
+    from cowork.common.history_scrub import register_vault_secrets
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "vault"))
+    vault = LocalDataVault(tmp_path / "vault")
+    vault.save("postgres", "mydb", {
+        "host": "db.example.com", "port": "5432", "database": "app",
+        "user": "svc", "password": "hunter2xyz",
+    })
+
+    # register_vault_secrets sets process-global DS_* env vars (anton's
+    # registry, not test-scoped) — clear them so this leaves no residue for
+    # later tests in the same session.
+    request.addfinalizer(vault.clear_ds_env)
+
+    register_vault_secrets(LOCAL_SCOPE)
+
+    def _msg(role, content):
+        return SimpleNamespace(
+            role=role,
+            to_openai_message=lambda: SimpleNamespace(
+                model_dump=lambda **kw: {"role": role, "content": content}
+            ),
+        )
+
+    rows = [_msg("user", "the password is hunter2xyz")]
+
+    class FakeConversationService:
+        def __init__(self, session):
+            pass
+
+        def get_ordered_messages(self, conv_id):
+            return rows
+
+    monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
+
+    history = ResponsesHandler._remote_history(object(), uuid4())
+
+    blob = json.dumps(history)
+    assert "hunter2xyz" not in blob
+    assert "[DS_" in blob
+
+
 def test_remote_backend_selected(monkeypatch):
     monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")
 
