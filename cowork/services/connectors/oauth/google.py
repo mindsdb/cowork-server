@@ -554,8 +554,21 @@ class OAuthService:
             # for a genuinely new connection; it can never clobber a label the
             # user already set on a reconnect (see persist_connection's
             # default_label docs).
+            #
+            # Falling back to account_email when account_name is empty matters
+            # most for Google: none of the granted scopes (Drive/Calendar/Ads/
+            # Analytics/Gmail) include profile/openid, so Google's userinfo
+            # response never carries a name claim, and account_name is always
+            # empty. Without this fallback, persist_connection instead defaults
+            # to the bare engine id (e.g. "gmail"), de-duplicated with a
+            # trailing counter on a second account ("gmail 2") — a label that
+            # survives connectionIdentity()'s "title, again" filter and leaks
+            # into the tile subtitle next to the email. Defaulting to the email
+            # keeps the label identical to the subtitle's own identity value,
+            # so the frontend's dedup collapses them back to just the email.
             connection_name = persist_connection(
-                cfg.engine, "browser_oauth_builtin", "", new_fields, default_label=account_name or None
+                cfg.engine, "browser_oauth_builtin", "", new_fields,
+                default_label=account_name or account_email or None,
             )
         except HTTPException as exc:
             err_msg = str(exc.detail)
