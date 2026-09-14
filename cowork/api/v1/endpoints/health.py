@@ -1,7 +1,8 @@
 from importlib.metadata import version, PackageNotFoundError
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
+from cowork.api.v1.permissions import OpenByDesign, require
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import (
     Provider,
@@ -91,7 +92,12 @@ def _minds_runtime_credential_required(
 # COWORK_SERVER_OWNER. The app adopts an already-running server only when
 # this matches its own token, so one OS user's app can't drive another
 # user's sidecar on a shared loopback port (ENG-439). Empty when unset.
-@router.get("/", response_model=dict)
+#
+# OpenByDesign, standalone reason: this is the pre-auth readiness probe every
+# client polls before it can authenticate at all, so it has to answer with no
+# credential of any kind. Not "the middleware exempts it" — that the middleware
+# also lists it in _EXEMPT_PATHS follows from this, rather than justifying it.
+@router.get("/", response_model=dict, dependencies=[Depends(require(OpenByDesign))])
 def health() -> dict:
     settings = get_user_settings()
     # Read once: `org_mode` and the `aid` gate are the same decision, and two

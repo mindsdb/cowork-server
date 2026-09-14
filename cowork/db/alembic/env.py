@@ -7,6 +7,7 @@ from sqlalchemy.engine import make_url
 from sqlmodel import SQLModel
 
 import cowork.models.code_control  # noqa: F401
+import cowork.models.artifact_identity  # noqa: F401
 
 # Import models so SQLModel.metadata is fully populated for autogenerate.
 import cowork.models.conversation  # noqa: F401

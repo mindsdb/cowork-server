@@ -111,8 +111,9 @@ async def test_seal_carries_a_request_id_when_the_remote_producer_gives_one():
     assert "corr-seal" in buffer.appended[0][1]["sse"]
 
 
-async def test_seal_omits_request_id_for_the_in_process_path():
-    # The in-process/direct producers have no correlation id to offer.
+async def test_seal_omits_request_id_when_the_producer_offers_none():
+    # The direct and channel producers have no correlation id to offer; the
+    # in-process one does, and passes it.
     buffer = _FakeBuffer()
     await _seal_unterminated_buffer(buffer, _live(), "conv-7")
     assert "request_id" not in buffer.appended[0][1]["sse"]

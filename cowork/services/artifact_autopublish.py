@@ -20,6 +20,7 @@ from typing import Literal
 
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
 from cowork.services.artifact_publish_key import PublishKey
+from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 from cowork.services.publish import publish_artifact
 
 logger = logging.getLogger(__name__)
@@ -348,7 +349,12 @@ async def autopublish_project_artifacts(
                 if not acquire(base, slug, ttl_s=lock_ttl):
                     _record("lock_busy", slug=slug)
                     continue
-                api_key = await key.get()
+                try:
+                    api_key = await key.get()
+                except (ProductPermissionDenied, ProductPermissionUnavailable):
+                    release(base, slug)
+                    _record("no_key", slug=slug)
+                    return published
                 if not api_key:
                     release(base, slug)
                     _record("no_key", slug=slug)

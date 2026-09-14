@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session
 
-from cowork.api.v1.endpoints.guards import require_local, require_local_tenancy
+from cowork.api.v1.permissions import LoopbackDesktopOnly, require
 from cowork.coding.connector_capabilities import (
     ConnectorCapability,
     ConnectorCapabilityIssueRequest,
@@ -112,7 +112,12 @@ from cowork.services.providers import cached_minds_models
 from cowork.services.settings import SettingService
 from cowork.services.skills import CodeSkillService
 
-router = APIRouter(dependencies=[Depends(require_local), Depends(require_local_tenancy)])
+# LoopbackDesktopOnly: loopback peer plus desktop-only tenancy, which is the
+# whole credential this surface has. Declared on the router rather than per
+# route because it REFUSES — the 106 routes below inherit a check, so a new
+# one added here is closed until someone opens it, which is the opposite of
+# what inheriting OpenByDesign did.
+router = APIRouter(dependencies=[Depends(require(LoopbackDesktopOnly))])
 logger = logging.getLogger(__name__)
 
 
@@ -435,6 +440,16 @@ def code_project_integrations(project_id: str, integrations: IntegrationsDep):
 def read_code_project_source(project_id: str, body: SourceContextRequest, integrations: IntegrationsDep):
     project = _call(_service().projects.get, project_id)
     return _call(integrations.read, project, body)
+
+
+@router.post("/source-context")
+def read_code_source(body: SourceContextRequest, integrations: IntegrationsDep):
+    return _call(integrations.read, None, body)
+
+
+@router.post("/work-items/search")
+def search_code_work(body: WorkItemSearchRequest, integrations: IntegrationsDep):
+    return _call(integrations.search, None, body)
 
 
 @router.post("/projects/{project_id}/work-items/search")
