@@ -75,8 +75,31 @@ def test_env_harness_resolves_to_anton_in_local_mode(monkeypatch):
         get_app_settings.cache_clear()
 
 
-def test_writing_an_unknown_harness_stores_anton(engine):
-    _svc(engine).upsert_setting("harness", "hermes")
+def test_writing_an_unknown_harness_is_still_rejected(engine):
+    # Read tolerance must not turn a bad PUT into a silent write.
+    with pytest.raises(ValueError, match="Unknown harness"):
+        _svc(engine).upsert_setting("harness", "hermes")
     with Session(engine) as session:
-        row = session.exec(select(Setting).where(Setting.key == "harness")).one()
-    assert row.value == "anton"
+        assert session.exec(select(Setting).where(Setting.key == "harness")).first() is None
+
+
+def test_boot_repair_rewrites_stale_rows_at_every_scope(engine):
+    from cowork.migrations import normalize_retired_harness_rows
+
+    with Session(engine) as session:
+        session.add(Setting(key="harness", value="hermes"))
+        session.add(Setting(key="greeting", value="hello there"))
+        session.add(Setting(key="channels_harness", value="hermes", scope="org", org_id=ORG_A))
+        session.add(Setting(key="harness", value="hermes", scope="user", org_id=ORG_A, user_id=USER_A))
+        session.add(Setting(key="harness", value="anton", scope="org", org_id=ORG_A))
+        session.commit()
+
+    with Session(engine) as session:
+        assert normalize_retired_harness_rows(session) is True
+        by_key = {(r.key, r.scope, r.user_id): r.value for r in session.exec(select(Setting)).all()}
+        assert by_key[("harness", None, None)] == "anton"
+        assert by_key[("channels_harness", "org", None)] == "anton"
+        assert by_key[("harness", "user", USER_A)] == "anton"
+        assert by_key[("harness", "org", None)] == "anton"
+        assert by_key[("greeting", None, None)] == "hello there"
+        assert normalize_retired_harness_rows(session) is False
