@@ -419,27 +419,6 @@ def cards_for_slugs(
     return cards
 
 
-def finalize_turn_artifacts(
-    conversation, conversation_id, project_id, artifacts_base, before: set[str],
-    tracked_new: set[str] | None = None,
-) -> list[dict]:
-    """Index this turn's new artifacts and return their cards.
-
-    Kept as the pre-split entry point for harnesses that do not participate in
-    autopublish. Callers that
-    need `touched` or the tenant scope use `index_turn_artifacts` directly.
-
-    `before_mtimes` is empty here on purpose: without a pre-turn mtime snapshot
-    `touched` degenerates to "the new slugs", which is all this entry point's
-    callers need — they do not publish.
-    """
-    new, _touched, _scope = index_turn_artifacts(
-        conversation, conversation_id, project_id, artifacts_base, before, {},
-        tracked_new=tracked_new,
-    )
-    return cards_for_slugs(artifacts_base, new)
-
-
 async def publish_and_card_turn_artifacts(
     artifacts_base,
     *,

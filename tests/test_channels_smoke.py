@@ -749,8 +749,19 @@ def test_channels_harness_selection_and_pinning(monkeypatch):
     turn(701, 202)
     assert harnesses_of(701) == ["anton"]
 
-    # Unknown name in the setting resolves to the default rather than failing the turn.
-    set_channels_harness("ghost")
+    # A stored row naming a harness that no longer exists (the API rejects
+    # writing one, so seed it directly) resolves to the default rather than
+    # failing the turn.
+    from cowork.models.setting import Setting
+
+    s = get_open_session()
+    try:
+        row = s.exec(select(Setting).where(Setting.key == "channels_harness", Setting.scope.is_(None))).one()
+        row.value = "ghost"
+        s.add(row)
+        s.commit()
+    finally:
+        s.close()
     turn(702, 203)
     assert harnesses_of(702) == ["anton"]
 
