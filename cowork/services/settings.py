@@ -8,6 +8,7 @@ from pydantic import SecretStr, ValidationError
 from sqlmodel import Session, select
 
 from cowork.common.encryption import decrypt, encrypt
+from cowork.common.settings.runtime_credential import get_minds_credential
 from cowork.common.settings.user_settings import (
     UserSettings,
     invalidate_user_settings_cache,
@@ -187,6 +188,15 @@ class SettingService:
                 data[row.key] = decrypted
             else:
                 data[row.key] = row.value
+        # The desktop app hands its MindsHub credential over at runtime instead
+        # of storing it, so overlay it here — the one point every reader of
+        # get_user_settings() goes through. It beats a stored row deliberately:
+        # an install upgrading from a build that persisted its key still has
+        # that row until the migration clears it, and a stale key must never
+        # shadow the live credential. Returns None outside local mode.
+        runtime_minds_key = get_minds_credential()
+        if runtime_minds_key:
+            data["minds_api_key"] = runtime_minds_key
         return data
 
     @staticmethod

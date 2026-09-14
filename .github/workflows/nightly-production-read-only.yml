@@ -1,0 +1,58 @@
+name: Nightly Production Read-only Smoke
+
+on:
+  schedule:
+    # Off the hour so this monitor does not join the busiest Actions queue.
+    - cron: "43 7 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: nightly-production-read-only
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  production-read-only:
+    if: github.ref == 'refs/heads/main'
+    runs-on: mdb-prod
+    timeout-minutes: 10
+    environment:
+      name: prod-read-only
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.12.2"
+          cache-local-path: "/home/runner/_work/_tool/uv-local-cache"
+          prune-cache: false
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --locked --group dev
+      - name: Run production read-only smoke
+        env:
+          COWORK_BASE_URL: https://cowork.mindshub.ai
+          COWORK_REQUIRE_INTEGRATION: "true"
+          COWORK_TEST_IDENTITY_MODE: standing
+          COWORK_TEST_API_KEY: ${{ secrets.COWORK_PROD_READ_ONLY_API_KEY }}
+          COWORK_TEST_USER_EMAIL: ${{ vars.COWORK_PROD_READ_ONLY_USER_EMAIL }}
+          COWORK_TEST_ORG_ID: ${{ vars.COWORK_PROD_READ_ONLY_ORG_ID }}
+        run: make test/integration-production-read-only
+
+  notify:
+    needs: [production-read-only]
+    if: ${{ !cancelled() && (needs.production-read-only.result == 'success' || needs.production-read-only.result == 'failure') }}
+    permissions:
+      contents: read
+      actions: read
+    uses: mindsdb/github-actions/.github/workflows/notify-main-failure.yml@main
+    with:
+      env-name: "production Cowork read-only smoke"
+      status: ${{ needs.production-read-only.result == 'failure' && 'failed' || 'recovered' }}
+      runs-on: ubuntu-latest
+    secrets: inherit

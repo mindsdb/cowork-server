@@ -1,9 +1,14 @@
 from importlib.metadata import version, PackageNotFoundError
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
+from cowork.api.v1.permissions import OpenByDesign, require
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.common.settings.user_settings import get_user_settings
+from cowork.common.settings.user_settings import (
+    Provider,
+    UserSettings,
+    get_user_settings,
+)
 
 router = APIRouter()
 
@@ -61,6 +66,23 @@ def _anton_install_id() -> str:
         return ""
 
 
+def _minds_runtime_credential_required(
+    settings: UserSettings, *, org_mode: bool
+) -> bool:
+    """Whether a required desktop role can consume the runtime Minds JWT.
+
+    Router-only MindsHub use stays out of the wake-up barrier because it is an
+    optional fail-open probe. Org deployments mint per-turn credentials and do
+    not consume the desktop's in-memory hand-over.
+    """
+    if org_mode:
+        return False
+    return Provider.MINDS_CLOUD in (
+        settings.resolved_planning_provider,
+        settings.resolved_coding_provider,
+    )
+
+
 # Health endpoint — the Electron app and dev-web.mjs probe this
 # to know when the server is ready before mounting the renderer.
 # The cowork frontend also reads config_ready / config_error from
@@ -70,7 +92,12 @@ def _anton_install_id() -> str:
 # COWORK_SERVER_OWNER. The app adopts an already-running server only when
 # this matches its own token, so one OS user's app can't drive another
 # user's sidecar on a shared loopback port (ENG-439). Empty when unset.
-@router.get("/", response_model=dict)
+#
+# OpenByDesign, standalone reason: this is the pre-auth readiness probe every
+# client polls before it can authenticate at all, so it has to answer with no
+# credential of any kind. Not "the middleware exempts it" — that the middleware
+# also lists it in _EXEMPT_PATHS follows from this, rather than justifying it.
+@router.get("/", response_model=dict, dependencies=[Depends(require(OpenByDesign))])
 def health() -> dict:
     settings = get_user_settings()
     # Read once: `org_mode` and the `aid` gate are the same decision, and two
@@ -78,6 +105,12 @@ def health() -> dict:
     _org_mode = get_app_settings().tenancy_mode == "org"
     return {
         "status": "ok",
+        # Runtime feature handshake for desktop clients. A healthy HTTP server
+        # is not necessarily the server this UI was built for: during feature
+        # development an older published sidecar can still answer /health while
+        # returning 404 for every Code Mode route. Keep this list additive so a
+        # client can require the capability it needs before adopting a sidecar.
+        "capabilities": ["coding"],
         "anton_available": True,
         "mode": "anton",
         "server_version": _pkg_version("cowork-server"),
@@ -87,6 +120,9 @@ def health() -> dict:
         # client must not finalize onboarding by writing it. `config_ready` can't
         # express this: it says the deployment can run, not who may configure it.
         "org_mode": _org_mode,
+        "minds_runtime_credential_required": _minds_runtime_credential_required(
+            settings, org_mode=_org_mode
+        ),
         # anton's analytics install id, desktop only (ENG-1689). Empty in org
         # mode deliberately: there the id fingerprints the SERVER, identical for
         # every user of the deployment, so publishing it would answer no

@@ -5,6 +5,7 @@ Focus on the two properties that broke Windows boot (see skill_links.py):
   2. a single unlinkable skill never aborts a full reconcile (boot safety).
 """
 from pathlib import Path
+from types import SimpleNamespace
 
 import cowork.services.skill_links as sl
 
@@ -39,6 +40,51 @@ def test_ensure_link_retargets(tmp_path: Path):
     sl._ensure_symlink(link, a)
     sl._ensure_symlink(link, b)  # retarget
     assert link.resolve() == b.resolve()
+
+
+def test_windows_link_removal_passes_only_a_direct_child_to_rmdir(
+    tmp_path: Path,
+    monkeypatch,
+):
+    parent = tmp_path / "project" / "skills"
+    parent.mkdir(parents=True)
+    calls: list[tuple[Path, str]] = []
+    monkeypatch.setattr(sl, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        sl,
+        "dir_rmdir",
+        lambda directory, name: calls.append((directory.path, name)),
+    )
+
+    sl._unlink_dir_link(parent / "safe-skill")
+
+    assert calls == [(parent, "safe-skill")]
+
+
+def test_reconcile_project_selects_its_directory_from_inventory(
+    tmp_path: Path,
+    monkeypatch,
+):
+    discovered = tmp_path / "projects" / "renamed-project"
+    requested = tmp_path / "request-controlled-parent" / discovered.name
+    canonical = tmp_path / "canonical" / "safe-skill"
+    discovered.mkdir(parents=True)
+    canonical.mkdir(parents=True)
+    calls: list[tuple[Path, Path]] = []
+    monkeypatch.setattr(sl, "_project_dirs", lambda: [discovered])
+    monkeypatch.setattr(sl, "_canon_root", lambda: canonical.parent)
+    monkeypatch.setattr(
+        sl,
+        "_ensure_symlink",
+        lambda link, target: calls.append((link, target)),
+    )
+
+    sl.reconcile_project(
+        requested,
+        [SimpleNamespace(name="safe-skill", enabled=True, projects=[])],
+    )
+
+    assert calls == [(discovered / "skills" / "safe-skill", canonical)]
 
 
 def test_reconcile_all_skips_unlinkable_skill(monkeypatch):

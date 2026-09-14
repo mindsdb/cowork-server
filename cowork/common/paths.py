@@ -100,7 +100,8 @@ class PinnedDir:
     Callers MUST go through the ``dir_*`` helpers below rather than read ``fd``
     or ``path`` directly, so the one platform branch stays in one place. Every
     child *name* passed to a helper must already be a validated single path
-    component (the call sites guarantee this); the helpers do not re-check it.
+    component. Destructive helpers defensively repeat that direct-child check
+    beside their filesystem sink.
     """
 
     fd: int | None
@@ -133,10 +134,45 @@ def dir_stat(
 
 
 def dir_unlink(d: PinnedDir, name: str) -> None:
+    safe_name = os.path.basename(name)
+    if (
+        safe_name != name
+        or safe_name in {"", ".", ".."}
+        or "\\" in safe_name
+        or "\0" in safe_name
+    ):
+        raise ValueError("Unlink path must be a direct-child name")
     if d.fd is not None:
-        os.unlink(name, dir_fd=d.fd)
+        os.unlink(safe_name, dir_fd=d.fd)
     else:
-        os.unlink(d.path / name)
+        os.unlink(d.path / safe_name)
+
+
+def dir_replace(d: PinnedDir, source_name: str, destination_name: str) -> None:
+    """Atomically replace one pinned direct child with another.
+
+    ``dir_rename`` maps to ``os.rename``, which refuses an existing destination
+    on Windows. A durable write always lands on a file that already exists, so
+    that path needs ``os.replace`` instead, pinned the same way so the
+    destination cannot be swapped for a link between the check and the write.
+    """
+    safe_source = os.path.basename(source_name)
+    safe_destination = os.path.basename(destination_name)
+    for candidate, original in (
+        (safe_source, source_name),
+        (safe_destination, destination_name),
+    ):
+        if (
+            candidate != original
+            or candidate in {"", ".", ".."}
+            or "\\" in candidate
+            or "\0" in candidate
+        ):
+            raise ValueError("Replace paths must be direct-child names")
+    if d.fd is not None:
+        os.replace(safe_source, safe_destination, src_dir_fd=d.fd, dst_dir_fd=d.fd)
+    else:
+        os.replace(d.path / safe_source, d.path / safe_destination)
 
 
 def dir_mkdir(d: PinnedDir, name: str) -> None:
@@ -146,22 +182,68 @@ def dir_mkdir(d: PinnedDir, name: str) -> None:
         os.mkdir(d.path / name)
 
 
+def dir_rmdir(d: PinnedDir, name: str) -> None:
+    safe_name = os.path.basename(name)
+    if (
+        safe_name != name
+        or safe_name in {"", ".", ".."}
+        or "\\" in safe_name
+        or "\0" in safe_name
+    ):
+        raise ValueError("Directory removal path must be a direct-child name")
+    if d.fd is not None:
+        os.rmdir(safe_name, dir_fd=d.fd)
+    else:
+        os.rmdir(d.path / safe_name)
+
+
 def dir_rmtree(d: PinnedDir, name: str) -> None:
+    safe_name = os.path.basename(name)
+    if (
+        safe_name != name
+        or safe_name in {"", ".", ".."}
+        or "\\" in safe_name
+        or "\0" in safe_name
+    ):
+        raise ValueError("Removal path must be a direct-child name")
     if d.fd is not None:
-        shutil.rmtree(name, dir_fd=d.fd)
+        shutil.rmtree(safe_name, dir_fd=d.fd)
     else:
-        shutil.rmtree(d.path / name)
+        shutil.rmtree(d.path / safe_name)
 
 
-def dir_rename_into(d: PinnedDir, src: str | Path, name: str) -> None:
-    """Rename the absolute path *src* to child *name* of *d*.
-
-    Only the destination is pinned; *src* is passed as an absolute path (see
-    ``ProjectService._rename_in_root``)."""
-    if d.fd is not None:
-        os.rename(str(src), name, dst_dir_fd=d.fd)
+def dir_rename(
+    source: PinnedDir,
+    source_name: str,
+    destination: PinnedDir,
+    destination_name: str,
+) -> None:
+    """Rename one pinned direct child to another pinned direct child."""
+    safe_source_name = os.path.basename(source_name)
+    safe_destination_name = os.path.basename(destination_name)
+    if (
+        safe_source_name != source_name
+        or safe_destination_name != destination_name
+        or safe_source_name in {"", ".", ".."}
+        or safe_destination_name in {"", ".", ".."}
+        or "\\" in safe_source_name
+        or "\\" in safe_destination_name
+        or "\0" in safe_source_name
+        or "\0" in safe_destination_name
+    ):
+        raise ValueError("Rename paths must be direct-child names")
+    if source.fd is not None and destination.fd is not None:
+        os.rename(
+            safe_source_name,
+            safe_destination_name,
+            src_dir_fd=source.fd,
+            dst_dir_fd=destination.fd,
+        )
     else:
-        os.rename(str(src), str(d.path / name))
+        os.rename(
+            source.path / safe_source_name,
+            destination.path / safe_destination_name,
+        )
 
 
 def dir_scandir(d: PinnedDir) -> "Iterator[os.DirEntry[str]]":

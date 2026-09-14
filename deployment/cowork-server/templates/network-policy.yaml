@@ -22,16 +22,20 @@
 # itself by inheriting it. Enable one environment at a time and watch pod
 # readiness: a policy that refuses the kubelet takes the deployment down.
 #
-# BEFORE ENABLING THIS ANYWHERE: the CI deploy identity must be able to create
-# the kind. It cannot today. `helm upgrade` runs in-cluster as
-# `system:serviceaccount:infrastructure:<env>-gha-runner`, and on newdev
-# `auth can-i create networkpolicies -n staging` answers no while `ingresses`
-# and `deployments` answer yes, so enabling this fails the release and --atomic
-# rolls the whole deploy back. Check it, do not assume:
-#   kubectl --context newdev -n staging auth can-i create networkpolicies \
-#     --as=system:serviceaccount:infrastructure:newdev-gha-runner
+# BEFORE ENABLING THIS IN A NEW ENVIRONMENT: the CI deploy identity must be able
+# to create the kind. `helm upgrade` runs in-cluster as
+# `system:serviceaccount:infrastructure:<env>-gha-runner`, which holds
+# `create networkpolicies` only in the namespaces listed under
+# `runner_deploy_namespaces` in Kubernetes-Foundational-Services
+# (`gha-runners/deployment/gha-runner-scale-set`). Anywhere else the release
+# fails and --atomic rolls the whole deploy back. Check it, do not assume:
+#   kubectl --context <ctx> -n <ns> auth can-i create networkpolicies \
+#     --as=system:serviceaccount:infrastructure:<env>-gha-runner
 # A server-side dry-run under your own kubeconfig does NOT answer this: it tells
 # you the API server accepts the manifest, not that the deployer may create it.
+#
+# A PR environment is one of the places it cannot be created, which is the other
+# reason this stays off in base values.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

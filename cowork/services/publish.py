@@ -60,6 +60,25 @@ class PublisherUnavailable(RuntimeError):
     """
 
 
+def raise_publish_permission_error(exc: Exception) -> None:
+    """Preserve the artifact consumer's explicit authority result through wrappers."""
+    from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
+
+    if isinstance(exc, (ProductPermissionDenied, ProductPermissionUnavailable)):
+        raise exc
+    if not isinstance(exc, urllib.error.HTTPError):
+        return
+    if exc.code == 503:
+        raise ProductPermissionUnavailable() from exc
+    if exc.code == 403:
+        try:
+            body = json.loads(exc.read(65_536))
+        except (OSError, ValueError):
+            return
+        if isinstance(body, dict) and body.get("code") == "permission_denied":
+            raise ProductPermissionDenied() from exc
+
+
 def _cowork_state_dir() -> Path:
     base = os.environ.get("ANTON_COWORK_STATE_DIR")
     if base:
@@ -114,6 +133,17 @@ def _secret_str(val: SecretStr | str | None) -> str:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _lambda_artifact_key(result: dict) -> str:
+    """The upload lambda's own `artifact_key` echo, or "" when it sent none.
+
+    Kept apart from the `artifact_key` entry field, which falls back to cowork's
+    canonical key: that fallback is indistinguishable from an echo, and the two
+    imply DIFFERENT cloud comment scopes (stable key vs. composite), so mixing
+    them routes comments to a scope with no access rule behind it.
+    """
+    return str(result.get("artifact_key") or "").strip()
 
 
 def _write_published_map(published_json: Path, published_map: dict[str, Any]) -> None:
@@ -405,6 +435,20 @@ def publish_artifact(
     # changed so previously issued viewer grants invalidate.
     effective_access, pwd_version, access_version, owner_side = _resolve_access(password, access, previous)
 
+    # One identity spans private drafts, published versions, and comments. A
+    # legacy loose file has no metadata and keeps the service-generated key.
+    canonical_artifact_key: str | None = None
+    if (published_dir / "metadata.json").is_file():
+        from cowork.services.artifact_identity import artifact_key, ensure_full_id
+
+        artifact_id, _metadata = ensure_full_id(published_dir)
+        if scope is not None and scope.org_mode:
+            from cowork.services.artifact_authorization_identity import publish_authorization_key
+
+            canonical_artifact_key = publish_authorization_key(artifact_id, artifacts_base, scope)
+        else:
+            canonical_artifact_key = artifact_key(artifact_id)
+
     # Markdown is rendered to a throwaway index.html that we hand to the
     # publisher; `.html` and fullstack publish their real target directly.
     # `publish_target` stays the original artifact so the registry, history,
@@ -426,6 +470,7 @@ def publish_artifact(
             access=effective_access,
             access_version=access_version,
             pwd_version=pwd_version,
+            artifact_key=canonical_artifact_key,
             # Resolve datasource secrets from cowork's own vault
             # (`~/.cowork/data-vault`), not anton's default
             # (`~/.anton/data_vault`) — otherwise secrets are missed and
@@ -435,6 +480,7 @@ def publish_artifact(
             vault=vault_for_scope(scope),
         )
     except Exception as exc:
+        raise_publish_permission_error(exc)
         logger.exception("Publishing failed")
         # Only network/HTTP failures get the "Connection failed" framing — a
         # gateway timeout (e.g. a fullstack artifact whose deps take too long
@@ -470,7 +516,12 @@ def publish_artifact(
             "url": view_url,
             # Composite comments scope {user_dir}/{report_id} (Plan 4/5); persisted
             # so the comments panel can key threads after an app restart.
-            "artifact_key": result.get("artifact_key", ""),
+            "artifact_key": result.get("artifact_key") or canonical_artifact_key or "",
+            # The lambda's raw echo, or "" from an older lambda that sends none.
+            # Decides which scope the published page uses for comments; see
+            # services/comments_scope. Deliberately NOT merged with the field
+            # above, whose canonical fallback would read as an echo.
+            "lambda_artifact_key": _lambda_artifact_key(result),
             "last_md5": result.get("md5", ""),
             # Snapshot of the artifact's content mtime at publish time — the
             # cheap gate for the `modified` badge (see card_for_folder). Uses
@@ -492,8 +543,9 @@ def publish_artifact(
         "accessProtected": bool(owner_side.get("requires_password")),
         "accessEmails": owner_side.get("emails", []),
         "orgAllowed": bool(owner_side.get("org_allowed")),
+        "ownerOnly": bool(owner_side.get("owner_only")),
         # Composite comments scope for the panel (Plan 5).
-        "artifactKey": result.get("artifact_key", ""),
+        "artifactKey": result.get("artifact_key") or canonical_artifact_key or "",
         "result": {k: v for k, v in result.items() if k != "file_payload"},
     }
 
@@ -596,6 +648,7 @@ def unpublish_artifact(
             ssl_verify=ssl_verify,
         )
     except Exception as exc:
+        raise_publish_permission_error(exc)
         msg = str(exc) or "Unpublishing failed."
         if "404" in msg or "not found" in msg.lower():
             # Already gone upstream, OR still alive under another owner's prefix
@@ -622,6 +675,30 @@ def unpublish_artifact(
     return {"status": "ok"}
 
 
+def published_artifact_access(artifact: Path, *, artifacts_base: Path) -> dict:
+    """Return the stored access for a live artifact, or raise when it is not live.
+
+    Credential resolution deliberately lives outside this helper. Callers can
+    therefore distinguish an unpublished draft from a publish failure before
+    minting an org turn key or asking Desktop for configured provider settings.
+    """
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
+        artifact, container_dirs=[artifacts_base]
+    )
+    published_json = published_dir / ".published.json"
+    if not published_json.is_file():
+        raise FileNotFoundError("Artifact has no publish record")
+    try:
+        published_map: dict[str, Any] = json.loads(published_json.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError("Could not read publish record") from exc
+
+    entry = published_map.get(published_key)
+    if not isinstance(entry, dict) or not entry.get("published", True) or not entry.get("report_id"):
+        raise FileNotFoundError("No published version to update")
+    return access_from_owner_side(entry)
+
+
 def update_artifact(raw_path: str) -> dict:
     """Re-publish an already-published artifact, preserving its URL and access.
 
@@ -638,20 +715,7 @@ def update_artifact(raw_path: str) -> dict:
         artifact, container_dirs=[artifacts_base]
     )
     published_json = published_dir / ".published.json"
-    if not published_json.is_file():
-        raise FileNotFoundError("Artifact has no publish record")
-    try:
-        published_map: dict[str, Any] = json.loads(published_json.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise RuntimeError("Could not read publish record") from exc
-
-    entry = published_map.get(published_key)
-    if not isinstance(entry, dict) or not entry.get("published", True) or not entry.get("report_id"):
-        raise FileNotFoundError("No published version to update")
-
-    # Rebuild the cowork→publish access shape from the stored owner-side state
-    # (single source of truth in anton.publish_access).
-    access = access_from_owner_side(entry)
+    access = published_artifact_access(artifact, artifacts_base=artifacts_base)
 
     # Delegates: reuses report_id (read from .published.json) + refreshes last_md5.
     api_key, publish_url = desktop_publish_credential()
@@ -669,7 +733,7 @@ def update_artifact(raw_path: str) -> dict:
             fresh_map[published_key] = fresh_entry
             _write_published_map(published_json, fresh_map)
     except Exception:
-        pass
+        logger.warning("Could not refresh publish mtime for %s", published_dir, exc_info=True)
 
     return result
 

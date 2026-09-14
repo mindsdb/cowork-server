@@ -61,9 +61,46 @@ def _fetch_userinfo_google(access_token: str) -> dict[str, Any]:
     )
 
 
+def _fetch_linear_workspace(access_token: str) -> tuple[str, str]:
+    """Best-effort (workspace_id, workspace_name) for the token's Linear
+    workspace, or ("", "") on any failure.
+
+    Deliberately a separate request from `_fetch_userinfo_linear`'s viewer
+    query, not one combined query: `_json_request` only raises on a bad HTTP
+    status, but a GraphQL response can be HTTP 200 with an `errors` array
+    instead (e.g. an unknown field) — checked explicitly here, since bundling
+    this into the viewer query would make a broken/unverified organization
+    query capable of failing the whole Linear connection (auth's version of
+    this function raises on any `errors` array), not just miss the workspace
+    split."""
+    try:
+        result = _json_request(
+            "https://api.linear.app/graphql",
+            method="POST",
+            json_body={"query": "query { organization { id name } }"},
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        if result.get("errors"):
+            raise ValueError(f"Linear organization query returned errors: {result['errors']!r}")
+        organization = (result.get("data") or {}).get("organization") or {}
+        return str(organization.get("id") or "").strip(), str(organization.get("name") or "").strip()
+    except Exception:
+        _log.warning("Could not fetch Linear workspace identity — falling back to bare email", exc_info=True)
+        return "", ""
+
+
 def _fetch_userinfo_linear(access_token: str) -> dict[str, Any]:
     """Linear has no REST userinfo endpoint — identity comes from a GraphQL
-    query against the authenticated user (`viewer`)."""
+    query against the authenticated user (`viewer`).
+
+    Unlike Google, a Linear account isn't one-account-one-email: the same
+    email can belong to several workspaces. Folding the workspace id (from
+    `_fetch_linear_workspace`, best-effort) into the returned identity — the
+    same trick `_fetch_userinfo_supabase` above uses for its own
+    per-organization identity, rather than a new persisted field — means
+    connecting a second workspace gets its own connection tile instead of
+    silently overwriting the first (both derive_connection_name's slug and
+    is_same_account's dedup key come from this function's return value)."""
     result = _json_request(
         "https://api.linear.app/graphql",
         method="POST",
@@ -71,7 +108,55 @@ def _fetch_userinfo_linear(access_token: str) -> dict[str, Any]:
         headers={"Authorization": f"Bearer {access_token}"},
     )
     viewer = (result.get("data") or {}).get("viewer") or {}
-    return {"email": viewer.get("email", ""), "name": viewer.get("name", "")}
+    email = str(viewer.get("email") or "").strip()
+    name = str(viewer.get("name") or "").strip()
+    workspace_id, workspace_name = _fetch_linear_workspace(access_token)
+    return {
+        "email": f"{email}:{workspace_id}" if workspace_id else email,
+        # Workspace name first, matching _fetch_userinfo_supabase's
+        # per-organization identity convention above — the tile shows the
+        # workspace/org, not the connecting individual, the same way a
+        # Supabase tile shows the org rather than the person who authorized it.
+        "name": workspace_name or name,
+    }
+
+
+def _fetch_posthog_organization(access_token: str, *, api_host: str) -> tuple[str, str]:
+    """Best-effort (organization_id, organization_name) for the token's
+    PostHog organization(s), or ("", "") on any failure.
+
+    Deliberately a separate request from `_fetch_userinfo_posthog`'s user
+    query, not one combined call: the organization lookup is best-effort, so
+    an unexpected response shape degrades to "no organization split" instead
+    of failing the whole PostHog connection — same reasoning as
+    `_fetch_linear_workspace` above. Queries the SAME regional host the user
+    lookup already succeeded against, for the reason `_fetch_userinfo_posthog`
+    documents: a token issued for one region isn't guaranteed to be accepted
+    by the other's host.
+
+    PostHog's consent screen lets a user select multiple organizations in a
+    single authorization — unlike Linear, where one grant is exactly one
+    workspace — so `organization_name` joins every organization the token
+    can see (e.g. "Acme, Other Org"), not just the first, so the tile
+    accurately shows everything the connection actually covers.
+    `organization_id` still keys off the first organization only: it's used
+    solely for dedup, and a full multi-organization-aware dedup key is a
+    separate, not-yet-scoped improvement."""
+    try:
+        result = _json_request(
+            f"{api_host}/api/organizations/",
+            headers={"Authorization": f"Bearer {access_token}"},
+        )
+        organizations = result if isinstance(result, list) else (result.get("results") or [])
+        if not organizations:
+            return "", ""
+        organization_id = str(organizations[0].get("id") or "").strip()
+        names = [str(org.get("name") or "").strip() for org in organizations]
+        organization_name = ", ".join(name for name in names if name)
+        return organization_id, organization_name
+    except Exception:
+        _log.warning("Could not fetch PostHog organization identity — falling back to bare email", exc_info=True)
+        return "", ""
 
 
 def _fetch_userinfo_posthog(access_token: str) -> dict[str, Any]:
@@ -81,22 +166,39 @@ def _fetch_userinfo_posthog(access_token: str) -> dict[str, Any]:
     (us.posthog.com / eu.posthog.com) and a token issued for one region is
     not guaranteed to be accepted by the other's host. Try US Cloud first
     (the default/most common case) and fall back to EU Cloud on failure,
-    rather than requiring the caller to know the account's region upfront."""
+    rather than requiring the caller to know the account's region upfront.
+
+    Unlike Google, a PostHog account isn't one-account-one-email: the same
+    email can belong to several organizations. Folding the organization id
+    (from `_fetch_posthog_organization`, best-effort) into the returned
+    identity — the same trick `_fetch_userinfo_supabase`/`_fetch_userinfo_linear`
+    above use for their own per-organization identity — means connecting a
+    second organization gets its own connection tile instead of silently
+    overwriting the first."""
+    api_host = "https://us.posthog.com"
     try:
         result = _json_request(
-            "https://us.posthog.com/api/users/@me/",
+            f"{api_host}/api/users/@me/",
             headers={"Authorization": f"Bearer {access_token}"},
         )
     except HTTPException:
+        api_host = "https://eu.posthog.com"
         result = _json_request(
-            "https://eu.posthog.com/api/users/@me/",
+            f"{api_host}/api/users/@me/",
             headers={"Authorization": f"Bearer {access_token}"},
         )
     email = str(result.get("email") or "").strip()
     first_name = str(result.get("first_name") or "").strip()
     last_name = str(result.get("last_name") or "").strip()
     name = " ".join(part for part in (first_name, last_name) if part)
-    return {"email": email, "name": name or email}
+    org_id, org_name = _fetch_posthog_organization(access_token, api_host=api_host)
+    return {
+        "email": f"{email}:{org_id}" if org_id else email,
+        # Organization name first, matching _fetch_userinfo_supabase's/
+        # _fetch_userinfo_linear's per-organization identity convention
+        # above — the tile shows the org, not the connecting individual.
+        "name": org_name or name or email,
+    }
 
 
 def _fetch_userinfo_github(access_token: str) -> dict[str, Any]:
@@ -445,7 +547,16 @@ class OAuthService:
             # identity-derived match (is_same_account) updates the existing record
             # in place, carrying forward Google Picker grants and any label,
             # instead of leaving a stale duplicate connection behind.
-            connection_name = persist_connection(cfg.engine, "browser_oauth_builtin", "", new_fields)
+            #
+            # default_label=account_name gives a brand-new connection's tile a
+            # meaningful title (the account/org/workspace name the provider
+            # returned) instead of the generic engine-id default — but only
+            # for a genuinely new connection; it can never clobber a label the
+            # user already set on a reconnect (see persist_connection's
+            # default_label docs).
+            connection_name = persist_connection(
+                cfg.engine, "browser_oauth_builtin", "", new_fields, default_label=account_name or None
+            )
         except HTTPException as exc:
             err_msg = str(exc.detail)
             store.clear_pending(service, error=err_msg)

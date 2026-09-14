@@ -7,6 +7,9 @@ A MindsHub Workspace is an org-internal container that owns hub resources and
 lives in the auth service. It is unrelated to the filesystem directories this
 repo calls workspaces; the stored key is ``hub_workspace_id`` for that reason.
 
+The listing is answered whatever its length. Whether a client draws a control
+is the client's decision, and Cowork's is to draw nothing below two rows.
+
 **This selector changes what the client shows, not what a turn is billed to.**
 Which workspace a usage row carries is decided by the credential the turn
 presents, and neither credential carries one today: a desktop turn runs against
@@ -22,6 +25,13 @@ That is fine rather than a hole, and only because of where the filtering lives:
 id the caller holds no grant on resolves to the default workspace and the menu
 renders the same rows either way. The stored value decides which row carries a
 check, never which rows exist. Move the filtering and that stops being true.
+
+So nothing that REFUSES a request may read it. The archived check on
+``PUT /active`` reads the target row's own ``archived_at`` for exactly that
+reason: phrasing it as "is this in the set the menu offered" would have gone
+through ``selectable``, which keeps the active row even when archived, and one
+call to the settings route would then have made an archived workspace current
+and talked the refusal into accepting it.
 """
 
 from __future__ import annotations
@@ -32,6 +42,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlmodel import Session
 
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
 from cowork.principal import hub_credential
@@ -50,7 +61,13 @@ from cowork.services.settings import SettingService
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+# AuthenticatedInOrgMode, declared explicitly: both routes have no local check
+# of their own — they rely on authorization_ui_enabled() calling auth's
+# GET /v1/entitlements/me/ with the caller's bearer, which fails closed (no
+# gate = not enabled) on a missing/invalid bearer just as much as on the gate
+# being off. Declaring it too makes the requirement visible to a route walker
+# instead of something only discoverable by reading that fail-closed call.
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 SessionDep = Annotated[Session, Depends(get_session)]
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
@@ -75,10 +92,11 @@ async def _build_view(
     """
     bearer = hub_credential(request)
     org_id = scope.org_id or ""
-    if not await authorization_ui_enabled(bearer_token=bearer, org_id=org_id):
+    user_id = scope.user_id or ""
+    if not await authorization_ui_enabled(bearer_token=bearer, org_id=org_id, user_id=user_id):
         return _DISABLED
 
-    listing = await fetch_hub_workspaces(bearer_token=bearer, org_id=org_id)
+    listing = await fetch_hub_workspaces(bearer_token=bearer, org_id=org_id, user_id=user_id)
     stored = SettingService(session, scope).load().hub_workspace_id
     active = resolve_active(listing.workspaces, stored)
     active_id = active.id if active else None
@@ -116,16 +134,23 @@ async def set_active_hub_workspace(
     refuses rather than storing an id nobody could verify: a stored id that names
     nothing resolves to the default workspace on the next read, which would look
     like the switch silently doing nothing.
+
+    Two refusals rather than one, because "you may not" and "not any more" are
+    different answers and the client can only act on one of them. A workspace
+    missing from the listing is a grant the caller does not hold, and that is a
+    403. A workspace in the listing but stamped archived is a 409, so the UI can
+    say retrying will not help instead of offering a loop with no exit.
     """
     bearer = hub_credential(request)
     org_id = scope.org_id or ""
-    if not await authorization_ui_enabled(bearer_token=bearer, org_id=org_id):
+    user_id = scope.user_id or ""
+    if not await authorization_ui_enabled(bearer_token=bearer, org_id=org_id, user_id=user_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="workspace selection is not enabled",
         )
 
-    listing = await fetch_hub_workspaces(bearer_token=bearer, org_id=org_id)
+    listing = await fetch_hub_workspaces(bearer_token=bearer, org_id=org_id, user_id=user_id)
     if not listing.reachable:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -135,6 +160,23 @@ async def set_active_hub_workspace(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="no access to that workspace",
+        )
+
+    # Archived is refused on the target's own flag, deliberately NOT by asking
+    # whether it is in `selectable(...)`. `selectable` keeps the active row even
+    # when archived, so the set it returns depends on the stored pick, and the
+    # stored pick has a second writer that grants nothing (see this module's
+    # header): `PUT /api/v1/settings/hub_workspace_id` writes the same key with
+    # no gate and no listing check. Reading the offered set here would have let
+    # one call to that route make an archived workspace "current", and the
+    # refusal below would then wave it through. Nobody loses anything by reading
+    # the flag instead: re-selecting the archived workspace you are already in is
+    # a no-op, and every other row in the menu is live.
+    target = next(w for w in listing.workspaces if w.id == body.workspace_id)
+    if target.archived_at:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="that workspace is archived",
         )
 
     SettingService(session, scope).upsert_setting(SETTING_KEY, body.workspace_id)

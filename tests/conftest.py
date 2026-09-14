@@ -56,3 +56,40 @@ def db_schema():
             session.add(Project(id=GENERAL_PROJECT_ID, name=GENERAL_PROJECT, path=str(general_dir)))
             session.commit()
     yield
+
+
+@pytest.fixture(autouse=True)
+def close_coding_services():
+    yield
+    from coding_service_fakes import close_services
+
+    close_services()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def trust_test_client_host():
+    """Starlette's TestClient sends ``Host: testserver``; only tests trust it."""
+    from cowork.api.v1.endpoints import guards
+
+    production = guards._TRUSTED_LOOPBACK_HOSTS
+    guards._TRUSTED_LOOPBACK_HOSTS = production | {"testserver"}
+    yield
+    guards._TRUSTED_LOOPBACK_HOSTS = production
+
+
+@pytest.fixture
+def granted_product_permissions(monkeypatch):
+    """Model built-in Member grants only for suites testing resource ownership.
+
+    Tests of live role decisions opt out and exercise the internal HTTP boundary.
+    This fixture does not override artifact ownership or tenancy resolution.
+    """
+    from cowork.services import product_permissions
+    from cowork.api.v1.endpoints import artifact_workspace
+
+    async def allowed(scope, permission):
+        assert permission in {"product.execute", "artifact.manage"}
+        return True
+
+    monkeypatch.setattr(product_permissions, "has_product_permission", allowed)
+    monkeypatch.setattr(artifact_workspace, "has_product_permission", allowed)

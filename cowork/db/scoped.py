@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import Depends, Request
-from sqlalchemy import event
+from sqlalchemy import event, inspect
 from sqlalchemy.sql import Select
 from sqlmodel import Session, select
 
@@ -65,24 +65,55 @@ def scope_from_principal(principal: Principal | None) -> TenantScope:
     )
 
 
+def scope_for_org(org_id: str | None) -> TenantScope:
+    """Scope for a background or webhook-routed operation with a known org_id.
+    Local mode (no org) returns LOCAL_SCOPE; org mode returns an org-scoped
+    TenantScope. Replaces the inline pattern:
+    `SYSTEM_SCOPE if org_id is None else TenantScope(org_mode=True, org_id=org_id)`."""
+    return LOCAL_SCOPE if org_id is None else TenantScope(org_mode=True, org_id=org_id)
+
+
 def get_tenant_scope(request: Request) -> TenantScope:
     """FastAPI dependency: the request's tenant scope."""
     return scope_from_principal(get_principal(request))
 
 
 def scope_for_background_context() -> TenantScope:
-    """Scope for code with no request principal (scheduler, channels).
+    """Scope for code with no request principal and no owning row to derive one
+    from (channels: an inbound webhook has no per-org routing yet, so there is
+    nothing to build a service principal out of).
 
-    Local mode → LOCAL_SCOPE (today's behavior). Org mode → fail closed:
-    background work needs a service principal (deferred to the service-identity
-    ticket), and org mode must never silently write unscoped rows that users
-    can't see. Fail loud instead of creating invisible data.
+    Local mode → LOCAL_SCOPE (today's behavior). Org mode → fail closed: this
+    caller has no service principal available (channels are 501-gated in org
+    mode for the same reason), and org mode must never silently write unscoped
+    rows that users can't see. Fail loud instead of creating invisible data.
+    See `service_principal_for` for callers that DO have an owning row.
     """
     if get_app_settings().tenancy_mode != "org":
         return LOCAL_SCOPE
     raise MissingTenantScopeError(
         "background conversation creation requires a service principal (not yet implemented in org mode)"
     )
+
+
+def service_principal_for(org_id: str | None, user_id: str | None) -> Principal | None:
+    """Principal for a background job driven by a stored row's own org_id/created_by
+    (e.g. a fired Schedule) — there is no inbound request or gateway header to build
+    one from, but the row already carries who owns it from when it was created
+    through the normal request-scoped path.
+
+    Local mode → None (nothing to scope). Org mode → Principal from the row's own
+    identity, or fail closed if the row predates org stamping (a legacy/local row
+    with no org_id or created_by) — same "fail loud, never invisible" rule as
+    `scope_for_background_context`.
+    """
+    if get_app_settings().tenancy_mode != "org":
+        return None
+    if not org_id or not user_id:
+        raise MissingTenantScopeError(
+            "background job's row has no org_id/created_by to build a service principal from"
+        )
+    return Principal(user_id=user_id, org_id=org_id)
 
 
 def scoped_storage_root(base: Path, scope: TenantScope | None, *, store: str) -> Path:
@@ -108,7 +139,9 @@ def scoped_storage_root(base: Path, scope: TenantScope | None, *, store: str) ->
     if not scope.org_mode:
         return base
     if not scope.org_id:
-        raise MissingTenantScopeError("filesystem store requires an organization in scope")
+        raise MissingTenantScopeError(
+            "filesystem store requires an organization in scope"
+        )
     # "" is silently dropped by pathlib (store collapses onto the org root);
     # "."/".."/separators would escape it.
     if not store or store in (".", "..") or "/" in store or "\\" in store:
@@ -117,7 +150,9 @@ def scoped_storage_root(base: Path, scope: TenantScope | None, *, store: str) ->
     return shared / scope.org_id / store
 
 
-def scoped_user_storage_root(base: Path, scope: TenantScope | None, *, store: str) -> Path:
+def scoped_user_storage_root(
+    base: Path, scope: TenantScope | None, *, store: str
+) -> Path:
     """``<shared_root>/<org_id>/<store>/users/<user_id>``, for stores that are one
     person's rather than the org's. ``base`` in local mode (one user per machine);
     org mode fail-closes without BOTH ids, since silently sharing one person's
@@ -140,7 +175,9 @@ def scoped_user_storage_root(base: Path, scope: TenantScope | None, *, store: st
     if not scope.org_mode:
         return base
     if not scope.user_id:
-        raise MissingTenantScopeError("per-user filesystem store requires a user in scope")
+        raise MissingTenantScopeError(
+            "per-user filesystem store requires a user in scope"
+        )
     return scoped_storage_root(base, scope, store=store) / "users" / scope.user_id
 
 
@@ -180,6 +217,7 @@ class ScopedSelect:
     def __getattr__(self, name: str) -> Any:
         attr = getattr(self._stmt, name)
         if callable(attr):
+
             def _wrapped(*args: Any, **kwargs: Any) -> Any:
                 result = attr(*args, **kwargs)
                 return ScopedSelect(result) if isinstance(result, Select) else result
@@ -231,10 +269,7 @@ class ScopedSession:
                         f"org_id={self.scope.org_id!r}"
                     )
         for row in session.new:
-            if (
-                self.scope.user_id
-                and getattr(row, "created_by", "missing") is None
-            ):
+            if self.scope.user_id and getattr(row, "created_by", "missing") is None:
                 row.created_by = self.scope.user_id
         for row in session.deleted:
             if _is_org_scoped(type(row)):
@@ -260,14 +295,20 @@ class ScopedSession:
 
     def exec(self, stmt: ScopedSelect) -> Any:
         if not isinstance(stmt, ScopedSelect):
-            raise TypeError("ScopedSession.exec only runs statements built by .select()")
+            raise TypeError(
+                "ScopedSession.exec only runs statements built by .select()"
+            )
         return self._session.exec(stmt._stmt)
 
     def get(self, model: type, ident: Any) -> Any:
         if _is_org_scoped(model):
             self._require_org(model)
             row = self._session.get(model, ident)
-            if row is not None and self.scope.org_mode and row.org_id != self.scope.org_id:
+            if (
+                row is not None
+                and self.scope.org_mode
+                and row.org_id != self.scope.org_id
+            ):
                 return None
             return row
         return self._session.get(model, ident)
@@ -287,6 +328,7 @@ class ScopedSession:
         if (
             self.scope.org_mode
             and self.scope.user_id
+            and inspect(row).transient
             and getattr(row, "created_by", "missing") is None
         ):
             row.created_by = self.scope.user_id
@@ -313,6 +355,10 @@ class ScopedSession:
 
     def rollback(self) -> None:
         self._session.rollback()
+
+    def get_bind(self) -> Any:
+        """Return the scoped session's engine for server-owned coordination."""
+        return self._session.get_bind()
 
     def close(self) -> None:
         self._session.close()

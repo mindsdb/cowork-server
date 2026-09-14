@@ -2,6 +2,8 @@
 
 from typing import Optional
 
+from pydantic import Field
+
 from cowork.schemas.base import CamelRequest, CamelResponse
 
 
@@ -32,7 +34,7 @@ class HubWorkspaceView(CamelResponse):
 
     enabled: bool = False
     reachable: bool = False
-    workspaces: list[HubWorkspaceRow] = []
+    workspaces: list[HubWorkspaceRow] = Field(default_factory=list)
     active_workspace_id: Optional[str] = None
 
 

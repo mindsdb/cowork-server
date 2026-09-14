@@ -52,6 +52,7 @@ class ChannelInstallationResponse(BaseModel):
     display_name: str
     enabled: bool
     status: InstallationStatus
+    external_account_id: str | None = None
     created_at: datetime | None = None
     modified_at: datetime | None = None
 
@@ -134,6 +135,7 @@ class PluginCapabilities(BaseModel):
     supports_oauth: bool = False
     supports_direct_credentials: bool = True
     supports_custom_ack: bool = False
+    supports_verify: bool = False
 
 
 class PluginResponse(BaseModel):
@@ -143,6 +145,8 @@ class PluginResponse(BaseModel):
     has_oauth: bool = False
     webhook_paths: list[str] = []
     capabilities: PluginCapabilities
+    # False if no per-org webhook routing key (Telegram, WhatsApp); True in local mode.
+    org_ready: bool = True
 
 
 class CredentialValue(BaseModel):
@@ -191,4 +195,10 @@ class ChannelLifecycleResponse(BaseModel):
     channel_type: str
     action: str  # "setup" | "teardown"
     active: bool
+    detail: str
+
+
+class ChannelTestConnectionResponse(BaseModel):
+    channel_type: str
+    ok: bool
     detail: str

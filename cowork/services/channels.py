@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from cowork.channels.plugin import ChannelPlugin
+from sqlmodel import Session, select
+
+from cowork.channels.plugin import ChannelPlugin, VerifyResult
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.common.encryption import decrypt, encrypt
-from cowork.db.scoped import ScopedSession
+from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import MissingTenantScopeError, ScopedSession
 from cowork.models.channel import ChannelInstallation
 from cowork.models.setting import Setting
 from cowork.schemas.channels import (
@@ -26,6 +29,36 @@ def _cred_key(channel_type: str, field: str) -> str:
 
 class UnknownChannelError(Exception):
     """Raised when a channel_type has no registered plugin (→ 404 at the edge)."""
+
+
+def is_org_ready(plugin: ChannelPlugin) -> bool:
+    """Whether org-mode tenants can safely configure this channel.
+
+    Always true in local mode — one tenant, nothing to resolve. In org mode,
+    true iff the plugin has a per-org routing-key extractor (Slack, Discord
+    today): without one, an inbound webhook can never resolve to an org, so
+    configuring it would silently never deliver."""
+    if get_app_settings().tenancy_mode != "org":
+        return True
+    return plugin.extract_routing_key is not None
+
+
+def resolve_installation_by_external_account(
+    session: Session, channel_type: str, external_account_id: str
+) -> ChannelInstallation | None:
+    """Which installation claims this platform account (Slack team_id, Discord
+    guild_id, ...), looked up BEFORE any org scope exists — an inbound webhook
+    has none yet; this lookup is what establishes one. Takes a raw Session, on
+    purpose: a ScopedSession would need a scope we don't have until this
+    returns. None means no installation claims this account at all; a
+    returned row with org_id=None means the local/desktop installation
+    matched — the caller decides what to do with either case."""
+    return session.exec(
+        select(ChannelInstallation).where(
+            ChannelInstallation.channel_type == channel_type,
+            ChannelInstallation.external_account_id == external_account_id,
+        )
+    ).first()
 
 
 class ChannelConfigService:
@@ -68,6 +101,22 @@ class ChannelConfigService:
         plugin = self._require_plugin(channel_type)
         return self._config_dto(plugin)
 
+    async def test_connection(self, channel_type: str) -> VerifyResult:
+        """Calls the plugin's `verify` hook against the currently STORED
+        credentials — proof they actually authenticate, not just that
+        `_is_configured` found something typed into every required field."""
+        plugin = self._require_plugin(channel_type)
+        if plugin.verify is None:
+            return VerifyResult(ok=False, detail=f"{plugin.display_name} has no connection test yet")
+        result = await plugin.verify(self.load_credentials(channel_type))
+        # Stamp the discovered routing key onto the installation (in org mode, so
+        # webhooks can route to the right org; in local mode, for webhook deduping).
+        # If another org claimed this platform account, IntegrityError surfaces the
+        # conflict and the caller decides whether to proceed.
+        if result.ok and result.routing_key:
+            self.set_external_account_id(channel_type, result.routing_key)
+        return result
+
     def load_credentials(self, channel_type: str) -> dict[str, str]:
         """Decrypted credential values for internal runtime use only — building
         the live adapter. NEVER exposed via the API (get_config masks secrets)."""
@@ -96,6 +145,20 @@ class ChannelConfigService:
         self._ensure_installation(plugin)
         self.session.commit()
         return self._config_dto(plugin)
+
+    def set_external_account_id(self, channel_type: str, external_account_id: str) -> None:
+        """Stamp the pre-scope webhook-routing key onto this org's installation
+        (creating it if this is the first thing configured). Raises IntegrityError
+        if another org already claimed this platform account — the unique index
+        is the actual guarantee; this call just surfaces the same failure a
+        credential write already would."""
+        plugin = self._require_plugin(channel_type)
+        self._org_id()  # fail closed before touching anything, same as set_config
+        self._ensure_installation(plugin)
+        install = self._fetch_installation(channel_type)
+        install.external_account_id = external_account_id
+        self.session.add(install)
+        self.session.commit()
 
     def delete_config(self, channel_type: str) -> bool:
         plugin = self._require_plugin(channel_type)
@@ -135,6 +198,7 @@ class ChannelConfigService:
             capabilities=PluginCapabilities.model_validate(
                 plugin.capabilities, from_attributes=True
             ),
+            org_ready=is_org_ready(plugin),
         )
 
     def _config_dto(self, plugin: ChannelPlugin) -> ChannelConfigResponse:
@@ -163,27 +227,52 @@ class ChannelConfigService:
             for name in required
         )
 
+    def _org_id(self) -> str | None:
+        """Org-wide, not per-member: one installation's credentials serve the
+        whole org, matching how provider credentials are already scoped
+        (SettingService). Fails closed rather than falling back to a global
+        row — a channel credential belonging to no specific org must never be
+        readable or writable once org mode is on."""
+        scope = self.session.scope
+        if not scope.org_mode:
+            return None
+        if not scope.org_id:
+            raise MissingTenantScopeError("channel config requires an organization in scope")
+        return scope.org_id
+
     def _fetch_setting(self, key: str) -> Setting | None:
-        # Channel creds are global (key-only) rows here, bypassing SettingService
-        # scope routing — safe only because org mode refuses these routes (403).
-        return self.session.exec(
-            self.session.select(Setting).where(Setting.key == key)
-        ).first()
+        # Not routed through SettingService (its keys are fixed UserSettings
+        # fields; these are dynamic) but uses the same scope columns, org-wide.
+        org_id = self._org_id()
+        stmt = self.session.select(Setting).where(Setting.key == key)
+        if org_id is None:
+            stmt = stmt.where(Setting.scope.is_(None))
+        else:
+            stmt = stmt.where(Setting.scope == "org", Setting.org_id == org_id)
+        return self.session.exec(stmt).first()
 
     def _upsert_setting(self, key: str, value: str) -> None:
         row = self._fetch_setting(key)
         if row is None:
-            row = Setting(key=key, value=value)
+            org_id = self._org_id()
+            if org_id is None:
+                row = Setting(key=key, value=value)
+            else:
+                row = Setting(key=key, value=value, scope="org", org_id=org_id)
         else:
             row.value = value
         self.session.add(row)
 
     def _fetch_installation(self, channel_type: str) -> ChannelInstallation | None:
-        return self.session.exec(
-            self.session.select(ChannelInstallation).where(
-                ChannelInstallation.channel_type == channel_type
-            )
-        ).first()
+        org_id = self._org_id()
+        stmt = self.session.select(ChannelInstallation).where(
+            ChannelInstallation.channel_type == channel_type
+        )
+        stmt = stmt.where(
+            ChannelInstallation.org_id.is_(None) if org_id is None
+            else ChannelInstallation.org_id == org_id
+        )
+        return self.session.exec(stmt).first()
 
     def _ensure_installation(self, plugin: ChannelPlugin) -> None:
         """Create the installation row on first config write. Enable/status are
@@ -193,5 +282,6 @@ class ChannelConfigService:
                 ChannelInstallation(
                     channel_type=plugin.channel_type,
                     display_name=plugin.display_name,
+                    org_id=self._org_id(),
                 )
             )

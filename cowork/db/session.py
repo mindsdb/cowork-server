@@ -15,6 +15,12 @@ _engines = {}
 _session_factories = {}
 
 
+
+def _is_client_error(exc: BaseException) -> bool:
+    """True for HTTP exceptions answered as 4xx; those are expected outcomes."""
+    status = getattr(exc, "status_code", None)
+    return isinstance(status, int) and 400 <= status < 500
+
 def _create_engine(db_uri: str):
     is_sqlite = db_uri.startswith("sqlite")
     try:
@@ -102,7 +108,13 @@ def get_session(db_uri: str = settings.database.uri):
         logger.debug("🔗 Created database session")
         yield db
     except Exception as e:
-        logger.exception(f"❌ Session error: {str(e)}")
+        # A 4xx HTTPException is the endpoint's intended answer (a 409 for a
+        # steer during an approval, a 404 for a missing task); it still rolls
+        # the transaction back, but it is not an error worth a traceback.
+        if _is_client_error(e):
+            logger.debug(f"Session rolled back after a client error: {e}")
+        else:
+            logger.exception(f"❌ Session error: {str(e)}")
         db.rollback()
         raise
     finally:

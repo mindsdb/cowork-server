@@ -15,11 +15,19 @@ from __future__ import annotations
 import json
 import logging
 from typing import Annotated, Any, Optional
+from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlmodel import Session
 
-from cowork.api.v1.endpoints.guards import require_local, require_local_tenancy
+from cowork.api.v1.endpoints.guards import require_local_in_desktop_mode
+from cowork.api.v1.permissions import (
+    AuthenticatedInOrgMode,
+    LoopbackDesktopOnly,
+    LoopbackOnly,
+    OpenByDesign,
+    require,
+)
 from cowork.common.paths import cowork_home
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
@@ -51,9 +59,11 @@ from cowork.common.settings.app_settings import (
     DIRECT_EFFORT_CATALOG,
     RECOMMENDED_MODELS,
     RECOMMENDED_PAIR,
+    default_minds_api_host,
 )
 from cowork.common.settings.user_settings import (
     Provider,
+    UserSettings,
     minds_role_start_models,
     provider_api_key_str,
     setting_is_org_scoped,
@@ -84,7 +94,16 @@ def _require_org_admin_for(keys, scope: TenantScope, principal: Principal | None
         )
 
 
-@router.get("/", response_model=list[SettingResponse])
+# AuthenticatedInOrgMode, not OpenByDesign: SettingService masks every
+# sensitive field to null (_to_response, cowork/services/settings.py), so no
+# key value escapes — but the row it reads is deployment-global (`settings` is
+# in _TENANCY_DEFERRED_TABLES, cowork/db/scoped.py), and what is left after
+# masking is still this deployment's configuration: which providers are set,
+# their base URLs, the model choices. "No secret leaks" is a bound on the
+# damage, not a reason the route needs no caller.
+@router.get(
+    "/", response_model=list[SettingResponse], dependencies=[Depends(require(AuthenticatedInOrgMode))]
+)
 def list_settings(session: SessionDep, scope: ScopeDep) -> list[SettingResponse]:
     return SettingService(session, scope).list_settings()
 
@@ -179,7 +198,14 @@ async def _reject_unservable_models(
             )
 
 
-@router.put("/")
+# AuthenticatedInOrgMode, declared explicitly: SettingService's write path
+# already fails closed on its own (_require_writable -> MissingTenantScopeError
+# -> 401, cowork/services/settings.py) whenever org mode has no org in scope.
+# Declaring it too makes the requirement visible to a route walker. Org-admin
+# gating on org-scoped keys stays in _require_org_admin_for below — it's
+# conditional on which keys are in the request body, not a blanket per-route
+# check a declared dependency can express.
+@router.put("/", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def bulk_upsert_settings(
     body: SettingsBulkUpsertRequest,
     session: SessionDep,
@@ -207,7 +233,9 @@ async def bulk_upsert_settings(
     return {"updated": updated}
 
 
-@router.put("/{key}", response_model=SettingResponse)
+# AuthenticatedInOrgMode, declared explicitly: same _require_writable
+# fail-closed reasoning as bulk_upsert_settings above.
+@router.put("/{key}", response_model=SettingResponse, dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def upsert_setting(
     key: str,
     body: SettingUpsertRequest,
@@ -225,7 +253,9 @@ async def upsert_setting(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
-@router.delete("/{key}")
+# AuthenticatedInOrgMode, declared explicitly: same _require_writable
+# fail-closed reasoning as bulk_upsert_settings above.
+@router.delete("/{key}", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 def delete_setting(key: str, session: SessionDep, scope: ScopeDep, principal: PrincipalDep):
     _require_org_admin_for([key], scope, principal)
     try:
@@ -243,7 +273,10 @@ def delete_setting(key: str, session: SessionDep, scope: ScopeDep, principal: Pr
 # ── Provider validation & testing ────────────────────────────────────
 
 
-@router.post("/validate")
+# AuthenticatedInOrgMode, same reasoning as list_settings above: no key value
+# is returned, but the provider and model names that are belong to the
+# deployment-global config rather than to the caller.
+@router.post("/validate", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 def validate_settings(session: SessionDep, scope: ScopeDep):
     s = SettingService(session, scope).load()
     cs = check_config_status(s)
@@ -256,7 +289,9 @@ def validate_settings(session: SessionDep, scope: ScopeDep):
     }
 
 
-@router.get("/configured")
+# AuthenticatedInOrgMode, same reasoning as validate_settings above: a
+# provider name and a configured flag are still the deployment's config.
+@router.get("/configured", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 def check_configured(session: SessionDep, scope: ScopeDep):
     s = SettingService(session, scope).load()
     if s.minds_api_key is not None:
@@ -275,7 +310,18 @@ def check_configured(session: SessionDep, scope: ScopeDep):
     return {"configured": False, "provider": ""}
 
 
-@router.post("/logout")
+# OpenByDesign, standalone reason: what protects this route is
+# require_local_in_desktop_mode below. In org mode it is a deliberate no-op
+# (credentials are org-owned there, see the docstring) and needs no caller; in
+# local mode it DELETES every stored credential, so the desktop half takes the
+# same loopback restriction as reveal-key and /raw. The only caller is
+# Electron main's sign-out (cowork src/main/sign-out.ts), already over
+# 127.0.0.1; without the guard, a plain POST from any page or network peer
+# signs the desktop install out.
+@router.post(
+    "/logout",
+    dependencies=[Depends(require_local_in_desktop_mode), Depends(require(OpenByDesign))],
+)
 def logout_clear_credentials(session: SessionDep, scope: ScopeDep):
     """Clear all stored credentials from the DB (desktop sign-out flow, so
     ``/health`` returns ``config_ready: false``; preferences are kept).
@@ -289,15 +335,17 @@ def logout_clear_credentials(session: SessionDep, scope: ScopeDep):
     return {"ok": True, "deleted": deleted}
 
 
-@router.get("/install-status")
+# OpenByDesign, standalone reason: hardcoded stub response, nothing to
+# expose.
+@router.get("/install-status", dependencies=[Depends(require(OpenByDesign))])
 def install_status():
     return {"antonInstalled": True, "serverDepsReady": True}
 
 
-@router.get("/reveal-key/{name}")
-def reveal_key(name: str, session: SessionDep, scope: ScopeDep, request: Request):
-    # reveal-key returns an unmasked provider secret — loopback only (ENG-457).
-    require_local(request)
+# LoopbackOnly: returns an unmasked provider secret, so the credential is the
+# caller being on this machine, not who they are (ENG-457).
+@router.get("/reveal-key/{name}", dependencies=[Depends(require(LoopbackOnly))])
+def reveal_key(name: str, session: SessionDep, scope: ScopeDep):
     name_map = {
         "anthropic": Provider.ANTHROPIC,
         "openai": Provider.OPENAI,
@@ -318,7 +366,103 @@ class _TestProvidersBody(BaseModel):
     providers: Optional[list[dict[str, Any]]] = None
 
 
-@router.post("/test-providers")
+#: Provider types whose ping target comes out of the request body instead of
+#: a hardcoded vendor host (``ping_provider``, cowork/services/providers.py).
+#: Every other type is pinned to api.anthropic.com / api.openai.com /
+#: generativelanguage.googleapis.com and cannot be aimed anywhere.
+_BODY_SUPPLIED_URL_FIELD = {"openai-compatible": "baseUrl", "minds-cloud": "mindsUrl"}
+
+
+def _origin(url: object) -> str:
+    """``scheme://host[:port]`` for ``url``, or ``""`` when it names no host.
+
+    The guard below compares origins rather than whole URL strings, because
+    the question it asks is which party receives the key, and that is the
+    host. Comparing whole strings refused hosts this deployment does reach:
+    a stored URL may carry a path where the body sends the host alone, which
+    is what ``minds_url`` does whenever no row was written and
+    ``default_minds_url`` supplies ``<host>/v1``. ``minds_chat_base_url``
+    (cowork/services/providers.py) resolves both spellings to the same
+    request, so they were never two targets. Parsing also defeats a userinfo
+    prefix, where ``https://api.mindshub.ai@evil.test`` reads as host
+    ``evil.test``; ``is_minds_host`` in the same module parses for that
+    reason.
+
+    Answers ``""`` for anything it cannot parse, because both callers hand it
+    untrusted text and neither can absorb an exception. The body field is
+    whatever the caller sent; a ``providers_json`` card holds whatever was
+    stored. Four shapes reach here that ``urlsplit`` will not take: a
+    non-string, an unbalanced ``[``, a port that is not an integer in range,
+    and a netloc that NFKC-normalizes into a delimiter. Each has to read as
+    "no origin", which refuses a caller's URL and drops a stored one from the
+    allowlist instead of 500-ing the whole batch. ``is_minds_host`` guards the
+    same call for the same reason and says so.
+    """
+    if not isinstance(url, str):
+        return ""
+    try:
+        parts = urlsplit(url.strip())
+        hostname = parts.hostname
+        port = parts.port
+    except ValueError:
+        return ""
+    if not hostname:
+        return ""
+    # `is not None`, not truthiness: port 0 names a different listener from a
+    # URL that carries no port at all.
+    suffix = f":{port}" if port is not None else ""
+    return f"{parts.scheme.lower()}://{hostname}{suffix}"
+
+
+def _stored_origins_for(settings: UserSettings, ptype: str) -> set[str]:
+    """Every ping target this deployment has actually stored for ``ptype``.
+
+    The provider cards in ``providers_json`` are what the Settings UI edits
+    and each carries its own ``baseUrl``, so a deployment can legitimately
+    hold several. The scalar ``openai_base_url``/``minds_url`` settings are
+    included too, since a config written before the cards existed only has
+    those.
+    """
+    origins = set()
+    try:
+        cards = json.loads(settings.providers_json or "[]")
+    except (ValueError, TypeError):
+        cards = []
+    # Decoding is not the same as getting a list to walk: `json.loads("null")`
+    # succeeds and hands back None, and a bare number decodes to an int. Both
+    # are storable, because providers_json is a plain string setting with no
+    # shape validation on write.
+    if not isinstance(cards, list):
+        cards = []
+    field = _BODY_SUPPLIED_URL_FIELD.get(ptype)
+    for card in cards:
+        if not isinstance(card, dict):
+            continue
+        # `.get(key, "")` hands back a stored null rather than the default,
+        # and a card carrying `"type": null` is storable: providers_json is a
+        # plain string setting with no shape validation on write.
+        if (card.get("type") or "").replace("_", "-") != ptype:
+            continue
+        # Parse on the way in, not on the way out: a card's URL is whatever
+        # was stored, and an unhashable one never even reaches a set.
+        origins.add(_origin(card.get(field)))
+    if ptype == "openai-compatible":
+        origins.add(_origin(settings.openai_base_url))
+    if ptype == "minds-cloud":
+        origins.add(_origin(settings.minds_url))
+        # A minds-cloud ping that omits mindsUrl goes here (``ping_provider``,
+        # cowork/services/providers.py), so naming this host is a destination
+        # the caller already reaches, not a new one.
+        origins.add(_origin(default_minds_api_host()))
+    return {o for o in origins if o}
+
+
+# AuthenticatedInOrgMode, and a URL check underneath it. The permission stops
+# an anonymous caller spending the deployment's stored keys on probes;
+# _foreign_ping_url_field below stops ANY caller, member included, choosing
+# the host a stored key is sent to. Two layers because they answer different
+# questions and the second one is the one that was missing.
+@router.post("/test-providers", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def test_providers(session: SessionDep, scope: ScopeDep, body: _TestProvidersBody | None = None):
     """Ping the given (or all stored) providers and return connectivity results.
 
@@ -326,6 +470,11 @@ async def test_providers(session: SessionDep, scope: ScopeDep, body: _TestProvid
     Persisting made a "test" a silent write, and a stored green dot could
     outlive a revoked key or a drained wallet and read as passing when it no
     longer was (ENG-335). Callers render the returned results directly.
+
+    An ``apiKey`` of ``""`` or ``"***"`` means "use the stored one", which is
+    how the Settings UI re-tests a provider it only ever received masked. That
+    substitution is what makes the URL check below load-bearing: without it a
+    caller who never knew the key could still choose the host it is sent to.
     """
     s = SettingService(session, scope).load()
 
@@ -341,12 +490,64 @@ async def test_providers(session: SessionDep, scope: ScopeDep, body: _TestProvid
         if s.minds_api_key is not None:
             providers.append({"type": "minds-cloud", "apiKey": "", "mindsUrl": s.minds_url})
 
+    pingable: list[dict[str, Any]] = []
+    refused: dict[str, str] = {}
     for p in providers:
         if p.get("apiKey") in ("***", ""):
+            field = _foreign_ping_url_field(s, p)
+            if field is not None:
+                # Refusing the request outright would blank every other
+                # provider's status dot, because both callers send the whole
+                # configured list in one call. ping_provider already reports
+                # per provider, so this joins its results as an ordinary
+                # failure and the refused provider is never pinged at all.
+                refused[p.get("type", "")] = (
+                    f"cannot test a stored key against a {field} this deployment has not saved"
+                )
+                continue
             p["apiKey"] = resolve_stored_key(s, p.get("type", ""))
+        pingable.append(p)
 
-    statuses, details = await ping_providers(providers)
+    statuses, details = await ping_providers(pingable)
+    for ptype, reason in refused.items():
+        # setdefault, not update: ping_providers keys by type, so two cards of
+        # one type collapse into a single slot. Overwriting would report a card
+        # that pinged perfectly well as failed.
+        statuses.setdefault(ptype, "fail")
+        details.setdefault(ptype, reason)
     return {"providerStatus": statuses, "providerStatusDetails": details}
+
+
+def _foreign_ping_url_field(settings: UserSettings, provider: dict[str, Any]) -> str | None:
+    """The body field aiming a STORED key at a host this deployment never saved.
+
+    Returns the field name to refuse on, or ``None`` when the ping may go
+    ahead. ``settings`` rows are deployment-global (``settings`` is in
+    ``_TENANCY_DEFERRED_TABLES``, cowork/db/scoped.py), so the key being
+    substituted is the whole deployment's. Sending it to an arbitrary
+    ``baseUrl``/``mindsUrl`` would hand it to whoever asked. Omitting the URL
+    is fine and keeps the ``/test-providers`` body the Settings UI already
+    sends working: ``ping_provider`` then sends a minds-cloud probe to the
+    vendor host, and answers ``missing base URL`` for an openai-compatible one
+    rather than reaching for the stored value. A URL that is present but names
+    no host is refused, since there is nothing to compare.
+    """
+    raw_type = provider.get("type")
+    ptype = raw_type.replace("_", "-") if isinstance(raw_type, str) else ""
+    field = _BODY_SUPPLIED_URL_FIELD.get(ptype)
+    if field is None:
+        return None
+    supplied = provider.get(field)
+    if supplied is None or supplied == "":
+        return None
+    # The body is `list[dict[str, Any]]`, so this arrives as whatever the
+    # caller sent. A non-string names no origin, so refuse it here rather than
+    # leaning on _origin to say the same thing one call further down.
+    if not isinstance(supplied, str):
+        return field
+    if _origin(supplied) in _stored_origins_for(settings, ptype):
+        return None
+    return field
 
 
 class _ValidateProviderBody(CamelRequest):
@@ -356,7 +557,14 @@ class _ValidateProviderBody(CamelRequest):
     model: Optional[str] = None
 
 
-@router.post("/validate-provider")
+# AuthenticatedInOrgMode, not OpenByDesign: it is true that this reads no
+# stored value, but that answers the wrong question. The route makes the
+# server issue a request to a caller-supplied base_url with a caller-supplied
+# Authorization header and returns the upstream status, so from inside an org
+# pod an anonymous caller could use it to probe cluster-internal addresses
+# they cannot reach directly. OpenByDesign's bar is "would this be a problem
+# with no layer in front of it", and this would.
+@router.post("/validate-provider", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def validate_provider_endpoint(body: _ValidateProviderBody):
     return await validate_provider_svc(body.provider, body.api_key, body.base_url, body.model)
 
@@ -373,7 +581,13 @@ def _fill_missing(target: dict, extra: dict, *, skip: Optional[set[str]] = None)
         target.setdefault(key, value)
 
 
-@router.get("/recommended-models")
+# AuthenticatedInOrgMode, not OpenByDesign: the MindsHub overlay does need
+# the caller's own bearer and scope.org_id (fetch_org_model_catalog below),
+# but the openai-compatible overlay further down does not — it resolves the
+# stored key and fetches the stored baseUrl on any caller's behalf, and
+# `?refresh=true` bypasses its cache every time. So this is not a static
+# catalog read for an anonymous caller, and it should not read as one.
+@router.get("/recommended-models", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def recommended_models(request: Request, session: SessionDep, scope: ScopeDep, refresh: bool = False):
     """Per-provider model picker options for the Settings UI.
 
@@ -645,12 +859,13 @@ def _read_env_dict() -> dict[str, str]:
     return {}
 
 
-@router.get("/raw")
-def read_raw_settings(request: Request):
+# LoopbackDesktopOnly: /raw dumps the dotenv verbatim, every provider secret
+# in it. Loopback-only, and desktop-only because the dotenv is
+# deployment-global state no org boundary divides.
+@router.get("/raw", dependencies=[Depends(require(LoopbackDesktopOnly))])
+def read_raw_settings():
     # /raw dumps the dotenv verbatim (all provider secrets) — same loopback
     # restriction as reveal-key, and desktop-only (deployment-global state).
-    require_local_tenancy()
-    require_local(request)
     return _read_env_dict()
 
 
@@ -658,8 +873,9 @@ class _RawSettingsBody(BaseModel):
     content: str
 
 
-@router.post("/raw")
-async def write_raw_settings(body: _RawSettingsBody, session: SessionDep, request: Request):
+# LoopbackDesktopOnly: same reasoning as GET /raw above, and this one writes.
+@router.post("/raw", dependencies=[Depends(require(LoopbackDesktopOnly))])
+async def write_raw_settings(body: _RawSettingsBody, session: SessionDep):
     """Merge dotenv content into ~/.cowork/.env and sync recognised keys to the DB.
 
     Uses key-level merge (not full overwrite) because callers like the
@@ -672,8 +888,6 @@ async def write_raw_settings(body: _RawSettingsBody, session: SessionDep, reques
     path writes settings (onboarding, OAuth token refresh, etc.)."""
     # Writing the dotenv lands provider secrets on disk and syncs them into
     # global settings rows — loopback-only, and desktop-only.
-    require_local_tenancy()
-    require_local(request)
 
     from cowork.migrations import sync_env_vars_to_db
 

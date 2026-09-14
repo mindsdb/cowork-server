@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import logging
+import os
 import re
+import threading
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -13,7 +17,7 @@ import sqlalchemy as sa
 from cowork.common.paths import (
     PinnedDir,
     dir_mkdir,
-    dir_rename_into,
+    dir_rename,
     dir_rmtree,
     pinned_dir,
     safe_join,
@@ -21,6 +25,10 @@ from cowork.common.paths import (
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession, scoped_storage_root, unsafe_unscoped_session
 from cowork.models.project import Project
+from cowork.services.shared_resources import RESOURCE_LOCK_TIMEOUT_SECONDS
+
+if TYPE_CHECKING:
+    from cowork.services.skills import ProjectReferenceRewrite
 
 logger = logging.getLogger(__name__)
 
@@ -28,15 +36,82 @@ logger = logging.getLogger(__name__)
 GENERAL_PROJECT = "general"
 GENERAL_PROJECT_ID = UUID("00000000-0000-0000-0000-000000000001")
 
+# The local deployment's project-name namespace, mirroring the distributed
+# lock an org create takes on `SKILL_PROJECT_REFERENCES`. `projects.name` has
+# no unique index, so every name allocation is a read with nothing behind it,
+# and `mkdir` only arbitrates one allocated create against another.
+#
+# Process-local is enough only because it is taken exactly where the
+# distributed lock is not: on the single-process desktop sidecar. Do not reuse
+# it on a cloud path, where replicas would each hold their own.
+_LOCAL_NAME_LOCK = threading.Lock()
+
+# Bounded on purpose. The locked region stats paths the user chose, and a
+# chosen folder on a mount that has gone away blocks in the kernel. Unbounded,
+# one dead mount would wedge every create and rename in the process; the
+# endpoints are sync, so the waiters would also hold anyio threadpool slots.
+_NAME_LOCK_TIMEOUT_SECONDS = RESOURCE_LOCK_TIMEOUT_SECONDS
+
 _NAME_DISALLOWED = re.compile(r"[^A-Za-z0-9._-]+")
 _NAME_HYPHEN_RUNS = re.compile(r"-{2,}")
 _WIN_RESERVED = {
-    "con", "prn", "aux", "nul",
+    "con",
+    "prn",
+    "aux",
+    "nul",
     *(f"com{i}" for i in range(1, 10)),
     *(f"lpt{i}" for i in range(1, 10)),
 }
 _NAME_MAX_LEN = 48
 _NAME_FALLBACK = "untitled-project"
+_DISPLAY_NAME_MAX_LEN = 255
+
+
+def display_label(project: "Project") -> str:
+    """The name a person reads for this project.
+
+    The ONE place that answers "which field do we show". `display_name` holds
+    what the user typed; it is NULL on every row created before that column
+    existed, and those fall back to the slug so they render exactly as they
+    always have (ENG-1676).
+
+    Never use this to address anything. `name` is the directory, the URL
+    segment and the lookup key, and it stays that way.
+    """
+    # getattr, not attribute access: the harness passes project-shaped objects
+    # (SimpleNamespace in tests, and any caller predating the column), and a
+    # label helper must not be the thing that raises.
+    return getattr(project, "display_name", None) or project.name
+
+
+class ProjectNotFoundError(ValueError):
+    """The requested project is absent from the caller's scoped view."""
+
+
+class ProjectNameLockBusyError(Exception):
+    """The project-name lock could not be taken in time.
+
+    Deliberately not a `ValueError`: the endpoints map that to 400, and this is
+    a retryable 503. Nothing about the request is wrong.
+    """
+
+
+class ProjectPathNotAllowedError(ValueError):
+    """A caller chose a project folder on a deployment that does not allow one."""
+
+
+@dataclass
+class ProjectRenameStage:
+    """Filesystem changes held open until the project transaction commits."""
+
+    project_id: UUID
+    old_name: str
+    new_name: str
+    old_path: Path
+    new_path: Path
+    skill_rewrites: list["ProjectReferenceRewrite"]
+    directory_moved: bool = False
+    skill_rewrites_applied: bool = False
 
 
 class ProjectService:
@@ -88,11 +163,14 @@ class ProjectService:
         # NOT EXISTS narrows the race; `uq_projects_default_per_org` settles it —
         # on Postgres both replicas can pass the check at READ COMMITTED (only
         # SQLite serialises writes). The caller re-reads, so the loser adopts the
-        # winner's row. Core insert, not session.add, so the flush hook can't stamp
-        # created_by: this project is the org's, not the first member's.
+        # winner's row. Core insert, not session.add, so created_by is written
+        # explicitly rather than stamped by the flush hook: the member who first
+        # reaches the org provisions General and becomes its recorded creator,
+        # which is what makes its instructions editable without an admin. Rename
+        # and delete stay refused for every role, creator included.
         raw = unsafe_unscoped_session(self.session)  # bootstrap op, not query path
         try:
-            self._execute_general_insert(raw, path, scope.org_id)
+            self._execute_general_insert(raw, path, scope.org_id, scope.user_id)
         except sa.exc.IntegrityError:
             raw.rollback()
 
@@ -114,29 +192,29 @@ class ProjectService:
             return sa.insert(Project)
         return dialect_insert(Project)
 
-    def _execute_general_insert(self, raw, path: Path, org_id: str | None) -> None:
-        stmt = (
-            self._insert_stmt(raw)
-            .from_select(
-                ["id", "name", "path", "is_active", "org_id"],
-                sa.select(
-                    # type_ is required: a bare literal binds as String and skips
-                    # the Uuid column's bind processor, so the id is stored in a
-                    # shape no other lookup matches ("Project not found").
-                    sa.literal(uuid4(), type_=sa.Uuid()),
-                    sa.literal(GENERAL_PROJECT),
-                    sa.literal(str(path)),
-                    # Active: it is the org's only project at this point, and
-                    # get_active_project raises when nothing is active.
-                    sa.literal(True),
-                    sa.literal(org_id),
-                ).where(
-                    ~sa.exists().where(
-                        Project.name == GENERAL_PROJECT,  # type: ignore[arg-type]
-                        Project.org_id == org_id,  # type: ignore[arg-type]
-                    )
-                ),
-            )
+    def _execute_general_insert(
+        self, raw, path: Path, org_id: str | None, created_by: str | None
+    ) -> None:
+        stmt = self._insert_stmt(raw).from_select(
+            ["id", "name", "path", "is_active", "org_id", "created_by"],
+            sa.select(
+                # type_ is required: a bare literal binds as String and skips
+                # the Uuid column's bind processor, so the id is stored in a
+                # shape no other lookup matches ("Project not found").
+                sa.literal(uuid4(), type_=sa.Uuid()),
+                sa.literal(GENERAL_PROJECT),
+                sa.literal(str(path)),
+                # Active: it is the org's only project at this point, and
+                # get_active_project raises when nothing is active.
+                sa.literal(True),
+                sa.literal(org_id),
+                sa.literal(created_by),
+            ).where(
+                ~sa.exists().where(
+                    Project.name == GENERAL_PROJECT,  # type: ignore[arg-type]
+                    Project.org_id == org_id,  # type: ignore[arg-type]
+                )
+            ),
         )
         if hasattr(stmt, "on_conflict_do_nothing"):
             stmt = stmt.on_conflict_do_nothing()
@@ -216,7 +294,9 @@ class ProjectService:
         dir — a cross-org existence oracle.
         """
         return scoped_storage_root(
-            Path(get_app_settings().project.root_dir), self.session.scope, store="projects"
+            Path(get_app_settings().project.root_dir),
+            self.session.scope,
+            store="projects",
         )
 
     # --- Symlink-safe filesystem ops on the projects root -------------------
@@ -259,18 +339,46 @@ class ProjectService:
                 if not exist_ok:
                     raise
 
-    def _rename_in_root(self, old: Path, new: Path) -> None:
-        """Rename *old* to *new*, where *new* is a direct child of the root.
+    def _trusted_project_root(self, path: Path) -> tuple[Path, str]:
+        """Return the trusted direct-child root and name for ``path``.
 
-        Only the DESTINATION is pinned. The source is passed absolute on
-        purpose: a legacy row still on a pre-org-keyed path lives outside this
-        root entirely, and that path is one we already hold rather than one an
-        agent can redirect us into. The destination is the side an attacker
-        would aim at another org, so that is the side that must not be
-        re-walked.
+        Org rows may still point at the old unkeyed projects root. Both that
+        root and the current org root are server configuration, but neither may
+        be resolved here: following a swapped root symlink would turn the
+        containment check into the cross-tenant traversal it is meant to stop.
         """
-        with self._root_fd() as root:
-            dir_rename_into(root, old, self._child_name(new))
+        absolute = Path(os.path.abspath(path))
+        path_parent = Path(os.path.abspath(absolute.parent))
+        canonical_parent = Path(os.path.realpath(path_parent.parent)) / path_parent.name
+        roots = (self._root_dir(), Path(get_app_settings().project.root_dir))
+        for candidate in roots:
+            configured = Path(os.path.abspath(candidate))
+            # Resolve stable ancestors (for macOS /var -> /private/var), but
+            # append the agent-writable projects-root component without
+            # following it. ``pinned_dir(..., nofollow_base=True)`` can then
+            # reject a swapped root symlink at use time.
+            root = Path(os.path.realpath(configured.parent)) / configured.name
+            if canonical_parent == root and absolute.name not in {"", ".", ".."}:
+                return root, absolute.name
+        raise ValueError(f"{path} is not a direct child of a trusted projects root")
+
+    def _rename_in_root(self, old: Path, new: Path) -> None:
+        """Rename between trusted project roots without re-walking either path."""
+        source_root, source_name = self._trusted_project_root(old)
+        destination_root, destination_name = self._trusted_project_root(new)
+        if source_root == destination_root:
+            with pinned_dir(source_root, nofollow_base=True) as root:
+                dir_rename(root, source_name, root, destination_name)
+            return
+        with pinned_dir(
+            source_root,
+            nofollow_base=True,
+        ) as source, pinned_dir(
+            destination_root,
+            create=True,
+            nofollow_base=True,
+        ) as destination:
+            dir_rename(source, source_name, destination, destination_name)
 
     def _rmtree_in_root(self, path: Path) -> None:
         with self._root_fd() as root:
@@ -284,7 +392,11 @@ class ProjectService:
         if not name or _NAME_DISALLOWED.search(name):
             raise ValueError("Invalid project name")
         candidate = Path(name)
-        if candidate.is_absolute() or len(candidate.parts) != 1 or candidate.name in {"", ".", ".."}:
+        if (
+            candidate.is_absolute()
+            or len(candidate.parts) != 1
+            or candidate.name in {"", ".", ".."}
+        ):
             raise ValueError("Invalid project name")
         # safe_join rejects anything that escapes root; the parent re-check keeps
         # a project dir a *direct* child of the projects root.
@@ -301,7 +413,8 @@ class ProjectService:
 
     def _unique_name(self, base: str, *, exclude: str | None = None) -> str:
         existing = {
-            p.name for p in self.session.exec(self.session.select(Project)).all()
+            p.name
+            for p in self.session.exec(self.session.select(Project)).all()
             if p.name != exclude
         }
         if base not in existing:
@@ -312,6 +425,77 @@ class ProjectService:
             if candidate not in existing:
                 return candidate
             i += 1
+
+    def _display_base(self, raw: str | None, fallback: str) -> str:
+        """The label to start from, before de-duplication.
+
+        Whitespace-only input does NOT become NULL: that would quietly expose
+        the slug on a project the user just created, and NULL is reserved for
+        "predates the column". Such input resolves through the existing
+        empty-name fallback instead, and we store the label that produced.
+        """
+        cleaned = (raw or "").strip()
+        return cleaned[:_DISPLAY_NAME_MAX_LEN] if cleaned else fallback
+
+    def _unique_display_name(self, base: str, *, exclude_id: UUID | None = None) -> str:
+        """`base`, or `base 2` / `base 3` when another project already reads that way.
+
+        Compared against the RESOLVED label of every other project, so a new
+        project typed literally `My-Project` still collides with an existing
+        slug-labelled `My-Project`. Space-separated, unlike `_unique_name`'s
+        hyphen: this suffix is read by humans, not used as a path.
+
+        Known limitation, accepted. This is a read-then-write with no unique
+        constraint behind it, so two concurrent creates of the same name can
+        both pick the unsuffixed label. `_unique_name` has the same shape but
+        `mkdir` settles it; there is no equivalent backstop for a label, and
+        adding one means a unique index and a failure path on a column that
+        addresses nothing. The cost of losing the race is two rows reading the
+        same way in the sidebar -- which is where every non-Latin project
+        already was before this ticket -- and renaming either one fixes it.
+        """
+        taken = {
+            (p.display_name or p.name)
+            for p in self.session.exec(self.session.select(Project)).all()
+            if p.id != exclude_id
+        }
+        if base not in taken:
+            return base
+        i = 2
+        while True:
+            # Leave room for the suffix rather than overflowing the column.
+            candidate = f"{base[: _DISPLAY_NAME_MAX_LEN - len(str(i)) - 1]} {i}"
+            if candidate not in taken:
+                return candidate
+            i += 1
+
+    @contextmanager
+    def _name_namespace_lock(self) -> Iterator[None]:
+        """Serialise a name allocation against every other one in this process.
+
+        Skipped in org mode, where the create and rename endpoints already hold
+        `coordination_lock(SKILL_PROJECT_REFERENCES, "all")` across replicas.
+        Keyed on the scope rather than on whether a folder was chosen: the
+        colliding pair need not both be adoptions. An adoption holding `notes`
+        before its commit does not stop an allocated create taking the same
+        name, because adoption is refused inside the projects root and so
+        creates nothing for `mkdir` to trip over.
+
+        Bounded acquire, matching `shared_resources._process_lock`: a caller
+        that cannot get the name in time is told to retry rather than parked
+        behind a stat that may never return.
+        """
+        if self.session.scope.org_mode:
+            yield
+            return
+        if not _LOCAL_NAME_LOCK.acquire(timeout=_NAME_LOCK_TIMEOUT_SECONDS):
+            raise ProjectNameLockBusyError(
+                "Project names are busy right now; retry the request"
+            )
+        try:
+            yield
+        finally:
+            _LOCAL_NAME_LOCK.release()
 
     def _sanitize_name(self, name: str) -> str:
         raw = (name or "").strip()
@@ -332,7 +516,7 @@ class ProjectService:
     def get_project(self, project_id: UUID) -> Project:
         project = self.session.get(Project, project_id)
         if project is None:
-            raise ValueError("Project not found")
+            raise ProjectNotFoundError("Project not found")
         return project
 
     def get_project_by_name(self, name: str) -> Project:
@@ -340,7 +524,7 @@ class ProjectService:
             self.session.select(Project).where(Project.name == name)
         ).first()
         if project is None:
-            raise ValueError("Project not found")
+            raise ProjectNotFoundError("Project not found")
         return project
 
     def get_project_by_name_or_none(self, name: str) -> Project | None:
@@ -370,7 +554,7 @@ class ProjectService:
         """`get_or_provision_by_name_or_none`, raising when the name is genuinely missing."""
         project = self.get_or_provision_by_name_or_none(name)
         if project is None:
-            raise ValueError("Project not found")
+            raise ProjectNotFoundError("Project not found")
         return project
 
     def _allocate_project_dir(self, base: str) -> tuple[str, Path]:
@@ -385,32 +569,408 @@ class ProjectService:
                 candidate = self._unique_name(f"{base}-{attempt}")
         raise ValueError("Could not allocate a project directory")
 
-    def create_project(self, name: str) -> Project:
+    def directory_is_external(self, project: Project) -> bool:
+        """Whether this project's directory sits outside the projects root.
+
+        True only for a folder the user chose. Artifact discovery, skill link
+        distribution and rename all find projects by scanning that root, so
+        they need this to know when to consult the row instead.
+
+        Always False in org mode. A folder can only be adopted on a local
+        deployment, so a path outside the org-keyed root there is a stale or
+        pre-org-keyed row -- `_repoint_if_stale`'s job, not a chosen folder.
+        """
+        if get_app_settings().tenancy_mode == "org" or self.session.scope.org_mode:
+            return False
+        try:
+            # `.parent` first, then resolve: `Path.resolve()` resolves the
+            # final component too, so resolving and then taking the parent is
+            # a different question. A project directory that is itself a
+            # symlink elsewhere is still a direct child of the root, and
+            # renaming it renames the link -- the comparison `_in_scoped_root`
+            # makes. Resolving the leaf would reclassify it as chosen and
+            # refuse a rename that works today.
+            parent = Path(project.path).parent.resolve(strict=False)
+            root = self._root_dir().resolve(strict=False)
+        except (OSError, RuntimeError):
+            return False
+        return parent != root
+
+    def _within_root(self, path: Path) -> bool:
+        try:
+            root = self._root_dir().resolve(strict=False)
+        except (OSError, RuntimeError):
+            return False
+        return path == root or root in path.parents
+
+    def _path_in_use(self, path: Path) -> bool:
+        for project in self.session.exec(self.session.select(Project)).all():
+            try:
+                if Path(project.path).resolve(strict=False) == path:
+                    return True
+            except (OSError, RuntimeError):
+                continue
+        return False
+
+    def _adopt_project_dir(self, base: str, path: Path) -> tuple[str, Path]:
+        """Take a folder the user already has, creating nothing.
+
+        The tenancy refusal comes before any filesystem access on purpose: an
+        org deployment does not run on the caller's machine, so statting a
+        path it chose would answer whether that server path exists.
+        """
+        if get_app_settings().tenancy_mode == "org":
+            raise ProjectPathNotAllowedError(
+                "Choosing a project folder is not available on this deployment"
+            )
+        try:
+            resolved = path.expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError("Choose an existing local folder") from exc
+        if not resolved.is_dir():
+            raise ValueError("Choose an existing local folder")
+        # Inside the root a chosen folder can equal _project_path() for another
+        # row, and delete_project would re-derive a match and rmtree it.
+        if self._within_root(resolved):
+            raise ValueError("Choose a folder outside the Cowork projects directory")
+        if self._path_in_use(resolved):
+            raise ValueError("Another project already uses this folder")
+        # Refused rather than bumped to `<name>-2`. The allocated path can
+        # safely bump because `mkdir` arbitrates a concurrent pair; adoption
+        # creates nothing, so it has no such backstop and `projects` has no
+        # unique index on `name` to settle it. A duplicate `name` is not a
+        # cosmetic problem: it is the lookup key, and `get_project_by_name` is
+        # a `.first()` on an unordered select.
+        #
+        # Serialised by `_name_namespace_lock`, held from here through the
+        # insert. SQLite serialises the writes but never re-evaluates this
+        # read, so unguarded a concurrent pair both see the name free and both
+        # commit it.
+        if self._unique_name(base) != base:
+            raise ValueError(
+                f"A project called {base!r} already exists. Rename it, or "
+                "choose a different name for this folder."
+            )
+        return base, resolved
+
+    def create_project(
+        self,
+        name: str,
+        *,
+        project_id: UUID | None = None,
+        path: Path | None = None,
+    ) -> Project:
         sanitized = self._sanitize_name(name)
         # `general` belongs to the system row. A member creating it first would own
         # an undeletable, user-attributed project AND block the real default,
         # which is looked up by name.
         if sanitized == GENERAL_PROJECT:
             sanitized = f"{GENERAL_PROJECT}-2"
-        # No exist_ok: `_unique_name` is a read-then-write with no unique
-        # constraint behind it, so two concurrent creates can pick the same name.
-        # Letting mkdir fail keeps them from sharing one directory (where deleting
-        # either would rmtree the other's files) and stops a leftover directory
-        # being adopted with stale contents. On collision, take the next name.
-        final_name, path = self._allocate_project_dir(sanitized)
-        # self._scaffold(path)
-        project = Project(name=final_name, path=str(path), is_active=False)
-        self.session.add(project)
-        self.session.commit()
-        self.session.refresh(project)
+        with self._name_namespace_lock():
+            if path is not None:
+                final_name, project_dir = self._adopt_project_dir(sanitized, path)
+            else:
+                # No exist_ok: `_unique_name` is a read-then-write with no unique
+                # constraint behind it, so two concurrent creates can pick the same name.
+                # Letting mkdir fail keeps them from sharing one directory (where deleting
+                # either would rmtree the other's files) and stops a leftover directory
+                # being adopted with stale contents. On collision, take the next name.
+                final_name, project_dir = self._allocate_project_dir(sanitized)
+            # self._scaffold(project_dir)
+            # The literal input, kept verbatim; `final_name` stays the slug. A new
+            # project always gets an explicit display_name -- NULL means "predates
+            # the column", never "the user typed nothing" (ENG-1676).
+            display = self._unique_display_name(self._display_base(name, final_name))
+            project = (
+                Project(
+                    id=project_id,
+                    name=final_name,
+                    display_name=display,
+                    path=str(project_dir),
+                    is_active=False,
+                )
+                if project_id is not None
+                else Project(
+                    name=final_name,
+                    display_name=display,
+                    path=str(project_dir),
+                    is_active=False,
+                )
+            )
+            self.session.add(project)
+            self.session.commit()
 
         # Skill symlink distribution is desktop-only (see SkillService).
         if not self.session.scope.org_mode:
-            from cowork.services.skill_links import reconcile_project
-            from cowork.services.skills import SkillService
-            reconcile_project(path, SkillService(self.session.scope).list_skills())
+            try:
+                from cowork.services.skill_links import reconcile_project
+                from cowork.services.skills import SkillService
+
+                reconcile_project(
+                    project_dir,
+                    SkillService(self.session.scope).list_skills(),
+                    project_name=final_name,
+                )
+            except Exception:
+                # These links are derived desktop state and the row is already
+                # committed, so a failure here must not answer 500 for a
+                # project that exists — the name is taken by then, so the
+                # client cannot even retry. A folder the user chose can hold a
+                # real `skills/<slug>` directory or be read-only, which is
+                # exactly how this now fails. Same treatment as rename.
+                logger.exception(
+                    "Could not reconcile desktop skill links for project %s",
+                    project.id,
+                )
 
         return project
+
+    def resolve_display_label(self, project: Project, name: str) -> str:
+        """The label this project would read as after being renamed to `name`.
+
+        Exposed so the endpoint can tell a label-only rename from a true no-op
+        without reimplementing the resolution. `_sanitize_name` is lossy for
+        exactly the input ENG-1676 is about, so a rename can leave the slug
+        untouched and still change what every member sees.
+        """
+        return self._unique_display_name(
+            self._display_base(name, project.name), exclude_id=project.id
+        )
+
+    def resolve_update_name(self, project: Project, name: str) -> str:
+        """Return the canonical collision-resolved name for an update."""
+        sanitized = self._sanitize_name(name)
+        if sanitized == GENERAL_PROJECT and project.name != GENERAL_PROJECT:
+            sanitized = f"{GENERAL_PROJECT}-2"
+        return self._unique_name(sanitized, exclude=project.name)
+
+    def _stage_project_rename(
+        self,
+        project: Project,
+        final_name: str,
+        *,
+        skill_rewrites: list["ProjectReferenceRewrite"] | None = None,
+    ) -> ProjectRenameStage:
+        from cowork.services.skills import SkillService
+
+        old_name = project.name
+        old_path = Path(project.path)
+        new_path = self._project_path(final_name)
+        skill_service = SkillService(self.session.scope)
+        rewrites = (
+            skill_rewrites
+            if skill_rewrites is not None
+            else skill_service.prepare_project_reference_rewrites(
+                old_name,
+                final_name,
+            )
+        )
+        stage = ProjectRenameStage(
+            project_id=project.id,
+            old_name=old_name,
+            new_name=final_name,
+            old_path=old_path,
+            new_path=new_path,
+            skill_rewrites=rewrites,
+        )
+        try:
+            if old_path.exists():
+                # The org's root may not exist yet for a legacy row. The
+                # destination remains pinned inside the scoped root.
+                self._rename_in_root(old_path, new_path)
+                stage.directory_moved = True
+            skill_service.apply_project_reference_rewrites(rewrites)
+            stage.skill_rewrites_applied = True
+            project.name = final_name
+            project.path = str(new_path)
+            self.session.add(project)
+        except Exception:
+            self.session.rollback()
+            try:
+                self.rollback_project_rename(stage)
+            except Exception:
+                logger.exception(
+                    "Could not fully restore project %s after rename staging failed",
+                    project.id,
+                )
+            raise
+        return stage
+
+    def rollback_project_rename(self, stage: ProjectRenameStage) -> None:
+        """Restore every filesystem component of an uncommitted rename."""
+        first_error: Exception | None = None
+        if stage.skill_rewrites_applied:
+            from cowork.services.skills import SkillService
+
+            try:
+                SkillService(self.session.scope).restore_project_reference_rewrites(
+                    stage.skill_rewrites
+                )
+                stage.skill_rewrites_applied = False
+            except Exception as exc:
+                first_error = exc
+                logger.exception(
+                    "Could not restore skill references for project %s",
+                    stage.project_id,
+                )
+        if stage.directory_moved:
+            try:
+                self._rename_in_root(stage.new_path, stage.old_path)
+                stage.directory_moved = False
+            except Exception as exc:
+                first_error = first_error or exc
+                logger.exception(
+                    "Could not restore the directory for project %s",
+                    stage.project_id,
+                )
+        if first_error is not None:
+            raise RuntimeError(
+                "Project rename compensation was incomplete"
+            ) from first_error
+
+    def _apply_active_selection(
+        self,
+        project: Project,
+        is_active: bool | None,
+    ) -> None:
+        if is_active is None:
+            return
+        if is_active:
+            for other in self.session.exec(self.session.select(Project)).all():
+                if other.id != project.id and other.is_active:
+                    other.is_active = False
+                    self.session.add(other)
+        project.is_active = is_active
+
+    def stage_project_update(
+        self,
+        project_id: UUID,
+        *,
+        resolved_name: str | None,
+        is_active: bool | None,
+        # No default on purpose. Both endpoint branches call this, and only one
+        # of them passed a label -- so an org rename moved the directory and
+        # rewrote every skill reference while `display_name` stayed frozen at
+        # the old name. Requiring it makes that omission a TypeError instead of
+        # a stale label, and matches the two parameters above.
+        display_label: str | None,
+        skill_rewrites: list["ProjectReferenceRewrite"] | None = None,
+    ) -> tuple[Project, ProjectRenameStage | None]:
+        """Stage a project update without committing its DB transaction.
+
+        `display_label` is the raw name the user typed, not the slug. It is a
+        separate parameter because `resolved_name` has already been through
+        `_sanitize_name`, which is lossy for exactly the input ENG-1676 is
+        about: every Cyrillic name sanitizes to `untitled-project`.
+        """
+        project = self.session.get(Project, project_id)
+        if project is None:
+            raise ProjectNotFoundError("Project not found")
+        stage = None
+        try:
+            if resolved_name is not None and resolved_name != project.name:
+                if project.name == GENERAL_PROJECT:
+                    raise ValueError("Cannot rename the General project")
+                if self.directory_is_external(project):
+                    # Refused here rather than inside the move: _rename_in_root
+                    # would raise "not a direct child of a trusted projects
+                    # root", which is true and unusable as a message.
+                    raise ValueError(
+                        "This project points at a folder you chose, so it cannot "
+                        "be renamed. Rename the folder instead."
+                    )
+                stage = self._stage_project_rename(
+                    project,
+                    resolved_name,
+                    skill_rewrites=skill_rewrites,
+                )
+            if display_label is not None:
+                # Outside the rename branch on purpose: two different names can
+                # sanitize to the same slug -- every pair of Cyrillic names
+                # does -- and the user still renamed the project, so the label
+                # must follow even when nothing moved on disk (ENG-1676).
+                project.display_name = self._unique_display_name(
+                    self._display_base(display_label, project.name),
+                    exclude_id=project.id,
+                )
+            self._apply_active_selection(project, is_active)
+            self.session.add(project)
+            self.session.flush()
+        except Exception:
+            self.session.rollback()
+            if stage is not None:
+                try:
+                    self.rollback_project_rename(stage)
+                except Exception:
+                    logger.exception(
+                        "Could not fully restore project %s after update staging failed",
+                        project_id,
+                    )
+            raise
+        return project, stage
+
+    def commit_staged_project_update(
+        self,
+        project: Project,
+        stage: ProjectRenameStage | None,
+    ) -> Project:
+        """Commit a staged update and compensate its filesystem on failure."""
+        self._commit_staged_project_update(project, stage)
+        self.reconcile_renamed_project_links(project, stage)
+        return project
+
+    def _commit_staged_project_update(
+        self,
+        project: Project,
+        stage: ProjectRenameStage | None,
+    ) -> None:
+        """Commit the staged rows, undoing the staged filesystem move on failure."""
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            if stage is not None:
+                try:
+                    self.rollback_project_rename(stage)
+                except Exception:
+                    logger.exception(
+                        "Could not fully restore project %s after commit failed",
+                        project.id,
+                    )
+            raise
+
+    def reconcile_renamed_project_links(
+        self,
+        project: Project,
+        stage: ProjectRenameStage | None,
+    ) -> None:
+        """Re-point desktop skill links at a renamed project's directory.
+
+        Separate from the commit so a caller holding the name lock can release
+        it first. This walks every project row and writes a symlink per enabled
+        skill, none of which needs the name reserved once the row is committed.
+        """
+        if stage is None or self.session.scope.org_mode:
+            return
+        # These links are derived desktop state, so a reconciliation failure
+        # is logged after the canonical project/skill commit rather than
+        # turning a successful rename into a false API failure.
+        try:
+            from cowork.services.skill_links import reconcile_project
+            from cowork.services.skills import SkillService
+
+            skill_service = SkillService(self.session.scope)
+            skill_service.finalize_project_reference_rewrites(stage.skill_rewrites)
+            reconcile_project(
+                stage.new_path,
+                skill_service.list_skills(),
+                project_name=stage.new_name,
+            )
+        except Exception:
+            logger.exception(
+                "Could not reconcile desktop links for renamed project %s",
+                project.id,
+            )
 
     def update_project(
         self,
@@ -420,51 +980,34 @@ class ProjectService:
     ) -> Project:
         project = self.session.get(Project, project_id)
         if project is None:
-            raise ValueError("Project not found")
+            raise ProjectNotFoundError("Project not found")
+        # A rename allocates a name the same way a create does, so it takes the
+        # same lock. Only when one is being resolved: an is_active toggle
+        # touches no name and should not queue behind an unrelated create.
+        guard = self._name_namespace_lock() if name is not None else nullcontext()
+        with guard:
+            resolved_name = (
+                self.resolve_update_name(project, name) if name is not None else None
+            )
+            updated, stage = self.stage_project_update(
+                project_id,
+                resolved_name=resolved_name,
+                is_active=is_active,
+                display_label=name,
+            )
+            self._commit_staged_project_update(updated, stage)
+        # Outside the lock, for the reason `create_project` keeps its own
+        # reconcile outside: the row is committed, so the name is no longer
+        # in question, and this part is filesystem work.
+        self.reconcile_renamed_project_links(updated, stage)
+        return updated
 
-        if name is not None:
-            if project.name == GENERAL_PROJECT:
-                raise ValueError("Cannot rename the General project")
-            sanitized = self._sanitize_name(name)
-            final_name = self._unique_name(sanitized, exclude=project.name)
-            if final_name != project.name:
-                old_name = project.name
-                old_path = Path(project.path)
-                new_path = self._project_path(final_name)
-                if old_path.exists():
-                    # The org's root may not exist yet (a legacy row still on an
-                    # un-keyed path): rename would raise FileNotFoundError, which
-                    # the endpoint's `except ValueError` turns into a 500.
-                    self._rename_in_root(old_path, new_path)
-                project.name = final_name
-                project.path = str(new_path)
-
-                # Update skill metadata that referenced the old project name,
-                # then reconcile links for the renamed dir.
-                from cowork.services.skill_links import reconcile_project
-                from cowork.services.skills import SkillService
-                svc = SkillService(self.session.scope)
-                for skill in svc.list_skills():
-                    if old_name in skill.projects:
-                        updated = [final_name if p == old_name else p for p in skill.projects]
-                        svc.update_skill(skill.name, projects=updated)
-                if not self.session.scope.org_mode:  # symlinks are desktop-only
-                    reconcile_project(new_path, svc.list_skills())
-
-        if is_active is not None:
-            if is_active:
-                for other in self.session.exec(self.session.select(Project)).all():
-                    if other.id != project_id and other.is_active:
-                        other.is_active = False
-                        self.session.add(other)
-            project.is_active = is_active
-
-        self.session.add(project)
-        self.session.commit()
-        self.session.refresh(project)
-        return project
-
-    def delete_project(self, project_id: UUID) -> bool:
+    def delete_project(
+        self,
+        project_id: UUID,
+        *,
+        before_commit: Callable[[], None] | None = None,
+    ) -> bool:
         project = self.session.get(Project, project_id)
         if project is None:
             return False
@@ -479,70 +1022,113 @@ class ProjectService:
         # it while the conversation still exists so the cleanup is safe.
         from cowork.models.conversation import Conversation
         from cowork.services.conversations import ConversationService
+
         conv_svc = ConversationService(self.session)
         conv_ids = [
             c.id
             for c in self.session.exec(
-                self.session.select(Conversation).where(Conversation.project_id == project_id)
+                self.session.select(Conversation).where(
+                    Conversation.project_id == project_id
+                )
             ).all()
         ]
-        for cid in conv_ids:
-            # Fault-isolated: one conversation failing to delete must not abort
-            # the whole project delete and leave it half-cascaded. Log and move
-            # on — a skipped conversation just retains today's orphan behavior.
-            try:
-                # Owner-AGNOSTIC: a project is org-shared and may hold several
+        conversation_stages = []
+        try:
+            for cid in conv_ids:
+                # Owner-agnostic: a project is org-shared and may hold several
                 # members' conversations. Fetch org-scoped (session.get validates
-                # org, not owner) and delete the row directly — the request-facing
-                # delete_conversation is owner-scoped and would skip foreign rows,
-                # re-orphaning them (ENG-701).
+                # org, not owner) and stage the row directly. No attachment or
+                # workspace bytes are removed until the project/audit commit.
                 conv = self.session.get(Conversation, cid)
                 if conv is None:
                     continue
-                conv_svc.delete_conversation_row(conv)
-            except Exception:
-                # Roll back the failed conversation's partial work FIRST.
-                # delete_conversation stages its row deletes (messages, events,
-                # task objects, attachment rows) before its own commit; without
-                # this rollback those pending deletes would be silently flushed
-                # by the next commit in the cascade (or the project commit below)
-                # — wiping the conversation's data while its row survives.
-                self.session.rollback()
-                logger.warning(
-                    "delete_project: failed to delete conversation %s; skipping", cid,
-                    exc_info=True,
+                conversation_stages.append(
+                    # A project delete is the org-wide cascade, so it is the one
+                    # caller allowed to drop every member's attachment rows.
+                    conv_svc.stage_delete_conversation_row(
+                        conv, include_org_attachments=True
+                    )
                 )
+        except Exception:
+            # Atomicity is stricter than the old skip-on-error behavior. A
+            # failed child stage rolls back every earlier child and aborts the
+            # project delete, so no surviving conversation becomes a ghost.
+            self.session.rollback()
+            raise
         # rmtree only a path re-derived from the sanitized name inside the
         # org-keyed root (same rebuild-and-compare as ensure_dir_exists). The
         # stored string can be stale (pre-org-keying) or tampered, and deleting
         # it verbatim would rmtree an arbitrary directory. A mismatched dir is
         # left behind instead — an orphaned directory beats a wrong-target rm.
         path = Path(project.path)
+        staged_path: Path | None = None
         try:
             safe = self._project_path(project.name)
         except ValueError:
             safe = None
         if path.exists():
             if safe is not None and safe.resolve() == path.resolve():
-                self._rmtree_in_root(path)
+                staged_path = self._root_dir() / (f".delete-{project.id}-{uuid4().hex}")
+                try:
+                    self._rename_in_root(path, staged_path)
+                except Exception:
+                    self.session.rollback()
+                    raise
+            elif self.directory_is_external(project):
+                # The expected outcome for a folder the user chose, not an
+                # anomaly: it is theirs, so the project row goes and the
+                # directory stays. `directoryIsExternal` tells the client to
+                # say so before it asks for confirmation.
+                logger.info(
+                    "delete_project: %r points at a folder outside the projects "
+                    "root; leaving it in place",
+                    project.name,
+                )
             else:
                 logger.warning(
                     "delete_project: stored path %s does not match the derived "
                     "project path; leaving the directory in place",
                     project.path,
                 )
-        was_active = project.is_active
-        self.session.delete(project)
-        self.session.commit()
-        if was_active:
-            # By name, not the fixed id: an org's default row has its own uuid, so
-            # the constant resolves to None and deleting the active project left
-            # the org with none active.
-            general = self.get_project_by_name_or_none(GENERAL_PROJECT)
-            if general is not None and not general.is_active:
-                general.is_active = True
-                self.session.add(general)
-                self.session.commit()
+        try:
+            if project.is_active:
+                # By name, not the fixed id: an org's default row has its own
+                # uuid. Keep this selection change in the project-delete commit.
+                general = self.get_project_by_name_or_none(GENERAL_PROJECT)
+                if general is not None and not general.is_active:
+                    general.is_active = True
+                    self.session.add(general)
+            if before_commit is not None:
+                before_commit()
+            self.session.delete(project)
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            if staged_path is not None and staged_path.exists():
+                try:
+                    self._rename_in_root(staged_path, path)
+                except Exception:
+                    logger.exception(
+                        "Could not restore project directory after delete failed: %s",
+                        project_id,
+                    )
+            raise
+        for conversation_stage in conversation_stages:
+            conv_svc.finalize_staged_conversation_delete(
+                conversation_stage,
+                cleanup_project_files=staged_path is None,
+            )
+        if staged_path is not None and staged_path.exists():
+            try:
+                self._rmtree_in_root(staged_path)
+            except Exception:
+                # The row and required audit already committed together. A
+                # hidden tombstone is safe to reap later and must not turn the
+                # successful delete into a retry that records another event.
+                logger.exception(
+                    "Could not finalize staged project directory deletion: %s",
+                    staged_path,
+                )
         return True
 
     def get_active_project(self) -> Project:

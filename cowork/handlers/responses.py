@@ -13,6 +13,7 @@ from sqlmodel import Session
 
 from cowork.build_info import build_trace_metadata
 from cowork.common.chat_session import in_process_agent_allowed
+from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings
 from cowork.common.settings.user_settings import (
     Provider,
@@ -25,6 +26,7 @@ from cowork.harnesses.base import available_harness_ids, get_harness
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
+    _MAX_HISTORY_MESSAGES,
     RouteDecision,
     RouterBinding,
     decide_route,
@@ -32,7 +34,11 @@ from cowork.handlers.response_routing import (
 )
 from cowork.harnesses.anton_harness.stream_formatter import SkillCreated, format_responses_stream
 from cowork.streaming import TurnLifecycle, new_buffer, registry, sse_frame
+from cowork.streaming.answer_text import accumulate_answer_text
+from cowork.streaming.backend import get_backend
+from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
+from cowork.turnqueue.redis_client import cancel_flag_key, get_redis
 from cowork.schemas.responses import (
     Content,
     ContentType,
@@ -53,6 +59,8 @@ from cowork.handlers.turn_errors import (
     ALLOWANCE_EXHAUSTED_CODE,
     PROVIDER_OVERLOADED_CODE,
     RATE_LIMITED_CODE,
+    REMOTE_CANCEL_LITERAL,
+    REMOTE_CANCEL_VIA_FAIL_JOB,
     auth_error_detail,
     friendly_turn_error,
     model_unavailable_info,
@@ -63,10 +71,13 @@ from cowork.handlers.turn_errors import (
     retry_at_instant,
     response_failed_sse,
 )
-from cowork.db.scoped import ScopedSession, scope_from_principal
+from cowork.db.scoped import ScopedSession, TenantScope, scope_from_principal
 from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
+from cowork.services.product_permissions import (
+    ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
+)
 from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectService
 from cowork.services.skills import SkillService
@@ -131,7 +142,40 @@ def cancelled_ask_user_retirements(events: list[dict]) -> list[dict]:
     return synthesized
 
 
-async def _seal_unterminated_buffer(buffer, lifecycle: "TurnLifecycle", conv_id) -> None:
+async def _remote_cancel_confirmed(error: str | None, correlation_id: str) -> bool:
+    """Whether a remote ``turn_failed`` is the user's own Stop, not a failure.
+
+    ``REMOTE_CANCEL_LITERAL`` is proof on its own. ``REMOTE_CANCEL_VIA_FAIL_JOB``
+    is not: a controller replica taking SIGTERM mid-turn unwinds through the
+    same handler that a keepalive-driven cancel does, so the string cannot tell
+    a Stop from a rolling deploy killing the turn.
+
+    The cancel flag separates them. ``/cancel`` writes it, the producer clears
+    a stale one before each turn, and the keepalive-driven path never clears
+    it — so its presence means a user asked for this turn to stop. A shutdown
+    abort leaves no flag and stays a failure, which is the outcome that earns
+    an error frame and a lookup id.
+    """
+    if error == REMOTE_CANCEL_LITERAL:
+        return True
+    if error != REMOTE_CANCEL_VIA_FAIL_JOB:
+        return False
+    try:
+        return bool(await get_redis().exists(cancel_flag_key(correlation_id)))
+    except Exception:
+        # Redis is how the reply being classified arrived, so this is close to
+        # unreachable. Read as a failure rather than a cancel: a visible error
+        # carrying an id is the recoverable way to be wrong here.
+        logger.exception(
+            "[responses] could not read the cancel flag for correlation_id=%s; "
+            "treating the turn as failed", correlation_id,
+        )
+        return False
+
+
+async def _seal_unterminated_buffer(
+    buffer, lifecycle: "TurnLifecycle", conv_id, *, request_id: str | None = None,
+) -> None:
     """Guarantee a terminal record so a producer that ended WITHOUT closing its
     buffer can't leave the client's tail (and its shared stream slot) hanging
     forever.
@@ -151,16 +195,23 @@ async def _seal_unterminated_buffer(buffer, lifecycle: "TurnLifecycle", conv_id)
     abstract on ``StreamBuffer`` but a minimal test double may lack it — treat an
     absent flag as already-terminated so a stub can't trigger a spurious second
     terminal.
+
+    ``request_id`` is the producing turn's own correlation id — the remote
+    one for ``_produce_remote``, the locally minted one for ``_run_turn``.
+    This is the hardest-failing turn (one that escaped every named ``except``),
+    so it's exactly the one a user is most likely to report. Still optional:
+    the direct/channel producers have no such id to offer.
     """
     if lifecycle.discarded or getattr(buffer, "is_closed", True):
         return
     logger.error(
-        "[responses] turn for conversation %s ended without a terminal record; "
-        "sealing the buffer so the client releases its stream slot", conv_id,
+        "[responses] turn for conversation %s (correlation_id=%s) ended without a "
+        "terminal record; sealing the buffer so the client releases its stream slot",
+        conv_id, request_id, extra={"request_id": request_id},
     )
     try:
         await buffer.append("sse", {"sse": response_failed_sse(
-            GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
+            GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)})
     except Exception:
         logger.exception("[responses] could not emit terminal error frame while sealing")
     try:
@@ -168,6 +219,37 @@ async def _seal_unterminated_buffer(buffer, lifecycle: "TurnLifecycle", conv_id)
     except Exception:
         logger.exception("[responses] could not seal unterminated turn buffer")
 
+
+def _auth_failure_provider(settings, role: str | None) -> Provider | None:
+    """Whose credential the failing call was using, or None if unattributable.
+
+    Anton's `LLMClient` stamps the role on every confirmed refusal that leaves
+    it, so the three named roles cover normal operation. An unstamped auth error
+    can still arrive from a version-skewed anton, whose 401 is an untyped
+    `ConnectionError` that `turn_errors.is_auth_error` still recognizes. Guessing
+    "planning" there would name the wrong provider and offer the wrong remedy in
+    a mixed configuration — a MindsHub "Reconnect" card for a failing BYOK
+    Anthropic key, or the reverse.
+
+    When the required roles resolve to the same provider there is nothing to get
+    wrong, so answer. When they disagree, decline and let the caller fall back to
+    the generic auth copy.
+    """
+    if role == "coding":
+        return settings.resolved_coding_provider
+    if role == "router":
+        # Defensive, and not reachable today: every router call site swallows a
+        # confirmed refusal rather than propagating it — `summarize()` at
+        # anton/core/session.py:2366, `gate()` inside `_gate_turn` at
+        # anton/core/session.py:3515, and `_route_decision` below. The turn
+        # falls back to planning instead, which `tests/test_thalamus.py` pins in
+        # anton. Kept so a future propagating router path attributes the card to
+        # the provider that actually failed rather than defaulting to planning.
+        return settings.resolved_router_provider
+    if role == "planning":
+        return settings.resolved_planning_provider
+    planning = settings.resolved_planning_provider
+    return planning if planning == settings.resolved_coding_provider else None
 
 class ResponsesHandler:
     def __init__(self, session: Session, principal: Principal | None = None) -> None:
@@ -189,6 +271,8 @@ class ResponsesHandler:
 
     async def handle(self, request: ResponsesRequest) -> AsyncGenerator[str, None] | Response:
         logger.info("[responses] handle() called — conversation=%s, stream=%s", request.conversation, request.stream)
+
+        await require_product_permission(self.scope, "product.execute")
 
         # A per-conversation harness pick (Coding Mode's composer pill)
         # overrides the account default for THIS call only — mirrors the
@@ -412,12 +496,20 @@ class ResponsesHandler:
         if reason:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
         try:
-            history = [
-                message.to_openai_message().model_dump()
-                for message in ConversationService(self.scoped).get_ordered_messages(conversation_id)
-                if message.role in {"user", "assistant"}
-            ]
-            history.append({"role": "user", "content": self._prompt_text(harness_input)})
+            # Scrub credentials: this history bypasses the normal turn's
+            # _scrub_user_input/_stamp_message pass. Bounded to the rows
+            # decide_route can actually use (_text_history keeps at most
+            # _MAX_HISTORY_MESSAGES) so scrubbing doesn't pay for the whole
+            # conversation on every gated turn.
+            ordered = [
+                m for m in ConversationService(self.scoped).get_ordered_messages(conversation_id)
+                if m.role in {"user", "assistant"}
+            ][-_MAX_HISTORY_MESSAGES:]
+            history = [scrubbed_openai_dump(m) for m in ordered]
+            history.append({
+                "role": "user",
+                "content": scrub_credentials(self._prompt_text(harness_input)),
+            })
             # The gate's LLM call is the only one a direct turn makes, and it
             # is made outside any ChatSession — so without a trace context it
             # reaches MindsHub anonymous, and a direct turn leaves no trace to
@@ -450,8 +542,10 @@ class ResponsesHandler:
             finally:
                 reset_trace_context(trace_token)
             return decision, turn_llm
+        except (ProductPermissionDenied, ProductPermissionUnavailable):
+            raise
         except Exception:
-            # Any gate-path failure (history query, mint, settings) fails open.
+            # Non-authorization routing failures may delegate to the agent.
             logger.exception("[responses] routing gate failed — delegating")
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
@@ -461,7 +555,7 @@ class ResponsesHandler:
         """Hosted orgs keep no stored Minds key (remote turns mint one), so the
         gate mints its own per-turn key here and hands it back for the
         delegated turn to reuse. Everywhere else the stored settings apply."""
-        if TurnQueueSettings().backend != "remote":
+        if not TurnQueueSettings().is_remote:
             return None, None
         settings = get_user_settings(self.scope)
         if (settings.resolved_router_provider is not Provider.MINDS_CLOUD
@@ -522,7 +616,7 @@ class ResponsesHandler:
         # turn_id comes from handle(): same numbering as the delegated path.
         buffer = new_buffer(str(conversation_id), turn_id)
         lifecycle = TurnLifecycle()
-        await registry.start(
+        handle = await registry.start(
             conversation_id=str(conversation_id),
             turn_id=turn_id,
             buffer=buffer,
@@ -537,6 +631,19 @@ class ResponsesHandler:
             ),
             lifecycle=lifecycle,
         )
+        # A direct answer still uses the shared Redis buffer in a multi-replica
+        # deployment. Register it just like a delegated turn so another replica
+        # can locate and replay that buffer. Do this only when start accepted our
+        # buffer: a duplicate send returns the existing handle and must not
+        # overwrite its index entry with the discarded turn.
+        if get_backend() == "redis" and handle.buffer is buffer:
+            await record_turn(
+                str(conversation_id),
+                turn_id=turn_id,
+                correlation_id=f"direct-{uuid4()}",
+                org_id=self.scoped.scope.org_id,
+                user_id=self.scoped.scope.user_id,
+            )
         return sse_from_buffer(buffer, 0)
 
     async def _produce_direct(
@@ -641,7 +748,7 @@ class ResponsesHandler:
         read.
         """
         lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
-        if TurnQueueSettings().backend == "remote":
+        if TurnQueueSettings().is_remote:
             return self._produce_remote(
                 lifecycle=lifecycle,
                 conv_id=conv_id,
@@ -699,6 +806,48 @@ class ResponsesHandler:
             SkillService(session.scope).ensure_builtin_skills()
         except Exception:
             logger.exception("[responses] failed to stage workspace files for conversation %s", conv_id)
+
+    @staticmethod
+    def _stage_remote_workspace_files_in_new_session(
+        conv_id: UUID,
+        scope: TenantScope,
+    ) -> None:
+        raw_session = None
+        session = None
+        try:
+            raw_session = get_open_session()
+            session = ScopedSession(raw_session, scope)
+            ResponsesHandler._stage_remote_workspace_files(session, conv_id)
+        except Exception:
+            logger.exception(
+                "[responses] failed to open workspace staging session for conversation %s",
+                conv_id,
+            )
+        finally:
+            opened = session or raw_session
+            if opened is not None:
+                try:
+                    opened.close()
+                except Exception:
+                    logger.exception(
+                        "[responses] failed to close workspace staging session for conversation %s",
+                        conv_id,
+                    )
+
+    @staticmethod
+    def _remote_started_at(session: ScopedSession, conv_id: UUID) -> str | None:
+        """The conversation's creation time as ISO 8601, for the pod's fixed
+        "conversation started" prompt line. Mirrors what the in-process path
+        passes as `started_at`. A lookup failure degrades to None (today's
+        date in the pod) rather than failing the turn."""
+        try:
+            created_at = getattr(
+                ConversationService(session).get_conversation(conv_id), "created_at", None
+            )
+            return created_at.isoformat() if created_at is not None else None
+        except Exception:
+            logger.exception("[responses] failed to resolve started_at for conversation %s", conv_id)
+            return None
 
     @staticmethod
     def _remote_workspace(session: ScopedSession, conv_id: UUID) -> dict:
@@ -775,17 +924,30 @@ class ResponsesHandler:
 
     @staticmethod
     def _remote_memory(session: ScopedSession, conv_id: UUID) -> dict:
-        """This org's memory slots for the pod. A read error degrades to a turn
-        without memory rather than failing the turn."""
+        """This project's shared memory slots for the pod.
+
+        Personal/global memory is already mounted read-only per (org, user).
+        The pod's writable mount starts at the conversation workspace, so it
+        cannot see the project-level ``.anton/memory`` sibling unless these two
+        slots travel on the wire. A read error degrades to a turn without
+        project memory rather than failing the turn.
+        """
         try:
             conversation = ConversationService(session).get_conversation(conv_id)
-            return build_turn_memory(session.scope, conversation.project.path)
+            resolved = build_turn_memory(session.scope, conversation.project.path)
+            project = resolved.get("project")
+            return {"project": project} if project else {}
         except Exception:
             logger.exception("[responses] failed to read memory for conversation %s", conv_id)
             return {}
 
     @staticmethod
-    def _persist_turn_memory(session: ScopedSession, conv_id: UUID, entries: list) -> None:
+    def _persist_turn_memory(
+        session: ScopedSession,
+        conv_id: UUID,
+        entries: list,
+        principal: Principal | None,
+    ) -> None:
         """Apply what the pod asked to remember, re-anchoring the conversation
         first (like persist(): one deleted mid-turn must not write memory).
 
@@ -795,19 +957,87 @@ class ResponsesHandler:
             return
         try:
             conversation = ConversationService(session).get_conversation(conv_id)
-            applied = apply_turn_memory(session.scope, conversation.project.path, entries)
+            from cowork.models.project import Project
+            from cowork.services.shared_resources import (
+                PROJECT,
+                SharedResourceAccess,
+                project_resource_key,
+            )
+
+            access = SharedResourceAccess(session, principal)
+            project_id = conversation.project_id
+            with access.coordination_lock(
+                PROJECT,
+                project_resource_key(project_id),
+            ):
+                # The turn may have waited behind rename/delete. Re-anchor both
+                # rows while holding the project lock and use only that current
+                # path for the contained memory mutation.
+                conversation = ConversationService(session).get_conversation(conv_id)
+                session.refresh(conversation)
+                if conversation.project_id != project_id:
+                    raise RuntimeError("Conversation project changed during memory write")
+                project = session.get(Project, project_id)
+                if project is None:
+                    raise ValueError("Project not found")
+                session.refresh(project)
+                applied = apply_turn_memory(
+                    session.scope,
+                    project.path,
+                    entries,
+                    access=access,
+                    project_id=project.id,
+                )
             logger.info("[responses] applied %d memory entr(ies) for conversation %s",
                         applied, conv_id)
         except Exception:
             logger.exception("[responses] failed to apply memory for conversation %s", conv_id)
 
     @staticmethod
+    def _persist_turn_memory_in_new_session(
+        conv_id: UUID,
+        entries: list,
+        principal: Principal | None,
+        scope: TenantScope,
+    ) -> None:
+        if not entries:
+            return
+        raw_session = None
+        session = None
+        try:
+            raw_session = get_open_session()
+            session = ScopedSession(raw_session, scope)
+            ResponsesHandler._persist_turn_memory(
+                session,
+                conv_id,
+                entries,
+                principal,
+            )
+        except Exception:
+            logger.exception(
+                "[responses] failed to open memory persistence session for conversation %s",
+                conv_id,
+            )
+        finally:
+            opened = session or raw_session
+            if opened is not None:
+                try:
+                    opened.close()
+                except Exception:
+                    logger.exception(
+                        "[responses] failed to close memory persistence session for conversation %s",
+                        conv_id,
+                    )
+
+    @staticmethod
     def _remote_history(session, conv_id) -> list[dict]:
-        """Prior user/assistant messages in canonical order, as OpenAI-shaped
-        dicts (mode="json": the payload gets json.dumps'd into the Redis job)."""
+        """Prior user/assistant messages in canonical order, as OpenAI-shaped,
+        scrubbed dicts (mode="json": the payload gets json.dumps'd into the
+        Redis job). The pod's harness only scrubs the current turn's input,
+        never this replayed history, so it must arrive already clean."""
         ordered = ConversationService(session).get_ordered_messages(conv_id)
         return [
-            m.to_openai_message().model_dump(mode="json")
+            scrubbed_openai_dump(m, mode="json")
             for m in ordered
             if m.role in {"user", "assistant"}
         ]
@@ -832,7 +1062,6 @@ class ResponsesHandler:
         user + assistant together on terminal (deferred, so _remote_history
         reads prior turns without the current input)."""
         lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
-        producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
         collected_text: list[str] = []
         collected_events: list[dict] = []
         # This turn's tool block-rows, for LLM-history persistence only. Kept
@@ -842,6 +1071,16 @@ class ResponsesHandler:
         persisted = False
         pending_message_id: UUID | None = None
         failure: dict = {}
+        # Resolved once, up front — not left for stream_remote_replies to mint
+        # internally on a None — so every failure branch below (classified or
+        # not) can attach the SAME id a support/log lookup would use. Each of
+        # those branches logs the id at WARNING or above, which is the floor
+        # the deployed environments run at; this INFO line is only the
+        # per-turn breadcrumb that ties a successful turn to its id in dev.
+        corr = (turn_llm or {}).get("correlation_id") or str(uuid4())
+        logger.info(
+            "[responses] remote turn conversation=%s correlation_id=%s", conv_id, corr,
+        )
 
         def event_sink(event_type: str, data: dict) -> None:
             # Same event log the in-process path records, so the client
@@ -849,18 +1088,14 @@ class ResponsesHandler:
             # at_ms is stamped at receipt (the pod sends no timestamps), so
             # replayed durations are approximate under consumer lag.
             collected_events.append(data)
-            if event_type == "response.output_text.delta":
-                collected_text.append(data.get("delta", ""))
+            accumulate_answer_text(collected_text, event_type, data)
 
-        # Stage attachments + project instructions into the workspace before the
-        # pod runs, so it can read them off the shared mount (no other channel).
-        # Off the event loop: the copies are blocking fs I/O (multi-MB uploads,
-        # EFS latency) and would otherwise stall every other SSE stream on this
-        # worker. Safe to share the producer session with the thread — nothing
-        # else touches it until the reply stream below starts.
-        await asyncio.to_thread(self._stage_remote_workspace_files, producer_session, conv_id)
+        producer_scope: TenantScope | None = None
+        producer_session: ScopedSession | None = None
 
         async def replies_as_stream_events():
+            if producer_session is None or producer_scope is None:
+                raise RuntimeError("Remote producer session is not initialized")
             from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
             from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated
             from cowork.services.task_objects import (
@@ -881,6 +1116,13 @@ class ResponsesHandler:
             new_slugs: list[str] = []
             touched_slugs: set[str] = set()
             turn_scope = None
+            artifact_writes_allowed = False
+            # Off the loop: this reads the project's memory slots off the shared
+            # mount, and one worker serves every other request on this process
+            # while a blocking EFS round trip is in flight.
+            memory = await asyncio.to_thread(
+                self._remote_memory, producer_session, conv_id
+            )
 
             try:
                 async for kind, data in stream_remote_replies(
@@ -893,20 +1135,31 @@ class ResponsesHandler:
                     # Producer session, NOT self.scoped: this coroutine is detached
                     # and the request session may be closed by the time it runs.
                     history=self._remote_history(producer_session, conv_id),
-                    # Skills and memory are NOT sent: the pod reads them off the
-                    # shared mount. Only the org-relative project path travels.
+                    # Global memory and skills use read-only mounts. Project
+                    # memory is outside the conversation workspace and therefore
+                    # travels as a bounded, sheddable wire block.
+                    memory=memory,
                     **self._remote_workspace(producer_session, conv_id),
-                    correlation_id=(turn_llm or {}).get("correlation_id"),
+                    started_at=self._remote_started_at(producer_session, conv_id),
+                    correlation_id=corr,
                     llm=(turn_llm or {}).get("llm"),
                     disabled=disabled,
                 ):
-                    if kind == "turn_delta":
+                    if kind == "progress" and data.get("phase") == "workspace_authorized":
+                        artifact_writes_allowed = data.get("workspace_mode") == "persistent"
+                    elif kind == "turn_delta":
                         yield StreamTextDelta(text=data.get("text", ""))
                     elif kind == "turn_step":
                         for event in step_stream_events(data):
                             yield event
                     elif kind == "turn_memory":
-                        self._persist_turn_memory(producer_session, conv_id, data.get("entries") or [])
+                        await asyncio.to_thread(
+                            self._persist_turn_memory_in_new_session,
+                            conv_id,
+                            data.get("entries") or [],
+                            self.principal,
+                            producer_scope,
+                        )
                     elif kind == "turn_history":
                         # Slice-assign, not extend: the pod emits one frame per
                         # turn, so a repeated frame must replace the rows rather
@@ -935,6 +1188,18 @@ class ResponsesHandler:
                         # try must still run on a clean finish.
                         break
                     elif kind == "turn_failed":
+                        if await _remote_cancel_confirmed(data.get("error"), corr):
+                            # A /cancel that reached a replica which doesn't
+                            # own the producer sets the Redis flag only, so
+                            # the controller is what discards the pod and it
+                            # reports the stop as a turn_failed. Neither of
+                            # its cancel literals reaches remote_turn_error,
+                            # which would collapse them to anton_error.
+                            # Route them through the same path a locally
+                            # aborted turn takes: partial text persists, no
+                            # response.failed frame, no error bubble on
+                            # reload.
+                            raise asyncio.CancelledError()
                         failure.update(data)
                         raise _RemoteTurnFailed()
             finally:
@@ -942,7 +1207,7 @@ class ResponsesHandler:
                 # an artifact the worker wrote is recorded even when the turn
                 # failed or was stopped, and it is synchronous because an await
                 # in a generator's finally is skipped on cancellation.
-                if artifacts is not None:
+                if artifacts is not None and artifact_writes_allowed:
                     new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
                         artifacts[0], conv_id, artifacts[2], artifacts[1],
                         before_slugs, before_mtimes,
@@ -951,7 +1216,7 @@ class ResponsesHandler:
             # Clean completion only — a raise inside the try skips this, matching
             # the in-process path where Stop/error produce no cards and the next
             # turn in the project heals the publish.
-            if artifacts is not None:
+            if artifacts is not None and artifact_writes_allowed:
                 for card in await publish_and_card_turn_artifacts(
                     artifacts[1],
                     new_slugs=new_slugs,
@@ -967,6 +1232,12 @@ class ResponsesHandler:
             if persisted:
                 return
             persisted = True
+            if producer_session is None:
+                logger.error(
+                    "[responses] cannot persist remote turn without a session for conversation %s",
+                    conv_id,
+                )
+                return
             try:
                 # Re-anchor first: the conversation may be gone or out of scope.
                 svc = ConversationService(producer_session)
@@ -994,6 +1265,19 @@ class ResponsesHandler:
                 logger.exception("[responses] failed to persist remote turn for conversation %s", conv_id)
 
         try:
+            # Stage attachments + project instructions before the pod runs. The
+            # copies use a worker-owned session, so cancellation can safely close
+            # this producer without racing blocking EFS or database work.
+            producer_scope = scope_from_principal(self.principal)
+            await asyncio.to_thread(
+                self._stage_remote_workspace_files_in_new_session,
+                conv_id,
+                producer_scope,
+            )
+            producer_session = ScopedSession(
+                get_open_session(),
+                producer_scope,
+            )
             # Persist the user message (pending) as the first thing this producer
             # does (ENG-1231) — see the note in handle(). Committed here, before
             # streaming, so a refresh/reconnect mid-turn shows the question via
@@ -1017,8 +1301,17 @@ class ResponsesHandler:
         except _RemoteTurnFailed:
             message = failure.get("message") or GENERIC_TURN_ERROR_MESSAGE
             code = failure.get("code") or GENERIC_TURN_ERROR_CODE
-            collected_events.append(response_failed_payload(message, code))
-            await buffer.append("sse", {"sse": response_failed_sse(message, code)})
+            # At WARNING because that is the floor the deployed environments
+            # run at: the id below is what the client shows the user as a
+            # Reference, so a line carrying it has to survive prod's log level
+            # or support has nothing to search for.
+            logger.warning(
+                "[responses] remote turn reported a failure for conversation %s "
+                "correlation_id=%s code=%s", conv_id, corr, code,
+                extra={"request_id": corr},
+            )
+            collected_events.append(response_failed_payload(message, code, request_id=corr))
+            await buffer.append("sse", {"sse": response_failed_sse(message, code, request_id=corr)})
             if code == CONTENT_RECOVERY_CODE:
                 # ENG-1992: the remote/org path's twin of the streaming
                 # handler's repair — producer.py already classified this via
@@ -1047,16 +1340,25 @@ class ResponsesHandler:
             persist()
             await buffer.close("cancelled")
         except Exception:
-            logger.exception("[responses] remote turn failed for conversation %s", conv_id)
+            logger.exception(
+                "[responses] remote turn failed for conversation %s correlation_id=%s",
+                conv_id, corr, extra={"request_id": corr},
+            )
             collected_events.append(response_failed_payload(
-                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE))
+                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr))
             await buffer.append("sse", {"sse": response_failed_sse(
-                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
+                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr)})
             persist()
             await buffer.close("error")
         finally:
-            await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
-            producer_session.close()
+            await _seal_unterminated_buffer(
+                buffer, lifecycle, conv_id, request_id=corr
+            )
+            # The session is only bound part-way into the try above, so a
+            # failure before that point leaves it None. Closing unguarded would
+            # raise here and mask the exception that actually ended the turn.
+            if producer_session is not None:
+                producer_session.close()
 
     async def _produce(self, **kwargs) -> None:
         # Detached task: bind the turn's org scope so every settings reader in the
@@ -1101,6 +1403,12 @@ class ResponsesHandler:
         # Send time captured before the turn
         sent_at = datetime.now(timezone.utc)
         pending_message_id: UUID | None = None
+        # The in-process twin of _produce_remote's correlation id. Minted up
+        # front so the failure branch and the seal below attach the SAME id the
+        # log line carries. This path has no pod and so no correlation id of its
+        # own to reuse — a desktop turn's only trace is the local log, which is
+        # exactly the report this id exists to make possible.
+        corr = str(uuid4())
 
         def event_sink(event_type: str, data: dict) -> None:
             # Tool block-rows are for LLM-history persistence, not UI replay —
@@ -1109,8 +1417,7 @@ class ResponsesHandler:
                 turn_rows[:] = data.get("rows") or []
                 return
             collected_events.append(data)
-            if event_type == "response.output_text.delta":
-                collected_text.append(data.get("delta", ""))
+            accumulate_answer_text(collected_text, event_type, data)
 
         def persist() -> None:
             nonlocal persisted
@@ -1137,7 +1444,10 @@ class ResponsesHandler:
                     tool_rows=turn_rows,
                 )
             except Exception:
-                logger.exception("[responses] failed to persist turn for conversation %s", conv_id)
+                logger.exception(
+                    "[responses] failed to persist turn for conversation %s", conv_id,
+                    extra={"request_id": corr},
+                )
 
         try:
             conv = ConversationService(producer_session).get_conversation(conv_id)
@@ -1190,10 +1500,20 @@ class ResponsesHandler:
             friendly = friendly_turn_error(exc, model_info=model_info)
             if friendly is not None:
                 code, message = friendly
-                logger.info("[responses] user-facing turn error: %s", exc)
+                logger.info(
+                    "[responses] user-facing turn error: %s", exc,
+                    extra={"request_id": corr},
+                )
             else:
                 code, message = GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
-                logger.exception("[responses] turn failed for conversation %s", conv_id)
+                # WARNING or above is the floor the deployed environments run
+                # at, and this is the branch whose message tells the user
+                # nothing — so the id has to survive that level or the
+                # Reference they quote resolves to no line.
+                logger.exception(
+                    "[responses] turn failed for conversation %s correlation_id=%s",
+                    conv_id, corr, extra={"request_id": corr},
+                )
             if code == CONTENT_RECOVERY_CODE:
                 # ENG-1992: the provider permanently rejected an image block in
                 # this conversation's stored history — repair the DATA once,
@@ -1205,12 +1525,12 @@ class ResponsesHandler:
                     logger.warning(
                         "[responses] content validation error on conversation %s — "
                         "repaired %d message(s) with image content: %s",
-                        conv_id, len(repaired), exc,
+                        conv_id, len(repaired), exc, extra={"request_id": corr},
                     )
                 except Exception:
                     logger.exception(
                         "[responses] failed to repair conversation %s after content validation error",
-                        conv_id,
+                        conv_id, extra={"request_id": corr},
                     )
             # For an auth failure, tell the client which provider failed so it
             # offers the right action: "Reconnect" only for MindsHub (we can
@@ -1223,13 +1543,21 @@ class ResponsesHandler:
                 # if it raises we just fall back to the generic auth message
                 # (no reconnectable flag), so the stream still closes cleanly.
                 try:
-                    from cowork.common.settings.user_settings import Provider
-                    provider = get_user_settings().resolved_planning_provider
-                    reconnectable = provider == Provider.MINDS_CLOUD
-                    message = auth_error_detail(provider.label, reconnectable)
-                    extra = {"reconnectable": reconnectable, "provider_label": provider.label}
+                    provider = _auth_failure_provider(
+                        get_user_settings(), getattr(exc, "role", None)
+                    )
+                    # An unattributable failure keeps the generic auth copy with
+                    # no provider fields, rather than naming a provider that may
+                    # not be the one that failed.
+                    if provider is not None:
+                        reconnectable = provider == Provider.MINDS_CLOUD
+                        message = auth_error_detail(provider.label, reconnectable)
+                        extra = {"reconnectable": reconnectable, "provider_label": provider.label}
                 except Exception:
-                    logger.exception("[responses] could not resolve provider for auth error")
+                    logger.exception(
+                        "[responses] could not resolve provider for auth error",
+                        extra={"request_id": corr},
+                    )
             elif code in MODEL_UNAVAILABLE_CODES:
                 # The model was rejected (legacy 403 gate, or a 404 for a model
                 # the provider can't serve): tell the client WHICH model so the
@@ -1269,7 +1597,10 @@ class ResponsesHandler:
                         # non-desktop consumers; no cowork code reads it.
                         extra = {"retry_after": _after, "retry_at": retry_at_instant(_after)}
                 except Exception:
-                    logger.exception("[responses] could not resolve the retry hint")
+                    logger.exception(
+                        "[responses] could not resolve the retry hint",
+                        extra={"request_id": corr},
+                    )
             elif code == PROVIDER_OVERLOADED_CODE:
                 # Transient-incident timeout (ENG-673): give the card the failing
                 # model AND the active provider, and flag whether the user is
@@ -1281,7 +1612,6 @@ class ResponsesHandler:
                 failed_model = overloaded_info[1] if overloaded_info else ""
                 extra = {"model": failed_model}
                 try:
-                    from cowork.common.settings.user_settings import Provider
                     s = get_user_settings()
                     # The nudge keys on WHICH provider overloaded. anton passes the
                     # actual failing model (planning OR coding); map it back to its
@@ -1302,14 +1632,25 @@ class ResponsesHandler:
                     extra["provider_label"] = provider.label
                     extra["reconnectable"] = provider == Provider.MINDS_CLOUD
                 except Exception:
-                    logger.exception("[responses] could not resolve provider for overload error")
+                    logger.exception(
+                        "[responses] could not resolve provider for overload error",
+                        extra={"request_id": corr},
+                    )
+            # Set after the branches above, each of which REPLACES `extra`
+            # rather than adding to it — seeding it earlier would survive only
+            # the unmapped path. Carried on every failure so the payload shape
+            # stays uniform, but only the unmapped branch tags its log line
+            # with the id, so a curated failure can reach the log with nothing
+            # to match a quoted reference against. The client renders it on
+            # the generic card alone, so there is nothing to quote for one.
+            extra["request_id"] = corr
             failed = response_failed_payload(message, code, **extra)
             await buffer.append("sse", {"sse": response_failed_sse(message, code, **extra)})
             collected_events.append(failed)
             persist()
             await buffer.close("error")
         finally:
-            await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
+            await _seal_unterminated_buffer(buffer, lifecycle, conv_id, request_id=corr)
             producer_session.close()
 
     @staticmethod
@@ -1319,7 +1660,7 @@ class ResponsesHandler:
         if "response.created" in sse_string and "conversation_id" not in sse_string:
             try:
                 lines = sse_string.strip().split("\n")
-                data_line = next(l for l in lines if l.startswith("data:"))
+                data_line = next(line for line in lines if line.startswith("data:"))
                 payload = json.loads(data_line[5:])
                 payload["conversation_id"] = str(conversation_id)
                 if harness_id:
@@ -1347,8 +1688,7 @@ class ResponsesHandler:
                 turn_rows[:] = data.get("rows") or []
                 return
             collected_events.append(data)
-            if event_type == "response.output_text.delta":
-                collected_text.append(data.get("delta", ""))
+            accumulate_answer_text(collected_text, event_type, data)
 
         try:
             async for _ in self._get_harness().formatter(stream, model, event_sink):
@@ -1358,10 +1698,16 @@ class ResponsesHandler:
             # unsupported image) surfaces its curated message with a 400;
             # anything else stays a generic 500 so provider internals never
             # leak. (cowork PR #156.)
+            # Minted here rather than up front like the streaming twin: this
+            # path has no seal to feed, so a successful turn needs no id.
+            corr = str(uuid4())
             friendly = friendly_turn_error(exc)
             if friendly is not None:
                 code, message = friendly
-                logger.info("[responses] user-facing turn error: %s", exc)
+                logger.info(
+                    "[responses] user-facing turn error: %s", exc,
+                    extra={"request_id": corr},
+                )
                 if code == CONTENT_RECOVERY_CODE:
                     # ENG-1992: see the streaming path's twin for the full
                     # rationale — repair the conversation's stored history
@@ -1372,15 +1718,31 @@ class ResponsesHandler:
                             "[responses] content validation error on conversation %s — "
                             "repaired %d message(s) with image content: %s",
                             conversation_id, len(repaired), exc,
+                            extra={"request_id": corr},
                         )
                     except Exception:
                         logger.exception(
                             "[responses] failed to repair conversation %s after content validation error",
-                            conversation_id,
+                            conversation_id, extra={"request_id": corr},
                         )
-                raise HTTPException(status_code=400, detail=message)
-            logger.exception("[responses] turn failed")
-            raise HTTPException(status_code=500, detail=GENERIC_TURN_ERROR_MESSAGE)
+                # The ladder already produced a code; carry it instead of dropping
+                # it here. Same wire shape the streaming twin emits.
+                raise HTTPException(
+                    status_code=400,
+                    detail=response_failed_payload(message, code, request_id=corr),
+                )
+            logger.exception(
+                "[responses] turn failed for conversation %s correlation_id=%s",
+                conversation_id, corr, extra={"request_id": corr},
+            )
+            # Same shape as the 400 above: one body for every turn failure, so a
+            # caller never has to branch on status to know how to read `detail`.
+            raise HTTPException(
+                status_code=500,
+                detail=response_failed_payload(
+                    GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
+                ),
+            )
 
         assistant_text = "".join(collected_text)
         # Persist the user message now — after the harness has read history for

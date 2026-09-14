@@ -4,6 +4,10 @@ from uuid import UUID
 from pydantic import BaseModel, model_validator
 
 from cowork.harnesses.memory.registry import MemorySlot
+from cowork.schemas.shared_resources import (
+    MutableResourceCapabilities,
+    ResourceAttribution,
+)
 
 
 class MemoryScope(str, Enum):
@@ -45,6 +49,8 @@ class MemoryResponse(BaseModel):
     category: MemorySlot
     content: str
     project_id: UUID | None = None
+    attribution: ResourceAttribution
+    capabilities: MutableResourceCapabilities
 
     @model_validator(mode="before")
     def validate_project_id(cls, values):

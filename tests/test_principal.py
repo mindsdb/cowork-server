@@ -11,6 +11,7 @@ from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
 
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.principal import (
     Principal,
     TrustedHeaderMiddleware,
@@ -23,7 +24,11 @@ WEBHOOK = "/api/v1/channels/slack/events"
 
 USER_ID = "0f7f0b6a-3f0f-4c58-9e0c-6dbb3ac0f0a1"
 ORG_ID = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+OTHER_ORG_ID = "4e27728a-a002-48b5-8961-0e1ca339d13f"
 IDENTITY = {"X-User-Id": USER_ID, "X-Organization-Id": ORG_ID}
+EXPECTED_ORG_HEADER = "X-Cowork-Expected-Organization-Id"
+RELOAD_HEADER = "X-Cowork-Organization-Reload"
+JWT = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ1c2VyIn0.signature"
 
 
 def _app(org_mode: bool = True, enforce: bool = True) -> FastAPI:
@@ -51,7 +56,11 @@ def _app(org_mode: bool = True, enforce: bool = True) -> FastAPI:
     # Mirror create_app's ordering: principal added first (inner), CORS last
     # (outer) so a 401 still flows back out through CORS.
     if org_mode:
-        app.add_middleware(TrustedHeaderMiddleware, exempt_paths={WEBHOOK}, enforce=enforce)
+        app.add_middleware(
+            TrustedHeaderMiddleware,
+            exempt_paths={WEBHOOK},
+            enforce=enforce,
+        )
     app.add_middleware(
         CORSMiddleware,
         allow_origins=[ORIGIN],
@@ -64,6 +73,13 @@ def _app(org_mode: bool = True, enforce: bool = True) -> FastAPI:
 
 def _client(org_mode: bool = True, enforce: bool = True) -> TestClient:
     return TestClient(_app(org_mode, enforce))
+
+
+def _browser_headers(expected_org_id: str | None = ORG_ID) -> dict[str, str]:
+    headers = {**IDENTITY, "Authorization": f"Bearer {JWT}"}
+    if expected_org_id is not None:
+        headers[EXPECTED_ORG_HEADER] = expected_org_id
+    return headers
 
 
 def test_missing_identity_is_401():
@@ -246,6 +262,200 @@ def test_audit_mode_still_builds_principal_when_identity_present():
     assert res.status_code == 200
     assert res.json()["user_id"] == USER_ID
     assert res.json()["org_id"] == ORG_ID
+
+
+def test_browser_jwt_expected_organization_exact_match_is_allowed():
+    res = _client().get(
+        "/api/v1/whoami", headers=_browser_headers()
+    )
+
+    assert res.status_code == 200
+    assert res.json()["org_id"] == ORG_ID
+
+
+def test_browser_jwt_expected_organization_is_uuid_normalized():
+    res = _client().get(
+        "/api/v1/whoami", headers=_browser_headers(ORG_ID.upper())
+    )
+
+    assert res.status_code == 200
+    assert res.json()["org_id"] == ORG_ID
+
+
+def _assert_organization_boundary_rejection(response, status_code: int) -> None:
+    assert response.status_code == status_code
+    assert response.json() == {
+        "code": "organization_reload_required",
+        "detail": "Reload Cowork to continue in the active organization.",
+    }
+    assert response.headers.get(RELOAD_HEADER) == "required"
+    assert response.headers.get("cache-control") == "no-store"
+    assert response.headers.get("access-control-allow-origin") == ORIGIN
+
+
+def test_organization_boundary_requires_browser_header():
+    res = _client().get(
+        "/api/v1/whoami",
+        headers={**_browser_headers(None), "Origin": ORIGIN},
+    )
+
+    _assert_organization_boundary_rejection(res, 426)
+
+
+def test_no_environment_variable_reopens_the_organization_boundary(monkeypatch):
+    """The old mode key cannot bring the pass-through branch back.
+
+    TrustedHeaderMiddleware reads no setting for the fence, so an environment
+    still carrying the retired key gets the same refusal. The cache clears are
+    aimed at one re-wiring in particular, a middleware that reads
+    ``get_app_settings()`` itself: without them the settings load before the
+    monkeypatch and this passes against that broken build. They do nothing for
+    the shipped code, which never reads settings on this path. Restoring the
+    original shape instead, a constructor keyword defaulting to ``"enforce"``,
+    is caught by
+    ``test_app_settings.py::test_stale_organization_boundary_mode_env_var_is_inert``,
+    because that shape needs the AppSettings field back.
+    """
+    monkeypatch.setenv("COWORK_ORGANIZATION_BOUNDARY_MODE", "audit")
+    get_app_settings.cache_clear()
+
+    res = _client().get(
+        "/api/v1/whoami",
+        headers={**_browser_headers(None), "Origin": ORIGIN},
+    )
+
+    _assert_organization_boundary_rejection(res, 426)
+    get_app_settings.cache_clear()
+
+
+def test_organization_boundary_rejects_malformed_browser_header():
+    res = _client().get(
+        "/api/v1/whoami",
+        headers={**_browser_headers("not-an-organization"), "Origin": ORIGIN},
+    )
+
+    _assert_organization_boundary_rejection(res, 409)
+
+
+def test_organization_boundary_rejects_browser_org_mismatch():
+    res = _client().get(
+        "/api/v1/whoami",
+        headers={**_browser_headers(OTHER_ORG_ID), "Origin": ORIGIN},
+    )
+
+    _assert_organization_boundary_rejection(res, 409)
+
+
+def test_api_key_is_exempt_from_organization_boundary():
+    res = _client().get(
+        "/api/v1/whoami",
+        headers={
+            **IDENTITY,
+            "Authorization": "Bearer mdb_organization_api_key",
+            EXPECTED_ORG_HEADER: OTHER_ORG_ID,
+        },
+    )
+
+    assert res.status_code == 200
+
+
+def test_opaque_bearer_is_exempt_from_organization_boundary():
+    res = _client().get(
+        "/api/v1/whoami",
+        headers={
+            **IDENTITY,
+            "Authorization": "Bearer opaque-token",
+            EXPECTED_ORG_HEADER: OTHER_ORG_ID,
+        },
+    )
+
+    assert res.status_code == 200
+
+
+def test_short_three_part_bearer_is_exempt_from_organization_boundary():
+    res = _client().get(
+        "/api/v1/whoami",
+        headers={
+            **IDENTITY,
+            "Authorization": "Bearer opaque.service.token",
+            EXPECTED_ORG_HEADER: OTHER_ORG_ID,
+        },
+    )
+
+    assert res.status_code == 200
+
+
+def test_compact_jose_header_still_takes_part_in_the_organization_boundary():
+    """`{"alg":"RS256"}` encodes to exactly 20 characters — a real signed token
+    that a length threshold would wave past the boundary."""
+    compact = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ1c2VyIn0.signature"
+
+    res = _client().get(
+        "/api/v1/whoami",
+        headers={
+            **IDENTITY,
+            "Authorization": f"Bearer {compact}",
+            EXPECTED_ORG_HEADER: OTHER_ORG_ID,
+            "Origin": ORIGIN,
+        },
+    )
+
+    _assert_organization_boundary_rejection(res, 409)
+
+
+def test_three_part_bearer_without_a_jose_header_is_exempt():
+    """The first segment decodes, but to a JSON string rather than a header."""
+    not_a_header = "IlJTMjU2Ig.eyJzdWIiOiJ1c2VyIn0.signature"
+
+    res = _client().get(
+        "/api/v1/whoami",
+        headers={
+            **IDENTITY,
+            "Authorization": f"Bearer {not_a_header}",
+            EXPECTED_ORG_HEADER: OTHER_ORG_ID,
+        },
+    )
+
+    assert res.status_code == 200
+
+
+def test_missing_bearer_is_exempt_from_organization_boundary():
+    res = _client().get(
+        "/api/v1/whoami",
+        headers={**IDENTITY, EXPECTED_ORG_HEADER: OTHER_ORG_ID},
+    )
+
+    assert res.status_code == 200
+
+
+def test_health_is_exempt_from_organization_boundary():
+    res = _client().get(
+        "/api/v1/health", headers=_browser_headers(OTHER_ORG_ID)
+    )
+
+    assert res.status_code == 200
+
+
+def test_channel_webhook_is_exempt_from_organization_boundary():
+    res = _client().post(
+        WEBHOOK, headers=_browser_headers(OTHER_ORG_ID)
+    )
+
+    assert res.status_code == 200
+
+
+def test_options_is_exempt_from_organization_boundary():
+    res = _client().options(
+        "/api/v1/whoami",
+        headers={
+            "Origin": ORIGIN,
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": EXPECTED_ORG_HEADER,
+        },
+    )
+
+    assert res.status_code in (200, 204)
+    assert res.headers.get("access-control-allow-origin") == ORIGIN
 
 
 def test_identity_trace_metadata_without_principal_is_passthrough():

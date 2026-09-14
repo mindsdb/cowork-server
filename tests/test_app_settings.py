@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from cowork.common.settings.app_settings import AppSettings
+from cowork.common.settings.app_settings import AppSettings, TurnQueueSettings
 
 
 def test_app_settings_ignores_generic_server_port(monkeypatch):
@@ -155,8 +155,95 @@ def test_app_settings_identity_enforce_defaults_to_enforce(monkeypatch):
     assert settings.identity_enforce == "enforce"
 
 
+def test_app_settings_identity_enforce_can_opt_into_audit(monkeypatch):
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "audit")
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.identity_enforce == "audit"
+
+
 def test_app_settings_rejects_invalid_identity_enforce(monkeypatch):
     monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "strict")
 
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None)
+
+
+def test_turn_queue_settings_is_remote(monkeypatch):
+    monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")
+    assert TurnQueueSettings().is_remote is True
+
+    monkeypatch.setenv("COWORK_TURN_BACKEND", "inprocess")
+    assert TurnQueueSettings().is_remote is False
+
+    monkeypatch.delenv("COWORK_TURN_BACKEND", raising=False)
+    assert TurnQueueSettings().is_remote is False  # default is "inprocess"
+
+
+def test_stale_organization_boundary_mode_env_var_is_inert(monkeypatch):
+    """A leftover overlay entry loads and changes nothing.
+
+    The expected-organization fence has no mode any more. An environment that
+    still carries the old key must neither reopen the fail-open path nor stop
+    the pod booting, because an overlay can outlive a deploy. Deleting the field
+    is what makes the key inert: AppSettings sets no ``env_prefix`` and gives
+    every field an explicit ``validation_alias``, so the environment source only
+    looks up names a field still claims. ``extra`` does not enter into it for an
+    environment variable, which is how an overlay delivers this one; it decides
+    only what happens to an unknown key arriving in a ``.env`` file.
+    """
+    monkeypatch.setenv("COWORK_ORGANIZATION_BOUNDARY_MODE", "audit")
+
+    settings = AppSettings(_env_file=None)
+
+    assert not hasattr(settings, "organization_boundary_mode")
+
+
+def test_app_settings_organization_switch_defaults_to_disabled(monkeypatch):
+    monkeypatch.delenv("COWORK_ORGANIZATION_SWITCH_ENABLED", raising=False)
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.organization_switch_enabled is False
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("true", True), ("false", False), ("1", True), ("0", False)],
+)
+def test_app_settings_reads_organization_switch_enabled(monkeypatch, raw, expected):
+    monkeypatch.setenv("COWORK_ORGANIZATION_SWITCH_ENABLED", raw)
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.organization_switch_enabled is expected
+
+
+def test_app_settings_rejects_invalid_organization_switch_enabled(monkeypatch):
+    monkeypatch.setenv("COWORK_ORGANIZATION_SWITCH_ENABLED", "sometimes")
+
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None)
+
+
+def test_identity_enforce_defaults_to_enforce(monkeypatch):
+    """ENG-2094 AC6: a dropped env var must not reopen the no-principal path.
+
+    The rollout mode has to be asked for by name. Without this the default is
+    one edit away from flipping and nothing goes red — the permission front
+    door 401s an anonymous org-mode caller, but TrustedHeaderMiddleware is
+    what stops one reaching a route declared OpenByDesign at all.
+    """
+    monkeypatch.delenv("COWORK_IDENTITY_ENFORCE", raising=False)
+
+    assert AppSettings(_env_file=None).identity_enforce == "enforce"
+
+
+def test_identity_enforce_audit_must_be_asked_for_by_name(monkeypatch):
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "audit")
+    assert AppSettings(_env_file=None).identity_enforce == "audit"
+
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "off")
     with pytest.raises(ValidationError):
         AppSettings(_env_file=None)
