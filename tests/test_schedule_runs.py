@@ -390,7 +390,7 @@ def test_execute_schedule_passes_pinned_model_through(monkeypatch):
 # the turn receives that principal so the remote backend can mint the org's key
 # headlessly.
 
-def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch):
+def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch, granted_product_permissions):
     import asyncio
 
     import cowork.handlers.responses as responses_mod
@@ -781,7 +781,7 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
         s.close()
 
 
-def test_execute_schedule_derives_service_principal_in_org_mode(monkeypatch):
+def test_execute_schedule_derives_service_principal_in_org_mode(monkeypatch, granted_product_permissions):
     """A schedule's own org_id/created_by — stamped when a real user created it
     through the request-scoped path — is what fires the turn in org mode. No
     live request principal exists at cron time, so the schedule row is the only
