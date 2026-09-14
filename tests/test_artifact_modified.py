@@ -272,6 +272,33 @@ def test_update_preserves_password_access(tmp_path: Path):
     assert entry["access_password"] == "s3cret"
 
 
+def test_update_refreshes_mtime_when_publish_does_not_rewrite_state(tmp_path: Path):
+    root = _make_static_html(tmp_path)
+    published_json = root / ".published.json"
+    published_json.write_text(
+        json.dumps({"index.html": {
+            "report_id": "uuid-1", "url": "https://4nton.ai/a/uuid-1",
+            "last_md5": "old", "published": True, "mode": "public",
+            "published_mtime": 1,
+        }}),
+        encoding="utf-8",
+    )
+
+    with ExitStack() as stack:
+        stack.enter_context(_patch_scan(tmp_path))
+        stack.enter_context(_patch_publish_scan(tmp_path))
+        stack.enter_context(patch.object(
+            publish_mod, "desktop_publish_credential", lambda: ("key", "https://4nton.ai")
+        ))
+        stack.enter_context(patch.object(
+            publish_mod, "publish_artifact", lambda *args, **kwargs: {"status": "ok"}
+        ))
+        publish_mod.update_artifact(str(root))
+
+    entry = json.loads(published_json.read_text(encoding="utf-8"))["index.html"]
+    assert entry["published_mtime"] == publish_mod._content_mtime(root)
+
+
 def test_update_unpublished_raises(tmp_path: Path):
     import pytest
     root = _make_static_html(tmp_path)  # no .published.json at all

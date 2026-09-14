@@ -61,14 +61,10 @@ def task_title(prompt: str) -> str:
     return f"{compact[: TASK_TITLE_MAX_LENGTH - 1].rstrip()}…"
 
 
-def project_instructions(
-    project: CodeProject | None,
+def _project_setup_instructions(
+    project: CodeProject,
     workspaces: list[TaskWorkspace],
-    contexts: list[SourceContext],
-    playbook_guidance: str,
-) -> str:
-    if project is None:
-        return playbook_guidance
+) -> list[str]:
     sections = [
         f"You are working in the MindsHub Code Project {project.name!r}.",
         "Treat every listed task workspace as part of one project. Inspect and change multiple folders when the outcome requires it.",
@@ -91,6 +87,16 @@ def project_instructions(
             + "\n".join(f"- {item.provider}: {item.label or item.name}" for item in project.connections)
             + "\nExternal writes require an explicit user action in MindsHub Code. Do not post or publish merely because work completed."
         )
+    return sections
+
+
+def project_instructions(
+    project: CodeProject | None,
+    workspaces: list[TaskWorkspace],
+    contexts: list[SourceContext],
+    playbook_guidance: str,
+) -> str:
+    sections = _project_setup_instructions(project, workspaces) if project is not None else []
     if playbook_guidance:
         sections.append(playbook_guidance)
     if contexts:

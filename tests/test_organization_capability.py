@@ -35,12 +35,10 @@ def _configure(
     *,
     tenancy_mode: str,
     identity_enforce: str,
-    boundary_mode: str,
     switch_enabled: bool,
 ) -> None:
     monkeypatch.setenv("COWORK_TENANCY_MODE", tenancy_mode)
     monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", identity_enforce)
-    monkeypatch.setenv("COWORK_ORGANIZATION_BOUNDARY_MODE", boundary_mode)
     monkeypatch.setenv(
         "COWORK_ORGANIZATION_SWITCH_ENABLED", "true" if switch_enabled else "false"
     )
@@ -50,24 +48,21 @@ def _configure(
     (
         "tenancy_mode",
         "identity_enforce",
-        "boundary_mode",
         "switch_enabled",
         "expected_enforced",
         "expected_enabled",
     ),
     [
-        ("local", "enforce", "enforce", True, False, False),
-        ("org", "audit", "enforce", True, False, False),
-        ("org", "enforce", "audit", True, False, False),
-        ("org", "enforce", "enforce", False, True, False),
-        ("org", "enforce", "enforce", True, True, True),
+        ("local", "enforce", True, False, False),
+        ("org", "audit", True, False, False),
+        ("org", "enforce", False, True, False),
+        ("org", "enforce", True, True, True),
     ],
 )
 def test_organization_switch_capability_is_fail_closed(
     monkeypatch,
     tenancy_mode,
     identity_enforce,
-    boundary_mode,
     switch_enabled,
     expected_enforced,
     expected_enabled,
@@ -76,7 +71,6 @@ def test_organization_switch_capability_is_fail_closed(
         monkeypatch,
         tenancy_mode=tenancy_mode,
         identity_enforce=identity_enforce,
-        boundary_mode=boundary_mode,
         switch_enabled=switch_enabled,
     )
 
@@ -99,7 +93,6 @@ def test_organization_switch_capability_requires_a_principal(monkeypatch, tenanc
         monkeypatch,
         tenancy_mode=tenancy_mode,
         identity_enforce="enforce",
-        boundary_mode="enforce",
         switch_enabled=True,
     )
 
@@ -117,7 +110,6 @@ def test_real_app_advertises_enabled_protocol_through_the_boundary(monkeypatch):
         monkeypatch,
         tenancy_mode="org",
         identity_enforce="enforce",
-        boundary_mode="enforce",
         switch_enabled=True,
     )
 

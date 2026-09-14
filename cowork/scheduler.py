@@ -193,6 +193,11 @@ async def execute_schedule(
             session.commit()
             raise
 
+        from cowork.db.scoped import scope_from_principal
+        from cowork.services.product_permissions import require_product_permission
+
+        await require_product_permission(scope_from_principal(principal), "product.execute")
+
         if conversation_id is None:
             from cowork.db.scoped import (
                 ScopedSession,
