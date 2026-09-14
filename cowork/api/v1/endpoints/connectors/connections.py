@@ -24,6 +24,7 @@ from cowork.services.connectors.developer_validation import (
     DeveloperProviderUnavailable,
     validate_developer_connection,
 )
+from cowork.services.connectors.identity import oauth_default_label
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.google import oauth_service
 from cowork.services.connectors.persist import persist_connection
@@ -168,22 +169,16 @@ def _persist_direct_connection(
         # a genuinely new connection; it can never clobber a label the user
         # already set on a reconnect (see persist_connection's default_label
         # docs). Mirrors the same wiring in oauth/google.py's callback(),
-        # the analogous save path for a non-Electron (web) OAuth flow —
-        # including the account_email fallback: none of the Google-family
-        # scopes (Drive/Calendar/Ads/Analytics/Gmail) include profile/openid,
-        # so account_name is never populated for them, and without this
-        # fallback the label defaults to the bare engine id, de-duplicated
-        # with a trailing counter on a second account ("gmail 2") — a label
-        # that leaks into the tile subtitle next to the email.
-        account_name = str(values.get("account_name") or "").strip()
-        account_email = str(values.get("account_email") or "").strip()
+        # the analogous save path for a non-Electron (web) OAuth flow — both
+        # reuse oauth_default_label() rather than hand-rolling this fallback
+        # independently.
         slug = persist_connection(
             body.connector_id,
             body.method,
             body.name,
             values,
             replace_existing=body.replace_existing,
-            default_label=account_name or account_email or None,
+            default_label=oauth_default_label(values, body.connector_id),
             vault=vault,
         )
     except Exception:

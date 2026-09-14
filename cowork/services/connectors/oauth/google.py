@@ -18,6 +18,7 @@ from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
 from cowork.schemas.connectors import OAuthConfig, OAuthStartResponse
 from cowork.services.connectors.oauth import pkce as pkce_utils
 from cowork.services.connectors.oauth.config import OAUTH_SERVICES
+from cowork.services.connectors.identity import oauth_default_label
 from cowork.services.connectors.oauth.state import OAuthStateStore
 from cowork.services.connectors.persist import persist_connection
 from cowork.services.connectors.specs._registry import registry as spec_registry
@@ -555,20 +556,21 @@ class OAuthService:
             # user already set on a reconnect (see persist_connection's
             # default_label docs).
             #
-            # Falling back to account_email when account_name is empty matters
-            # most for Google: none of the granted scopes (Drive/Calendar/Ads/
-            # Analytics/Gmail) include profile/openid, so Google's userinfo
-            # response never carries a name claim, and account_name is always
-            # empty. Without this fallback, persist_connection instead defaults
-            # to the bare engine id (e.g. "gmail"), de-duplicated with a
-            # trailing counter on a second account ("gmail 2") — a label that
-            # survives connectionIdentity()'s "title, again" filter and leaks
-            # into the tile subtitle next to the email. Defaulting to the email
-            # keeps the label identical to the subtitle's own identity value,
-            # so the frontend's dedup collapses them back to just the email.
+            # oauth_default_label falls back to account_email when
+            # account_name is empty, which matters most for Google: none of
+            # the granted scopes (Drive/Calendar/Ads/Analytics/Gmail) include
+            # profile/openid, so Google's userinfo response never carries a
+            # name claim, and account_name is always empty. Without that
+            # fallback, persist_connection instead defaults to the bare
+            # engine id (e.g. "gmail"), de-duplicated with a trailing counter
+            # on a second account ("gmail 2") — a label that survives
+            # connectionIdentity()'s "title, again" filter and leaks into the
+            # tile subtitle next to the email. Defaulting to the email keeps
+            # the label identical to the subtitle's own identity value, so
+            # the frontend's dedup collapses them back to just the email.
             connection_name = persist_connection(
                 cfg.engine, "browser_oauth_builtin", "", new_fields,
-                default_label=account_name or account_email or None,
+                default_label=oauth_default_label(new_fields, cfg.engine),
             )
         except HTTPException as exc:
             err_msg = str(exc.detail)
