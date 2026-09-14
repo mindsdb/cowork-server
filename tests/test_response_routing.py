@@ -351,6 +351,62 @@ async def test_route_request_scrubs_secrets_from_history_and_current_prompt(monk
 
 
 @pytest.mark.asyncio
+async def test_route_request_scrubs_a_registered_vault_secret_by_value(monkeypatch, tmp_path, request):
+    """A DSN password has no key-shape for _SECRET_KEY_PATTERN to match, so it
+    only gets redacted if register_vault_secrets() ran register_secret_vars()
+    against this vault before the history is scrubbed. Without step 2's call
+    site this reaches decide_route in the clear."""
+    from uuid import uuid4
+
+    from anton.core.datasources.data_vault import LocalDataVault
+    from cowork.models.message_event import MessageEvent  # noqa: F401 — resolves the ORM relationship
+    from cowork.models.message import Message
+    from cowork.schemas.responses import Role
+    import cowork.handlers.responses as responses
+
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "vault"))
+    vault = LocalDataVault(tmp_path / "vault")
+    vault.save("postgres", "mydb", {
+        "host": "db.example.com", "port": "5432", "database": "app",
+        "user": "svc", "password": "hunter2xyz",
+    })
+
+    # register_vault_secrets sets process-global DS_* env vars (anton's
+    # registry, not test-scoped) — clear them so this leaves no residue for
+    # later tests in the same session.
+    request.addfinalizer(vault.clear_ds_env)
+
+    handler = _routing_handler(monkeypatch)
+    responses.register_vault_secrets(handler.scope)
+
+    cid = uuid4()
+    rows = [Message(conversation_id=cid, role=Role.user, content="the password is hunter2xyz")]
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: rows),
+    )
+    seen = {}
+
+    async def fake_decide_route(**kwargs):
+        seen.update(kwargs)
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+
+    await handler._route_request(
+        conversation_id=cid,
+        harness_input=[{"type": "text", "text": "hi"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+
+    blob = str(seen["history"])
+    assert "hunter2xyz" not in blob
+    assert "[DS_" in blob
+
+
+@pytest.mark.asyncio
 async def test_route_request_does_not_hand_the_composer_pick_to_the_gate(monkeypatch):
     """ENG-1851: the composer's per-conversation pick drives Anton's turn, not
     the gate. `_route_request` no longer accepts or forwards it."""

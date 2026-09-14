@@ -7,7 +7,16 @@ Every caller that replays history from storage must scrub it itself with
 """
 from anton.utils.datasources import scrub_credentials
 
-__all__ = ["scrub_credentials", "scrub_message_dict", "scrubbed_openai_dump"]
+from cowork.common.logger import get_logger
+
+logger = get_logger(__name__)
+
+__all__ = [
+    "register_vault_secrets",
+    "scrub_credentials",
+    "scrub_message_dict",
+    "scrubbed_openai_dump",
+]
 
 
 def scrub_message_dict(om: dict) -> dict:
@@ -33,3 +42,24 @@ def scrub_message_dict(om: dict) -> dict:
 def scrubbed_openai_dump(message, **dump_kwargs) -> dict:
     """`message.to_openai_message().model_dump(**dump_kwargs)`, scrubbed."""
     return scrub_message_dict(message.to_openai_message().model_dump(**dump_kwargs))
+
+
+def register_vault_secrets(scope) -> None:
+    """Register this request's DS_* secret names+values so scrub_credentials
+    can redact them by exact value, not just by API-key shape.
+
+    Call once at request entry, before any history is scrubbed: the
+    registration is context-scoped, so it reaches everything running in the
+    same task and leaves a concurrent request's registration alone. A failure
+    must not fail the turn — scrubbing falls back to the shape-based regex.
+    """
+    from anton.utils.datasources import restore_namespaced_env
+    from cowork.services.connectors.persist import vault_for_scope
+
+    try:
+        restore_namespaced_env(vault_for_scope(scope))
+    except Exception:
+        logger.warning(
+            "Could not register vault secrets; this turn's history is scrubbed "
+            "by key shape only", exc_info=True,
+        )

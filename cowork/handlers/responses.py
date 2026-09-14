@@ -13,7 +13,7 @@ from sqlmodel import Session
 
 from cowork.build_info import build_trace_metadata
 from cowork.common.chat_session import in_process_agent_allowed
-from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
+from cowork.common.history_scrub import register_vault_secrets, scrub_credentials, scrubbed_openai_dump
 from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings
 from cowork.common.settings.user_settings import (
     Provider,
@@ -351,6 +351,8 @@ class ResponsesHandler:
         # this is a stable per-conversation index for the buffer file.
         turn_id = len(conversation.messages)
 
+        register_vault_secrets(self.scope)
+
         disabled = (
             [dc.model_dump() for dc in request.disabled_connections]
             if request.disabled_connections else None
@@ -497,10 +499,12 @@ class ResponsesHandler:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
         try:
             # Scrub credentials: this history bypasses the normal turn's
-            # _scrub_user_input/_stamp_message pass. Bounded to the rows
-            # decide_route can actually use (_text_history keeps at most
-            # _MAX_HISTORY_MESSAGES) so scrubbing doesn't pay for the whole
-            # conversation on every gated turn.
+            # _scrub_user_input/_stamp_message pass. DS_* value registration
+            # for this is done by register_vault_secrets() at handle() entry,
+            # not by _build_chat_session. Bounded to the rows decide_route can
+            # actually use (_text_history keeps at most _MAX_HISTORY_MESSAGES)
+            # so scrubbing doesn't pay for the whole conversation on every
+            # gated turn.
             ordered = [
                 m for m in ConversationService(self.scoped).get_ordered_messages(conversation_id)
                 if m.role in {"user", "assistant"}
