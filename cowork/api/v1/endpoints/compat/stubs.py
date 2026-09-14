@@ -14,10 +14,12 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, File, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse
 
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.db.scoped import MissingTenantScopeError, ScopedSessionDep
+from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
 
 logger = logging.getLogger(__name__)
 
@@ -26,12 +28,15 @@ logger = logging.getLogger(__name__)
 integrations_router = APIRouter()
 
 
-@integrations_router.get("")
+# OpenByDesign, standalone reason: both routes below return a hardcoded stub
+# value, ignoring their input entirely — there is nothing caller identity
+# could change or expose.
+@integrations_router.get("", dependencies=[Depends(require(OpenByDesign))])
 def list_integrations():
     return []
 
 
-@integrations_router.post("/{service}/oauth/start")
+@integrations_router.post("/{service}/oauth/start", dependencies=[Depends(require(OpenByDesign))])
 def oauth_start(service: str, body: dict[str, Any] | None = None):
     return {"url": None, "error": "OAuth not yet available in cowork-server"}
 
@@ -42,7 +47,12 @@ def oauth_start(service: str, body: dict[str, Any] | None = None):
 # input_file content blocks in the Responses request input field.
 # These endpoints exist as a compat bridge for the current client.
 
-attachments_router = APIRouter()
+# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
+# whenever org mode has no org in scope. Declaring it too makes the
+# requirement visible to a route walker instead of something only
+# discoverable by reading scoped.py.
+attachments_router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
 def _attachment_purpose(project_name: str, session_id: str) -> str:
@@ -161,8 +171,20 @@ def attachment_raw(project_name: str, session_id: str, attachment_id: UUID, scop
     )
 
 
+#: Project-root names the server owns. `.anton` holds instructions, memory and
+#: skill drafts; `conversations` holds every member's private workspace. A plain
+#: file landing on either name squats a directory the server has to create later,
+#: so a move that would take one is refused before anything is copied.
+_RESERVED_PROJECT_ROOT_NAMES = frozenset({".anton", CONVERSATIONS_DIRNAME})
+
+
+def _project_destination_name(filename: str | None) -> str:
+    """The project-root filename a moved attachment lands on."""
+    return os.path.basename(filename or "upload").strip() or "upload"
+
+
 def _unique_project_target(project_dir: Path, filename: str) -> Path:
-    safe_name = os.path.basename(filename or "upload").strip() or "upload"
+    safe_name = _project_destination_name(filename)
     target = project_dir / safe_name
     if not target.exists():
         return target
@@ -188,6 +210,13 @@ def move_attachment_to_project(
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
+    destination_name = _project_destination_name(filename)
+    if scoped.scope.org_mode and destination_name in _RESERVED_PROJECT_ROOT_NAMES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"The {destination_name} project namespace is reserved",
+        )
+
     project_dir = Path(project.path)
     project_dir.mkdir(parents=True, exist_ok=True)
     target = _unique_project_target(project_dir, filename)
@@ -206,7 +235,8 @@ def move_attachment_to_project(
 scratchpad_router = APIRouter()
 
 
-@scratchpad_router.post("/cancel")
+# OpenByDesign, standalone reason: hardcoded stub response, nothing to expose.
+@scratchpad_router.post("/cancel", dependencies=[Depends(require(OpenByDesign))])
 def cancel_scratchpad():
     return {"ok": True}
 
@@ -216,7 +246,7 @@ def cancel_scratchpad():
 browse_router = APIRouter()
 
 
-@browse_router.get("/status")
+# OpenByDesign, standalone reason: hardcoded stub response, nothing to expose.
+@browse_router.get("/status", dependencies=[Depends(require(OpenByDesign))])
 def browse_status():
     return {"available": False}
-

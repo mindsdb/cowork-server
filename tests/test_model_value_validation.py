@@ -503,6 +503,7 @@ def test_org_mode_gate_is_wired_through_the_endpoint(monkeypatch):
     from cowork.db.scoped import TenantScope, get_tenant_scope
     from cowork.db.session import get_open_session, get_session
     from cowork.common.settings.app_settings import get_app_settings
+    from cowork.principal import Principal, get_principal
 
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
     get_app_settings.cache_clear()
@@ -525,6 +526,12 @@ def test_org_mode_gate_is_wired_through_the_endpoint(monkeypatch):
     app.dependency_overrides[get_session] = lambda: session
     app.dependency_overrides[get_tenant_scope] = lambda: TenantScope(
         org_mode=True, org_id="org-123", user_id="user-1"
+    )
+    # AuthenticatedInOrgMode (upsert_setting's declared permission, ENG-2094)
+    # needs a resolved principal in org mode; this minimal app has no
+    # TrustedHeaderMiddleware to build one from a request header.
+    app.dependency_overrides[get_principal] = lambda: Principal(
+        user_id="user-1", org_id="org-123"
     )
     try:
         client = TestClient(app)

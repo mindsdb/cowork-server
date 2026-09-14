@@ -9,7 +9,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel
 
-from cowork.api.v1.endpoints.guards import require_local_tenancy
+from cowork.api.v1.permissions import DesktopOnly, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 
 from cowork.services.publish import (
@@ -26,18 +26,22 @@ from cowork.services.publish import (
 # The whole publish surface is desktop-only: it addresses artifacts by absolute
 # server path and resolves the credential from stored provider settings, neither of
 # which exists in an org deployment. Auto-publish is the org path instead.
-router = APIRouter(dependencies=[Depends(require_local_tenancy)])
+router = APIRouter(dependencies=[Depends(require(DesktopOnly))])
 
 
 class _AccessBody(BaseModel):
     # Mutually exclusive publish modes (ENG-322):
     #   public     — anyone with the link
     #   password   — visitors must enter `password`
-    #   restricted — only `emails` and/or everyone in the owner's org
+    #   restricted — only `emails` and/or everyone in the owner's org, or the
+    #                owner alone when `owner_only` is set
     mode: Literal["public", "password", "restricted"] = "public"
     password: str | None = None
     emails: list[str] = []
     org_allowed: bool = False
+    # Explicit "only me": a restricted publish with no emails and no org.
+    # Without this flag that combination degrades to public (ENG-1769).
+    owner_only: bool = False
 
 
 class _PublishBody(BaseModel):

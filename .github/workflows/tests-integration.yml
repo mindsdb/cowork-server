@@ -9,6 +9,10 @@ on:
       deploy-env:
         required: true
         type: string
+      runner:
+        description: Self-hosted runner in the deployment's cluster
+        required: true
+        type: string
 
 defaults:
   run:
@@ -18,7 +22,7 @@ jobs:
   integration-tests:
     # Needs cluster access: the second-replica test port-forwards to individual
     # pods, since the load balancer is free to send both requests to the same one.
-    runs-on: mdb-dev
+    runs-on: ${{ inputs.runner }}
     environment:
       name: ${{ inputs.deploy-env }}
     steps:
@@ -44,12 +48,22 @@ jobs:
       # is mounted there (it exists only where auth's `ephemeral` setting is on),
       # so no secret is needed and each run gets a fresh throwaway tenant.
       #
-      # dev/staging/prod: the dev route is deliberately not mounted there, so
+      # dev/staging: the dev route is deliberately not mounted there, so
       # identity comes from auth's internal provisioning endpoint with the
-      # dedicated secret. It provisions the fixed `cowork` suite: one
-      # @emailsink.dev tenant reused across runs. The hostnames come from a
-      # committed env file rather than GitHub Environment variables, so a change
-      # is a reviewable diff (same as mindshub_inference).
+      # dedicated secret. It provisions the fixed `cowork` suite. Prod uses a
+      # separately managed standing identity: mutating the shared emailsink
+      # account there is disabled while its fixture password remains committed.
+      # Hostnames come from a committed
+      # env file rather than GitHub Environment variables, so a change is a
+      # reviewable diff (same as mindshub_inference).
+      #
+      # That provisioning call goes to auth's Service over cluster DNS, not to
+      # the public host. After the internal-edge cutover, Cloudflare
+      # Access rejects that public POST before it reaches Django. The caller
+      # passes a runner in the deployment's cluster, so the Service's fully
+      # qualified name needs no Cloudflare credential and no extra Kubernetes
+      # permission. This matches auth's tests-integration.yml and the
+      # auth.<env>.svc.cluster.local address our chart already gives the ingress.
       - name: Resolve the target and the identity source
         env:
           DEPLOY_ENV: ${{ inputs.deploy-env }}
@@ -75,7 +89,11 @@ jobs:
             set +a
             {
               echo "COWORK_BASE_URL=${COWORK_BASE_URL}"
-              echo "TEST_USER_PROVISION_URL=${COWORK_AUTH_BASE_URL}/v1/internal/test-users/"
+              if [[ "$DEPLOY_ENV" == "prod" ]]; then
+                echo "COWORK_TEST_IDENTITY_MODE=standing"
+              else
+                echo "TEST_USER_PROVISION_URL=${COWORK_AUTH_INTERNAL_BASE_URL}/v1/internal/test-users/"
+              fi
             } >> "$GITHUB_ENV"
           fi
 
@@ -84,15 +102,38 @@ jobs:
       # the same replica. Everything else goes through the ingress, which is
       # also what authenticates the Bearer key.
       #
-      # One pod is a valid deployment, so that test skips rather than fails.
+      # One pod is a valid deployment where nobody promised two, so the test
+      # skips rather than fails there. In a namespace this runner deploys to,
+      # the deploy job just rolled two, so a skip is a failure.
       - name: Port-forward two pods for the cross-replica test
         env:
           DEPLOY_ENV: ${{ inputs.deploy-env }}
         run: |
           set -euo pipefail
           # PR envs and permanent envs both deploy into a namespace named
-          # after the env.
+          # after the env. The caller supplies the matching cluster runner;
+          # staging uses mdb-dev and prod uses mdb-prod.
           ns="$DEPLOY_ENV"
+          # Which namespaces make a missing replica or a dead port-forward a
+          # real defect rather than a known gap in the environment. Permanent
+          # jobs run inside their target cluster, where `<env>-gha-runner-deploy`
+          # carries both `pods list` and `create pods/portforward`. A `pr-*`
+          # namespace is served by `<env>-gha-runner-prenv`, which is read-only
+          # by design. That gap is unrelated to the change being shipped, so it
+          # does not go red. A PR
+          # environment also runs one replica, pinned by argocd-envs in
+          # parent/templates/cowork-server-app.yaml, so it lands in the one-pod
+          # branch below rather than the port-forward one.
+          case "$ns" in
+            dev|staging|prod) enforce=true ;;
+            *)           enforce=false ;;
+          esac
+          # The same answer, handed to pytest. A post-deploy test with no target
+          # and no identity skips, and nine skips print the same green as nine
+          # passes, which is how this suite ran on every staging push without
+          # anyone noticing. Where the environment is supposed to have every
+          # prerequisite, a missing one is a defect: see tests/integration/prereq.py.
+          echo "COWORK_REQUIRE_INTEGRATION=$enforce" >> "$GITHUB_ENV"
           # Selected by name rather than by label: the chart comes from an
           # external `deployment` dependency, so its label scheme is not ours to
           # rely on. Deployment pods are always <deployment>-<hash>-<suffix>.
@@ -103,15 +144,22 @@ jobs:
           )
           if [[ "${#pods[@]}" -lt 2 ]]; then
             # Not the same thing, and the messages should not read the same.
-            # Zero means this runner cannot see that namespace's pods at all:
-            # the job is pinned to mdb-dev, so on the prod release path it lists
-            # nothing and has never exercised the cross-replica behaviour.
+            # Zero means the environment's own runner cannot see that
+            # namespace's pods at all, so it has not exercised cross-replica
+            # behaviour.
             if [[ "${#pods[@]}" -eq 0 ]]; then
-              echo "::warning::No cowork-server pods visible in $ns from this runner." \
-                   "The cross-replica test did NOT run. A green job here says nothing about it."
+              detail="No cowork-server pods visible in $ns from this runner."
             else
-              echo "::warning::Only 1 cowork-server pod in $ns; the cross-replica test did NOT run."
+              detail="Only 1 cowork-server pod in $ns."
             fi
+            if [[ "$enforce" == true ]]; then
+              # The deploy job just rolled two replicas into this namespace and
+              # this runner can read it, so seeing fewer is a real failure.
+              echo "::error::$detail The cross-replica test did NOT run."
+              exit 1
+            fi
+            echo "::warning::$detail The cross-replica test did NOT run." \
+                 "A green job here says nothing about it."
             exit 0
           fi
           # 9010 is the port uvicorn binds (see the chart's args). Reached
@@ -131,27 +179,84 @@ jobs:
             fi
             sleep 2
           done
-          # Say what did not happen, and do not fail on it yet.
+          # A warning exits 0, so the job stays green while the cross-replica
+          # test silently skips, which reads exactly like "the cross-replica
+          # behaviour is fine". So fail where the port-forward is supposed to
+          # work, and warn where it is known not to.
           #
-          # Failing here is the right end state: a warning exits 0, so the job
-          # stays green while the cross-replica test silently skips, which reads
-          # exactly like "the cross-replica behaviour is fine". But this step is
-          # ALREADY failing on every push to staging, and has been for as long
-          # as the annotations go back, because the runner ServiceAccount has no
-          # `create pods/portforward` in that namespace. Turning it into `exit 1`
-          # before that RBAC lands makes every staging release red and alerts
-          # on-call per push, for a cause that has nothing to do with whatever
-          # change is being shipped.
-          #
-          # So: grant the runner `pods/portforward` in
-          # Kubernetes-Foundational-Services, confirm this step goes green on a
-          # staging push, and then make this an error.
+          # Reaching here means two pods were listed, so in practice only a
+          # deploy namespace gets this far: a PR environment runs one replica.
+          # The guard below is there for the day that changes, and it is right on
+          # its own terms, because `<env>-gha-runner-prenv` is read-only and does not
+          # carry `create pods/portforward`, so a PR environment with two pods
+          # still could not forward to them.
           echo "::warning::port-forwards to ${pods[0]} and ${pods[1]} never answered ${health}."
-          echo "::warning::The cross-replica test did NOT run. Check the runner's pods/portforward RBAC first;" \
-               "this step cannot pass without it."
-          exit 0
+          if [[ "$enforce" != true ]]; then
+            echo "::warning::The cross-replica test did NOT run. $ns cannot port-forward:" \
+                 "the runner is read-only there by design."
+            exit 0
+          fi
+          echo "::error::The cross-replica test did NOT run. Check the runner's pods/portforward RBAC first:" \
+               "kubectl -n $ns auth can-i create pods --subresource=portforward" \
+               "--as=system:serviceaccount:infrastructure:<env>-gha-runner"
+          exit 1
 
-      - name: Run integration tests
+      # Name every empty prod input at once, here, rather than letting the
+      # session-scoped identity fixture report the same absence once per test.
+      # The suite's own report is seven identical setup errors four seconds into
+      # pytest, which reads as a broken test suite rather than as unset
+      # configuration. Reads the values only to test them for emptiness and
+      # never prints one. Mirrors mindshub_services' scripts/check_integration_inputs.sh.
+      #
+      # Deliberately ABOVE the non-prod step: tests/test_integration_workflow.py
+      # slices this file between the two run steps and asserts the prod key name
+      # does not appear in that window.
+      - name: Check the prod standing-identity inputs
+        if: inputs.deploy-env == 'prod'
+        env:
+          COWORK_TEST_API_KEY: ${{ secrets.COWORK_TEST_API_KEY }}
+          COWORK_TEST_USER_EMAIL: ${{ vars.COWORK_TEST_USER_EMAIL }}
+          COWORK_TEST_ORG_ID: ${{ vars.COWORK_TEST_ORG_ID }}
+        run: |
+          set -euo pipefail
+          # Accumulated as a string: an empty array under `set -u` is an error on
+          # bash 3.2, which is what a developer running this locally may have.
+          missing=""
+          for name in COWORK_TEST_API_KEY COWORK_TEST_USER_EMAIL COWORK_TEST_ORG_ID; do
+            if [ -z "${!name:-}" ]; then
+              missing="${missing}${missing:+, }${name}"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Required prod integration inputs are empty: ${missing}." \
+                 "Set them on the 'prod' GitHub Environment: COWORK_TEST_API_KEY is a" \
+                 "secret, COWORK_TEST_USER_EMAIL and COWORK_TEST_ORG_ID are variables." \
+                 "Protect that Environment first - a nonempty required-reviewer rule," \
+                 "prevent self-review, admin bypass disabled, and exactly one 'main'" \
+                 "branch rule. See README.md for the exact checks."
+            exit 1
+          fi
+          echo "All required prod integration inputs are present."
+
+      - name: Run integration tests (non-prod)
+        if: inputs.deploy-env != 'prod'
         env:
           TEST_USER_PROVISION_SECRET: ${{ secrets.TEST_USER_PROVISION_SECRET }}
+        run: make test/integration
+
+      - name: Run integration tests (prod)
+        if: inputs.deploy-env == 'prod'
+        env:
+          # Configure these only after the prod GitHub Environment has a
+          # nonempty reviewer rule, prevents self-review, disables admin bypass,
+          # and allows exactly one `main` Branch rule. Production evidence must
+          # use a fresh attempt 1 started after protection and approved by an
+          # eligible reviewer other than both its actor and triggering actor.
+          # Auth then resolves the key's ids and verifies the configured
+          # controlled-domain email and dedicated organization live.
+          # The caller's main-ref check is defense in depth; Environment settings
+          # are the credential boundary. See README.md for the exact checks.
+          COWORK_TEST_API_KEY: ${{ secrets.COWORK_TEST_API_KEY }}
+          COWORK_TEST_USER_EMAIL: ${{ vars.COWORK_TEST_USER_EMAIL }}
+          COWORK_TEST_ORG_ID: ${{ vars.COWORK_TEST_ORG_ID }}
         run: make test/integration

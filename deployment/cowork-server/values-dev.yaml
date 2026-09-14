@@ -28,3 +28,8 @@ deployment:
     # headers are rejected with 401.
     - name: COWORK_IDENTITY_ENFORCE
       value: "enforce"
+
+    # Shows the organization picker. The expected-organization boundary refuses
+    # a mismatched tab whatever this says; see README.md.
+    - name: COWORK_ORGANIZATION_SWITCH_ENABLED
+      value: "true"

@@ -99,3 +99,21 @@ async def test_still_seals_when_the_error_frame_cannot_be_emitted():
     assert buffer.appended == []  # append raised
     assert buffer.close_reason == "error"
     assert buffer.is_closed is True
+
+
+async def test_seal_carries_a_request_id_when_the_remote_producer_gives_one():
+    # The remote path's own correlation id — this is the hardest-failing
+    # turn (one that escaped every named except clause), so it's exactly the
+    # one a user is most likely to report; it must not be the one case with
+    # no reference id.
+    buffer = _FakeBuffer()
+    await _seal_unterminated_buffer(buffer, _live(), "conv-6", request_id="corr-seal")
+    assert "corr-seal" in buffer.appended[0][1]["sse"]
+
+
+async def test_seal_omits_request_id_when_the_producer_offers_none():
+    # The direct and channel producers have no correlation id to offer; the
+    # in-process one does, and passes it.
+    buffer = _FakeBuffer()
+    await _seal_unterminated_buffer(buffer, _live(), "conv-7")
+    assert "request_id" not in buffer.appended[0][1]["sse"]

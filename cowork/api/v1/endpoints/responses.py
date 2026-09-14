@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field, StringConstraints
 from sqlmodel import Session
 from starlette.responses import JSONResponse
 
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.common.logger import setup_logging
 from cowork.db.scoped import (
     MissingTenantScopeError,
@@ -31,11 +32,21 @@ from cowork.streaming.answers import SubmitResult, broker
 from cowork.streaming.backend import get_backend
 from cowork.streaming.buffer import RedisStreamBuffer
 from cowork.streaming.turn_index import get_turn, list_turns
-from cowork.turnqueue.redis_client import get_redis
+from cowork.turnqueue.redis_client import cancel_flag_key, get_redis
 
 
 logger = setup_logging()
 
+# Declared per route, not on the router: options_handler below has to be
+# genuinely open, and a route-level dependency is ADDED to its router's rather
+# than substituted for it — a router-level AuthenticatedInOrgMode would still
+# run on the preflight and 401 it, because TrustedHeaderMiddleware builds no
+# Principal for an OPTIONS request. Every route that carries
+# AuthenticatedInOrgMode below already fails closed on its own too
+# (_require_streaming_scope in this module raises MissingTenantScopeError ->
+# 401 exactly like ScopedSession, and POST / builds its own ScopedSession
+# inside ResponsesHandler); declaring it makes that visible to the route
+# walker instead of only to someone reading those checks.
 router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
 TenantScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
@@ -144,7 +155,7 @@ async def _request_cancel(correlation_id: str) -> None:
     the request landed on.
     """
     await get_redis().set(
-        f"cowork:cancel:{correlation_id}", "1", ex=CANCEL_FLAG_TTL_SECONDS
+        cancel_flag_key(correlation_id), "1", ex=CANCEL_FLAG_TTL_SECONDS
     )
 
 
@@ -162,7 +173,9 @@ _SSE_HEADERS = {
 }
 
 
-@router.options("/")
+# OpenByDesign, standalone reason: hardcoded CORS-preflight response, no
+# identity or data involved.
+@router.options("/", dependencies=[Depends(require(OpenByDesign))])
 async def options_handler():
     return JSONResponse(
         content={"message": "OK"},
@@ -174,7 +187,7 @@ async def options_handler():
     )
 
 
-@router.post("/")
+@router.post("/", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def responses(
     responses_request: ResponsesRequest,
     session: SessionDep,
@@ -189,7 +202,7 @@ async def responses(
     return result
 
 
-@router.get("/in-flight-list")
+@router.get("/in-flight-list", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def in_flight_list(scope: TenantScopeDep):
     """Conversations with a turn running. The renderer uses it to sync stream
     state across clients/boots. Scoped to the caller's org so it can't
@@ -223,7 +236,7 @@ async def in_flight_list(scope: TenantScopeDep):
     return {"in_flight": out}
 
 
-@router.get("/in-flight")
+@router.get("/in-flight", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def in_flight(scope: TenantScopeDep, conversation_id: str | None = None):
     """Probe so the renderer can decide whether to open a /tail on mount.
 
@@ -258,7 +271,7 @@ class CancelRequest(BaseModel):
     conversation_id: str
 
 
-@router.post("/cancel")
+@router.post("/cancel", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def cancel_response(req: CancelRequest, scope: TenantScopeDep):
     """Halt the in-flight producer (Stop button). Fetch-abort / tab-close
     does NOT cancel — only this does.
@@ -315,7 +328,7 @@ class AnswerRequest(BaseModel):
     skipped: bool | None = None
 
 
-@router.post("/answer")
+@router.post("/answer", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
     """Deliver the user's answer to a question a turn is blocked on.
 
@@ -368,7 +381,7 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
             raise AssertionError(f"unhandled SubmitResult: {result}")
 
 
-@router.get("/tail")
+@router.get("/tail", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def tail_response(
     scope: TenantScopeDep,
     conversation_id: str = Query(..., description="Conversation to tail."),

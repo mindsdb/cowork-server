@@ -108,13 +108,15 @@ COWORK_PUBLISH_PROMPT = (
     "ACCESS MODE:\n"
     "- Before publishing you MUST know the access mode. If the user stated it\n"
     "  (e.g. 'publish with password', 'share only with a@x.com', 'make it public'), use it:\n"
-    "  set access_mode (+ password/emails/org_allowed) accordingly.\n"
+    "  set access_mode (+ password/emails/org_allowed/owner_only) accordingly.\n"
     "- If the user did NOT specify an access mode, ASK them in chat which one they want —\n"
-    "  public (anyone with the link), password-protected, or restricted to specific emails /\n"
-    "  the whole organization — and wait for their answer before calling this tool with\n"
-    "  action='publish'. Do NOT silently default to public.\n"
+    "  public (anyone with the link), password-protected, restricted to specific emails /\n"
+    "  the whole organization, or private to themselves — and wait for their answer before\n"
+    "  calling this tool with action='publish'. Do NOT silently default to public.\n"
     "- NEVER invent a password. If the user chooses password, get the value from them in chat\n"
     "  or point them to the publish panel (Access → Password).\n"
+    "- For 'only me' / 'just for myself' / 'private to me', set access_mode='restricted' with\n"
+    "  owner_only=true and no emails. Leaving emails empty WITHOUT owner_only publishes PUBLICLY.\n"
     "- Exception: when re-publishing an artifact that already has access on record and the user\n"
     "  says nothing new about access, omit these fields to keep its previous access (no need to\n"
     "  ask again)."
@@ -195,9 +197,19 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             )
         access = {"mode": "password", "password": pw}
     elif access_mode == "restricted":
+        from anton.publish_access import parse_emails
+        valid, invalid = parse_emails(tc_input.get("emails") or [])
+        if invalid:
+            # Parity with anton.tools: dropping these would collapse the
+            # selection and publish PUBLICLY behind the user's back.
+            return (
+                "INVALID: these are not valid email addresses: "
+                f"{', '.join(invalid)}. Fix them or omit them, then call the tool again."
+            )
         access = {"mode": "restricted",
-                  "emails": tc_input.get("emails") or [],
-                  "org_allowed": bool(tc_input.get("org_allowed"))}
+                  "emails": valid,
+                  "org_allowed": bool(tc_input.get("org_allowed")),
+                  "owner_only": bool(tc_input.get("owner_only"))}
     elif access_mode == "public":
         access = {"mode": "public"}
     else:
@@ -873,5 +885,116 @@ def build_cowork_create_skill_draft_tool():
         description=CREATE_SKILL_DRAFT_DESCRIPTION,
         input_schema=CREATE_SKILL_DRAFT_SCHEMA,
         handler=_cowork_create_skill_draft,
+    )
+
+
+####################
+# History Recall Tool
+####################
+
+# The summary that replaces older turns drops detail by design (ENG-664). This
+# tool is the backstop: it searches the raw turns the summary covers, so a fact
+# the summary flattened is still reachable without replaying the whole history
+# (ENG-735). Registered only once a summary exists — see AntonHarness.
+
+_RECALL_HISTORY_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "query": {
+            "type": "string",
+            "description": (
+                "Words to look for in the earlier turns — the wording of the "
+                "detail you need (names, paths, values, topic), not a question. "
+                "Matching is on the START of each word, so drop endings and "
+                "keep the stem: “passwo” finds “password(s)”, and the same "
+                "applies to inflected endings in any other language. Keep "
+                "every term at least 4 characters, and prefer 2-4 distinctive "
+                "words over a sentence."
+            ),
+        },
+        "limit": {
+            "type": "integer",
+            "description": "How many matching turns to return (default 3, max 10).",
+        },
+    },
+    "required": ["query"],
+}
+
+_RECALL_HISTORY_PROMPT = (
+    "The earlier part of this conversation is replaced by a compacted summary, "
+    "and the raw turns behind it are archived. When you need a detail the "
+    "summary dropped — an exact value, a path, a name, what was decided and "
+    "why — call `recall_history` instead of guessing or asking the user to "
+    "repeat something they already said."
+)
+
+_RECALL_HISTORY_LIMIT_DEFAULT = 3
+_RECALL_HISTORY_LIMIT_MAX = 10
+
+
+async def _cowork_recall_history(load_archive, tc_input: dict) -> str:
+    """Tool handler for `recall_history` — search the archived earlier turns.
+
+    `load_archive` returns the archive as plain message dicts, so the handler
+    stays a presentation layer: it never touches the DB, and the hosted path
+    can supply the same archive off the shared mount instead.
+    """
+    from cowork.services.history_recall import format_turns, search_turns
+
+    query = str(tc_input.get("query") or "").strip()
+    if not query:
+        return "recall_history: `query` is required."
+    try:
+        limit = int(tc_input.get("limit") or _RECALL_HISTORY_LIMIT_DEFAULT)
+    except (TypeError, ValueError):
+        limit = _RECALL_HISTORY_LIMIT_DEFAULT
+    limit = max(1, min(limit, _RECALL_HISTORY_LIMIT_MAX))
+
+    try:
+        messages = load_archive()
+    except Exception as exc:
+        logger.exception("Cowork recall_history failed")
+        return f"recall_history: could not read the archive ({type(exc).__name__})."
+
+    if not messages:
+        return (
+            "recall_history: nothing is archived for this conversation — every "
+            "turn so far is already in your context."
+        )
+
+    turns = search_turns(messages, query, limit=limit)
+    if not turns:
+        return (
+            f"recall_history: no earlier turn matches “{query}”. Try once more "
+            "with fewer, more distinctive words, cut to their stems (matching "
+            "is on word beginnings, minimum 4 characters) — then move on. Do "
+            "not repeat this query."
+        )
+    return format_turns(turns)
+
+
+def build_cowork_recall_history_tool(load_archive):
+    """`load_archive` is called per tool call and returns the archived messages."""
+    from anton.core.tools.tool_defs import ToolDef
+
+    async def handler(_session, tc_input: dict) -> str:
+        return await _cowork_recall_history(load_archive, tc_input)
+
+    return ToolDef(
+        name="recall_history",
+        description=(
+            "Search the earlier turns of THIS conversation that were compacted "
+            "into the summary you were given. Use it when you need a specific "
+            "detail the summary dropped (an exact value, path, name, or what "
+            "was decided and why). Returns the matching turns verbatim, best "
+            "match first, truncated to fit. The archive is searched literally, "
+            "by word beginnings — it finds word forms, not synonyms, so query "
+            "with words that would actually appear in the turn. One call is "
+            "normally enough; if nothing matches, rephrase once, then move on. "
+            "Not for searching files or data in the workspace: use the scratchpad."
+        ),
+        input_schema=_RECALL_HISTORY_SCHEMA,
+        handler=handler,
+        prompt=_RECALL_HISTORY_PROMPT,
     )
 

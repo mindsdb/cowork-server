@@ -46,6 +46,18 @@ jobs:
     # installs from, and a failed publish should not hide a broken image. Both
     # land in this one run tree, and `notify` covers both. Mirrors the same job
     # in `publish-staging.yml`.
+    #
+    # workflow_dispatch can select any ref. Refuse a non-main selection before
+    # it enters the reusable production path, while leaving push-to-main
+    # unchanged. This is defense in depth against an accidental dispatch, not
+    # the credential boundary: a selected branch can change this workflow. The
+    # prod GitHub Environment must first have a nonempty reviewer rule, prevent
+    # self-review, disable admin bypass, and allow exactly one `main` Branch
+    # rule. Add credentials only after that policy is active. Count evidence
+    # only from a fresh attempt 1 started afterward and approved at the prod gate
+    # by an eligible reviewer other than both the actor and triggering actor.
+    # See README.md.
+    if: github.ref == 'refs/heads/main'
     permissions:
       contents: read
     uses: ./.github/workflows/build-deploy.yml
@@ -90,6 +102,21 @@ jobs:
 
       - name: Build package
         run: uv build
+
+      # This pipeline has no anton-agent pin (unlike publish-staging.yml): the
+      # wheel ships whatever satisfies the loose floor in pyproject.toml, which
+      # can be a stable anton release that predates a symbol this commit's code
+      # already imports at module scope (ENG-2065). Import the wheel we are
+      # about to ship, from outside the checkout so a local cowork/ package
+      # can't shadow it (see the identical check in publish-staging.yml and its
+      # review discussion for why that matters).
+      - name: Verify anton-agent satisfies this build
+        run: |
+          set -euo pipefail
+          uv venv .smoke-venv
+          uv pip install --python .smoke-venv "$(ls dist/*.whl)"
+          VENV_PY="$(pwd)/.smoke-venv/bin/python"
+          cd /tmp && "$VENV_PY" -c "import cowork.server"
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

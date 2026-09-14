@@ -6,12 +6,14 @@ and all necessary configurations for the Cowork service.
 """
 
 import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import MutableHeaders
 
+from cowork.api.v1.route_walker import contradictory_routes, route_key, undeclared_routes
 from cowork.api.v1.router import api_router as v1_router
 from starlette.responses import JSONResponse
 
@@ -32,9 +34,10 @@ logger = setup_logging()
 async def _start_channels(app: FastAPI) -> None:
     """Build live adapters from stored credentials and start ingress.
 
-    Org mode: channels are local-mode only — no adapters, no provider
-    connections, no ingress (the config endpoints answer 403 and webhook
-    routes are not mounted, see _install_channels)."""
+    Local mode only: adapters/ingress are boot-time and singleton, built from
+    the one deployment-global installation. Org mode resolves adapters
+    per-request instead (LiveAdapterRegistry.resolve_org_bridge), since
+    credentials are per-org and there is no single set to preload at boot."""
     if get_app_settings().tenancy_mode == "org":
         return
     await app.state.channel_adapters.refresh_all()
@@ -144,6 +147,13 @@ async def lifespan(app: FastAPI):
         logger.info("warmed MindsHub model-availability map on boot")
     start_scheduler()
     await _start_channels(app)
+    app.state.channel_ingress_reconciler = None
+    if get_app_settings().tenancy_mode == "org":
+        from cowork.channels.ingress import start_reconciler
+
+        app.state.channel_ingress_reconciler = start_reconciler(
+            app.state.channel_ingress, app.state.channel_adapters
+        )
     try:
         yield
     finally:
@@ -151,10 +161,18 @@ async def lifespan(app: FastAPI):
         from cowork.common.http_client import close_proxy_client
         from cowork.services.artifacts import shutdown_launched_backends
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
+        from cowork.coding.service import get_coding_service
+
+        reconciler = getattr(app.state, "channel_ingress_reconciler", None)
+        if reconciler is not None:
+            reconciler.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reconciler
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
         await app.state.channel_adapters.shutdown()
+        get_coding_service().close_all()
         shutdown_launched_backends()
         await close_scratchpads()
         await close_proxy_client()
@@ -234,7 +252,8 @@ def create_app() -> FastAPI:
             enforce=enforce,
         )
         logger.info(
-            "auth: org tenancy mode — principal middleware enabled (%s)",
+            "auth: org tenancy mode — principal middleware enabled "
+            "(identity=%s)",
             settings.identity_enforce,
         )
         # No explicit shared root → org data sits on the ephemeral pod FS.
@@ -270,7 +289,8 @@ def create_app() -> FastAPI:
         )
         logger.info("auth: bearer-token authentication enabled")
 
-    # Configure CORS middleware (added last → outermost)
+    # Configure CORS outside the authentication and principal layers. The
+    # no-store wrapper added below remains outermost.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
@@ -286,16 +306,86 @@ def create_app() -> FastAPI:
     # and submission SSE streams set no-store at their own routes. OAuth is
     # swept in too: GET .../oauth/{engine}/credentials returns a raw
     # client_secret and, being a plain GET with no explicit cache directive,
-    # is cacheable by default wherever it's fetched from.
-    app.add_middleware(_NoStoreMiddleware, prefixes=("/api/v1/settings", "/api/v1/connectors/oauth"))
+    # is cacheable by default wherever it's fetched from. Capabilities are
+    # included so a browser never reuses a stale rollout state.
+    app.add_middleware(
+        _NoStoreMiddleware,
+        prefixes=(
+            "/api/v1/settings",
+            "/api/v1/connectors/oauth",
+            "/api/v1/capabilities",
+        ),
+    )
 
     # Include v1 API routes
     app.include_router(v1_router)
 
     _install_channels(app, channel_webhook_paths)
 
+    # ENG-2094: every route must declare a Permission (require(...)) so a
+    # walker can tell "open on purpose" from "someone forgot the line" — see
+    # route_walker.py and its docstring. Boot-time, not just CI, so a gap
+    # can't reach any environment undetected.
+    gaps = undeclared_routes(app)
+    if gaps:
+        # route_key, not route.methods: APIWebSocketRoute has no .methods, so
+        # reading it here would raise AttributeError over the top of the
+        # message that names the offending route.
+        names = ", ".join(f"{list(methods)} {path}" for path, methods in map(route_key, gaps))
+        raise RuntimeError(f"routes with no declared Permission (ENG-2094): {names}")
+
+    contradictions = contradictory_routes(app)
+    if contradictions:
+        names = ", ".join(f"{list(methods)} {path}" for path, methods in map(route_key, contradictions))
+        raise RuntimeError(
+            "routes declaring OpenByDesign alongside an identity Permission (ENG-2094): "
+            f"{names} — a route-level dependency is ADDED to its router's, never substituted for it, "
+            "so the stricter check still runs and the route is not open"
+        )
+
+    _warn_if_the_front_door_outranks_the_identity_layer(app)
+
     logger.info("Cowork application created successfully")
     return app
+
+
+def _warn_if_the_front_door_outranks_the_identity_layer(app: FastAPI) -> None:
+    """Say out loud when the audit rollback lever has stopped covering things.
+
+    ``identity_enforce=audit`` tells TrustedHeaderMiddleware to log a missing
+    principal and let the request through. The ENG-2094 permission classes do
+    not read that flag — deliberately, see AuthenticatedInOrgMode's docstring
+    — so in org mode they still 401 every route that requires identity. That
+    is the right layering and the wrong surprise: an operator who reaches for
+    audit to unblock traffic would get a 401 storm from a layer the flag never
+    named. Naming the count at boot is what turns that into a decision instead
+    of an incident.
+
+    A warning rather than a refusal: no deployment runs this state, and a boot
+    failure over a combination nothing uses buys less than it costs.
+    """
+    settings = get_app_settings()
+    if settings.tenancy_mode != "org" or settings.identity_enforce == "enforce":
+        return
+
+    from fastapi.routing import APIRoute, APIWebSocketRoute
+
+    from cowork.api.v1.permissions import Authenticated
+    from cowork.api.v1.route_walker import declared_permissions
+
+    still_enforcing = sum(
+        1
+        for route in app.routes
+        if isinstance(route, (APIRoute, APIWebSocketRoute))
+        and any(issubclass(cls, Authenticated) for cls in declared_permissions(route))
+    )
+    logger.warning(
+        "identity_enforce=%s applies to TrustedHeaderMiddleware only. %d route(s) "
+        "declare a Permission that requires identity and will still answer 401 "
+        "without it (ENG-2094). Audit mode is not a full rollback in org tenancy.",
+        settings.identity_enforce,
+        still_enforcing,
+    )
 
 
 def _install_channels(app: FastAPI, webhook_paths: set[str]) -> None:
@@ -311,34 +401,37 @@ def _install_channels(app: FastAPI, webhook_paths: set[str]) -> None:
     Every mounted webhook path is recorded in ``webhook_paths`` so the bearer
     auth layer exempts it — these endpoints are called by external platforms
     that authenticate with their own signature, not the Cowork token.
+
+    Mounted in both local and org mode: org mode resolves the org per-request
+    from the payload (LiveAdapterRegistry.resolve_org_bridge) rather than
+    from one boot-time adapter, so there's no global set of credentials to
+    preload here the way local mode's lifespan startup does (_start_channels).
     """
     from cowork.channels.ingress import IngressManager
     from cowork.channels.registry import get_registry, load_first_party_plugins
     from cowork.channels.runtime import AntonChannelRuntime, LiveAdapterRegistry
     from cowork.channels.webhooks import build_channel_webhook_router
 
-    # Org mode: channels are local-mode only — mount no auth-exempt webhook
-    # routes and load no plugins. The empty registry/manager keep the
-    # lifespan start/stop paths inert.
-    local_mode = get_app_settings().tenancy_mode != "org"
-    if local_mode:
-        load_first_party_plugins()
+    load_first_party_plugins()
     adapters = LiveAdapterRegistry()
     runtime = AntonChannelRuntime(adapters)
-    if local_mode:
-        for plugin in get_registry().all():
-            if not plugin.webhooks:
-                continue
-            app.include_router(
-                build_channel_webhook_router(plugin, resolver=adapters.get, sink=runtime.handle),
-                prefix="/api/v1/channels",
-            )
-            # Mirrors the route path built in webhooks._add_webhook_route:
-            # f"/{channel_type}{webhook.path}" under the /api/v1/channels prefix.
-            webhook_paths.update(
-                f"/api/v1/channels/{plugin.channel_type}{webhook.path}"
-                for webhook in plugin.webhooks
-            )
+
+    for plugin in get_registry().all():
+        if not plugin.webhooks:
+            continue
+        app.include_router(
+            build_channel_webhook_router(
+                plugin, resolver=adapters.get, sink=runtime.handle,
+                org_resolver=adapters.resolve_org_bridge,
+            ),
+            prefix="/api/v1/channels",
+        )
+        # Mirrors the route path built in webhooks._add_webhook_route:
+        # f"/{channel_type}{webhook.path}" under the /api/v1/channels prefix.
+        webhook_paths.update(
+            f"/api/v1/channels/{plugin.channel_type}{webhook.path}"
+            for webhook in plugin.webhooks
+        )
     app.state.channel_adapters = adapters
     app.state.channel_runtime = runtime
     app.state.channel_ingress = IngressManager(sink=runtime.handle)

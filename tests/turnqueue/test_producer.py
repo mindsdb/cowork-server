@@ -3,6 +3,7 @@ import json
 
 import pytest
 
+from cowork.handlers import turn_errors as te
 from cowork.turnqueue import producer as prod
 
 
@@ -20,12 +21,27 @@ def _stub_llm_mint(monkeypatch):
 
 
 class FakeRedis:
-    def __init__(self, replies): self.added = []; self.registered = []; self._replies = replies
-    async def sadd(self, key, member): self.registered.append((key, member)); return 1
+    def __init__(self, replies, *, workspace_mode="persistent"):
+        self.added = []
+        self.registered = []
+        self._replies = list(replies)
+        if workspace_mode is not None:
+            self._replies.insert(0, ("scratchpad:reply:conv-1", _reply(
+                "progress", {"phase": "workspace_authorized", "workspace_mode": workspace_mode}
+            )))
+
+    async def sadd(self, key, member):
+        self.registered.append((key, member))
+        return 1
+
     async def hset(self, key, mapping=None): return 1
     async def expire(self, key, seconds): return 1
     async def delete(self, *keys): return len(keys)
-    async def xadd(self, stream, fields): self.added.append((stream, fields)); return "1-0"
+
+    async def xadd(self, stream, fields):
+        self.added.append((stream, fields))
+        return "1-0"
+
     async def xread(self, streams, count=None, block=None):
         if self._replies:
             stream, fields = self._replies.pop(0)
@@ -37,10 +53,36 @@ def _reply(kind, data):
     return {"payload": json.dumps({"correlation_id": "r", "kind": kind, "data": data})}
 
 
-async def _drain(gen):
+async def test_default_model_uses_the_verified_hosted_scope(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from cowork.common.settings import user_settings
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(prod, "get_app_settings", lambda: SimpleNamespace(tenancy_mode="org"))
+    monkeypatch.setattr(prod, "_mint_oauth_block", AsyncMock(return_value=None))
+
+    def current_settings(scope):
+        assert scope.org_mode is True
+        assert scope.org_id == "org-verified"
+        assert scope.user_id == "user-verified"
+        return SimpleNamespace(resolved_planning_model="minds-default")
+
+    monkeypatch.setattr(user_settings, "get_user_settings", current_settings)
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="org-verified", user_id="user-verified",
+        input_text="hi", model=None,
+    ))
+    job = json.loads(fake.added[0][1]["payload"])
+    assert job["params"]["model"] == "minds-default"
+
+
+async def _drain(gen, *, include_policy=False):
     """Exhaust the reply generator, returning its (kind, data) yields.
     Nothing happens (no mint, no XADD) before the first __anext__."""
-    return [item async for item in gen]
+    return [item async for item in gen if include_policy or item[0] != "progress"]
 
 
 @pytest.mark.asyncio
@@ -72,7 +114,8 @@ async def test_stream_remote_replies_yields_deltas_in_order(monkeypatch):
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi",
         model="m", history=[{"role": "user", "content": "prev"}]))
     job = json.loads(fake.added[0][1]["payload"])
-    assert job["op"] == "anton_turn"
+    assert job["op"] == "anton_turn_v2"
+    assert job["params"]["workspace_mode"] == "persistent"
     assert job["params"]["history"] == [{"role": "user", "content": "prev"}]
     assert items == [("turn_delta", {"text": "he"}),
                      ("turn_delta", {"text": "llo"}),
@@ -123,12 +166,9 @@ async def test_stream_remote_replies_history_defaults_empty(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_oversized_request_warns_because_nothing_is_sheddable(monkeypatch):
-    # _fit_request used to shed skills then memory. Both now live on the shared
-    # EFS mount and never enter the payload, so what remains (input, model, llm,
-    # history) cannot be dropped without changing the turn's meaning. An
-    # oversized line must therefore be reported, not silently truncated by the
-    # pod's readline, and the real fix is history windowing upstream.
+async def test_oversized_required_request_warns_without_shedding_history(monkeypatch):
+    # Once optional project memory is absent, input/model/llm/history cannot be
+    # silently dropped without changing the turn's meaning.
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
@@ -150,6 +190,81 @@ async def test_oversized_request_warns_because_nothing_is_sheddable(monkeypatch)
     assert any("over the 4096-byte cap" in w for w in warnings), warnings
     params = json.loads(fake.added[0][1]["payload"])["params"]
     assert params["history"] == huge_history, "history must not be silently dropped"
+
+
+@pytest.mark.asyncio
+async def test_oversized_request_sheds_whole_project_memory_first(monkeypatch):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(prod, "_MAX_REQUEST_BYTES", 4096)
+    monkeypatch.setattr(prod, "_REQUEST_BYTES_MARGIN", 0)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        prod.logger,
+        "warning",
+        lambda msg, *args, **kw: warnings.append(msg % args if args else msg),
+    )
+
+    history = [{"role": "user", "content": "required history"}]
+    await _drain(
+        prod.stream_remote_replies(
+            conversation_id="conv-1",
+            org_id="org-1",
+            user_id="user-1",
+            input_text="hi",
+            model="m",
+            history=history,
+            memory={
+                "project": {
+                    "rules": "r" * 5000,
+                    "lessons": "l" * 5000,
+                }
+            },
+        )
+    )
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert "memory" not in params
+    assert params["history"] == history
+    shedding = [warning for warning in warnings if "project memory" in warning]
+    assert len(shedding) == 1
+    assert "dropped project memory" in shedding[0]
+
+
+@pytest.mark.asyncio
+async def test_stream_remote_replies_forwards_started_at_only_when_known(monkeypatch):
+    # The pod renders this as the fixed "conversation started" date. Absent
+    # entirely when unknown so an older controller sees no new key.
+    fake = FakeRedis(replies=[
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+    ])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    async def fake_mint(**kw):
+        return "mdb_turnkey"
+
+    monkeypatch.setattr(prod, "mint_turn_key", fake_mint)
+
+    async def fake_list_active_connections(**kw):
+        return []
+
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        started_at="2026-09-01T08:15:00",
+    ))
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+
+    with_it = json.loads(fake.added[0][1]["payload"])["params"]
+    without = json.loads(fake.added[1][1]["payload"])["params"]
+    assert with_it["started_at"] == "2026-09-01T08:15:00"
+    assert "started_at" not in without
 
 
 @pytest.mark.asyncio
@@ -175,9 +290,11 @@ async def test_stream_remote_replies_attaches_oauth_block_with_the_llm_turn_key(
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
     # Reuses the same turn key minted for the llm block — never a second mint.
+    # No base_url (ENG-2128): anton's TurnKeyDataVault only ever resolves the
+    # auth host from its own ANTON_CLOUD_AUTH_BASE_URL env var, so a wire
+    # value here was dead — see _mint_oauth_block.
     assert params["oauth"] == {
         "turn_key": "mdb_turnkey",
-        "base_url": prod.TurnQueueSettings().auth_internal_base_url,
         "connections": [{"engine": "google_drive", "name": "work"}],
     }
 
@@ -368,7 +485,9 @@ async def test_unresponsive_worker_fails_the_turn_instead_of_spinning(monkeypatc
     # and the caller persists a failure so a reload shows the error card.
     kind, data = items[-1]
     assert kind == "turn_failed"
-    assert data["code"] == "anton_error"
+    # Its own code, not the generic one (ENG-2126): nothing ran, so the card
+    # has to say the turn never started rather than blame the agent.
+    assert data["code"] == te.WORKER_UNRESPONSIVE_CODE
     assert data["error"] == prod.UNRESPONSIVE_WORKER_ERROR
 
 
@@ -389,6 +508,10 @@ async def test_replies_refresh_the_idle_deadline(monkeypatch):
         async def xread(self, streams, count=None, block=None):
             self.reads += 1
             await asyncio.sleep(self._delay)
+            if self.reads == 1:
+                return [["scratchpad:reply:conv-1", [["1-0", _reply(
+                    "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+                )]]]]
             self._quiet = not self._quiet
             if self._quiet:
                 return None
@@ -511,3 +634,106 @@ async def test_turn_history_reaches_the_caller(monkeypatch):
     items = await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
     assert items == [("turn_history", {"rows": rows}), ("turn_completed", {})]
+
+
+pytestmark = pytest.mark.usefixtures("granted_product_permissions")
+
+
+@pytest.mark.parametrize("can_manage,resolved_mode", [(True, "persistent"), (True, "ephemeral"), (False, "ephemeral")])
+async def test_workspace_authority_is_sent_and_acknowledged_before_turn_events(monkeypatch, can_manage, resolved_mode):
+    async def allowed(scope, permission):
+        return permission == "product.execute" or can_manage
+
+    monkeypatch.setattr(prod.product_permissions, "has_product_permission", allowed)
+    fake = FakeRedis([
+        ("scratchpad:reply:conv-1", _reply("turn_delta", {"text": "answer"})),
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+    ], workspace_mode=resolved_mode)
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"
+    ), include_policy=True)
+    job = json.loads(fake.added[0][1]["payload"])
+    assert job["op"] == "anton_turn_v2"
+    assert job["params"]["workspace_mode"] == ("persistent" if can_manage else "ephemeral")
+    assert items == [
+        ("progress", {"phase": "workspace_authorized", "workspace_mode": resolved_mode}),
+        ("turn_delta", {"text": "answer"}),
+        ("turn_completed", {}),
+    ]
+
+
+@pytest.mark.parametrize("reply", [
+    ("error", {"error": "unsupported op 'anton_turn_v2'"}),
+    ("turn_delta", {"text": "must not be shown"}),
+    ("turn_completed", {}),
+    ("turn_failed", {"code": "permission_unavailable", "error": "private authority detail"}),
+])
+async def test_worker_without_verified_storage_policy_fails_terminally(monkeypatch, reply):
+    fake = FakeRedis([("scratchpad:reply:conv-1", _reply(*reply))], workspace_mode=None)
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"
+    ), include_policy=True)
+    assert len(items) == 1
+    assert items[0][0] == "turn_failed"
+    assert items[0][1]["code"] == "permission_unavailable"
+    assert "private authority detail" not in items[0][1]["message"]
+
+
+@pytest.mark.parametrize("resolved_mode", [None, True, "unknown", "persistent"])
+async def test_worker_cannot_upgrade_or_malform_execution_only_policy(monkeypatch, resolved_mode):
+    async def allowed(scope, permission):
+        return permission == "product.execute"
+
+    monkeypatch.setattr(prod.product_permissions, "has_product_permission", allowed)
+    fake = FakeRedis([("scratchpad:reply:conv-1", _reply(
+        "progress", {"phase": "workspace_authorized", "workspace_mode": resolved_mode}
+    ))], workspace_mode=None)
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"
+    ), include_policy=True)
+    assert len(items) == 1
+    assert items[0][0] == "turn_failed"
+    assert items[0][1]["code"] == "permission_unavailable"
+
+
+async def test_worker_cannot_change_an_acknowledged_mount_policy(monkeypatch):
+    fake = FakeRedis([("scratchpad:reply:conv-1", _reply(
+        "progress", {"phase": "workspace_authorized", "workspace_mode": "ephemeral"}
+    ))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"
+    ), include_policy=True)
+    assert items[0] == ("progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"})
+    assert items[1][0] == "turn_failed"
+    assert items[1][1]["code"] == "permission_unavailable"
+
+
+async def test_artifact_authority_outage_stops_before_queue_side_effects(monkeypatch):
+    from unittest.mock import Mock
+
+    permissions = []
+
+    async def allowed(scope, permission):
+        permissions.append(permission)
+        if permission == "artifact.manage":
+            raise prod.product_permissions.ProductPermissionUnavailable()
+        return True
+
+    redis = Mock(side_effect=AssertionError("Authority outage must not reach Redis"))
+    monkeypatch.setattr(prod.product_permissions, "has_product_permission", allowed)
+    monkeypatch.setattr(prod, "get_redis", redis)
+    with pytest.raises(prod.product_permissions.ProductPermissionUnavailable):
+        await _drain(prod.stream_remote_replies(
+            conversation_id="conv-1", org_id="org", user_id="user", input_text="run",
+            model="m", llm={"api_key": "already-minted-key"},
+        ))
+    assert permissions == ["product.execute", "artifact.manage"]
+    redis.assert_not_called()
