@@ -73,6 +73,28 @@ def test_prod_uses_a_standing_identity_without_provisioner_fallback() -> None:
     assert "COWORK_TEST_ORG_ID: ${{ vars.COWORK_TEST_ORG_ID }}" in prod_step
 
 
+def test_prod_inputs_are_named_once_before_the_suite_runs() -> None:
+    """A missing prod credential is named once, not once per test.
+
+    Without this the first signal is seven identical session-fixture errors,
+    which reads as a broken suite rather than as unset configuration. That is
+    how prod run 34790453832 reported it.
+
+    The preflight sits ABOVE the non-prod run step so it stays outside the
+    window test_prod_uses_a_standing_identity_without_provisioner_fallback
+    asserts is free of the prod key name.
+    """
+    marker = "- name: Check the prod standing-identity inputs"
+    assert marker in INTEGRATION
+    preflight = INTEGRATION.split(marker, 1)[1].split(
+        "- name: Run integration tests (non-prod)", 1
+    )[0]
+    assert "if: inputs.deploy-env == 'prod'" in preflight
+    for name in ("COWORK_TEST_API_KEY", "COWORK_TEST_USER_EMAIL", "COWORK_TEST_ORG_ID"):
+        assert name in preflight
+    assert "::error::Required prod integration inputs are empty" in preflight
+
+
 def test_standing_identity_mode_fails_before_a_configured_provisioner(
     monkeypatch,
 ) -> None:
