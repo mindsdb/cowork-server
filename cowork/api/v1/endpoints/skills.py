@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
 from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import (
     ScopedSession,
     ScopedSessionDep,
@@ -35,7 +36,12 @@ from cowork.services.skills import (
     is_builtin_skill,
 )
 
-router = APIRouter()
+# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
+# whenever org mode has no org in scope. Declaring it too makes the
+# requirement visible to a route walker instead of something only
+# discoverable by reading scoped.py.
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 logger = logging.getLogger(__name__)
 
 
