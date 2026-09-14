@@ -353,9 +353,10 @@ async def test_route_request_scrubs_secrets_from_history_and_current_prompt(monk
 @pytest.mark.asyncio
 async def test_route_request_scrubs_a_registered_vault_secret_by_value(monkeypatch, tmp_path, request):
     """A DSN password has no key-shape for _SECRET_KEY_PATTERN to match, so it
-    only gets redacted if register_vault_secrets() ran register_secret_vars()
-    against this vault before the history is scrubbed. Without step 2's call
-    site this reaches decide_route in the clear."""
+    only gets redacted by exact value, which register_secret_vars() makes
+    possible. This pins the mechanism _route_request's scrub relies on, given
+    that registration already happened — it does not exercise handle()'s
+    call site; see test_handle_registers_vault_secrets_before_routing for that."""
     from uuid import uuid4
 
     from anton.core.datasources.data_vault import LocalDataVault
@@ -371,9 +372,12 @@ async def test_route_request_scrubs_a_registered_vault_secret_by_value(monkeypat
         "user": "svc", "password": "hunter2xyz",
     })
 
-    # register_vault_secrets sets process-global DS_* env vars (anton's
-    # registry, not test-scoped) — clear them so this leaves no residue for
+    # register_vault_secrets populates anton's process-global DS_* registry
+    # (env vars and/or a context-scoped value map, depending on the anton
+    # version), not test-scoped — reset both so this leaves no residue for
     # later tests in the same session.
+    from anton.utils.datasources import _reset_registered_ds_vars
+    request.addfinalizer(_reset_registered_ds_vars)
     request.addfinalizer(vault.clear_ds_env)
 
     handler = _routing_handler(monkeypatch)
@@ -404,6 +408,45 @@ async def test_route_request_scrubs_a_registered_vault_secret_by_value(monkeypat
     blob = str(seen["history"])
     assert "hunter2xyz" not in blob
     assert "[DS_" in blob
+
+
+@pytest.mark.asyncio
+async def test_handle_registers_vault_secrets_before_routing(monkeypatch):
+    """Wiring guard for handle()'s register_vault_secrets() call site: removing
+    it, or moving it after _route_request, must fail here — the mechanism
+    tests above call register_vault_secrets directly and would stay green
+    either way."""
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = uuid4()
+    conversation = SimpleNamespace(id=conv_id, messages=[])
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_conversation=lambda _cid: conversation),
+    )
+    calls = []
+    monkeypatch.setattr(
+        responses, "register_vault_secrets", lambda scope: calls.append(("register", scope))
+    )
+
+    class _StopHere(Exception):
+        pass
+
+    async def fake_route_request(**kwargs):
+        calls.append(("route_request", None))
+        raise _StopHere
+
+    handler._route_request = fake_route_request
+
+    with pytest.raises(_StopHere):
+        await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id)))
+
+    assert calls == [("register", handler.scope), ("route_request", None)]
 
 
 @pytest.mark.asyncio
