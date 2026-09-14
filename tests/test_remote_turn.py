@@ -19,13 +19,15 @@ class _FakeSession:
     scope = _FakeScope()
 
 
-def _fake_handler(monkeypatch, *, persist_turn_memory=None, remote_artifacts_context=None):
+def _fake_handler(
+    monkeypatch, *, persist_turn_memory=None, remote_artifacts_context=None, remote_history=None
+):
     """Replace ResponsesHandler with a stand-in exposing only the 5 methods
     remote_turn_events calls, resolved at call time like every other name here."""
     monkeypatch.setattr(remote_turn_mod, "ResponsesHandler", type(
         "FakeResponsesHandler", (), {
             "_remote_artifacts_context": staticmethod(remote_artifacts_context or (lambda s, c: None)),
-            "_remote_history": staticmethod(lambda s, c: []),
+            "_remote_history": staticmethod(remote_history or (lambda s, c: [])),
             "_remote_workspace": staticmethod(lambda s, c: {}),
             "_remote_started_at": staticmethod(lambda s, c: None),
             "_persist_turn_memory": staticmethod(persist_turn_memory or (lambda s, c, e: None)),
@@ -170,6 +172,39 @@ async def test_no_artifacts_context_skips_indexing_without_error(monkeypatch):
 
     assert failure is None
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_vault_secrets_are_registered_before_the_history_is_read(monkeypatch):
+    """Wiring guard for this module's register_vault_secrets() call site: the
+    replayed history only gets DS_* secrets redacted by exact value once that
+    registration has run, and it is read while building stream_remote_replies'
+    kwargs — so removing the call, or moving it below that, must fail here."""
+    calls = []
+
+    def fake_history(_session, _conv_id):
+        calls.append(("history", None))
+        return []
+
+    _fake_handler(monkeypatch, remote_history=fake_history)
+    monkeypatch.setattr(
+        remote_turn_mod, "register_vault_secrets", lambda scope: calls.append(("register", scope))
+    )
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    session = _FakeSession()
+    _, failure = await _drain(remote_turn_events(
+        session=session, conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[],
+    ))
+
+    assert failure is None
+    assert calls == [("register", session.scope), ("history", None)]
 
 
 @pytest.mark.parametrize("workspace_mode", [None, "ephemeral", "persistent"])
