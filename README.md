@@ -115,8 +115,9 @@ scope is safe only when these Environment controls are active.
 
 #### Nightly production read-only smoke
 
-The production nightly runs at `43 7 * * *` on `mdb-prod`. It uses the same
-guarded standing identity, but selects only
+The production nightly reads production on `mdb-prod` at `43 7 * * *` once its
+schedule is live. It is held today; the Environment prerequisites below say what
+turns it on. It uses the same guarded standing identity, but selects only
 `tests/integration/test_production_read_only.py`. That selection is GET-only:
 it reads health, conversations, schedules, files, and pins. It never
 provisions an identity and does not create conversations, schedules, files,
@@ -198,8 +199,17 @@ The Environment response must have no `required_reviewers` or `wait_timer`
 entry and must enable only custom branch policies. The branch-policy response
 must be exactly `[{"name":"main","type":"branch"}]`. The branch-protection
 response must show at least one required approval, administrator enforcement,
-and required conversation resolution. Do not dispatch or enable the schedule
-until every check passes and the cowork-server#472 prerequisite has landed.
+and required conversation resolution. Do not dispatch until every check passes
+and the cowork-server#472 prerequisite has landed.
+
+The nightly schedule is held out of the workflow until those checks pass.
+GitHub arms a `schedule:` trigger as soon as the file reaches the default
+branch, so shipping one before the Environment exists does not buy a monitor, it
+buys a nightly page that reports a missing credential in the same shape as a
+production outage. `workflow_dispatch` is the only trigger until an operator has
+provisioned `prod-read-only` and watched one dispatched run go green. Restore the
+`schedule:` block with `- cron: "43 7 * * *"` and delete this paragraph in the
+same change; a contract test fails if only one of the two happens.
 
 ### Logging
 
