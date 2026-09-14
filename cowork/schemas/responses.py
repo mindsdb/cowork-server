@@ -162,7 +162,7 @@ class ResponsesRequest(BaseModel):
     # `model` above. Silently ignored (falls back to the account default) if
     # it doesn't name a harness this account currently has registered/
     # available (see ResponsesHandler.handle); an invalid transient value
-    # (e.g. a stale client cache after Hermes gets uninstalled) must never
+    # (e.g. a stale client cache after a harness is removed) must never
     # fail the turn. Persisted onto the new conversation's Conversation.harness
     # so a reopened task remembers the pick, same as `model`.
     harness: str | None = Field(

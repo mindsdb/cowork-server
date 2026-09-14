@@ -422,27 +422,6 @@ def cards_for_slugs(
     return cards
 
 
-def finalize_turn_artifacts(
-    conversation, conversation_id, project_id, artifacts_base, before: set[str],
-    tracked_new: set[str] | None = None,
-) -> list[dict]:
-    """Index this turn's new artifacts and return their cards.
-
-    Kept as the pre-split entry point for harnesses that do not participate in
-    autopublish (hermes_harness sets `supports_org_mode = False`). Callers that
-    need `touched` or the tenant scope use `index_turn_artifacts` directly.
-
-    `before_mtimes` is empty here on purpose: without a pre-turn mtime snapshot
-    `touched` degenerates to "the new slugs", which is all this entry point's
-    callers need — they do not publish.
-    """
-    new, _touched, _scope = index_turn_artifacts(
-        conversation, conversation_id, project_id, artifacts_base, before, {},
-        tracked_new=tracked_new,
-    )
-    return cards_for_slugs(artifacts_base, new)
-
-
 async def publish_and_card_turn_artifacts(
     artifacts_base,
     *,
@@ -746,9 +725,8 @@ def _seed_draft_from_store(folder: Path, slug: str) -> None:
         logger.warning("Could not seed skill draft %r from store", slug, exc_info=True)
 
 
-# LLM-facing contract for the `create_skill_draft` tool, shared verbatim by both
-# harnesses (hermes registers it in run_agent's registry, anton as a ToolDef) so
-# the tool reads identically regardless of agent.
+# LLM-facing contract for the `create_skill_draft` tool. Registered by anton as
+# a ToolDef; kept harness-neutral so any agent reads the same contract.
 CREATE_SKILL_DRAFT_DESCRIPTION = (
     "Claim a staging folder for a skill you are building or improving for the "
     "user (e.g. while running the skill-creator skill). Call this BEFORE writing "
