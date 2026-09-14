@@ -1,4 +1,6 @@
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -377,6 +379,37 @@ def _harness_options() -> list[str]:
     return available_harness_ids()
 
 
+_warned_unknown_harness: set[tuple[str, str]] = set()
+# Set by SettingService while validating an incoming write, so a bad PUT is
+# rejected while a stale stored value still loads. pydantic-settings drops
+# model_validate's `context`, hence a contextvar rather than ValidationInfo.
+_reject_unknown_harness: ContextVar[bool] = ContextVar("_reject_unknown_harness", default=False)
+
+
+@contextmanager
+def reject_unknown_harness():
+    token = _reject_unknown_harness.set(True)
+    try:
+        yield
+    finally:
+        _reject_unknown_harness.reset(token)
+
+
+def _known_harness_or_anton(value: str, field: str) -> str:
+    # "anton" is always registered, so the common case skips the harness import.
+    if value == "anton" or value in _harness_options():
+        return value
+    if (field, value) not in _warned_unknown_harness:
+        _warned_unknown_harness.add((field, value))
+        logger.warning("Unknown harness %r for %s; using 'anton'", value, field)
+    return "anton"
+
+
+def _channels_harness_default() -> str:
+    value = get_app_settings().channels_harness or "anton"
+    return _known_harness_or_anton(value, "channels_harness")
+
+
 def _coding_engine_options() -> list[str]:
     # Imported lazily so normal Cowork settings startup does not import or
     # launch a coding runtime. The registry only reports functional adapters;
@@ -591,10 +624,7 @@ class UserSettings(Settings):
         description="The AI harness used to generate responses.",
     )
     channels_harness: Annotated[str, _DynamicOptions(_harness_options), ORG] = Field(
-        default_factory=lambda: (get_app_settings().channels_harness or "anton"),
-        # The default comes from COWORK_CHANNELS_HARNESS, so it needs the same
-        # unknown-id tolerance as an explicit value.
-        validate_default=True,
+        default_factory=_channels_harness_default,
         title="Channel Agent",
         description="The AI harness that serves messaging-channel conversations.",
     )
@@ -917,16 +947,16 @@ class UserSettings(Settings):
     @field_validator("harness", "channels_harness")
     @classmethod
     def validate_harness(cls, v: str, info: ValidationInfo) -> str:
-        # Unknown ids resolve to anton instead of raising. The value can come
-        # from a stored row at any scope, ~/.cowork/.env or process env (local
-        # mode), and a raise here fails every settings load for an install
-        # that once picked a harness we no longer ship. Writers persist the
-        # returned value, so a stale id is never stored back.
-        options = _harness_options()
-        if v not in options:
-            logger.warning("Unknown harness %r for %s; using 'anton'", v, info.field_name)
-            return "anton"
-        return v
+        # Reads tolerate an unknown id: a stored row at any scope, ~/.cowork/.env
+        # or process env can still name a harness we no longer ship, and a
+        # raise here would fail every settings load. Writers validate inside
+        # reject_unknown_harness() and keep the rejection.
+        if _reject_unknown_harness.get():
+            options = _harness_options()
+            if v not in options:
+                raise ValueError(f"Unknown harness '{v}'. Available: {', '.join(options) or 'none'}")
+            return v
+        return _known_harness_or_anton(v, info.field_name)
 
     @field_validator("coding_agent_model")
     @classmethod
