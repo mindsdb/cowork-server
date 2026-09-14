@@ -177,7 +177,6 @@ def test_set_channel_agent_write_does_not_leak_to_other_orgs(monkeypatch):
     from cowork.common.settings.user_settings import get_user_settings
     from cowork.db.scoped import ScopedSession, TenantScope
     from cowork.db.session import get_open_session
-    from cowork.principal import Principal
     from cowork.schemas.channels import ChannelAgentUpdateRequest
     from cowork.services.settings import SettingService
 
@@ -188,10 +187,9 @@ def test_set_channel_agent_write_does_not_leak_to_other_orgs(monkeypatch):
     session = get_open_session()
     scope_a = TenantScope(org_mode=True, org_id=ORG_A)
     scoped_a = ScopedSession(session, scope_a)
-    admin = Principal(user_id=USER_A, org_id=ORG_A, roles=frozenset({"manage-organization"}))
     try:
         result = channels_ep.set_channel_agent(
-            ChannelAgentUpdateRequest(harness="hermes"), session, scoped_a, admin
+            ChannelAgentUpdateRequest(harness="hermes"), session, scoped_a
         )
         assert result.harness == "hermes"
         assert get_user_settings(TenantScope(org_mode=True, org_id=ORG_A)).channels_harness == "hermes"

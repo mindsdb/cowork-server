@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 #: Ceiling for ``TurnJob.deadline_ms``. 24h is far past any real turn and far
@@ -48,6 +48,12 @@ class TurnJob(BaseModel):
     #: would mean a ~57 year deadline and no timeout at all.
     deadline_ms: int | None = None
     params: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _workspace_mode_is_declared(self) -> TurnJob:
+        if self.op == "anton_turn_v2" and self.params.get("workspace_mode") not in ("persistent", "ephemeral"):
+            raise ValueError("anton_turn_v2 requires a persistent or ephemeral workspace_mode")
+        return self
 
     @field_validator("deadline_ms")
     @classmethod

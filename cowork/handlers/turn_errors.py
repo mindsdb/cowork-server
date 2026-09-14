@@ -1135,11 +1135,11 @@ def response_failed_payload(
     keep the shape unchanged for every other failure. All additive: an older
     client ignores fields it doesn't read.
 
-    ``request_id`` is the remote turn's own correlation id — present on every
-    remote-backend failure regardless of code, including the fully generic
-    ``anton_error`` bucket, so a user report of "An unexpected error
-    occurred" can still be pinned to this turn's server-side logs. The
-    in-process path has no such id to offer and omits it.
+    ``request_id`` is the producing turn's own correlation id — present on
+    every remote-backend and in-process failure regardless of code, including
+    the fully generic ``anton_error`` bucket, so a user report of "An
+    unexpected error occurred" can still be pinned to this turn's server-side
+    logs. The direct and channel producers have none to offer and omit it.
     """
     payload = {"type": "response.failed", "code": code, "error": error}
     if reconnectable is not None:

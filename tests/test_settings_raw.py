@@ -1,14 +1,7 @@
 import asyncio
-from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
-
-
-def _local_request():
-    """Loopback stand-in for the Request arg the raw-settings endpoints now
-    take — they 403 non-loopback callers (guards.require_local, ENG-457)."""
-    return SimpleNamespace(client=SimpleNamespace(host="127.0.0.1"))
 
 
 def _delete_settings(session, *keys: str) -> None:
@@ -57,11 +50,11 @@ def test_raw_settings_write_syncs_credentials_but_not_models(tmp_path, monkeypat
         _delete_settings(session, "minds_api_key", "planning_provider", "planning_model")
 
         response = asyncio.run(
-            write_raw_settings(_RawSettingsBody(content="ANTON_PLANNING_MODEL=_reason_"), session, _local_request())
+            write_raw_settings(_RawSettingsBody(content="ANTON_PLANNING_MODEL=_reason_"), session)
         )
 
         assert response == {"ok": True}
-        raw = settings_endpoint.read_raw_settings(_local_request())
+        raw = settings_endpoint.read_raw_settings()
         assert raw["ANTON_MINDS_API_KEY"] == "existing-key"
         # The model line IS preserved in .env (CLI-only surface)…
         assert raw["ANTON_PLANNING_MODEL"] == "_reason_"
@@ -105,7 +98,6 @@ def test_raw_settings_write_rejects_invalid_db_values_before_env_write(tmp_path,
                     )
                 ),
                 session,
-                _local_request(),
             ))
 
         assert exc.value.status_code == 400
