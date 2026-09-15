@@ -3,7 +3,6 @@ from pathlib import Path
 import pytest
 from sqlmodel import Session, SQLModel, create_engine
 
-import cowork.harnesses.hermes_harness.memory_adapter  # noqa: F401
 from cowork.common.settings.app_settings import AppSettings, MemorySettings
 from cowork.harnesses.memory.migration import migrate_harness_memory_to_shared
 from cowork.harnesses.memory.registry import MemorySlot
@@ -47,13 +46,6 @@ def test_migration_copies_legacy_files(db_session, memory_root, tmp_path, monkey
             (hermes_dir / "MEMORY.md", MemorySlot.LESSONS),
         ],
     )
-    monkeypatch.setattr(
-        "cowork.harnesses.hermes_harness.memory_adapter.HermesMemoryAdapter.RUNTIME_SYMLINKS",
-        {
-            hermes_dir / "USER.md": MemorySlot.PROFILE,
-            hermes_dir / "MEMORY.md": MemorySlot.LESSONS,
-        },
-    )
 
     store = GlobalMemoryStore(root=memory_root)
     assert migrate_harness_memory_to_shared(db_session) is True
@@ -61,8 +53,9 @@ def test_migration_copies_legacy_files(db_session, memory_root, tmp_path, monkey
     assert store.read(MemorySlot.RULES).strip() == "Always use TypeScript"
     assert store.read(MemorySlot.PROFILE).strip() == "User prefers dark mode"
     assert store.read(MemorySlot.LESSONS).strip() == "Lesson one"
-    assert not (hermes_dir / "USER.md").exists()
-    assert not (hermes_dir / "MEMORY.md").exists()
+    # Sources are never deleted.
+    assert (hermes_dir / "USER.md").is_file()
+    assert (hermes_dir / "MEMORY.md").is_file()
     assert migrate_harness_memory_to_shared(db_session) is False
 
 
@@ -79,10 +72,6 @@ def test_migration_skips_when_canonical_slot_already_has_content(
     monkeypatch.setattr(
         "cowork.harnesses.memory.migration._MIGRATION_SOURCES",
         [(anton_dir / "rules.md", MemorySlot.RULES)],
-    )
-    monkeypatch.setattr(
-        "cowork.harnesses.hermes_harness.memory_adapter.HermesMemoryAdapter.RUNTIME_SYMLINKS",
-        {},
     )
 
     assert migrate_harness_memory_to_shared(db_session) is True
@@ -110,13 +99,6 @@ def test_migration_combines_multiple_sources_for_same_slot(
             (anton_dir / "lessons.md", MemorySlot.LESSONS),
             (hermes_dir / "MEMORY.md", MemorySlot.LESSONS),
         ],
-    )
-    monkeypatch.setattr(
-        "cowork.harnesses.hermes_harness.memory_adapter.HermesMemoryAdapter.RUNTIME_SYMLINKS",
-        {
-            hermes_dir / "USER.md": MemorySlot.PROFILE,
-            hermes_dir / "MEMORY.md": MemorySlot.LESSONS,
-        },
     )
 
     store = GlobalMemoryStore(root=memory_root)
