@@ -222,6 +222,7 @@ class SessionLifecycleOperations:
                     "engine_session_id": None,
                     "active_turn_id": None,
                     "pending_approval": None,
+                    "command_approval_grants": [],
                     "queued_instructions": [],
                     "terminal_tabs": [],
                     "pinned": False,
