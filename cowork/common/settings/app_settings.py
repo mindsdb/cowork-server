@@ -350,6 +350,18 @@ class FileSettings(Settings):
     )  # FILE_ROOT_DIR or COWORK_FILES_DIR or FILES_ROOT_DIR
 
 
+class CodingSettings(Settings):
+    root_dir: str = Field(
+        default_factory=lambda: str(cowork_home() / "coding"),
+        validation_alias=AliasChoices("COWORK_CODING_DIR"),
+        description=(
+            "Root directory for the coding store, its git workspaces and code "
+            "projects. Org mode does not route this through scoped_storage_root, "
+            "so it is not partitioned per organization there."
+        ),
+    )  # COWORK_CODING_DIR
+
+
 class StorageSettings(Settings):
     # Org mode only: stores live under <shared_root>/<org_id>/<store>/ (one
     # mountable subtree per org). Local mode never reads this; in org mode the
@@ -839,6 +851,7 @@ class AppSettings(Settings):
     skill: SkillSettings = Field(default_factory=SkillSettings)  # SKILL_*
     connector: ConnectorSettings = Field(default_factory=ConnectorSettings)  # CONNECTOR_*
     memory: MemorySettings = Field(default_factory=MemorySettings)  # MEMORY_*
+    coding: CodingSettings = Field(default_factory=CodingSettings)  # CODING_*
 
 
 @lru_cache

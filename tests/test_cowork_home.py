@@ -9,6 +9,7 @@ from pathlib import Path
 from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import (
     AppSettings,
+    CodingSettings,
     OAuthSettings,
     StreamSettings,
     _env_file_chain,
@@ -102,6 +103,46 @@ def test_explicit_database_uri_still_overrides_cowork_home(monkeypatch, tmp_path
     assert AppSettings(_env_file=None).database.uri == "sqlite:////tmp/explicit.db"
 
     get_app_settings.cache_clear()
+
+
+def test_coding_root_derives_from_cowork_home(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    monkeypatch.setenv("COWORK_HOME", str(home))
+    monkeypatch.delenv("COWORK_CODING_DIR", raising=False)
+    get_app_settings.cache_clear()
+
+    assert Path(CodingSettings(_env_file=None).root_dir) == home / "coding"
+
+    get_app_settings.cache_clear()
+
+
+def test_explicit_coding_dir_still_overrides_cowork_home(monkeypatch, tmp_path):
+    # The desktop app points this at a per-organization subtree so one
+    # organization's code tasks, workspaces and code projects stay its own.
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("COWORK_CODING_DIR", "/explicit/coding")
+    get_app_settings.cache_clear()
+
+    assert CodingSettings(_env_file=None).root_dir == "/explicit/coding"
+
+    get_app_settings.cache_clear()
+
+
+def test_coding_service_honors_the_coding_dir_override(monkeypatch, tmp_path):
+    """The behavioural half: the service must READ the setting, not recompute
+    the path. Without that, the desktop's per-organization override is ignored
+    and one organization's code tasks stay visible in the next."""
+    from cowork.coding.service import get_coding_service
+
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("COWORK_CODING_DIR", str(tmp_path / "orgs" / "org-b" / "coding"))
+    get_app_settings.cache_clear()
+    get_coding_service.cache_clear()
+    try:
+        assert get_coding_service().root == tmp_path / "orgs" / "org-b" / "coding"
+    finally:
+        get_coding_service.cache_clear()
+        get_app_settings.cache_clear()
 
 
 def test_explicit_state_path_still_overrides_cowork_home(monkeypatch, tmp_path):
