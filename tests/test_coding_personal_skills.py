@@ -10,7 +10,8 @@ from fastapi.testclient import TestClient
 
 from coding_service_fakes import CREDS, FakeEngine, repository, service_with, wait_for_status
 from cowork.api.v1.endpoints import coding
-from cowork.api.v1.endpoints.coding_personal_skills import MAX_SKILL_BYTES, PersonalSkillStore
+from cowork.api.v1.endpoints.coding_personal_skills import MAX_SKILL_BYTES
+from cowork.api.v1.router import api_router
 from cowork.coding.contracts import SessionCreateRequest, SessionStatus
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.services.skills import CodeSkillService, SkillService
@@ -32,7 +33,7 @@ def app(tmp_path, monkeypatch):
     monkeypatch.setattr(coding, "_service", lambda: service)
     app = FastAPI()
     app.state.engine = engine
-    app.include_router(coding.router, prefix="/api/v1/coding")
+    app.include_router(api_router)
     yield app
     get_app_settings.cache_clear()
 
@@ -41,6 +42,48 @@ def app(tmp_path, monkeypatch):
 def client(app):
     with TestClient(app, client=("127.0.0.1", 12345)) as client:
         yield client
+
+
+def test_personal_routes_are_mounted_once_in_the_canonical_router(client):
+    from cowork.api.v1.route_walker import route_key
+
+    routes = [
+        route_key(route)
+        for route in api_router.routes
+        if route.path.startswith(BASE)
+    ]
+    assert len(routes) == 5
+    assert len(set(routes)) == 5
+    schema = client.get("/openapi.json").json()
+    assert "PersonalSkillWrite" in schema["components"]["schemas"]
+    assert "PersonalSkillImport" in schema["components"]["schemas"]
+
+
+def test_other_code_routes_keep_standard_validation_errors(client):
+    result = client.post("/api/v1/coding/skills/sources", json={})
+    assert result.status_code == 422
+    assert isinstance(result.json()["detail"], list)
+
+
+@pytest.mark.parametrize("body", [None, [], {"name": "Incomplete"}])
+def test_malformed_skill_body_has_string_validation_detail(client, body):
+    result = client.post(BASE, json=body)
+    assert result.status_code == 400
+    assert isinstance(result.json()["detail"], str)
+    assert not CodeSkillService().list_skills()
+
+
+def test_malformed_skill_json_has_string_validation_detail(client):
+    result = client.post(BASE, content="{", headers={"Content-Type": "application/json"})
+    assert result.status_code == 400
+    assert isinstance(result.json()["detail"], str)
+
+
+@pytest.mark.parametrize("text", ["a" * MAX_SKILL_BYTES, "🙂" * (MAX_SKILL_BYTES // 4)], ids=["ascii", "unicode"])
+def test_instructions_at_the_byte_limit_are_accepted(client, text):
+    result = client.post(BASE, json={**BODY, "instructions": text})
+    assert result.status_code == 201
+    assert CodeSkillService().get_skill("review-typescript").instructions == text
 
 
 def test_create_catalogue_read_edit_disable_and_delete(client):
@@ -88,16 +131,20 @@ def test_duplicate_create_returns_conflict_without_overwriting(client):
     assert path.read_bytes() == original
 
 
-def test_concurrent_creates_return_conflict_at_the_atomic_write(client, monkeypatch):
+@pytest.fixture
+def concurrent_writes(monkeypatch):
     barrier = Barrier(2)
-    write = PersonalSkillStore._write
+    write = CodeSkillService._write
 
     def concurrent_write(self, skill, **kwargs):
         # Both requests pass the existence check before either claims the slug.
         barrier.wait(timeout=5)
         return write(self, skill, **kwargs)
 
-    monkeypatch.setattr(PersonalSkillStore, "_write", concurrent_write)
+    monkeypatch.setattr(CodeSkillService, "_write", concurrent_write)
+
+
+def test_concurrent_creates_return_conflict_at_the_atomic_write(client, concurrent_writes):
     bodies = [{**BODY, "instructions": instructions} for instructions in ["First", "Second"]]
     with ThreadPoolExecutor(max_workers=2) as pool:
         responses = list(pool.map(lambda body: client.post(BASE, json=body), bodies))
@@ -132,18 +179,52 @@ def test_edit_preserves_supporting_files_metadata_and_project_restrictions(clien
     assert reference.read_text() == "Keep this reference."
 
 
-@pytest.mark.parametrize("field,value", [("name", " "), ("name", "!!!"), ("description", " "), ("instructions", "\n\t"), ("instructions", "a" * (MAX_SKILL_BYTES + 1)), ("instructions", "🙂" * 40_000), ("name", None), ("projects", ["x"])])
+@pytest.mark.parametrize("field,value", [
+    pytest.param("name", " ", id="blank-name"),
+    pytest.param("name", "!!!", id="invalid-slug"),
+    pytest.param("description", " ", id="blank-description"),
+    pytest.param("instructions", "\n\t", id="blank-instructions"),
+    pytest.param("instructions", "a" * (MAX_SKILL_BYTES + 1), id="large-ascii"),
+    pytest.param("instructions", "🙂" * 40_000, id="large-unicode"),
+    pytest.param("name", None, id="null-name"),
+    pytest.param("projects", ["x"], id="unknown-field"),
+])
 def test_invalid_create_does_not_write(client, field, value):
     result = client.post(BASE, json={**BODY, field: value})
-    assert result.status_code in {400, 422}
+    assert result.status_code == 400
+    assert isinstance(result.json()["detail"], str)
     assert not CodeSkillService().list_skills()
 
 
-@pytest.mark.parametrize("content", ["", "Just ordinary text", "---\nname: [broken\n---\n", "a" * (MAX_SKILL_BYTES + 1), "🙂" * 40_000])
+@pytest.mark.parametrize("content", [
+    pytest.param("", id="empty"),
+    pytest.param("Just ordinary text", id="no-frontmatter"),
+    pytest.param("---\nname: [broken\n---\n", id="invalid-frontmatter"),
+    pytest.param("a" * (MAX_SKILL_BYTES + 1), id="large-ascii"),
+    pytest.param("🙂" * 40_000, id="large-unicode"),
+])
 def test_invalid_import_is_non_destructive(client, content):
     result = client.post(f"{BASE}/import", json={"content": content})
-    assert result.status_code in {400, 422}
+    assert result.status_code == 400
+    assert isinstance(result.json()["detail"], str)
     assert not CodeSkillService().list_skills()
+
+
+@pytest.mark.parametrize("text", ["a" * (MAX_SKILL_BYTES + 1), "🙂" * 40_000], ids=["ascii", "unicode"])
+@pytest.mark.parametrize("operation", ["create", "update", "import"])
+def test_oversized_text_has_a_readable_error(client, text, operation):
+    assert client.post(BASE, json=BODY).status_code == 201
+    path = CodeSkillService().root / "review-typescript" / "SKILL.md"
+    before = path.read_bytes()
+    if operation == "import":
+        result = client.post(f"{BASE}/import", json={"content": text})
+    else:
+        method = "PUT" if operation == "update" else "POST"
+        url = f"{BASE}/review-typescript" if operation == "update" else BASE
+        result = client.request(method, url, json={**BODY, "instructions": text})
+    assert result.status_code == 400
+    assert "Keep the skill under 120 KB." in result.json()["detail"]
+    assert path.read_bytes() == before
 
 
 def test_import_uses_the_canonical_parser_to_normalize_the_directory_name(client):
@@ -195,11 +276,16 @@ def test_cloud_and_non_loopback_callers_are_refused(app, monkeypatch, method, pa
         assert cloud.request(method, BASE + path, json=body).status_code == 403
 
 
-def test_concurrent_imports_have_one_winner(client):
+def test_concurrent_imports_have_one_winner(client, concurrent_writes):
+    sources = [MARKDOWN, MARKDOWN.replace("specific", "friendly")]
     with ThreadPoolExecutor(max_workers=2) as pool:
-        responses = list(pool.map(lambda _: client.post(f"{BASE}/import", json={"content": MARKDOWN}), range(2)))
+        responses = list(pool.map(
+            lambda content: client.post(f"{BASE}/import", json={"content": content}),
+            sources,
+        ))
     assert sorted(item.status_code for item in responses) == [201, 409]
-    assert CodeSkillService().get_skill("human-writing").instructions.strip() == "Keep it concise and specific."
+    winner = next(item.json() for item in responses if item.status_code == 201)
+    assert CodeSkillService().get_skill("human-writing").instructions == winner["instructions"]
 
 
 def test_untrusted_browser_origin_cannot_write(client):
@@ -222,14 +308,18 @@ def test_new_task_receives_the_skill_created_over_http(client, app, tmp_path):
     assert BODY["instructions"] in (Path(task.skill_roots[0]) / "review-typescript" / "SKILL.md").read_text()
 
 
-@pytest.mark.parametrize("failure", [OSError("private path and internal details"), PermissionError(13, "private path and internal details")])
+@pytest.mark.parametrize("failure", [
+    pytest.param(OSError("private path and internal details"), id="storage"),
+    pytest.param(PermissionError(13, "private path and internal details"), id="permission-errno"),
+    pytest.param(PermissionError("private path and internal details"), id="permission-no-errno"),
+])
 def test_failed_atomic_save_keeps_original(client, monkeypatch, failure):
     client.post(BASE, json=BODY)
     path = CodeSkillService().root / "review-typescript" / "SKILL.md"
     before = path.read_bytes()
     def fail(*args, **kwargs):
         raise failure
-    monkeypatch.setattr(PersonalSkillStore, "_replace_direct_child", fail)
+    monkeypatch.setattr(CodeSkillService, "_replace_direct_child", fail)
     result = client.put(f"{BASE}/review-typescript", json={**BODY, "instructions": "Changed"})
     assert result.status_code == 500
     assert "internal details" not in result.text

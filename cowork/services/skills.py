@@ -52,6 +52,10 @@ class SkillAlreadyExistsError(ValueError):
     """A create or rename conflicts with an existing skill identity."""
 
 
+class SkillImmutableError(PermissionError):
+    """A built-in mutation was refused, not a filesystem permission failure."""
+
+
 # Per-file cap (matches the skill-draft cap): filters mispackaged data blobs and
 # stops one bad skill from bloating the payload. The aggregate request size is
 # bounded downstream by the producer's _fit_request against the real stdin cap.
@@ -282,6 +286,7 @@ class SkillService:
 
     store_name = "skills"
     seed_builtins_in_local_mode = False
+    immutable_builtins_in_local_mode = False
 
     def __init__(self, scope: TenantScope | None = None) -> None:
         settings = get_app_settings()
@@ -369,11 +374,10 @@ class SkillService:
         return Path(skill_dir)
 
     def _is_immutable_builtin(self, slug: str) -> bool:
-        return bool(
-            self._scope is not None
-            and self._scope.org_mode
-            and slug in self.packaged_builtin_slugs
+        protected = self.immutable_builtins_in_local_mode or (
+            self._scope is not None and self._scope.org_mode
         )
+        return bool(protected and slug in self.packaged_builtin_slugs)
 
     def _ensure_root(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -585,7 +589,7 @@ class SkillService:
     ) -> Skill:
         label = self._slug_from_label(label)
         if self._is_immutable_builtin(label):
-            raise PermissionError(builtin_skill_refusal(label))
+            raise SkillImmutableError(builtin_skill_refusal(label))
         if not self.allows_skill(label):
             raise ValueError(f"Skill name {label!r} is reserved for MindsHub Code.")
         if self._skill_dir(label).exists():
@@ -618,12 +622,12 @@ class SkillService:
         projects: list[str] | None = None,
     ) -> Skill:
         if self._is_immutable_builtin(skill_id):
-            raise PermissionError(builtin_skill_refusal(skill_id))
+            raise SkillImmutableError(builtin_skill_refusal(skill_id))
         skill = self.get_skill(skill_id)
         # ``skill_id`` may be a same-root alias, so the reservation is
         # re-checked against the directory this edit would rewrite.
         if self._is_immutable_builtin(skill.name):
-            raise PermissionError(builtin_skill_refusal(skill.name))
+            raise SkillImmutableError(builtin_skill_refusal(skill.name))
         original_state = (
             skill.name,
             skill.display_name,
@@ -639,7 +643,7 @@ class SkillService:
         if label is not None:
             new_slug = self._slug_from_label(label)
             if self._is_immutable_builtin(new_slug):
-                raise PermissionError(builtin_skill_refusal(new_slug))
+                raise SkillImmutableError(builtin_skill_refusal(new_slug))
 
         if name is not None:
             if name and name != new_slug:
@@ -771,7 +775,7 @@ class SkillService:
         if not skill.name:
             raise ValueError("Skill name is missing or invalid.")
         if self._is_immutable_builtin(skill.name):
-            raise PermissionError(builtin_skill_refusal(skill.name))
+            raise SkillImmutableError(builtin_skill_refusal(skill.name))
         if not self.allows_skill(skill.name):
             raise ValueError(
                 f"Skill name {skill.name!r} is reserved for MindsHub Code."
@@ -859,14 +863,14 @@ class SkillService:
 
     def delete_skill(self, slug: str) -> bool:
         if self._is_immutable_builtin(slug):
-            raise PermissionError(builtin_skill_refusal(slug))
+            raise SkillImmutableError(builtin_skill_refusal(slug))
         skill_dir = self._skill_dir(slug)
         if not skill_dir.exists():
             return False
         # A same-root alias resolves to another slug's directory, so the
         # reservation is re-checked against the directory actually removed.
         if self._is_immutable_builtin(skill_dir.name):
-            raise PermissionError(builtin_skill_refusal(skill_dir.name))
+            raise SkillImmutableError(builtin_skill_refusal(skill_dir.name))
         self._rmtree_direct_child(self.root, skill_dir.name)
         if self._link_projects:
             remove_skill_links(slug)
@@ -875,14 +879,14 @@ class SkillService:
     def stage_delete(self, slug: str) -> Path | None:
         """Atomically hide a skill while its deletion audit is committed."""
         if self._is_immutable_builtin(slug):
-            raise PermissionError(builtin_skill_refusal(slug))
+            raise SkillImmutableError(builtin_skill_refusal(slug))
         skill_dir = self._skill_dir(slug)
         if not skill_dir.exists():
             return None
         # A same-root alias resolves to another slug's directory, so the
         # reservation is re-checked against the directory actually staged.
         if self._is_immutable_builtin(skill_dir.name):
-            raise PermissionError(builtin_skill_refusal(skill_dir.name))
+            raise SkillImmutableError(builtin_skill_refusal(skill_dir.name))
         trash = self._delete_staging_root()
         trash.mkdir(parents=True, exist_ok=True)
         staged = trash / f"{skill_dir.name}-{uuid4()}"
@@ -1177,6 +1181,7 @@ class CodeSkillService(SkillService):
 
     store_name = "code-skills"
     seed_builtins_in_local_mode = True
+    immutable_builtins_in_local_mode = True
 
     @property
     def builtin_skills_version(self) -> int:
