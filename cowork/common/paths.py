@@ -10,16 +10,32 @@ entire install: preview/stable desktop builds set ``COWORK_HOME`` to
 Every default path in the codebase MUST derive from :func:`cowork_home` (via
 the settings classes or directly) — a path that hardcodes ``~/.cowork`` would
 silently leak across builds and defeat the isolation.
+
+When ``COWORK_HOME`` is unset, the resolved home depends on whether we run from
+an installed wheel or a source checkout (ENG-1541). The desktop app sets
+``COWORK_HOME`` before spawning the server, so a *source* run that reaches this
+module with it unset bypassed the app — a bare ``uv run cowork-server``, the
+``cowork-dev-setup`` entrypoint, ``npm run dev:web``, a pyenv-shim binary.
+Silently defaulting such a run to production ``~/.cowork`` migrated the prod DB
+twice, so a source checkout defaults to an isolated ``~/.cowork-dev`` (with a
+warning) instead. Only an installed wheel — where the desktop prod build
+legitimately leaves ``COWORK_HOME`` unset — keeps the ``~/.cowork`` default.
 """
 
+import logging
 import os
 import shutil
+import tomllib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+
 _DEFAULT_HOME = Path.home() / ".cowork"
+_DEV_HOME = Path.home() / ".cowork-dev"
 
 _IS_WINDOWS = os.name == "nt"
 
@@ -35,6 +51,44 @@ O_DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 
 
+@cache
+def _running_from_source() -> bool:
+    """True when imported from a cowork-server source checkout, not a wheel.
+
+    An installed wheel lives under ``site-packages`` with no project metadata
+    beside it; a dev checkout has the repo's ``pyproject.toml`` (``name =
+    "cowork-server"``) at its root. Cached because the answer is fixed for the
+    process and reading the file on every ``cowork_home()`` call would be waste.
+    """
+    # paths.py → common → cowork → repo root
+    root = Path(__file__).resolve().parents[2]
+    pyproject = root / "pyproject.toml"
+    if not pyproject.is_file():
+        return False
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    return data.get("project", {}).get("name") == "cowork-server"
+
+
+@cache
+def _dev_home_fallback() -> Path:
+    """Return ``~/.cowork-dev`` and warn once that we steered off production.
+
+    Cached so a source run resolving paths many times logs the warning a single
+    time rather than on every ``cowork_home()`` call.
+    """
+    logger.warning(
+        "COWORK_HOME is unset while cowork-server runs from a source checkout; "
+        "defaulting to the isolated dev home %s instead of production "
+        "(~/.cowork). Set COWORK_HOME=~/.cowork to deliberately target "
+        "production, or COWORK_HOME=~/.cowork-dev to silence this warning.",
+        _DEV_HOME,
+    )
+    return _DEV_HOME
+
+
 def cowork_home() -> Path:
     """Root directory for all cowork state (default ``~/.cowork``).
 
@@ -42,9 +96,17 @@ def cowork_home() -> Path:
     builds set to isolate their data. Read from the environment on each call so
     tests can monkeypatch it; the desktop app sets it before the server process
     starts, so it is stable for the lifetime of a real run.
+
+    With ``COWORK_HOME`` unset, a source checkout defaults to an isolated
+    ``~/.cowork-dev`` (with a warning) rather than the production ``~/.cowork``
+    — see the module docstring (ENG-1541). An installed wheel keeps ``~/.cowork``.
     """
     raw = os.environ.get("COWORK_HOME")
-    return Path(raw).expanduser() if raw else _DEFAULT_HOME
+    if raw:
+        return Path(raw).expanduser()
+    if _running_from_source():
+        return _dev_home_fallback()
+    return _DEFAULT_HOME
 
 
 def pod_local_only(local_path: Path, name: str) -> Path:
