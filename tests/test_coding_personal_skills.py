@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 from fastapi import FastAPI
@@ -75,6 +76,47 @@ def test_import_keeps_metadata_and_duplicate_never_overwrites(client):
     duplicate = client.post(f"{BASE}/import", json={"content": source.replace("specific", "different")})
     assert duplicate.status_code == 409
     assert (CodeSkillService().root / skill.name / "SKILL.md").read_bytes() == original
+
+
+def test_duplicate_create_returns_conflict_without_overwriting(client):
+    assert client.post(BASE, json=BODY).status_code == 201
+    path = CodeSkillService().root / "review-typescript" / "SKILL.md"
+    original = path.read_bytes()
+    duplicate = client.post(BASE, json={**BODY, "name": "review-typescript", "instructions": "Do not overwrite."})
+    assert duplicate.status_code == 409
+    assert duplicate.json()["detail"] == "A skill with that name already exists. Edit it or use a different name."
+    assert path.read_bytes() == original
+
+
+def test_concurrent_creates_return_conflict_at_the_atomic_write(client, monkeypatch):
+    barrier = Barrier(2)
+    write = PersonalSkillStore._write
+
+    def concurrent_write(self, skill, **kwargs):
+        # Both requests pass the existence check before either claims the slug.
+        barrier.wait(timeout=5)
+        return write(self, skill, **kwargs)
+
+    monkeypatch.setattr(PersonalSkillStore, "_write", concurrent_write)
+    bodies = [{**BODY, "instructions": instructions} for instructions in ["First", "Second"]]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        responses = list(pool.map(lambda body: client.post(BASE, json=body), bodies))
+    assert sorted(result.status_code for result in responses) == [201, 409]
+    winner = next(result.json() for result in responses if result.status_code == 201)
+    assert CodeSkillService().get_skill(winner["id"]).instructions == winner["instructions"]
+
+
+@pytest.mark.parametrize("deleted", [False, True], ids=["missing", "deleted"])
+@pytest.mark.parametrize("method", ["GET", "PUT", "DELETE"])
+def test_missing_skill_returns_not_found(client, method, deleted):
+    path = f"{BASE}/review-typescript"
+    if deleted:
+        assert client.post(BASE, json=BODY).status_code == 201
+        assert client.delete(path).status_code == 204
+    result = client.request(method, path, json=BODY if method == "PUT" else None)
+    assert result.status_code == 404
+    assert result.json()["detail"] == "This personal skill no longer exists."
+    assert not (CodeSkillService().root / "review-typescript").exists()
 
 
 def test_edit_preserves_supporting_files_metadata_and_project_restrictions(client):

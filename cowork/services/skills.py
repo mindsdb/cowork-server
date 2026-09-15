@@ -43,6 +43,15 @@ from cowork.services.skill_links import reconcile_skill_links, remove_skill_link
 
 logger = logging.getLogger(__name__)
 
+
+class SkillNotFoundError(ValueError):
+    """A skill is unavailable; remains compatible with ValueError callers."""
+
+
+class SkillAlreadyExistsError(ValueError):
+    """A create or rename conflicts with an existing skill identity."""
+
+
 # Per-file cap (matches the skill-draft cap): filters mispackaged data blobs and
 # stops one bad skill from bloating the payload. The aggregate request size is
 # bounded downstream by the producer's _fit_request against the real stdin cap.
@@ -499,7 +508,7 @@ class SkillService:
 
     def get_skill(self, slug: str) -> Skill:
         if not self.allows_skill(slug):
-            raise ValueError(f"Skill {slug!r} not found.")
+            raise SkillNotFoundError(f"Skill {slug!r} not found.")
         skill_dir = self._skill_dir(slug)
         skill = (
             _skill_from_dir(skill_dir, canonicalize_name=True)
@@ -507,7 +516,7 @@ class SkillService:
             else None
         )
         if skill is None:
-            raise ValueError(f"Skill {slug!r} not found.")
+            raise SkillNotFoundError(f"Skill {slug!r} not found.")
         return skill
 
     def has_complete_skill(self, slug: str) -> bool:
@@ -580,7 +589,7 @@ class SkillService:
         if not self.allows_skill(label):
             raise ValueError(f"Skill name {label!r} is reserved for MindsHub Code.")
         if self._skill_dir(label).exists():
-            raise ValueError(f"A skill named '{label}' already exists.")
+            raise SkillAlreadyExistsError(f"A skill named '{label}' already exists.")
 
         metadata = self._build_metadata(label, name, datetime.now(UTC))
         self._apply_metadata_flags(metadata, enabled, projects)
@@ -595,7 +604,7 @@ class SkillService:
         try:
             self._write(skill, create=True)
         except FileExistsError:
-            raise ValueError(f"A skill named '{label}' already exists.")
+            raise SkillAlreadyExistsError(f"A skill named '{label}' already exists.")
         return self.get_skill(label)
 
     def update_skill(
@@ -644,7 +653,7 @@ class SkillService:
 
         renaming = new_slug != skill.name
         if renaming and self._skill_dir(new_slug).exists():
-            raise ValueError(f"A skill named '{new_slug}' already exists.")
+            raise SkillAlreadyExistsError(f"A skill named '{new_slug}' already exists.")
 
         candidate = skill.model_copy(deep=True)
         candidate.name = new_slug
