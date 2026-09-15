@@ -57,6 +57,9 @@ dependencies = [
     "xhtml2pdf>=0.2.16",
     "python-docx>=1.1.2",
     "htmldocx>=0.0.6",
+    # Floor for the Pillow security fixes; the document libraries above only
+    # pull it in transitively with no lower bound of their own.
+    "pillow>=12.3.0",
 ]
 
 [project.urls]
@@ -70,8 +73,6 @@ cowork-dev-setup = "cowork.cli:dev_setup_main"
 cowork-code-runtime = "cowork.coding.runtime_worker:main"
 
 [project.optional-dependencies]
-# Optional: hermes-agent pins openai==2.24.0, anton needs openai>=3 (see override below).
-hermes = ["hermes-agent>=0.15.2,<0.18"]
 channels = [
     "slack-sdk>=3.27.0",
     "aiohttp>=3.9.0",
@@ -89,13 +90,6 @@ fallback-version = "0.0.0-dev"
 [tool.hatch.build.targets.wheel]
 packages = ["cowork"]
 
-[tool.uv]
-# hermes-agent pins Pillow==12.2.0 exactly (still true as of its latest
-# upstream commit), which blocks picking up Pillow security fixes. Override
-# it project-wide so the resolver isn't held back by that inner pin.
-# hermes-agent also pins openai==2.24.0; anton needs openai>=3 and hermes runs on it.
-override-dependencies = ["pillow>=12.3.0", "openai>=3.0"]
-
 [tool.uv.sources]
 # cowork-server imports the artifact-identity derivation
 # (`resolve_artifact_id`, `canonical_artifact_id`, `artifact_key`) from Anton
@@ -112,8 +106,6 @@ override-dependencies = ["pillow>=12.3.0", "openai>=3.0"]
 # must retain the static construction-time key, and `handlers/turn_errors.py`
 # keeps the legacy 401 classifier available under that skew.
 anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
-# pinned: upstream HEAD (v0.18.0) requires cryptography==46, conflicts with our >=48
-hermes-agent = { git = "https://github.com/NousResearch/hermes-agent.git", rev = "44ddc552f5e054759a6970af8997ea588a9d81c9" }
 
 [dependency-groups]
 dev = [

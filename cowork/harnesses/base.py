@@ -3,7 +3,6 @@ from typing import AsyncIterator, Literal, Protocol
 from typing_extensions import TypedDict
 
 from cowork.models.conversation import Conversation
-from cowork.models.skill import Skill
 
 
 class TextInputBlock(TypedDict):
@@ -83,10 +82,10 @@ def get_harness(name: str) -> HarnessProvider:
         raise ValueError(f"Unknown harness {name!r}. Available: {available}")
     # available_harness_ids() only HIDES a single-tenant harness from the
     # picker. The chosen harness is an org-scoped user setting, so a stored row
-    # naming one still resolved here and ran it: Hermes keeps skills, memory and
-    # sessions under an unscoped cowork_home() path, which on an org deployment
-    # is shared storage every organization can read. Enforce the flag where the
-    # instance is actually built, not only where the list is rendered.
+    # naming one would still resolve here and run it against unscoped
+    # cowork_home() paths, which on an org deployment is shared storage every
+    # organization can read. Enforce the flag where the instance is built, not
+    # only where the list is rendered.
     from cowork.common.settings.app_settings import get_app_settings
 
     if get_app_settings().tenancy_mode == "org" and not getattr(cls, "supports_org_mode", True):
