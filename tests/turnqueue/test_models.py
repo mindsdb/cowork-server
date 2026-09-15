@@ -48,8 +48,8 @@ def test_turn_reply_accepts_every_kind_the_controller_publishes():
 
     published = {
         "progress", "cell", "error", "turn_delta", "turn_step",
-        "turn_memory", "turn_skill", "turn_history", "turn_completed",
-        "turn_failed",
+        "turn_memory", "turn_skill", "turn_history", "turn_compaction",
+        "turn_completed", "turn_failed",
     }
     accepted = set(typing.get_args(TurnReply.model_fields["kind"].annotation))
     assert published == accepted

@@ -5,6 +5,7 @@ import base64
 import json
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -1013,17 +1014,92 @@ class ResponsesHandler:
                     )
 
     @staticmethod
-    def _remote_history(session, conv_id) -> list[dict]:
-        """Prior user/assistant messages in canonical order, as OpenAI-shaped,
-        scrubbed dicts (mode="json": the payload gets json.dumps'd into the
-        Redis job). The pod's harness only scrubs the current turn's input,
-        never this replayed history, so it must arrive already clean."""
-        ordered = ConversationService(session).get_ordered_messages(conv_id)
-        return [
-            scrubbed_openai_dump(m, mode="json")
-            for m in ordered
+    def _remote_seed_history(session, conv_id) -> tuple[list[dict], dict | None]:
+        """History to seed the pod with, and what's needed to map its compaction
+        result back onto our messages.
+
+        Messages are OpenAI-shaped, scrubbed dicts (mode="json": the payload
+        gets json.dumps'd into the Redis job). The pod's harness only scrubs the
+        current turn's input, never this replayed history, so it must arrive
+        already clean.
+
+        With compaction on, this is `[summary] + [messages after the cutoff]`
+        rather than the whole conversation, exactly as the in-process path
+        seeds it — the pod compacts either way, and without the saved summary
+        every turn resent the full history and paid to summarize it again
+        (ENG-1827). `seed_info` carries message *ids*, not ORM rows: the pod's
+        reply lands after this session may be closed.
+
+        Unlike in-process, messages are not timestamp-stamped here; that
+        divergence is tracked separately.
+        """
+        from cowork.harnesses.anton_harness.harness import AntonHarness
+
+        service = ConversationService(session)
+        replayable = [
+            m for m in service.get_ordered_messages(conv_id)
             if m.role in {"user", "assistant"}
         ]
+        fmt = partial(scrubbed_openai_dump, mode="json")
+        if not get_user_settings(session.scope).history_compaction_enabled:
+            return [fmt(m) for m in replayable], None
+
+        conversation = service.get_conversation(conv_id)
+        history, seed_info = AntonHarness._seed_history(
+            replayable,
+            conversation.history_summary,
+            conversation.history_summary_cutoff_id,
+            fmt,
+        )
+        return history, {
+            "message_ids": [m.id for m in seed_info["ordered_messages"]],
+            "tail_start": seed_info["tail_start"],
+            "synthetic_prefix_len": seed_info["synthetic_prefix_len"],
+        }
+
+    @staticmethod
+    def _persist_remote_compaction(
+        conv_id: UUID, data: dict, seed_info: dict | None, scope: TenantScope,
+    ) -> None:
+        """Save the summary the pod folded this turn's leading history into.
+
+        Everything here is untrusted: the pod reports `covered_through` against
+        the history we sent it, so a wrong or malformed count must degrade to
+        "no compaction saved" — the next turn then replays in full, which is
+        merely the old behaviour — never to a cutoff pointing at the wrong
+        message, which would silently drop real turns from every later replay.
+        """
+        from cowork.harnesses.anton_harness.harness import AntonHarness
+
+        summary = data.get("summary")
+        if not seed_info or not summary:
+            return
+        message_ids = seed_info["message_ids"]
+        idx = AntonHarness.compaction_cutoff_index(
+            seed_info, data.get("covered_through") or 0, len(message_ids),
+        )
+        if idx is None:
+            return
+        raw_session = None
+        try:
+            raw_session = get_open_session()
+            ConversationService(
+                ScopedSession(raw_session, scope)
+            ).update_history_compaction(conv_id, summary, message_ids[idx])
+        except Exception:
+            logger.exception(
+                "[responses] failed to persist history compaction for conversation %s",
+                conv_id,
+            )
+        finally:
+            if raw_session is not None:
+                try:
+                    raw_session.close()
+                except Exception:
+                    logger.exception(
+                        "[responses] failed to close compaction session for conversation %s",
+                        conv_id,
+                    )
 
     async def _produce_remote(
         self,
@@ -1042,7 +1118,7 @@ class ResponsesHandler:
         """Remote-backend counterpart of _produce: pipe the turn's replies
         through the same SSE formatter as the in-process path (full step /
         thinking parity, live and in the persisted events log) and persist
-        user + assistant together on terminal (deferred, so _remote_history
+        user + assistant together on terminal (deferred, so _remote_seed_history
         reads prior turns without the current input)."""
         lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
         collected_text: list[str] = []
@@ -1087,6 +1163,10 @@ class ResponsesHandler:
                 snapshot_artifact_state,
             )
 
+            # Resolved once and held for the whole turn: the pod counts its
+            # compaction against exactly the history seeded here, so re-reading
+            # it when the reply arrives could map the count onto a different list.
+            seeded_history, seed_info = self._remote_seed_history(producer_session, conv_id)
             # The worker writes artifacts into the shared tree while this turn
             # runs, so cowork-server does the same before/after diff it does for
             # an in-process turn. Snapshotting here rather than in the caller is
@@ -1117,7 +1197,7 @@ class ResponsesHandler:
                     turn_id=turn_id,
                     # Producer session, NOT self.scoped: this coroutine is detached
                     # and the request session may be closed by the time it runs.
-                    history=self._remote_history(producer_session, conv_id),
+                    history=seeded_history,
                     # Global memory and skills use read-only mounts. Project
                     # memory is outside the conversation workspace and therefore
                     # travels as a bounded, sheddable wire block.
@@ -1150,6 +1230,17 @@ class ResponsesHandler:
                         # is semi-trusted and these rows reach both the DB and
                         # every later turn's LLM context.
                         turn_rows[:] = sanitize_turn_history_rows(data.get("rows"))
+                    elif kind == "turn_compaction":
+                        # Persisted as it arrives, like memory: the cutoff names
+                        # a message from an earlier turn, so it stays correct
+                        # even if this turn goes on to fail.
+                        await asyncio.to_thread(
+                            self._persist_remote_compaction,
+                            conv_id,
+                            data,
+                            seed_info,
+                            producer_scope,
+                        )
                     elif kind == "turn_skill":
                         # Not persisted like memory: a draft is the user's decision.
                         # Yielding SkillCreated puts it through the same formatter the
@@ -1264,7 +1355,7 @@ class ResponsesHandler:
             # Persist the user message (pending) as the first thing this producer
             # does (ENG-1231) — see the note in handle(). Committed here, before
             # streaming, so a refresh/reconnect mid-turn shows the question via
-            # /items. _remote_history reads get_ordered_messages, which excludes
+            # /items. _remote_seed_history reads get_ordered_messages, which excludes
             # pending, so the current input isn't replayed into the remote job.
             pending_message_id = ConversationService(producer_session).save_user_message(
                 conv_id, original_content, pending=True,

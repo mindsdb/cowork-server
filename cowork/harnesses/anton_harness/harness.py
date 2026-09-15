@@ -736,15 +736,28 @@ class AntonHarness:
         )
 
     @staticmethod
+    def compaction_cutoff_index(seed_info: dict, covered_through: int, total: int) -> int | None:
+        """Index of the last seeded message a compaction covers, or None.
+
+        `covered_through` counts entries of the `initial_history` that was
+        seeded, which starts with `synthetic_prefix_len` non-real entries (the
+        summary, plus an assistant separator when one was needed) — so they
+        come off before the count maps onto real messages.
+
+        Returns None when the compaction covers nothing real or lands outside
+        the list: both mean "don't save a cutoff", not an error. The hosted
+        path shares this because `covered_through` arrives from the pod there,
+        where an out-of-range value is untrusted input rather than a bug.
+        """
+        covered = covered_through - seed_info["synthetic_prefix_len"]
+        if covered <= 0:
+            return None
+        idx = seed_info["tail_start"] + covered - 1
+        return idx if 0 <= idx < total else None
+
+    @staticmethod
     def _persist_history_compaction(conversation: Conversation, session, seed_info: dict) -> None:
         """Save anton's compacted summary + cutoff if it compacted this turn.
-
-        `seed_info["ordered_messages"]`/`["tail_start"]` are what this turn's
-        `initial_history` was built from; `["synthetic_prefix_len"]` is how
-        many non-real entries (summary, plus an assistant separator if one was
-        needed) were prepended ahead of them — `covered_through` from
-        `session.last_compaction` counts those too, so they must be subtracted
-        before mapping onto `ordered_messages`.
 
         `getattr` (not `session.last_compaction` directly): an anton build
         predating this property must no-op here, not raise — cowork-server and
@@ -753,13 +766,11 @@ class AntonHarness:
         compaction = getattr(session, "last_compaction", None)
         if compaction is None:
             return
-        offset = seed_info["synthetic_prefix_len"]
-        covered = compaction["covered_through"] - offset
-        if covered <= 0:
-            return
         ordered_messages = seed_info["ordered_messages"]
-        idx = seed_info["tail_start"] + covered - 1
-        if not (0 <= idx < len(ordered_messages)):
+        idx = AntonHarness.compaction_cutoff_index(
+            seed_info, compaction["covered_through"], len(ordered_messages),
+        )
+        if idx is None:
             return
         from sqlalchemy.orm import object_session
         from cowork.db.scoped import adopt_scoped_session
