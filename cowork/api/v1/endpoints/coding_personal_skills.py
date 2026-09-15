@@ -10,7 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from cowork.api.v1.permissions import LoopbackDesktopOnly, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.models.skill import Skill
-from cowork.services.skills import CodeSkillService
+from cowork.services.skills import CodeSkillService, SkillAlreadyExistsError, SkillNotFoundError
 
 router = APIRouter(prefix="/skills/personal", dependencies=[Depends(require(LoopbackDesktopOnly))])
 logger = logging.getLogger(__name__)
@@ -70,8 +70,10 @@ def personal_store(scope: Annotated[TenantScope, Depends(get_tenant_scope)]):
             logger.exception("Personal skill files are not writable")
             raise HTTPException(500, "Could not access the skill files on this computer. Check folder permissions, then try again.") from exc
         raise HTTPException(403, "MindsHub skills cannot be changed in the personal skill editor.") from exc
-    except FileExistsError as exc:
+    except (SkillAlreadyExistsError, FileExistsError) as exc:
         raise HTTPException(409, "A skill with that name already exists. Edit it or use a different name.") from exc
+    except SkillNotFoundError as exc:
+        raise HTTPException(404, "This personal skill no longer exists.") from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     except OSError as exc:
