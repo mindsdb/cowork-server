@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import os
 import stat
@@ -9,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
-from sqlalchemy import case, func
+from sqlalchemy import case, func, tuple_
 from sqlalchemy import select as sa_select
 
 from cowork.common.paths import (
@@ -23,11 +25,25 @@ from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
+from cowork.schemas.conversations import ConversationItemsPage
 from cowork.schemas.responses import Role
 from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.schedules import ScheduleService
 from cowork.services.scratchpad_sessions import remove_conversation_sessions
 from cowork.services.task_objects import TaskObjectService
+
+# Defaults/bounds for GET /conversations/{id}/items's opt-in pagination
+# (see get_messages_page). Omitting both limit and before keeps the route's
+# original bare-list, unbounded response — these only apply once a caller
+# opts in.
+_DEFAULT_PAGE_LIMIT = 50
+_MAX_PAGE_LIMIT = 200
+# How many raw rows (visible + hidden tool rows) get_messages_page will scan
+# past `limit` before giving up on filling a full page of visible items.
+# Bounded so a pathological run of consecutive tool rows can't reintroduce
+# an unbounded query; a page that hits this cap is simply reported as
+# `has_more=True` so the client just asks again.
+_SCAN_CAP_MULTIPLIER = 10
 
 # created_at is only second-precision, so rows of turns in the same second
 # would otherwise interleave. `seq` is a per-conversation monotonic ordinal
@@ -40,6 +56,41 @@ _MESSAGE_ORDER = (
     case((Message.role == Role.user, 0), else_=1),
     Message.id,
 )
+
+
+def _message_order_key(message: Message) -> tuple[datetime | None, int, int, UUID]:
+    """The runtime value of each _MESSAGE_ORDER column for one row, in the
+    same order — used to build a keyset pagination cursor from it."""
+    role_rank = 0 if message.role == Role.user else 1
+    return (message.created_at, message.seq, role_rank, message.id)
+
+
+def _encode_message_cursor(message: Message) -> str:
+    created_at, seq, role_rank, message_id = _message_order_key(message)
+    payload = [
+        created_at.isoformat() if created_at else None,
+        seq,
+        role_rank,
+        str(message_id),
+    ]
+    return base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+
+
+class InvalidPaginationParams(ValueError):
+    """A malformed `before` cursor or an out-of-range `limit` on
+    GET .../items — the route maps this to 400, distinct from the plain
+    ValueError get_conversation raises for a missing/foreign conversation
+    (mapped to 404)."""
+
+
+def _decode_message_cursor(cursor: str) -> tuple[datetime | None, int, int, UUID]:
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode())
+        created_at_iso, seq, role_rank, message_id = json.loads(raw)
+        created_at = datetime.fromisoformat(created_at_iso) if created_at_iso else None
+        return (created_at, int(seq), int(role_rank), UUID(message_id))
+    except Exception as e:
+        raise InvalidPaginationParams("Malformed pagination cursor") from e
 
 
 @dataclass(frozen=True)
@@ -910,3 +961,67 @@ class ConversationService:
             .order_by(*_MESSAGE_ORDER)
         ).all()
         return self._hydrate_message_items(messages)
+
+    def get_messages_page(
+        self,
+        conversation_id: UUID,
+        *,
+        limit: int = _DEFAULT_PAGE_LIMIT,
+        before: str | None = None,
+    ) -> ConversationItemsPage:
+        """Cursor-paginated sibling of get_messages, for GET .../items when
+        the caller opts in via limit/before. get_messages itself is left
+        alone (still used by the route's no-params branch and by callers
+        that want the whole history at once).
+
+        Walks newest-to-oldest from `before` (or from the most recent
+        message when absent), collecting up to `limit` VISIBLE (non-tool-row)
+        items — `pending` rows are included, same as get_messages, since
+        this is the same UI-facing view. Over-fetches raw rows (bounded by
+        _SCAN_CAP_MULTIPLIER) so a run of consecutive tool rows can't come
+        back as an empty page while still claiming more is available.
+        """
+        self.get_conversation(conversation_id)  # raises if not found
+        if not (1 <= limit <= _MAX_PAGE_LIMIT):
+            raise InvalidPaginationParams(f"limit must be between 1 and {_MAX_PAGE_LIMIT}")
+        cursor = _decode_message_cursor(before) if before else None
+
+        stmt = self.session.select(Message).where(Message.conversation_id == conversation_id)
+        if cursor is not None:
+            stmt = stmt.where(tuple_(*_MESSAGE_ORDER) < tuple_(*cursor))
+        stmt = stmt.order_by(
+            Message.created_at.desc(),
+            Message.seq.desc(),
+            case((Message.role == Role.user, 0), else_=1).desc(),
+            Message.id.desc(),
+        )
+
+        scan_cap = limit * _SCAN_CAP_MULTIPLIER
+        raw_rows = list(self.session.exec(stmt.limit(scan_cap + 1)).all())
+
+        visible: list[Message] = []
+        consumed = 0
+        for message in raw_rows:
+            if consumed >= scan_cap:
+                break
+            consumed += 1
+            if not _is_tool_row(message.content):
+                visible.append(message)
+                if len(visible) == limit:
+                    break
+
+        if len(visible) == limit:
+            has_more = len(raw_rows) > consumed
+        else:
+            has_more = len(raw_rows) > scan_cap
+
+        # Anchor the next page off the last row actually scanned, not the
+        # last VISIBLE one — otherwise a page that's all tool rows (has_more
+        # true, nothing visible to show) would have no cursor to continue
+        # from, and the client's "load earlier" would dead-end.
+        next_before = (
+            _encode_message_cursor(raw_rows[consumed - 1]) if has_more and consumed else None
+        )
+
+        items = self._hydrate_message_items(list(reversed(visible)))
+        return ConversationItemsPage(items=items, has_more=has_more, next_before=next_before)

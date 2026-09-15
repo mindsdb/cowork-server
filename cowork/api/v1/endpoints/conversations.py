@@ -14,7 +14,7 @@ from cowork.schemas.conversations import (
     ConversationMoveRequest,
     ConversationUpdateRequest,
 )
-from cowork.services.conversations import ConversationService
+from cowork.services.conversations import ConversationService, InvalidPaginationParams
 from cowork.services.task_objects import TaskObjectService
 
 # AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
@@ -147,11 +147,30 @@ def move_conversation(conversation_id: UUID, body: ConversationMoveRequest, sess
 
 
 @router.get("/{conversation_id}/items")
-def get_messages(conversation_id: UUID, scoped: ScopedSessionDep):
+def get_messages(
+    conversation_id: UUID,
+    scoped: ScopedSessionDep,
+    limit: int | None = None,
+    before: str | None = None,
+):
+    """Omitting both `limit` and `before` returns the full, unbounded
+    history as a bare list — unchanged from before this endpoint supported
+    pagination, so an existing caller that doesn't pass either param (e.g.
+    cowork_evals, outside this repo) keeps working exactly as today. Passing
+    either opts into the cursor-paginated envelope."""
+    svc = ConversationService(scoped)
     try:
-        return ConversationService(scoped).get_messages(conversation_id)
+        if limit is None and before is None:
+            return svc.get_messages(conversation_id)
+        page_kwargs = {"before": before}
+        if limit is not None:
+            page_kwargs["limit"] = limit  # let get_messages_page default when omitted; pass through (even invalid) values otherwise
+        page = svc.get_messages_page(conversation_id, **page_kwargs)
+    except InvalidPaginationParams as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    return page.model_dump(by_alias=True)
 
 
 @router.delete("/{conversation_id}")
