@@ -8,6 +8,8 @@ existing convention (see test_connectors_endpoints.py, test_connections_org_mode
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 from fastapi import HTTPException
 
@@ -206,29 +208,33 @@ class TestPatchAccessMode:
 
 
 class TestMcpIdentityBridge:
-    async def test_resolves_email_and_name_from_json_string_tool_results(self, monkeypatch):
+    async def test_resolves_email_and_portal_name_from_json_string_tool_results(self, monkeypatch):
+        """Real shapes, live-verified 2026-09-15 against an actual HubSpot
+        MCP server — both nest the useful fields one level down."""
         async def fake_call_mcp_tool(engine, access_token, tool_name, **kwargs):
             assert engine == "hubspot"
             assert access_token == "tok"
             if tool_name == "get_user_details":
-                return '{"email": "user@acme.com", "name": "Jordan"}'
-            return '{"portal_name": "Acme Inc"}'
-
-        monkeypatch.setattr("anton.core.mcp.wiring.call_mcp_tool", fake_call_mcp_tool)
-
-        result = await oauth_endpoints.get_mcp_identity("hubspot", McpIdentityRequest(access_token="tok"))
-        assert result == {"account_email": "user@acme.com", "account_name": "Jordan"}
-
-    async def test_falls_back_to_organization_name_when_user_has_none(self, monkeypatch):
-        async def fake_call_mcp_tool(engine, access_token, tool_name, **kwargs):
-            if tool_name == "get_user_details":
-                return {"email": "user@acme.com"}
-            return {"portal_name": "Acme Inc"}
+                return json.dumps({
+                    "userInformation": {"email": "user@acme.com", "firstName": "Jordan", "lastName": "Lee"},
+                })
+            return json.dumps({"accountInformation": {"portalName": "Acme Inc"}})
 
         monkeypatch.setattr("anton.core.mcp.wiring.call_mcp_tool", fake_call_mcp_tool)
 
         result = await oauth_endpoints.get_mcp_identity("hubspot", McpIdentityRequest(access_token="tok"))
         assert result == {"account_email": "user@acme.com", "account_name": "Acme Inc"}
+
+    async def test_falls_back_to_person_name_when_no_portal_name(self, monkeypatch):
+        async def fake_call_mcp_tool(engine, access_token, tool_name, **kwargs):
+            if tool_name == "get_user_details":
+                return {"userInformation": {"email": "user@acme.com", "firstName": "Jordan", "lastName": "Lee"}}
+            return {"accountInformation": {}}
+
+        monkeypatch.setattr("anton.core.mcp.wiring.call_mcp_tool", fake_call_mcp_tool)
+
+        result = await oauth_endpoints.get_mcp_identity("hubspot", McpIdentityRequest(access_token="tok"))
+        assert result == {"account_email": "user@acme.com", "account_name": "Jordan Lee"}
 
     async def test_unknown_engine_404s(self):
         with pytest.raises(HTTPException) as exc:
@@ -261,21 +267,24 @@ class TestMcpIdentityBridge:
         already-successful email instead of degrading to email-only identity."""
         async def fake_call_mcp_tool(engine, access_token, tool_name, **kwargs):
             if tool_name == "get_user_details":
-                return '{"email": "user@acme.com", "name": "Jordan"}'
+                return json.dumps({
+                    "userInformation": {"email": "user@acme.com", "firstName": "Jordan", "lastName": "Lee"},
+                })
             raise RuntimeError("hubspot MCP tool get_organization_details returned an error: insufficient scope")
 
         monkeypatch.setattr("anton.core.mcp.wiring.call_mcp_tool", fake_call_mcp_tool)
 
         result = await oauth_endpoints.get_mcp_identity("hubspot", McpIdentityRequest(access_token="tok"))
-        assert result == {"account_email": "user@acme.com", "account_name": "Jordan"}
+        assert result == {"account_email": "user@acme.com", "account_name": "Jordan Lee"}
 
 
 class TestParseMcpIdentity:
     def test_tolerates_dict_input_not_just_json_strings(self):
         email, name = _parse_mcp_identity(
-            {"email": "a@b.com", "full_name": "Ann"}, {"name": "Org"},
+            {"userInformation": {"email": "a@b.com", "firstName": "Ann", "lastName": "Lee"}},
+            {"accountInformation": {"portalName": "Org"}},
         )
-        assert (email, name) == ("a@b.com", "Ann")
+        assert (email, name) == ("a@b.com", "Org")
 
     def test_returns_empty_strings_on_unparseable_input(self):
         assert _parse_mcp_identity("not json", "also not json") == ("", "")

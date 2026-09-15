@@ -103,16 +103,25 @@ def _first_str(*values: Any) -> str:
 
 
 def _parse_mcp_identity(user_details: Any, org_details: Any) -> tuple[str, str]:
-    """Best-effort extraction of {account_email, account_name} out of
+    """Extraction of {account_email, account_name} out of
     get_user_details/get_organization_details' real JSON shapes.
 
-    Tolerant of a few plausible key spellings and of the tool result coming
-    back as a JSON string (the common case — MCP text-content blocks) or an
-    already-decoded dict, since the exact field names weren't pinned down
-    verbatim during Stage 1's live testing (only that the shape is "clean,
-    well-structured JSON" with email/name/portal-name fields — see the
-    HubSpot blueprint tab's Open Questions). Confirm against a real account
-    during Stage 2 testing and simplify this once the true keys are known."""
+    Live-verified 2026-09-15 against a real HubSpot MCP server (Stage 2
+    testing) — both nest the useful fields one level down, not at the top
+    level as originally guessed during Stage 1:
+
+        get_user_details:         {"userInformation": {"email": ..., "firstName": ..., "lastName": ...}, ...}
+        get_organization_details: {"accountInformation": {"portalName": ..., ...}, ...}
+
+    `account_name` prefers the HubSpot portal name over the connecting
+    person's own name — HubSpot connections are portal-scoped (a whole team
+    can share one), so the portal is the more useful "account" identity for
+    the connection tile, the same reasoning Supabase/Linear/PostHog already
+    use their org/workspace name for.
+
+    Tolerant of the tool result coming back as a JSON string (the common
+    case — MCP text-content blocks) or an already-decoded dict.
+    """
 
     def _as_dict(value: Any) -> dict:
         if isinstance(value, dict):
@@ -126,12 +135,15 @@ def _parse_mcp_identity(user_details: Any, org_details: Any) -> tuple[str, str]:
         return {}
 
     user = _as_dict(user_details)
+    user_info = _as_dict(user.get("userInformation"))
     org = _as_dict(org_details)
-    email = _first_str(user.get("email"), user.get("user_email"), user.get("hub_id_email"))
-    name = _first_str(
-        user.get("name"), user.get("full_name"), user.get("user_name"),
-        org.get("portal_name"), org.get("name"), org.get("account_name"), org.get("hub_domain"),
+    account_info = _as_dict(org.get("accountInformation"))
+
+    email = _first_str(user_info.get("email"))
+    person_name = _first_str(
+        f"{user_info.get('firstName', '')} {user_info.get('lastName', '')}".strip(),
     )
+    name = _first_str(account_info.get("portalName"), person_name)
     return email, name
 
 
