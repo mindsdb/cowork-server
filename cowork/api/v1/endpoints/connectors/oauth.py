@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from typing import Annotated
+import json
+import logging
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
+from pydantic import BaseModel
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackOnly, OpenByDesign, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
@@ -19,6 +22,14 @@ from cowork.services.connectors.oauth.google import (
 )
 
 router = APIRouter()
+_log = logging.getLogger("cowork.connectors.oauth")
+
+# Engines whose identity can only be resolved via an MCP tool call, not a
+# plain REST/GraphQL request Electron can make on its own — see
+# get_mcp_identity below. Only HubSpot today; kept as a set (not a bare
+# `engine == "hubspot"` check) since Stage 1 built this as general MCP
+# infrastructure and Linear/PostHog both already run their own MCP servers.
+_MCP_IDENTITY_ENGINES = {"hubspot"}
 
 # Same alias as connections.py: the vault/relay choice is per-request tenancy
 # context, not a bare settings flag — resolving it once here keeps this file
@@ -78,6 +89,102 @@ def get_oauth_credentials(engine: str):
     if OAUTH_SERVICES[service_id].uses_picker and settings.google_picker_api_key:
         response["picker_api_key"] = settings.google_picker_api_key
     return response
+
+
+class McpIdentityRequest(BaseModel):
+    access_token: str
+
+
+def _first_str(*values: Any) -> str:
+    for v in values:
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return ""
+
+
+def _parse_mcp_identity(user_details: Any, org_details: Any) -> tuple[str, str]:
+    """Extraction of {account_email, account_name} out of
+    get_user_details/get_organization_details' real JSON shapes.
+
+    Live-verified 2026-09-15 against a real HubSpot MCP server (Stage 2
+    testing) — both nest the useful fields one level down, not at the top
+    level as originally guessed during Stage 1:
+
+        get_user_details:         {"userInformation": {"email": ..., "firstName": ..., "lastName": ...}, ...}
+        get_organization_details: {"accountInformation": {"portalName": ..., ...}, ...}
+
+    `account_name` prefers the HubSpot portal name over the connecting
+    person's own name — HubSpot connections are portal-scoped (a whole team
+    can share one), so the portal is the more useful "account" identity for
+    the connection tile, the same reasoning Supabase/Linear/PostHog already
+    use their org/workspace name for.
+
+    Tolerant of the tool result coming back as a JSON string (the common
+    case — MCP text-content blocks) or an already-decoded dict.
+    """
+
+    def _as_dict(value: Any) -> dict:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+            except ValueError:
+                return {}
+            return parsed if isinstance(parsed, dict) else {}
+        return {}
+
+    user = _as_dict(user_details)
+    user_info = _as_dict(user.get("userInformation"))
+    org = _as_dict(org_details)
+    account_info = _as_dict(org.get("accountInformation"))
+
+    email = _first_str(user_info.get("email"))
+    person_name = _first_str(
+        f"{user_info.get('firstName', '')} {user_info.get('lastName', '')}".strip(),
+    )
+    name = _first_str(account_info.get("portalName"), person_name)
+    return email, name
+
+
+# LoopbackOnly: same restriction as /credentials above — this hands back
+# account identity derived from the caller-supplied access token, so the
+# credential is the caller being on this machine. Called by Electron's
+# oauth-identity.ts (fetchHubspotIdentity) — Electron can't speak MCP
+# itself (it's TypeScript, the client is Python), so it hands the
+# freshly-obtained access token here instead of calling the provider
+# directly, unlike every other FETCHERS entry.
+@router.post("/{engine}/mcp/identity", dependencies=[Depends(require(LoopbackOnly))])
+async def get_mcp_identity(engine: str, body: McpIdentityRequest):
+    """Resolve {account_email, account_name} for an MCP-based connector by
+    calling its `get_user_details`/`get_organization_details` tools directly
+    (anton's lightweight `call_mcp_tool` helper — cowork-server already
+    depends on anton as a package, so this reuses its client/server-URL
+    table rather than a second MCP implementation here)."""
+    if engine not in _MCP_IDENTITY_ENGINES:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No MCP identity resolution for {engine!r}.")
+    from anton.core.mcp.wiring import call_mcp_tool
+
+    try:
+        user_details = await call_mcp_tool(engine, body.access_token, "get_user_details")
+    except Exception as exc:
+        _log.warning("MCP identity resolution failed for %s: %s", engine, exc)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Could not resolve {engine} account identity.") from exc
+
+    # Separate try/except from get_user_details above: account_name is only
+    # ever a nice-to-have (see the account_email check below), so a portal
+    # where get_organization_details errors — unsupported tool, insufficient
+    # scope, tier-gating — must not throw away an already-successful email.
+    try:
+        org_details = await call_mcp_tool(engine, body.access_token, "get_organization_details")
+    except Exception as exc:
+        _log.warning("MCP organization lookup failed for %s (continuing with email only): %s", engine, exc)
+        org_details = None
+
+    account_email, account_name = _parse_mcp_identity(user_details, org_details)
+    if not account_email:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Could not retrieve {engine} account email.")
+    return {"account_email": account_email, "account_name": account_name}
 
 
 # AuthenticatedInOrgMode: in org mode this forwards to auth_proxy.proxy_catalogue.
