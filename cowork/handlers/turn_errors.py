@@ -1124,6 +1124,7 @@ def response_failed_payload(
     retry_at: str | None = None,
     reset_at: str | None = None,
     request_id: str | None = None,
+    assistant_message_id: str | None = None,
 ) -> dict:
     """Wire payload for a ``response.failed`` event (SSE + DB sidecar).
 
@@ -1140,6 +1141,12 @@ def response_failed_payload(
     the fully generic ``anton_error`` bucket, so a user report of "An
     unexpected error occurred" can still be pinned to this turn's server-side
     logs. The direct and channel producers have none to offer and omit it.
+
+    ``assistant_message_id`` (ENG-2768) is the persisted assistant Message's
+    id when the failed turn still produced one (e.g. partial text before an
+    error) — lets the client anchor delete/rekey logic on it immediately,
+    without waiting for a reload. Omitted, not null, when nothing was
+    persisted.
     """
     payload = {"type": "response.failed", "code": code, "error": error}
     if reconnectable is not None:
@@ -1156,6 +1163,8 @@ def response_failed_payload(
         payload["reset_at"] = reset_at
     if request_id is not None:
         payload["request_id"] = request_id
+    if assistant_message_id is not None:
+        payload["assistant_message_id"] = assistant_message_id
     return payload
 
 
@@ -1170,6 +1179,7 @@ def response_failed_sse(
     retry_at: str | None = None,
     reset_at: str | None = None,
     request_id: str | None = None,
+    assistant_message_id: str | None = None,
 ) -> str:
     """Build a ``response.failed`` SSE frame (same wire shape the renderer's
     parser already handles, plus the optional auth/model/retry-after fields)."""
@@ -1183,5 +1193,6 @@ def response_failed_sse(
         retry_at=retry_at,
         reset_at=reset_at,
         request_id=request_id,
+        assistant_message_id=assistant_message_id,
     )
     return f"event: response.failed\ndata: {json.dumps(payload)}\n\n"

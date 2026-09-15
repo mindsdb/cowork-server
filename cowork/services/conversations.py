@@ -827,8 +827,11 @@ class ConversationService:
         events: list[dict],
         harness: str | None = None,
         tool_rows: list[dict] | None = None,
-    ) -> None:
-        """Persist an assistant turn.
+    ) -> Message | None:
+        """Persist an assistant turn. Returns the created assistant Message
+        (its id is what the completion SSE frames hand back to the browser,
+        ENG-2768), or None on the early-return below when nothing was
+        actually persisted.
 
         `tool_rows` are the turn's tool block-messages ({role, content} with
         `tool_use` / `tool_result` blocks). They are written as their own rows
@@ -843,7 +846,7 @@ class ConversationService:
         # emits a `response.artifact_created` event, and that event must survive
         # reload so the inline card replays identically.
         if not text and not events and not tool_rows:
-            return
+            return None
         # Anchor the write to a parent loaded through THIS session's scope —
         # detached writers (producer) call this on a fresh session, and the
         # conversation may be gone or out-of-scope by now.
@@ -891,6 +894,7 @@ class ConversationService:
                 self._supersede_skill_cards(
                     conversation_id, assistant_msg.id, new_slugs
                 )
+        return assistant_msg
 
     def _supersede_skill_cards(
         self, conversation_id: UUID, keep_message_id: UUID, slugs: set[str]
