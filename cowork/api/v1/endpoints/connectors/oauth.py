@@ -155,10 +155,19 @@ async def get_mcp_identity(engine: str, body: McpIdentityRequest):
 
     try:
         user_details = await call_mcp_tool(engine, body.access_token, "get_user_details")
-        org_details = await call_mcp_tool(engine, body.access_token, "get_organization_details")
     except Exception as exc:
         _log.warning("MCP identity resolution failed for %s: %s", engine, exc)
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Could not resolve {engine} account identity.") from exc
+
+    # Separate try/except from get_user_details above: account_name is only
+    # ever a nice-to-have (see the account_email check below), so a portal
+    # where get_organization_details errors — unsupported tool, insufficient
+    # scope, tier-gating — must not throw away an already-successful email.
+    try:
+        org_details = await call_mcp_tool(engine, body.access_token, "get_organization_details")
+    except Exception as exc:
+        _log.warning("MCP organization lookup failed for %s (continuing with email only): %s", engine, exc)
+        org_details = None
 
     account_email, account_name = _parse_mcp_identity(user_details, org_details)
     if not account_email:

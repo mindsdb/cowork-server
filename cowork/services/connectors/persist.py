@@ -159,14 +159,16 @@ def persist_connection(
         existing_picked_files = (existing or {}).get("fields", {}).get("_picked_files")
         if existing_picked_files:
             payload.setdefault("_picked_files", existing_picked_files)
-        if existing is None:
-            for key, value in (default_fields or {}).items():
-                payload.setdefault(key, value)
-        else:
-            for key in (default_fields or {}):
-                prior = (existing.get("fields") or {}).get(key)
-                if prior is not None:
-                    payload.setdefault(key, prior)
+        for key, value in (default_fields or {}).items():
+            # Carry the existing record's value forward when it has one —
+            # never overwrite it. Falls back to `value` (the caller's
+            # default) both for a genuinely new connection AND for an
+            # existing record that predates this field entirely (found in
+            # review: the record-exists-but-lacks-the-key case previously
+            # left the key unset rather than backfilled, silently relying
+            # on every downstream reader defaulting it the same way).
+            prior = (existing.get("fields") or {}).get(key) if existing is not None else None
+            payload.setdefault(key, prior if prior is not None else value)
         vault.save(connector_id, slug, payload, secure_keys=secure_keys)
         return slug
 

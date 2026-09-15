@@ -135,6 +135,23 @@ class TestPersistConnectionDefaultFields:
         record = vault.read_record("hubspot", slug)
         assert record["fields"]["_access_mode"] == "write"
 
+    def test_backfills_a_default_field_on_a_reconnect_of_a_record_that_predates_it(self, tmp_path):
+        """Found in code review: a record saved before `_access_mode` existed
+        (or migrated from private-app) reconnecting via the mcp method must
+        still end up with the field set, not silently left absent."""
+        from anton.core.datasources.data_vault import LocalDataVault
+
+        vault = LocalDataVault(tmp_path / "vault")
+        # Simulate a legacy record with no _access_mode key at all.
+        vault.save("hubspot", "a-hubspot", {"access_token": "tok-1", "account_email": "a.hubspot", "_connector_id": "hubspot"})
+
+        persist_connection(
+            "hubspot", "mcp", "", {"access_token": "tok-2", "account_email": "a.hubspot"},
+            default_fields={"_access_mode": "read"}, vault=vault,
+        )
+        record = vault.read_record("hubspot", "a-hubspot")
+        assert record["fields"]["_access_mode"] == "read"
+
 
 class TestPatchAccessMode:
     async def test_local_mode_writes_the_vault_field_directly(self, tmp_path, monkeypatch):
@@ -237,6 +254,20 @@ class TestMcpIdentityBridge:
         with pytest.raises(HTTPException) as exc:
             await oauth_endpoints.get_mcp_identity("hubspot", McpIdentityRequest(access_token="tok"))
         assert exc.value.status_code == 502
+
+    async def test_an_organization_lookup_failure_does_not_discard_a_successful_email(self, monkeypatch):
+        """Found in code review: get_user_details and get_organization_details
+        were both under one try/except, so an org-lookup failure discarded an
+        already-successful email instead of degrading to email-only identity."""
+        async def fake_call_mcp_tool(engine, access_token, tool_name, **kwargs):
+            if tool_name == "get_user_details":
+                return '{"email": "user@acme.com", "name": "Jordan"}'
+            raise RuntimeError("hubspot MCP tool get_organization_details returned an error: insufficient scope")
+
+        monkeypatch.setattr("anton.core.mcp.wiring.call_mcp_tool", fake_call_mcp_tool)
+
+        result = await oauth_endpoints.get_mcp_identity("hubspot", McpIdentityRequest(access_token="tok"))
+        assert result == {"account_email": "user@acme.com", "account_name": "Jordan"}
 
 
 class TestParseMcpIdentity:
