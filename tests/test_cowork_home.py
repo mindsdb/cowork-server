@@ -4,6 +4,7 @@ Every cowork path must derive from a single root so preview/stable desktop
 builds can be fully isolated from a user's production ~/.cowork (ENG-324) by
 setting one env var. These tests pin that contract.
 """
+import ast
 from pathlib import Path
 
 from cowork.common.paths import cowork_home, pod_local_only
@@ -68,6 +69,9 @@ _PER_RESOURCE_OVERRIDES = [
     "COWORK_VAULT_DIR",
     "CONNECTOR_VAULT_DIR",
     "COWORK_STREAMS_DIR",
+    "COWORK_MEMORY_DIR",
+    "MEMORY_ROOT_DIR",
+    "COWORK_CODING_DIR",
     "ANTON_SKILLS_ROOT_DIR",
 ]
 
@@ -86,6 +90,7 @@ def test_all_settings_paths_derive_from_cowork_home(monkeypatch, tmp_path):
     assert Path(s.skill.root_dir) == home / "skills"
     assert Path(s.connector.vault_dir) == home / "data-vault"
     assert Path(s.memory.root_dir) == home / "memory"
+    assert Path(s.coding.root_dir) == home / "coding"
     assert Path(s.master_key_path) == home / ".master_key"
     assert Path(StreamSettings(_env_file=None).dir) == home / "streams"
     assert Path(OAuthSettings(_env_file=None).state_path) == home / "oauth_state.json"
@@ -240,3 +245,119 @@ def test_bearer_auth_token_env_derives_from_cowork_home(monkeypatch, tmp_path):
         assert "COWORK_AUTH_TOKEN=tok-eng-868" in env_file.read_text(encoding="utf-8")
     finally:
         get_app_settings.cache_clear()
+
+
+# The desktop app gives each organization its own stores by overriding the
+# paths below, one per cowork_home()-derived store. A store added here without
+# an override there is shared across organizations silently, which is the whole
+# failure the overrides exist to prevent — so this fails until someone decides
+# which side a new one belongs on.
+#
+# Mirrors `orgStoreEnv` in cowork's src/main/account-data.ts.
+_PER_ORGANIZATION_OVERRIDES = {
+    "DATABASE_URI",
+    "COWORK_PROJECTS_DIR",
+    "COWORK_FILES_DIR",
+    "COWORK_SKILLS_DIR",
+    "COWORK_VAULT_DIR",
+    "COWORK_MEMORY_DIR",
+    "COWORK_STREAMS_DIR",
+    "COWORK_CODING_DIR",
+    "ANTON_SKILLS_ROOT_DIR",
+    "ANTON_COWORK_STATE_DIR",
+}
+
+# Deliberately NOT per organization, each with the reason it stays shared.
+_ACCOUNT_LEVEL_MODULES = {
+    # The dotenv and the provider config: no organization switch rewrites them,
+    # so moving them would leave a switched-to organization unconfigured.
+    "cowork/server.py",
+    "cowork/migrations.py",
+    "cowork/api/v1/endpoints/settings.py",
+    # Per-turn scratch, holding nothing that outlives a turn.
+    "cowork/harnesses/anton_harness/harness.py",
+    "cowork/services/connectors/probe.py",
+    # Read-only sources for a one-time legacy import.
+    "cowork/harnesses/memory/migration.py",
+}
+
+# Settings live here and are covered by the assertions above; publish is covered
+# by its own test below.
+_SCANNED_EXEMPT_MODULES = {
+    "cowork/common/settings/app_settings.py",
+    "cowork/harnesses/anton_harness/settings.py",
+    "cowork/services/publish.py",
+}
+
+
+def _modules_reading_cowork_home() -> set[str]:
+    """Every module that actually CALLS cowork_home().
+
+    Parsed rather than grepped: the name appears in docstrings across the
+    codebase, and a text scan reports those as call sites and hides real ones
+    behind a line break.
+    """
+    root = Path(__file__).resolve().parent.parent
+    found: set[str] = set()
+    for path in (root / "cowork").rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "cowork_home"
+            ):
+                found.add(path.relative_to(root).as_posix())
+                break
+    return found
+
+
+def test_every_cowork_home_reader_is_classified():
+    known = _ACCOUNT_LEVEL_MODULES | _SCANNED_EXEMPT_MODULES | {"cowork/common/paths.py"}
+    unclassified = _modules_reading_cowork_home() - known
+    assert not unclassified, (
+        "These modules derive a path from cowork_home() and are not classified as "
+        "per-organization or account-level. Decide which, and if per-organization "
+        "add the override to orgStoreEnv in cowork's src/main/account-data.ts: "
+        f"{sorted(unclassified)}"
+    )
+
+
+def test_publish_state_dir_is_overridable_per_organization(monkeypatch, tmp_path):
+    """publish's state.json holds publish_history, which carries no org_id, so
+    left on cowork_home() every organization reads every other's. It is read
+    with os.environ.get rather than a settings field, so it needs its own
+    assertion."""
+    from cowork.services import publish
+
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("ANTON_COWORK_STATE_DIR", str(tmp_path / "orgs" / "org-b"))
+
+    assert publish._cowork_state_dir() == tmp_path / "orgs" / "org-b"
+
+
+def test_every_per_organization_override_is_a_real_knob(monkeypatch, tmp_path):
+    """Each name the desktop sets must actually move something. A typo there is
+    silent: the store stays on the shared root and the organization reads the
+    previous one's data."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("COWORK_HOME", str(home))
+    org = tmp_path / "orgs" / "org-b"
+    for name in _PER_ORGANIZATION_OVERRIDES:
+        monkeypatch.setenv(
+            name, f"sqlite:///{org / 'cowork.db'}" if name == "DATABASE_URI" else str(org)
+        )
+    get_app_settings.cache_clear()
+
+    s = AppSettings(_env_file=None)
+    moved = [
+        s.database.uri, s.project.root_dir, s.file.root_dir, s.skill.root_dir,
+        s.connector.vault_dir, s.memory.root_dir, s.coding.root_dir,
+        StreamSettings(_env_file=None).dir,
+        AntonHarnessSettings(_env_file=None).skills_root_dir,
+    ]
+    for value in moved:
+        assert str(org) in str(value), f"{value} did not follow its override"
+    assert str(home) not in " ".join(str(v) for v in moved)
+
+    get_app_settings.cache_clear()
