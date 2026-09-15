@@ -712,6 +712,7 @@ class SkillService:
         filename: str | None = None,
         *,
         before_persist: Callable[[str], None] | None = None,
+        validate_skill: Callable[[Skill], None] | None = None,
     ) -> Skill:
         """Import a skill from an uploaded file.
 
@@ -722,9 +723,15 @@ class SkillService:
         Validation = "does its ``SKILL.md`` parse via skill_format". Raises
         ``ValueError`` for an unparseable/unsafe file, ``FileExistsError`` on
         slug collision.
+        ``validate_skill`` can enforce a caller's edit constraints on the parsed
+        skill before any files are persisted; other callers remain lenient.
         """
         if Path(filename or "").suffix.lower() == ".zip":
-            return self._import_zip(data, before_persist=before_persist)
+            return self._import_zip(
+                data,
+                before_persist=before_persist,
+                validate_skill=validate_skill,
+            )
         try:
             content = data.decode("utf-8")
         except UnicodeDecodeError:
@@ -738,6 +745,7 @@ class SkillService:
                 tmp_dir,
                 copy_tree=False,
                 before_persist=before_persist,
+                validate_skill=validate_skill,
             )
 
     def _import_zip(
@@ -745,6 +753,7 @@ class SkillService:
         data: bytes,
         *,
         before_persist: Callable[[str], None] | None = None,
+        validate_skill: Callable[[Skill], None] | None = None,
     ) -> Skill:
         with tempfile.TemporaryDirectory() as tmp:
             extract_dir = Path(tmp) / "skill"
@@ -754,6 +763,7 @@ class SkillService:
                 extract_dir,
                 copy_tree=True,
                 before_persist=before_persist,
+                validate_skill=validate_skill,
             )
 
     def _persist_imported(
@@ -762,6 +772,7 @@ class SkillService:
         *,
         copy_tree: bool,
         before_persist: Callable[[str], None] | None = None,
+        validate_skill: Callable[[Skill], None] | None = None,
     ) -> Skill:
         """Validate a parsed skill folder and persist it into the canon.
 
@@ -791,6 +802,8 @@ class SkillService:
         skill.metadata = metadata
         if not skill.description.strip():
             skill.description = skill.display_name or skill.name
+        if validate_skill is not None:
+            validate_skill(skill)
 
         if copy_tree:
             self._ensure_root()

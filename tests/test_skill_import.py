@@ -69,6 +69,28 @@ def test_import_duplicate(svc: SkillService):
         svc.import_skill(VALID, filename="x.md")
 
 
+@pytest.mark.parametrize("filename", ["SKILL.md", "skill.zip"])
+def test_import_validation_runs_before_any_persistent_write(svc: SkillService, filename):
+    source = VALID if filename.endswith(".md") else _zip({"SKILL.md": VALID})
+
+    def reject(skill):
+        assert skill.name == "my-test-skill"
+        assert skill.instructions.strip() == "Step 1. do the thing"
+        assert skill.created_at is not None
+        raise ValueError("The editor cannot save this skill")
+
+    with pytest.raises(ValueError, match="editor cannot save"):
+        svc.import_skill(source, filename=filename, validate_skill=reject)
+    assert list(svc.root.iterdir()) == []
+
+
+def test_import_without_editor_validation_remains_lenient(svc: SkillService):
+    source = b"---\nname: existing-cowork-import\ndescription: Example\n---\n"
+    skill = svc.import_skill(source, filename="SKILL.md")
+    assert skill.instructions.strip() == ""
+    assert (svc.root / skill.name / "SKILL.md").is_file()
+
+
 def test_skill_dir_rejects_a_symlink_escape(svc: SkillService):
     container = svc.root
     svc.root = container / "skills"

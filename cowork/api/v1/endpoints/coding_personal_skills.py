@@ -4,10 +4,11 @@ from __future__ import annotations
 import logging
 from typing import Annotated
 
+import yaml
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from cowork.api.v1.permissions import LoopbackDesktopOnly, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
@@ -90,6 +91,25 @@ class PersonalSkillImport(BaseModel):
     def bounded_content(cls, value: object) -> object:
         return _bounded_content(value)
 
+    @field_validator("content")
+    @classmethod
+    def text_name(cls, value: str) -> str:
+        # The canonical parser normalizes names before validating them. Guard
+        # this one raw YAML type first; leave parsing/metadata to that parser.
+        lines = value.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        if lines[0].rstrip() != "---":
+            return value
+        end = next((i for i in range(1, len(lines)) if lines[i].rstrip() == "---"), None)
+        if end is None:
+            return value
+        try:
+            fields = yaml.safe_load("\n".join(lines[1:end]))
+        except yaml.YAMLError as exc:
+            raise ValueError("Use valid YAML between the skill's --- lines.") from exc
+        if isinstance(fields, dict) and "name" in fields and not isinstance(fields["name"], str):
+            raise ValueError("The skill name must be text. Put numeric names in quotes.")
+        return value
+
 
 class PersonalSkillResponse(BaseModel):
     id: str
@@ -145,6 +165,19 @@ def _skill_response(skill: Skill) -> PersonalSkillResponse:
     )
 
 
+def _validate_imported_skill(skill: Skill) -> None:
+    """Anything imported here must remain editable with the same form."""
+    try:
+        PersonalSkillWrite(
+            name=skill.display_name,
+            description=skill.description,
+            instructions=skill.instructions,
+            enabled=skill.enabled,
+        )
+    except ValidationError as exc:
+        raise RequestValidationError(exc.errors()) from exc
+
+
 @router.post("", response_model=PersonalSkillResponse, status_code=201)
 def create_personal_skill(body: PersonalSkillWrite, store: StoreDep):
     skill = store.create_skill(
@@ -159,7 +192,12 @@ def create_personal_skill(body: PersonalSkillWrite, store: StoreDep):
 
 @router.post("/import", response_model=PersonalSkillResponse, status_code=201)
 def import_personal_skill(body: PersonalSkillImport, store: StoreDep):
-    return _skill_response(store.import_skill(body.content.encode("utf-8"), "SKILL.md"))
+    skill = store.import_skill(
+        body.content.encode("utf-8"),
+        "SKILL.md",
+        validate_skill=_validate_imported_skill,
+    )
+    return _skill_response(skill)
 
 
 @router.get("/{skill_id}", response_model=PersonalSkillResponse)
