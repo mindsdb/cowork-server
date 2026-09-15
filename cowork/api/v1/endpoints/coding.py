@@ -13,7 +13,6 @@ from fastapi.responses import StreamingResponse
 from sqlmodel import Session
 
 from cowork.api.v1.permissions import LoopbackDesktopOnly, require
-from cowork.api.v1.endpoints import coding_personal_skills
 from cowork.coding.connector_capabilities import (
     ConnectorCapability,
     ConnectorCapabilityIssueRequest,
@@ -119,7 +118,6 @@ from cowork.services.skills import CodeSkillService
 # one added here is closed until someone opens it, which is the opposite of
 # what inheriting OpenByDesign did.
 router = APIRouter(dependencies=[Depends(require(LoopbackDesktopOnly))])
-router.include_router(coding_personal_skills.router)
 logger = logging.getLogger(__name__)
 
 
