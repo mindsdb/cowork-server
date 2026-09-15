@@ -872,6 +872,36 @@ class ConversationService:
             stmt = stmt.where(Message.pending == False)  # noqa: E712 — SQL boolean column, not Python identity
         return list(self.session.exec(stmt.order_by(*_MESSAGE_ORDER)).all())
 
+    def _hydrate_message_items(self, messages: Iterable[Message]) -> list[dict]:
+        """Turn ordered Message rows into the UI-facing item-dict shape,
+        skipping hidden tool rows. Fetches every included message's events in
+        one batched query instead of one per message (the events relationship
+        is intentionally not used here — this keeps the query shape explicit
+        and ordered)."""
+        visible = [m for m in messages if not _is_tool_row(m.content)]
+        if not visible:
+            return []
+        events_by_message: dict[UUID, list] = {}
+        for event in self.session.exec(
+            self.session.select(MessageEvent)
+            .where(MessageEvent.message_id.in_([m.id for m in visible]))
+            .order_by(MessageEvent.message_id, MessageEvent.sequence_number)
+        ).all():
+            events_by_message.setdefault(event.message_id, []).append(event.event_data)
+        result = []
+        for message in visible:
+            item = {
+                "id": message.id,
+                "role": message.role,
+                "content": message.content,
+                "created_at": message.created_at,
+                "events": events_by_message.get(message.id, []),
+            }
+            if message.harness:
+                item["harness"] = message.harness
+            result.append(item)
+        return result
+
     def get_messages(self, conversation_id: UUID) -> list[dict]:
         self.get_conversation(conversation_id)  # raises if not found
         messages = self.session.exec(
@@ -879,23 +909,4 @@ class ConversationService:
             .where(Message.conversation_id == conversation_id)
             .order_by(*_MESSAGE_ORDER)
         ).all()
-        result = []
-        for message in messages:
-            if _is_tool_row(message.content):
-                continue  # history-only tool row — not shown in the chat
-            events = self.session.exec(
-                self.session.select(MessageEvent)
-                .where(MessageEvent.message_id == message.id)
-                .order_by(MessageEvent.sequence_number)
-            ).all()
-            item = {
-                "id": message.id,
-                "role": message.role,
-                "content": message.content,
-                "created_at": message.created_at,
-                "events": [e.event_data for e in events],
-            }
-            if message.harness:
-                item["harness"] = message.harness
-            result.append(item)
-        return result
+        return self._hydrate_message_items(messages)
