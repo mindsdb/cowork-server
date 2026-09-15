@@ -13,6 +13,7 @@ from sqlmodel import Session
 
 from cowork.build_info import build_trace_metadata
 from cowork.common.chat_session import in_process_agent_allowed
+from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings
 from cowork.common.settings.user_settings import (
     Provider,
@@ -25,6 +26,7 @@ from cowork.harnesses.base import available_harness_ids, get_harness
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
+    _MAX_HISTORY_MESSAGES,
     RouteDecision,
     RouterBinding,
     decide_route,
@@ -276,8 +278,8 @@ class ResponsesHandler:
         # overrides the account default for THIS call only — mirrors the
         # per-conversation model override below. Ignored (not raised) when it
         # doesn't name a currently-registered/available harness: a stale
-        # client cache (e.g. Hermes got uninstalled since the picker last
-        # loaded) must never fail the turn, it just falls back to the
+        # client cache (a harness removed since the picker last loaded)
+        # must never fail the turn, it just falls back to the
         # account default. self.harness stays None either way — still lazy,
         # only self.harness_name (which harness _get_harness() will build)
         # changes here.
@@ -494,12 +496,20 @@ class ResponsesHandler:
         if reason:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
         try:
-            history = [
-                message.to_openai_message().model_dump()
-                for message in ConversationService(self.scoped).get_ordered_messages(conversation_id)
-                if message.role in {"user", "assistant"}
-            ]
-            history.append({"role": "user", "content": self._prompt_text(harness_input)})
+            # Scrub credentials: this history bypasses the normal turn's
+            # _scrub_user_input/_stamp_message pass. Bounded to the rows
+            # decide_route can actually use (_text_history keeps at most
+            # _MAX_HISTORY_MESSAGES) so scrubbing doesn't pay for the whole
+            # conversation on every gated turn.
+            ordered = [
+                m for m in ConversationService(self.scoped).get_ordered_messages(conversation_id)
+                if m.role in {"user", "assistant"}
+            ][-_MAX_HISTORY_MESSAGES:]
+            history = [scrubbed_openai_dump(m) for m in ordered]
+            history.append({
+                "role": "user",
+                "content": scrub_credentials(self._prompt_text(harness_input)),
+            })
             # The gate's LLM call is the only one a direct turn makes, and it
             # is made outside any ChatSession — so without a trace context it
             # reaches MindsHub anonymous, and a direct turn leaves no trace to
@@ -779,10 +789,18 @@ class ResponsesHandler:
         chats before it ever opens the skills menu. Never fails the turn: a
         staging error degrades to a turn without the missing piece."""
         try:
+            from cowork.services.artifact_roots import project_artifacts_base
             from cowork.services.files import stage_project_instructions
 
             conversation = ConversationService(session).get_conversation(conv_id)
             project_path = conversation.project.path
+            # ENG-2056: the pod mounts the PROJECT-level artifacts base (subPath
+            # `.anton/artifacts`) at /project-artifacts, and a subPath mount needs
+            # the directory to exist before the pod starts. Project creation does
+            # not make it, so make it here — this is the one place that runs
+            # before every remote turn. First in the block: the pod needs it even
+            # when a later staging step degrades.
+            project_artifacts_base(project_path).mkdir(parents=True, exist_ok=True)
             FileService(session).stage_conversation_attachments(conv_id, project_path)
             stage_project_instructions(project_path, conv_id)
             SkillService(session.scope).ensure_builtin_skills()
@@ -875,15 +893,24 @@ class ResponsesHandler:
         None on any failure: no artifact card and no autopublish is a recoverable
         outcome (the next turn in this project reconciles), a failed turn is not.
         """
-        from cowork.services.artifact_roots import conversation_artifacts_base
+        from cowork.services.artifact_roots import project_artifacts_base
 
         try:
             conversation = ConversationService(session).get_conversation(conv_id)
-            # Conversation-scoped in org mode: the pod's workspace is
-            # <project>/conversations/<id>, not the project, so that is where the
-            # worker's artifacts land. Resolved through artifact_roots so this and
-            # the artifacts list agree on the layout.
-            artifacts_base = conversation_artifacts_base(conversation.project.path, conv_id)
+            # ENG-2056: project-scoped in BOTH modes. The pod mounts the
+            # PROJECT-level base at /project-artifacts and anton writes there
+            # (ANTON_CLOUD_ARTIFACTS_ROOT), so that is where the worker's
+            # artifacts land — no longer under conversations/<id>/. Resolved
+            # through artifact_roots so this and the artifacts list agree on
+            # the layout.
+            #
+            # The base is now shared by every task in the project, so the raw
+            # before/after diff below can attribute a concurrent sibling turn's
+            # artifact to this turn. Pre-existing caveat, not new machinery: the
+            # in-process path bounds the same diff with the session's
+            # artifacts_touched set (ENG-1933), but the remote pod reports no
+            # equivalent yet, so the diff stands alone here.
+            artifacts_base = project_artifacts_base(conversation.project.path)
             return (
                 conversation,
                 artifacts_base,
@@ -1004,11 +1031,13 @@ class ResponsesHandler:
 
     @staticmethod
     def _remote_history(session, conv_id) -> list[dict]:
-        """Prior user/assistant messages in canonical order, as OpenAI-shaped
-        dicts (mode="json": the payload gets json.dumps'd into the Redis job)."""
+        """Prior user/assistant messages in canonical order, as OpenAI-shaped,
+        scrubbed dicts (mode="json": the payload gets json.dumps'd into the
+        Redis job). The pod's harness only scrubs the current turn's input,
+        never this replayed history, so it must arrive already clean."""
         ordered = ConversationService(session).get_ordered_messages(conv_id)
         return [
-            m.to_openai_message().model_dump(mode="json")
+            scrubbed_openai_dump(m, mode="json")
             for m in ordered
             if m.role in {"user", "assistant"}
         ]

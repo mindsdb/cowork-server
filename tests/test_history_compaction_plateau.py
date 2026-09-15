@@ -24,7 +24,13 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from sqlmodel import Session
 
-from anton.core.llm.provider import LLMResponse, ProviderConnectionInfo, Usage
+from anton.core.llm.provider import (
+    LLMResponse,
+    ProviderConnectionInfo,
+    StreamComplete,
+    StreamTextDelta,
+    Usage,
+)
 from anton.core.session import ChatSession, ChatSessionConfig
 
 from cowork.common.settings.app_settings import get_app_settings
@@ -75,8 +81,30 @@ def _mock_llm():
         return LLMResponse(content="## Remaining facts\n" + ", ".join(facts))
 
     llm.plan = AsyncMock(side_effect=_plan)
+
+    # anton's ChatSession runs turns through plan_stream (the non-streaming
+    # turn() was removed); delegate to the same _plan fake, wrapped in the
+    # minimal event stream the loop consumes.
+    def _plan_stream(messages, **kwargs):
+        async def gen():
+            resp = _plan(messages, **kwargs)
+            if resp.content:
+                yield StreamTextDelta(text=resp.content)
+            yield StreamComplete(response=resp)
+        return gen()
+
+    llm.plan_stream = _plan_stream
     llm.summarize = AsyncMock(side_effect=_summarize)
     return llm
+
+
+async def _run_turn(session, user_input) -> str:
+    """Drive one turn through turn_stream and return the reply text."""
+    parts: list[str] = []
+    async for event in session.turn_stream(user_input):
+        if isinstance(event, StreamTextDelta):
+            parts.append(event.text)
+    return "".join(parts)
 
 
 @pytest.fixture
@@ -100,7 +128,7 @@ async def _run_conversation(svc, *, compaction_enabled: bool):
         chars_per_turn.append(len(json.dumps(initial_history)))
 
         anton_session = ChatSession(ChatSessionConfig(llm_client=_mock_llm(), initial_history=initial_history))
-        reply = await anton_session.turn(f"Turn {turn}: remember FACT_{turn} = value{turn}.")
+        reply = await _run_turn(anton_session, f"Turn {turn}: remember FACT_{turn} = value{turn}.")
 
         if compaction_enabled and anton_session.last_compaction is not None:
             compactions += 1
