@@ -3,7 +3,7 @@ through the Redis-backed remote producer instead of the in-process detached
 run; unset/"inprocess" must stay byte-identical to today.
 
 Built without __init__ (same pattern as tests/test_turn_errors.py) so no
-DB/harness setup is needed - the DB-touching pieces (_remote_history and
+DB/harness setup is needed - the DB-touching pieces (_remote_seed_history and
 the persistence layer inside _produce_remote) are stubbed.
 """
 from __future__ import annotations
@@ -62,21 +62,18 @@ def _kwargs(**overrides) -> dict:
     return base
 
 
-def test_remote_history_scrubs_secrets(monkeypatch):
-    """The pod's harness scrubs only the CURRENT turn's input, never the
-    replayed history it gets handed — so `_remote_history` must scrub before
-    the payload is json.dumps'd into the Redis job."""
-    leaked_key = "sk-" + "a" * 30
+def _msg(role, content, msg_id=None):
+    return SimpleNamespace(
+        id=msg_id or uuid4(),
+        role=role,
+        to_openai_message=lambda: SimpleNamespace(
+            model_dump=lambda **kw: {"role": role, "content": content}
+        ),
+    )
 
-    def _msg(role, content):
-        return SimpleNamespace(
-            role=role,
-            to_openai_message=lambda: SimpleNamespace(
-                model_dump=lambda **kw: {"role": role, "content": content}
-            ),
-        )
 
-    rows = [_msg("user", f"my key is {leaked_key}")]
+def _fake_history(monkeypatch, rows, *, enabled=True, summary=None, cutoff_id=None):
+    """Point `_remote_seed_history` at `rows` with the given saved compaction."""
 
     class FakeConversationService:
         def __init__(self, session):
@@ -85,12 +82,83 @@ def test_remote_history_scrubs_secrets(monkeypatch):
         def get_ordered_messages(self, conv_id):
             return rows
 
-    monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
+        def get_conversation(self, conv_id):
+            return SimpleNamespace(
+                history_summary=summary, history_summary_cutoff_id=cutoff_id,
+            )
 
-    history = ResponsesHandler._remote_history(object(), uuid4())
+    monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
+    monkeypatch.setattr(
+        responses_mod, "get_user_settings",
+        lambda scope=None: SimpleNamespace(history_compaction_enabled=enabled),
+    )
+
+
+def test_remote_history_scrubs_secrets(monkeypatch):
+    """The pod's harness scrubs only the CURRENT turn's input, never the
+    replayed history it gets handed — so the seed must scrub before the
+    payload is json.dumps'd into the Redis job."""
+    leaked_key = "sk-" + "a" * 30
+    _fake_history(monkeypatch, [_msg("user", f"my key is {leaked_key}")])
+
+    history, _ = ResponsesHandler._remote_seed_history(_FakeScoped(), uuid4())
 
     assert leaked_key not in json.dumps(history)
     assert "[REDACTED_API_KEY]" in history[0]["content"]
+
+
+# ── seeding the pod with the saved compaction (ENG-1827) ─────────────────────
+
+
+def test_remote_seed_replays_summary_and_tail_instead_of_everything(monkeypatch):
+    """Without this the job carries the whole conversation every turn, and the
+    pod re-summarizes what it already summarized last turn.
+
+    The separator after the summary is counted, not incidental: the pod's
+    `covered_through` counts it too, so `synthetic_prefix_len` is what keeps
+    the cutoff off by zero rather than by one.
+    """
+    cutoff = uuid4()
+    rows = [
+        _msg("user", "turn one"),
+        _msg("assistant", "reply one", msg_id=cutoff),
+        _msg("user", "turn two"),
+    ]
+    _fake_history(monkeypatch, rows, summary="EARLIER: one happened", cutoff_id=cutoff)
+
+    history, seed_info = ResponsesHandler._remote_seed_history(_FakeScoped(), uuid4())
+
+    assert [m["content"] for m in history] == [
+        "EARLIER: one happened",
+        "Understood — using that as reference.",
+        "turn two",
+    ]
+    assert seed_info["tail_start"] == 2
+    assert seed_info["synthetic_prefix_len"] == 2
+    assert seed_info["message_ids"] == [m.id for m in rows]
+
+
+def test_remote_seed_replays_everything_when_compaction_is_off(monkeypatch):
+    rows = [_msg("user", "turn one"), _msg("assistant", "reply one")]
+    _fake_history(monkeypatch, rows, enabled=False,
+                  summary="EARLIER: one happened", cutoff_id=rows[1].id)
+
+    history, seed_info = ResponsesHandler._remote_seed_history(_FakeScoped(), uuid4())
+
+    assert [m["content"] for m in history] == ["turn one", "reply one"]
+    assert seed_info is None  # nothing to map a compaction onto
+
+
+def test_remote_seed_ignores_a_cutoff_whose_message_is_gone(monkeypatch):
+    """A deleted cutoff message would otherwise silently drop every turn the
+    summary claimed to cover."""
+    rows = [_msg("user", "turn one"), _msg("assistant", "reply one")]
+    _fake_history(monkeypatch, rows, summary="EARLIER: one happened", cutoff_id=uuid4())
+
+    history, seed_info = ResponsesHandler._remote_seed_history(_FakeScoped(), uuid4())
+
+    assert [m["content"] for m in history] == ["turn one", "reply one"]
+    assert seed_info["synthetic_prefix_len"] == 0
 
 
 def test_remote_backend_selected(monkeypatch):
@@ -127,7 +195,7 @@ def _remote_handler(monkeypatch, saved):
     """Handler wired for _produce_remote with the DB layer faked out."""
     handler = _handler()
     handler.principal = object()
-    handler._remote_history = lambda session, conv_id: []
+    handler._remote_seed_history = lambda session, conv_id: ([], None)
 
     class FakeConversationService:
         def __init__(self, session):
@@ -263,6 +331,120 @@ def test_remote_started_at_reads_created_at_and_degrades_to_none(monkeypatch):
 
     monkeypatch.setattr(responses_mod, "ConversationService", Missing)
     assert ResponsesHandler._remote_started_at(object(), uuid4()) is None
+
+
+# ── saving the pod's compaction result (ENG-1827) ────────────────────────────
+
+
+def _capture_compaction(monkeypatch):
+    """Record what `update_history_compaction` is called with, if anything."""
+    saved = {}
+
+    class Service:
+        def __init__(self, session):
+            pass
+
+        def update_history_compaction(self, conv_id, summary, cutoff_id):
+            saved.update(conv_id=conv_id, summary=summary, cutoff_id=cutoff_id)
+
+    monkeypatch.setattr(responses_mod, "ConversationService", Service)
+    monkeypatch.setattr(responses_mod, "ScopedSession", lambda s, scope: object())
+    monkeypatch.setattr(responses_mod, "get_open_session",
+                        lambda: SimpleNamespace(close=lambda: None))
+    return saved
+
+
+_IDS = [uuid4() for _ in range(4)]
+_SEED = {"message_ids": _IDS, "tail_start": 0, "synthetic_prefix_len": 0}
+
+
+def test_compaction_cutoff_maps_onto_our_own_message_ids(monkeypatch):
+    """`covered_through` counts the seeded list; the cutoff must name the last
+    message it covers, or the next turn replays turns the summary already ate."""
+    saved = _capture_compaction(monkeypatch)
+    conv_id = uuid4()
+
+    ResponsesHandler._persist_remote_compaction(
+        conv_id, {"summary": "EARLIER: …", "covered_through": 3}, _SEED, _FakeScope(),
+    )
+
+    assert saved == {"conv_id": conv_id, "summary": "EARLIER: …", "cutoff_id": _IDS[2]}
+
+
+def test_compaction_cutoff_skips_the_synthetic_prefix(monkeypatch):
+    """The summary and its separator are seeded ahead of real messages and
+    counted by the pod, so they come off before the count is mapped."""
+    saved = _capture_compaction(monkeypatch)
+    seed = {"message_ids": _IDS, "tail_start": 1, "synthetic_prefix_len": 2}
+
+    ResponsesHandler._persist_remote_compaction(
+        uuid4(), {"summary": "EARLIER: …", "covered_through": 4}, seed, _FakeScope(),
+    )
+
+    # 4 counted - 2 synthetic = 2 real, starting at tail_start 1 -> _IDS[2]
+    assert saved["cutoff_id"] == _IDS[2]
+
+
+@pytest.mark.parametrize("data", [
+    {"summary": "EARLIER: …", "covered_through": 99},  # past the end
+    {"summary": "EARLIER: …", "covered_through": 0},   # covers nothing
+    {"summary": "", "covered_through": 2},             # malformed/empty event
+    {"covered_through": 2},                            # field absent entirely
+])
+def test_an_untrustworthy_compaction_is_dropped_not_guessed(monkeypatch, data, caplog):
+    """The pod is semi-trusted and a wrong cutoff silently deletes real turns
+    from every later replay; falling back to full history is the safe failure.
+
+    Checked as a clean skip, not merely "nothing saved": reaching persistence
+    and being rescued by the exception handler would log an error per turn for
+    a case that is expected, burying the failures that aren't."""
+    saved = _capture_compaction(monkeypatch)
+
+    with caplog.at_level(logging.ERROR, logger="cowork.handlers.responses"):
+        ResponsesHandler._persist_remote_compaction(uuid4(), data, _SEED, _FakeScope())
+
+    assert saved == {}
+    assert caplog.records == []
+
+
+def test_no_compaction_is_saved_when_seeding_was_disabled(monkeypatch):
+    """Compaction off means the pod got full history, so `covered_through`
+    counts a list we never built a mapping for."""
+    saved = _capture_compaction(monkeypatch)
+
+    ResponsesHandler._persist_remote_compaction(
+        uuid4(), {"summary": "EARLIER: …", "covered_through": 2}, None, _FakeScope(),
+    )
+
+    assert saved == {}
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_saves_the_pods_compaction(monkeypatch):
+    """End of the wire: a turn_compaction reply reaches persistence."""
+    handler = _remote_handler(monkeypatch, {})
+    handler._remote_seed_history = lambda session, conv_id: ([], _SEED)
+    persisted = {}
+    handler._persist_remote_compaction = staticmethod(
+        lambda conv_id, data, seed_info, scope: persisted.update(
+            data=data, seed_info=seed_info,
+        )
+    )
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_compaction", {"summary": "EARLIER: …", "covered_through": 3}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert persisted["data"] == {"summary": "EARLIER: …", "covered_through": 3}
+    assert persisted["seed_info"] is _SEED
 
 
 def test_persist_turn_memory_refetches_under_project_lock(monkeypatch):

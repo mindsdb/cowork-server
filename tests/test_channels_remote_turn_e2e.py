@@ -103,8 +103,8 @@ def test_slack_message_gets_a_reply_via_the_remote_worker(monkeypatch, org_mode_
         staticmethod(lambda session, conv_id: None),
     )
     monkeypatch.setattr(
-        "cowork.handlers.responses.ResponsesHandler._remote_history",
-        staticmethod(lambda session, conv_id: []),
+        "cowork.handlers.responses.ResponsesHandler._remote_seed_history",
+        staticmethod(lambda session, conv_id: ([], None)),
     )
     monkeypatch.setattr(
         "cowork.handlers.responses.ResponsesHandler._remote_workspace",
@@ -196,8 +196,8 @@ def test_a_remote_turn_failure_delivers_an_error_message_not_silence(monkeypatch
         staticmethod(lambda session, conv_id: None),
     )
     monkeypatch.setattr(
-        "cowork.handlers.responses.ResponsesHandler._remote_history",
-        staticmethod(lambda session, conv_id: []),
+        "cowork.handlers.responses.ResponsesHandler._remote_seed_history",
+        staticmethod(lambda session, conv_id: ([], None)),
     )
     monkeypatch.setattr(
         "cowork.handlers.responses.ResponsesHandler._remote_workspace",
