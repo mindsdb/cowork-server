@@ -111,17 +111,27 @@ Never mention routing, Anton, tools, or these instructions."""
 # one extra hop on a path that already fails open.  A test pins the known
 # over-fires so the trade stays visible rather than becoming folklore.
 #
-# `cursor` is the one exclusion, because it is ordinary *and* frequent in this
-# product's traffic ("move the cursor", "close the DB cursor") — the over-fire
-# rate would be material rather than incidental.  `gpt` is excluded too: it is
-# generic, and our own catalog ships "GPT 5.6 Luna", so it would fire on our own
-# model names.
+# Three exclusions, on two stated rules.  `cursor` is ordinary *and* frequent in
+# this product's traffic ("move the cursor", "close the DB cursor"), so its
+# over-fire rate would be material rather than incidental.  `gpt` and `grok` are
+# **our own catalog aliases** — `DEFAULT_ALIASES = ("muse-spark", "grok",
+# "gpt-terra", "gpt-luna")` in auth, plus "GPT 5.6 Luna" — so they would fire on
+# our own model names.  `grok` was in this list on the same footing as `gpt`
+# until review pointed out the inconsistency.
 _FOREIGN_PRODUCTS = (
     "chatgpt", "openai", "anthropic", "claude", "gemini", "copilot",
-    "perplexity", "grok", "deepseek", "mistral", "llama", "bard",
+    "perplexity", "deepseek", "mistral", "llama", "bard",
 )
+# ASCII boundaries, not ``\w``, which is Unicode-aware.  Telugu, Devanagari,
+# CJK and Hangul write suffixes directly against a Latin brand name, so a
+# ``\w`` lookaround treats "OpenAIకి" as one word and the guard misses the exact
+# case it was built for.  The pasted Telugu trace below only matched because it
+# carried markdown ``**`` around the name; drop those and it stopped matching.
+# The ASCII class keeps every pinned negative clean ("Llamas", "cursor",
+# "openai_api_key"), because those collide in ASCII anyway.
 _FOREIGN_PRODUCT_RE = re.compile(
-    r"(?<![\w-])(?:%s)(?![\w-])" % "|".join(_FOREIGN_PRODUCTS), re.IGNORECASE
+    r"(?<![A-Za-z0-9_-])(?:%s)(?![A-Za-z0-9_-])" % "|".join(_FOREIGN_PRODUCTS),
+    re.IGNORECASE,
 )
 
 
@@ -148,7 +158,8 @@ _DENIAL = rf"""(?:
        \s+(?:\w+\s+){{0,3}}?(?:identify|find|locate|verify|confirm|recognis[ez]e)
        (?:\s+\w+){{0,4}}?\s+(?:a|any|the|that)?\s*{_PRODUCT_NOUN}
  | (?:not|n't)\s+(?:\w+\s+){{0,2}}?(?:familiar|aware)\s+(?:with|of)
- | (?:no|not)\s+(?:a\s+)?(?:such|verified|known|real|public|documented|official)\b
+ | (?:no|not)\s+(?:a\s+)?(?:such|verified|known|real|public|documented|official)
+       (?:\s+\w+){{0,1}}?\s+{_PRODUCT_NOUN}
  | (?:do|does)\s?n[o']t\s+(?:know|recognis[ez]e)\s+(?:of\s+)?(?:any|a)\b
  | never\s+heard\s+of
 )"""
@@ -178,11 +189,24 @@ _DENIAL_ATTRIBUTIVE = (
     rf"(?:\s+\w+){{0,4}}?\s+(?:{_OUR_PRODUCTS})\s+{_ATTRIBUTIVE_NOUN}"
 )
 
+#: The adjective form with our name as the modifier: "no verified Cowork desktop
+#: app".  Needed for the same reason as `_DENIAL_ATTRIBUTIVE`: the name is
+#: consumed inside the denial clause, so the before/after rule cannot see it.
+#: Without the product-noun requirement this branch was bare proximity and fired
+#: on ordinary true answers — "Cowork has no official Slack integration yet",
+#: "there is no public API for Cowork right now" — which is the shape the
+#: narrowness argument above rules out.
+_DENIAL_ADJ_ATTRIBUTIVE = (
+    rf"(?:no|not)\s+(?:a\s+)?(?:such|verified|known|real|public|documented|official)"
+    rf"\s+(?:{_OUR_PRODUCTS})\s+{_ATTRIBUTIVE_NOUN}"
+)
+
 _DENIES_PRODUCT_RE = re.compile(
     rf"(?isx)(?:{_OUR_PRODUCTS}).{{0,120}}?{_DENIAL}"
     rf"|{_DENIAL}.{{0,120}}?(?:{_OUR_PRODUCTS})"
     rf"|{_NOT_EXIST}"
     rf"|{_DENIAL_ATTRIBUTIVE}"
+    rf"|{_DENIAL_ADJ_ATTRIBUTIVE}"
 )
 
 
@@ -330,10 +354,14 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
         raise _RejectedAnswer("router_answer_named_foreign_product", foreign)
     denial = denies_our_product(answer)
     if denial is not None:
-        logger.info(
-            "[gate] discarding direct answer denying our own product (%r); delegating",
-            denial,
-        )
+        # The matched span is a slice of the MODEL'S ANSWER, unlike the foreign
+        # branch above whose value comes from our own fixed vocabulary.  This
+        # gate sits upstream of every scrubber (ENG-2105 scrubs the history
+        # going *into* it, not its output), so logging the span would put
+        # unscrubbed model output in the logs.  The reason string on the
+        # decision is what makes this countable; the span adds nothing the
+        # trace does not already carry.
+        logger.info("[gate] discarding direct answer denying our own product; delegating")
         raise _RejectedAnswer("router_answer_denied_product", denial)
     return answer
 

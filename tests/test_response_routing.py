@@ -1144,14 +1144,18 @@ async def test_product_identity_questions_never_answer_with_a_competitor(questio
         ("A llama is a South American camelid.", "llama"),
         ("Claude Shannon founded information theory in 1948.", "Claude"),
         ("Gemini is a zodiac sign and also a 1960s NASA programme.", "Gemini"),
-        ("To grok something means to understand it deeply.", "grok"),
         ("The copilot sits in the right-hand seat.", "copilot"),
         ("The bard in your party can cast charm person.", "bard"),
         ("The mistral is a cold wind through southern France.", "mistral"),
     ],
 )
 def test_known_over_fires_are_accepted_and_pinned(sentence, name):
-    """Seven names in the list are also ordinary words, and DO fire.
+    """Six names in the list are also ordinary words, and DO fire.
+
+    `grok` used to be a seventh. It came out of the list entirely: it is one of
+    our own catalog aliases (`DEFAULT_ALIASES` in auth), which is the same
+    reason `gpt` was already excluded, and review pointed out that keeping one
+    while excluding the other made the stated rule incoherent.
 
     Pinned rather than fixed, deliberately. The gate runs on the router role,
     which for most users is a third-party model, so "I'm Claude, made by
@@ -1221,10 +1225,9 @@ def test_denial_matcher_leaves_true_statements_about_cowork_alone():
         "I couldn't find that setting in Cowork — try Settings → Agent Harness.",
         "Cowork can't identify the file encoding automatically; specify it.",
         "The Cowork desktop app is not available from the Mac App Store.",
-        # These three separate the attributive rule from the obvious version of
-        # it. Anchoring on the bare product name instead of `<product> <noun>`
-        # fires on all three, and the first is a real answer shape.
-        "I couldn't find that setting in Cowork — try Settings → Agent Harness.",
+        # These separate the attributive rule from the obvious version of it.
+        # Anchoring on the bare product name instead of `<product> <noun>` fires
+        # on all of them, and the first is a real answer shape.
         "I can't locate that file in your Cowork workspace.",
         "I cannot verify the checksum of the Cowork download you pasted.",
         "I couldn't find the Cowork log file you asked about.",
@@ -1255,3 +1258,70 @@ async def test_answer_denying_our_product_is_discarded_with_its_own_reason():
     assert decision.reason == "router_answer_denied_product"
     assert decision.text == ""
     assert decision.fallback is False
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        # Telugu — the trace this whole guard exists for, WITHOUT the markdown
+        # bold that was masking the bug. `**OpenAI**` matched under `\w`
+        # boundaries; a bare suffix did not.
+        "నన్ను OpenAIతయారు చేసింది",
+        "OpenAIకి",
+        "मुझे OpenAIने बनाया",
+        "ChatGPTを使ってください",
+        "저는 ChatGPT입니다",
+        "ChatGPT的桌面应用",
+    ],
+)
+def test_brand_name_is_caught_when_a_non_latin_suffix_abuts_it(answer):
+    """`\\w` is Unicode-aware, and these scripts write suffixes against the name.
+
+    Under `(?<![\\w-])` every one of these missed: the suffix character counts as
+    a word character, so the lookaround sees no boundary. The guard built for a
+    Telugu prod answer did not, in fact, handle Telugu — its own regression test
+    passed only because that trace carried `**` around the brand.
+    """
+    from cowork.handlers.response_routing import names_foreign_product
+
+    assert names_foreign_product(answer) is not None, answer
+
+
+def test_ascii_boundary_still_rejects_the_pinned_negatives():
+    """The boundary narrowed; the negatives it was protecting must still hold."""
+    from cowork.handlers.response_routing import names_foreign_product
+
+    for benign in (
+        "Move the cursor to the end of the line.",
+        "Llamas and alpacas are both camelids.",
+        'Set OPENAI_API_KEY in your .env file.',
+        'openai_api_key = "sk-..."',
+        "You can pick grok in the model picker.",  # our own catalog alias
+    ):
+        assert names_foreign_product(benign) is None, benign
+
+
+def test_denial_matcher_leaves_true_negative_capability_claims_alone():
+    """The adjective branch was bare proximity: our name within 120 characters
+    of "no <adjective>". These are ordinary correct answers about what Cowork
+    does not have, and every one of them fired before the product-noun
+    requirement was added."""
+    from cowork.handlers.response_routing import denies_our_product
+
+    for true_statement in (
+        "Cowork has no official Slack integration yet.",
+        "There is no public API for Cowork right now.",
+        "Cowork has no known issues with that file type.",
+        "MindsHub has no documented rate limit for that endpoint.",
+    ):
+        assert denies_our_product(true_statement) is None, true_statement
+
+
+def test_the_adjective_denial_still_catches_the_prod_failure():
+    """...without losing "no verified Cowork desktop app", which is one of the
+    ticket's three real answers. The name sits inside the denial clause there,
+    so it needs its own alternative — the same shape as the attributive rule."""
+    from cowork.handlers.response_routing import denies_our_product
+
+    assert denies_our_product("There is no verified Cowork desktop app that I could find.")
+    assert denies_our_product("There's no such app as MindsHub Cowork that I know of.")
