@@ -717,14 +717,29 @@ class ConversationService:
         self.finalize_staged_conversation_delete(stage)
         return True
 
-    def delete_turn(self, conversation_id: UUID, turn_index: int) -> int:
-        """Delete a turn and everything after it.
+    def delete_turn(self, conversation_id: UUID, message_id: UUID) -> int:
+        """Delete a turn and everything after it, anchored at `message_id`
+        instead of a positional index — a client that has only lazily
+        loaded the most recent page of a long conversation cannot compute a
+        correct absolute position, and getting that wrong here would delete
+        the wrong range of history (see ENG-2768).
 
-        turn_index is 0-based counting only VISIBLE assistant messages —
-        hidden tool rows (tool_use / tool_result) are skipped so the index
-        matches the UI's, which never shows them. The turn's opening user
-        message and all subsequent messages (including this turn's tool rows)
-        are removed. Returns the number of messages deleted.
+        `message_id` must be one of:
+        - a visible assistant message (role=assistant, not a hidden
+          tool_use/tool_result row) — the normal case. Walks backward over
+          that turn's hidden tool rows and includes the user message that
+          opened it, exactly as the old index-based walk did.
+        - a visible user message with no visible assistant reply before
+          the next visible user message or the end of history (an orphan
+          turn — stopped or failed before any answer). Cuts from that user
+          message directly; there is nothing to walk back over.
+
+        Anything else (a hidden tool row's id, an answered user message, an
+        id from another conversation, or an id that doesn't exist at all)
+        raises the same ValueError, mapped to the same 404 either way — a
+        foreign id must not be distinguishable from a nonexistent one.
+
+        Returns the number of messages deleted.
         """
         conversation = self.get_conversation(conversation_id)  # raises if not found
         messages = list(
@@ -734,27 +749,38 @@ class ConversationService:
                 .order_by(*_MESSAGE_ORDER)
             ).all()
         )
-        # Find the Nth visible assistant message (0-based).
-        assistant_count = -1
-        cut_from = None
-        for i, m in enumerate(messages):
-            if m.role.value == "assistant" and not _is_tool_row(m.content):
-                assistant_count += 1
-                if assistant_count == turn_index:
-                    # Walk back over this turn's hidden tool rows (the
-                    # tool_result row is role=user, so a plain i-1 check would
-                    # stop on it and orphan the real user input + tool_use).
-                    cut_from = i
-                    j = i - 1
-                    while j >= 0 and _is_tool_row(messages[j].content):
-                        cut_from = j
-                        j -= 1
-                    # Include the user message that opened the turn.
-                    if j >= 0 and messages[j].role.value == "user":
-                        cut_from = j
-                    break
-        if cut_from is None:
-            raise ValueError(f"Turn {turn_index} not found")
+        anchor_index = next((i for i, m in enumerate(messages) if m.id == message_id), None)
+        if anchor_index is None:
+            raise ValueError(f"Turn anchor {message_id} not found")
+        anchor = messages[anchor_index]
+
+        cut_from: int | None = None
+        if anchor.role.value == "assistant" and not _is_tool_row(anchor.content):
+            # Walk back over this turn's hidden tool rows (the
+            # tool_result row is role=user, so a plain i-1 check would
+            # stop on it and orphan the real user input + tool_use).
+            cut_from = anchor_index
+            j = anchor_index - 1
+            while j >= 0 and _is_tool_row(messages[j].content):
+                cut_from = j
+                j -= 1
+            # Include the user message that opened the turn.
+            if j >= 0 and messages[j].role.value == "user":
+                cut_from = j
+        elif anchor.role.value == "user" and not _is_tool_row(anchor.content):
+            # Orphan anchor: valid only if nothing visible answers it yet.
+            answered = False
+            for m in messages[anchor_index + 1 :]:
+                if _is_tool_row(m.content):
+                    continue
+                answered = m.role.value == "assistant"
+                break  # first visible row after the anchor decides it either way
+            if answered:
+                raise ValueError(f"Turn anchor {message_id} already has a reply")
+            cut_from = anchor_index
+        else:
+            raise ValueError(f"Turn anchor {message_id} is not a valid turn boundary")
+
         to_delete = messages[cut_from:]
         swept_slugs: set[str] = set()
         for msg in to_delete:

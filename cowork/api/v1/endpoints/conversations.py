@@ -181,15 +181,21 @@ def delete_conversation(conversation_id: UUID, scoped: ScopedSessionDep):
     return {"ok": True}
 
 
-@router.delete("/{conversation_id}/turns/{turn_index}")
-def delete_conversation_turn(conversation_id: UUID, turn_index: int, scoped: ScopedSessionDep):
+@router.delete("/{conversation_id}/turns/{message_id}")
+def delete_conversation_turn(conversation_id: UUID, message_id: UUID, scoped: ScopedSessionDep):
     """Delete a turn (user+assistant exchange) and everything after it.
 
-    turn_index is the 0-based index counting only assistant messages.
+    message_id anchors the turn: the visible assistant message it produced,
+    or (for a turn stopped/failed before any answer) the opening user
+    message itself. A positional index doesn't survive lazy-loaded/
+    paginated history (ENG-2768), so this took over from an earlier
+    `turn_index: int` path param — an old client still sending an int 422s
+    here, and a new client sending a UUID would have 422d against the old
+    route, so the break is fail-closed both directions.
     """
     svc = ConversationService(scoped)
     try:
-        deleted = svc.delete_turn(conversation_id, turn_index)
+        deleted = svc.delete_turn(conversation_id, message_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     return {"ok": True, "deleted": deleted}

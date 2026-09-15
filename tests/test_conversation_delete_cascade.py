@@ -36,6 +36,22 @@ def _rows_for(session, conversation_id) -> list[TaskObject]:
     )
 
 
+def _assistant_message_ids(session, conversation_id):
+    """delete_turn is anchored by message id (ENG-2768), not a position —
+    this reproduces the old "Nth assistant turn" selection these tests
+    relied on, ordered the same way ConversationService orders history."""
+    from cowork.models.message import Message
+
+    return [
+        m.id
+        for m in session.exec(
+            select(Message)
+            .where(Message.conversation_id == conversation_id, Message.role == "assistant")
+            .order_by(Message.created_at, Message.seq, Message.id)
+        ).all()
+    ]
+
+
 def test_delete_conversation_drops_task_objects(session):
     svc = ConversationService(ScopedSession(session, LOCAL_SCOPE))
     conv = svc.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
@@ -66,7 +82,7 @@ def test_clear_all_history_drops_task_objects(session):
     )
     assert _rows_for(session, conv.id), "precondition: artifact indexed"
 
-    svc.delete_turn(conv.id, 0)  # clear from the first turn = clear all history
+    svc.delete_turn(conv.id, _assistant_message_ids(session, conv.id)[0])  # clear from the first turn = clear all history
     assert _rows_for(session, conv.id) == [], "cleared history must drop the index"
 
 
@@ -87,7 +103,7 @@ def test_partial_turn_delete_keeps_task_objects(session):
         conv.id, GENERAL_PROJECT_ID, "my-artifact"
     )
 
-    svc.delete_turn(conv.id, 1)  # drop only the second turn
+    svc.delete_turn(conv.id, _assistant_message_ids(session, conv.id)[1])  # drop only the second turn
     assert _rows_for(session, conv.id), "partial delete must keep the index"
 
 
@@ -431,7 +447,7 @@ def test_delete_turn_sweeps_skill_draft(session):
     draft.mkdir(parents=True, exist_ok=True)
     (draft / "SKILL.md").write_text("---\nname: x\n---\n", encoding="utf-8")
 
-    svc.delete_turn(conv.id, 0)
+    svc.delete_turn(conv.id, _assistant_message_ids(session, conv.id)[0])
     assert not draft.exists(), "draft of a deleted skill-card turn must be swept"
 
 
@@ -447,7 +463,7 @@ def test_delete_turn_without_skill_card_keeps_drafts(session):
     draft.mkdir(parents=True, exist_ok=True)
     (draft / "SKILL.md").write_text("x", encoding="utf-8")
 
-    svc.delete_turn(conv.id, 0)
+    svc.delete_turn(conv.id, _assistant_message_ids(session, conv.id)[0])
     assert draft.exists(), "a turn without a skill card must not sweep drafts"
     shutil.rmtree(draft, ignore_errors=True)
 
@@ -515,7 +531,7 @@ def test_delete_turn_discards_stream_buffers(session):
     buf.write_text('{"seq": 0}\n', encoding="utf-8")
     assert buf.exists()
 
-    svc.delete_turn(conv.id, 0)
+    svc.delete_turn(conv.id, _assistant_message_ids(session, conv.id)[0])
     assert not buf.exists(), "stale stream buffers must be discarded on turn delete"
 
 
