@@ -1025,6 +1025,24 @@ class AntonHarness:
 
             restore_namespaced_env(data_vault)
 
+        # HubSpot's MCP connector (ENG-487) and any future MCP-based one:
+        # discover tools BEFORE ChatSessionConfig/ChatSession exist — see
+        # anton/core/mcp/wiring.py's module docstring for why this can't
+        # happen after construction. Uses whichever data_vault was resolved
+        # above (filtered or source), so a connection disabled for this turn
+        # via `disabled_connections` is excluded here the same way its env
+        # vars already are. discover_mcp_tools_async itself skips every
+        # connection whose `_method` isn't "mcp" — safe to pass the full,
+        # unfiltered connection list for every other connector.
+        mcp_tool_defs: list = []
+        mcp_sessions: list = []
+        if data_vault is not None:
+            from anton.core.mcp.wiring import discover_mcp_tools_async
+
+            mcp_tool_defs, mcp_sessions = await discover_mcp_tools_async(
+                data_vault, data_vault.list_connections()
+            )
+
         # TODO: Add guidance for integrations
 
         # Google Drive's google_drive connector uses the drive.file OAuth
@@ -1171,7 +1189,9 @@ class AntonHarness:
                 # FETCH_SUBMISSION_TOOL,
                 # UPDATE_FORM_TOOL,
                 *([RECALL_HISTORY_TOOL] if RECALL_HISTORY_TOOL else []),
+                *mcp_tool_defs,
             ],
+            mcp_sessions=mcp_sessions,
             cells=cells
         )
         # Not `ChatSession(config)` directly: every construction of anton's
@@ -1181,7 +1201,19 @@ class AntonHarness:
         # but keeping the construction uniform is what lets the static test
         # (tests/test_no_subprocess_static.py) treat any other ChatSession(...)
         # call under cowork/ as a new, unreviewed execution site.
-        return build_chat_session(config), temp_vault_dir, seed_info
+        try:
+            session = build_chat_session(config)
+        except Exception:
+            # Mirrors anton's own build_cloud_chat_session fix (ENG-1816
+            # code review): ChatSession.close() is what closes mcp_sessions,
+            # so a construction failure before that point would otherwise
+            # leak every MCP transport this turn opened.
+            if mcp_sessions:
+                from anton.core.mcp.wiring import close_mcp_sessions
+
+                await close_mcp_sessions(mcp_sessions)
+            raise
+        return session, temp_vault_dir, seed_info
 
     @staticmethod
     def _build_llm_client(effort: str | None = None):

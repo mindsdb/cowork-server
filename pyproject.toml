@@ -105,7 +105,15 @@ packages = ["cowork"]
 # `services/providers.py` capability-gates the live supplier and logs when it
 # must retain the static construction-time key, and `handlers/turn_errors.py`
 # keeps the legacy 401 classifier available under that skew.
-anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
+#
+# TEMPORARY, for this PR only: pinned to anton's ENG-1816 branch instead of
+# `main` because this PR's HubSpot MCP work (discover_mcp_tools_async,
+# call_mcp_tool, access.py's tool table) only exists there — anton PR #478
+# (https://github.com/mindsdb/anton/pull/478) is still open, not yet merged
+# to `main`. MUST be re-pinned to `branch = "main"` (and `uv lock` re-run)
+# once that PR merges, before this PR merges — same convention as auth's
+# temporary Mind-Castle git pin.
+anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "feat/eng-1816-mcp-client-in-anton" }
 
 [dependency-groups]
 dev = [

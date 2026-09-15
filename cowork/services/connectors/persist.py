@@ -48,6 +48,7 @@ def persist_connection(
     user_label: str | None = None,
     replace_existing: bool = False,
     default_label: str | None = None,
+    default_fields: dict[str, str] | None = None,
     vault=None,
     scope: "TenantScope | None" = None,
 ) -> str:
@@ -77,6 +78,14 @@ def persist_connection(
     ``replace_existing`` is reserved for an explicit reconnect of the named
     record. It replaces that record atomically after the caller has validated
     the new credential, while retaining its label and picked-file metadata.
+
+    ``default_fields`` generalizes the same "default once, then sticky"
+    behavior ``default_label``/``user_label`` already have, for any other
+    per-connector bookkeeping key a caller wants seeded on a genuinely new
+    connection but never silently reset on a later reconnect (e.g. HubSpot's
+    MCP connector defaulting ``_access_mode`` to ``"read"`` — a token
+    refresh/re-auth reaching this same save path must not clobber a value the
+    user already upgraded to ``"write"``).
     """
     if vault is None:
         vault = vault_for_scope(scope)
@@ -150,6 +159,14 @@ def persist_connection(
         existing_picked_files = (existing or {}).get("fields", {}).get("_picked_files")
         if existing_picked_files:
             payload.setdefault("_picked_files", existing_picked_files)
+        if existing is None:
+            for key, value in (default_fields or {}).items():
+                payload.setdefault(key, value)
+        else:
+            for key in (default_fields or {}):
+                prior = (existing.get("fields") or {}).get(key)
+                if prior is not None:
+                    payload.setdefault(key, prior)
         vault.save(connector_id, slug, payload, secure_keys=secure_keys)
         return slug
 
