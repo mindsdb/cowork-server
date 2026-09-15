@@ -121,6 +121,58 @@ def test_import_keeps_metadata_and_duplicate_never_overwrites(client):
     assert (CodeSkillService().root / skill.name / "SKILL.md").read_bytes() == original
 
 
+@pytest.mark.parametrize("content", [
+    pytest.param("---\nname: empty\ndescription: Example\n---\n", id="empty-body"),
+    pytest.param("---\nname: blank\ndescription: Example\n---\n \n\t", id="blank-body"),
+    pytest.param(MARKDOWN.replace("Use when writing user-facing copy.", "x" * 1_025), id="long-description"),
+    pytest.param(MARKDOWN.replace("---\nKeep", "metadata:\n  display_name: " + "x" * 121 + "\n---\nKeep"), id="long-display-name"),
+])
+def test_import_rejects_fields_the_editor_cannot_save(client, monkeypatch, content):
+    def must_not_write(*args, **kwargs):
+        pytest.fail("An invalid skill reached the persistent store")
+
+    monkeypatch.setattr(CodeSkillService, "_write", must_not_write)
+    result = client.post(f"{BASE}/import", json={"content": content})
+    assert result.status_code == 400, result.text
+    assert isinstance(result.json()["detail"], str)
+    assert not CodeSkillService().list_skills()
+
+
+@pytest.mark.parametrize("name", ["123", "1.5", "[example]", "{example: value}", "true", "null", "0", "[]", "{}", "2026-09-15"])
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"], ids=["lf", "crlf", "cr"])
+def test_import_rejects_non_text_yaml_names_without_writing(client, name, newline):
+    source = f"---\nname: {name}\ndescription: Example\n---\nInstructions"
+    result = client.post(f"{BASE}/import", json={"content": source.replace("\n", newline)})
+    assert result.status_code == 400, result.text
+    assert "name" in result.json()["detail"].lower()
+    assert "text" in result.json()["detail"].lower()
+    assert not CodeSkillService().list_skills()
+
+
+@pytest.mark.parametrize("content", [
+    pytest.param(MARKDOWN, id="basic"),
+    pytest.param(MARKDOWN.replace("human-writing", '"123"'), id="quoted-numeric-name"),
+    pytest.param(MARKDOWN.replace("Use when writing user-facing copy.", "x" * 1_024), id="description-boundary"),
+    pytest.param(MARKDOWN.replace("---\nKeep", "metadata:\n  display_name: " + "x" * 120 + "\n  custom: retained\n---\nKeep"), id="display-name-boundary"),
+    pytest.param(MARKDOWN.replace("---\nKeep", "display_name: My own skill\nmetadata:\n  enabled: false\n---\nKeep"), id="top-level-display-name-disabled"),
+    pytest.param(MARKDOWN.replace("description: Use when writing user-facing copy.\n", ""), id="canonical-description-fallback"),
+])
+def test_successful_import_can_be_disabled_edited_and_reenabled(client, content):
+    result = client.post(f"{BASE}/import", json={"content": content})
+    assert result.status_code == 201, result.text
+    imported = result.json()
+    path = f"{BASE}/{imported['id']}"
+    fields = {key: imported[key] for key in BODY}
+    for enabled in [False, True]:
+        saved = client.put(path, json={**fields, "enabled": enabled})
+        assert saved.status_code == 200, saved.text
+        assert saved.json() == {**imported, "enabled": enabled}
+        assert client.get(path).json() == saved.json()
+    updated = client.put(path, json={**fields, "instructions": "Edited after import."})
+    assert updated.status_code == 200, updated.text
+    assert CodeSkillService().get_skill(imported["id"]).instructions == "Edited after import."
+
+
 def test_duplicate_create_returns_conflict_without_overwriting(client):
     assert client.post(BASE, json=BODY).status_code == 201
     path = CodeSkillService().root / "review-typescript" / "SKILL.md"
@@ -199,6 +251,7 @@ def test_invalid_create_does_not_write(client, field, value):
 @pytest.mark.parametrize("content", [
     pytest.param("", id="empty"),
     pytest.param("Just ordinary text", id="no-frontmatter"),
+    pytest.param("---\nname: incomplete\ndescription: Example\n", id="unclosed-frontmatter"),
     pytest.param("---\nname: [broken\n---\n", id="invalid-frontmatter"),
     pytest.param("a" * (MAX_SKILL_BYTES + 1), id="large-ascii"),
     pytest.param("🙂" * 40_000, id="large-unicode"),
