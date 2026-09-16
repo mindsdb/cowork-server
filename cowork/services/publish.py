@@ -60,6 +60,25 @@ class PublisherUnavailable(RuntimeError):
     """
 
 
+def raise_publish_permission_error(exc: Exception) -> None:
+    """Preserve the artifact consumer's explicit authority result through wrappers."""
+    from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
+
+    if isinstance(exc, (ProductPermissionDenied, ProductPermissionUnavailable)):
+        raise exc
+    if not isinstance(exc, urllib.error.HTTPError):
+        return
+    if exc.code == 503:
+        raise ProductPermissionUnavailable() from exc
+    if exc.code == 403:
+        try:
+            body = json.loads(exc.read(65_536))
+        except (OSError, ValueError):
+            return
+        if isinstance(body, dict) and body.get("code") == "permission_denied":
+            raise ProductPermissionDenied() from exc
+
+
 def _cowork_state_dir() -> Path:
     base = os.environ.get("ANTON_COWORK_STATE_DIR")
     if base:
@@ -335,11 +354,8 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
     web page). The original ``.md`` is never modified — the registry and
     publish history still key off it, not this temp file.
     """
-    # `markdown` ships transitively via hermes-agent (a pinned core
-    # dependency), so it's always present in the resolved environment. The
-    # guard stays defensive in case that ever changes; promote markdown to a
-    # direct dependency in pyproject.toml when the lockfile is next
-    # regenerated with the canonical uv version.
+    # `markdown` is a direct dependency (pyproject.toml); the guard stays
+    # defensive so a broken install reports a clear error.
     try:
         import markdown
     except Exception as exc:  # pragma: no cover - dependency guard
@@ -423,7 +439,12 @@ def publish_artifact(
         from cowork.services.artifact_identity import artifact_key, ensure_full_id
 
         artifact_id, _metadata = ensure_full_id(published_dir)
-        canonical_artifact_key = artifact_key(artifact_id)
+        if scope is not None and scope.org_mode:
+            from cowork.services.artifact_authorization_identity import publish_authorization_key
+
+            canonical_artifact_key = publish_authorization_key(artifact_id, artifacts_base, scope)
+        else:
+            canonical_artifact_key = artifact_key(artifact_id)
 
     # Markdown is rendered to a throwaway index.html that we hand to the
     # publisher; `.html` and fullstack publish their real target directly.
@@ -456,6 +477,7 @@ def publish_artifact(
             vault=vault_for_scope(scope),
         )
     except Exception as exc:
+        raise_publish_permission_error(exc)
         logger.exception("Publishing failed")
         # Only network/HTTP failures get the "Connection failed" framing — a
         # gateway timeout (e.g. a fullstack artifact whose deps take too long
@@ -623,6 +645,7 @@ def unpublish_artifact(
             ssl_verify=ssl_verify,
         )
     except Exception as exc:
+        raise_publish_permission_error(exc)
         msg = str(exc) or "Unpublishing failed."
         if "404" in msg or "not found" in msg.lower():
             # Already gone upstream, OR still alive under another owner's prefix

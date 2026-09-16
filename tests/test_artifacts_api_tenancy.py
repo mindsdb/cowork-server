@@ -143,14 +143,17 @@ async def test_list_hides_other_org_artifacts(session, tmp_path, org_mode):
     assert "secret" not in slugs
 
 
-def test_list_hides_another_members_artifacts(session, tmp_path, org_mode):
-    """Same org, different chat. Live artifacts live inside a conversation, so
-    they inherit that conversation's privacy rather than the project's sharing.
+def test_list_hides_another_members_legacy_artifacts(session, tmp_path, org_mode):
+    """Same org, different chat, LEGACY layout. Artifacts written before
+    ENG-2056 live inside a conversation workspace, so they inherit that
+    conversation's privacy. New artifacts land in the shared project base and
+    are project-wide by decision — that case is pinned in
+    `test_artifact_roots.py::test_listing_shows_project_base_artifacts_to_every_member_and_keeps_legacy_ones`.
 
     Two projects here, because `_project_with_artifact` builds one per call. The
     one-project-two-owners case, which is what a narrowing of the filter to
     per-project granularity would slip past, is pinned at the resolver instead:
-    `test_artifact_roots.py::test_sources_for_project_skip_another_members_conversations`.
+    `test_artifact_roots.py::test_sources_for_project_skip_another_members_legacy_conversations`.
     """
     _project_with_artifact(
         session, tmp_path, name="shared", org_id=ORG_A, slug="theirs", owner=USER_A2
@@ -316,6 +319,10 @@ async def _grant_draft_review(session, tmp_path, monkeypatch, *, slug="dash", or
         "cowork.services.artifact_access.provision_draft_review_access",
         fake_provision,
     )
+    monkeypatch.setattr(
+        "cowork.services.artifact_authorization_identity._allocate_or_adopt",
+        lambda *_args: card["artifactKey"],
+    )
     enabled = await workspace_ep.enable_artifact_comments(
         str(row.id), card["id"], _scoped(session, org_id)
     )
@@ -458,6 +465,98 @@ async def test_delete_by_slug_removes_the_folder(session, tmp_path, org_mode, pu
     assert not folder.exists()
 
 
+@pytest.mark.parametrize("stage", ["mint", "unpublish"])
+@pytest.mark.parametrize("status", [403, 503])
+async def test_delete_preserves_authority_failures_and_keeps_artifact_files(
+    session, tmp_path, org_mode, monkeypatch, stage, status,
+):
+    import io
+    from urllib.error import HTTPError
+    from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
+
+    row, folder = _project_with_artifact(
+        session, tmp_path, name="publish-denied", org_id=ORG_A, slug="dash"
+    )
+    record = {"index.html": {"report_id": "rid", "published": True}}
+    (folder / ".published.json").write_text(json.dumps(record))
+    error_type = ProductPermissionDenied if status == 403 else ProductPermissionUnavailable
+
+    async def mint(**kwargs):
+        if stage == "mint":
+            raise error_type()
+        return "artifact-key"
+
+    async def revoke(*args, **kwargs):
+        return True
+
+    def unpublish(*args, **kwargs):
+        assert stage == "unpublish", "Mint denial must stop before unpublishing"
+        body = {"code": "permission_denied"} if status == 403 else {"error": "Auth unavailable"}
+        raise HTTPError("https://publish.example/delete/rid", status, "Rejected", {},
+                        io.BytesIO(json.dumps(body).encode()))
+
+    monkeypatch.setattr("cowork.services.artifact_publish_key.mint_turn_key", mint)
+    monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
+    monkeypatch.setattr("anton.publisher.unpublish", unpublish)
+    with pytest.raises(error_type) as error:
+        await ep.delete_artifact_for_request(_scoped(session, ORG_A), "dash", project_id=row.id)
+    assert error.value.status_code == status
+    assert (folder / "index.html").read_text() == "<html></html>"
+    assert json.loads((folder / ".published.json").read_text()) == record
+
+
+@pytest.mark.parametrize("by_id", [False, True])
+async def test_delete_revokes_with_the_verified_owner_and_tenant_before_removing_files(
+    session, tmp_path, org_mode, publish_key, monkeypatch, by_id
+):
+    row, folder = _project_with_artifact(
+        session, tmp_path, name="owned", org_id=ORG_A, slug="dash"
+    )
+    artifact_id, _metadata = ensure_full_id(folder)
+    calls = []
+
+    async def revoke(identifier, scope):
+        assert folder.exists()
+        calls.append((identifier, scope.user_id, scope.org_id))
+        return True
+
+    monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
+
+    await ep.delete_artifact_for_request(
+        _scoped(session, ORG_A), artifact_id if by_id else "dash", project_id=row.id
+    )
+
+    assert [(UUID(identifier).hex, owner, org) for identifier, owner, org in calls] == [
+        (artifact_id, USER_A, ORG_A)
+    ]
+    assert not folder.exists()
+
+
+async def test_delete_keeps_files_when_draft_authorization_is_unavailable(
+    session, tmp_path, org_mode, publish_key, monkeypatch
+):
+    from cowork.services.artifact_access import ArtifactAccessUnavailable
+
+    row, folder = _project_with_artifact(
+        session, tmp_path, name="owned", org_id=ORG_A, slug="dash"
+    )
+    artifact_id, _metadata = ensure_full_id(folder)
+
+    async def revoke(identifier, scope):
+        raise ArtifactAccessUnavailable("Could not revoke draft collaboration")
+
+    monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
+
+    with pytest.raises(HTTPException) as err:
+        await ep.delete_artifact_for_request(
+            _scoped(session, ORG_A), artifact_id, project_id=row.id
+        )
+
+    assert err.value.status_code == 503
+    assert (folder / "index.html").read_text() == "<html></html>"
+    assert (folder / "metadata.json").exists()
+
+
 async def test_delete_by_artifact_id_selects_the_exact_duplicate_slug(
     session, tmp_path, org_mode, publish_key
 ):
@@ -513,6 +612,11 @@ async def test_reviewer_cannot_delete_an_owners_artifact(
     not hidden as a 404, which would read as "already gone" to a client that is
     looking at the draft."""
     row, folder, card = await _grant_draft_review(session, tmp_path, monkeypatch)
+
+    async def revoke(identifier, scope):
+        pytest.fail("A reviewer must never reach the policy mutation")
+
+    monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
 
     with Session(session.get_bind()) as reviewer_session:
         with pytest.raises(HTTPException) as err:
@@ -704,3 +808,6 @@ async def test_desktop_project_path_that_matches_nothing_yields_nothing(
     )
 
     assert cards == []
+
+
+pytestmark = pytest.mark.usefixtures("granted_product_permissions")

@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
+from contextlib import contextmanager
 from types import ModuleType
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from anton.core.llm.provider import ProviderAuthError
@@ -281,6 +283,54 @@ def test_collect_raises_400_with_curated_message_for_image_error():
     assert err.value.detail["type"] == "response.failed"
     assert err.value.detail["code"] == te.IMAGE_FORMAT_CODE
     assert "PNG or JPEG" in err.value.detail["error"]
+
+
+@contextmanager
+def _records_from(name: str, level: int = logging.WARNING):
+    """Capture one logger's records, with that logger forced back on.
+
+    Not caplog: the alembic env used by the migration tests calls fileConfig,
+    which defaults to disable_existing_loggers=True and leaves every logger
+    built before it with disabled=True for the rest of the session. A log
+    assertion running after one of those silently captures nothing, so this
+    clears the flag for the duration and puts it back.
+    """
+    captured: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            captured.append(record)
+
+    target = logging.getLogger(name)
+    handler = _Capture(level)
+    restore = (target.level, target.propagate, target.disabled)
+    target.setLevel(level)
+    target.propagate = False
+    target.disabled = False
+    target.addHandler(handler)
+    try:
+        yield captured
+    finally:
+        target.removeHandler(handler)
+        target.level, target.propagate, target.disabled = restore
+
+
+def test_collect_puts_the_same_id_on_the_body_and_the_log_line():
+    # The non-streaming arm is reached from handle() and from the scheduler, and
+    # it failed with no id at all: the user got the generic message and the log
+    # line named neither the turn nor a reference to quote.
+    handler = _handler_with_raising_formatter(Exception("kaboom"))
+    with _records_from("cowork.handlers.responses") as records:
+        with pytest.raises(HTTPException) as err:
+            asyncio.run(handler._collect(
+                stream=None, conversation_id=uuid4(), model="anton", original_content="hi",
+            ))
+
+    request_id = err.value.detail["request_id"]
+    UUID(request_id)
+    deployed = [r for r in records if r.levelno >= logging.WARNING]
+    assert deployed
+    assert all(getattr(r, "request_id", None) == request_id for r in deployed)
 
 
 def test_collect_raises_500_generic_for_unmapped_error():
@@ -1727,7 +1777,11 @@ def test_the_non_streaming_failure_body_on_the_wire(exc, expected_status, expect
         res = client.post("/api/v1/responses/", json={"input": "hi", "stream": False})
 
     assert res.status_code == expected_status, res.text
-    assert res.json()["detail"] == {
+    body = res.json()["detail"]
+    # The id is minted per failure, so pin its shape and the rest of the body
+    # exactly. The point of the assertion is that no OTHER field appears.
+    UUID(body.pop("request_id"))
+    assert body == {
         "type": "response.failed",
         "code": expected_code,
         "error": expected_error,

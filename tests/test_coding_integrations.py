@@ -325,7 +325,7 @@ def test_connected_github_issue_becomes_normalized_source_context(tmp_path: Path
 def test_github_work_search_returns_normalized_issue_and_pull_request_results(tmp_path: Path, standalone: bool) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/search/issues"
-        assert request.url.params["q"] == "delivery is:open"
+        assert request.url.params["q"] in {"is:issue delivery is:open", "is:pull-request delivery is:open"}
         assert request.url.params["sort"] == "updated"
         return httpx.Response(200, json={
             "incomplete_results": False,
@@ -362,10 +362,10 @@ def test_github_work_search_returns_normalized_issue_and_pull_request_results(tm
     ))
 
     assert [(item.external_id, item.kind) for item in page.items] == [
-        ("mindsdb/cowork#42", "issue"),
         ("mindsdb/cowork#99", "pull_request"),
+        ("mindsdb/cowork#42", "issue"),
     ]
-    assert page.items[0].assignee == "ian"
+    assert page.items[1].assignee == "ian"
     assert current.connections == []
 
 

@@ -6,12 +6,15 @@ and keeps the long-lived tenant key out of the worker pod.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Literal
 
 import httpx
 
+from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
+
 
 async def mint_turn_key(*, user_id: str, org_id: str, correlation_id: str,
-                        ttl_seconds: int, settings) -> str:
+                        ttl_seconds: int, settings, purpose: Literal["execution", "artifact_publish"] = "execution") -> str:
     expiry = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
     # Cluster-only route: turn-key mint is secret-only (no Bearer factor), so
     # auth serves it under the top-level /internal/ prefix the public LB never
@@ -19,11 +22,24 @@ async def mint_turn_key(*, user_id: str, org_id: str, correlation_id: str,
     url = f"{settings.auth_internal_base_url.rstrip('/')}/internal/turn-keys/"
     headers = {"X-Internal-Auth": settings.auth_internal_secret}
     body = {"user_id": user_id, "organization_id": org_id,
-            "instance_id": correlation_id, "expiry_date": expiry, "rotate": False}
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        resp = await client.post(url, json=body, headers=headers)
-        resp.raise_for_status()
-        return resp.json()["key"]
+            "instance_id": correlation_id, "expiry_date": expiry, "rotate": False, "purpose": purpose}
+    if not settings.auth_internal_base_url or not settings.auth_internal_secret:
+        raise ProductPermissionUnavailable()
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+            resp = await client.post(url, json=body, headers=headers)
+            if resp.status_code == 403:
+                error = resp.json()
+                if isinstance(error, dict) and error.get("code") == "permission_denied":
+                    raise ProductPermissionDenied()
+            resp.raise_for_status()
+            result = resp.json()
+            if not isinstance(result, dict) or not isinstance(result.get("key"), str) or not result["key"].strip():
+                raise ProductPermissionUnavailable()
+            return result["key"]
+    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+        raise ProductPermissionUnavailable() from exc
+
 
 
 async def list_active_connections(*, org_id: str, user_id: str, settings) -> list[dict]:

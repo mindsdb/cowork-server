@@ -15,6 +15,7 @@ jobs:
     uses: ./.github/workflows/tests-integration.yml
     with:
       deploy-env: staging
+      runner: mdb-dev
     secrets: inherit
 
   notify:

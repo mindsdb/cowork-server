@@ -7,7 +7,7 @@ import time
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlmodel import Session
 
-from cowork.api.v1.endpoints.guards import require_local_tenancy
+from cowork.api.v1.permissions import DesktopOnly, require
 from cowork.coding.connector_capabilities import ConnectorInvocationRequest
 from cowork.coding.control_models import RUNTIME_PROTOCOL_VERSION, RuntimeEvent
 from cowork.coding.control_service import RuntimeAuthenticationError, StaleRuntimeEvent
@@ -34,7 +34,15 @@ from cowork.services.settings import SettingService
 # Remote computers are supported by the desktop control plane. Hosted/org
 # activation requires the tenant-bound service resolver and SQL store; until
 # that boundary is wired, fail closed rather than sharing desktop-global state.
-router = APIRouter(dependencies=[Depends(require_local_tenancy)])
+#
+# DesktopOnly: require_local_tenancy 403s the whole router in org mode, so
+# there is never a cowork.principal.Principal to check (local mode never has
+# one either). Each route that accepts a runtime bearer checks it itself via
+# `_authenticate` — a different credential axis from Principal — except
+# `register_runtime`, whose credential is the registration token in its body.
+# Declared on the router because it refuses: a route added here inherits the
+# desktop-only refusal rather than a marker saying it is open.
+router = APIRouter(dependencies=[Depends(require(DesktopOnly))])
 
 
 def _control():

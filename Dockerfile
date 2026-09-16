@@ -4,7 +4,7 @@ FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd
 # uv binary (pinned to match the repo's lockfile tooling).
 COPY --from=ghcr.io/astral-sh/uv:0.6.14@sha256:3362a526af7eca2fcd8604e6a07e873fb6e4286d8837cb753503558ce1213664 /uv /uvx /bin/
 
-# git: pyproject sources anton-agent / hermes-agent from GitHub, and hatch-vcs
+# git: pyproject sources anton-agent from GitHub, and hatch-vcs
 # reads git metadata for the version. build-essential is NOT needed — psycopg
 # is installed as psycopg[binary] (prebuilt wheels).
 RUN --mount=target=/var/lib/apt,type=cache,sharing=locked \
@@ -58,6 +58,33 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 # Final: slim runtime with just the venv + source.
 FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de AS final
+
+# Bring the base packages up to the current trixie versions. The digest above
+# pins a rootfs Debian builds from a dated snapshot.debian.org pin, so it ships
+# whatever the archive held on that date and never moves afterwards, and nothing
+# else in this stage runs apt. Bumping the digest is not an alternative: every
+# published digest of this image pins a snapshot of its own, and the newest one
+# carries the same superseded packages as this one. The fixes ship in trixie
+# main rather than trixie-security, so narrowing this to a security-only source
+# would miss them.
+#
+# IMAGE_TAG is declared to put its value into this layer's cache key. BuildKit
+# keys a RUN on the parent state plus the command text, and a digest-pinned base
+# holds both constant forever, so a long-lived builder would serve this layer
+# from cache on every later build and the image would drift back to the
+# snapshot's packages while the file still read as though it upgrades. Every ARG
+# in scope joins the environment of the RUN steps below it, so a changed value
+# misses the cache, and the build passes
+# `--build-arg IMAGE_TAG=<environment>-<commit sha>`: the upgrade re-runs once
+# per commit. Runs before `USER app` below, because apt needs root.
+ARG IMAGE_TAG
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
+    # apt-get upgrade exits 0 when it holds a package back, so a fix that needs
+    # a new dependency is skipped and the image ships the CVE this layer exists
+    # to remove. Re-simulate and fail the build if anything is still pending.
+    && apt-get -s upgrade | grep -q "and 0 not upgraded" \
+    && rm -rf /var/lib/apt/lists/*
 
 # Non-root: this image runs in per-PR dev environments (see
 # .github/workflows/build-deploy.yml) and is a candidate for staging/prod via
