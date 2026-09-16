@@ -351,6 +351,105 @@ async def test_route_request_scrubs_secrets_from_history_and_current_prompt(monk
 
 
 @pytest.mark.asyncio
+async def test_route_request_scrubs_a_registered_vault_secret_by_value(monkeypatch, tmp_path, request):
+    """A DSN password has no key-shape for _SECRET_KEY_PATTERN to match, so it
+    only gets redacted by exact value, which register_secret_vars() makes
+    possible. This pins the mechanism _route_request's scrub relies on, given
+    that registration already happened — it does not exercise handle()'s
+    call site; see test_handle_registers_vault_secrets_before_routing for that."""
+    from uuid import uuid4
+
+    from anton.core.datasources.data_vault import LocalDataVault
+    from cowork.models.message_event import MessageEvent  # noqa: F401 — resolves the ORM relationship
+    from cowork.models.message import Message
+    from cowork.schemas.responses import Role
+    import cowork.handlers.responses as responses
+
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "vault"))
+    vault = LocalDataVault(tmp_path / "vault")
+    vault.save("postgres", "mydb", {
+        "host": "db.example.com", "port": "5432", "database": "app",
+        "user": "svc", "password": "hunter2xyz",
+    })
+
+    # register_vault_secrets populates anton's process-global DS_* registry
+    # (env vars and/or a context-scoped value map, depending on the anton
+    # version), not test-scoped — reset both so this leaves no residue for
+    # later tests in the same session.
+    from anton.utils.datasources import _reset_registered_ds_vars
+    request.addfinalizer(_reset_registered_ds_vars)
+    request.addfinalizer(vault.clear_ds_env)
+
+    handler = _routing_handler(monkeypatch)
+    responses.register_vault_secrets(handler.scope)
+
+    cid = uuid4()
+    rows = [Message(conversation_id=cid, role=Role.user, content="the password is hunter2xyz")]
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: rows),
+    )
+    seen = {}
+
+    async def fake_decide_route(**kwargs):
+        seen.update(kwargs)
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+
+    await handler._route_request(
+        conversation_id=cid,
+        harness_input=[{"type": "text", "text": "hi"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+
+    blob = str(seen["history"])
+    assert "hunter2xyz" not in blob
+    assert "[DS_" in blob
+
+
+@pytest.mark.asyncio
+async def test_handle_registers_vault_secrets_before_routing(monkeypatch):
+    """Wiring guard for handle()'s register_vault_secrets() call site: removing
+    it, or moving it after _route_request, must fail here — the mechanism
+    tests above call register_vault_secrets directly and would stay green
+    either way."""
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = uuid4()
+    conversation = SimpleNamespace(id=conv_id, messages=[])
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_conversation=lambda _cid: conversation),
+    )
+    calls = []
+    monkeypatch.setattr(
+        responses, "register_vault_secrets", lambda scope: calls.append(("register", scope))
+    )
+
+    class _StopHere(Exception):
+        pass
+
+    async def fake_route_request(**kwargs):
+        calls.append(("route_request", None))
+        raise _StopHere
+
+    handler._route_request = fake_route_request
+
+    with pytest.raises(_StopHere):
+        await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id)))
+
+    assert calls == [("register", handler.scope), ("route_request", None)]
+
+
+@pytest.mark.asyncio
 async def test_route_request_does_not_hand_the_composer_pick_to_the_gate(monkeypatch):
     """ENG-1851: the composer's per-conversation pick drives Anton's turn, not
     the gate. `_route_request` no longer accepts or forwards it."""

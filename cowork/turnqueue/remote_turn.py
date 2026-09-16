@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from cowork.common.history_scrub import register_vault_secrets
 from cowork.db.scoped import ScopedSession
 from cowork.handlers.responses import ResponsesHandler
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
@@ -52,6 +53,8 @@ async def remote_turn_events(
     touched_slugs: set[str] = set()
     turn_scope = None
     artifact_writes_allowed = False
+
+    register_vault_secrets(session.scope)
 
     try:
         async for kind, data in stream_remote_replies(
