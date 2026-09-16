@@ -15,6 +15,7 @@ from uuid import UUID
 import re2
 
 from anton.core.dispatch import OutboundMessage
+from cowork.handlers._turn_history import reject_unreplayable_tool_rows
 from cowork.build_info import build_trace_metadata
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.db.scoped import LOCAL_SCOPE, SYSTEM_SCOPE, ScopedSession, TenantScope, scope_for_background_context, scope_for_org
@@ -34,6 +35,7 @@ from cowork.services.channels import ChannelConfigService, resolve_installation_
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.skills import SkillService
+from cowork.streaming.answer_text import accumulate_answer_text
 from cowork.turnqueue.remote_turn import RemoteTurnFailed, remote_turn_events
 
 log = logging.getLogger(__name__)
@@ -544,11 +546,11 @@ class AntonChannelRuntime:
             # Tool block-rows are for LLM-history persistence, not UI replay —
             # keep them out of the events log (mirrors handlers/responses.py).
             if event_type == "response.turn_history":
-                turn_rows[:] = data.get("rows") or []
+                # Id-checked even in-process; see handlers/responses.py (ENG-2420).
+                turn_rows[:] = reject_unreplayable_tool_rows(data.get("rows") or [])
                 return
             events.append(data)
-            if event_type == "response.output_text.delta":
-                collected.append(data.get("delta", ""))
+            accumulate_answer_text(collected, event_type, data)
 
         stream = await self._turn_stream(
             harness, harness_id, scoped, conversation, blocks, text, channel_context, turn_rows,

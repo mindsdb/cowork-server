@@ -5,6 +5,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 
+from cowork.coding.command_approvals import command_rule
 from cowork.coding.contracts import ApprovalDecision, PendingApproval
 from cowork.coding.redaction import redact_text
 
@@ -14,6 +15,7 @@ class _Waiter:
     session_id: str
     pending: PendingApproval
     event: threading.Event
+    command_grant: str | None = None
     decision: ApprovalDecision | None = None
     closed: bool = False
 
@@ -24,22 +26,32 @@ class ApprovalBroker:
     def __init__(
         self,
         on_open: Callable[[str, PendingApproval], None],
-        on_close: Callable[[str, PendingApproval, ApprovalDecision], None],
+        on_close: Callable[[str, PendingApproval, ApprovalDecision, str | None], None],
+        get_command_grants: Callable[[str], list[str]],
     ) -> None:
         self._on_open = on_open
         self._on_close = on_close
+        self._get_command_grants = get_command_grants
         self._lock = threading.RLock()
         self._waiters: dict[str, _Waiter] = {}
 
     def request(self, session_id: str, method: str, params: dict | None) -> dict[str, str]:
         pending = self._describe(method, params or {})
-        waiter = _Waiter(session_id=session_id, pending=pending, event=threading.Event())
+        rule = command_rule(method, params or {})
+        waiter = _Waiter(
+            session_id=session_id, pending=pending, event=threading.Event(),
+            command_grant=rule.grant if rule else None,
+        )
         with self._lock:
             if any(item.session_id == session_id and not item.closed for item in self._waiters.values()):
                 # CodingSession intentionally exposes one approval card. Fail a
                 # concurrent request closed instead of replacing the visible
                 # approval and leaving the first operation impossible to resume.
                 return {"decision": "decline"}
+            if rule and rule.matches(self._get_command_grants(session_id)):
+                # Authorize this request only. The engine must consult us
+                # again, so a permission change can revoke remembered rules.
+                return {"decision": "accept"}
             self._waiters[pending.id] = waiter
         try:
             self._on_open(session_id, pending)
@@ -59,9 +71,7 @@ class ApprovalBroker:
             close_now = not waiter.closed
             waiter.closed = True
         if close_now:
-            self._on_close(session_id, pending, decision)
-        if decision == ApprovalDecision.approve_session and pending.allow_session:
-            return {"decision": "acceptForSession"}
+            self._on_close(session_id, pending, decision, None)
         if decision in {ApprovalDecision.approve_once, ApprovalDecision.approve_session}:
             return {"decision": "accept"}
         return {"decision": "decline"}
@@ -76,7 +86,10 @@ class ApprovalBroker:
         try:
             # Persist the decision before waking Codex so the approval response
             # cannot still describe the task as awaiting the same decision.
-            self._on_close(session_id, waiter.pending, decision)
+            self._on_close(
+                session_id, waiter.pending, decision,
+                waiter.command_grant if decision == ApprovalDecision.approve_session else None,
+            )
         except Exception:
             # An approval that the local store could not record must never
             # authorize the underlying action. Wake Codex with a denial while
@@ -99,7 +112,7 @@ class ApprovalBroker:
         first_error: Exception | None = None
         for waiter in cancelled:
             try:
-                self._on_close(session_id, waiter.pending, ApprovalDecision.deny)
+                self._on_close(session_id, waiter.pending, ApprovalDecision.deny, None)
             except Exception as exc:  # noqa: BLE001 - every waiter still needs to be released.
                 first_error = first_error or exc
             finally:
@@ -122,7 +135,7 @@ class ApprovalBroker:
             command = params.get("command") or params.get("commands") or params.get("reason")
             detail = ApprovalBroker._string(command) or "Codex requested permission to run a command."
             risk = "The command may modify files, start processes, or access resources outside the task sandbox."
-            allow_session = bool(params.get("proposedExecpolicyAmendment") or params.get("proposedExecPolicyAmendment"))
+            allow_session = command_rule(method, params) is not None
         elif "fileChange" in method:
             kind = "file_change"
             title = "Modify protected files"

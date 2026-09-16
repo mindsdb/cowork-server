@@ -1,7 +1,7 @@
 """Inline artifact cards — the guarantee that every artifact a turn produces
 gets an openable card that survives reload.
 
-Covers the shared end-of-turn path (services.task_objects.finalize_turn_artifacts
+Covers the shared end-of-turn path (services.task_objects.index_turn_artifacts
 + services.artifacts.card_for_folder) and the persistence fix that lets an
 artifact-only turn (no body text) keep its `response.artifact_created` event.
 """
@@ -59,25 +59,6 @@ def test_card_for_folder_none_on_unreadable_metadata(tmp_path):
     folder.mkdir()
     (folder / "metadata.json").write_text("{ not json")
     assert card_for_folder(folder) is None
-
-
-# ── finalize: index + cards from one diff ──────────────────────────────────
-
-def test_finalize_surfaces_only_new_artifacts(session, tmp_path):
-    base = tmp_path / "artifacts"
-    base.mkdir()
-    _make_artifact(base, "old", files={"a.md": "old"}, meta={"slug": "old", "type": "document"})
-    before = t.snapshot_artifact_slugs(base)
-
-    _make_artifact(base, "new", files={"r.md": "new"}, meta={"slug": "new", "name": "New", "type": "document"})
-
-    conv = ConversationService(ScopedSession(session, LOCAL_SCOPE)).create_conversation(topic="t")
-    cards = t.finalize_turn_artifacts(conv, conv.id, conv.project_id, base, before)
-    assert [c["slug"] for c in cards] == ["new"]
-
-    # Nothing new on a second pass.
-    after = t.snapshot_artifact_slugs(base)
-    assert t.finalize_turn_artifacts(conv, conv.id, conv.project_id, base, after) == []
 
 
 # ── persistence: the reload guarantee ──────────────────────────────────────

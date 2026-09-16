@@ -5,6 +5,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSession, TenantScope, get_tenant_scope
 from cowork.db.session import get_open_session
 from cowork.principal import Principal, get_principal
@@ -15,7 +16,13 @@ from cowork.schemas.memory import (
 )
 from cowork.services.memory import MemoryService
 
-router = APIRouter()
+# AuthenticatedInOrgMode, declared explicitly: MemoryService already fails
+# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py) —
+# Project through ScopedSession, GlobalMemoryStore through
+# scoped_user_storage_root — whenever org mode has no resolved org/user.
+# Declaring it too makes the requirement visible to a route walker instead
+# of something only discoverable by reading scoped.py.
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
 @contextmanager

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import logging
 import os
 import shutil
 import stat
@@ -10,6 +11,8 @@ from pathlib import Path
 
 from cowork.coding.contracts import DiffFile
 from cowork.coding.workspace_key import managed_key
+
+logger = logging.getLogger(__name__)
 
 MAX_LOCAL_DIFF_FILES = 250
 MAX_LOCAL_TEXT_BYTES = 2 * 1024 * 1024
@@ -46,11 +49,13 @@ class LocalCopyManager:
         workspace.parent.mkdir(parents=True, exist_ok=True)
         baseline.parent.mkdir(parents=True, exist_ok=True)
         try:
-            shutil.copytree(source, baseline, symlinks=True)
-            shutil.copytree(source, workspace, symlinks=True)
-        except Exception:
+            shutil.copytree(source, baseline, symlinks=True, ignore=self._skip_unsupported)
+            shutil.copytree(source, workspace, symlinks=True, ignore=self._skip_unsupported)
+        except Exception as exc:
             shutil.rmtree(workspace, ignore_errors=True)
             shutil.rmtree(baseline, ignore_errors=True)
+            if isinstance(exc, OSError):
+                raise self._copy_failure("The task folder could not be copied", exc) from exc
             raise
         return PreparedLocalCopy(source=source, workspace=workspace, baseline=baseline)
 
@@ -67,11 +72,13 @@ class LocalCopyManager:
         # inherited changes disappear from review and handoff.
         parent_baseline = self._baseline_for(current_workspace)
         try:
-            shutil.copytree(current_workspace, workspace, symlinks=True)
-            shutil.copytree(parent_baseline, baseline, symlinks=True)
-        except Exception:
+            shutil.copytree(current_workspace, workspace, symlinks=True, ignore=self._skip_unsupported)
+            shutil.copytree(parent_baseline, baseline, symlinks=True, ignore=self._skip_unsupported)
+        except Exception as exc:
             shutil.rmtree(workspace, ignore_errors=True)
             shutil.rmtree(baseline, ignore_errors=True)
+            if isinstance(exc, OSError):
+                raise self._copy_failure("The existing task copy could not be duplicated", exc) from exc
             raise
         return PreparedLocalCopy(source=source, workspace=workspace, baseline=baseline)
 
@@ -115,6 +122,13 @@ class LocalCopyManager:
         current_source = self._manifest(source)
         task = self._manifest(workspace)
         changed = sorted(path for path in set(before) | set(task) if before.get(path) != task.get(path))
+        # A skipped entry is in no manifest, so a task file at its path reads as
+        # a clean addition and would replace a live socket, pipe or device.
+        occupied = self._occupied_by_special(source, changed)
+        if occupied:
+            preview = ", ".join(occupied[:5])
+            suffix = "…" if len(occupied) > 5 else ""
+            raise LocalCopyError(f"Handoff stopped before changing the source; a socket, pipe or device still occupies: {preview}{suffix}")
         conflicts = [path for path in changed if current_source.get(path) != before.get(path)]
         if conflicts:
             preview = ", ".join(conflicts[:5])
@@ -170,7 +184,10 @@ class LocalCopyManager:
             recovery.parent.mkdir(parents=True, exist_ok=True)
             if recovery.exists():
                 shutil.rmtree(recovery)
-            shutil.copytree(workspace, recovery, symlinks=True)
+            try:
+                shutil.copytree(workspace, recovery, symlinks=True, ignore=self._skip_unsupported)
+            except OSError as exc:
+                raise self._copy_failure("The task copy could not be saved for recovery", exc) from exc
         shutil.rmtree(workspace, ignore_errors=True)
         shutil.rmtree(baseline, ignore_errors=True)
 
@@ -197,6 +214,55 @@ class LocalCopyManager:
             return path.relative_to(root.resolve())
         except ValueError:
             return None
+
+    @staticmethod
+    def _copy_failure(subject: str, exc: OSError) -> LocalCopyError:
+        # _call does not log a RuntimeError, so this warning is the only
+        # operator record; the destination is managed, so report the source only.
+        entries = exc.args[0] if exc.args and isinstance(exc.args[0], list) else []
+        reported = [f"{item[0]}: {item[2]}" for item in entries[:5] if isinstance(item, tuple) and len(item) == 3]
+        detail = "; ".join(reported) if reported else str(exc)
+        logger.warning("%s: %s", subject, detail, exc_info=exc)
+        return LocalCopyError(f"{subject}: {detail}")
+
+    @staticmethod
+    def _unsupported_mode(mode: int) -> bool:
+        return not (stat.S_ISREG(mode) or stat.S_ISDIR(mode) or stat.S_ISLNK(mode))
+
+    @staticmethod
+    def _skip_unsupported(directory: str, names: list[str]) -> set[str]:
+        # Sockets, FIFOs and device nodes cannot be reproduced by a copy, and
+        # _manifest already ignores them, so nothing skipped here is reviewable.
+        skipped: set[str] = set()
+        for name in names:
+            try:
+                mode = os.lstat(os.path.join(directory, name)).st_mode
+            except OSError:
+                # copytree collects per-entry failures; raising from inside its
+                # ignore callback would abort the whole tree instead.
+                continue
+            if LocalCopyManager._unsupported_mode(mode):
+                skipped.add(name)
+        return skipped
+
+    def _occupied_by_special(self, source: Path, changed: list[str]) -> list[str]:
+        occupied: list[str] = []
+        for relative in changed:
+            try:
+                mode = self._safe_child(source, relative).lstat().st_mode
+            except (FileNotFoundError, NotADirectoryError):
+                # Both mean nothing is at that path. NotADirectoryError is the
+                # file-to-directory replacement the handoff already supports.
+                continue
+            except OSError as exc:
+                # This gate exists to stop handoff destroying an entry it cannot
+                # describe, so an entry it cannot read has to stop it too.
+                raise LocalCopyError(
+                    f"Handoff stopped before changing the source; {relative} could not be inspected: {exc}"
+                ) from exc
+            if self._unsupported_mode(mode):
+                occupied.append(relative)
+        return occupied
 
     @staticmethod
     def _manifest(root: Path) -> dict[str, str]:
