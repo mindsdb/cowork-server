@@ -50,6 +50,9 @@ _SCAN_CAP_MULTIPLIER = 10
 # trip on the unbounded get_messages branch a 1,000+ message conversation
 # can reach.
 _EVENTS_IN_CHUNK_SIZE = 500
+# Upper bound for a decoded cursor's `seq`: the widest value the column can
+# hold. Anything above it is a forged cursor, not a row that exists.
+_MAX_CURSOR_SEQ = 2**63 - 1
 
 # created_at is only second-precision, so rows of turns in the same second
 # would otherwise interleave. `seq` is a per-conversation monotonic ordinal
@@ -75,9 +78,10 @@ _MESSAGE_ORDER = (
 # every page repeats the newest N forever. `seq` is already a per-conversation
 # monotonic ordinal assigned at insert (max(seq)+1) that tracks the same real
 # insert order created_at was approximating, so it alone is a safe, precise
-# keyset key for any two rows with different seq; role/id remain as the
-# tiebreak for legacy rows (seq 0 for all of them — ordered by role then id
-# among themselves, same as _MESSAGE_ORDER already tolerates for that case).
+# keyset key. It is a TOTAL order per conversation only because migration
+# 3e4b5f7586d3 backfills the pre-seq rows that all shared 0; without that
+# backfill every legacy row ties here and the page comes back grouped by role
+# in UUID order. role/id stay as a defensive tiebreak, not a load-bearing one.
 _MESSAGE_CURSOR_ORDER = (
     Message.seq,
     case((Message.role == Role.user, 0), else_=1),
@@ -109,9 +113,15 @@ def _decode_message_cursor(cursor: str) -> tuple[int, int, UUID]:
     try:
         raw = base64.urlsafe_b64decode(cursor.encode())
         seq, role_rank, message_id = json.loads(raw)
-        return (int(seq), int(role_rank), UUID(message_id))
+        seq, role_rank, message_id = int(seq), int(role_rank), UUID(message_id)
     except Exception as e:
         raise InvalidPaginationParams("Malformed pagination cursor") from e
+    # Range-checked, not just shape-checked: `before` is unsigned client
+    # input, and a decodable seq wider than the column overflows inside the
+    # driver, past this function's own error mapping and out as a 500.
+    if not 0 <= seq <= _MAX_CURSOR_SEQ or role_rank not in (0, 1):
+        raise InvalidPaginationParams("Malformed pagination cursor")
+    return (seq, role_rank, message_id)
 
 
 @dataclass(frozen=True)

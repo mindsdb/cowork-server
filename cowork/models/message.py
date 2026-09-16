@@ -48,7 +48,11 @@ class Message(BaseSQLModel, table=True):
             "(assistant tool_use, user tool_result, ...) can share one "
             "created_at (second precision); seq orders every message in the "
             "conversation deterministically, without depending on that "
-            "resolution. Assigned as max(seq)+1 on insert; 0 for legacy rows."
+            "resolution. Assigned as max(seq)+1 on insert. Rows written "
+            "before this column existed all defaulted to 0 and were "
+            "renumbered per conversation by migration 3e4b5f7586d3, so it "
+            "is a total order within a conversation and cursor pagination "
+            "can key on it alone."
         ),
     )
 

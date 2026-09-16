@@ -7,6 +7,8 @@ this must not break).
 """
 from __future__ import annotations
 
+import base64
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -205,30 +207,44 @@ class TestPendingRowInclusion:
         assert [i["content"] for i in page.items] == ["q"]
 
 
-class TestLegacySeqZero:
-    def test_legacy_all_seq_zero_conversation_pages_without_dup_or_skip(self, session, conversation):
-        # Legacy pre-migration rows: seq is 0 and created_at ties for
-        # everything, so the only remaining tiebreaks are role (user before
-        # assistant) then id. Insertion order within a role group is NOT
-        # preserved (id is effectively random) -- what must hold is: every
-        # row appears exactly once across all pages, and every user row
-        # sorts before every assistant row (the one deterministic guarantee
-        # _MESSAGE_ORDER gives legacy data).
+class TestPagedAndUnboundedReadsAgree:
+    """The two branches of GET /items must render the same history.
+
+    This is the property that matters, and the one an earlier version of
+    this file did not check: it built every legacy row with an identical
+    created_at, which is the only shape where a seq-keyed cursor and
+    _MESSAGE_ORDER cannot disagree, and then asserted the grouping the
+    implementation happened to produce. Real rows carry distinct
+    second-precision timestamps. The pre-seq rows that all share seq 0 are
+    renumbered by migration 3e4b5f7586d3 (proved in
+    test_message_seq_backfill_migration.py); here the concern is that a
+    multi-page walk of ordinary rows reproduces the unbounded list exactly.
+    """
+
+    def test_page_walk_reproduces_the_unbounded_list(self, session, conversation):
         svc = ConversationService(session)
-        inserted = []
         for i in range(6):
             role = Role.user if i % 2 == 0 else Role.assistant
-            inserted.append(
-                _add_message(session, conversation, role=role, content=f"legacy{i}", seq=0, minute=0)
-            )
+            _add_message(session, conversation, role=role, content=f"m{i}", seq=i, minute=i)
+
         items, _ = _walk_all_pages(svc, conversation.id, limit=2)
 
-        assert {i["id"] for i in items} == {m.id for m in inserted}
-        assert len(items) == len(set(i["id"] for i in items))  # no duplicates
-        roles = [i["role"] for i in items]
-        last_user_pos = max(idx for idx, r in enumerate(roles) if r == Role.user)
-        first_assistant_pos = min(idx for idx, r in enumerate(roles) if r == Role.assistant)
-        assert last_user_pos < first_assistant_pos
+        unbounded = svc.get_messages(conversation.id)
+        assert [i["id"] for i in items] == [m["id"] for m in unbounded]
+        assert [i["content"] for i in items] == [f"m{i}" for i in range(6)]
+
+    def test_rows_sharing_one_created_at_stay_in_seq_order(self, session, conversation):
+        # One turn's block-messages commit together, so they share a
+        # second-precision created_at and only seq separates them.
+        svc = ConversationService(session)
+        for i in range(6):
+            role = Role.user if i % 2 == 0 else Role.assistant
+            _add_message(session, conversation, role=role, content=f"m{i}", seq=i, minute=0)
+
+        items, _ = _walk_all_pages(svc, conversation.id, limit=2)
+
+        assert [i["content"] for i in items] == [f"m{i}" for i in range(6)]
+        assert [i["id"] for i in items] == [m["id"] for m in svc.get_messages(conversation.id)]
 
 
 class TestValidation:
@@ -243,6 +259,21 @@ class TestValidation:
     def test_malformed_cursor_is_rejected(self, session, conversation):
         with pytest.raises(InvalidPaginationParams):
             ConversationService(session).get_messages_page(conversation.id, before="not-a-real-cursor")
+
+    @pytest.mark.parametrize("payload", [
+        [10**30, 1, "00000000-0000-0000-0000-000000000001"],   # seq wider than the column
+        [-1, 1, "00000000-0000-0000-0000-000000000001"],       # seq below any real row
+        [0, 7, "00000000-0000-0000-0000-000000000001"],        # role rank outside {0, 1}
+    ])
+    def test_out_of_range_cursor_is_rejected_not_raised_from_the_driver(
+        self, session, conversation, payload
+    ):
+        # `before` is unsigned client input. A decodable but out-of-range
+        # value used to reach the driver and surface as a 500 with a
+        # SQLAlchemy traceback instead of this service's own 400.
+        cursor = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+        with pytest.raises(InvalidPaginationParams):
+            ConversationService(session).get_messages_page(conversation.id, before=cursor)
 
 
 class TestOrgIsolation404Parity:
