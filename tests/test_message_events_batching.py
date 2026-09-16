@@ -1,4 +1,4 @@
-"""ENG-2768: get_messages fetched every message's MessageEvents in its own
+"""get_messages fetched every message's MessageEvents in its own
 query (an N+1). _hydrate_message_items batches them into one
 `WHERE message_id IN (...)` query, grouped by message_id in Python — this
 only regression-tests that grouping preserves each message's own event
@@ -87,3 +87,28 @@ def test_message_with_no_events_gets_empty_list(session, conversation):
     items = ConversationService(session).get_messages(conversation.id)
     assert items[0]["id"] == m.id
     assert items[0]["events"] == []
+
+
+def test_events_batch_correctly_across_the_in_clause_chunk_boundary(session, conversation):
+    # A 1,000-message conversation (the ticket's own largest verification
+    # size) binds one parameter per visible message in the events IN(...)
+    # query if it isn't chunked — past some SQLite builds' bound-parameter
+    # ceiling. Insert more messages than one chunk holds and confirm every
+    # message's events still resolve correctly, not just the first chunk's.
+    from cowork.services.conversations import _EVENTS_IN_CHUNK_SIZE
+
+    count = _EVENTS_IN_CHUNK_SIZE + 5
+    messages = [
+        _add_message(
+            session, conversation, role=Role.assistant, content=f"m{i}", seq=i,
+            events=[{"step": i}],
+        )
+        for i in range(count)
+    ]
+
+    items = ConversationService(session).get_messages(conversation.id)
+
+    by_id = {item["id"]: item for item in items}
+    assert len(items) == count
+    for i, m in enumerate(messages):
+        assert by_id[m.id]["events"] == [{"step": i}]

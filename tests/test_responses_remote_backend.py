@@ -1523,7 +1523,7 @@ async def test_a_forced_continuation_persists_only_the_replacement(monkeypatch):
     assert saved["assistant"] == "REPLACEMENT"
 
 
-# ── ENG-2768: the persisted assistant message id rides the completion frame ──
+# ── The persisted assistant message id rides the completion frame ──
 
 def _remote_handler_with_message_id(monkeypatch, saved, *, assistant_message_id):
     """Same DB-layer fake as _remote_handler, but save_assistant_turn returns

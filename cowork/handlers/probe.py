@@ -76,7 +76,7 @@ class ProbeHandler:
 
         def _persist_once(conversation_id: UUID | None):
             # Idempotent — every response.completed below calls this so the
-            # turn's real assistant message id (ENG-2768) can ride the SAME
+            # turn's real assistant message id can ride the SAME
             # frame the client's SSE reader stops at; a probe turn legitimately
             # persists nothing when there's no conversation or no body text.
             nonlocal persisted
@@ -92,7 +92,7 @@ class ProbeHandler:
         def _completed(conversation_id: UUID | None, response_fields: dict) -> str:
             # _push records the (id-less) event and bumps seq first, exactly
             # like every other event — persistence must see this completion
-            # event in recorded_events, matching the pre-ENG-2768 ordering
+            # event in recorded_events, matching the ordering this replaced,
             # where _save_assistant_turn always ran after this push.
             wire = _push(
                 "response.completed",

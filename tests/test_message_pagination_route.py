@@ -1,4 +1,4 @@
-"""ENG-2768: GET /conversations/{id}/items route-level dispatch — omitting
+"""GET /conversations/{id}/items route-level dispatch — omitting
 both `limit`/`before` must stay byte-identical to today's bare list (the
 existing consumer this preserves is asserted directly in
 test_conversation_model_persistence.py/test_org_isolation_e2e.py); passing

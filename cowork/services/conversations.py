@@ -44,6 +44,12 @@ _MAX_PAGE_LIMIT = 200
 # an unbounded query; a page that hits this cap is simply reported as
 # `has_more=True` so the client just asks again.
 _SCAN_CAP_MULTIPLIER = 10
+# Batch size for _hydrate_message_items's MessageEvent `IN (...)` query —
+# comfortably under every SQLite build's bound-parameter ceiling (including
+# pre-3.32 defaults of 999) while still batching hundreds of ids per round
+# trip on the unbounded get_messages branch a 1,000+ message conversation
+# can reach.
+_EVENTS_IN_CHUNK_SIZE = 500
 
 # created_at is only second-precision, so rows of turns in the same second
 # would otherwise interleave. `seq` is a per-conversation monotonic ordinal
@@ -57,22 +63,38 @@ _MESSAGE_ORDER = (
     Message.id,
 )
 
+# Keyset comparison tuple for get_messages_page's cursor, deliberately NOT
+# _MESSAGE_ORDER: created_at is populated two different ways depending on the
+# write path — an explicit Python datetime (bound with microsecond precision)
+# on most test/legacy paths, vs `server_default=sa.func.now()` on the normal
+# save_user_message/save_assistant_turn path, which SQLite stores as a bare
+# second-precision string. A cursor built from one and compared against rows
+# written the other way compares unequal-length datetime strings, and SQLite
+# resolves that lexicographically rather than temporally — the leading tuple
+# column then never satisfies `<`, so every "before" query matches every row,
+# every page repeats the newest N forever. `seq` is already a per-conversation
+# monotonic ordinal assigned at insert (max(seq)+1) that tracks the same real
+# insert order created_at was approximating, so it alone is a safe, precise
+# keyset key for any two rows with different seq; role/id remain as the
+# tiebreak for legacy rows (seq 0 for all of them — ordered by role then id
+# among themselves, same as _MESSAGE_ORDER already tolerates for that case).
+_MESSAGE_CURSOR_ORDER = (
+    Message.seq,
+    case((Message.role == Role.user, 0), else_=1),
+    Message.id,
+)
 
-def _message_order_key(message: Message) -> tuple[datetime | None, int, int, UUID]:
-    """The runtime value of each _MESSAGE_ORDER column for one row, in the
-    same order — used to build a keyset pagination cursor from it."""
+
+def _message_cursor_key(message: Message) -> tuple[int, int, UUID]:
+    """The runtime value of each _MESSAGE_CURSOR_ORDER column for one row, in
+    the same order — used to build a keyset pagination cursor from it."""
     role_rank = 0 if message.role == Role.user else 1
-    return (message.created_at, message.seq, role_rank, message.id)
+    return (message.seq, role_rank, message.id)
 
 
 def _encode_message_cursor(message: Message) -> str:
-    created_at, seq, role_rank, message_id = _message_order_key(message)
-    payload = [
-        created_at.isoformat() if created_at else None,
-        seq,
-        role_rank,
-        str(message_id),
-    ]
+    seq, role_rank, message_id = _message_cursor_key(message)
+    payload = [seq, role_rank, str(message_id)]
     return base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
 
 
@@ -83,12 +105,11 @@ class InvalidPaginationParams(ValueError):
     (mapped to 404)."""
 
 
-def _decode_message_cursor(cursor: str) -> tuple[datetime | None, int, int, UUID]:
+def _decode_message_cursor(cursor: str) -> tuple[int, int, UUID]:
     try:
         raw = base64.urlsafe_b64decode(cursor.encode())
-        created_at_iso, seq, role_rank, message_id = json.loads(raw)
-        created_at = datetime.fromisoformat(created_at_iso) if created_at_iso else None
-        return (created_at, int(seq), int(role_rank), UUID(message_id))
+        seq, role_rank, message_id = json.loads(raw)
+        return (int(seq), int(role_rank), UUID(message_id))
     except Exception as e:
         raise InvalidPaginationParams("Malformed pagination cursor") from e
 
@@ -722,7 +743,7 @@ class ConversationService:
         instead of a positional index — a client that has only lazily
         loaded the most recent page of a long conversation cannot compute a
         correct absolute position, and getting that wrong here would delete
-        the wrong range of history (see ENG-2768).
+        the wrong range of history.
 
         `message_id` must be one of:
         - a visible assistant message (role=assistant, not a hidden
@@ -768,12 +789,21 @@ class ConversationService:
             if j >= 0 and messages[j].role.value == "user":
                 cut_from = j
         elif anchor.role.value == "user" and not _is_tool_row(anchor.content):
-            # Orphan anchor: valid only if nothing visible answers it yet.
+            # Orphan anchor: valid only if nothing visible answers it yet. A
+            # visible assistant row with empty content is a turn that failed
+            # or was stopped before producing anything — save_assistant_turn
+            # still persists it when it carries events (e.g. the
+            # response.failed record), but the client renders no bubble for
+            # it and treats the user row as the orphan instead
+            # (isSkippedFailedAssistant / isOrphanUser,
+            # lib/turnVisibility.js) — the two must agree, or deleting
+            # exactly the "stopped/failed before any answer" turn the ticket
+            # calls out 404s here.
             answered = False
             for m in messages[anchor_index + 1 :]:
                 if _is_tool_row(m.content):
                     continue
-                answered = m.role.value == "assistant"
+                answered = m.role.value == "assistant" and bool(m.content)
                 break  # first visible row after the anchor decides it either way
             if answered:
                 raise ValueError(f"Turn anchor {message_id} already has a reply")
@@ -829,8 +859,8 @@ class ConversationService:
         tool_rows: list[dict] | None = None,
     ) -> Message | None:
         """Persist an assistant turn. Returns the created assistant Message
-        (its id is what the completion SSE frames hand back to the browser,
-        ENG-2768), or None on the early-return below when nothing was
+        (its id is what the completion SSE frames hand back to the browser),
+        or None on the early-return below when nothing was
         actually persisted.
 
         `tool_rows` are the turn's tool block-messages ({role, content} with
@@ -956,19 +986,26 @@ class ConversationService:
     def _hydrate_message_items(self, messages: Iterable[Message]) -> list[dict]:
         """Turn ordered Message rows into the UI-facing item-dict shape,
         skipping hidden tool rows. Fetches every included message's events in
-        one batched query instead of one per message (the events relationship
-        is intentionally not used here — this keeps the query shape explicit
-        and ordered)."""
+        one batched query per _EVENTS_IN_CHUNK_SIZE ids instead of one per
+        message (the events relationship is intentionally not used here —
+        this keeps the query shape explicit and ordered). Chunked rather than
+        a single `IN (...)` over every id: a 1,000-message conversation (the
+        ticket's own largest verification size) would otherwise bind one
+        parameter per visible message, which is fine on Postgres and modern
+        SQLite but exceeds older SQLite builds' bound-parameter limit."""
         visible = [m for m in messages if not _is_tool_row(m.content)]
         if not visible:
             return []
         events_by_message: dict[UUID, list] = {}
-        for event in self.session.exec(
-            self.session.select(MessageEvent)
-            .where(MessageEvent.message_id.in_([m.id for m in visible]))
-            .order_by(MessageEvent.message_id, MessageEvent.sequence_number)
-        ).all():
-            events_by_message.setdefault(event.message_id, []).append(event.event_data)
+        visible_ids = [m.id for m in visible]
+        for start in range(0, len(visible_ids), _EVENTS_IN_CHUNK_SIZE):
+            chunk = visible_ids[start : start + _EVENTS_IN_CHUNK_SIZE]
+            for event in self.session.exec(
+                self.session.select(MessageEvent)
+                .where(MessageEvent.message_id.in_(chunk))
+                .order_by(MessageEvent.message_id, MessageEvent.sequence_number)
+            ).all():
+                events_by_message.setdefault(event.message_id, []).append(event.event_data)
         result = []
         for message in visible:
             item = {
@@ -1018,9 +1055,8 @@ class ConversationService:
 
         stmt = self.session.select(Message).where(Message.conversation_id == conversation_id)
         if cursor is not None:
-            stmt = stmt.where(tuple_(*_MESSAGE_ORDER) < tuple_(*cursor))
+            stmt = stmt.where(tuple_(*_MESSAGE_CURSOR_ORDER) < tuple_(*cursor))
         stmt = stmt.order_by(
-            Message.created_at.desc(),
             Message.seq.desc(),
             case((Message.role == Role.user, 0), else_=1).desc(),
             Message.id.desc(),

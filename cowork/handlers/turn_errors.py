@@ -1142,7 +1142,7 @@ def response_failed_payload(
     unexpected error occurred" can still be pinned to this turn's server-side
     logs. The direct and channel producers have none to offer and omit it.
 
-    ``assistant_message_id`` (ENG-2768) is the persisted assistant Message's
+    ``assistant_message_id`` is the persisted assistant Message's
     id when the failed turn still produced one (e.g. partial text before an
     error) — lets the client anchor delete/rekey logic on it immediately,
     without waiting for a reload. Omitted, not null, when nothing was

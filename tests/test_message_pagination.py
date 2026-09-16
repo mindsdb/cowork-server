@@ -1,4 +1,4 @@
-"""ENG-2768: GET /conversations/{id}/items grows an opt-in, cursor-based
+"""GET /conversations/{id}/items grows an opt-in, cursor-based
 `limit`/`before` pagination on ConversationService.get_messages_page.
 Omitting both params keeps get_messages's existing unbounded bare-list
 behavior untouched (asserted at the route level in
@@ -69,6 +69,20 @@ def _add_message(
     return message
 
 
+def _add_message_with_server_default_created_at(session, conversation, *, role, content, seq):
+    """Like _add_message, but omits created_at so the DB's own
+    `server_default=sa.func.now()` populates it — the real write path
+    (save_user_message/save_assistant_turn never pass an explicit
+    created_at). On SQLite this stores a bare second-precision string,
+    unlike the microsecond-formatted value a bound Python datetime
+    produces; the cursor must not depend on the two matching."""
+    message = Message(conversation_id=conversation.id, role=role, content=content, seq=seq)
+    session.add(message)
+    session.commit()
+    session.refresh(message)
+    return message
+
+
 def _add_visible_run(session, conversation, count, *, start_seq=0):
     """`count` plain visible messages, oldest to newest, alternating role."""
     messages = []
@@ -101,7 +115,7 @@ def _walk_all_pages(svc, conversation_id, *, limit):
 
 class TestPageBoundariesAndCursor:
     def test_first_page_is_the_most_recent_items_in_ascending_order(self, session, conversation):
-        msgs = _add_visible_run(session, conversation, 5)
+        _add_visible_run(session, conversation, 5)
         svc = ConversationService(session)
         page = svc.get_messages_page(conversation.id, limit=2)
         assert [i["content"] for i in page.items] == ["m3", "m4"]
@@ -109,7 +123,7 @@ class TestPageBoundariesAndCursor:
         assert page.next_before is not None
 
     def test_cursor_walks_back_without_duplicate_or_skipped_messages(self, session, conversation):
-        msgs = _add_visible_run(session, conversation, 11)
+        _add_visible_run(session, conversation, 11)
         svc = ConversationService(session)
         items, pages = _walk_all_pages(svc, conversation.id, limit=3)
         assert [i["content"] for i in items] == [f"m{i}" for i in range(11)]
@@ -130,6 +144,29 @@ class TestPageBoundariesAndCursor:
         second = svc.get_messages_page(conversation.id, limit=2, before=first.next_before)
         assert [i["content"] for i in second.items] == ["m0", "m1"]
         assert second.has_more is False
+
+    def test_cursor_advances_when_created_at_comes_from_the_db_server_default(self, session, conversation):
+        # The real write path never passes an explicit created_at (see
+        # _add_message_with_server_default_created_at) — SQLite's own
+        # CURRENT_TIMESTAMP stores a bare second-precision string, while a
+        # cursor built from a Python datetime binds with forced microsecond
+        # formatting. A keyset comparison that leads on created_at compares
+        # those two representations as permanently unequal-length strings,
+        # which SQLite orders lexicographically: the boundary row's
+        # created_at then never satisfies `<`, so every "before" query
+        # matches every row again and every page repeats the same content
+        # forever. Keying the cursor on `seq` instead (monotonic, assigned
+        # at insert, independent of created_at's storage format) is immune
+        # to this regardless of which write path populated the timestamp.
+        for i in range(4):
+            role = Role.user if i % 2 == 0 else Role.assistant
+            _add_message_with_server_default_created_at(
+                session, conversation, role=role, content=f"m{i}", seq=i,
+            )
+        svc = ConversationService(session)
+        items, pages = _walk_all_pages(svc, conversation.id, limit=2)
+        assert [i["content"] for i in items] == ["m0", "m1", "m2", "m3"]
+        assert pages == 2
 
 
 class TestToolRowFiltering:

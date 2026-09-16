@@ -1,5 +1,5 @@
 """Seed a conversation with a long message history, for manually verifying
-ENG-2768 (loading feedback + cursor pagination) at realistic sizes.
+loading feedback and cursor pagination at realistic sizes.
 
 Bulk-inserts `Message` rows directly rather than going through
 `ConversationService.save_assistant_turn` — that path does one extra
@@ -91,7 +91,7 @@ def _ensure_project(session: Session, project_id: UUID | None) -> UUID:
 
 def seed(session: Session, *, count: int, project_id: UUID | None) -> UUID:
     resolved_project_id = _ensure_project(session, project_id)
-    conversation = Conversation(project_id=resolved_project_id, topic=f"ENG-2768 seed ({count} messages)")
+    conversation = Conversation(project_id=resolved_project_id, topic=f"Seeded long conversation ({count} messages)")
     session.add(conversation)
     session.commit()
     session.refresh(conversation)

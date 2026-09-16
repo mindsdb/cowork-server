@@ -205,7 +205,7 @@ def _visible(session, conv):
 
 
 def _assistant_message_id(session, conv, answer_text):
-    """delete_turn is anchored by message id (ENG-2768), not a UI position."""
+    """delete_turn is anchored by message id, not a UI position."""
     return next(
         m["id"]
         for m in ConversationService(session).get_messages(conv.id)

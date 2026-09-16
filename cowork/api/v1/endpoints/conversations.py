@@ -164,7 +164,7 @@ def get_messages(
             return svc.get_messages(conversation_id)
         page_kwargs = {"before": before}
         if limit is not None:
-            page_kwargs["limit"] = limit  # let get_messages_page default when omitted; pass through (even invalid) values otherwise
+            page_kwargs["limit"] = limit
         page = svc.get_messages_page(conversation_id, **page_kwargs)
     except InvalidPaginationParams as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
@@ -188,7 +188,7 @@ def delete_conversation_turn(conversation_id: UUID, message_id: UUID, scoped: Sc
     message_id anchors the turn: the visible assistant message it produced,
     or (for a turn stopped/failed before any answer) the opening user
     message itself. A positional index doesn't survive lazy-loaded/
-    paginated history (ENG-2768), so this took over from an earlier
+    paginated history, so this took over from an earlier
     `turn_index: int` path param — an old client still sending an int 422s
     here, and a new client sending a UUID would have 422d against the old
     route, so the break is fail-closed both directions.

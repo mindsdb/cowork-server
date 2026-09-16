@@ -37,7 +37,7 @@ def _rows_for(session, conversation_id) -> list[TaskObject]:
 
 
 def _assistant_message_ids(session, conversation_id):
-    """delete_turn is anchored by message id (ENG-2768), not a position —
+    """delete_turn is anchored by message id, not a position —
     this reproduces the old "Nth assistant turn" selection these tests
     relied on, ordered the same way ConversationService orders history."""
     from cowork.models.message import Message

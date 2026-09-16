@@ -1,4 +1,4 @@
-"""ENG-2768: delete_turn is anchored by message id instead of a positional
+"""delete_turn is anchored by message id instead of a positional
 turn_index. The old index was resolved against whatever the CLIENT
 happened to have loaded — on a lazily-paginated long conversation that's
 only ever a partial view, so a client-computed index could name the wrong
@@ -62,7 +62,7 @@ def _visible_pairs(svc, conv):
 
 def test_delete_by_assistant_id_removes_that_turn_and_everything_after(session, conversation):
     svc = ConversationService(session)
-    a1 = _turn(svc, conversation, "q1", "a1")
+    _turn(svc, conversation, "q1", "a1")
     _turn(svc, conversation, "q2", "a2")
     _turn(svc, conversation, "q3", "a3")
 
@@ -91,6 +91,28 @@ def test_delete_orphan_turn_by_user_message_id(session, conversation):
     svc = ConversationService(session)
     _turn(svc, conversation, "q1", "a1")
     orphan = svc.save_user_message(conversation.id, "q2-never-answered")
+
+    svc.delete_turn(conversation.id, orphan.id)
+
+    assert _visible_pairs(svc, conversation) == [("user", "q1"), ("assistant", "a1")]
+
+
+def test_delete_orphan_turn_whose_failed_reply_persisted_empty_content(session, conversation):
+    # A turn that failed before producing any text still persists an
+    # assistant row: save_assistant_turn only truly no-ops when text,
+    # events, AND tool_rows are all empty, and a response.failed record
+    # alone makes events non-empty. The client renders no bubble for that
+    # empty reply and treats the user row as the orphan
+    # (isSkippedFailedAssistant / isOrphanUser, lib/turnVisibility.js); the
+    # server must agree, or exactly the "turn failed before answering"
+    # case the ticket calls out 404s instead of deleting.
+    svc = ConversationService(session)
+    _turn(svc, conversation, "q1", "a1")
+    orphan = svc.save_user_message(conversation.id, "q2-failed")
+    svc.save_assistant_turn(
+        conversation.id, "",
+        [{"type": "response.failed", "code": "rate_limited", "error": "Too many requests"}],
+    )
 
     svc.delete_turn(conversation.id, orphan.id)
 

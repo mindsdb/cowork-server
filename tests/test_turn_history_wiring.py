@@ -80,8 +80,8 @@ def test_remote_path_gates_rows_on_a_clean_finish():
     """Rows arrive before the terminal event and persist() also runs on failure
     and cancellation, so the gate is what keeps a torn turn text-only.
 
-    Two `persist(clean=True)` call sites live on the SAME clean-finish path
-    (ENG-2768): one fires as soon as the terminal frame is about to go out,
+    Two `persist(clean=True)` call sites live on the SAME clean-finish path:
+    one fires as soon as the terminal frame is about to go out,
     so the assistant message's real id can ride it; the other is the
     original unconditional call after the formatter loop drains, kept as a
     fallback for a formatter that returns without yielding a terminal frame
@@ -93,7 +93,7 @@ def test_remote_path_gates_rows_on_a_clean_finish():
     assert "tool_rows=turn_rows if clean else None" in src
     assert "persist(clean=True)" in src
     # Both clean=True call sites live on the success path: the early one
-    # (ENG-2768) fires as the terminal frame is about to go out, so the
+    # fires as the terminal frame is about to go out, so the
     # assistant message's real id can ride it; the other is the original
     # unconditional call after the formatter loop drains, kept as a fallback
     # for a formatter that returns without yielding a terminal frame

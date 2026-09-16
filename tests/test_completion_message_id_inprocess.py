@@ -1,4 +1,4 @@
-"""ENG-2768: the in-process producers (_run_turn, _produce_direct) and the
+"""The in-process producers (_run_turn, _produce_direct) and the
 data-vault probe (ProbeHandler) hand the browser the persisted assistant
 message's id on the completion frame, so a client can rekey delete/sidecar/
 usage-notice logic off it instead of a positional index that doesn't survive
@@ -119,6 +119,56 @@ async def test_run_turn_failed_frame_carries_the_id_when_something_persisted():
     failed = [f for f in buffer.frames if f.startswith("event: response.failed")]
     assert len(failed) == 1
     assert _payload(failed[0])["assistant_message_id"] == str(real_id)
+
+
+# ── A delta frame that quotes a frame-type name must not be mistaken for
+# the real thing (model output is untrusted input) ─────────────────────────
+
+@pytest.mark.asyncio
+async def test_run_turn_ignores_a_delta_frame_whose_text_quotes_a_frame_type_name():
+    real_id = uuid4()
+    # The delta's own text contains the literal substring "response.completed"
+    # — e.g. the model discussing the API, or a prompt-injected instruction —
+    # inside a frame that is NOT the real completion. A naive substring match
+    # over the whole SSE text (rather than the frame's own `event:` line)
+    # would mistake this for the terminal frame: persist a partial turn early
+    # and rewrite this delta's event line to `response.completed`.
+    async def formatter(stream, model, event_sink):
+        yield "event: response.created\ndata: {}\n\n"
+        yield (
+            'event: response.output_text.delta\ndata: '
+            '{"type": "response.output_text.delta", '
+            '"delta": "note: the stream ends with event: response.completed"}\n\n'
+        )
+        yield ('event: response.completed\ndata: {"type": "response.completed", '
+               '"response": {"output": [{"content": [{"type": "output_text", "text": "hi"}]}]}}\n\n')
+
+    handler = _handler_with_formatter(formatter)
+    buffer = _Buffer()
+    conv_id = uuid4()
+    with (
+        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
+        patch("cowork.handlers.responses.ConversationService") as conv_svc,
+        patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
+    ):
+        conv_svc.return_value.get_conversation.return_value = MagicMock()
+        conv_svc.return_value.save_user_message.return_value = SimpleNamespace(id=uuid4())
+        conv_svc.return_value.save_assistant_turn.return_value = SimpleNamespace(id=real_id)
+        await handler._produce(
+            conv_id=conv_id, harness_input=[{"type": "text", "text": "hi"}],
+            original_content="hi", model="anton", disabled=None,
+            harness_name="anton", harness_id="anton", buffer=buffer,
+        )
+
+    delta_frames = [f for f in buffer.frames if f.startswith("event: response.output_text.delta")]
+    completed_frames = [f for f in buffer.frames if f.startswith("event: response.completed")]
+    assert len(delta_frames) == 1, "the delta frame must pass through unchanged, not be consumed/rewritten"
+    assert "response.completed" in _payload(delta_frames[0])["delta"], "delta text itself is untouched"
+    assert len(completed_frames) == 1, "only the real terminal frame counts as a completion"
+    assert _payload(completed_frames[0])["assistant_message_id"] == str(real_id)
+    # The early-persist path must only fire on the real completion,
+    # not once per frame that happens to mention it in its own text.
+    assert conv_svc.return_value.save_assistant_turn.call_count == 1
 
 
 @pytest.mark.asyncio

@@ -704,7 +704,7 @@ class ResponsesHandler:
                 "sequence_number": 3,
                 "response": completed_response,
             }
-            # ENG-2768: the persisted row's real id, at the frame root (not
+            # The persisted row's real id, at the frame root (not
             # inside `response`) — lets the client delete/rekey this turn
             # without ever having only a positional index for it. Both rows
             # are already persisted above, before this frame is built, so no
@@ -1309,8 +1309,8 @@ class ResponsesHandler:
                     # harness; inject them like the in-process path does.
                     sse = self._inject_created(sse, conv_id, harness_id)
                     first = False
-                if "response.completed" in sse:
-                    # Persist now (ENG-2768) — event_sink has already seen
+                if self._sse_event_type(sse) == "response.completed":
+                    # Persist now — event_sink has already seen
                     # every delta/event this turn produced, since the
                     # formatter only yields its terminal frame after its
                     # source is exhausted — so this turn's real id can ride
@@ -1338,7 +1338,7 @@ class ResponsesHandler:
                 extra={"request_id": corr},
             )
             collected_events.append(response_failed_payload(message, code, request_id=corr))
-            # Persist before building the frame (ENG-2768) — a client's SSE
+            # Persist before building the frame — a client's SSE
             # reader stops at response.failed, so any id has to ride this
             # frame, not one after it.
             assistant_msg = persist()
@@ -1379,7 +1379,7 @@ class ResponsesHandler:
             )
             collected_events.append(response_failed_payload(
                 GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr))
-            # Persist before building the frame (ENG-2768) — see the
+            # Persist before building the frame — see the
             # _RemoteTurnFailed branch above for why.
             assistant_msg = persist()
             await buffer.append("sse", {"sse": response_failed_sse(
@@ -1506,8 +1506,8 @@ class ResponsesHandler:
             async for sse_string in harness.formatter(stream, model, event_sink):
                 event_count += 1
                 sse_string = self._inject_created(sse_string, conv_id, harness_id)
-                if "response.completed" in sse_string:
-                    # Persist now (ENG-2768), same reasoning as _produce_remote:
+                if self._sse_event_type(sse_string) == "response.completed":
+                    # Persist now, same reasoning as _produce_remote:
                     # the formatter only yields its terminal frame once its
                     # source is exhausted, so event_sink has already seen
                     # everything this turn produced. The unconditional
@@ -1693,7 +1693,7 @@ class ResponsesHandler:
             # the generic card alone, so there is nothing to quote for one.
             extra["request_id"] = corr
             failed = response_failed_payload(message, code, **extra)
-            # Append to collected_events BEFORE persisting (ENG-2768) — persist()
+            # Append to collected_events BEFORE persisting — persist()
             # reads collected_events to build the assistant row, and this failure
             # event must land in it exactly as it did before this frame carried
             # an id; only the append/persist order relative to the SSE frame
@@ -1710,26 +1710,44 @@ class ResponsesHandler:
             producer_session.close()
 
     @staticmethod
-    def _inject_created(sse_string: str, conversation_id: UUID, harness_id: str | None) -> str:
+    def _sse_event_type(sse_string: str) -> str | None:
+        """The frame's own `event:` line, e.g. "response.completed" — every
+        frame in this codebase is built by `sse_frame`/this same f-string
+        shape, always `event: {type}\\n` as the first line (streaming/sse.py).
+
+        Never substring-search the full SSE text for a frame type: the JSON
+        payload can carry untrusted model output (a delta chunk, an error
+        message) that happens to contain a frame-type-looking string, which
+        would otherwise make a plain delta frame match "response.completed"
+        and get rewritten into one — persisting a partial turn early and
+        mislabeling the real event to the client."""
+        first_line = sse_string.strip().split("\n", 1)[0]
+        prefix = "event: "
+        return first_line[len(prefix):].strip() if first_line.startswith(prefix) else None
+
+    @classmethod
+    def _inject_created(cls, sse_string: str, conversation_id: UUID, harness_id: str | None) -> str:
         """Inject conversation_id + harness into the response.created event so
         the client learns the canonical id and which agent generated this."""
-        if "response.created" in sse_string and "conversation_id" not in sse_string:
-            try:
-                lines = sse_string.strip().split("\n")
-                data_line = next(line for line in lines if line.startswith("data:"))
-                payload = json.loads(data_line[5:])
-                payload["conversation_id"] = str(conversation_id)
-                if harness_id:
-                    payload["harness"] = harness_id
-                return f"event: response.created\ndata: {json.dumps(payload)}\n\n"
-            except Exception:
-                pass
-        return sse_string
+        if cls._sse_event_type(sse_string) != "response.created":
+            return sse_string
+        try:
+            lines = sse_string.strip().split("\n")
+            data_line = next(line for line in lines if line.startswith("data:"))
+            payload = json.loads(data_line[5:])
+            if "conversation_id" in payload:
+                return sse_string
+            payload["conversation_id"] = str(conversation_id)
+            if harness_id:
+                payload["harness"] = harness_id
+            return f"event: response.created\ndata: {json.dumps(payload)}\n\n"
+        except Exception:
+            return sse_string
 
-    @staticmethod
-    def _inject_completion_id(sse_string: str, assistant_message_id: UUID | None) -> str:
+    @classmethod
+    def _inject_completion_id(cls, sse_string: str, assistant_message_id: UUID | None) -> str:
         """Inject the persisted assistant message's id into a formatter-built
-        response.completed frame (ENG-2768), at the frame root (sibling to
+        response.completed frame, at the frame root (sibling to
         `type`/`response`, not nested inside `response.output`) — the client
         reads it from there the same way `_inject_created` places
         conversation_id/harness. Persistence for this turn must already have
@@ -1740,7 +1758,7 @@ class ResponsesHandler:
         A turn that persisted nothing (an early-return in save_assistant_turn)
         passes assistant_message_id=None and the field is simply omitted,
         same convention as response_failed_payload's optional fields."""
-        if "response.completed" not in sse_string:
+        if cls._sse_event_type(sse_string) != "response.completed":
             return sse_string
         try:
             lines = sse_string.strip().split("\n")
