@@ -158,3 +158,47 @@ def test_an_unconfirmed_publisher_403_is_not_a_permission_denial(tmp_path, monke
     with pytest.raises(RuntimeError) as error:
         publish.publish_artifact(page, artifacts_base=tmp_path, api_key="key", publish_url="https://4nton.ai")
     assert "HTTP 403" in str(error.value)
+
+
+from anton.publisher import PublishJobFailed, PublishJobTimeout
+from cowork.services.product_permissions import ProductPermissionUnavailable
+
+
+def test_job_failed_503_maps_to_product_permission_unavailable():
+    exc = PublishJobFailed(503, "auth service unavailable", job_id="a" * 32, report_id="r")
+    with pytest.raises(ProductPermissionUnavailable):
+        publish.raise_publish_permission_error(exc)
+
+
+@pytest.mark.parametrize("exc", [
+    PublishJobFailed(400, "pip install failed: x", job_id="a" * 32, report_id="r"),
+    PublishJobFailed(403, "denied", job_id="a" * 32, report_id="r"),
+    PublishJobTimeout(job_id="a" * 32, report_id="r", waited_s=180),
+])
+def test_other_job_errors_are_left_alone(exc):
+    publish.raise_publish_permission_error(exc)  # returns None, no raise
+
+
+def test_job_failed_400_surfaces_server_text_as_502(tmp_path, monkeypatch):
+    art = tmp_path / "art"
+    art.mkdir()
+    page = art / "dashboard.html"
+    page.write_text("<h1>dash</h1>")
+    exc = PublishJobFailed(400, "pip install failed: no wheel", job_id="a" * 32, report_id="r")
+    _wire_publish(monkeypatch, tmp_path, page, "dashboard.html", publish_side_effect=exc)
+    with pytest.raises(RuntimeError) as ei:
+        publish.publish_artifact(page, artifacts_base=tmp_path, api_key="k", publish_url="https://p")
+    assert str(ei.value) == "Publishing failed: " + str(exc)
+    assert "pip install failed: no wheel" in str(ei.value)
+
+
+def test_job_timeout_surfaces_job_id_as_502(tmp_path, monkeypatch):
+    art = tmp_path / "art"
+    art.mkdir()
+    page = art / "dashboard.html"
+    page.write_text("<h1>dash</h1>")
+    exc = PublishJobTimeout(job_id="b" * 32, report_id="r", waited_s=180)
+    _wire_publish(monkeypatch, tmp_path, page, "dashboard.html", publish_side_effect=exc)
+    with pytest.raises(RuntimeError) as ei:
+        publish.publish_artifact(page, artifacts_base=tmp_path, api_key="k", publish_url="https://p")
+    assert "b" * 32 in str(ei.value)
