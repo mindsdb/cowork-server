@@ -73,11 +73,12 @@ def _add_message(
 
 def _add_message_with_server_default_created_at(session, conversation, *, role, content, seq):
     """Like _add_message, but omits created_at so the DB's own
-    `server_default=sa.func.now()` populates it — the real write path
-    (save_user_message/save_assistant_turn never pass an explicit
-    created_at). On SQLite this stores a bare second-precision string,
-    unlike the microsecond-formatted value a bound Python datetime
-    produces; the cursor must not depend on the two matching."""
+    `server_default=sa.func.now()` populates it — the way save_assistant_turn
+    writes. save_user_message takes the opposite path and binds an explicit
+    Python datetime (handlers/responses.py, channels/runtime.py), so a single
+    turn stores the two formats side by side: SQLite keeps a bare
+    second-precision string for one and a microsecond-formatted value for the
+    other. Ordering must not depend on the two being comparable."""
     message = Message(conversation_id=conversation.id, role=role, content=content, seq=seq)
     session.add(message)
     session.commit()
@@ -222,12 +223,34 @@ class TestPagedAndUnboundedReadsAgree:
     """
 
     def _conversation_via_the_real_write_path(self, session, conversation):
-        """One turn persisted exactly the way a live turn persists it."""
+        """One turn persisted exactly the way a live turn persists it.
+
+        Asserts the two rows really did land in different timestamp formats.
+        Without that check these tests would quietly stop guarding anything the
+        moment the writes straddled a second boundary — the old created_at-led
+        order sorts them correctly then, so a revert would pass.
+        """
         svc = ConversationService(session)
         svc.save_user_message(
             conversation.id, "question", created_at=datetime.now(timezone.utc)
         )
         svc.save_assistant_turn(conversation.id, "answer", [{"type": "response.completed"}])
+
+        rows = {
+            m.role: m.created_at
+            for m in session.exec(
+                session.select(Message).where(Message.conversation_id == conversation.id)
+            ).all()
+        }
+        user_at, assistant_at = str(rows[Role.user]), str(rows[Role.assistant])
+        assert user_at[:19] == assistant_at[:19], (
+            f"fixture straddled a second boundary ({user_at} vs {assistant_at}); "
+            "the format divergence these tests guard is not exercised"
+        )
+        assert "." in user_at and "." not in assistant_at, (
+            f"expected the two write paths to store different precisions, got "
+            f"user={user_at!r} assistant={assistant_at!r}"
+        )
         return svc
 
     def test_a_turn_reads_question_before_answer_on_both_paths(self, session, conversation):

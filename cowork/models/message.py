@@ -20,6 +20,12 @@ class Message(BaseSQLModel, table=True):
     # leading column the DB can seek to the max instead of scanning the group.
     __table_args__ = (
         Index("ix_messages_conversation_created", "conversation_id", "created_at"),
+        # Backs the keyset pagination in get_messages_page, which orders by
+        # seq. Declared here as well as in migration 3e4b5f7586d3 so tests
+        # (which build the schema through metadata.create_all) exercise the
+        # same index production has, and so autogenerate does not emit a DROP
+        # for an index the model never mentions.
+        Index("ix_messages_conversation_seq", "conversation_id", "seq"),
     )
 
     conversation_id: UUID = Field(

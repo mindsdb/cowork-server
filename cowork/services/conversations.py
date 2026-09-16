@@ -50,10 +50,12 @@ _SCAN_CAP_MULTIPLIER = 10
 # trip on the unbounded get_messages branch a 1,000+ message conversation
 # can reach.
 _EVENTS_IN_CHUNK_SIZE = 500
-# Upper bound for a decoded cursor's `seq`. This is the driver's limit, not
-# the column's (`seq` is INTEGER, so 2**31-1 on Postgres): both sqlite3 and
-# psycopg raise rather than bind an int wider than 64 bits, and that raise
-# escapes past this module's own error mapping as a 500.
+# Upper bound for a decoded cursor's `seq`. Not the column's limit (`seq` is
+# INTEGER, so 2**31-1 on Postgres) — this is what the drivers tolerate. sqlite3
+# raises OverflowError rather than bind an int wider than 64 bits, and that
+# raise escapes past this module's error mapping as a 500. psycopg does not
+# raise (it promotes the value to numeric, which Postgres compares against
+# int4 happily), so this guard is what makes the two backends agree.
 _MAX_CURSOR_SEQ = 2**63 - 1
 
 # The one order every read path uses: the UI list, the paginated page, the
@@ -1064,11 +1066,12 @@ class ConversationService:
             # cursor instead of scanning and discarding every newer row.
             stmt = stmt.where(Message.seq <= cursor[0])
             stmt = stmt.where(tuple_(*_MESSAGE_ORDER) < tuple_(*cursor))
-        stmt = stmt.order_by(
-            Message.seq.desc(),
-            case((Message.role == Role.user, 0), else_=1).desc(),
-            Message.id.desc(),
-        )
+        # Derived, not restated: the cursor tuple and this ORDER BY have to stay
+        # the same columns in the same sequence, and a hand-written copy drifts
+        # silently — a fourth column added to _MESSAGE_ORDER would widen the
+        # cursor while this stayed at three, and the walk would start skipping
+        # rows while the unbounded read looked fine.
+        stmt = stmt.order_by(*[column.desc() for column in _MESSAGE_ORDER])
 
         scan_cap = limit * _SCAN_CAP_MULTIPLIER
         raw_rows = list(self.session.exec(stmt.limit(scan_cap + 1)).all())
