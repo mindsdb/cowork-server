@@ -29,15 +29,31 @@ permanently, because afterwards the conversation's seqs are distinct and the
 block (all 0) first, ordered among itself by created_at, which is safe
 because every pre-seq row was written by the same path and shares one format.
 
-Deploy notes: on Postgres this is a bulk UPDATE plus an index build, both of
-which block writes to `messages` for their duration — on a large table that is
-a visible stall, and it happens at pod startup, because every pod runs
-migrations itself from the FastAPI lifespan rather than from a separate job.
-The backfill takes SHARE ROW EXCLUSIVE explicitly for the same reason: a
-rolling deploy means old pods are still writing, and a row inserted mid-
-backfill would take seq = max(seq)+1 against the still-all-zero column,
-collide with a renumbered row, and stay stranded in the wrong position because
-this conversation is never selected for renumbering again.
+Deploy notes, and an unclosed race. Every pod runs migrations itself at boot
+(`cowork/server.py`'s lifespan -> `run_dev_setup` in `cowork/dev_setup.py` ->
+`run_schema_migrations`), so on a rolling deploy this runs while old pods are
+still serving turns, and `run_schema_migrations` wraps the whole chain in one
+`engine.begin()`.
+
+A message written to a legacy conversation while the backfill is running can
+still land in the wrong place: `ConversationService._next_seq` computes
+max(seq)+1 in its own SELECT, so a writer that read the column before the
+renumbering commits inserts seq=1 against rows that are now 0..N-1, and the
+`HAVING` filter never selects that conversation again to repair it. The window
+is the gap between one conversation's SELECT and its UPDATE.
+
+A table-level LOCK does NOT close this, and an earlier version of this
+migration that took SHARE ROW EXCLUSIVE made it worse: that mode does not
+conflict with the writer's plain SELECT, so the stale read still happened and
+the INSERT merely queued behind the lock, turning an insert that would have
+committed before the backfill (and so been renumbered correctly) into a
+stranded one. Closing it properly needs the seq allocation itself serialized —
+a row lock in `_next_seq` plus a unique `(conversation_id, seq)` so a collision
+raises instead of silently reordering — or the backfill run with writers
+actually stopped rather than merely blocked. Both are larger than this change.
+
+Run this with writers quiesced if the deployment allows it. On a large
+`messages` table the index build also blocks writes for its duration.
 
 Cursor pagination then needs ``(conversation_id, seq)`` to be an index seek.
 An earlier draft of this migration created ``(conversation_id, created_at,
@@ -81,17 +97,6 @@ def _backfill_message_seq() -> None:
     so a database written entirely after a1c3e5f7b9d2 is a no-op.
     """
     bind = op.get_bind()
-    # Every pod runs migrations itself at boot (cowork/server.py's lifespan ->
-    # run_schema_migrations), so on a rolling deploy this runs while old pods
-    # are still serving turns. An insert landing between a conversation's
-    # SELECT and its UPDATE gets seq = max(seq)+1 = 1 off the still-all-zero
-    # column, collides with a backfilled row, and is stranded at position 1 of
-    # that history forever — the HAVING filter never selects the conversation
-    # again. Hold the writers off for the duration instead. SQLite is
-    # single-writer and takes the whole database anyway, so this is Postgres
-    # only.
-    if bind.dialect.name == "postgresql":
-        bind.execute(sa.text("LOCK TABLE messages IN SHARE ROW EXCLUSIVE MODE"))
     tied = bind.execute(
         sa.text(
             """

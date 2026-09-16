@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -230,22 +231,30 @@ class TestPagedAndUnboundedReadsAgree:
         moment the writes straddled a second boundary — the old created_at-led
         order sorts them correctly then, so a revert would pass.
         """
+        # Arrange the same-second condition rather than assert it: the two
+        # writes are a few milliseconds apart, so left to chance they straddle
+        # a second boundary often enough to redden CI, and a straddled pair
+        # sorts correctly even under the old order — the test would fail for a
+        # reason that has nothing to do with the code.
+        while datetime.now(timezone.utc).microsecond > 500_000:
+            time.sleep(0.01)
+
         svc = ConversationService(session)
         svc.save_user_message(
             conversation.id, "question", created_at=datetime.now(timezone.utc)
         )
         svc.save_assistant_turn(conversation.id, "answer", [{"type": "response.completed"}])
 
-        rows = {
-            m.role: m.created_at
-            for m in session.exec(
-                session.select(Message).where(Message.conversation_id == conversation.id)
-            ).all()
-        }
-        user_at, assistant_at = str(rows[Role.user]), str(rows[Role.assistant])
+        rows = session.exec(
+            session.select(Message).where(Message.conversation_id == conversation.id)
+        ).all()
+        # Keyed by content, and counted: keying by role would silently collapse
+        # duplicates if this fixture ever grows tool rows.
+        assert len(rows) == 2, f"expected exactly one turn, got {len(rows)} rows"
+        stored = {m.content: str(m.created_at) for m in rows}
+        user_at, assistant_at = stored["question"], stored["answer"]
         assert user_at[:19] == assistant_at[:19], (
-            f"fixture straddled a second boundary ({user_at} vs {assistant_at}); "
-            "the format divergence these tests guard is not exercised"
+            f"fixture straddled a second boundary ({user_at} vs {assistant_at})"
         )
         assert "." in user_at and "." not in assistant_at, (
             f"expected the two write paths to store different precisions, got "

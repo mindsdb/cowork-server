@@ -1087,7 +1087,7 @@ class AntonHarness:
                     "surfaces every file this app can legitimately see, Shared Drive items included."
                 )
 
-        # Canonical order (seq, role, id — ConversationService._MESSAGE_ORDER);
+        # Canonical order (ConversationService._MESSAGE_ORDER: seq, role, id);
         # the bare `conversation.messages`
         # relationship is unordered and would scramble a turn's tool_use/tool_result
         # block-rows. Ordering needs the DB session, so the conversation must be
