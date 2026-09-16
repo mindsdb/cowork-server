@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from anton.minds_client import DEFAULT_REQUEST_TIMEOUT_S
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
@@ -47,6 +48,7 @@ _MIN_START_BUDGET_S = 5.0
 
 # Time budgets (ENG-1580). Three numbers must agree:
 #   PUBLISH_POST_TIMEOUT_S      anton's urllib timeout on the POST /upload itself
+#                               (imported, so a change in anton moves the budget)
 #   job_budget_for(ttl, t)      how long anton polls an accepted (202) job
 #   lock_ttl_for(t)             how long the slug lock is held
 # The publish runs in a thread that asyncio.wait_for(...) abandons but cannot
@@ -58,7 +60,7 @@ _MIN_START_BUDGET_S = 5.0
 # (not from the per-slug min(timeout_s, remaining), which can be as small as
 # _MIN_START_BUDGET_S and would make the budget negative).
 # Enforced by tests/test_autopublish_budgets.py. Defaults: 60 + 30 + 90 = 180.
-PUBLISH_POST_TIMEOUT_S = 30.0
+PUBLISH_POST_TIMEOUT_S = float(DEFAULT_REQUEST_TIMEOUT_S)
 DEFAULT_TIMEOUT_S = 60.0
 LOCK_TTL_FACTOR = 3
 

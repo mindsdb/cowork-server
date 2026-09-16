@@ -29,6 +29,7 @@ from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.providers import publish_url_for_endpoint
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
 from anton.minds_client import describe_minds_connection_error
+from anton.publisher import PUBLISH_JOB_BUDGET_S, PublishJobFailed
 from anton.publish_access import access_from_owner_side
 from anton.publish_access import normalize_emails as _normalize_emails
 from anton.publish_access import resolve_access as _resolve_access
@@ -72,14 +73,8 @@ def raise_publish_permission_error(exc: Exception) -> None:
 
     if isinstance(exc, (ProductPermissionDenied, ProductPermissionUnavailable)):
         raise exc
-    try:
-        from anton.publisher import PublishJobFailed
-    except Exception:  # pragma: no cover - publisher import guarded elsewhere
-        PublishJobFailed = None  # type: ignore[assignment]
-    if PublishJobFailed is not None and isinstance(exc, PublishJobFailed):
-        if exc.status_code == 503:
-            raise ProductPermissionUnavailable() from exc
-        return
+    if isinstance(exc, PublishJobFailed) and exc.status_code == 503:
+        raise ProductPermissionUnavailable() from exc
     if not isinstance(exc, urllib.error.HTTPError):
         return
     if exc.code == 503:
@@ -396,7 +391,7 @@ def publish_artifact(
     password: str | None = None,
     access: dict | None = None,
     scope: TenantScope | None = None,
-    job_budget_s: float | None = None,
+    job_budget_s: float = PUBLISH_JOB_BUDGET_S,
     progress: dict | None = None,
 ) -> dict:
     """Zip an artifact and upload it, returning its public URL.
@@ -420,7 +415,7 @@ def publish_artifact(
     another org's secrets.
 
     `job_budget_s` caps how long an asynchronously accepted publish (server
-    202, ENG-1580) is polled; None keeps anton's default. `progress`, when
+    202, ENG-1580) is polled; defaults to anton's. `progress`, when
     given, gets `phase="polling"` set the moment the server accepts the job,
     so a caller that abandons the thread on its own timeout can tell "upload
     still in flight" from "job accepted, still polling".
@@ -479,6 +474,11 @@ def publish_artifact(
         publish_source = _render_markdown_to_html(publish_target, Path(md_tmp_dir.name))
 
     ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
+
+    def on_job_accepted(_accepted: dict) -> None:
+        if progress is not None:
+            progress["phase"] = "polling"
+
     try:
         result = publish(
             publish_source,
@@ -497,14 +497,8 @@ def publish_artifact(
             # Org-keyed: the persisted vault is per organization, and an
             # unscoped lookup would resolve to the shared namespace root.
             vault=vault_for_scope(scope),
-            # Both kwargs are omitted when the caller passes neither, so direct
-            # callers keep working against an anton without ENG-1580. The
-            # autopublish reconciler always passes both, so it requires an
-            # anton that has them (anton branch/tag with ENG-1580; merge
-            # anton before cowork-server).
-            **({"job_budget_s": job_budget_s} if job_budget_s is not None else {}),
-            **({"on_job_accepted": (lambda accepted: progress.__setitem__("phase", "polling"))}
-               if progress is not None else {}),
+            job_budget_s=job_budget_s,
+            on_job_accepted=on_job_accepted,
         )
     except Exception as exc:
         raise_publish_permission_error(exc)
