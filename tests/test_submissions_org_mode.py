@@ -173,9 +173,6 @@ def test_incomplete_submission_is_refused_before_field_validation(org_client, fo
     assert "Missing required fields" not in res.text
 
 
-# --- desktop keeps the whole flow; the refusal must not be unconditional ----
-
-
 @pytest.fixture()
 def local_client(monkeypatch):
     monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
