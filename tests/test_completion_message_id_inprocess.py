@@ -53,7 +53,7 @@ class _Buffer:
         self.frames.append(f"CLOSE:{_status}")
 
 
-async def _run(handler, *, assistant_message_id) -> _Buffer:
+async def _run(handler, *, assistant_message_id, user_message_id=None) -> _Buffer:
     buffer = _Buffer()
     conv_id = uuid4()
     with (
@@ -62,7 +62,9 @@ async def _run(handler, *, assistant_message_id) -> _Buffer:
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
         conv_svc.return_value.get_conversation.return_value = MagicMock()
-        conv_svc.return_value.save_user_message.return_value = SimpleNamespace(id=uuid4())
+        conv_svc.return_value.save_user_message.return_value = SimpleNamespace(
+            id=user_message_id or uuid4()
+        )
         conv_svc.return_value.save_assistant_turn.return_value = (
             SimpleNamespace(id=assistant_message_id) if assistant_message_id else None
         )
@@ -186,7 +188,7 @@ async def test_run_turn_failed_frame_omits_the_id_when_nothing_persisted():
 
 # ── _produce_direct: both rows already persisted before any frame is built ──
 
-async def _run_direct(*, assistant_message_id, route_text="ok"):
+async def _run_direct(*, assistant_message_id, route_text="ok", user_message_id=None):
     from cowork.streaming.registry import TurnLifecycle
     from cowork.handlers.response_routing import RouteDecision
 
@@ -199,7 +201,9 @@ async def _run_direct(*, assistant_message_id, route_text="ok"):
         patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
     ):
-        conv_svc.return_value.save_user_message.return_value = SimpleNamespace(id=uuid4())
+        conv_svc.return_value.save_user_message.return_value = SimpleNamespace(
+            id=user_message_id or uuid4()
+        )
         conv_svc.return_value.save_assistant_turn.return_value = (
             SimpleNamespace(id=assistant_message_id) if assistant_message_id else None
         )
@@ -280,3 +284,51 @@ async def test_probe_completed_frame_omits_the_id_when_nothing_persisted():
     completed = [f for f in frames if f.startswith("event: response.completed")]
     assert len(completed) == 1
     assert "assistant_message_id" not in _payload(completed[0])
+
+
+# ── The user row's id rides response.created ────────────────────────────────
+#
+# The client appends the user's own message optimistically on send, so
+# without this it holds a row with no id for the whole live turn — and every
+# consumer keyed on message id (turn delete, the step sidecar, the
+# usage-notice anchor) silently degrades for exactly the turn the user is
+# looking at.
+
+@pytest.mark.asyncio
+async def test_run_turn_created_frame_carries_the_user_message_id():
+    user_id = uuid4()
+
+    async def formatter(stream, model, event_sink):
+        yield "event: response.created\ndata: {}\n\n"
+        yield ('event: response.completed\ndata: {"type": "response.completed", '
+               '"response": {"output": [{"content": [{"type": "output_text", "text": "hi"}]}]}}\n\n')
+
+    buffer = await _run(
+        _handler_with_formatter(formatter), assistant_message_id=uuid4(), user_message_id=user_id,
+    )
+    created = [f for f in buffer.frames if f.startswith("event: response.created")]
+    assert len(created) == 1
+    assert _payload(created[0])["user_message_id"] == str(user_id)
+
+
+@pytest.mark.asyncio
+async def test_produce_direct_created_frame_carries_the_user_message_id():
+    user_id = uuid4()
+    buffer = await _run_direct(assistant_message_id=uuid4(), user_message_id=user_id)
+    created = [f for f in buffer.frames if f.startswith("event: response.created")]
+    assert len(created) == 1
+    assert _payload(created[0])["user_message_id"] == str(user_id)
+
+
+@pytest.mark.asyncio
+async def test_created_frame_omits_the_user_message_id_when_no_user_row_was_persisted():
+    """Absent, not null — the same convention assistant_message_id uses.
+
+    The probe producer persists no user message at all, so its created frame
+    must carry no `user_message_id` key rather than an explicit null the
+    client would have to special-case.
+    """
+    frame = ResponsesHandler._inject_created(
+        "event: response.created\ndata: {}\n\n", uuid4(), "anton", None,
+    )
+    assert "user_message_id" not in _payload(frame)

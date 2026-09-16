@@ -675,7 +675,7 @@ class ResponsesHandler:
                 "response_route_reason": route.reason,
             }
             svc = ConversationService(producer_session)
-            svc.save_user_message(conv_id, original_content)
+            user_msg = svc.save_user_message(conv_id, original_content)
             assistant_msg = svc.save_assistant_turn(
                 conv_id, route.text, [delta, {"type": "response.completed"}],
                 harness="cowork-direct",
@@ -689,6 +689,7 @@ class ResponsesHandler:
                 "sequence_number": 1,
                 "conversation_id": str(conv_id),
                 "harness": "cowork-direct",
+                **({"user_message_id": str(user_msg.id)} if user_msg is not None else {}),
                 "response": response.model_dump(),
             })})
             await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", delta)})
@@ -1307,7 +1308,7 @@ class ResponsesHandler:
                 if first:
                     # The formatter's created frame lacks conversation_id +
                     # harness; inject them like the in-process path does.
-                    sse = self._inject_created(sse, conv_id, harness_id)
+                    sse = self._inject_created(sse, conv_id, harness_id, pending_message_id)
                     first = False
                 if self._sse_event_type(sse) == "response.completed":
                     # Persist now — event_sink has already seen
@@ -1505,7 +1506,7 @@ class ResponsesHandler:
             event_count = 0
             async for sse_string in harness.formatter(stream, model, event_sink):
                 event_count += 1
-                sse_string = self._inject_created(sse_string, conv_id, harness_id)
+                sse_string = self._inject_created(sse_string, conv_id, harness_id, pending_message_id)
                 if self._sse_event_type(sse_string) == "response.completed":
                     # Persist now, same reasoning as _produce_remote:
                     # the formatter only yields its terminal frame once its
@@ -1726,9 +1727,23 @@ class ResponsesHandler:
         return first_line[len(prefix):].strip() if first_line.startswith(prefix) else None
 
     @classmethod
-    def _inject_created(cls, sse_string: str, conversation_id: UUID, harness_id: str | None) -> str:
+    def _inject_created(
+        cls,
+        sse_string: str,
+        conversation_id: UUID,
+        harness_id: str | None,
+        user_message_id: UUID | None = None,
+    ) -> str:
         """Inject conversation_id + harness into the response.created event so
-        the client learns the canonical id and which agent generated this."""
+        the client learns the canonical id and which agent generated this.
+
+        `user_message_id` is the persisted user Message's id, carried on the
+        same frame. The client appends the user's row optimistically on send,
+        so without this it holds a row with no id until a later refetch — and
+        every consumer keyed on message id (turn delete, the step sidecar, the
+        usage-notice anchor) silently degrades for the live turn. Omitted, not
+        null, on a producer that persists no user row (the probe path).
+        """
         if cls._sse_event_type(sse_string) != "response.created":
             return sse_string
         try:
@@ -1740,6 +1755,8 @@ class ResponsesHandler:
             payload["conversation_id"] = str(conversation_id)
             if harness_id:
                 payload["harness"] = harness_id
+            if user_message_id is not None:
+                payload["user_message_id"] = str(user_message_id)
             return f"event: response.created\ndata: {json.dumps(payload)}\n\n"
         except Exception:
             return sse_string
