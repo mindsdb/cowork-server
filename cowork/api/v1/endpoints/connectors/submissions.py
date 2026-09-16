@@ -20,7 +20,7 @@ from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import store
 
 # DesktopOnly until the encrypted relay to auth exists: an org-mode submission
-# is refused before FastAPI validates the body, so no credential reaches the
+# is refused before the body model is validated, so no credential reaches the
 # staging store, the probe, the local vault or a 422 echo. ScopedSessionDep
 # still fails closed on its own; the declaration is what the route walker sees.
 router = APIRouter(dependencies=[Depends(require(DesktopOnly))])
