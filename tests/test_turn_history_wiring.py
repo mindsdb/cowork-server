@@ -112,9 +112,12 @@ def test_in_process_paths_id_check_before_persisting(persister):
 
 
 def test_the_in_process_guard_is_not_the_pod_sanitizer():
-    """The two must not be collapsed into one. Asserted on the remote path so
-    a well-meaning simplification that routes everything through a single
-    function fails here rather than silently truncating desktop tool output."""
+    """The two must not be collapsed into one.
+
+    Asserted over the three IN-PROCESS persisters — the ones that must NOT
+    reach the pod sanitizer — so a well-meaning simplification that routes
+    everything through a single function fails here rather than silently
+    truncating desktop tool output against the pod's size budgets."""
     for p in (r.ResponsesHandler._run_turn, r.ResponsesHandler._collect,
               rt.AntonChannelRuntime._run_anton):
         assert "sanitize_turn_history_rows(" not in _norm(p)
