@@ -17,14 +17,14 @@ def test_post_plus_job_budget_fits_inside_lock_ttl_for_defaults():
     ttl = ap.lock_ttl_for(t)
     budget = ap.job_budget_for(ttl, t)
     assert budget == 90.0
-    assert ap.PUBLISH_POST_TIMEOUT_S + budget <= ttl
+    assert t + ap.PUBLISH_POST_TIMEOUT_S + budget <= ttl
     assert budget > 0
 
 
 @pytest.mark.parametrize("timeout_s", [30.0, 60.0, 120.0])
 def test_invariant_holds_for_supported_timeouts(timeout_s):
     ttl = ap.lock_ttl_for(timeout_s)
-    assert ap.PUBLISH_POST_TIMEOUT_S + ap.job_budget_for(ttl, timeout_s) <= ttl
+    assert timeout_s + ap.PUBLISH_POST_TIMEOUT_S + ap.job_budget_for(ttl, timeout_s) <= ttl
     assert ap.job_budget_for(ttl, timeout_s) > 0
 
 

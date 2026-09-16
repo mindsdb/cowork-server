@@ -497,8 +497,11 @@ def publish_artifact(
             # Org-keyed: the persisted vault is per organization, and an
             # unscoped lookup would resolve to the shared namespace root.
             vault=vault_for_scope(scope),
-            # Both are passed only when set: cowork-server pins anton by git
-            # branch, and an anton without ENG-1580 rejects unknown keywords.
+            # Both kwargs are omitted when the caller passes neither, so direct
+            # callers keep working against an anton without ENG-1580. The
+            # autopublish reconciler always passes both, so it requires an
+            # anton that has them (anton branch/tag with ENG-1580; merge
+            # anton before cowork-server).
             **({"job_budget_s": job_budget_s} if job_budget_s is not None else {}),
             **({"on_job_accepted": (lambda accepted: progress.__setitem__("phase", "polling"))}
                if progress is not None else {}),
