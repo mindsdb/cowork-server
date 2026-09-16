@@ -107,7 +107,7 @@ def test_remote_history_scrubs_secrets(monkeypatch):
     assert "[REDACTED_API_KEY]" in history[0]["content"]
 
 
-# ── seeding the pod with the saved compaction (ENG-1827) ─────────────────────
+# ── seeding the pod with the saved compaction ────────────────────────────────
 
 
 def test_remote_seed_replays_summary_and_tail_instead_of_everything(monkeypatch):
@@ -333,7 +333,7 @@ def test_remote_started_at_reads_created_at_and_degrades_to_none(monkeypatch):
     assert ResponsesHandler._remote_started_at(object(), uuid4()) is None
 
 
-# ── saving the pod's compaction result (ENG-1827) ────────────────────────────
+# ── saving the pod's compaction result ───────────────────────────────────────
 
 
 def _capture_compaction(monkeypatch):
@@ -405,6 +405,26 @@ def test_an_untrustworthy_compaction_is_dropped_not_guessed(monkeypatch, data, c
 
     assert saved == {}
     assert caplog.records == []
+
+
+@pytest.mark.parametrize("data", [
+    {"summary": "EARLIER: …", "covered_through": "3"},       # count as a string
+    {"summary": "EARLIER: …", "covered_through": 2.5},       # count as a float
+    {"summary": {"text": "EARLIER: …"}, "covered_through": 2},  # summary not a string
+])
+def test_a_wrongly_typed_compaction_frame_cannot_fail_the_turn(monkeypatch, data, caplog):
+    """Types come from the pod, and the cutoff arithmetic runs outside the
+    persistence try/except — a string count raising there takes down the turn
+    the frame arrived on. Logged, unlike the in-range skips above: a frame that
+    doesn't typecheck means the contract is broken, not that there's nothing to
+    save."""
+    saved = _capture_compaction(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="cowork.handlers.responses"):
+        ResponsesHandler._persist_remote_compaction(uuid4(), data, _SEED, _FakeScope())
+
+    assert saved == {}
+    assert "malformed compaction frame" in caplog.text
 
 
 def test_no_compaction_is_saved_when_seeding_was_disabled(monkeypatch):

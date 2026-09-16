@@ -1026,9 +1026,9 @@ class ResponsesHandler:
         With compaction on, this is `[summary] + [messages after the cutoff]`
         rather than the whole conversation, exactly as the in-process path
         seeds it — the pod compacts either way, and without the saved summary
-        every turn resent the full history and paid to summarize it again
-        (ENG-1827). `seed_info` carries message *ids*, not ORM rows: the pod's
-        reply lands after this session may be closed.
+        every turn resent the full history and paid to summarize it again.
+        `seed_info` carries message *ids*, not ORM rows: the pod's reply lands
+        after this session may be closed.
 
         Unlike in-process, messages are not timestamp-stamped here; that
         divergence is tracked separately.
@@ -1072,11 +1072,25 @@ class ResponsesHandler:
         from cowork.harnesses.anton_harness.harness import AntonHarness
 
         summary = data.get("summary")
+        covered_through = data.get("covered_through") or 0
         if not seed_info or not summary:
+            return
+        # Types, not just presence: the arithmetic below runs outside the
+        # try/except, so a string count would raise out of the turn's reply
+        # loop and fail the turn it rode in on.
+        if (
+            not isinstance(summary, str)
+            or not isinstance(covered_through, int)
+            or isinstance(covered_through, bool)
+        ):
+            logger.warning(
+                "[responses] malformed compaction frame for conversation %s — not saved",
+                conv_id,
+            )
             return
         message_ids = seed_info["message_ids"]
         idx = AntonHarness.compaction_cutoff_index(
-            seed_info, data.get("covered_through") or 0, len(message_ids),
+            seed_info, covered_through, len(message_ids),
         )
         if idx is None:
             return
