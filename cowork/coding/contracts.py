@@ -416,6 +416,8 @@ class CodingSession(BaseModel):
     engine_session_id: str | None = None
     active_turn_id: str | None = None
     pending_approval: PendingApproval | None = None
+    # Fingerprints only; raw command rules can contain secrets.
+    command_approval_grants: list[str] = Field(default_factory=list, max_length=256)
     queued_instructions: list[QueuedInstruction] = Field(default_factory=list)
     terminal_tabs: list[TerminalTab] = Field(default_factory=list, max_length=12)
     pinned: bool = False
