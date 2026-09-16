@@ -14,6 +14,7 @@ every test.
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 
 import pytest
 from anton.core.datasources import data_vault
@@ -170,3 +171,68 @@ def test_incomplete_submission_is_refused_before_field_validation(org_client, fo
 
     assert res.status_code == 403
     assert "Missing required fields" not in res.text
+
+
+# --- desktop keeps the whole flow; the refusal must not be unconditional ----
+
+
+@pytest.fixture()
+def local_client(monkeypatch):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    get_app_settings.cache_clear()
+    return TestClient(create_app())
+
+
+@pytest.fixture()
+def leave_store_as_found():
+    """The handler stages into the process-global store and never consumes;
+    drop whatever this test staged so later tests see the store they expect."""
+    staged_before = set(store._store)
+    yield
+    for submission_id in set(store._store) - staged_before:
+        store.consume(submission_id)
+
+
+def test_desktop_registry_submission_still_stages_and_probes(local_client, leave_store_as_found, monkeypatch):
+    seen: dict = {}
+
+    class FakeProbeHandler:
+        def __init__(self, scoped):
+            pass
+
+        async def run(self, submission_id, connector_id, method, name, conversation_id):
+            seen.update(submission_id=submission_id, connector_id=connector_id, method=method)
+            yield "event: response.created\ndata: {}\n\n"
+
+    monkeypatch.setattr(submissions_endpoints, "ProbeHandler", FakeProbeHandler)
+
+    res = local_client.post(SUBMISSIONS, json=_registry_body())
+
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("text/event-stream")
+    assert res.headers["cache-control"] == "no-store"
+    assert seen["connector_id"] == "postgres"
+    assert seen["method"] == "host-port"
+    staged = store.get(seen["submission_id"])
+    assert staged is not None
+    assert staged["values"]["password"] == PASSWORD
+
+
+def test_desktop_handcrafted_submission_still_saves_to_the_local_vault(
+    local_client, leave_store_as_found, monkeypatch, tmp_path
+):
+    """No probe for a connector the registry does not know: the real handler
+    saves straight into the local vault, and the record it wrote is the
+    desktop behavior to keep."""
+    assert registry.get_connector(HANDCRAFTED_CONNECTOR) is None
+    vault_dir = tmp_path / "vault"
+    monkeypatch.setattr(persist, "ConnectorSettings", lambda: SimpleNamespace(vault_dir=str(vault_dir)))
+
+    res = local_client.post(SUBMISSIONS, json=_handcrafted_body())
+
+    assert res.status_code == 200
+    assert "Saved as" in res.text
+    record = data_vault.LocalDataVault(vault_dir).read_record(HANDCRAFTED_CONNECTOR, "acme")
+    assert record is not None
+    assert record["fields"]["api_key"] == API_KEY
+    assert "api_key" in record["secure_keys"]
