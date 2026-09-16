@@ -636,6 +636,24 @@ async def test_turn_history_reaches_the_caller(monkeypatch):
     assert items == [("turn_history", {"rows": rows}), ("turn_completed", {})]
 
 
+@pytest.mark.asyncio
+async def test_turn_compaction_reaches_the_caller(monkeypatch):
+    """Dropped by the same whitelist, the summary never reaches the handler
+    that saves it and every turn goes back to resending the whole conversation
+    for the pod to summarize again — invisible to the behavioural tests,
+    because the turn itself still succeeds."""
+    payload = {"summary": "## Goal\nship it", "covered_through": 12}
+    fake = FakeRedis(replies=[
+        ("scratchpad:reply:conv-1", _reply("turn_compaction", payload)),
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+    ])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+    assert items == [("turn_compaction", payload), ("turn_completed", {})]
+
+
 pytestmark = pytest.mark.usefixtures("granted_product_permissions")
 
 
