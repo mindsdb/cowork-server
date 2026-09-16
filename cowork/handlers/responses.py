@@ -252,6 +252,19 @@ def _auth_failure_provider(settings, role: str | None) -> Provider | None:
     planning = settings.resolved_planning_provider
     return planning if planning == settings.resolved_coding_provider else None
 
+def _turn_anchor_id(user_message: Message, assistant_message: Message | None) -> UUID:
+    """The id a non-streaming caller can hand back to DELETE .../turns/{id}.
+
+    The output item carries the assistant's text, so its id is the assistant
+    row's — which is also the anchor delete_turn expects for an answered turn.
+    When nothing was persisted for the assistant (an empty turn), the user row
+    is the whole turn and is itself a valid orphan anchor, so it stands in.
+    Previously this was always the user row's id, which named the wrong message
+    for the content and 404s as an anchor once the turn has a reply.
+    """
+    return assistant_message.id if assistant_message is not None else user_message.id
+
+
 class ResponsesHandler:
     def __init__(self, session: Session, principal: Principal | None = None) -> None:
         self.session = session
@@ -605,13 +618,13 @@ class ResponsesHandler:
                 "response_route": route.route,
                 "response_route_reason": route.reason,
             }, {"type": "response.completed"}]
-            ConversationService(self.scoped).save_assistant_turn(
+            assistant_message = ConversationService(self.scoped).save_assistant_turn(
                 conversation_id, text, events, harness="cowork-direct",
             )
             return Response(
                 status=ResponseStatus.completed,
                 model=route.model,
-                output=[self._build_output(str(user_message.id), text)],
+                output=[self._build_output(str(_turn_anchor_id(user_message, assistant_message)), text)],
             )
 
         # turn_id comes from handle(): same numbering as the delegated path.
@@ -1867,12 +1880,14 @@ class ResponsesHandler:
         user_message = ConversationService(self.scoped).save_user_message(
             conversation_id, original_content, created_at=sent_at,
         )
-        self._save_assistant_turn(conversation_id, assistant_text, collected_events, turn_rows)
+        assistant_message = self._save_assistant_turn(
+            conversation_id, assistant_text, collected_events, turn_rows
+        )
 
         return Response(
             status=ResponseStatus.completed,
             model=model,
-            output=[self._build_output(str(user_message.id), assistant_text)],
+            output=[self._build_output(str(_turn_anchor_id(user_message, assistant_message)), assistant_text)],
         )
 
     def _save_assistant_turn(
@@ -1881,9 +1896,9 @@ class ResponsesHandler:
         text: str,
         events: list[dict],
         tool_rows: list[dict] | None = None,
-    ) -> None:
+    ) -> Message | None:
         harness_id = getattr(self._get_harness(), 'id', None)
-        ConversationService(self.scoped).save_assistant_turn(
+        return ConversationService(self.scoped).save_assistant_turn(
             conversation_id, text, events, harness=harness_id, tool_rows=tool_rows,
         )
 

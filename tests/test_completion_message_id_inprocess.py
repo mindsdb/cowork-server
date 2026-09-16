@@ -332,3 +332,29 @@ async def test_created_frame_omits_the_user_message_id_when_no_user_row_was_pers
         "event: response.created\ndata: {}\n\n", uuid4(), "anton", None,
     )
     assert "user_message_id" not in _payload(frame)
+
+
+# ── The non-streaming paths' output item id ─────────────────────────────────
+#
+# `_collect` and `_produce_direct`'s non-streaming branch return one output
+# item carrying the assistant's text. Its id used to be the USER row's, which
+# names the wrong message for that content and 404s if a caller hands it back
+# to DELETE .../turns/{id}, because delete_turn rejects a user row that already
+# has a reply.
+
+def test_turn_anchor_is_the_assistant_row_when_one_was_persisted():
+    from cowork.handlers.responses import _turn_anchor_id
+
+    user_id, assistant_id = uuid4(), uuid4()
+    anchor = _turn_anchor_id(SimpleNamespace(id=user_id), SimpleNamespace(id=assistant_id))
+    assert anchor == assistant_id
+
+
+def test_turn_anchor_falls_back_to_the_user_row_when_nothing_was_persisted():
+    # An empty turn persists no assistant row, so the user message is the whole
+    # turn — and an unanswered user row is exactly what delete_turn accepts as
+    # an orphan anchor.
+    from cowork.handlers.responses import _turn_anchor_id
+
+    user_id = uuid4()
+    assert _turn_anchor_id(SimpleNamespace(id=user_id), None) == user_id

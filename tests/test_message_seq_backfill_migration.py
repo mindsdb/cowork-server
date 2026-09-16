@@ -203,3 +203,46 @@ def test_a_conversation_spanning_the_seq_migration_keeps_its_modern_turns_paired
     expected = [content for _, content in _LEGACY_ROWS] + [c for _, c, _, _ in modern]
     assert [m["content"] for m in svc.get_messages(cid)] == expected
     assert [m["content"] for m in svc.get_messages_page(cid, limit=50).items] == expected
+
+
+def test_a_legacy_turn_completed_inside_one_second_keeps_question_before_answer(legacy_db):
+    """Legacy rows can share a created_at to the second, so the role tiebreak
+    is what orders them — the backfill must not renumber the answer first.
+
+    The fixture above gives every legacy row its own minute, which is the one
+    shape where this cannot go wrong. Pre-seq rows all came from the column
+    default (the explicit-datetime write path arrived three weeks after the seq
+    column), so they share one format and tie exactly rather than comparing as
+    unequal-length strings.
+    """
+    cfg, db_path, _ = legacy_db
+    engine = create_engine(f"sqlite:///{db_path}")
+    project_id = uuid4().hex
+    same_second_id = uuid4().hex
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO projects (id, name, path, is_active) VALUES (:id, 'ss', '/tmp/ss', 1)"
+        ), {"id": project_id})
+        conn.execute(text(
+            "INSERT INTO conversations (id, topic, project_id) VALUES (:id, 'same second', :pid)"
+        ), {"id": same_second_id, "pid": project_id})
+        for role, content in [
+            ("user", "q1"), ("assistant", "a1"), ("user", "q2"), ("assistant", "a2"),
+        ]:
+            conn.execute(text(
+                "INSERT INTO messages (id, conversation_id, role, content, seq, created_at) "
+                "VALUES (:id, :cid, :role, :content, 0, '2026-07-01 10:00:00')"
+            ), {"id": uuid4().hex, "cid": same_second_id, "role": role, "content": f'"{content}"'})
+
+    command.upgrade(cfg, "head")
+
+    svc = _service(db_path)
+    cid = UUID(same_second_id)
+    rendered = [m["content"] for m in svc.get_messages(cid)]
+    paged = [m["content"] for m in svc.get_messages_page(cid, limit=50).items]
+    # Both questions sort ahead of both answers here, because every row shares
+    # one timestamp and only the role tiebreak separates them. What must not
+    # happen is an answer taking a lower seq than the question it replies to.
+    assert rendered.index("q1") < rendered.index("a1")
+    assert rendered.index("q2") < rendered.index("a2")
+    assert paged == rendered
