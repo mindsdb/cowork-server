@@ -50,39 +50,31 @@ _SCAN_CAP_MULTIPLIER = 10
 # trip on the unbounded get_messages branch a 1,000+ message conversation
 # can reach.
 _EVENTS_IN_CHUNK_SIZE = 500
-# Upper bound for a decoded cursor's `seq`: the widest value the column can
-# hold. Anything above it is a forged cursor, not a row that exists.
+# Upper bound for a decoded cursor's `seq`. This is the driver's limit, not
+# the column's (`seq` is INTEGER, so 2**31-1 on Postgres): both sqlite3 and
+# psycopg raise rather than bind an int wider than 64 bits, and that raise
+# escapes past this module's own error mapping as a 500.
 _MAX_CURSOR_SEQ = 2**63 - 1
 
-# created_at is only second-precision, so rows of turns in the same second
-# would otherwise interleave. `seq` is a per-conversation monotonic ordinal
-# (see _next_seq) that resolves those ties deterministically. The role tiebreak
-# only matters for legacy rows (all seq 0), keeping user before assistant; id is
-# the final tiebreak.
+# The one order every read path uses: the UI list, the paginated page, the
+# replayed LLM history, and delete_turn's anchor resolution.
+#
+# `seq` leads, and created_at is deliberately absent. created_at is written two
+# different ways depending on the path — an explicit Python datetime (bound
+# with microsecond precision) by save_user_message, vs `server_default=now()`
+# by save_assistant_turn, which SQLite stores as a bare second-precision
+# string. SQLite compares those lexicographically, not temporally, so an
+# answer persisted in the same second as its question sorts BEFORE it. Leading
+# on created_at therefore returns a turn back to front, and a cursor built
+# from one format never satisfies `<` against rows stored in the other.
+#
+# `seq` is a per-conversation monotonic ordinal assigned at insert
+# (max(seq)+1, see _next_seq) that records the real insert order created_at
+# was only approximating. It is a TOTAL order per conversation only because
+# migration 3e4b5f7586d3 backfills the pre-seq rows that all shared 0; without
+# that backfill every legacy row ties here. role/id stay as a defensive
+# tiebreak, not a load-bearing one.
 _MESSAGE_ORDER = (
-    Message.created_at,
-    Message.seq,
-    case((Message.role == Role.user, 0), else_=1),
-    Message.id,
-)
-
-# Keyset comparison tuple for get_messages_page's cursor, deliberately NOT
-# _MESSAGE_ORDER: created_at is populated two different ways depending on the
-# write path — an explicit Python datetime (bound with microsecond precision)
-# on most test/legacy paths, vs `server_default=sa.func.now()` on the normal
-# save_user_message/save_assistant_turn path, which SQLite stores as a bare
-# second-precision string. A cursor built from one and compared against rows
-# written the other way compares unequal-length datetime strings, and SQLite
-# resolves that lexicographically rather than temporally — the leading tuple
-# column then never satisfies `<`, so every "before" query matches every row,
-# every page repeats the newest N forever. `seq` is already a per-conversation
-# monotonic ordinal assigned at insert (max(seq)+1) that tracks the same real
-# insert order created_at was approximating, so it alone is a safe, precise
-# keyset key. It is a TOTAL order per conversation only because migration
-# 3e4b5f7586d3 backfills the pre-seq rows that all shared 0; without that
-# backfill every legacy row ties here and the page comes back grouped by role
-# in UUID order. role/id stay as a defensive tiebreak, not a load-bearing one.
-_MESSAGE_CURSOR_ORDER = (
     Message.seq,
     case((Message.role == Role.user, 0), else_=1),
     Message.id,
@@ -90,8 +82,8 @@ _MESSAGE_CURSOR_ORDER = (
 
 
 def _message_cursor_key(message: Message) -> tuple[int, int, UUID]:
-    """The runtime value of each _MESSAGE_CURSOR_ORDER column for one row, in
-    the same order — used to build a keyset pagination cursor from it."""
+    """The runtime value of each _MESSAGE_ORDER column for one row, in the
+    same order — used to build a keyset pagination cursor from it."""
     role_rank = 0 if message.role == Role.user else 1
     return (message.seq, role_rank, message.id)
 
@@ -1065,7 +1057,13 @@ class ConversationService:
 
         stmt = self.session.select(Message).where(Message.conversation_id == conversation_id)
         if cursor is not None:
-            stmt = stmt.where(tuple_(*_MESSAGE_CURSOR_ORDER) < tuple_(*cursor))
+            # Two predicates on purpose. The row-value comparison is the
+            # exact one, but its middle element is a CASE expression, which
+            # no index can serve as a range start-point. The plain `seq <=`
+            # alongside it is sargable, so the index seeks straight to the
+            # cursor instead of scanning and discarding every newer row.
+            stmt = stmt.where(Message.seq <= cursor[0])
+            stmt = stmt.where(tuple_(*_MESSAGE_ORDER) < tuple_(*cursor))
         stmt = stmt.order_by(
             Message.seq.desc(),
             case((Message.role == Role.user, 0), else_=1).desc(),

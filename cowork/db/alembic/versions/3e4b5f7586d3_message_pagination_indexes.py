@@ -10,15 +10,31 @@ Three gaps, all on the message-history read path:
 a message was an unindexed scan.
 
 `messages.seq` was added by a1c3e5f7b9d2 with ``server_default="0"`` and no
-backfill, so every row written before that migration shares seq 0. Cursor
-pagination keys on seq, and with every legacy row tied at 0 the tiebreak
-falls through to a random UUID — a paginated read of a legacy conversation
-comes back grouped by role instead of in history order, disagreeing with
-the unbounded read of the same rows. The backfill below renumbers each
-affected conversation by the order those rows already sort in
-(``created_at``, ``seq``, user-before-assistant, ``id`` — ConversationService's
-_MESSAGE_ORDER), so seq becomes a dense per-conversation ordinal and the two
-read paths agree permanently.
+backfill, so every row written before that migration shares seq 0. Every read
+path orders by seq (ConversationService._MESSAGE_ORDER), and with every legacy
+row tied at 0 the tiebreak falls through to a random UUID — a legacy
+conversation comes back grouped by role instead of in history order. The
+backfill below renumbers each affected conversation into a dense ordinal so
+seq is a total order per conversation.
+
+It orders by ``seq`` before ``created_at`` on purpose. A conversation that
+spans this migration holds legacy rows (all seq 0) alongside newer rows with
+real seq values, and on SQLite those newer rows carry created_at in two
+different formats — microsecond-precision where the writer passed a datetime,
+second-precision where the column default fired — which SQLite compares
+lexicographically. Leading on created_at there puts an answer before the
+question it replies to, and this migration would bake that into seq
+permanently, because afterwards the conversation's seqs are distinct and the
+``HAVING`` filter never selects it again. Leading on seq keeps the legacy
+block (all 0) first, ordered among itself by created_at, which is safe
+because every pre-seq row was written by the same path and shares one format.
+
+Deploy notes: the backfill is a bulk UPDATE and the index build takes a
+write-blocking lock on Postgres, so both want a maintenance window on a large
+`messages` table. It must also not race a writer — a row inserted by a
+still-running old pod mid-migration computes max(seq)+1 against the
+pre-backfill all-zero column and lands in the wrong place, and this
+conversation will never be renumbered again.
 
 Cursor pagination then needs ``(conversation_id, seq)`` to be an index seek.
 An earlier draft of this migration created ``(conversation_id, created_at,
@@ -48,10 +64,6 @@ depends_on: Union[str, Sequence[str], None] = None
 
 _MESSAGE_EVENTS_INDEX = "ix_message_events_message_id"
 _MESSAGES_SEQ_INDEX = "ix_messages_conversation_seq"
-# An earlier draft of this same revision created a (conversation_id,
-# created_at, seq) index under this name. Dropped on upgrade so a checkout
-# that already ran that draft locally doesn't keep an index nothing uses.
-_SUPERSEDED_SEQ_INDEX = "ix_messages_conversation_created_seq"
 
 
 def _has_index(table_name: str, index_name: str) -> bool:
@@ -83,16 +95,16 @@ def _backfill_message_seq() -> None:
                 SELECT id
                 FROM messages
                 WHERE conversation_id = :cid
-                ORDER BY created_at, seq,
+                ORDER BY seq, created_at,
                          CASE WHEN role = 'user' THEN 0 ELSE 1 END, id
                 """
             ),
             {"cid": conversation_id},
         ).scalars().all()
-        for position, message_id in enumerate(rows):
+        updates = [{"new_seq": position, "row_id": row_id} for position, row_id in enumerate(rows)]
+        if updates:
             bind.execute(
-                sa.text("UPDATE messages SET seq = :seq WHERE id = :id"),
-                {"seq": position, "id": message_id},
+                sa.text("UPDATE messages SET seq = :new_seq WHERE id = :row_id"), updates
             )
 
 
@@ -101,8 +113,6 @@ def upgrade() -> None:
     if not _has_index("message_events", _MESSAGE_EVENTS_INDEX):
         op.create_index(_MESSAGE_EVENTS_INDEX, "message_events", ["message_id"])
     _backfill_message_seq()
-    if _has_index("messages", _SUPERSEDED_SEQ_INDEX):
-        op.drop_index(_SUPERSEDED_SEQ_INDEX, table_name="messages")
     if not _has_index("messages", _MESSAGES_SEQ_INDEX):
         op.create_index(_MESSAGES_SEQ_INDEX, "messages", ["conversation_id", "seq"])
 

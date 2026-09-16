@@ -208,18 +208,47 @@ class TestPendingRowInclusion:
 
 
 class TestPagedAndUnboundedReadsAgree:
-    """The two branches of GET /items must render the same history.
+    """The two branches of GET /items must render the same history, and both
+    must render it the right way round.
 
-    This is the property that matters, and the one an earlier version of
-    this file did not check: it built every legacy row with an identical
-    created_at, which is the only shape where a seq-keyed cursor and
-    _MESSAGE_ORDER cannot disagree, and then asserted the grouping the
-    implementation happened to produce. Real rows carry distinct
-    second-precision timestamps. The pre-seq rows that all share seq 0 are
-    renumbered by migration 3e4b5f7586d3 (proved in
-    test_message_seq_backfill_migration.py); here the concern is that a
-    multi-page walk of ordinary rows reproduces the unbounded list exactly.
+    An earlier version of this class built every row through `_add_message`,
+    which always passes an explicit created_at. Uniform timestamp formatting
+    is exactly the shape where the two orders cannot disagree, so the tests
+    could not fail for the reason the property exists. The real write path
+    does not look like that: save_user_message binds a Python datetime
+    (microsecond precision) and save_assistant_turn lets the column default
+    fire (second precision on SQLite), and SQLite compares those strings
+    lexicographically.
     """
+
+    def _conversation_via_the_real_write_path(self, session, conversation):
+        """One turn persisted exactly the way a live turn persists it."""
+        svc = ConversationService(session)
+        svc.save_user_message(
+            conversation.id, "question", created_at=datetime.now(timezone.utc)
+        )
+        svc.save_assistant_turn(conversation.id, "answer", [{"type": "response.completed"}])
+        return svc
+
+    def test_a_turn_reads_question_before_answer_on_both_paths(self, session, conversation):
+        svc = self._conversation_via_the_real_write_path(session, conversation)
+
+        unbounded = [m["content"] for m in svc.get_messages(conversation.id)]
+        paged = [m["content"] for m in svc.get_messages_page(conversation.id, limit=50).items]
+
+        assert unbounded == ["question", "answer"]
+        assert paged == unbounded
+
+    def test_replayed_llm_history_matches_what_the_ui_renders(self, session, conversation):
+        # get_ordered_messages feeds the harness. If it disagrees with the UI
+        # the model is replayed a conversation the user never had.
+        svc = self._conversation_via_the_real_write_path(session, conversation)
+
+        replayed = [m.content for m in svc.get_ordered_messages(conversation.id)]
+        rendered = [m["content"] for m in svc.get_messages(conversation.id)]
+
+        assert replayed == ["question", "answer"]
+        assert replayed == rendered
 
     def test_page_walk_reproduces_the_unbounded_list(self, session, conversation):
         svc = ConversationService(session)

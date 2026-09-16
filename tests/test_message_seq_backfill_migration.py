@@ -166,3 +166,40 @@ def test_conversations_written_after_the_seq_migration_are_untouched(legacy_db, 
             "SELECT seq FROM messages WHERE conversation_id = :cid ORDER BY seq"
         ), {"cid": modern_id}).scalars().all()
     assert seqs == [i * 10 for i in range(len(_LEGACY_ROWS))]
+
+
+def test_a_conversation_spanning_the_seq_migration_keeps_its_modern_turns_paired(legacy_db):
+    """The hard case: legacy rows tied at seq 0, then modern rows with real
+    seq and the two created_at formats the live write path produces.
+
+    Ordering the backfill by created_at first would swap each modern
+    question/answer pair, because SQLite compares
+    '...:00.500000' against '...:00' lexicographically — and it would be
+    permanent, since afterwards the conversation's seqs are distinct and the
+    HAVING filter never selects it again.
+    """
+    cfg, db_path, conversation_id = legacy_db
+    engine = create_engine(f"sqlite:///{db_path}")
+    modern = [
+        ("user", "modern q1", 1, "2026-08-10 11:00:00.500000"),
+        ("assistant", "modern a1", 2, "2026-08-10 11:00:00"),
+        ("user", "modern q2", 3, "2026-08-10 11:00:09.900000"),
+        ("assistant", "modern a2", 4, "2026-08-10 11:00:09"),
+    ]
+    with engine.begin() as conn:
+        for role, content, seq, created_at in modern:
+            conn.execute(text(
+                "INSERT INTO messages (id, conversation_id, role, content, seq, created_at) "
+                "VALUES (:id, :cid, :role, :content, :seq, :created_at)"
+            ), {
+                "id": uuid4().hex, "cid": conversation_id, "role": role,
+                "content": f'"{content}"', "seq": seq, "created_at": created_at,
+            })
+
+    command.upgrade(cfg, "head")
+
+    svc = _service(db_path)
+    cid = UUID(conversation_id)
+    expected = [content for _, content in _LEGACY_ROWS] + [c for _, c, _, _ in modern]
+    assert [m["content"] for m in svc.get_messages(cid)] == expected
+    assert [m["content"] for m in svc.get_messages_page(cid, limit=50).items] == expected

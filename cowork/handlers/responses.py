@@ -689,7 +689,7 @@ class ResponsesHandler:
                 "sequence_number": 1,
                 "conversation_id": str(conv_id),
                 "harness": "cowork-direct",
-                **({"user_message_id": str(user_msg.id)} if user_msg is not None else {}),
+                "user_message_id": str(user_msg.id),
                 "response": response.model_dump(),
             })})
             await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", delta)})
