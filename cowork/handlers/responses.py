@@ -49,7 +49,10 @@ from cowork.schemas.responses import (
     ResponsesRequest,
     Role,
 )
-from cowork.handlers._turn_history import sanitize_turn_history_rows
+from cowork.handlers._turn_history import (
+    reject_unreplayable_tool_rows,
+    sanitize_turn_history_rows,
+)
 from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
     CONTENT_RECOVERY_CODE,
@@ -238,13 +241,13 @@ def _auth_failure_provider(settings, role: str | None) -> Provider | None:
     if role == "coding":
         return settings.resolved_coding_provider
     if role == "router":
-        # Defensive, and not reachable today: every router call site swallows a
-        # confirmed refusal rather than propagating it — `summarize()` at
-        # anton/core/session.py:2366, `gate()` inside `_gate_turn` at
-        # anton/core/session.py:3515, and `_route_decision` below. The turn
-        # falls back to planning instead, which `tests/test_thalamus.py` pins in
-        # anton. Kept so a future propagating router path attributes the card to
-        # the provider that actually failed rather than defaulting to planning.
+        # Defensive, and not reachable today: anton's `summarize()` is the only
+        # router-role call that stamps a refusal, and it swallows a confirmed one
+        # rather than propagating (pinned by its
+        # `test_failed_summarize_reports_no_compaction`). `decide_route` below
+        # streams the provider directly, outside anton's client, so it never
+        # stamps a role at all. Kept so a future propagating router path
+        # attributes the card to the provider that failed rather than to planning.
         return settings.resolved_router_provider
     if role == "planning":
         return settings.resolved_planning_provider
@@ -1414,7 +1417,10 @@ class ResponsesHandler:
             # Tool block-rows are for LLM-history persistence, not UI replay —
             # keep them out of the events log the client rebuilds from.
             if event_type == "response.turn_history":
-                turn_rows[:] = data.get("rows") or []
+                # Id-checked even though we produced these ourselves: an
+                # unreplayable id here is permanent for the conversation, and
+                # the installed anton can be older than this server (ENG-2420).
+                turn_rows[:] = reject_unreplayable_tool_rows(data.get("rows") or [])
                 return
             collected_events.append(data)
             accumulate_answer_text(collected_text, event_type, data)
@@ -1685,7 +1691,10 @@ class ResponsesHandler:
 
         def event_sink(event_type: str, data: dict) -> None:
             if event_type == "response.turn_history":
-                turn_rows[:] = data.get("rows") or []
+                # Id-checked even though we produced these ourselves: an
+                # unreplayable id here is permanent for the conversation, and
+                # the installed anton can be older than this server (ENG-2420).
+                turn_rows[:] = reject_unreplayable_tool_rows(data.get("rows") or [])
                 return
             collected_events.append(data)
             accumulate_answer_text(collected_text, event_type, data)
