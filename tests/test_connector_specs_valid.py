@@ -232,7 +232,7 @@ class TestLangfuseSpec:
         return next(f for f in method.fields if f.name == name)
 
 
-# The two connectors ENG-2806 enables for cloud execution. Every other method
+# The two connectors enabled for cloud execution. Every other method
 # in the corpus carries no `cloud` block and is therefore desktop-only.
 CLOUD_DATABASE_METHODS = {"postgres": "host-port", "mysql": "host-password"}
 
