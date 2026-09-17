@@ -607,10 +607,24 @@ class AppSettings(Settings):
         validation_alias=AliasChoices("COWORK_REQUIRE_AUTH"),
         description=(
             "Require a bearer token on all API requests (except /health). "
-            "Set COWORK_AUTH_TOKEN to a fixed token, or leave it empty to "
+            "Defaults on in local/desktop tenancy unless explicitly set. Set "
+            "COWORK_AUTH_TOKEN to a fixed token, or leave it empty to "
             "auto-generate one on first startup (written back to ~/.cowork/.env)."
         ),
     )
+
+    @model_validator(mode="after")
+    def _default_require_auth_in_local_mode(self) -> "AppSettings":
+        """Only when nothing set it explicitly, and never in org mode:
+        create_app() refuses to boot with require_auth=True there (the token
+        would be mirrored into shared storage every org can read), so
+        defaulting it on would turn "nobody configured this" into a boot
+        failure instead of leaving org's own ingress auth as the boundary.
+        """
+        if self.tenancy_mode != "org" and "require_auth" not in self.model_fields_set:
+            self.require_auth = True
+        return self
+
     auth_token: str = Field(
         default="",
         validation_alias=AliasChoices("COWORK_AUTH_TOKEN"),
