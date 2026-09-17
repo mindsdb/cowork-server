@@ -2,6 +2,14 @@
 
 Project discovery happens before the generic credential probe: users know their
 PostHog project by name, while the downstream engine needs its numeric ID.
+
+Discovery forwards the caller's personal API key, so the destination is the
+security boundary: a host the caller chooses freely turns this into a
+credentialed fetch against anything the server can reach. In org mode it
+therefore reaches ``CLOUD_ORIGINS`` only. A self-hosted host stays
+desktop-only until a guarded custom-host path is reviewed, and the connector
+form still offers "Self-hosted (enter URL)" in cloud, so the refusal message
+is the only thing that tells a caller no URL will do.
 """
 from __future__ import annotations
 
