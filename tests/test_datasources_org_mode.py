@@ -363,11 +363,17 @@ def test_every_route_relays_the_callers_credential_and_no_substitute_identity(
     if path.endswith("datasources/") and method == "get":
         scripted["body"] = {"items": [CONNECTION]}
 
-    org_client.request(method.upper(), path, json=body, headers=AUTH_HEADERS)
+    res = org_client.request(method.upper(), path, json=body, headers=AUTH_HEADERS)
 
+    assert res.status_code == scripted["status"], "the route must relay cleanly, not 500 on its own response"
     assert len(recorded) == 1
     sent = recorded[0]
     assert sent.headers["authorization"] == BEARER
+    # The gateway's identity headers are cowork-server's, not auth's. Auth
+    # derives owner and org from the bearer, so forwarding these would hand it
+    # a second, unverified opinion about who is calling.
+    assert "x-user-id" not in sent.headers
+    assert "x-organization-id" not in sent.headers
     for identity in ("user_id", "organization_id", "org_id"):
         assert identity not in str(sent.url)
         assert identity not in sent.content.decode()
