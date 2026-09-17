@@ -1,8 +1,10 @@
 """Datasource connection input, parsed and checked before the relay to auth.
 
-The rules here mirror auth's canonicalize so a bad connection is refused
-before a password crosses a service boundary. Auth validates again and owns
-the storage contract; this is not the only gate, it is the early one.
+These rules are a subset of auth's canonicalize, not a second copy of it:
+enough to refuse a bad connection before a password crosses a service
+boundary. Auth re-parses everything and owns the storage contract, so where
+this is looser (it checks PEM framing but does not parse X.509, for example)
+the result is a rejection one hop later, never an accepted bad connection.
 
 Every rejection message is a fixed string. The DSN, the password and the CA
 are never interpolated into an error, a log or a response.
@@ -10,6 +12,7 @@ are never interpolated into an error, a log or a response.
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlsplit
@@ -39,28 +42,43 @@ class InvalidDatasourceInput(HTTPException):
 
 
 def _canonical_host(value: Any) -> str:
-    """Normalize a hostname, rejecting multi-host lists, sockets and IPv6 literals."""
+    """Normalize a hostname, rejecting multi-host lists, sockets and IPv6 literals.
+
+    Loopback and link-local are refused because the stored host is dialed from
+    a cluster pod later, where 169.254.169.254 is the cloud metadata service
+    and 127.0.0.1 is a neighbouring service. RFC1918 stays allowed: a
+    VPC-peered private address is a legitimate customer database.
+    """
     host = str(value or "").strip().rstrip(".").lower()
     if not host or len(host) > 253 or not _HOST_RE.fullmatch(host) or "/" in host or ":" in host:
         raise InvalidDatasourceInput("host must be a single hostname or IP address")
+    if host == "localhost" or host.endswith(".localhost"):
+        raise InvalidDatasourceInput("host must be a reachable database server, not a local address")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host
+    if address.is_loopback or address.is_link_local:
+        raise InvalidDatasourceInput("host must be a reachable database server, not a local address")
     return host
 
 
 def _canonical_port(value: Any, connector_id: str) -> int:
-    """Resolve the port, which this release pins to the connector default.
+    """Resolve the port, defaulting to the connector's standard one.
 
-    Auth accepts 1..65535; the connector spec accepts only the default in this
-    release, so the stricter of the two is applied before relay.
+    The bound is auth's storage contract, 1..65535. Whether a release supports
+    only the default port belongs to the capability policy and the adapter, not
+    to this normalizer: refusing it here would reject the managed poolers that
+    auth accepts and store.
     """
-    default = DEFAULT_PORTS[connector_id]
     if value in (None, ""):
-        return default
+        return DEFAULT_PORTS[connector_id]
     try:
         port = int(value)
     except (TypeError, ValueError) as exc:
         raise InvalidDatasourceInput("port must be an integer") from exc
-    if port != default:
-        raise InvalidDatasourceInput("only the connector's default port is accepted in this release")
+    if not 1 <= port <= 65535:
+        raise InvalidDatasourceInput("port must be between 1 and 65535")
     return port
 
 
@@ -165,10 +183,14 @@ def normalize_datasource_input(model: DatasourceCreateRequest) -> dict[str, Any]
     if not database or not username or not password:
         raise InvalidDatasourceInput("database, username and password are required")
 
+    name = model.name.strip()
+    if not name:
+        raise InvalidDatasourceInput("name is required")
+
     return {
         "connector_id": connector_id,
         "method": method,
-        "name": model.name.strip(),
+        "name": name,
         "host": _canonical_host(fields.get("host")),
         "port": _canonical_port(fields.get("port"), connector_id),
         "database": database,
