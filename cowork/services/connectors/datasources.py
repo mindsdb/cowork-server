@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
+import socket
 from typing import Any
 from urllib.parse import parse_qsl, unquote, urlsplit
 
@@ -44,10 +45,20 @@ class InvalidDatasourceInput(HTTPException):
 def _canonical_host(value: Any) -> str:
     """Normalize a hostname, rejecting multi-host lists, sockets and IPv6 literals.
 
-    Loopback and link-local are refused because the stored host is dialed from
-    a cluster pod later, where 169.254.169.254 is the cloud metadata service
-    and 127.0.0.1 is a neighbouring service. RFC1918 stays allowed: a
-    VPC-peered private address is a legitimate customer database.
+    An address literal is refused when it points somewhere only the pod can
+    reach: the stored host is dialed from a cluster pod later, where
+    169.254.169.254 is the cloud metadata service. RFC1918 stays allowed
+    because a VPC-peered private address is a legitimate customer database.
+
+    Parsing goes through inet_aton, which is what the resolver itself accepts,
+    so the numeric spellings that reach the same address (2852039166 and
+    0xa9fea9fe are both 169.254.169.254) are caught rather than mistaken for
+    DNS names, and the literal is stored in its canonical form.
+
+    This is an early filter, not the wall. A DNS name that resolves to a
+    link-local address passes here, and no literal check can catch that or
+    DNS rebinding; only resolving at connect time can, and that code lives
+    with whatever dials the connection.
     """
     host = str(value or "").strip().rstrip(".").lower()
     if not host or len(host) > 253 or not _HOST_RE.fullmatch(host) or "/" in host or ":" in host:
@@ -55,12 +66,19 @@ def _canonical_host(value: Any) -> str:
     if host == "localhost" or host.endswith(".localhost"):
         raise InvalidDatasourceInput("host must be a reachable database server, not a local address")
     try:
-        address = ipaddress.ip_address(host)
-    except ValueError:
+        packed = socket.inet_aton(host)
+    except OSError:
         return host
-    if address.is_loopback or address.is_link_local:
+    address = ipaddress.ip_address(packed)
+    if (
+        address.is_loopback
+        or address.is_link_local
+        or address.is_unspecified
+        or address.is_reserved
+        or address.is_multicast
+    ):
         raise InvalidDatasourceInput("host must be a reachable database server, not a local address")
-    return host
+    return str(address)
 
 
 def _canonical_port(value: Any, connector_id: str) -> int:
