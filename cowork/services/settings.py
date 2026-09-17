@@ -10,6 +10,7 @@ from sqlmodel import Session, select
 from cowork.common.encryption import decrypt, encrypt
 from cowork.common.settings.runtime_credential import get_minds_credential
 from cowork.common.settings.user_settings import (
+    reject_unknown_harness,
     UserSettings,
     invalidate_user_settings_cache,
     setting_is_org_scoped,
@@ -288,7 +289,8 @@ class SettingService:
         """
         self._validate_key(key)
         try:
-            validated = UserSettings.model_validate({key: value})
+            with reject_unknown_harness():
+                validated = UserSettings.model_validate({key: value})
         except ValidationError as e:
             raise ValueError(str(e))
         field_val = getattr(validated, key)

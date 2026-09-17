@@ -84,20 +84,36 @@ def test_two_orgs_never_share_a_vault_directory(org_deployment):
 
 def test_single_tenant_harness_is_refused_in_org_mode(org_deployment):
     """available_harness_ids() only hides it from the picker. The harness is an
-    org-scoped user setting, so a stored row naming one still reached get_harness
-    and ran it against unscoped shared-storage paths."""
-    from cowork.harnesses.base import get_harness
+    org-scoped user setting, so a stored row naming one would still reach
+    get_harness and run it against unscoped shared-storage paths."""
+    from cowork.harnesses.base import _registry, get_harness, register
 
-    with pytest.raises(ValueError, match="does not support multi-tenant"):
-        get_harness("hermes")
+    @register
+    class _SingleTenant:
+        id = "single-tenant-test"
+        label = "Single tenant"
+        supports_org_mode = False
+
+    try:
+        with pytest.raises(ValueError, match="does not support multi-tenant"):
+            get_harness(_SingleTenant.id)
+    finally:
+        _registry.pop(_SingleTenant.id, None)
 
 
 def test_single_tenant_harness_still_loads_on_desktop(local_deployment):
-    from cowork.harnesses.base import _registry, get_harness
+    from cowork.harnesses.base import _registry, get_harness, register
 
-    if "hermes" not in _registry:
-        pytest.skip("hermes harness not installed in this environment")
-    assert get_harness("hermes") is not None
+    @register
+    class _SingleTenant:
+        id = "single-tenant-test"
+        label = "Single tenant"
+        supports_org_mode = False
+
+    try:
+        assert isinstance(get_harness(_SingleTenant.id), _SingleTenant)
+    finally:
+        _registry.pop(_SingleTenant.id, None)
 
 
 def test_bearer_token_mirror_is_refused_in_org_mode(org_deployment, monkeypatch):

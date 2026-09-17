@@ -48,9 +48,7 @@ def organization_switch_capability(
 
     settings = get_app_settings()
     boundary_enforced = (
-        settings.tenancy_mode == "org"
-        and settings.identity_enforce == "enforce"
-        and settings.organization_boundary_mode == "enforce"
+        settings.tenancy_mode == "org" and settings.identity_enforce == "enforce"
     )
     return OrganizationSwitchCapability(
         expected_organization_enforced=boundary_enforced,

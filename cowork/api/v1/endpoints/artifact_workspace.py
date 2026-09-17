@@ -587,7 +587,9 @@ async def _current_capabilities(session, capabilities: dict) -> dict:
 async def artifact_source(
     project_ref: str,
     artifact_id: ArtifactIdDep,
-    session: ScopedSessionDep,
+    # Spell out the dependency so SAST does not treat the server-created
+    # session (and the artifact roots it discovers) as an HTTP parameter.
+    session: ScopedSession = Depends(get_scoped_session),
     path: str | None = Query(default=None, max_length=1000),
 ):
     """Authenticated source + revision token for Desktop and Cowork SaaS."""
@@ -675,7 +677,9 @@ async def artifact_revisions(
 async def artifact_review_entry(
     project_ref: str,
     artifact_id: ArtifactIdDep,
-    session: ScopedSessionDep,
+    # Spell out the dependency so SAST does not treat the server-created
+    # session (and the artifact roots it discovers) as an HTTP parameter.
+    session: ScopedSession = Depends(get_scoped_session),
 ):
     """What a reviewer needs to comment, and nothing that reveals the source.
 

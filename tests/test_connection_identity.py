@@ -17,6 +17,7 @@ from cowork.services.connectors.identity import (
     VAULT_KEEP_SENTINEL,
     connection_display_name,
     derive_connection_name,
+    oauth_default_label,
     resolve_keep_sentinels,
     secure_keys_for,
     spec_secret_fields,
@@ -375,6 +376,40 @@ class TestDisplayName:
         # fallback because `_user_label` is present (non-empty) on the record.
         assert detail.user_label == "gmail"
         assert detail.fields["app_password"] == VAULT_KEEP_SENTINEL  # still masked
+
+
+class TestOAuthDefaultLabel:
+    """default_label for a brand-new OAuth connection: prefers the friendly
+    account_name (unlike connection_display_name, the subtitle source, which
+    prefers account_email for most engines to guarantee uniqueness) — falls
+    back to account_email except for engines where it's a synthetic
+    placeholder, not a real display value."""
+
+    def test_prefers_account_name_when_present(self):
+        assert oauth_default_label(
+            {"account_name": "Real Name", "account_email": "user@example.com"}, "gmail"
+        ) == "Real Name"
+
+    def test_falls_back_to_account_email_when_no_name(self):
+        # None of the Google-family scopes include profile/openid, so
+        # account_name is always empty for them.
+        assert oauth_default_label({"account_email": "user@example.com"}, "gmail") == "user@example.com"
+
+    def test_returns_none_when_neither_present(self):
+        assert oauth_default_label({}, "gmail") is None
+
+    def test_does_not_fall_back_to_synthetic_account_email_for_linear_supabase_posthog(self):
+        # account_email is a synthetic composite placeholder for these three
+        # (see connection_display_name) — a missing account_name there means
+        # there is nothing presentable to fall back to.
+        for engine in ("linear", "supabase", "posthog"):
+            assert oauth_default_label({"account_email": "user@example.com:org-1"}, engine) is None
+
+    def test_prefers_account_name_for_linear_supabase_posthog_too(self):
+        for engine in ("linear", "supabase", "posthog"):
+            assert oauth_default_label(
+                {"account_name": "Acme", "account_email": "user@example.com:org-1"}, engine
+            ) == "Acme"
 
 
 class TestConnectionDisplayNameNoLongerPrefersLabel:
