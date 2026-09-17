@@ -136,6 +136,97 @@ def test_remote_content_validation_error_maps_to_curated_copy():
     assert message == te.CONTENT_RECOVERY_USER_MESSAGE
 
 
+# ── ENG-2689: too-large is its own card, and still repairs the conversation ──
+
+
+# anton's REAL parent type, deliberately. cowork-server pins anton from a git
+# branch, so `ContentTooLargeError` is not installed here yet — but production's
+# object is a real subclass of a real `ContentValidationError`, and that is the
+# whole point: BOTH detectors match it, so only their ORDER decides the card.
+# A hand-rolled stand-in would satisfy neither detector's isinstance check and
+# these tests would pass without the ordering ever being exercised.
+from anton.core.llm.provider import ContentValidationError as _AntonContentValidationError
+
+
+class ContentTooLargeError(_AntonContentValidationError):
+    """Named to match anton's class exactly — the name is the discriminator on
+    both transports (the remote wire carries only "<Type>: <message>")."""
+
+    def __init__(self, message, code="content_too_large"):
+        super().__init__(message, code=code)
+
+
+_RESIZE_COPY = (
+    "An image in this conversation is too large for the model to accept. The "
+    "provider said: The image you provided requires 32400 patches after "
+    "processing, exceeding the limit of 30000. Please resize the image and "
+    "try again. That image will be removed automatically so the conversation "
+    "can continue."
+)
+
+
+def test_the_too_large_fixture_is_also_matched_by_the_broader_detector():
+    """Guards the two tests below from passing for the wrong reason. If this
+    ever fails, the fixture stopped being a ContentValidationError and the
+    ordering assertions became vacuous."""
+    exc = ContentTooLargeError(_RESIZE_COPY)
+    assert te.is_content_validation_error(exc)
+    assert te.is_content_too_large_error(exc)
+
+
+def test_too_large_wins_over_the_content_recovery_detector():
+    """The ranking that matters. anton's too-large type SUBCLASSES the
+    content-validation one, so the broader detector matches it too — checked
+    in the wrong order, a user whose image is too big is told the problem was
+    already fixed and they can keep going, which is false."""
+    result = te.friendly_turn_error(ContentTooLargeError(_RESIZE_COPY))
+    assert result is not None
+    code, message = result
+    assert code == te.CONTENT_TOO_LARGE_CODE
+    assert message != te.CONTENT_RECOVERY_USER_MESSAGE
+
+
+def test_too_large_keeps_the_providers_resize_instruction():
+    """The sentence the user needed. This module normally replaces anton's
+    message with curated copy; here anton's is the more specific of the two
+    because it carries the provider's own remedy."""
+    _, message = te.friendly_turn_error(ContentTooLargeError(_RESIZE_COPY))
+    assert "resize the image" in message.lower()
+    assert "temporarily unavailable" not in message.lower()
+
+
+def test_a_plain_content_validation_error_keeps_its_own_card():
+    """The ENG-1992 behaviour must not move: that failure IS already fixed
+    server-side, and telling the user to attach a smaller image would be
+    nonsense advice for a serialization mismatch."""
+    result = te.friendly_turn_error(
+        _AntonContentValidationError("bad image block")
+    )
+    assert result is not None
+    code, message = result
+    assert code == te.CONTENT_RECOVERY_CODE
+    assert message == te.CONTENT_RECOVERY_USER_MESSAGE
+
+
+def test_remote_too_large_maps_to_its_own_code_and_passes_the_message():
+    """The hosted/pod path. Only the scrubbed "<Type>: <message>" string
+    crosses that wire, so the class name is the entire discriminator — which
+    is why anton raises a distinct subclass rather than varying a `code` the
+    wire does not carry."""
+    code, message = te.remote_turn_error(f"ContentTooLargeError: {_RESIZE_COPY}")
+    assert code == te.CONTENT_TOO_LARGE_CODE
+    assert "resize the image" in message.lower()
+
+
+def test_both_content_codes_trigger_the_conversation_repair():
+    """The bit that unsticks the user. The repair is keyed on this set, and a
+    too-large turn that skipped it would leave the oversized image in stored
+    history — every later turn in that conversation re-sends it and fails the
+    same way, which is the defect ENG-2689 was filed for."""
+    assert te.CONTENT_TOO_LARGE_CODE in te.CONTENT_REPAIR_CODES
+    assert te.CONTENT_RECOVERY_CODE in te.CONTENT_REPAIR_CODES
+
+
 def test_response_failed_sse_shape():
     frame = te.response_failed_sse("oops", "image_format")
     assert frame.startswith("event: response.failed\ndata: ")
@@ -1631,6 +1722,11 @@ def test_wire_code_inventory_matches_the_renderer_contract():
         # ENG-1992 — a content-shaped rejection the server already repaired;
         # distinct copy from image_format (no re-upload needed).
         "content_recovery",
+        # ENG-2689 — an image the provider refused as too LARGE. Split off
+        # content_recovery because the copy is the opposite: that one says
+        # "fixed, keep going", this one needs the user to attach something
+        # smaller. The renderer branch lands in mindsdb/cowork's ChatView.jsx.
+        "content_too_large",
         # ENG-2126 — the worker never answered, so the turn never ran. Split off
         # anton_error because the two need opposite next steps: this one is ours
         # to fix, and reads as an agent bug while it shares that code.

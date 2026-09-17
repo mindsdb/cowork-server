@@ -49,6 +49,36 @@ CONTENT_RECOVERY_USER_MESSAGE = (
     "you can keep going."
 )
 
+# ENG-2689: the same permanence, the opposite remedy. `content_recovery` above
+# says "I've fixed it, keep going", which is true for a serialization mismatch
+# WE caused. It is false for an image the provider refused as too large: the
+# conversation is unstuck (that image is stripped either way) but the thing the
+# user wanted done still hasn't happened, and only they can fix it by attaching
+# something smaller. Telling them it is fixed is how a user concludes the
+# product is broken — the reported session ended in "scrap the whole thing".
+#
+# anton's message carries the provider's own remedy sentence ("Please resize
+# the image and try again"), which is more specific than anything we can write
+# here, so this path passes that message through instead of replacing it — the
+# one place in this module where the provider's prose is better than ours.
+CONTENT_TOO_LARGE_CODE = "content_too_large"
+CONTENT_TOO_LARGE_USER_MESSAGE = (
+    "An image in this conversation is too large for the model to accept, so "
+    "it's been removed and the conversation can continue. Attach a smaller "
+    "or lower-resolution copy if you still need it."
+)
+
+# Codes whose turns leave a poisoned image in the conversation's stored
+# history, so the caller must run `repair_image_content` before returning.
+# A set rather than a second `or` at each of the three call sites: the repair
+# and the copy are different decisions, and keeping the repair keyed on one
+# name means the NEXT permanent image rejection is added here once instead of
+# being forgotten at two of three sites. Not named `*_CODE` on purpose — the
+# wire-vocabulary inventory test collects those, and this is not a wire code.
+CONTENT_REPAIR_CODES: frozenset[str] = frozenset(
+    {CONTENT_RECOVERY_CODE, CONTENT_TOO_LARGE_CODE}
+)
+
 # Curated copy for the out-of-credits case. In the wallet billing model this
 # fires when either the org's wallet is empty (gateway 402 `wallet_empty`) or
 # the free monthly included-token allowance is spent (gateway 429
@@ -393,6 +423,31 @@ def is_image_format_error(exc: Exception) -> bool:
     return "image" in s and ("unsupported image" in s or "could not process image" in s)
 
 
+# ENG-2689's discriminator, deliberately NOT an isinstance check against
+# `anton.core.llm.provider.ContentTooLargeError`. cowork-server pins anton from
+# a git branch, so importing a type this repo can be deployed ahead of would
+# turn a version skew into an ImportError on the error path — the worst place
+# to have one. The class NAME is also the only thing that survives the remote
+# hop (`anton.cloud_turn.__main__._scrub` emits "<Type>: <message>"), so keying
+# on it here keeps both transports on one rule. `code` is checked too because
+# it is the attribute anton actually declares, and a future rename of the class
+# should not silently downgrade this to the wrong card.
+CONTENT_TOO_LARGE_TYPE_NAME = "ContentTooLargeError"
+
+
+def is_content_too_large_error(exc: Exception) -> bool:
+    """Whether the provider refused this turn because an image is too BIG.
+
+    A strict subset of `is_content_validation_error`: anton raises a subclass,
+    so everything true here is also true there. It must therefore be checked
+    FIRST wherever both are consulted, or the broader detector wins and the
+    user is told an unfixed problem was fixed.
+    """
+    if type(exc).__name__ == CONTENT_TOO_LARGE_TYPE_NAME:
+        return True
+    return getattr(exc, "code", None) == CONTENT_TOO_LARGE_CODE
+
+
 def is_content_validation_error(exc: Exception) -> bool:
     """Detect a permanent, content-SHAPED provider rejection — a content block
     in conversation history reached the model in a shape it doesn't parse
@@ -407,6 +462,11 @@ def is_content_validation_error(exc: Exception) -> bool:
     'type' does not match any of the expected tags"), and the caller that
     detects this repairs the conversation's stored history (unlike
     `is_image_format_error`, whose own docstring says it can't).
+
+    Also matches the too-large family (ENG-2689), whose anton type subclasses
+    this one — which is why `is_content_too_large_error` is consulted FIRST
+    wherever both are, and why this detector must not be "tightened" to
+    exclude it: the repair it gates is correct for both.
     """
     try:
         from anton.core.llm.provider import ContentValidationError
@@ -1024,6 +1084,12 @@ def friendly_turn_error(
     # are different failures with different correct copy — this one has
     # already been auto-repaired server-side, that one needs the user to
     # re-upload. The two detectors' phrasings don't overlap.
+    # Checked before is_content_validation_error: anton's too-large type is a
+    # SUBCLASS of the content-validation one, so the broader detector matches
+    # it too and would answer with the "already fixed, keep going" copy for a
+    # failure the user still has to act on (ENG-2689).
+    if is_content_too_large_error(exc):
+        return CONTENT_TOO_LARGE_CODE, str(exc) or CONTENT_TOO_LARGE_USER_MESSAGE
     if is_content_validation_error(exc):
         return CONTENT_RECOVERY_CODE, CONTENT_RECOVERY_USER_MESSAGE
     if is_image_format_error(exc):
@@ -1102,6 +1168,12 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
         and message.lower().startswith(LEGACY_AUTH_ERROR_MESSAGE_PREFIX)
     ):
         return AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE
+    if type_name == CONTENT_TOO_LARGE_TYPE_NAME:
+        # Unlike its sibling below, the message is passed through: anton built
+        # it around the provider's own "resize the image" sentence, which is
+        # more actionable than any constant here (ENG-2689). Ranked first —
+        # a remote payload names the concrete subclass, never the parent.
+        return CONTENT_TOO_LARGE_CODE, message or CONTENT_TOO_LARGE_USER_MESSAGE
     if type_name == "ContentValidationError":
         # ENG-1992: the repair itself (stripping the offending image blocks
         # from stored history) is triggered by the caller, keyed on this
