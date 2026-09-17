@@ -145,9 +145,39 @@ def test_structured_mode_refuses_a_dsn():
         normalize_datasource_input(_structured(input_mode="structured", dsn=DSN))
 
 
-def test_a_non_default_port_is_refused_before_relay():
+@pytest.mark.parametrize("port", [6543, 6432, 25060])
+def test_a_managed_pooler_port_is_accepted(port):
+    """Auth stores any port in 1..65535, and these are real managed endpoints.
+
+    Whether a release can execute against them is the capability policy's
+    call, not something to refuse at the storage boundary.
+    """
+    assert normalize_datasource_input(_structured(port=port))["port"] == port
+
+
+@pytest.mark.parametrize("port", [0, 65536, -1])
+def test_a_port_outside_the_valid_range_is_refused_before_relay(port):
     with pytest.raises(InvalidDatasourceInput):
-        normalize_datasource_input(_structured(port=6543))
+        normalize_datasource_input(_structured(port=port))
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "169.254.169.254", "localhost"])
+def test_loopback_and_link_local_hosts_are_refused(host):
+    """The stored host is dialed from a cluster pod later, so the metadata
+    service and neighbouring services must not be reachable through it."""
+    with pytest.raises(InvalidDatasourceInput):
+        normalize_datasource_input(_structured(host=host))
+
+
+def test_a_vpc_private_address_is_still_accepted():
+    assert normalize_datasource_input(_structured(host="10.0.0.5"))["host"] == "10.0.0.5"
+
+
+def test_a_name_that_is_only_whitespace_is_refused_before_relay():
+    """It passes min_length=1 but strips to empty, and auth answers a blank
+    name with a serializer error that carries no code to relay."""
+    with pytest.raises(InvalidDatasourceInput):
+        normalize_datasource_input(_structured(name="   "))
 
 
 def test_unsupported_connector_and_method_are_refused():
