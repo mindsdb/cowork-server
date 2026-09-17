@@ -335,3 +335,39 @@ def test_every_route_is_absent_in_local_mode(local_client, relay, method, path, 
 
     assert res.status_code == 404
     assert recorded == [], "a desktop caller must not reach auth"
+
+
+@pytest.mark.parametrize(
+    "method,path,body",
+    [
+        ("post", "/api/v1/connectors/datasources/", CREATE_BODY),
+        ("get", "/api/v1/connectors/datasources/", None),
+        ("get", "/api/v1/connectors/datasources/7", None),
+        ("patch", "/api/v1/connectors/datasources/7", {**CREATE_BODY, "expected_version": 1}),
+        ("delete", "/api/v1/connectors/datasources/7", None),
+        ("post", "/api/v1/connectors/datasources/7/validation-retry", None),
+    ],
+)
+def test_every_route_relays_the_callers_credential_and_no_substitute_identity(
+    org_client, relay, method, path, body
+):
+    """Owner and org are auth's to derive from the bearer.
+
+    Pinned on every route, not just create: a per-route regression that added
+    a user_id parameter or dropped the caller's header would otherwise pass.
+    """
+    recorded, scripted = relay
+    scripted["status"] = 201 if method == "post" and path.endswith("datasources/") else 200
+    if method == "delete":
+        scripted["status"] = 204
+    if path.endswith("datasources/") and method == "get":
+        scripted["body"] = {"items": [CONNECTION]}
+
+    org_client.request(method.upper(), path, json=body, headers=AUTH_HEADERS)
+
+    assert len(recorded) == 1
+    sent = recorded[0]
+    assert sent.headers["authorization"] == BEARER
+    for identity in ("user_id", "organization_id", "org_id"):
+        assert identity not in str(sent.url)
+        assert identity not in sent.content.decode()
