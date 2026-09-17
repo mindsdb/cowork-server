@@ -180,6 +180,28 @@ async def test_a_dual_stack_answer_falls_back_to_the_next_vetted_address(org_mod
 
 
 @pytest.mark.asyncio
+async def test_a_redirect_is_not_followed(org_mode):
+    """A 302 from an approved origin would otherwise be re-dialed wherever it
+    points, past the allowlist and past the address check, and its body would
+    come back through the project parser."""
+    seen: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(302, headers={"location": "http://169.254.169.254/latest/meta-data/"})
+
+    with pytest.raises(PostHogDiscoveryError, match="invalid project list"):
+        await discover_projects(
+            personal_api_key=KEY,
+            host="https://us.posthog.com",
+            transport=httpx.MockTransport(handle),
+            resolver=_answer(PUBLIC_V4),
+        )
+
+    assert [str(request.url) for request in seen] == [f"https://{PUBLIC_V4}/api/projects/"]
+
+
+@pytest.mark.asyncio
 async def test_a_custom_host_is_refused_without_resolving_or_dialing(org_mode):
     with pytest.raises(PostHogDiscoveryError, match="US Cloud or EU Cloud"):
         await discover_projects(
