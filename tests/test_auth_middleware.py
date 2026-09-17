@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from cowork.auth_middleware import (
     BearerTokenMiddleware,
     _read_token,
+    _write_token,
     ensure_auth_token,
     sync_auth_token,
 )
@@ -109,6 +110,32 @@ def test_sync_auth_token_mirrors_and_is_idempotent(tmp_path):
     assert _read_token(env) == "fixed-123"
     sync_auth_token(env, "fixed-123")  # no duplicate line / no error
     assert _read_token(env) == "fixed-123"
+
+
+def test_read_token_does_not_bleed_into_the_next_line_when_empty(tmp_path):
+    # A blank COWORK_AUTH_TOKEN= immediately followed by another setting must
+    # read as "no token" (which then triggers a fresh random one), not
+    # silently adopt that next line's value as a predictable bearer secret.
+    env = tmp_path / ".env"
+    env.write_text("COWORK_AUTH_TOKEN=\nENV=local\n")
+    assert _read_token(env) == ""
+
+
+def test_write_token_preserves_other_settings_on_success(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text("OPENAI_API_KEY=sk-existing\nANOTHER_SETTING=1\n")
+    _write_token(env, "new-token")
+    text = env.read_text()
+    assert "OPENAI_API_KEY=sk-existing" in text
+    assert "ANOTHER_SETTING=1" in text
+    assert _read_token(env) == "new-token"
+
+
+def test_write_token_leaves_no_temp_file_behind(tmp_path):
+    env = tmp_path / ".env"
+    _write_token(env, "a-token")
+    leftovers = [p for p in tmp_path.iterdir() if p.name != ".env"]
+    assert leftovers == []
 
 
 def test_real_app_requires_the_generated_token_by_default_in_local_mode(monkeypatch, tmp_path):

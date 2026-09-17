@@ -97,7 +97,7 @@ def sync_auth_token(env_path: Path, token: str) -> None:
 
 # ── private helpers ────────────────────────────────────────────────────────
 
-_TOKEN_RE = re.compile(r"^COWORK_AUTH_TOKEN\s*=\s*(.+)$", re.MULTILINE)
+_TOKEN_RE = re.compile(r"^COWORK_AUTH_TOKEN[ \t]*=[ \t]*(.+)$", re.MULTILINE)
 
 
 def _read_token(env_path: Path) -> str:
@@ -121,13 +121,21 @@ def _write_token(env_path: Path, token: str) -> None:
         sep = "\n" if existing and not existing.endswith("\n") else ""
         new_text = existing + sep + f"COWORK_AUTH_TOKEN={token}\n"
 
-    # Open with O_CREAT and mode 0o600 so a freshly created file is private
-    # from the start — never world-readable in the gap between write and chmod.
-    # For a pre-existing file the mode arg is ignored, so still chmod to tighten
-    # any looser permissions.
-    fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        fh.write(new_text)
+    # Write to a sibling temp file and atomically rename over env_path
+    # (os.replace) rather than truncating it in place — this file carries
+    # every other local setting (API keys, provider config), and a crash
+    # between truncate and write would otherwise erase all of it, not just
+    # the token line.
+    tmp_path = env_path.with_name(f".{env_path.name}.tmp-{os.getpid()}")
+    try:
+        # O_CREAT with mode 0o600 so the temp file is private from the start
+        # — never world-readable in the gap between write and chmod.
+        fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(new_text)
+        os.replace(tmp_path, env_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
     try:
         env_path.chmod(0o600)
     except OSError:

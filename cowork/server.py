@@ -273,8 +273,7 @@ def create_app() -> FastAPI:
         # read it back. On an org deployment cowork_home() is shared storage
         # that every organization's agent pod can read and write, so mirroring
         # a bearer token there would publish it to every tenant and let any of
-        # them overwrite it. Inert today only because require_auth defaults off
-        # and no values file sets it; guarded so turning it on is not a trap.
+        # them overwrite it.
         if settings.tenancy_mode == "org":
             raise RuntimeError(
                 "COWORK_REQUIRE_AUTH is not supported in org tenancy mode: the bearer token "
@@ -288,6 +287,15 @@ def create_app() -> FastAPI:
             BearerTokenMiddleware, token=token, exempt_paths=channel_webhook_paths
         )
         logger.info("auth: bearer-token authentication enabled")
+    elif settings.tenancy_mode != "org":
+        # Defaults on in local mode; someone explicitly turned it back off.
+        # Any browser tab can then reach every route this token would have
+        # gated, not just the ones require_local separately covers.
+        logger.warning(
+            "auth: COWORK_REQUIRE_AUTH explicitly disabled in local mode — "
+            "conversations, project files, and the agent endpoint have no "
+            "protection against a cross-site or DNS-rebound request."
+        )
 
     # Configure CORS outside the authentication and principal layers. The
     # no-store wrapper added below remains outermost.
