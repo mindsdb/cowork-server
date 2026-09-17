@@ -50,7 +50,10 @@ from cowork.schemas.responses import (
     ResponsesRequest,
     Role,
 )
-from cowork.handlers._turn_history import sanitize_turn_history_rows
+from cowork.handlers._turn_history import (
+    reject_unreplayable_tool_rows,
+    sanitize_turn_history_rows,
+)
 from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
     CONTENT_RECOVERY_CODE,
@@ -244,13 +247,13 @@ def _auth_failure_provider(settings, role: str | None) -> Provider | None:
     if role == "coding":
         return settings.resolved_coding_provider
     if role == "router":
-        # Defensive, and not reachable today: every router call site swallows a
-        # confirmed refusal rather than propagating it — `summarize()` at
-        # anton/core/session.py:2366, `gate()` inside `_gate_turn` at
-        # anton/core/session.py:3515, and `_route_decision` below. The turn
-        # falls back to planning instead, which `tests/test_thalamus.py` pins in
-        # anton. Kept so a future propagating router path attributes the card to
-        # the provider that actually failed rather than defaulting to planning.
+        # Defensive, and not reachable today: anton's `summarize()` is the only
+        # router-role call that stamps a refusal, and it swallows a confirmed one
+        # rather than propagating (pinned by its
+        # `test_failed_summarize_reports_no_compaction`). `decide_route` below
+        # streams the provider directly, outside anton's client, so it never
+        # stamps a role at all. Kept so a future propagating router path
+        # attributes the card to the provider that failed rather than to planning.
         return settings.resolved_router_provider
     if role == "planning":
         return settings.resolved_planning_provider
@@ -284,8 +287,8 @@ class ResponsesHandler:
         # overrides the account default for THIS call only — mirrors the
         # per-conversation model override below. Ignored (not raised) when it
         # doesn't name a currently-registered/available harness: a stale
-        # client cache (e.g. Hermes got uninstalled since the picker last
-        # loaded) must never fail the turn, it just falls back to the
+        # client cache (a harness removed since the picker last loaded)
+        # must never fail the turn, it just falls back to the
         # account default. self.harness stays None either way — still lazy,
         # only self.harness_name (which harness _get_harness() will build)
         # changes here.
@@ -795,10 +798,18 @@ class ResponsesHandler:
         chats before it ever opens the skills menu. Never fails the turn: a
         staging error degrades to a turn without the missing piece."""
         try:
+            from cowork.services.artifact_roots import project_artifacts_base
             from cowork.services.files import stage_project_instructions
 
             conversation = ConversationService(session).get_conversation(conv_id)
             project_path = conversation.project.path
+            # ENG-2056: the pod mounts the PROJECT-level artifacts base (subPath
+            # `.anton/artifacts`) at /project-artifacts, and a subPath mount needs
+            # the directory to exist before the pod starts. Project creation does
+            # not make it, so make it here — this is the one place that runs
+            # before every remote turn. First in the block: the pod needs it even
+            # when a later staging step degrades.
+            project_artifacts_base(project_path).mkdir(parents=True, exist_ok=True)
             FileService(session).stage_conversation_attachments(conv_id, project_path)
             stage_project_instructions(project_path, conv_id)
             SkillService(session.scope).ensure_builtin_skills()
@@ -891,15 +902,24 @@ class ResponsesHandler:
         None on any failure: no artifact card and no autopublish is a recoverable
         outcome (the next turn in this project reconciles), a failed turn is not.
         """
-        from cowork.services.artifact_roots import conversation_artifacts_base
+        from cowork.services.artifact_roots import project_artifacts_base
 
         try:
             conversation = ConversationService(session).get_conversation(conv_id)
-            # Conversation-scoped in org mode: the pod's workspace is
-            # <project>/conversations/<id>, not the project, so that is where the
-            # worker's artifacts land. Resolved through artifact_roots so this and
-            # the artifacts list agree on the layout.
-            artifacts_base = conversation_artifacts_base(conversation.project.path, conv_id)
+            # ENG-2056: project-scoped in BOTH modes. The pod mounts the
+            # PROJECT-level base at /project-artifacts and anton writes there
+            # (ANTON_CLOUD_ARTIFACTS_ROOT), so that is where the worker's
+            # artifacts land — no longer under conversations/<id>/. Resolved
+            # through artifact_roots so this and the artifacts list agree on
+            # the layout.
+            #
+            # The base is now shared by every task in the project, so the raw
+            # before/after diff below can attribute a concurrent sibling turn's
+            # artifact to this turn. Pre-existing caveat, not new machinery: the
+            # in-process path bounds the same diff with the session's
+            # artifacts_touched set (ENG-1933), but the remote pod reports no
+            # equivalent yet, so the diff stands alone here.
+            artifacts_base = project_artifacts_base(conversation.project.path)
             return (
                 conversation,
                 artifacts_base,
@@ -1517,7 +1537,10 @@ class ResponsesHandler:
             # Tool block-rows are for LLM-history persistence, not UI replay —
             # keep them out of the events log the client rebuilds from.
             if event_type == "response.turn_history":
-                turn_rows[:] = data.get("rows") or []
+                # Id-checked even though we produced these ourselves: an
+                # unreplayable id here is permanent for the conversation, and
+                # the installed anton can be older than this server (ENG-2420).
+                turn_rows[:] = reject_unreplayable_tool_rows(data.get("rows") or [])
                 return
             collected_events.append(data)
             accumulate_answer_text(collected_text, event_type, data)
@@ -1788,7 +1811,10 @@ class ResponsesHandler:
 
         def event_sink(event_type: str, data: dict) -> None:
             if event_type == "response.turn_history":
-                turn_rows[:] = data.get("rows") or []
+                # Id-checked even though we produced these ourselves: an
+                # unreplayable id here is permanent for the conversation, and
+                # the installed anton can be older than this server (ENG-2420).
+                turn_rows[:] = reject_unreplayable_tool_rows(data.get("rows") or [])
                 return
             collected_events.append(data)
             accumulate_answer_text(collected_text, event_type, data)

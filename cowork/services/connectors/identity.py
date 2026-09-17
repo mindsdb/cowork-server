@@ -118,6 +118,17 @@ def spec_secret_fields(connector_id: str, method: str | None) -> list[str]:
     return sorted(secret)
 
 
+# Engines whose OAuth fetcher folds a per-organization identity into
+# `account_email` as a synthetic composite placeholder — `org:<slug>` (see
+# `_fetch_userinfo_supabase`) or `<email>:<workspace_id>`/
+# `<email>:<organization_id>` (see `_fetch_userinfo_linear`/
+# `_fetch_userinfo_posthog`) — rather than a real, displayable email. Shared
+# so any caller falling back from `account_name` to `account_email` can skip
+# that fallback for exactly these three instead of leaking the composite
+# string.
+SYNTHETIC_ACCOUNT_EMAIL_ENGINES = frozenset({"supabase", "linear", "posthog"})
+
+
 def connection_display_name(fields: dict, engine: str = "") -> str | None:
     """Human-facing identity for a saved connection, or None.
 
@@ -128,21 +139,19 @@ def connection_display_name(fields: dict, engine: str = "") -> str | None:
     *subtitle* source only. Returns None when there's nothing meaningful —
     the caller then falls back to the slug.
 
-    ``account_name`` is checked first only for ``supabase``, ``linear``, and
-    ``posthog``: their ``account_email`` is a synthetic placeholder —
-    ``org:<slug>`` (see ``_fetch_userinfo_supabase``) or
-    ``<email>:<workspace_id>``/``<email>:<organization_id>`` (see
-    ``_fetch_userinfo_linear``/``_fetch_userinfo_posthog``) — not a real
-    email/display value, so the human org/workspace name is more useful
-    there. Every other engine populates a real ``account_email`` already,
-    and ``account_name`` there is just a free-text display name — preferring
-    it for all engines would collapse the subtitle for any two accounts that
-    share a name but have different emails.
+    ``account_name`` is checked first only for ``SYNTHETIC_ACCOUNT_EMAIL_ENGINES``
+    (supabase/linear/posthog): their ``account_email`` is a synthetic
+    placeholder, not a real email/display value, so the human org/workspace
+    name is more useful there. Every other engine populates a real
+    ``account_email`` already, and ``account_name`` there is just a
+    free-text display name — preferring it for all engines would collapse
+    the subtitle for any two accounts that share a name but have different
+    emails.
     """
     f = fields or {}
     keys = (
         ("account_name", "email", "account_email")
-        if engine in ("supabase", "linear", "posthog")
+        if engine in SYNTHETIC_ACCOUNT_EMAIL_ENGINES
         else ("email", "account_email")
     )
     for key in keys:
@@ -154,6 +163,34 @@ def connection_display_name(fields: dict, engine: str = "") -> str | None:
         database = str(f.get("database", "")).strip()
         return f"{host}/{database}" if database else host
     return None
+
+
+def oauth_default_label(fields: dict, engine: str) -> str | None:
+    """Default ``user_label`` for a brand-new OAuth connection, or None.
+
+    Unlike ``connection_display_name`` (the *subtitle* source, which prefers
+    ``account_email`` for most engines so two accounts sharing a display
+    name still render distinct subtitles), a fresh connection's *label*
+    should prefer the friendly ``account_name`` the provider returned when
+    there is one — ``persist_connection`` only uses this to title a
+    genuinely new connection's tile, and de-duplicates it globally via
+    ``ensure_unique_user_label`` regardless, so the readability tradeoff
+    that makes ``account_email`` the safer *identity* value doesn't apply
+    here.
+
+    Falls back to ``account_email`` when there's no name — except for
+    ``SYNTHETIC_ACCOUNT_EMAIL_ENGINES``, where it's a synthetic composite
+    placeholder (see ``connection_display_name``), not a real display value,
+    so a missing name there means there is nothing presentable to fall back
+    to.
+    """
+    f = fields or {}
+    account_name = str(f.get("account_name") or "").strip()
+    if account_name:
+        return account_name
+    if engine in SYNTHETIC_ACCOUNT_EMAIL_ENGINES:
+        return None
+    return str(f.get("account_email") or "").strip() or None
 
 
 # OAuth token-response/metadata field names that trip anton's generic
