@@ -5,6 +5,7 @@ builds can be fully isolated from a user's production ~/.cowork (ENG-324) by
 setting one env var. These tests pin that contract.
 """
 import ast
+from collections import Counter
 from pathlib import Path
 
 from cowork.common.paths import cowork_home, pod_local_only
@@ -267,60 +268,240 @@ _PER_ORGANIZATION_OVERRIDES = {
     "ANTON_COWORK_STATE_DIR",
 }
 
+
+def _expression_identity(expression: ast.expr) -> str:
+    return ast.dump(expression, include_attributes=False)
+
+
+def _callsite(path: str, owner: str, expression: str) -> str:
+    parsed = ast.parse(expression, mode="eval")
+    return f"{path}:{owner}[{_expression_identity(parsed.body)}]"
+
+
+_APP_SETTINGS_PATH = "cowork/common/settings/app_settings.py"
+
 # Deliberately NOT per organization, each with the reason it stays shared.
-_ACCOUNT_LEVEL_MODULES = {
-    # The dotenv and the provider config: no organization switch rewrites them,
-    # so moving them would leave a switched-to organization unconfigured.
-    "cowork/server.py",
-    "cowork/migrations.py",
-    "cowork/api/v1/endpoints/settings.py",
-    # Per-turn scratch, holding nothing that outlives a turn.
-    "cowork/harnesses/anton_harness/harness.py",
-    "cowork/services/connectors/probe.py",
-    # Read-only sources for a one-time legacy import.
-    "cowork/harnesses/memory/migration.py",
+_ACCOUNT_LEVEL_COWORK_HOME_CALLS = Counter(
+    _callsite(*spec)
+    for spec in (
+        # The dotenv and provider config must survive organization switches.
+        ("cowork/server.py", "create_app.env_path", "cowork_home() / '.env'"),
+        ("cowork/migrations.py", "_ENV_PATH", "cowork_home() / '.env'"),
+        ("cowork/api/v1/endpoints/settings.py", "_ENV_PATH", "cowork_home() / '.env'"),
+        (_APP_SETTINGS_PATH, "_env_file_chain.files", "str(cowork_home() / '.env')"),
+        (_APP_SETTINGS_PATH, "OAuthSettings.state_path", "str(cowork_home() / 'oauth_state.json')"),
+        (_APP_SETTINGS_PATH, "StorageSettings.shared_root", "str(cowork_home())"),
+        (_APP_SETTINGS_PATH, "AppSettings.master_key_path", "str(cowork_home() / '.master_key')"),
+        # Per-turn scratch holds nothing that outlives a turn.
+        (
+            "cowork/harnesses/anton_harness/harness.py",
+            "_vault_scratch_dir",
+            "pod_local_only(cowork_home() / 'tmp', 'tmp')",
+        ),
+        (
+            "cowork/services/connectors/probe.py",
+            "_probe_tmp_dir",
+            "pod_local_only(cowork_home() / 'tmp', 'tmp')",
+        ),
+        # These are read-only sources for a one-time legacy import.
+        *(
+            ("cowork/harnesses/memory/migration.py", "_MIGRATION_SOURCES", f"cowork_home() / '{path}'")
+            for path in (
+                "anton/memory/rules.md",
+                "anton/memory/lessons.md",
+                "anton/memory/profile.md",
+                "hermes/memories/USER.md",
+                "hermes/memories/MEMORY.md",
+            )
+        ),
+    )
+)
+
+_PER_ORGANIZATION_COWORK_HOME_CALLS = {
+    _callsite(path, owner, expression): override
+    for path, owner, expression, override in (
+        (_APP_SETTINGS_PATH, "DatabaseSettings.uri", "f\"sqlite:///{cowork_home() / 'cowork.db'}\"", "DATABASE_URI"),
+        (_APP_SETTINGS_PATH, "ProjectSettings.root_dir", "str(cowork_home() / 'projects')", "COWORK_PROJECTS_DIR"),
+        (_APP_SETTINGS_PATH, "FileSettings.root_dir", "str(cowork_home() / 'files')", "COWORK_FILES_DIR"),
+        (_APP_SETTINGS_PATH, "CodingSettings.root_dir", "str(cowork_home() / 'coding')", "COWORK_CODING_DIR"),
+        (_APP_SETTINGS_PATH, "SkillSettings.root_dir", "str(cowork_home() / 'skills')", "COWORK_SKILLS_DIR"),
+        (_APP_SETTINGS_PATH, "ConnectorSettings.vault_dir", "str(cowork_home() / 'data-vault')", "COWORK_VAULT_DIR"),
+        (_APP_SETTINGS_PATH, "MemorySettings.root_dir", "str(cowork_home() / 'memory')", "COWORK_MEMORY_DIR"),
+        (_APP_SETTINGS_PATH, "StreamSettings.dir", "str(cowork_home() / 'streams')", "COWORK_STREAMS_DIR"),
+        (
+            "cowork/harnesses/anton_harness/settings.py",
+            "AntonHarnessSettings.skills_root_dir",
+            "str(cowork_home() / 'anton' / 'skills')",
+            "ANTON_SKILLS_ROOT_DIR",
+        ),
+        (
+            "cowork/services/publish.py",
+            "_cowork_state_dir.path",
+            "pod_local_only(cowork_home(), 'publish')",
+            "ANTON_COWORK_STATE_DIR",
+        ),
+    )
 }
 
-# Settings live here and are covered by the assertions above; publish is covered
-# by its own test below.
-_SCANNED_EXEMPT_MODULES = {
-    "cowork/common/settings/app_settings.py",
-    "cowork/harnesses/anton_harness/settings.py",
-    "cowork/services/publish.py",
-}
+
+def _attribute_name(node: ast.expr) -> str | None:
+    parts: list[str] = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if not isinstance(node, ast.Name):
+        return None
+    return ".".join([node.id, *reversed(parts)])
 
 
-def _modules_reading_cowork_home() -> set[str]:
-    """Every module that actually CALLS cowork_home().
+def _assigned_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        return node.target.id
+    if (
+        isinstance(node, ast.Assign)
+        and len(node.targets) == 1
+        and isinstance(node.targets[0], ast.Name)
+    ):
+        return node.targets[0].id
+    if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
+        return node.target.id
+    return None
+
+
+def _call_expression(node: ast.Call, parents: dict[ast.AST, ast.AST]) -> str:
+    """The smallest stable expression that distinguishes this path read."""
+    current: ast.expr = node
+    while current in parents:
+        parent = parents[current]
+        if isinstance(parent, ast.Lambda):
+            current = parent.body
+            break
+        if not isinstance(parent, ast.expr) or isinstance(
+            parent, (ast.Dict, ast.List, ast.Set, ast.Tuple)
+        ):
+            break
+        current = parent
+    return _expression_identity(current)
+
+
+def _cowork_home_calls(path: str, source: str) -> Counter[str]:
+    """Every real cowork_home call, keyed by its stable owning symbol.
 
     Parsed rather than grepped: the name appears in docstrings across the
-    codebase, and a text scan reports those as call sites and hides real ones
-    behind a line break.
+    codebase. Import resolution covers direct aliases and qualified calls so a
+    different import style cannot bypass the organization-store guard.
     """
-    root = Path(__file__).resolve().parent.parent
-    found: set[str] = set()
-    for path in (root / "cowork").rglob("*.py"):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Name)
-                and node.func.id == "cowork_home"
-            ):
-                found.add(path.relative_to(root).as_posix())
-                break
+    tree = ast.parse(source)
+    parents = {
+        child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+    }
+    direct_names: set[str] = set()
+    module_names = {"cowork.common.paths"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "cowork.common.paths":
+            direct_names.update(
+                alias.asname or alias.name for alias in node.names if alias.name == "cowork_home"
+            )
+        elif isinstance(node, ast.ImportFrom) and node.module == "cowork.common":
+            module_names.update(
+                alias.asname or alias.name for alias in node.names if alias.name == "paths"
+            )
+        elif isinstance(node, ast.Import):
+            module_names.update(
+                alias.asname or alias.name
+                for alias in node.names
+                if alias.name == "cowork.common.paths"
+            )
+
+    found: Counter[str] = Counter()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _attribute_name(node.func)
+        is_direct = isinstance(node.func, ast.Name) and node.func.id in direct_names
+        if not is_direct and not any(
+            name == f"{module}.cowork_home" for module in module_names
+        ):
+            continue
+
+        scopes: list[str] = []
+        binding: str | None = None
+        current: ast.AST = node
+        while current in parents:
+            current = parents[current]
+            binding = binding or _assigned_name(current)
+            if isinstance(current, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                scopes.append(current.name)
+        owner = ".".join([*reversed(scopes), *([binding] if binding else [])]) or "<module>"
+        expression = _call_expression(node, parents)
+        found[f"{path}:{owner}[{expression}]"] += 1
     return found
 
 
+def _all_cowork_home_calls() -> Counter[str]:
+    root = Path(__file__).resolve().parent.parent
+    found: Counter[str] = Counter()
+    for path in (root / "cowork").rglob("*.py"):
+        relative = path.relative_to(root).as_posix()
+        found.update(_cowork_home_calls(relative, path.read_text(encoding="utf-8")))
+    return found
+
+
+def _unclassified_cowork_home_calls(calls: Counter[str]) -> Counter[str]:
+    known = Counter(_ACCOUNT_LEVEL_COWORK_HOME_CALLS)
+    known.update(_PER_ORGANIZATION_COWORK_HOME_CALLS.keys())
+    return calls - known
+
+
 def test_every_cowork_home_reader_is_classified():
-    known = _ACCOUNT_LEVEL_MODULES | _SCANNED_EXEMPT_MODULES | {"cowork/common/paths.py"}
-    unclassified = _modules_reading_cowork_home() - known
+    calls = _all_cowork_home_calls()
+    known = Counter(_ACCOUNT_LEVEL_COWORK_HOME_CALLS)
+    known.update(_PER_ORGANIZATION_COWORK_HOME_CALLS.keys())
+    unclassified = calls - known
+    stale = known - calls
     assert not unclassified, (
-        "These modules derive a path from cowork_home() and are not classified as "
+        "These call sites derive a path from cowork_home() and are not classified as "
         "per-organization or account-level. Decide which, and if per-organization "
         "add the override to orgStoreEnv in cowork's src/main/account-data.ts: "
-        f"{sorted(unclassified)}"
+        f"{sorted(unclassified.elements())}"
     )
+    assert not stale, (
+        f"Remove or update stale cowork_home classifications: {sorted(stale.elements())}"
+    )
+    overrides = list(_PER_ORGANIZATION_COWORK_HOME_CALLS.values())
+    assert len(overrides) == len(set(overrides)), "Each store needs its own desktop override"
+    assert set(overrides) == _PER_ORGANIZATION_OVERRIDES
+
+
+def test_cowork_home_scan_catches_new_settings_and_qualified_calls():
+    source = """
+from cowork.common import paths as store_paths
+from cowork.common.paths import cowork_home as data_home
+
+class FutureSettings:
+    root_dir = Field(default_factory=lambda: data_home() / "future")
+
+def another_store():
+    return store_paths.cowork_home() / "another"
+"""
+    calls = _cowork_home_calls("cowork/future.py", source)
+
+    assert calls == Counter(
+        {
+            _callsite(
+                "cowork/future.py", "FutureSettings.root_dir", "data_home() / 'future'"
+            ): 1,
+            _callsite(
+                "cowork/future.py",
+                "another_store",
+                "store_paths.cowork_home() / 'another'",
+            ): 1,
+        }
+    )
+    assert _unclassified_cowork_home_calls(calls) == calls
+    replaced = _cowork_home_calls("cowork/future.py", source.replace('"future"', '"replacement"'))
+    assert replaced != calls
+    assert _unclassified_cowork_home_calls(replaced) == replaced
 
 
 def test_publish_state_dir_is_overridable_per_organization(monkeypatch, tmp_path):
@@ -340,24 +521,44 @@ def test_every_per_organization_override_is_a_real_knob(monkeypatch, tmp_path):
     """Each name the desktop sets must actually move something. A typo there is
     silent: the store stays on the shared root and the organization reads the
     previous one's data."""
+    from cowork.services import publish
+
+    readers = {
+        "DatabaseSettings.uri": lambda: AppSettings(_env_file=None).database.uri,
+        "ProjectSettings.root_dir": lambda: AppSettings(_env_file=None).project.root_dir,
+        "FileSettings.root_dir": lambda: AppSettings(_env_file=None).file.root_dir,
+        "CodingSettings.root_dir": lambda: AppSettings(_env_file=None).coding.root_dir,
+        "SkillSettings.root_dir": lambda: AppSettings(_env_file=None).skill.root_dir,
+        "ConnectorSettings.vault_dir": lambda: AppSettings(_env_file=None).connector.vault_dir,
+        "MemorySettings.root_dir": lambda: AppSettings(_env_file=None).memory.root_dir,
+        "StreamSettings.dir": lambda: StreamSettings(_env_file=None).dir,
+        "AntonHarnessSettings.skills_root_dir": lambda: AntonHarnessSettings(
+            _env_file=None
+        ).skills_root_dir,
+        "_cowork_state_dir.path": publish._cowork_state_dir,
+    }
+    owners = {
+        callsite.split(":", 1)[1].split("[", 1)[0]
+        for callsite in _PER_ORGANIZATION_COWORK_HOME_CALLS
+    }
+    assert set(readers) == owners
+
     home = tmp_path / "home"
     monkeypatch.setenv("COWORK_HOME", str(home))
-    org = tmp_path / "orgs" / "org-b"
-    for name in _PER_ORGANIZATION_OVERRIDES:
-        monkeypatch.setenv(
-            name, f"sqlite:///{org / 'cowork.db'}" if name == "DATABASE_URI" else str(org)
-        )
-    get_app_settings.cache_clear()
+    for callsite, env_name in _PER_ORGANIZATION_COWORK_HOME_CALLS.items():
+        for name in _PER_ORGANIZATION_OVERRIDES:
+            monkeypatch.delenv(name, raising=False)
+        owner = callsite.split(":", 1)[1].split("[", 1)[0]
+        target = tmp_path / "orgs" / "org-b" / owner.replace(".", "-")
+        value = f"sqlite:///{target}" if env_name == "DATABASE_URI" else str(target)
+        monkeypatch.setenv(env_name, value)
+        get_app_settings.cache_clear()
 
-    s = AppSettings(_env_file=None)
-    moved = [
-        s.database.uri, s.project.root_dir, s.file.root_dir, s.skill.root_dir,
-        s.connector.vault_dir, s.memory.root_dir, s.coding.root_dir,
-        StreamSettings(_env_file=None).dir,
-        AntonHarnessSettings(_env_file=None).skills_root_dir,
-    ]
-    for value in moved:
-        assert str(org) in str(value), f"{value} did not follow its override"
-    assert str(home) not in " ".join(str(v) for v in moved)
+        resolved = readers[owner]()
+
+        assert str(target) in str(resolved), (
+            f"{callsite} did not follow its declared override {env_name}: {resolved}"
+        )
+        assert str(home) not in str(resolved)
 
     get_app_settings.cache_clear()
