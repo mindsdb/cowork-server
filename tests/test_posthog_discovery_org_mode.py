@@ -18,6 +18,7 @@ import httpx
 import pytest
 
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.services.connectors import posthog as posthog_service
 from cowork.services.connectors.posthog import (
     CLOUD_ORIGINS,
     PostHogDiscoveryError,
@@ -223,7 +224,6 @@ async def test_a_custom_host_is_refused_without_resolving_or_dialing(org_mode):
         ("https://us.posthog.com.", "US Cloud or EU Cloud"),
         ("https://us.posthog.com%2e.evil.example", "US Cloud or EU Cloud"),
         ("https://us.xn--psthog-8za.com", "US Cloud or EU Cloud"),
-        # U+017F folds to "s", so a casefolded compare would accept this one.
         ("https://uſ.posthog.com", "US Cloud or EU Cloud"),
         ("https://user:pw@us.posthog.com", "valid HTTPS PostHog host"),
         ("http://us.posthog.com", "valid HTTPS PostHog host"),
@@ -237,6 +237,21 @@ async def test_a_host_outside_the_allowlist_is_refused_before_dialing(org_mode, 
         await discover_projects(
             personal_api_key=KEY,
             host=host,
+            transport=_refuse_network(),
+            resolver=_refuse_resolution(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_unicode_case_mapping_cannot_match_an_origin(org_mode, monkeypatch):
+    """U+212A lowercases to "k". Neither origin holds a "k" today, so this
+    pins the ASCII-only precondition for the next one that does."""
+    monkeypatch.setattr(posthog_service, "CLOUD_ORIGINS", ("https://uk.posthog.com",))
+
+    with pytest.raises(PostHogDiscoveryError, match="US Cloud or EU Cloud"):
+        await discover_projects(
+            personal_api_key=KEY,
+            host="https://uK.posthog.com",
             transport=_refuse_network(),
             resolver=_refuse_resolution(),
         )
