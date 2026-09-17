@@ -427,6 +427,36 @@ def test_a_wrongly_typed_compaction_frame_cannot_fail_the_turn(monkeypatch, data
     assert "malformed compaction frame" in caplog.text
 
 
+def test_an_oversized_summary_is_rejected_rather_than_stored(monkeypatch, caplog):
+    """The summary is sticky — seeded into history on every later turn until
+    something re-summarizes it — and the producer only warns about an oversized
+    request line before sending it anyway. Storing a multi-megabyte one wedges
+    the conversation permanently; dropping the frame costs one full replay."""
+    saved = _capture_compaction(monkeypatch)
+    summary = "x" * (responses_mod._MAX_COMPACTION_SUMMARY_BYTES + 1)
+
+    with caplog.at_level(logging.WARNING, logger="cowork.handlers.responses"):
+        ResponsesHandler._persist_remote_compaction(
+            uuid4(), {"summary": summary, "covered_through": 3}, _SEED, _FakeScope(),
+        )
+
+    assert saved == {}
+    assert "over the" in caplog.text
+
+
+def test_a_summary_at_the_cap_is_still_stored(monkeypatch):
+    """The cap rejects only what exceeds it: a legitimate summary near the
+    budget must not be silently dropped."""
+    saved = _capture_compaction(monkeypatch)
+    summary = "x" * responses_mod._MAX_COMPACTION_SUMMARY_BYTES
+
+    ResponsesHandler._persist_remote_compaction(
+        uuid4(), {"summary": summary, "covered_through": 3}, _SEED, _FakeScope(),
+    )
+
+    assert saved["cutoff_id"] == _IDS[2]
+
+
 def test_no_compaction_is_saved_when_seeding_was_disabled(monkeypatch):
     """Compaction off means the pod got full history, so `covered_through`
     counts a list we never built a mapping for."""

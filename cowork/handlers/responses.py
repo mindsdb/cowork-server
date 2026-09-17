@@ -99,6 +99,11 @@ class _RemoteTurnFailed(Exception):
 ASK_USER_EVENT = "response.ask_user"
 ASK_USER_ANSWERED_EVENT = "response.ask_user_answered"
 
+#: Budget for a pod-reported history summary. Well above what the summarizer's
+#: own output cap can produce, and the summary is sticky: it is replayed on
+#: every later turn, so an oversized one wedges the conversation for good.
+_MAX_COMPACTION_SUMMARY_BYTES = 64 * 1024
+
 
 def cancelled_ask_user_retirements(events: list[dict]) -> list[dict]:
     """Retirement events for every question in *events* that nothing retires.
@@ -1086,6 +1091,16 @@ class ResponsesHandler:
             logger.warning(
                 "[responses] malformed compaction frame for conversation %s — not saved",
                 conv_id,
+            )
+            return
+        # Rejected, not truncated: half a summary is still replayed on every
+        # later turn, while dropping the frame costs one full replay.
+        summary_bytes = len(summary.encode("utf-8"))
+        if summary_bytes > _MAX_COMPACTION_SUMMARY_BYTES:
+            logger.warning(
+                "[responses] compaction summary for conversation %s is %d bytes, over "
+                "the %d-byte cap — not saved",
+                conv_id, summary_bytes, _MAX_COMPACTION_SUMMARY_BYTES,
             )
             return
         message_ids = seed_info["message_ids"]
