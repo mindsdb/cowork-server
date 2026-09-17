@@ -68,9 +68,9 @@ def cloud_origin(selected: str) -> str:
 
     Compares the whole origin, so a port, a path, userinfo or a lookalike host
     cannot match, and returns the server's own constant, so nothing the caller
-    sent reaches the request. Non-ASCII is refused rather than folded: casefold
-    maps U+017F to "s" and U+212A to "k", which would make two different
-    hostnames compare equal.
+    sent reaches the request. The compare only ever sees ASCII, because U+212A
+    lowercases to "k": a non-ASCII host can equal an origin holding one, and
+    neither origin here holds one yet.
     """
     if not selected.isascii():
         raise PostHogDiscoveryError(_CLOUD_ONLY)

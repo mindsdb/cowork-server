@@ -33,6 +33,10 @@ def vetted_public_addresses(
     any address that is not globally routable: one private address in a
     mixed answer refuses the whole host, because dialing the rest would
     still leave the private one reachable on a later attempt.
+
+    A record whose address will not parse, such as a link-local IPv6 that
+    ``getaddrinfo`` returns with its zone attached, is dropped rather than
+    refused, and an answer left with nothing refuses.
     """
 
     try:
