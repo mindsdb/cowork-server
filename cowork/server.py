@@ -227,10 +227,10 @@ def create_app() -> FastAPI:
     async def _missing_tenant_scope(request, exc):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
-    # Optional bearer-token auth.  Off by default; enabled when
-    # COWORK_REQUIRE_AUTH=true.  Token is auto-generated on first startup
-    # when COWORK_AUTH_TOKEN is not set, then persisted to <cowork_home>/.env
-    # so the desktop app and subsequent server runs share the same secret.
+    # Bearer-token auth. On by default in local mode (see AppSettings.
+    # require_auth). Token is auto-generated on first startup when
+    # COWORK_AUTH_TOKEN is not set, then persisted to <cowork_home>/.env so
+    # the desktop app and subsequent server runs share the same secret.
     #
     # Registered BEFORE CORS so CORS ends up the outer layer (Starlette applies
     # the last-added middleware outermost): a 401 from the auth layer still
