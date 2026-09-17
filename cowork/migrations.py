@@ -41,7 +41,6 @@ from cowork.common.settings.user_settings import (
 from cowork.models.setting import Setting
 from cowork.models.skill import META_CREATED_AT, META_DISPLAY_NAME, Skill, SkillLegacy
 from cowork.services.settings import SettingService
-from cowork.harnesses.hermes_harness.settings import HermesHarnessSettings
 from cowork.services.skills import BUILTIN_SKILLS_VERSION, SkillService
 
 logger = logging.getLogger(__name__)
@@ -169,6 +168,36 @@ def migrate_env_to_db(session: Session) -> bool:
 _LEGACY_MINDS_HOSTS = ("https://mdb.ai", "http://mdb.ai")
 
 
+def normalize_retired_harness_rows(session: Session) -> bool:
+    """Rewrite settings rows that name a harness no longer registered.
+
+    Covers every scope (global, org, user). Idempotent and sentinel-free, so a
+    stale row is repaired once at boot instead of being coerced on every read.
+    Returns True if any row was rewritten.
+    """
+    from cowork.harnesses.base import available_harness_ids
+
+    known = set(available_harness_ids())
+    rows = session.exec(
+        select(Setting).where(Setting.key.in_(("harness", "channels_harness")))
+    ).all()
+    changed = 0
+    for row in rows:
+        if row.value in known:
+            continue
+        logger.info(
+            "settings: %s=%r (scope=%s) names a retired harness; rewriting to 'anton'",
+            row.key, row.value, row.scope,
+        )
+        row.value = "anton"
+        session.add(row)
+        changed += 1
+    if changed:
+        session.commit()
+        invalidate_user_settings_cache()
+    return bool(changed)
+
+
 def backfill_minds_url(session: Session) -> bool:
     """Rewrite the legacy MindsHub host (mdb.ai) to the env-appropriate host.
 
@@ -225,11 +254,6 @@ def seed_builtin_skills(session: Session) -> bool:
     current = int(row.value) if row is not None and row.value.isdigit() else 0
     if current >= BUILTIN_SKILLS_VERSION:
         return False
-
-    # remove symlink to global skills if exists
-    link = Path(HermesHarnessSettings().root_dir) / "skills"
-    if link.is_symlink():
-        link.unlink()
 
     store = SkillService()
     copied = store._copy_builtin_skills()

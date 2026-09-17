@@ -58,9 +58,12 @@ def test_org_discovery_drops_a_symlinked_conversation_root(tmp_path, monkeypatch
     )
     monkeypatch.setattr(artifact_roots, "_org_mode", lambda: True)
 
+    # ENG-2056: the project-level base is always a candidate root regardless of
+    # any conversation's safety — only the symlinked conversation entry itself
+    # is dropped.
     assert artifact_roots._project_artifact_bases(
         str(project), object(), include_other_members=True
-    ) == []
+    ) == [artifact_roots._artifacts_base(str(project))]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="directory-link threat is POSIX org storage")

@@ -15,8 +15,6 @@ uv tool install cowork-server
 cowork-server
 ```
 
-The Hermes harness is an optional extra: `uv tool install 'cowork-server[hermes]'`. It cannot be installed alongside anton-agent 2.26.9.3.1rc2 or later because hermes-agent pins openai 2.x and anton needs openai 3.x.
-
 The server starts on `http://127.0.0.1:26866`. Confirm with:
 
 ```sh
@@ -28,8 +26,6 @@ curl http://127.0.0.1:26866/api/v1/health/
 ```sh
 # Run from source (auto-manages virtualenv + deps)
 uv run cowork-server
-# With the Hermes harness
-uv run --extra hermes cowork-server
 ```
 
 When running alongside the Electron app in dev mode, the app spawns the server automatically — no manual start needed. The Electron app looks for a sibling `cowork-server/` directory by convention (override with `COWORK_SERVER_DIR`).
@@ -115,8 +111,9 @@ scope is safe only when these Environment controls are active.
 
 #### Nightly production read-only smoke
 
-The production nightly runs at `43 7 * * *` on `mdb-prod`. It uses the same
-guarded standing identity, but selects only
+The production nightly reads production on `mdb-prod` at `43 7 * * *` once its
+schedule is live. It is held today; the Environment prerequisites below say what
+turns it on. It uses the same guarded standing identity, but selects only
 `tests/integration/test_production_read_only.py`. That selection is GET-only:
 it reads health, conversations, schedules, files, and pins. It never
 provisions an identity and does not create conversations, schedules, files,
@@ -198,8 +195,17 @@ The Environment response must have no `required_reviewers` or `wait_timer`
 entry and must enable only custom branch policies. The branch-policy response
 must be exactly `[{"name":"main","type":"branch"}]`. The branch-protection
 response must show at least one required approval, administrator enforcement,
-and required conversation resolution. Do not dispatch or enable the schedule
-until every check passes and the cowork-server#472 prerequisite has landed.
+and required conversation resolution. Do not dispatch until every check passes
+and the cowork-server#472 prerequisite has landed.
+
+The nightly schedule is held out of the workflow until those checks pass.
+GitHub arms a `schedule:` trigger as soon as the file reaches the default
+branch, so shipping one before the Environment exists does not buy a monitor, it
+buys a nightly page that reports a missing credential in the same shape as a
+production outage. `workflow_dispatch` is the only trigger until an operator has
+provisioned `prod-read-only` and watched one dispatched run go green. Restore the
+`schedule:` block with `- cron: "43 7 * * *"` and delete this paragraph in the
+same change; a contract test fails if only one of the two happens.
 
 ### Logging
 
@@ -254,14 +260,14 @@ cowork/
   schemas/            # Pydantic request/response schemas
   db/                 # Database session and migrations
   common/             # Shared utilities, settings
-  harnesses/          # Agent adapters (Anton, Hermes, etc.)
+  harnesses/          # Agent adapters (Anton)
 ```
 
 The server is designed to be **agent-agnostic** — core features (projects, conversations, files) are shared across agents, while agent-specific behavior lives in harness adapters. See [docs/DESIGN.md](docs/DESIGN.md) for the full architectural rationale.
 
 ### Harness system
 
-A **harness** adapts an external agent library (Anton, Hermes, etc.) to the cowork-server interface. All harnesses implement the `HarnessProvider` protocol (`harnesses/base.py`), which exposes streaming responses, skill sync, and memory operations. The active harness is selected via the `harness` user setting. To add a new agent, implement the protocol and register it with the `@register` decorator.
+A **harness** adapts an external agent library (Anton today) to the cowork-server interface. All harnesses implement the `HarnessProvider` protocol (`harnesses/base.py`), which exposes streaming responses, skill sync, and memory operations. The active harness is selected via the `harness` user setting. To add a new agent, implement the protocol and register it with the `@register` decorator.
 
 ### Streaming & scheduling
 
@@ -386,7 +392,7 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/settings` | User preferences and API keys |
 | `/runtime-credential` | Desktop hand-over of the MindsHub credential (write-only, loopback, local mode) |
 | `/hub/workspaces` | Which MindsHub workspace this person is working in |
-| `/hub/usage` | The caller's free monthly tokens, balance, auto top up and credit spend, for the desktop's usage warnings |
+| `/hub/usage` | The caller's free Air allowance (as a proportion), balance, auto top up and credit spend, for the desktop's usage warnings |
 
 ### Declaring who may call a route
 
@@ -534,30 +540,41 @@ runs. It applies only to Keycloak-shaped bearer JWTs. MindsDB API keys, opaque
 service credentials, requests without a bearer, CORS preflights, health checks,
 and channel webhooks keep their existing behavior.
 
-`COWORK_ORGANIZATION_BOUNDARY_MODE=audit` logs a missing, malformed, or changed
-expected organization and lets the request continue. In `enforce` mode, a
-missing header returns 426 and a malformed or changed value returns 409. Both
-responses carry `X-Cowork-Organization-Reload: required`, a JSON `code` and
-`detail`, and `Cache-Control: no-store`. The browser reloads instead of letting
-an old document continue under a new Keycloak organization. A request already
-inside a route keeps the `Principal` created at its start, so a concurrent
-session change cannot retarget that in-flight operation.
+The boundary always refuses. A missing header returns 426 and a malformed or
+changed value returns 409. Both responses carry
+`X-Cowork-Organization-Reload: required`, a JSON `code` and `detail`, and
+`Cache-Control: no-store`. The browser reloads instead of letting an old
+document continue under a new Keycloak organization. A request already inside a
+route keeps the `Principal` created at its start, so a concurrent session change
+cannot retarget that in-flight operation.
+
+There is no setting that relaxes this. The boundary once had an `audit` position
+that logged a violation and served the request anyway; it and the staged rollout
+it existed for are gone. An environment that still carries the retired
+`COWORK_ORGANIZATION_BOUNDARY_MODE` key boots normally and ignores it. Deleting
+the field is what makes it unreadable: `AppSettings` sets no `env_prefix` and
+gives every field an explicit `validation_alias`, so the environment source only
+looks up names a field still claims. `extra="ignore"` only decides what happens
+to an unknown key arriving in a `.env` file, which is not how the overlays
+deliver this one. Both halves are pinned, the settings half by
+`tests/test_app_settings.py::test_stale_organization_boundary_mode_env_var_is_inert`
+and the request half by
+`tests/test_principal.py::test_no_environment_variable_reopens_the_organization_boundary`.
 
 `GET /api/v1/capabilities/organization-switch` is authenticated and returns
-protocol version 1. It reports `expectedOrganizationEnforced: true` only when
-both identity and expected-organization enforcement are active. It reports
-`enabled: true` only when those boundaries are active and
+protocol version 1. It reports `expectedOrganizationEnforced: true` when org
+tenancy and identity enforcement are both active. Identity enforcement is in
+that answer because the picker should stay hidden while identity is only
+audited, not because it gates the boundary: `TrustedHeaderMiddleware` runs the
+boundary for every browser JWT request it builds a `Principal` for, under org
+tenancy alone. It reports `enabled: true` when those hold and
 `COWORK_ORGANIZATION_SWITCH_ENABLED=true`.
 
-Roll this out in four separate steps:
-
-1. Deploy the capability-aware Cowork client. The picker stays hidden.
-2. Deploy cowork-server with the organization boundary in `audit` and switching
-   disabled.
-3. Set the boundary to `enforce` on every replica while switching remains
-   disabled, then verify the capability still reports `enabled: false`.
-4. Enable switching separately and verify the capability reports all three
-   required values.
+`COWORK_ORGANIZATION_SWITCH_ENABLED` is the product enable for the picker, not a
+safety switch, and it is the lever to reach for to hide the picker without a
+rebuild. `COWORK_IDENTITY_ENFORCE=audit` hides it too, by dropping
+`expectedOrganizationEnforced`, but it reopens the no-principal path and leaves
+the boundary refusing anyway.
 
 Inside one organization, two different rules apply, and which one you get
 depends on the resource:
@@ -767,6 +784,22 @@ listing probe, so a MindsHub host configured through that card is health-checked
 against a route MindsHub does not deploy everywhere; those routes answer 404 or 401
 even for a valid key, which is the reason the `minds-cloud` type does not use one.
 
+An `apiKey` of `""` or `"***"` on that route means "use the stored one", which is
+how the Settings UI re-tests a provider it only ever received masked. A stored key
+only goes to a host this deployment saved: the provider cards in `providers_json`,
+the scalar `openai_base_url`/`minds_url`, and the vendor host an omitted `mindsUrl`
+already reaches. The comparison is on origin (`scheme://host[:port]`), not the whole
+URL, because the question is which party receives the key; that also means a stored
+URL carrying a path still matches a body sending the host alone. A URL the guard
+cannot parse names no origin, so it is refused rather than raising. Omitting the URL
+stays legal: a `minds-cloud` probe then goes to the vendor host, and an
+`openai-compatible` one answers `missing base URL`, which is what it did before this
+guard. A key the caller supplied may go anywhere, since nothing stored is at risk.
+
+A refused provider comes back `fail` with its reason and is never pinged, rather
+than failing the whole request. Callers send every configured provider in one call,
+so refusing the request would blank the other providers' dots over one bad URL.
+
 Every MindsHub-bound chat probe caps the completion at `max_tokens: 20`, not 1:
 some models refuse a 1-token budget and fail the probe for a perfectly good key
 (see `_chat_probe`). The cap is not sent to a non-MindsHub endpoint, because
@@ -842,8 +875,7 @@ Environment variables fall into two namespaces:
 | `COWORK_SERVER_HOST` | `127.0.0.1` | Bind address |
 | `COWORK_TENANCY_MODE` | `local` | `local` is the desktop sidecar: one user, no organization, no identity headers. `org` is the cloud deployment and turns on everything in "Who can read what in org mode" above. |
 | `COWORK_IDENTITY_ENFORCE` | `enforce` | Org mode only. `enforce` answers 401 to a request carrying no valid identity headers. `audit` logs it and lets it through, which is the rollout mode the org cutover used; it now has to be asked for. |
-| `COWORK_ORGANIZATION_BOUNDARY_MODE` | `enforce` | Canonical web only. `enforce` requires a browser JWT request to name the trusted organization it expects. `audit` logs violations and accepts them for a staged rollout. Long-lived Helm environments explicitly start in `audit`. |
-| `COWORK_ORGANIZATION_SWITCH_ENABLED` | `false` | Enables the version 1 organization-switch capability only while identity and expected-organization enforcement are both active. |
+| `COWORK_ORGANIZATION_SWITCH_ENABLED` | `false` | Shows the canonical-web organization picker. Requires org tenancy and identity enforcement. The product enable, not a safety switch: the expected-organization boundary refuses a mismatched tab whatever this says. Long-lived Helm environments set `true`. |
 | `COWORK_SHARED_DIR` | `~/.cowork` | **Org mode only.** Root of the org-keyed tree: `<shared>/<org_id>/{skills,memory,projects,files}`. In cloud, point it at the durable mount — on the default the data is ephemeral (boot warning). |
 | `COWORK_PROJECTS_DIR` | `~/.cowork/projects` | Project storage root (local mode only) |
 | `COWORK_FILES_DIR` | `~/.cowork/files` | Uploaded files root (local mode only) |
@@ -852,14 +884,13 @@ Environment variables fall into two namespaces:
 | `COWORK_VAULT_DIR` | `~/.cowork/data-vault` | Connector credential vault |
 | `COWORK_HUB_WORKSPACES_FORCE_ON` | `false` | Development override that turns the MindsHub workspace surfaces on where no Statsig rule targets you. ON only, so it can never switch them off and never escape the kill switch. The switch itself is auth's `authorization_ui` gate; see "The MindsHub workspace selector" above. Never set in a deployed environment. |
 
-**Harness-level** (`ANTON_*`, `HERMES_*`) — configure a specific agent harness. These are read by the harness adapter, not by cowork-server core. They use the harness prefix because the upstream agent libraries (anton, hermes-agent) define them:
+**Harness-level** (`ANTON_*`) — configure a specific agent harness. These are read by the harness adapter, not by cowork-server core. They use the harness prefix because the upstream agent library (anton) defines them:
 
 | Variable | Harness | Description |
 |----------|---------|-------------|
 | `ANTON_PUBLISH_URL` | Anton | Artifact publish endpoint |
 | `ANTON_SKILLS_ROOT_DIR` | Anton | Skill file storage |
 | `ANTON_GLOBAL_MEMORY_ROOT_DIR` | Anton | Global memory files |
-| `HERMES_HOME` / `HERMES_ROOT_DIR` | Hermes | Hermes data root |
 
 In Docker/Lightsail deployments, the container also receives `ANTON_MINDS_API_KEY`, `ANTON_OPENAI_API_KEY`, etc. — these are consumed by the Anton agent library directly (not by cowork-server settings), and are injected by the provisioning lambda via cloud-init user-data.
 

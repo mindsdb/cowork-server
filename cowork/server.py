@@ -250,13 +250,11 @@ def create_app() -> FastAPI:
             TrustedHeaderMiddleware,
             exempt_paths=channel_webhook_paths,
             enforce=enforce,
-            organization_boundary_mode=settings.organization_boundary_mode,
         )
         logger.info(
             "auth: org tenancy mode — principal middleware enabled "
-            "(identity=%s, organization-boundary=%s)",
+            "(identity=%s)",
             settings.identity_enforce,
-            settings.organization_boundary_mode,
         )
         # No explicit shared root → org data sits on the ephemeral pod FS.
         # Warn, don't fail: dev deployments predate the mount. model_fields_set
