@@ -45,7 +45,7 @@ def session_log(client):
 
     Two things silence this logger for a test that only reads caplog, and
     either one turns "the secret is absent from the log" into an assertion
-    over nothing: create_app() calls setup_logging(), whose
+    over nothing: importing cowork.server runs setup_logging(), whose
     logging.basicConfig(force=True) drops pytest's handler, and any earlier
     test that runs Alembic leaves the logger disabled, because
     cowork/db/alembic/env.py calls fileConfig() with its default
