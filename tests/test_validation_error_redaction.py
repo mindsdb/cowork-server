@@ -39,6 +39,40 @@ def client() -> TestClient:
     return TestClient(create_app())
 
 
+@pytest.fixture()
+def session_log(client):
+    """Capture the db session logger directly, not through caplog.
+
+    Two things silence this logger for a test that only reads caplog, and
+    either one turns "the secret is absent from the log" into an assertion
+    over nothing: create_app() calls setup_logging(), whose
+    logging.basicConfig(force=True) drops pytest's handler, and any earlier
+    test that runs Alembic leaves the logger disabled, because
+    cowork/db/alembic/env.py calls fileConfig() with its default
+    disable_existing_loggers=True. So take the logger's state for the test.
+    """
+    from cowork.db import session as session_module
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Capture(logging.DEBUG)
+    logger = session_module.logger
+    previous_level, previously_disabled = logger.level, logger.disabled
+    logger.setLevel(logging.DEBUG)
+    logger.disabled = False
+    logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+        logger.disabled = previously_disabled
+
+
 def test_malformed_body_is_not_echoed_in_the_response(client):
     res = client.post("/api/v1/connectors/submissions/", json=MALFORMED_BODY)
 
@@ -46,12 +80,16 @@ def test_malformed_body_is_not_echoed_in_the_response(client):
     assert SENTINEL not in res.text
 
 
-def test_malformed_body_is_not_echoed_in_the_session_log(client, caplog):
-    with caplog.at_level(logging.DEBUG):
-        res = client.post("/api/v1/connectors/submissions/", json=MALFORMED_BODY)
+def test_malformed_body_is_not_echoed_in_the_session_log(client, session_log):
+    res = client.post("/api/v1/connectors/submissions/", json=MALFORMED_BODY)
 
     assert res.status_code == 422
-    assert SENTINEL not in caplog.text
+    # Pin that the line was emitted before asserting what it does not contain,
+    # so the check below cannot pass on an empty log.
+    rollback = [r for r in session_log if "rolled back after a client error" in r.getMessage()]
+    assert len(rollback) == 1
+    assert rollback[0].levelname == "DEBUG"
+    assert all(SENTINEL not in record.getMessage() for record in session_log)
 
 
 def test_validation_detail_still_names_the_location_and_reason(client):
