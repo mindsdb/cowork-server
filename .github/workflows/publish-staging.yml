@@ -70,7 +70,12 @@ jobs:
     uses: ./.github/workflows/wheels-available.yml
 
   release:
-    needs: unit-tests
+    # Waits for `wheels-available` as well, so a red gate means NO TAG. With
+    # `needs: unit-tests` alone the two ran in parallel: the rc tag and its
+    # GitHub Release were created, then `publish` was skipped, leaving a
+    # version that exists on GitHub and not on PyPI and a tag to clean up
+    # before the fixed commit could re-release.
+    needs: [unit-tests, wheels-available]
     # workflow_dispatch can be pointed at any ref; only staging mints rc tags.
     if: github.ref == 'refs/heads/staging'
     permissions:
@@ -83,6 +88,10 @@ jobs:
 
   publish:
     name: Build and publish pre-release to PyPI
+    # `wheels-available` is redundant now that `release` waits for it too, and
+    # deliberately kept: it is the edge that actually stops a broken wheel
+    # reaching PyPI, so it should not disappear if the `release` edge is ever
+    # refactored away.
     needs: [release, wheels-available]
     runs-on: ubuntu-latest
     environment: pypi
@@ -133,6 +142,19 @@ jobs:
       # importing the app runs the same import chain uvicorn runs at startup
       # (server.py -> router.py -> endpoints -> services), so a stale pin fails
       # here instead of on a user's machine.
+      # The `wheels-available` gate above ran against the checked-in
+      # pyproject, i.e. the loose `anton-agent>=...,<3`. The pin step rewrote
+      # that to an exact rc, so the wheel just built can carry a dependency set
+      # the gate never saw — if that rc pulls something with no Intel-Mac or
+      # Windows wheel, desktop users get a source build and the gate stayed
+      # green. The smoke install below cannot catch it either: it runs on
+      # ubuntu and permits source builds.
+      #
+      # So re-run the cross-platform check against the artifact itself, which
+      # is the only thing that carries the pinned metadata.
+      - name: Check the built wheel resolves to wheels on every shipped platform
+        run: bash scripts/check_wheels_available.sh "$(ls dist/*.whl)"
+
       - name: Verify the pinned anton-agent satisfies this build
         run: |
           set -euo pipefail

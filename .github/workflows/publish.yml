@@ -79,7 +79,12 @@ jobs:
     uses: ./.github/workflows/wheels-available.yml
 
   release:
-    needs: unit-tests
+    # Waits for `wheels-available` as well, so a red gate means NO TAG. With
+    # `needs: unit-tests` alone the two ran in parallel: the stable tag and its
+    # GitHub Release were created, then `publish` was skipped, leaving a
+    # version that exists on GitHub and not on PyPI and a tag to clean up
+    # before the fixed commit could re-release.
+    needs: [unit-tests, wheels-available]
     # workflow_dispatch can be pointed at any ref; only main cuts a stable release.
     if: github.ref == 'refs/heads/main'
     permissions:
@@ -91,6 +96,10 @@ jobs:
 
   publish:
     name: Build and publish to PyPI
+    # `wheels-available` is redundant now that `release` waits for it too, and
+    # deliberately kept: it is the edge that actually stops a broken wheel
+    # reaching PyPI, so it should not disappear if the `release` edge is ever
+    # refactored away.
     needs: [release, wheels-available]
     runs-on: ubuntu-latest
     environment: pypi

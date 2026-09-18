@@ -18,9 +18,22 @@ name: Wheels Available
 # things: the PR run blames the change, and the publish run is what stops a
 # broken artifact reaching PyPI when a dependency's wheel matrix changes under
 # a tree nobody touched.
+#
+# It also runs WEEKLY on the default branch, because neither of those covers
+# the gap between releases. A dependency can drop a wheel with no commit here
+# at all, and we do not publish on a fixed cadence, so a tree that was green
+# when it published can be broken for every new install a week later with
+# nothing red anywhere. That is the shape of the incident this file exists for:
+# cryptography dropped the macOS x86_64 wheel on 2026-06-12 and it surfaced two
+# months later as a blocked user. The schedule turns "caught at the next
+# publish, whenever that is" into "caught within a week".
 
 on:
   workflow_call:
+  schedule:
+    # Mondays 06:17 UTC, ahead of the weekly release train.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -48,3 +61,19 @@ jobs:
       # macOS and Windows too, and no Intel-Mac hardware is needed.
       - name: Check every shipped platform resolves to versions with wheels
         run: bash scripts/check_wheels_available.sh
+
+  notify:
+    # A scheduled run has no PR and no release to fail, so without this it goes
+    # red where nobody looks. Only on the schedule: the workflow_call paths
+    # already surface through their caller's own checks and notify jobs.
+    needs: wheels-available
+    if: ${{ github.event_name == 'schedule' && !cancelled() }}
+    permissions:
+      contents: read
+      actions: read
+    uses: mindsdb/github-actions/.github/workflows/notify-main-failure.yml@main
+    with:
+      env-name: "wheel availability (weekly check)"
+      status: ${{ needs.wheels-available.result == 'failure' && 'failed' || 'recovered' }}
+      runs-on: ubuntu-latest
+    secrets: inherit

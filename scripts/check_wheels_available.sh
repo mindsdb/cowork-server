@@ -35,8 +35,23 @@
 # wheel, and the installer ships `nsis x64` only. Supporting Windows ARM is its
 # own piece of work, not this gate's business.
 #
+# TARGET. With no argument this checks `pyproject.toml`, which is what the PR
+# and pre-tag gates want: it blames the commit that broke it, before anything is
+# tagged. Pass a BUILT WHEEL instead where the published metadata is not the
+# checked-in metadata — `publish-staging.yml` rewrites the anton-agent
+# requirement to an exact rc before building, so the wheel users install can
+# carry a dependency set this file never described. Checking the wheel checks
+# what ships.
+#
 # Run locally with:  bash scripts/check_wheels_available.sh
+#                    bash scripts/check_wheels_available.sh dist/cowork_server-*.whl
 set -uo pipefail
+
+TARGET="${1:-pyproject.toml}"
+if [ ! -e "$TARGET" ]; then
+  echo "error: target '$TARGET' does not exist" >&2
+  exit 2
+fi
 
 PLATFORMS=(
   x86_64-apple-darwin
@@ -54,6 +69,23 @@ PYTHON_VERSIONS=(3.12 3.13)
 workdir="$(mktemp -d)"
 trap 'rm -rf "$workdir"' EXIT
 
+# `uv pip compile` takes a requirements file or a pyproject.toml, not a wheel
+# path, so a wheel is wrapped in a one-line requirements file. Resolving it
+# pulls the wheel's own Requires-Dist, which is the exact set a user's
+# `uv tool install` sees.
+case "$TARGET" in
+  *.whl)
+    printf '%s\n' "$(cd "$(dirname "$TARGET")" && pwd)/$(basename "$TARGET")" > "$workdir/target.txt"
+    SOURCE="$workdir/target.txt"
+    echo "Checking built wheel: $(basename "$TARGET")"
+    ;;
+  *)
+    SOURCE="$TARGET"
+    echo "Checking $TARGET"
+    ;;
+esac
+echo
+
 failed=0
 for plat in "${PLATFORMS[@]}"; do
   for pyver in "${PYTHON_VERSIONS[@]}"; do
@@ -61,7 +93,7 @@ for plat in "${PLATFORMS[@]}"; do
     pinned="$workdir/$plat-$pyver.txt"
 
     # Step 1 — what would we actually install here?
-    if ! out=$(uv pip compile pyproject.toml \
+    if ! out=$(uv pip compile "$SOURCE" \
                  --python-platform "$plat" \
                  --python-version "$pyver" \
                  --no-sources \

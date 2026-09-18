@@ -25,9 +25,41 @@ dependencies = [
     # sdist and uv tries to COMPILE it (Rust + OpenSSL). The PyPI install
     # channel deliberately ships no Xcode Command Line Tools step, so that
     # build fails and the desktop app dead-ends at "Install cowork-server".
-    # Scoped by marker rather than capped globally: a blanket <49 would freeze
-    # Apple Silicon, Windows and Linux on a line with no release since
-    # 2026-06-09 and block future cryptography SECURITY releases fleet-wide.
+    #
+    # READ THIS BEFORE BUMPING IT. The cap has a real security cost and is a
+    # deliberate trade, not an oversight. 48.x is a FINISHED line: 48.0.1
+    # shipped 2026-06-09 and 49.0.0 three days later, so nothing further will
+    # be backported to it.
+    #
+    # Exactly ONE open advisory applies to 48.0.1, and it is worth being
+    # precise because a scanner will present more than that:
+    #   - GHSA-g6cj-pr64-35w5 (HIGH, affects >=44.0.0,<50.0.0) APPLIES.
+    #     PKCS#7 EnvelopedData decryption Bleichenbacher oracle.
+    #   - GHSA-jwv3-5hgf-82ww (HIGH) and GHSA-m2h6-j472-rp4c (MODERATE) are
+    #     listed as "fixed in 49.0.0" but their vulnerable ranges END AT
+    #     48.0.0, so 48.0.1 already carries those fixes and is NOT affected.
+    #     Do not count them against this pin.
+    #
+    # Reachability of the one that does apply is low. This package's own use of
+    # cryptography is Fernet (common/encryption.py, services/settings.py) and
+    # Ed25519 signature verification (channels/plugins/discord.py) — it never
+    # touches PKCS#7 EnvelopedData decryption, which is where the oracle is.
+    # Not audited: whether any transitive dependency decrypts EnvelopedData
+    # (pyhanko is the notable cryptography user here, and signs rather than
+    # decrypts). Stated so the next reader knows the limit of the claim.
+    #
+    # Weighed against an install that cannot complete at all on the affected
+    # hardware, the cap wins — but re-check that reachability before assuming
+    # it still holds, and do not simply raise the ceiling because a scanner
+    # flagged it. Upstream is not restoring the wheel, so the only real exits
+    # are dropping Intel macOS support or `--no-build` at the install site
+    # (ENG-1629 item 1).
+    #
+    # Scoped by marker rather than capped globally so the cost lands only on
+    # the platform that forces it: a blanket <49 would freeze Apple Silicon,
+    # Windows and Linux on 48.0.1 too and carry that advisory fleet-wide, for
+    # nothing.
+    #
     # Enforced by the `wheels-available` CI gate — a bump that deletes the
     # marker turns that job red. ENG-2864 (regression of #320), ENG-1629.
     "cryptography>=48.0.0,<51",
