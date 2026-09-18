@@ -29,6 +29,7 @@ from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.providers import publish_url_for_endpoint
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
 from anton.minds_client import describe_minds_connection_error
+from anton.publisher import PUBLISH_JOB_BUDGET_S, PublishJobFailed
 from anton.publish_access import access_from_owner_side
 from anton.publish_access import normalize_emails as _normalize_emails
 from anton.publish_access import resolve_access as _resolve_access
@@ -61,11 +62,19 @@ class PublisherUnavailable(RuntimeError):
 
 
 def raise_publish_permission_error(exc: Exception) -> None:
-    """Preserve the artifact consumer's explicit authority result through wrappers."""
+    """Preserve the artifact consumer's explicit authority result through wrappers.
+
+    Two transports carry it: a synchronous /upload answers with an HTTPError,
+    an asynchronous one (ENG-1580) reports the job's failure as a
+    PublishJobFailed carrying the same status code. Authorization (403) is
+    always synchronous, so only the 503 case is mirrored for jobs.
+    """
     from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 
     if isinstance(exc, (ProductPermissionDenied, ProductPermissionUnavailable)):
         raise exc
+    if isinstance(exc, PublishJobFailed) and exc.status_code == 503:
+        raise ProductPermissionUnavailable() from exc
     if not isinstance(exc, urllib.error.HTTPError):
         return
     if exc.code == 503:
@@ -382,6 +391,8 @@ def publish_artifact(
     password: str | None = None,
     access: dict | None = None,
     scope: TenantScope | None = None,
+    job_budget_s: float = PUBLISH_JOB_BUDGET_S,
+    progress: dict | None = None,
 ) -> dict:
     """Zip an artifact and upload it, returning its public URL.
 
@@ -402,6 +413,12 @@ def publish_artifact(
     datasources at all, and because `vault_for_scope` fail-closes on an org
     deployment when it is missing - a caller that forgets it gets an error, not
     another org's secrets.
+
+    `job_budget_s` caps how long an asynchronously accepted publish (server
+    202, ENG-1580) is polled; defaults to anton's. `progress`, when
+    given, gets `phase="polling"` set the moment the server accepts the job,
+    so a caller that abandons the thread on its own timeout can tell "upload
+    still in flight" from "job accepted, still polling".
     """
     if not api_key:
         raise ValueError("Publishing requires an API key")
@@ -457,6 +474,11 @@ def publish_artifact(
         publish_source = _render_markdown_to_html(publish_target, Path(md_tmp_dir.name))
 
     ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
+
+    def on_job_accepted(_accepted: dict) -> None:
+        if progress is not None:
+            progress["phase"] = "polling"
+
     try:
         result = publish(
             publish_source,
@@ -475,6 +497,8 @@ def publish_artifact(
             # Org-keyed: the persisted vault is per organization, and an
             # unscoped lookup would resolve to the shared namespace root.
             vault=vault_for_scope(scope),
+            job_budget_s=job_budget_s,
+            on_job_accepted=on_job_accepted,
         )
     except Exception as exc:
         raise_publish_permission_error(exc)
