@@ -435,6 +435,28 @@ def is_image_format_error(exc: Exception) -> bool:
 CONTENT_TOO_LARGE_TYPE_NAME = "ContentTooLargeError"
 
 
+_CONTENT_SHAPE_PHRASES = (
+    "supported values are",
+    "does not match any of the expected tags",
+)
+
+# Quoted content-block type names. Quoted because these dialects quote both the
+# offending tag and the permitted ones; an unquoted provider falls through to
+# the generic handling, which is the safe direction to be wrong in.
+_CONTENT_BLOCK_TOKENS = (
+    "image", "image_url", "input_image", "input_file", "input_audio",
+    "input_text", "output_text", "refusal", "tool_use", "tool_result",
+    "document", "computer_screenshot",
+)
+
+
+def _names_a_content_block(message_low: str) -> bool:
+    return any(
+        f"'{tok}'" in message_low or f'"{tok}"' in message_low
+        for tok in _CONTENT_BLOCK_TOKENS
+    )
+
+
 def is_content_too_large_error(exc: Exception) -> bool:
     """Whether the provider refused this turn because an image is too BIG.
 
@@ -478,11 +500,20 @@ def is_content_validation_error(exc: Exception) -> bool:
         # provider-message phrasings below.
         pass
     s = str(exc).lower()
-    if "supported values are" in s:
-        return True
-    if "does not match any of the expected tags" in s:
-        return True
-    return False
+    # Corroboration required. These phrases are generic enum-validation prose —
+    # a provider emits "Supported values are: ..." for any bad enum, including
+    # `reasoning_effort` and `tool_choice`. Acting on the phrase alone makes
+    # this function's caller strip EVERY image from the conversation's stored
+    # history and tell the user it fixed things, while the real configuration
+    # error goes unaddressed (review of ENG-2689). Verified: before this guard,
+    # a `reasoning_effort` typo did exactly that.
+    #
+    # anton applies the same rule at the source; this fallback only runs when
+    # anton is unimportable or older, so the two must agree or the looser one
+    # decides.
+    if not any(p in s for p in _CONTENT_SHAPE_PHRASES):
+        return False
+    return ".content[" in s or _names_a_content_block(s)
 
 
 def is_token_limit_error(exc: Exception) -> bool:

@@ -218,6 +218,45 @@ def test_remote_too_large_maps_to_its_own_code_and_passes_the_message():
     assert "resize the image" in message.lower()
 
 
+@pytest.mark.parametrize("param,value,allowed", [
+    ("reasoning_effort", "ultra", "'low', 'medium', 'high'"),
+    ("tool_choice", "always", "'none', 'auto', 'required'"),
+    ("service_tier", "turbo", "'auto', 'default', 'flex'"),
+])
+def test_an_unrelated_enum_error_is_not_a_content_rejection(param, value, allowed):
+    """The destructive false positive (review of ENG-2689). These phrases are
+    generic enum-validation prose, and answering them with a content rejection
+    makes the caller strip EVERY image from the conversation and tell the user
+    it fixed things — while the real configuration error goes unmentioned.
+
+    Verified as a live defect before the guard: a `reasoning_effort` typo
+    returned `content_recovery` from this very function.
+    """
+    exc = Exception(
+        "Error code: 400 - {'error': {'message': \"Invalid value: '%s'. "
+        "Supported values are: %s.\", 'param': '%s'}}" % (value, allowed, param)
+    )
+    assert not te.is_content_validation_error(exc)
+    assert not te.is_content_too_large_error(exc)
+    assert te.friendly_turn_error(exc) is None
+
+
+def test_the_real_shape_dialects_still_qualify():
+    """The guard must not be so tight it kills ENG-1992. Both live dialects
+    name a content-block type, which is exactly the corroboration required."""
+    openai_dialect = Exception(
+        "Invalid value: 'image'. Supported values are: 'input_text', "
+        "'input_image', 'input_file'."
+    )
+    anthropic_dialect = Exception(
+        "Input tag 'image_url' found using 'type' does not match any of the "
+        "expected tags: 'image'"
+    )
+    for exc in (openai_dialect, anthropic_dialect):
+        assert te.is_content_validation_error(exc)
+        assert te.friendly_turn_error(exc)[0] == te.CONTENT_RECOVERY_CODE
+
+
 def test_both_content_codes_trigger_the_conversation_repair():
     """The bit that unsticks the user. The repair is keyed on this set, and a
     too-large turn that skipped it would leave the oversized image in stored
