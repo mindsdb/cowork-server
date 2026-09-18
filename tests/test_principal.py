@@ -182,6 +182,17 @@ def test_bare_options_without_a_preflight_header_still_needs_identity():
     assert res.status_code == 401
 
 
+def test_options_with_request_method_but_no_origin_still_needs_identity():
+    # Access-Control-Request-Method is caller-controlled — a browser never
+    # sends it without Origin, but nothing stops a client from doing so to
+    # try to reopen the bypass this closes. Both are required together.
+    res = _client().options(
+        "/api/v1/explicit-options",
+        headers={"Access-Control-Request-Method": "GET"},
+    )
+    assert res.status_code == 401
+
+
 def test_bare_options_with_identity_reaches_the_route():
     res = _client().options("/api/v1/explicit-options", headers=IDENTITY)
     assert res.status_code == 200

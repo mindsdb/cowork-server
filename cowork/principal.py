@@ -89,9 +89,16 @@ class TrustedHeaderMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
         # A genuine CORS preflight never carries identity headers — but
-        # OPTIONS alone doesn't prove that: a real preflight always carries
-        # Access-Control-Request-Method.
-        if request.method == "OPTIONS" and request.headers.get("access-control-request-method"):
+        # OPTIONS alone doesn't prove that, and neither does
+        # Access-Control-Request-Method alone: it's caller-controlled, so an
+        # anonymous caller could set it on a bare OPTIONS request with no
+        # Origin to reopen the same bypass. A browser preflight always
+        # carries both together; require both.
+        if (
+            request.method == "OPTIONS"
+            and request.headers.get("origin")
+            and request.headers.get("access-control-request-method")
+        ):
             return await call_next(request)
 
         if request.url.path in _EXEMPT_PATHS or request.url.path in self._exempt_paths:
