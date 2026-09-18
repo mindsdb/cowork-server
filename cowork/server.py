@@ -97,6 +97,22 @@ async def _warm_model_map_on_boot() -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_dev_setup()
+    # Write the orphaned turn into history FIRST, while its buffer file still
+    # has no terminal record — seal_orphan_buffers below uses that same "no
+    # terminal record" check, so running this after it would skip everything.
+    try:
+        from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
+        from cowork.db.session import get_open_session
+        from cowork.streaming import get_streams_dir
+        from cowork.streaming.recovery import seal_orphan_turns_in_history
+
+        history_session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
+        try:
+            seal_orphan_turns_in_history(history_session, get_streams_dir())
+        finally:
+            history_session.close()
+    except Exception:
+        logger.exception("turn-history boot recovery failed (non-fatal)")
     # Seal any turn buffers left open by a previous process (crash/restart)
     # so reconnecting clients get a clean Interrupted end-of-stream rather
     # than hanging. GC of old buffers happens lazily; cheap no-op when none.
@@ -162,6 +178,14 @@ async def lifespan(app: FastAPI):
         from cowork.services.artifacts import shutdown_launched_backends
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
         from cowork.coding.service import get_coding_service
+        from cowork.streaming.registry import registry
+
+        # Cancel any in-flight turn and wait (bounded) for it to persist its
+        # partial answer as interrupted, before the resources below it
+        # depends on go away.
+        cancelled = await registry.shutdown()
+        if cancelled:
+            logger.warning(f"Cancelled {cancelled} in-flight turn(s) for shutdown")
 
         reconciler = getattr(app.state, "channel_ingress_reconciler", None)
         if reconciler is not None:

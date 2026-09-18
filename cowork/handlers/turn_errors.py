@@ -254,6 +254,11 @@ GENERIC_TURN_ERROR_MESSAGE = "An unexpected error occurred."
 # clients (which may branch on it) keep working after the migration.
 GENERIC_TURN_ERROR_CODE = "anton_error"
 
+# Message for a turn cut off by boot recovery or shutdown, not by the model,
+# provider, or user Stop. Paired with GENERIC_TURN_ERROR_CODE, not a code of
+# its own — same as TurnInterrupted below.
+INTERRUPTED_TURN_MESSAGE = "The response was interrupted before it finished. Please try again."
+
 # Curated copy for scratchpad-controller literals that carry no "TypeName:"
 # prefix at all (main.py's own turn_failed publishes), so the type-name parse
 # in remote_turn_error never sees them. Matched by prefix/suffix rather than
