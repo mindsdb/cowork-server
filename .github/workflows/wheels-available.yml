@@ -38,9 +38,17 @@ defaults:
 
 jobs:
   wheels-available:
-    # GitHub-hosted and secret-free on purpose, like the unit tests: this is
-    # resolution only, it never executes dependency code, and a fork
+    # GitHub-hosted and secret-free on purpose, like the unit tests, so a fork
     # contributor gets the signal that matters to them.
+    #
+    # It installs nothing and runs no dependency at runtime, but do NOT read
+    # that as "executes no third-party code": step 1 of the script resolves
+    # WITHOUT `--only-binary`, so when a package publishes no PEP 658 metadata
+    # uv may download and build its sdist to read the metadata, which runs that
+    # package's `setup.py`. Exactly the exposure `uv lock` and `uv sync`
+    # already carry here, on a runner with no secrets and a read-only token —
+    # but stated plainly rather than claimed away, because the reason this job
+    # can be ungated is the blast radius, not an absolute.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

@@ -31,25 +31,37 @@ dependencies = [
     # shipped 2026-06-09 and 49.0.0 three days later, so nothing further will
     # be backported to it.
     #
-    # Exactly ONE open advisory applies to 48.0.1, and it is worth being
-    # precise because a scanner will present more than that:
-    #   - GHSA-g6cj-pr64-35w5 (HIGH, affects >=44.0.0,<50.0.0) APPLIES.
-    #     PKCS#7 EnvelopedData decryption Bleichenbacher oracle.
-    #   - GHSA-jwv3-5hgf-82ww (HIGH) and GHSA-m2h6-j472-rp4c (MODERATE) are
-    #     listed as "fixed in 49.0.0" but their vulnerable ranges END AT
-    #     48.0.0, so 48.0.1 already carries those fixes and is NOT affected.
-    #     Do not count them against this pin.
+    # THREE open advisories apply to 48.0.1, all fixed only in 49.0.0 or later:
+    #   - GHSA-g6cj-pr64-35w5 (HIGH)     PKCS#7 EnvelopedData decryption
+    #                                    Bleichenbacher oracle. Fixed 50.0.0.
+    #   - GHSA-jwv3-5hgf-82ww (HIGH)     X.509 path building, exponential blowup
+    #                                    on duplicate self-signed intermediates.
+    #   - GHSA-m2h6-j472-rp4c (MODERATE) X.509 verifier accepts wildcard DNS
+    #                                    names, escaping permittedSubtrees.
     #
-    # Reachability of the one that does apply is low. This package's own use of
+    # Do not be misled by GitHub's advisory API on the latter two: their
+    # `vulnerable_version_range` ends at `<= 48.0.0`, which reads as though
+    # 48.0.1 were clear, while `first_patched_version` says 49.0.0. The range
+    # is stale, and two independent checks settle it. The 48.0.1 changelog has
+    # exactly ONE entry — "Updated Windows, macOS, and Linux wheels to be
+    # compiled with OpenSSL 4.0.1" — which is GHSA-537c-gmf6-5ccf and nothing
+    # else, and a wheel rebuild cannot carry code fixes for cryptography's own
+    # Rust X.509 verifier. That same 537c advisory is the control showing the
+    # database does record genuine 48.0.1 backports when they exist
+    # (`< 48.0.1`, `first_patched_version: 48.0.1`). OSV agrees: it matches all
+    # three against 48.0.1 and correctly drops 537c.
+    #
+    # Reachability from THIS package is low for all three. Our own use of
     # cryptography is Fernet (common/encryption.py, services/settings.py) and
-    # Ed25519 signature verification (channels/plugins/discord.py) — it never
-    # touches PKCS#7 EnvelopedData decryption, which is where the oracle is.
-    # Not audited: whether any transitive dependency decrypts EnvelopedData
-    # (pyhanko is the notable cryptography user here, and signs rather than
-    # decrypts). Stated so the next reader knows the limit of the claim.
+    # Ed25519 signature verification (channels/plugins/discord.py); we never
+    # decrypt PKCS#7 EnvelopedData and never drive the X.509 path builder.
+    # Not audited: transitive use. pyhanko is the notable cryptography consumer
+    # here and the X.509 pair is the half with any bearing on it, so that is
+    # where to look first if this is ever revisited.
     #
     # Weighed against an install that cannot complete at all on the affected
-    # hardware, the cap wins — but re-check that reachability before assuming
+    # hardware, the cap wins — but it is three open advisories, not a free
+    # trade. Re-check that reachability before assuming
     # it still holds, and do not simply raise the ceiling because a scanner
     # flagged it. Upstream is not restoring the wheel, so the only real exits
     # are dropping Intel macOS support or `--no-build` at the install site
@@ -57,8 +69,8 @@ dependencies = [
     #
     # Scoped by marker rather than capped globally so the cost lands only on
     # the platform that forces it: a blanket <49 would freeze Apple Silicon,
-    # Windows and Linux on 48.0.1 too and carry that advisory fleet-wide, for
-    # nothing.
+    # Windows and Linux on 48.0.1 too and carry all three advisories
+    # fleet-wide, for nothing.
     #
     # Enforced by the `wheels-available` CI gate — a bump that deletes the
     # marker turns that job red. ENG-2864 (regression of #320), ENG-1629.
