@@ -49,10 +49,19 @@ def test_options_on_responses_is_open_in_org_mode(org_client):
     level, and FastAPI ADDS a route-level dependency to its router's rather
     than substituting for it — so the OPTIONS route carried both and answered
     401, under a comment saying it "carries its own OpenByDesign instead".
-    TrustedHeaderMiddleware returns before building a Principal on any OPTIONS
-    request, so there was never one to satisfy the stricter check.
+
+    Carries Access-Control-Request-Method, not a bare OPTIONS:
+    TrustedHeaderMiddleware only lets a request through with no principal
+    built when that header marks it as a real preflight, so this is what
+    actually exercises the route's own OpenByDesign dependency rather than
+    the middleware's own bypass. No Origin header, deliberately — an
+    allowed-origin check is CORSMiddleware's own concern (test_principal.py),
+    unrelated to what this test verifies.
     """
-    resp = org_client.options("/api/v1/responses/")
+    resp = org_client.options(
+        "/api/v1/responses/",
+        headers={"Access-Control-Request-Method": "POST"},
+    )
 
     assert resp.status_code == 200
     assert resp.json() == {"message": "OK"}
