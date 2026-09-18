@@ -10,12 +10,14 @@ repo calls workspaces; the stored key is ``hub_workspace_id`` for that reason.
 The listing is answered whatever its length. Whether a client draws a control
 is the client's decision, and Cowork's is to draw nothing below two rows.
 
-**This selector changes what the client shows, not what a turn is billed to.**
-Which workspace a usage row carries is decided by the credential the turn
-presents, and neither credential carries one today: a desktop turn runs against
-a long-lived key bound to a user and an organization, and a cloud turn runs
-against a short-TTL key whose mint body has no workspace field. So nothing here
-touches the turn path, and a test asserts it.
+**Which workspace a usage row carries is decided by the credential the turn
+presents, not by this selector directly.** A desktop turn still runs against a
+long-lived key bound to a user and an organization only. A cloud turn now
+carries this stored pick: the remote producer reads `hub_workspace_id` and
+forwards it to the turn-key and artifact-publish-key mints (`cowork/turnqueue/
+producer.py`, `cowork/services/artifact_autopublish.py`), which bind the key's
+`workspace_id` to it. So the desktop path is still workspace-blind; the cloud
+path picks this up as soon as a caller uses the selector below.
 
 **The stored key has a second writer, and it grants nothing.**
 ``hub_workspace_id`` is a declared ``UserSettings`` field, so
