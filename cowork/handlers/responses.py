@@ -59,6 +59,7 @@ from cowork.handlers.turn_errors import (
     CONTENT_RECOVERY_CODE,
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
+    INTERRUPTED_TURN_MESSAGE,
     MODEL_UNAVAILABLE_CODES,
     ALLOWANCE_EXHAUSTED_CODE,
     PROVIDER_OVERLOADED_CODE,
@@ -1459,6 +1460,16 @@ class ResponsesHandler:
                 # Same reasoning as _run_turn's discarded branch — see there.
                 logger.info("[responses] discarded remote turn %s — not persisting", conv_id)
                 return
+            if lifecycle.shutting_down:
+                # Same reasoning as _run_turn's shutting_down branch — see there.
+                collected_events.append(
+                    response_failed_payload(INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE)
+                )
+                await buffer.append("sse", {"sse": response_failed_sse(
+                    INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE)})
+                persist()
+                await buffer.close("interrupted")
+                return
             # Partial text generated before cancellation is persisted.
             persist()
             await buffer.close("cancelled")
@@ -1608,6 +1619,18 @@ class ResponsesHandler:
                 # then tail, since turn_id == message count is reused after a
                 # truncation. So drop the turn entirely.
                 logger.info("[responses] discarded turn %s — not persisting", conv_id)
+                return
+            if lifecycle.shutting_down:
+                # The server is exiting, not the user's own Stop: unlike the
+                # plain cancel below, this must read as an interruption, same
+                # marker seal_orphan_turns_in_history writes after a hard crash.
+                collected_events.append(
+                    response_failed_payload(INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE)
+                )
+                await buffer.append("sse", {"sse": response_failed_sse(
+                    INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE)})
+                persist()
+                await buffer.close("interrupted")
                 return
             # Nothing special is emitted on cancellation.
             # The partial text and events generated before cancellation are persisted.
