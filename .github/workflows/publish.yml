@@ -70,8 +70,21 @@ jobs:
       deploy-enabled: true
     secrets: inherit
 
+  wheels-available:
+    # Gates the publish below. A dependency's wheel matrix can change with no
+    # commit here at all, so this has to run on the release path and not only
+    # on PRs — that is exactly how the ENG-2864 regression shipped.
+    permissions:
+      contents: read
+    uses: ./.github/workflows/wheels-available.yml
+
   release:
-    needs: unit-tests
+    # Waits for `wheels-available` as well, so a red gate means NO TAG. With
+    # `needs: unit-tests` alone the two ran in parallel: the stable tag and its
+    # GitHub Release were created, then `publish` was skipped, leaving a
+    # version that exists on GitHub and not on PyPI and a tag to clean up
+    # before the fixed commit could re-release.
+    needs: [unit-tests, wheels-available]
     # workflow_dispatch can be pointed at any ref; only main cuts a stable release.
     if: github.ref == 'refs/heads/main'
     permissions:
@@ -83,7 +96,11 @@ jobs:
 
   publish:
     name: Build and publish to PyPI
-    needs: release
+    # `wheels-available` is redundant now that `release` waits for it too, and
+    # deliberately kept: it is the edge that actually stops a broken wheel
+    # reaching PyPI, so it should not disappear if the `release` edge is ever
+    # refactored away.
+    needs: [release, wheels-available]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -128,7 +145,7 @@ jobs:
     # One job covers both outcomes: a `uses:` job cannot branch on status, so
     # the aggregate result picks the failed or recovered message, and a
     # cancelled run stays silent.
-    needs: [unit-tests, build-deploy, release, publish]
+    needs: [unit-tests, build-deploy, wheels-available, release, publish]
     if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') }}
     permissions:
       contents: read
