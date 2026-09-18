@@ -53,6 +53,15 @@ def _app(org_mode: bool = True, enforce: bool = True) -> FastAPI:
     async def slack_webhook():
         return {"ack": True}
 
+    # A route with its own explicit OPTIONS handler (like responses.py's
+    # OpenByDesign preflight body) — CORSMiddleware only intercepts a
+    # genuine preflight (Origin + Access-Control-Request-Method) before this
+    # ever runs, so a bare OPTIONS with neither reaches TrustedHeaderMiddleware
+    # exactly like any other method.
+    @app.options("/api/v1/explicit-options")
+    def explicit_options():
+        return {"ok": True}
+
     # Mirror create_app's ordering: principal added first (inner), CORS last
     # (outer) so a 401 still flows back out through CORS.
     if org_mode:
@@ -163,6 +172,30 @@ def test_options_preflight_is_allowed_without_identity():
     )
     assert res.status_code in (200, 204)
     assert res.headers.get("access-control-allow-origin") == ORIGIN
+
+
+def test_bare_options_without_a_preflight_header_still_needs_identity():
+    # Not a real preflight (no Access-Control-Request-Method), so
+    # CORSMiddleware never intercepts it — it must reach identity
+    # enforcement like any other request, not bypass it just for being OPTIONS.
+    res = _client().options("/api/v1/explicit-options")
+    assert res.status_code == 401
+
+
+def test_options_with_request_method_but_no_origin_still_needs_identity():
+    # Access-Control-Request-Method is caller-controlled — a browser never
+    # sends it without Origin, but nothing stops a client from doing so to
+    # try to reopen the bypass this closes. Both are required together.
+    res = _client().options(
+        "/api/v1/explicit-options",
+        headers={"Access-Control-Request-Method": "GET"},
+    )
+    assert res.status_code == 401
+
+
+def test_bare_options_with_identity_reaches_the_route():
+    res = _client().options("/api/v1/explicit-options", headers=IDENTITY)
+    assert res.status_code == 200
 
 
 def test_401_carries_cors_headers():
