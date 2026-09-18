@@ -61,6 +61,14 @@ jobs:
       build-environment: staging
     secrets: inherit
 
+  wheels-available:
+    # Gates the publish below, same as in publish.yml. Staging is where an
+    # Intel-Mac wheel regression should be caught, since staging desktop builds
+    # install from PyPI exactly like prod.
+    permissions:
+      contents: read
+    uses: ./.github/workflows/wheels-available.yml
+
   release:
     needs: unit-tests
     # workflow_dispatch can be pointed at any ref; only staging mints rc tags.
@@ -75,7 +83,7 @@ jobs:
 
   publish:
     name: Build and publish pre-release to PyPI
-    needs: release
+    needs: [release, wheels-available]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -150,7 +158,7 @@ jobs:
     # One job covers both outcomes: a `uses:` job cannot branch on status, so
     # the aggregate result picks the failed or recovered message, and a
     # cancelled run stays silent.
-    needs: [unit-tests, build-deploy, release, publish]
+    needs: [unit-tests, build-deploy, wheels-available, release, publish]
     if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') }}
     permissions:
       contents: read
