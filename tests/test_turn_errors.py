@@ -272,13 +272,65 @@ def test_the_real_shape_dialects_still_qualify():
         assert te.friendly_turn_error(exc)[0] == te.CONTENT_RECOVERY_CODE
 
 
-def test_both_content_codes_trigger_the_conversation_repair():
-    """The bit that unsticks the user. The repair is keyed on this set, and a
-    too-large turn that skipped it would leave the oversized image in stored
-    history — every later turn in that conversation re-sends it and fails the
-    same way, which is the defect ENG-2689 was filed for."""
-    assert te.CONTENT_TOO_LARGE_CODE in te.CONTENT_REPAIR_CODES
-    assert te.CONTENT_RECOVERY_CODE in te.CONTENT_REPAIR_CODES
+def test_every_repair_guard_consults_the_shared_set():
+    """The two tests above cover the local streaming and non-streaming sites
+    behaviourally. The remote site (`_produce_remote`) needs a producer session,
+    seeded history, an artifact snapshot and a memory read before it reaches its
+    guard — mocking all of that would produce a test that passes for reasons
+    unrelated to the guard, which is the failure mode this whole exercise is
+    about. So that third site is pinned structurally instead, in the same style
+    as `test_no_return_emits_a_literal_code` below.
+
+    This is the exact mutation that went undetected: replacing the three guards
+    with `code == "content_recovery"` while leaving `CONTENT_REPAIR_CODES`
+    defined kept 191 checked-in tests green with ENG-2689's next-turn repair
+    gone. Asserting set membership proved a property of a constant; nothing
+    proved a handler consulted it.
+    """
+    import ast
+    import inspect
+
+    from cowork.handlers import responses as responses_mod
+
+    tree = ast.parse(inspect.getsource(responses_mod))
+    parent = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent[child] = node
+
+    calls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "repair_image_content"
+    ]
+    assert len(calls) == 3, f"expected 3 repair sites, found {len(calls)}"
+
+    banned = {te.CONTENT_RECOVERY_CODE, te.CONTENT_TOO_LARGE_CODE}
+    for call in calls:
+        # Nearest enclosing `if`, walking up — `ast.walk` alone double-counts,
+        # since the guard's own body contains further `if`s.
+        node, guard = call, None
+        while node in parent:
+            node = parent[node]
+            if isinstance(node, ast.If):
+                guard = node
+                break
+        assert guard is not None, "a repair call is not behind any guard at all"
+
+        names = {n.id for n in ast.walk(guard.test) if isinstance(n, ast.Name)}
+        assert "CONTENT_REPAIR_CODES" in names, (
+            "a repair site does not consult CONTENT_REPAIR_CODES, so it handles "
+            "only one of the two permanent-content families"
+        )
+        literals = {
+            n.value for n in ast.walk(guard.test)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+        }
+        assert not (literals & banned), (
+            "a repair site compares `code` to a bare code literal; that is how "
+            "one family silently stops being repaired"
+        )
 
 
 def test_response_failed_sse_shape():
@@ -492,10 +544,27 @@ def test_collect_raises_500_generic_for_unmapped_error():
 
 # ── Conversation repair on content validation error (ENG-1992) ────
 
-def test_stream_repairs_conversation_on_content_validation_error():
+# Both permanent-content families, because they enter through different
+# detectors and only the repair GUARD is shared. Before ENG-2689 these tests
+# only ever drove the shape family, so reverting all three handler guards to
+# `code == "content_recovery"` left 191 checked-in tests green with the
+# oversized-image repair gone entirely (review of ENG-2689).
+_REPAIR_FAMILIES = [
+    pytest.param(
+        lambda: Exception(
+            "Invalid value: 'image'. Supported values are: 'input_text', 'input_image'"
+        ),
+        id="shape",
+    ),
+    pytest.param(lambda: ContentTooLargeError(_RESIZE_COPY), id="too_large"),
+]
+
+
+@pytest.mark.parametrize("make_exc", _REPAIR_FAMILIES)
+def test_stream_repairs_conversation_on_content_validation_error(make_exc):
     from unittest.mock import MagicMock, patch
 
-    exc = Exception("Invalid value: 'image'. Supported values are: 'input_text', 'input_image'")
+    exc = make_exc()
     handler = _handler_with_raising_formatter(exc)
 
     class _Buffer:
@@ -558,10 +627,11 @@ def test_stream_does_not_repair_conversation_for_unrelated_errors():
         conv_svc.return_value.repair_image_content.assert_not_called()
 
 
-def test_collect_repairs_conversation_on_content_validation_error():
+@pytest.mark.parametrize("make_exc", _REPAIR_FAMILIES)
+def test_collect_repairs_conversation_on_content_validation_error(make_exc):
     from unittest.mock import MagicMock, patch
 
-    exc = Exception("Invalid value: 'image'. Supported values are: 'input_text', 'input_image'")
+    exc = make_exc()
     handler = _handler_with_raising_formatter(exc)
     handler.scoped = MagicMock()  # __init__ bypassed; _collect's repair path needs this
     conv_id = uuid4()
@@ -571,7 +641,7 @@ def test_collect_repairs_conversation_on_content_validation_error():
         with pytest.raises(HTTPException) as err:
             asyncio.run(handler._collect(stream=None, conversation_id=conv_id, model="anton", original_content="hi"))
         assert err.value.status_code == 400
-        assert err.value.detail["code"] == te.CONTENT_RECOVERY_CODE
+        assert err.value.detail["code"] in te.CONTENT_REPAIR_CODES
         conv_svc.return_value.repair_image_content.assert_called_once_with(conv_id)
 
 
