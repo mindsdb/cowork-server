@@ -74,12 +74,14 @@ def finish_turn(session: CodingSession, status: SessionStatus) -> None:
     session.status = status
     session.active_turn_id = None
     session.pending_approval = None
+    session.pending_question = None
 
 
 def fail_turn(session: CodingSession, cancelled: bool, message: str) -> None:
     session.status = SessionStatus.cancelled if cancelled else SessionStatus.failed
     session.active_turn_id = None
     session.pending_approval = None
+    session.pending_question = None
     session.last_error = None if cancelled else message
 
 
@@ -87,6 +89,7 @@ def interrupt_turn(session: CodingSession) -> None:
     session.status = SessionStatus.interrupted
     session.active_turn_id = None
     session.pending_approval = None
+    session.pending_question = None
     session.last_error = None
 
 
