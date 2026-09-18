@@ -157,6 +157,13 @@ def _publish_url(scope) -> str:
     return publish_url
 
 
+def _active_workspace_id(scope) -> str | None:
+    """The caller's picked MindsHub workspace, or None for the organization's Default."""
+    from cowork.common.settings.user_settings import get_user_settings
+
+    return getattr(get_user_settings(scope), "hub_workspace_id", "") or None
+
+
 def _record(result: str, **fields: object) -> None:
     """The metric. cowork-server has no metrics backend, so this is a structured
     log line with a stable prefix — greppable now, collectable later.
@@ -319,7 +326,9 @@ async def autopublish_project_artifacts(
     phase_two = [s for s in all_slugs if s not in touched]
 
     publish_url = _publish_url(scope)
-    key = PublishKey(scope.user_id, scope.org_id, min_ttl_s=timeout_s + 60.0)
+    key = PublishKey(
+        scope.user_id, scope.org_id, min_ttl_s=timeout_s + 60.0, workspace_id=_active_workspace_id(scope)
+    )
     started = time.monotonic()
     published: set[str] = set()
     lock_ttl = timeout_s * 3

@@ -240,6 +240,34 @@ async def test_scope_is_threaded_into_the_publisher(base, enabled, key, publishe
     assert published[0]["scope"] is ORG_SCOPE
 
 
+async def test_publish_key_carries_the_active_hub_workspace(base, enabled, published, monkeypatch):
+    """The caller's picked MindsHub workspace (UserSettings.hub_workspace_id,
+    written by the hub_workspaces selector) must reach the publish key mint,
+    the same as it reaches the execution turn key."""
+    captured = {}
+
+    class FakeKey:
+        instance_id = "inst-1"
+
+        def __init__(self, *a, **kw):
+            captured.update(kw)
+
+        async def get(self):
+            return "turnkey-1"
+
+        async def revoke(self):
+            pass
+
+    monkeypatch.setattr(ap, "PublishKey", FakeKey)
+    monkeypatch.setattr(ap, "_active_workspace_id", lambda scope: "ws-1")
+    _make(base, "rep", files={"report.html": "<html></html>"},
+          meta={"slug": "rep", "type": "html-app"})
+
+    await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+
+    assert captured["workspace_id"] == "ws-1"
+
+
 async def test_key_is_revoked_after_reconciliation(base, enabled, key, published):
     _make(base, "rep", files={"report.html": "<html></html>"},
           meta={"slug": "rep", "type": "html-app"})

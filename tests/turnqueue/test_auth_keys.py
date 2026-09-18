@@ -41,6 +41,32 @@ async def test_mint_turn_key_posts_and_returns_plaintext(monkeypatch):
     assert "Authorization" not in captured["headers"]
     assert captured["json"]["instance_id"] == "corr-1"
     assert captured["json"]["expiry_date"]  # present
+    assert "workspace_id" not in captured["json"]
+
+
+@pytest.mark.asyncio
+async def test_mint_turn_key_sends_workspace_id_when_given(monkeypatch):
+    captured = {}
+
+    class _Resp:
+        status_code = 201
+        def json(self): return {"key": "mdb_turnkey123"}
+        def raise_for_status(self): pass
+
+    class _Client:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json, headers):
+            captured["json"] = json
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    await mint_turn_key(
+        user_id="u1", org_id="o1", correlation_id="corr-1",
+        ttl_seconds=1200, settings=_Settings(), workspace_id="ws-1",
+    )
+    assert captured["json"]["workspace_id"] == "ws-1"
 
 
 @pytest.mark.asyncio

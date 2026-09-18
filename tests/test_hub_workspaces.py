@@ -602,54 +602,6 @@ def test_a_desktop_install_stores_the_pick_in_the_global_row(session):
     assert SettingService(session, LOCAL_SCOPE).load().hub_workspace_id == WS_CLIENT_A
 
 
-# ── What this must not touch ─────────────────────────────────────────
-
-
-def test_nothing_on_the_turn_path_reads_the_stored_workspace():
-    """The selector changes what the client shows, not what a turn is billed to.
-
-    Both turn credentials are workspace-blind: a desktop turn presents a
-    long-lived key bound to a user and an organization, and a cloud turn presents
-    a minted key whose request body has no workspace field. Attributing usage to a
-    workspace is separate work that has not shipped, so this asserts the boundary
-    rather than trusting it.
-    """
-    from pathlib import Path
-
-    repo = Path(__file__).resolve().parents[1]
-    targets = [
-        repo / "cowork" / "turnqueue",
-        repo / "cowork" / "handlers",
-        repo / "cowork" / "harnesses",
-        repo / "cowork" / "services" / "providers.py",
-    ]
-
-    # Read in Python rather than shelling out to grep. The shell version asserted
-    # on stdout alone, so a wrong working directory or a renamed path made grep
-    # error, print nothing, and the guard pass having checked no files at all.
-    missing = [str(t.relative_to(repo)) for t in targets if not t.exists()]
-    assert not missing, f"this guard points at paths that no longer exist: {missing}"
-
-    # Every file, not just `*.py`. The shell version this replaced was a plain
-    # `grep -rln`, so it also read the skill markdown and prompt templates under
-    # `cowork/harnesses/`, and the turn path can name a setting from one of those
-    # as easily as from code.
-    def _walk(target):
-        if target.is_file():
-            return [target]
-        return sorted(f for f in target.rglob("*") if f.is_file())
-
-    files = [f for t in targets for f in _walk(t)]
-    assert files, "the guard matched no files, so it proved nothing"
-    hits = [
-        str(f.relative_to(repo))
-        for f in files
-        if "hub_workspace_id" in f.read_text(encoding="utf-8", errors="ignore")
-    ]
-
-    assert hits == [], f"the turn path reads the stored workspace: {hits}"
-
-
 def test_the_read_goes_to_the_operator_auth_host_with_the_callers_own_bearer(
     monkeypatch, session
 ):
