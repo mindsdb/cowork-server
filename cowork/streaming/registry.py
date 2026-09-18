@@ -65,7 +65,7 @@ _IDLE_POLL_SECONDS = 15
 # Bound on RunRegistry.shutdown()'s wait for in-flight turns to persist their
 # partial answer before the process exits. The host's own graceful-shutdown
 # timeout (uvicorn, Kubernetes) should stay above this to give it room to run.
-TURN_SHUTDOWN_GRACE_SECONDS = 20
+TURN_SHUTDOWN_GRACE_SECONDS = 5
 
 
 @dataclass
