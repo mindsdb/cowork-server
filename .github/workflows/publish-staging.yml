@@ -61,8 +61,21 @@ jobs:
       build-environment: staging
     secrets: inherit
 
+  wheels-available:
+    # Gates the publish below, same as in publish.yml. Staging is where an
+    # Intel-Mac wheel regression should be caught, since staging desktop builds
+    # install from PyPI exactly like prod.
+    permissions:
+      contents: read
+    uses: ./.github/workflows/wheels-available.yml
+
   release:
-    needs: unit-tests
+    # Waits for `wheels-available` as well, so a red gate means NO TAG. With
+    # `needs: unit-tests` alone the two ran in parallel: the rc tag and its
+    # GitHub Release were created, then `publish` was skipped, leaving a
+    # version that exists on GitHub and not on PyPI and a tag to clean up
+    # before the fixed commit could re-release.
+    needs: [unit-tests, wheels-available]
     # workflow_dispatch can be pointed at any ref; only staging mints rc tags.
     if: github.ref == 'refs/heads/staging'
     permissions:
@@ -75,7 +88,11 @@ jobs:
 
   publish:
     name: Build and publish pre-release to PyPI
-    needs: release
+    # `wheels-available` is redundant now that `release` waits for it too, and
+    # deliberately kept: it is the edge that actually stops a broken wheel
+    # reaching PyPI, so it should not disappear if the `release` edge is ever
+    # refactored away.
+    needs: [release, wheels-available]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -125,6 +142,30 @@ jobs:
       # importing the app runs the same import chain uvicorn runs at startup
       # (server.py -> router.py -> endpoints -> services), so a stale pin fails
       # here instead of on a user's machine.
+      # The `wheels-available` gate above ran against the checked-in
+      # pyproject, i.e. the loose `anton-agent>=...,<3`. The pin step rewrote
+      # that to an exact rc, so the wheel just built can carry a dependency set
+      # the gate never saw — if that rc pulls something with no Intel-Mac or
+      # Windows wheel, desktop users get a source build and the gate stayed
+      # green. The smoke install below cannot catch it either: it runs on
+      # ubuntu and permits source builds.
+      #
+      # So re-run the cross-platform check against the artifact itself, which
+      # is the only thing that carries the pinned metadata.
+      - name: Check the built wheel resolves to wheels on every shipped platform
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          # Exactly one, or the check would silently inspect an arbitrary
+          # artifact. `uv build` produces one wheel plus an sdist, so anything
+          # else means the build changed and this check needs rethinking.
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "expected exactly 1 wheel in dist/, found ${#wheels[@]}: ${wheels[*]:-<none>}" >&2
+            exit 1
+          fi
+          bash scripts/check_wheels_available.sh "${wheels[0]}"
+
       - name: Verify the pinned anton-agent satisfies this build
         run: |
           set -euo pipefail
@@ -150,7 +191,7 @@ jobs:
     # One job covers both outcomes: a `uses:` job cannot branch on status, so
     # the aggregate result picks the failed or recovered message, and a
     # cancelled run stays silent.
-    needs: [unit-tests, build-deploy, release, publish]
+    needs: [unit-tests, build-deploy, wheels-available, release, publish]
     if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') }}
     permissions:
       contents: read
