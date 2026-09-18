@@ -153,7 +153,18 @@ jobs:
       # So re-run the cross-platform check against the artifact itself, which
       # is the only thing that carries the pinned metadata.
       - name: Check the built wheel resolves to wheels on every shipped platform
-        run: bash scripts/check_wheels_available.sh "$(ls dist/*.whl)"
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          # Exactly one, or the check would silently inspect an arbitrary
+          # artifact. `uv build` produces one wheel plus an sdist, so anything
+          # else means the build changed and this check needs rethinking.
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "expected exactly 1 wheel in dist/, found ${#wheels[@]}: ${wheels[*]:-<none>}" >&2
+            exit 1
+          fi
+          bash scripts/check_wheels_available.sh "${wheels[0]}"
 
       - name: Verify the pinned anton-agent satisfies this build
         run: |
