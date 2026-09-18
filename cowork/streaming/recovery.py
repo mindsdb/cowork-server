@@ -173,7 +173,10 @@ def seal_orphan_turns_in_history(session, streams_root: Path) -> int:
                 collected: list[str] = []
                 for event_type, data in _read_buffer_events(path):
                     accumulate_answer_text(collected, event_type, data)
-                svc.finalize_pending(conversation_id)
+                # Scoped to this turn's own row — an unscoped finalize_pending
+                # would also clear an unrelated pending row stranded by a
+                # different, unprocessed turn in the same conversation.
+                svc.finalize_pending(conversation_id, messages[turn_id].id)
                 conversation = svc.get_conversation(conversation_id)
                 svc.save_assistant_turn(
                     conversation_id,
