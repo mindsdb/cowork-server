@@ -56,6 +56,11 @@ from cowork.services.artifacts import (
     reveal_in_file_manager,
 )
 from cowork.services.projects import ProjectService
+from cowork.schemas.artifacts import (
+    ArtifactCardResponse,
+    ArtifactOpenResponse,
+    ArtifactPreviewResponse,
+)
 
 router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -605,7 +610,11 @@ def _desktop_artifact_status_for_path(path: str) -> dict:
 # AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
 # closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
 # whenever org mode has no org in scope.
-@router.get("/", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+@router.get(
+    "/",
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+    responses={status.HTTP_200_OK: {"model": list[ArtifactCardResponse]}},
+)
 async def list_artifacts(
     session: ScopedSessionDep,
     project_id: UUID | None = Query(default=None),
@@ -807,7 +816,11 @@ async def artifact_status(path: str = Query(..., min_length=1, max_length=4096))
     return _desktop_artifact_status_for_path(path)
 
 
-@router.get("/preview", dependencies=[Depends(require(DesktopOnly))])
+@router.get(
+    "/preview",
+    dependencies=[Depends(require(DesktopOnly))],
+    responses={status.HTTP_200_OK: {"model": ArtifactPreviewResponse}},
+)
 async def preview_artifact(path: str = Query(...)):
     try:
         artifact = resolve_artifact_path(path)
@@ -927,6 +940,16 @@ async def preview_asset(token: str, rel_path: str, request: Request):
 @router.get(
     "/serve/{project_name}/{file_path:path}",
     dependencies=[Depends(require(DesktopOnly))],
+    response_class=FileResponse,
+    responses={
+        status.HTTP_200_OK: {
+            "content": {
+                "application/octet-stream": {
+                    "schema": {"type": "string", "format": "binary"}
+                }
+            }
+        }
+    },
 )
 def serve_artifact_file(
     project_name: str,
@@ -957,7 +980,11 @@ def serve_artifact_file(
     return FileResponse(target, media_type=media_type, headers=artifact_response_headers(media_type))
 
 
-@router.post("/open", dependencies=[Depends(require(DesktopOnly))])
+@router.post(
+    "/open",
+    dependencies=[Depends(require(DesktopOnly))],
+    responses={status.HTTP_200_OK: {"model": ArtifactOpenResponse}},
+)
 async def open_artifact(req: _PathBody):
     from cowork.services.artifacts import _org_mode, _NO_EXEC_DETAIL
     # In org mode this always refuses; see _org_mode's docstring in services/artifacts.py.

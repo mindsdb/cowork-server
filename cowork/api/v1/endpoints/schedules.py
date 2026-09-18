@@ -9,8 +9,11 @@ from cowork.db.scoped import ScopedSessionDep
 from cowork.schemas.schedules import (
     DEFAULT_MODEL_SENTINEL,
     ScheduleCreateRequest,
+    ScheduleListResponse,
     ScheduleResponse,
+    ScheduleRunListResponse,
     ScheduleRunResponse,
+    ScheduleTriggerResponse,
     ScheduleUpdateRequest,
 )
 from cowork.services.schedules import ScheduleRunService, ScheduleService
@@ -31,13 +34,17 @@ def _serialize(schedule, scoped) -> dict:
     return data
 
 
-@router.get("/")
+@router.get("/", responses={status.HTTP_200_OK: {"model": ScheduleListResponse}})
 def list_schedules(scoped: ScopedSessionDep, project_id: UUID | None = None):
     schedules = ScheduleService(scoped).list_schedules(project_id=project_id)
     return {"schedules": [_serialize(s, scoped) for s in schedules]}
 
 
-@router.post("/", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/",
+    status_code=status.HTTP_201_CREATED,
+    responses={status.HTTP_201_CREATED: {"model": ScheduleResponse}},
+)
 def create_schedule(body: ScheduleCreateRequest, scoped: ScopedSessionDep):
     try:
         schedule = ScheduleService(scoped).create_schedule(
@@ -56,7 +63,10 @@ def create_schedule(body: ScheduleCreateRequest, scoped: ScopedSessionDep):
     return _serialize(schedule, scoped)
 
 
-@router.get("/{schedule_id}")
+@router.get(
+    "/{schedule_id}",
+    responses={status.HTTP_200_OK: {"model": ScheduleResponse}},
+)
 def get_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
     try:
         return _serialize(ScheduleService(scoped).get_schedule(schedule_id), scoped)
@@ -64,8 +74,14 @@ def get_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
-@router.put("/{schedule_id}")
-@router.patch("/{schedule_id}")
+@router.put(
+    "/{schedule_id}",
+    responses={status.HTTP_200_OK: {"model": ScheduleResponse}},
+)
+@router.patch(
+    "/{schedule_id}",
+    responses={status.HTTP_200_OK: {"model": ScheduleResponse}},
+)
 def update_schedule(schedule_id: UUID, body: ScheduleUpdateRequest, scoped: ScopedSessionDep):
     try:
         schedule = ScheduleService(scoped).update_schedule(
@@ -84,7 +100,10 @@ def delete_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
 
 
-@router.post("/{schedule_id}/pause")
+@router.post(
+    "/{schedule_id}/pause",
+    responses={status.HTTP_200_OK: {"model": ScheduleResponse}},
+)
 def pause_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
     try:
         return _serialize(ScheduleService(scoped).pause_schedule(schedule_id), scoped)
@@ -92,7 +111,10 @@ def pause_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
-@router.post("/{schedule_id}/resume")
+@router.post(
+    "/{schedule_id}/resume",
+    responses={status.HTTP_200_OK: {"model": ScheduleResponse}},
+)
 def resume_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
     try:
         return _serialize(ScheduleService(scoped).resume_schedule(schedule_id), scoped)
@@ -100,7 +122,11 @@ def resume_schedule(schedule_id: UUID, scoped: ScopedSessionDep):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
 
-@router.post("/{schedule_id}/run-now", status_code=status.HTTP_202_ACCEPTED)
+@router.post(
+    "/{schedule_id}/run-now",
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={status.HTTP_202_ACCEPTED: {"model": ScheduleTriggerResponse}},
+)
 def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tasks: BackgroundTasks):
     try:
         schedule = ScheduleService(scoped).get_schedule(schedule_id)
@@ -122,7 +148,10 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     return {"detail": "Run triggered", "conversation_id": str(conversation.id)}
 
 
-@router.get("/{schedule_id}/runs")
+@router.get(
+    "/{schedule_id}/runs",
+    responses={status.HTTP_200_OK: {"model": ScheduleRunListResponse}},
+)
 def list_schedule_runs(schedule_id: UUID, scoped: ScopedSessionDep, limit: int = 100):
     try:
         ScheduleService(scoped).get_schedule(schedule_id)
