@@ -23,7 +23,17 @@
 # pinned set wheel-only (step 2). Exact `==` pins leave nothing to backtrack
 # to, so a missing wheel has to fail.
 #
-# `--no-sources` on both steps, for the same reason. `[tool.uv.sources]` points
+# `--no-config` for the same reason as `--no-sources`. Without it uv applies
+# this project's `[tool.uv] override-dependencies` (currently `openai>=3.0`,
+# `pillow>=12.3.0`) while resolving — and those overrides are NOT part of the
+# published wheel, so a user's `uv tool install` never sees them. Measured: with
+# config, a requirement of `openai<3` still resolves to 3.16.1; with
+# `--no-config` it resolves to 2.54.0, which is what a user actually gets. The
+# two agree for today's dependency set, so this closes a latent divergence
+# rather than a live break — but a gate that resolves under constraints users do
+# not have is the same defect class this file exists to catch.
+#
+# `--no-sources` on both steps, for a related reason. `[tool.uv.sources]` points
 # anton-agent and hermes-agent at git, which is a source build by definition and
 # has no wheel to find — without the flag this gate fails on every platform for a
 # reason no user will ever hit. More importantly, those sources do not appear in
@@ -96,7 +106,7 @@ for plat in "${PLATFORMS[@]}"; do
     if ! out=$(uv pip compile "$SOURCE" \
                  --python-platform "$plat" \
                  --python-version "$pyver" \
-                 --no-sources \
+                 --no-sources --no-config \
                  --quiet --output-file "$pinned" 2>&1); then
       echo "FAILED (could not resolve at all)"
       echo "$out" | sed 's/^/    /'
@@ -108,7 +118,7 @@ for plat in "${PLATFORMS[@]}"; do
     if out=$(uv pip compile "$pinned" \
                --python-platform "$plat" \
                --python-version "$pyver" \
-               --no-sources \
+               --no-sources --no-config \
                --only-binary :all: \
                --quiet 2>&1); then
       echo "ok"
