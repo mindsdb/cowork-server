@@ -241,6 +241,21 @@ def test_an_unrelated_enum_error_is_not_a_content_rejection(param, value, allowe
     assert te.friendly_turn_error(exc) is None
 
 
+def test_a_param_that_legitimately_takes_image_is_not_a_content_rejection():
+    """Found by adversarially reviewing the first version of this guard, not by
+    the reviewer. `modalities` legitimately accepts the value 'image', so
+    "Supported values are: 'image', 'audio'" names a content-block token while
+    having nothing to do with content — and the corroboration rule as first
+    written still sent it down the path that deletes every image in the
+    conversation. A param the provider named is decisive when recoverable."""
+    exc = Exception(
+        "Error code: 400 - {'error': {'message': \"Invalid value: 'text'. "
+        "Supported values are: 'image', 'audio'.\", 'param': 'modalities'}}"
+    )
+    assert not te.is_content_validation_error(exc)
+    assert te.friendly_turn_error(exc) is None
+
+
 def test_the_real_shape_dialects_still_qualify():
     """The guard must not be so tight it kills ENG-1992. Both live dialects
     name a content-block type, which is exactly the corroboration required."""

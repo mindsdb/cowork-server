@@ -23,6 +23,7 @@ internals must never leak into the chat, so unmapped failures surface as
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
@@ -457,6 +458,26 @@ def _names_a_content_block(message_low: str) -> bool:
     )
 
 
+# The offending field, when the stringified error happens to carry one. This
+# path only ever sees a repr of the provider body (anton is unimportable or
+# older), so there is no structured param to read — but recovering it when it
+# IS there removes the last family of false positives: `modalities` legitimately
+# takes the value 'image', so "Supported values are: 'image', 'audio'" for a bad
+# `modalities` otherwise looks exactly like a content-block rejection and costs
+# the user every image in the conversation. No match means we fall back to the
+# token rule rather than guessing.
+_PARAM_IN_REPR = re.compile(r"""['"]param['"]\s*:\s*['"]([^'"]+)['"]""")
+
+
+def _param_points_at_content(message: str) -> bool | None:
+    """True/False when a param is recoverable, None when there is none to read."""
+    found = _PARAM_IN_REPR.search(message)
+    if found is None:
+        return None
+    param = found.group(1).lower()
+    return ".content[" in param or param.endswith(".content")
+
+
 def is_content_too_large_error(exc: Exception) -> bool:
     """Whether the provider refused this turn because an image is too BIG.
 
@@ -513,6 +534,10 @@ def is_content_validation_error(exc: Exception) -> bool:
     # decides.
     if not any(p in s for p in _CONTENT_SHAPE_PHRASES):
         return False
+    # A param the provider named, when we can recover it, is decisive either way.
+    points_at_content = _param_points_at_content(s)
+    if points_at_content is not None:
+        return points_at_content
     return ".content[" in s or _names_a_content_block(s)
 
 
