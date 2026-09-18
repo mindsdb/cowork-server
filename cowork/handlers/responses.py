@@ -5,6 +5,7 @@ import base64
 import json
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
+from functools import partial
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -13,6 +14,7 @@ from sqlmodel import Session
 
 from cowork.build_info import build_trace_metadata
 from cowork.common.chat_session import in_process_agent_allowed
+from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings
 from cowork.common.settings.user_settings import (
     Provider,
@@ -25,6 +27,7 @@ from cowork.harnesses.base import available_harness_ids, get_harness
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
+    _MAX_HISTORY_MESSAGES,
     RouteDecision,
     RouterBinding,
     decide_route,
@@ -47,7 +50,10 @@ from cowork.schemas.responses import (
     ResponsesRequest,
     Role,
 )
-from cowork.handlers._turn_history import sanitize_turn_history_rows
+from cowork.handlers._turn_history import (
+    reject_unreplayable_tool_rows,
+    sanitize_turn_history_rows,
+)
 from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
     CONTENT_RECOVERY_CODE,
@@ -95,6 +101,11 @@ class _RemoteTurnFailed(Exception):
 # this module synthesizes when a turn is stopped while a question is on screen.
 ASK_USER_EVENT = "response.ask_user"
 ASK_USER_ANSWERED_EVENT = "response.ask_user_answered"
+
+#: Budget for a pod-reported history summary. Well above what the summarizer's
+#: own output cap can produce, and the summary is sticky: it is replayed on
+#: every later turn, so an oversized one wedges the conversation for good.
+_MAX_COMPACTION_SUMMARY_BYTES = 64 * 1024
 
 
 def cancelled_ask_user_retirements(events: list[dict]) -> list[dict]:
@@ -236,13 +247,13 @@ def _auth_failure_provider(settings, role: str | None) -> Provider | None:
     if role == "coding":
         return settings.resolved_coding_provider
     if role == "router":
-        # Defensive, and not reachable today: every router call site swallows a
-        # confirmed refusal rather than propagating it — `summarize()` at
-        # anton/core/session.py:2366, `gate()` inside `_gate_turn` at
-        # anton/core/session.py:3515, and `_route_decision` below. The turn
-        # falls back to planning instead, which `tests/test_thalamus.py` pins in
-        # anton. Kept so a future propagating router path attributes the card to
-        # the provider that actually failed rather than defaulting to planning.
+        # Defensive, and not reachable today: anton's `summarize()` is the only
+        # router-role call that stamps a refusal, and it swallows a confirmed one
+        # rather than propagating (pinned by its
+        # `test_failed_summarize_reports_no_compaction`). `decide_route` below
+        # streams the provider directly, outside anton's client, so it never
+        # stamps a role at all. Kept so a future propagating router path
+        # attributes the card to the provider that failed rather than to planning.
         return settings.resolved_router_provider
     if role == "planning":
         return settings.resolved_planning_provider
@@ -276,8 +287,8 @@ class ResponsesHandler:
         # overrides the account default for THIS call only — mirrors the
         # per-conversation model override below. Ignored (not raised) when it
         # doesn't name a currently-registered/available harness: a stale
-        # client cache (e.g. Hermes got uninstalled since the picker last
-        # loaded) must never fail the turn, it just falls back to the
+        # client cache (a harness removed since the picker last loaded)
+        # must never fail the turn, it just falls back to the
         # account default. self.harness stays None either way — still lazy,
         # only self.harness_name (which harness _get_harness() will build)
         # changes here.
@@ -494,12 +505,20 @@ class ResponsesHandler:
         if reason:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
         try:
-            history = [
-                message.to_openai_message().model_dump()
-                for message in ConversationService(self.scoped).get_ordered_messages(conversation_id)
-                if message.role in {"user", "assistant"}
-            ]
-            history.append({"role": "user", "content": self._prompt_text(harness_input)})
+            # Scrub credentials: this history bypasses the normal turn's
+            # _scrub_user_input/_stamp_message pass. Bounded to the rows
+            # decide_route can actually use (_text_history keeps at most
+            # _MAX_HISTORY_MESSAGES) so scrubbing doesn't pay for the whole
+            # conversation on every gated turn.
+            ordered = [
+                m for m in ConversationService(self.scoped).get_ordered_messages(conversation_id)
+                if m.role in {"user", "assistant"}
+            ][-_MAX_HISTORY_MESSAGES:]
+            history = [scrubbed_openai_dump(m) for m in ordered]
+            history.append({
+                "role": "user",
+                "content": scrub_credentials(self._prompt_text(harness_input)),
+            })
             # The gate's LLM call is the only one a direct turn makes, and it
             # is made outside any ChatSession — so without a trace context it
             # reaches MindsHub anonymous, and a direct turn leaves no trace to
@@ -779,10 +798,18 @@ class ResponsesHandler:
         chats before it ever opens the skills menu. Never fails the turn: a
         staging error degrades to a turn without the missing piece."""
         try:
+            from cowork.services.artifact_roots import project_artifacts_base
             from cowork.services.files import stage_project_instructions
 
             conversation = ConversationService(session).get_conversation(conv_id)
             project_path = conversation.project.path
+            # ENG-2056: the pod mounts the PROJECT-level artifacts base (subPath
+            # `.anton/artifacts`) at /project-artifacts, and a subPath mount needs
+            # the directory to exist before the pod starts. Project creation does
+            # not make it, so make it here — this is the one place that runs
+            # before every remote turn. First in the block: the pod needs it even
+            # when a later staging step degrades.
+            project_artifacts_base(project_path).mkdir(parents=True, exist_ok=True)
             FileService(session).stage_conversation_attachments(conv_id, project_path)
             stage_project_instructions(project_path, conv_id)
             SkillService(session.scope).ensure_builtin_skills()
@@ -875,15 +902,24 @@ class ResponsesHandler:
         None on any failure: no artifact card and no autopublish is a recoverable
         outcome (the next turn in this project reconciles), a failed turn is not.
         """
-        from cowork.services.artifact_roots import conversation_artifacts_base
+        from cowork.services.artifact_roots import project_artifacts_base
 
         try:
             conversation = ConversationService(session).get_conversation(conv_id)
-            # Conversation-scoped in org mode: the pod's workspace is
-            # <project>/conversations/<id>, not the project, so that is where the
-            # worker's artifacts land. Resolved through artifact_roots so this and
-            # the artifacts list agree on the layout.
-            artifacts_base = conversation_artifacts_base(conversation.project.path, conv_id)
+            # ENG-2056: project-scoped in BOTH modes. The pod mounts the
+            # PROJECT-level base at /project-artifacts and anton writes there
+            # (ANTON_CLOUD_ARTIFACTS_ROOT), so that is where the worker's
+            # artifacts land — no longer under conversations/<id>/. Resolved
+            # through artifact_roots so this and the artifacts list agree on
+            # the layout.
+            #
+            # The base is now shared by every task in the project, so the raw
+            # before/after diff below can attribute a concurrent sibling turn's
+            # artifact to this turn. Pre-existing caveat, not new machinery: the
+            # in-process path bounds the same diff with the session's
+            # artifacts_touched set (ENG-1933), but the remote pod reports no
+            # equivalent yet, so the diff stands alone here.
+            artifacts_base = project_artifacts_base(conversation.project.path)
             return (
                 conversation,
                 artifacts_base,
@@ -1003,15 +1039,116 @@ class ResponsesHandler:
                     )
 
     @staticmethod
-    def _remote_history(session, conv_id) -> list[dict]:
-        """Prior user/assistant messages in canonical order, as OpenAI-shaped
-        dicts (mode="json": the payload gets json.dumps'd into the Redis job)."""
-        ordered = ConversationService(session).get_ordered_messages(conv_id)
-        return [
-            m.to_openai_message().model_dump(mode="json")
-            for m in ordered
+    def _remote_seed_history(session, conv_id) -> tuple[list[dict], dict | None]:
+        """History to seed the pod with, and what's needed to map its compaction
+        result back onto our messages.
+
+        Messages are OpenAI-shaped, scrubbed dicts (mode="json": the payload
+        gets json.dumps'd into the Redis job). The pod's harness only scrubs the
+        current turn's input, never this replayed history, so it must arrive
+        already clean.
+
+        With compaction on, this is `[summary] + [messages after the cutoff]`
+        rather than the whole conversation, exactly as the in-process path
+        seeds it — the pod compacts either way, and without the saved summary
+        every turn resent the full history and paid to summarize it again.
+        `seed_info` carries message *ids*, not ORM rows: the pod's reply lands
+        after this session may be closed.
+
+        Unlike in-process, messages are not timestamp-stamped here; that
+        divergence is tracked separately.
+        """
+        from cowork.harnesses.anton_harness.harness import AntonHarness
+
+        service = ConversationService(session)
+        replayable = [
+            m for m in service.get_ordered_messages(conv_id)
             if m.role in {"user", "assistant"}
         ]
+        fmt = partial(scrubbed_openai_dump, mode="json")
+        if not get_user_settings(session.scope).history_compaction_enabled:
+            return [fmt(m) for m in replayable], None
+
+        conversation = service.get_conversation(conv_id)
+        history, seed_info = AntonHarness._seed_history(
+            replayable,
+            conversation.history_summary,
+            conversation.history_summary_cutoff_id,
+            fmt,
+        )
+        return history, {
+            "message_ids": [m.id for m in seed_info["ordered_messages"]],
+            "tail_start": seed_info["tail_start"],
+            "synthetic_prefix_len": seed_info["synthetic_prefix_len"],
+        }
+
+    @staticmethod
+    def _persist_remote_compaction(
+        conv_id: UUID, data: dict, seed_info: dict | None, scope: TenantScope,
+    ) -> None:
+        """Save the summary the pod folded this turn's leading history into.
+
+        Everything here is untrusted: the pod reports `covered_through` against
+        the history we sent it, so a wrong or malformed count must degrade to
+        "no compaction saved" — the next turn then replays in full, which is
+        merely the old behaviour — never to a cutoff pointing at the wrong
+        message, which would silently drop real turns from every later replay.
+        """
+        from cowork.harnesses.anton_harness.harness import AntonHarness
+
+        summary = data.get("summary")
+        covered_through = data.get("covered_through") or 0
+        if not seed_info or not summary:
+            return
+        # Types, not just presence: the arithmetic below runs outside the
+        # try/except, so a string count would raise out of the turn's reply
+        # loop and fail the turn it rode in on.
+        if (
+            not isinstance(summary, str)
+            or not isinstance(covered_through, int)
+            or isinstance(covered_through, bool)
+        ):
+            logger.warning(
+                "[responses] malformed compaction frame for conversation %s — not saved",
+                conv_id,
+            )
+            return
+        # Rejected, not truncated: half a summary is still replayed on every
+        # later turn, while dropping the frame costs one full replay.
+        summary_bytes = len(summary.encode("utf-8"))
+        if summary_bytes > _MAX_COMPACTION_SUMMARY_BYTES:
+            logger.warning(
+                "[responses] compaction summary for conversation %s is %d bytes, over "
+                "the %d-byte cap — not saved",
+                conv_id, summary_bytes, _MAX_COMPACTION_SUMMARY_BYTES,
+            )
+            return
+        message_ids = seed_info["message_ids"]
+        idx = AntonHarness.compaction_cutoff_index(
+            seed_info, covered_through, len(message_ids),
+        )
+        if idx is None:
+            return
+        raw_session = None
+        try:
+            raw_session = get_open_session()
+            ConversationService(
+                ScopedSession(raw_session, scope)
+            ).update_history_compaction(conv_id, summary, message_ids[idx])
+        except Exception:
+            logger.exception(
+                "[responses] failed to persist history compaction for conversation %s",
+                conv_id,
+            )
+        finally:
+            if raw_session is not None:
+                try:
+                    raw_session.close()
+                except Exception:
+                    logger.exception(
+                        "[responses] failed to close compaction session for conversation %s",
+                        conv_id,
+                    )
 
     async def _produce_remote(
         self,
@@ -1030,7 +1167,7 @@ class ResponsesHandler:
         """Remote-backend counterpart of _produce: pipe the turn's replies
         through the same SSE formatter as the in-process path (full step /
         thinking parity, live and in the persisted events log) and persist
-        user + assistant together on terminal (deferred, so _remote_history
+        user + assistant together on terminal (deferred, so _remote_seed_history
         reads prior turns without the current input)."""
         lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
         collected_text: list[str] = []
@@ -1075,6 +1212,10 @@ class ResponsesHandler:
                 snapshot_artifact_state,
             )
 
+            # Resolved once and held for the whole turn: the pod counts its
+            # compaction against exactly the history seeded here, so re-reading
+            # it when the reply arrives could map the count onto a different list.
+            seeded_history, seed_info = self._remote_seed_history(producer_session, conv_id)
             # The worker writes artifacts into the shared tree while this turn
             # runs, so cowork-server does the same before/after diff it does for
             # an in-process turn. Snapshotting here rather than in the caller is
@@ -1105,7 +1246,7 @@ class ResponsesHandler:
                     turn_id=turn_id,
                     # Producer session, NOT self.scoped: this coroutine is detached
                     # and the request session may be closed by the time it runs.
-                    history=self._remote_history(producer_session, conv_id),
+                    history=seeded_history,
                     # Global memory and skills use read-only mounts. Project
                     # memory is outside the conversation workspace and therefore
                     # travels as a bounded, sheddable wire block.
@@ -1138,6 +1279,17 @@ class ResponsesHandler:
                         # is semi-trusted and these rows reach both the DB and
                         # every later turn's LLM context.
                         turn_rows[:] = sanitize_turn_history_rows(data.get("rows"))
+                    elif kind == "turn_compaction":
+                        # Persisted as it arrives, like memory: the cutoff names
+                        # a message from an earlier turn, so it stays correct
+                        # even if this turn goes on to fail.
+                        await asyncio.to_thread(
+                            self._persist_remote_compaction,
+                            conv_id,
+                            data,
+                            seed_info,
+                            producer_scope,
+                        )
                     elif kind == "turn_skill":
                         # Not persisted like memory: a draft is the user's decision.
                         # Yielding SkillCreated puts it through the same formatter the
@@ -1252,7 +1404,7 @@ class ResponsesHandler:
             # Persist the user message (pending) as the first thing this producer
             # does (ENG-1231) — see the note in handle(). Committed here, before
             # streaming, so a refresh/reconnect mid-turn shows the question via
-            # /items. _remote_history reads get_ordered_messages, which excludes
+            # /items. _remote_seed_history reads get_ordered_messages, which excludes
             # pending, so the current input isn't replayed into the remote job.
             pending_message_id = ConversationService(producer_session).save_user_message(
                 conv_id, original_content, pending=True,
@@ -1385,7 +1537,10 @@ class ResponsesHandler:
             # Tool block-rows are for LLM-history persistence, not UI replay —
             # keep them out of the events log the client rebuilds from.
             if event_type == "response.turn_history":
-                turn_rows[:] = data.get("rows") or []
+                # Id-checked even though we produced these ourselves: an
+                # unreplayable id here is permanent for the conversation, and
+                # the installed anton can be older than this server (ENG-2420).
+                turn_rows[:] = reject_unreplayable_tool_rows(data.get("rows") or [])
                 return
             collected_events.append(data)
             accumulate_answer_text(collected_text, event_type, data)
@@ -1656,7 +1811,10 @@ class ResponsesHandler:
 
         def event_sink(event_type: str, data: dict) -> None:
             if event_type == "response.turn_history":
-                turn_rows[:] = data.get("rows") or []
+                # Id-checked even though we produced these ourselves: an
+                # unreplayable id here is permanent for the conversation, and
+                # the installed anton can be older than this server (ENG-2420).
+                turn_rows[:] = reject_unreplayable_tool_rows(data.get("rows") or [])
                 return
             collected_events.append(data)
             accumulate_answer_text(collected_text, event_type, data)

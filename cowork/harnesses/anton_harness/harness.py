@@ -7,6 +7,7 @@ import tempfile
 
 from cowork.build_info import supported_kwargs, surface_kwarg
 from cowork.common.chat_session import build_chat_session
+from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.logger import get_logger
 from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
@@ -628,25 +629,19 @@ class AntonHarness:
         output — most visible on short turns like "hi"/"who are you?" with
         little else to anchor generation.
 
-        Also scrubs plain-text content before replay: anton only scrubs a
-        user turn's OWN input as it arrives, not history read back from
-        storage, so a credential typed in an earlier turn would otherwise
-        reappear unmasked here on every later turn (ENG-1849). Vault
-        secrets for the whole conversation are already registered by the
-        time this runs (`restore_namespaced_env` above, in
+        Also scrubs content before replay via `scrubbed_openai_dump`: anton
+        only scrubs a user turn's OWN input as it arrives, not history read
+        back from storage, so a credential typed in an earlier turn would
+        otherwise reappear unmasked here on every later turn (ENG-1849).
+        Vault secrets for the whole conversation are already registered by
+        the time this runs (`restore_namespaced_env` above, in
         `_build_chat_session`), so this catches anything vaulted since the
-        message was first persisted, not just what was known at persist
-        time. List-shaped content (tool_use/tool_result blocks) is left
-        alone — that's already scrubbed at generation time.
+        message was first persisted, not just what was known at persist time.
 
         Extracted (not an inline closure) so this can be unit-tested
         directly against fake messages, same reasoning as _seed_history.
         """
-        from anton.utils.datasources import scrub_credentials
-
-        om = m.to_openai_message().model_dump()
-        if isinstance(om.get("content"), str) and om["content"]:
-            om["content"] = scrub_credentials(om["content"])
+        om = scrubbed_openai_dump(m)
         ts = m.created_at.strftime("%Y-%m-%d %H:%M") if getattr(m, "created_at", None) else None
         if m.role == "user" and ts and isinstance(om.get("content"), str) and om["content"]:
             om["content"] = f"[{ts}] {om['content']}"
@@ -678,8 +673,6 @@ class AntonHarness:
 
         tail = [stamp(m) for m in ordered_messages[tail_start:]]
         if history_summary:
-            from anton.utils.datasources import scrub_credentials
-
             summary_msg = {"role": "user", "content": scrub_credentials(history_summary)}
             if tail and tail[0].get("role") == "user":
                 # Same fix anton's own _summarize_history applies: two
@@ -705,15 +698,66 @@ class AntonHarness:
         return initial_history, seed_info
 
     @staticmethod
+    def _recall_history_tool(conversation: Conversation, user):
+        """The archive-search tool for this turn, or None when there is nothing
+        to search (ENG-735).
+
+        Withheld in three cases:
+        - no summary saved yet — the whole history is still replayed, so the
+          tool's description and prompt would be dead prompt weight
+        - compaction switched off — nothing will ever be archived
+        - the conversation is detached from its DB session, so the archive
+          cannot be read at all
+
+        The DB stays on this side of the boundary: the tool receives a callable
+        that returns the archive, so its handler holds no session and the
+        hosted path can hand it the same data read off the shared mount.
+        """
+        if not user.history_compaction_enabled:
+            return None
+        if not conversation.history_summary_cutoff_id:
+            return None
+
+        from sqlalchemy.orm import object_session
+
+        from cowork.db.scoped import adopt_scoped_session
+        from cowork.services.conversations import ConversationService
+
+        from .tools import build_cowork_recall_history_tool
+
+        db_session = object_session(conversation)
+        if db_session is None:
+            return None
+        # Read per call, not here: most turns never call the tool, and the
+        # archive only changes when a compaction lands at turn end.
+        service = ConversationService(adopt_scoped_session(db_session))
+        return build_cowork_recall_history_tool(
+            lambda: service.archived_messages(conversation.id)
+        )
+
+    @staticmethod
+    def compaction_cutoff_index(seed_info: dict, covered_through: int, total: int) -> int | None:
+        """Index of the last seeded message a compaction covers, or None.
+
+        `covered_through` counts entries of the `initial_history` that was
+        seeded, which starts with `synthetic_prefix_len` non-real entries (the
+        summary, plus an assistant separator when one was needed) — so they
+        come off before the count maps onto real messages.
+
+        Returns None when the compaction covers nothing real or lands outside
+        the list: both mean "don't save a cutoff", not an error. The hosted
+        path shares this because `covered_through` arrives from the pod there,
+        where an out-of-range value is untrusted input rather than a bug.
+        """
+        covered = covered_through - seed_info["synthetic_prefix_len"]
+        if covered <= 0:
+            return None
+        idx = seed_info["tail_start"] + covered - 1
+        return idx if 0 <= idx < total else None
+
+    @staticmethod
     def _persist_history_compaction(conversation: Conversation, session, seed_info: dict) -> None:
         """Save anton's compacted summary + cutoff if it compacted this turn.
-
-        `seed_info["ordered_messages"]`/`["tail_start"]` are what this turn's
-        `initial_history` was built from; `["synthetic_prefix_len"]` is how
-        many non-real entries (summary, plus an assistant separator if one was
-        needed) were prepended ahead of them — `covered_through` from
-        `session.last_compaction` counts those too, so they must be subtracted
-        before mapping onto `ordered_messages`.
 
         `getattr` (not `session.last_compaction` directly): an anton build
         predating this property must no-op here, not raise — cowork-server and
@@ -722,13 +766,11 @@ class AntonHarness:
         compaction = getattr(session, "last_compaction", None)
         if compaction is None:
             return
-        offset = seed_info["synthetic_prefix_len"]
-        covered = compaction["covered_through"] - offset
-        if covered <= 0:
-            return
         ordered_messages = seed_info["ordered_messages"]
-        idx = seed_info["tail_start"] + covered - 1
-        if not (0 <= idx < len(ordered_messages)):
+        idx = AntonHarness.compaction_cutoff_index(
+            seed_info, compaction["covered_through"], len(ordered_messages),
+        )
+        if idx is None:
             return
         from sqlalchemy.orm import object_session
         from cowork.db.scoped import adopt_scoped_session
@@ -826,6 +868,8 @@ class AntonHarness:
 
         user = get_user_settings()
         _overlay_user_settings(anton_settings, user)
+
+        RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
 
         # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
         for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
@@ -1137,6 +1181,7 @@ class AntonHarness:
                 CREATE_SKILL_DRAFT_TOOL,
                 # FETCH_SUBMISSION_TOOL,
                 # UPDATE_FORM_TOOL,
+                *([RECALL_HISTORY_TOOL] if RECALL_HISTORY_TOOL else []),
             ],
             cells=cells
         )
