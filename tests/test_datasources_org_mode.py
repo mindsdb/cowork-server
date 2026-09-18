@@ -340,6 +340,30 @@ def test_every_route_is_absent_in_local_mode(local_client, relay, method, path, 
 @pytest.mark.parametrize(
     "method,path,body",
     [
+        ("post", "/api/v1/connectors/datasources/", {}),
+        ("post", "/api/v1/connectors/datasources/", {"nope": 1}),
+        ("patch", "/api/v1/connectors/datasources/7", {}),
+    ],
+)
+def test_a_malformed_body_is_still_absent_in_local_mode(local_client, relay, method, path, body):
+    """The org refusal has to beat body validation, not follow it.
+
+    FastAPI validates the body before the handler runs, so an org check made
+    inside the handler answers 422 here instead and names the schema's fields
+    to a desktop caller the surface is supposed to be absent for.
+    """
+    recorded, _ = relay
+
+    res = local_client.request(method.upper(), path, json=body)
+
+    assert res.status_code == 404
+    assert "connector_id" not in res.text, "a 422 here would advertise the schema"
+    assert recorded == [], "a desktop caller must not reach auth"
+
+
+@pytest.mark.parametrize(
+    "method,path,body",
+    [
         ("post", "/api/v1/connectors/datasources/", CREATE_BODY),
         ("get", "/api/v1/connectors/datasources/", None),
         ("get", "/api/v1/connectors/datasources/7", None),
