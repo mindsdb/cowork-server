@@ -62,6 +62,11 @@ _MAX_TURN_IDLE_SECONDS = _idle_bound_seconds()
 # fully wedged producer is at most _MAX_TURN_IDLE_SECONDS + this.
 _IDLE_POLL_SECONDS = 15
 
+# Bound on RunRegistry.shutdown()'s wait for in-flight turns to persist their
+# partial answer before the process exits. The host's own graceful-shutdown
+# timeout (uvicorn, Kubernetes) should stay above this to give it room to run.
+TURN_SHUTDOWN_GRACE_SECONDS = 20
+
 
 @dataclass
 class TurnLifecycle:
@@ -79,9 +84,14 @@ class TurnLifecycle:
     under it". Set from ``RunRegistry.discard``, which runs in a threadpool
     thread (the delete endpoint is a sync ``def``); a plain attribute write is
     safe there, unlike ``Task.cancel()``.
+
+    ``shutting_down`` means "the server is exiting, not the user's own Stop".
+    Set BEFORE the cancel, same ordering as ``discarded``: a producer's
+    ``CancelledError`` handler checks it to persist an interrupted turn.
     """
 
     discarded: bool = False
+    shutting_down: bool = False
 
 
 @dataclass
@@ -317,6 +327,37 @@ class RunRegistry:
                 "Could not cancel the discarded producer for conversation %s",
                 conversation_id, exc_info=True,
             )
+
+    async def shutdown(self, timeout_seconds: float = TURN_SHUTDOWN_GRACE_SECONDS) -> int:
+        """Cancel every running turn so its partial answer persists instead of
+        vanishing under a SIGKILL. Marks ``shutting_down`` before cancelling,
+        same ordering rule as ``discard``. Bounded by ``timeout_seconds``;
+        a turn still unwinding past it is left for the next boot's seal.
+        """
+        handles = self.in_flight()
+        if not handles:
+            return 0
+        for handle in handles:
+            handle.lifecycle.shutting_down = True
+        for handle in handles:
+            handle.task.cancel()
+        done, pending = await asyncio.wait(
+            [h.task for h in handles], timeout=timeout_seconds
+        )
+        if pending:
+            logger.warning(
+                "%d turn(s) still unwinding past the %ss shutdown budget; "
+                "left for boot recovery to seal.", len(pending), timeout_seconds,
+            )
+        for task in done:
+            if task.cancelled():
+                continue
+            exc = task.exception()
+            if exc is not None:
+                logger.error(
+                    "Turn raised while unwinding for shutdown", exc_info=exc,
+                )
+        return len(handles)
 
     def reset(self) -> None:
         """Forget every handle without touching the producer tasks.
