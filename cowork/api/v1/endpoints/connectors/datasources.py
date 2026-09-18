@@ -23,17 +23,15 @@ from cowork.schemas.connectors import (
 from cowork.services.connectors.datasources import normalize_datasource_input
 from cowork.services.connectors.oauth import auth_proxy
 
-router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
-
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
-def _require_org(scope: TenantScope) -> None:
-    """Make the org branch explicit in the handler, not only in the router.
+def _require_org(scope: ScopeDep) -> None:
+    """Refuse the whole surface outside org mode: a desktop caller gets 404.
 
-    Copies the shape of oauth.py's _require_picker_engine: a desktop caller
-    gets 404 rather than a relay attempt against an auth it has no credential
-    for.
+    A router dependency rather than a handler call, because FastAPI validates
+    the body first: an in-handler check lets a malformed desktop request
+    answer 422 and advertise the routes and their field names.
     """
     if not scope.org_mode:
         raise HTTPException(
@@ -41,43 +39,38 @@ def _require_org(scope: TenantScope) -> None:
         )
 
 
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode)), Depends(_require_org)])
+
+
 @router.post("/", response_model=DatasourceConnectionResponse, status_code=status.HTTP_201_CREATED)
 async def create_datasource_connection(
-    body: DatasourceCreateRequest, scope: ScopeDep, request: Request
+    body: DatasourceCreateRequest, request: Request
 ) -> DatasourceConnectionResponse:
     """Store a new datasource credential in auth's encrypted vault."""
-    _require_org(scope)
     payload = normalize_datasource_input(body)
     result = await auth_proxy.proxy_datasource_create(request, OAuthSettings(), payload)
     return DatasourceConnectionResponse.model_validate(result)
 
 
 @router.get("/", response_model=list[DatasourceConnectionResponse])
-async def list_datasource_connections(
-    scope: ScopeDep, request: Request
-) -> list[DatasourceConnectionResponse]:
+async def list_datasource_connections(request: Request) -> list[DatasourceConnectionResponse]:
     """List the caller's own datasource connections as masked metadata."""
-    _require_org(scope)
     items = await auth_proxy.proxy_datasource_list(request, OAuthSettings())
     return [DatasourceConnectionResponse.model_validate(item) for item in items]
 
 
 @router.get("/{connection_id}", response_model=DatasourceConnectionResponse)
-async def get_datasource_connection(
-    connection_id: int, scope: ScopeDep, request: Request
-) -> DatasourceConnectionResponse:
+async def get_datasource_connection(connection_id: int, request: Request) -> DatasourceConnectionResponse:
     """Read masked metadata for one owned connection."""
-    _require_org(scope)
     result = await auth_proxy.proxy_datasource_detail(connection_id, request, OAuthSettings())
     return DatasourceConnectionResponse.model_validate(result)
 
 
 @router.patch("/{connection_id}", response_model=DatasourceConnectionResponse)
 async def edit_datasource_connection(
-    connection_id: int, body: DatasourceEditRequest, scope: ScopeDep, request: Request
+    connection_id: int, body: DatasourceEditRequest, request: Request
 ) -> DatasourceConnectionResponse:
     """Replace a connection's credential, guarded by the version the caller saw."""
-    _require_org(scope)
     payload = normalize_datasource_input(body)
     payload["expected_version"] = body.expected_version
     result = await auth_proxy.proxy_datasource_edit(connection_id, request, OAuthSettings(), payload)
@@ -85,20 +78,14 @@ async def edit_datasource_connection(
 
 
 @router.delete("/{connection_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_datasource_connection(
-    connection_id: int, scope: ScopeDep, request: Request
-) -> Response:
+async def delete_datasource_connection(connection_id: int, request: Request) -> Response:
     """Delete an owned connection and its stored credential."""
-    _require_org(scope)
     await auth_proxy.proxy_datasource_delete(connection_id, request, OAuthSettings())
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @router.post("/{connection_id}/validation-retry", response_model=DatasourceConnectionResponse)
-async def retry_datasource_validation(
-    connection_id: int, scope: ScopeDep, request: Request
-) -> DatasourceConnectionResponse:
+async def retry_datasource_validation(connection_id: int, request: Request) -> DatasourceConnectionResponse:
     """Start a new validation attempt for an owned connection."""
-    _require_org(scope)
     result = await auth_proxy.proxy_datasource_retry(connection_id, request, OAuthSettings())
     return DatasourceConnectionResponse.model_validate(result)
