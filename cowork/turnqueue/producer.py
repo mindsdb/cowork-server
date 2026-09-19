@@ -205,19 +205,26 @@ async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
     }
 
 
+def _refuse_datasource_grants(reason: str) -> product_permissions.ProductPermissionUnavailable:
+    """Name the failed check for the operator, who otherwise sees the same
+    permission_unavailable for an outage, a malformed row and a bad binding.
+    The reason is a fixed phrase: never the key, the producer secret or a row."""
+    logger.warning("[producer] datasource grants refused: %s", reason)
+    return product_permissions.ProductPermissionUnavailable()
+
+
 def _datasource_connection_refs(connections: list[dict], disabled: list[dict] | None) -> list[dict]:
-    if len(connections) > MAX_DATASOURCE_CONNECTIONS:
-        raise product_permissions.ProductPermissionUnavailable()
+    """The grant set: every verified connection auth listed, minus the
+    conversation's disabled ones. A disabled entry carries ``engine`` and
+    ``name``; auth's ``connector_id`` is the same value, so the join is exact."""
     disabled_keys = {
-        (entry.get("engine") or entry.get("connector_id"), entry.get("name"))
-        for entry in (disabled or [])
-        if isinstance(entry, dict)
+        (entry.get("engine"), entry.get("name")) for entry in (disabled or []) if isinstance(entry, dict)
     }
     refs: list[dict] = []
     seen: set[int] = set()
     for connection in connections:
         if not isinstance(connection, dict):
-            raise product_permissions.ProductPermissionUnavailable()
+            raise _refuse_datasource_grants("listing carries a connection that is not an object")
         connection_id = connection.get("id")
         credential_version = connection.get("credential_version")
         if (
@@ -227,7 +234,7 @@ def _datasource_connection_refs(connections: list[dict], disabled: list[dict] | 
             or not connection["name"]
             or connection.get("status") != "verified"
         ):
-            raise product_permissions.ProductPermissionUnavailable()
+            raise _refuse_datasource_grants("listing carries a connection without verified metadata")
         if (connection.get("connector_id"), connection.get("name")) in disabled_keys:
             continue
         if (
@@ -239,9 +246,12 @@ def _datasource_connection_refs(connections: list[dict], disabled: list[dict] | 
             or credential_version < 1
             or connection_id in seen
         ):
-            raise product_permissions.ProductPermissionUnavailable()
+            raise _refuse_datasource_grants("listing carries a malformed or repeated connection reference")
         seen.add(connection_id)
         refs.append({"connection_id": connection_id, "credential_version": credential_version})
+    # Auth caps what is registered, so the cap applies after the disabled ones are gone.
+    if len(refs) > MAX_DATASOURCE_CONNECTIONS:
+        raise _refuse_datasource_grants("more enabled connections than a grant set may hold")
     return refs
 
 
@@ -265,7 +275,7 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
     # A datasource-enabled dispatch without the key prefix is a producer
     # misconfiguration; it fails here rather than reaching auth without it.
     if not isinstance(turn_key_id, str) or not turn_key_id.strip():
-        raise product_permissions.ProductPermissionUnavailable()
+        raise _refuse_datasource_grants("dispatch carries no turn key prefix")
     connections = await list_verified_datasource_connections(
         org_id=org_id, user_id=user_id, turn_key_id=turn_key_id, settings=settings
     )
@@ -288,10 +298,10 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
         or response.get("audience") != "datasource-gateway"
         or response.get("purpose") != "execute"
     ):
-        raise product_permissions.ProductPermissionUnavailable()
+        raise _refuse_datasource_grants("grant response binding does not match this turn")
     grants = response.get("grants")
     if not isinstance(grants, list):
-        raise product_permissions.ProductPermissionUnavailable()
+        raise _refuse_datasource_grants("grant response carries no grant list")
     returned = {
         (grant.get("connection_id"), grant.get("credential_version"))
         for grant in grants
@@ -299,7 +309,7 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
     }
     expected = {(ref["connection_id"], ref["credential_version"]) for ref in refs}
     if returned != expected or len(grants) != len(expected):
-        raise product_permissions.ProductPermissionUnavailable()
+        raise _refuse_datasource_grants("grants differ from the requested connection references")
     return {"protocol_version": 1, "connections": refs}
 
 

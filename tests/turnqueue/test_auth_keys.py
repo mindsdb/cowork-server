@@ -94,6 +94,37 @@ def _over_mock_transport(monkeypatch, handler):
 
 
 @pytest.mark.asyncio
+async def test_a_mint_that_returns_no_prefix_is_a_permission_failure(monkeypatch):
+    """The prefix is what every grant is bound to; a mint without it cannot start
+    a datasource turn, and must not be mistaken for a transport error."""
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+    from cowork.turnqueue.auth_keys import mint_turn_key_details
+
+    async def handler(request):
+        return httpx.Response(200, json={"key": "mdb_prefix.secret"})
+
+    _over_mock_transport(monkeypatch, handler)
+    with pytest.raises(ProductPermissionUnavailable):
+        await mint_turn_key_details(
+            user_id="u1", org_id="o1", correlation_id="corr-1", ttl_seconds=1200, settings=_Settings()
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_mint_with_a_prefix_returns_both_halves(monkeypatch):
+    from cowork.turnqueue.auth_keys import MintedTurnKey, mint_turn_key_details
+
+    async def handler(request):
+        return httpx.Response(200, json={"key": "mdb_prefix.secret", "prefix": "mdb_prefix"})
+
+    _over_mock_transport(monkeypatch, handler)
+    minted = await mint_turn_key_details(
+        user_id="u1", org_id="o1", correlation_id="corr-1", ttl_seconds=1200, settings=_Settings()
+    )
+    assert minted == MintedTurnKey(key="mdb_prefix.secret", prefix="mdb_prefix")
+
+
+@pytest.mark.asyncio
 async def test_listing_sends_the_turn_key_prefix_and_the_producer_identity(monkeypatch):
     """Auth derives the listing's identity from the live turn key, so the prefix is
     required; without it every datasource-enabled turn is refused at the door."""
