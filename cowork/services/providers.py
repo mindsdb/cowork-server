@@ -326,8 +326,8 @@ async def fetch_minds_models(
     treated as available. ``labels`` is purely a display aid for the picker — the
     model id remains the value used everywhere else (selection, storage,
     resolution); a model missing from ``labels`` falls back to the client's
-    id-derived label. Embeddings models are dropped entirely — they share this
-    listing but aren't chat/completion models (see ``_is_embedding_row``).
+    id-derived label. Embedding and decision models are dropped entirely — they
+    share this listing but cannot serve planning/coding roles.
 
     ``force_refresh`` skips the cache *read* for a cached success (a fresh
     result is still cached for subsequent calls) — used when the caller knows
@@ -432,11 +432,11 @@ async def fetch_minds_models(
         model_id = str(row.get("id")).strip()
         if not model_id:
             continue
-        # Embedding models share this listing but aren't chat/completion
+        # Embedding and decision models share this listing but aren't chat/completion
         # models — chosen for planning/coding roles they'd error every turn.
         # Filtered here, the single place every row is parsed, so neither the
         # picker nor default-resolution ever sees them.
-        if _is_embedding_row(row, model_id):
+        if row.get("kind") == "decision" or _is_embedding_row(row, model_id):
             continue
         ids.append(model_id)
         # A model the org's wallet can't currently pay for (or whose free
