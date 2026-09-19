@@ -341,6 +341,13 @@ deployment:
     # database and the capability response reports every method unavailable.
     - name: COWORK_DATASOURCE_CAPABILITIES
       value: '{"manifest_version": 1, "enabled": ["postgres:host-port", "mysql:host-password"]}'
+    # TEST ENABLEMENT, integration branch only, never merged or cherry-picked.
+    # The gateway's probe route is cluster-only, so this is the inference
+    # Service by name, namespace-relative like the auth address beside it.
+    # Without it a captured connection is never probed and stays pending, which
+    # is the released behaviour until the gate opens.
+    - name: COWORK_TURN_DATASOURCE_GATEWAY_BASE_URL
+      value: "http://mindshub-inference"
     - name: COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID
       valueFrom:
         secretKeyRef:
