@@ -51,13 +51,22 @@ def test_the_default_reports_the_methods_it_knows_and_none_of_them_available():
     assert "connection-string" not in body["datasources"]["postgres"]["methods"]
 
 
-def test_an_enabled_pair_is_the_only_one_that_reads_as_available(monkeypatch):
+def test_an_enabled_pair_is_the_only_one_that_reads_as_available(monkeypatch, adapter_verified_datasources):
     monkeypatch.setenv("COWORK_DATASOURCE_CAPABILITIES", '{"manifest_version": 1, "enabled": ["postgres:host-port"]}')
 
     body = _client().get(PATH).json()
 
     assert body["datasources"]["postgres"]["methods"]["host-port"]["available"] is True
     assert body["datasources"]["mysql"]["methods"]["host-password"]["available"] is False
+
+
+def test_a_method_the_specs_call_unverified_stays_off_however_it_is_configured(monkeypatch):
+    # No adapter_verified fixture: this is what the release ships today.
+    monkeypatch.setenv("COWORK_DATASOURCE_CAPABILITIES", '{"manifest_version": 1, "enabled": ["postgres:host-port"]}')
+
+    body = _client().get(PATH).json()
+
+    assert body["datasources"]["postgres"]["methods"]["host-port"]["available"] is False
 
 
 def test_a_manifest_from_another_version_reports_everything_unavailable(monkeypatch):
