@@ -9,6 +9,7 @@ from cowork.api.v1.permissions import Authenticated, require
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.principal import Principal
+from cowork.services.connectors.datasource_capabilities import load_datasource_capabilities
 
 router = APIRouter()
 
@@ -54,3 +55,53 @@ def organization_switch_capability(
         expected_organization_enforced=boundary_enforced,
         enabled=boundary_enforced and settings.organization_switch_enabled,
     )
+
+
+class DatasourceMethodCapability(BaseModel):
+    available: bool
+
+
+class DatasourceCapability(BaseModel):
+    methods: dict[str, DatasourceMethodCapability]
+
+
+class DatasourceCapabilities(BaseModel):
+    """What this deployment may run as a cloud datasource.
+
+    Every method whose spec declares a cloud block appears, available or not,
+    so a client can tell "this deployment does not do databases" from "it does
+    and this one is switched off".
+    """
+
+    manifest_version: int = Field(alias="manifestVersion")
+    datasources: dict[str, DatasourceCapability]
+
+
+@router.get(
+    "/datasources",
+    response_model=DatasourceCapabilities,
+    response_model_by_alias=True,
+)
+# Authenticated, matching the capability beside it: a caller with no principal
+# has nothing to be told about, in either tenancy mode.
+def datasource_capabilities(
+    response: Response, principal: Principal = Depends(require(Authenticated))
+) -> DatasourceCapabilities:
+    # Same reason as the capability beside it: what a deployment runs can be
+    # switched off between two requests, and a cached "available" would
+    # outlive the switch.
+    response.headers["Cache-Control"] = "no-store"
+    caps = load_datasource_capabilities()
+    return DatasourceCapabilities(
+        manifestVersion=caps.manifest_version,
+        datasources={
+            connector_id: DatasourceCapability(
+                methods={
+                    method: DatasourceMethodCapability(available=available)
+                    for method, available in methods.items()
+                }
+            )
+            for connector_id, methods in caps.methods.items()
+        },
+    )
+

@@ -75,3 +75,68 @@ async def test_local_mode_reports_every_connector_available():
     result = await specs_endpoints.list_connector_specs(LOCAL_SCOPE, FakeRequest())
 
     assert all(c.cloud_available for c in result)
+
+
+# ── Datasource availability ──────────────────────────────────────────────
+#
+# auth's catalogue is the OAuth allow-list and knows nothing about databases,
+# so a cloud-capable connector has to reach the list from the capability
+# policy instead. Without this, PostgreSQL is filtered out of cloud entirely
+# and the forms it ships can never be opened.
+
+ENABLED_POSTGRES = '{"manifest_version": 1, "enabled": ["postgres:host-port"]}'
+
+
+def _with_capabilities(monkeypatch, raw: str):
+    from cowork.common.settings.app_settings import AppSettings
+    from cowork.services.connectors import datasource_capabilities as caps_module
+
+    real = caps_module.load_datasource_capabilities
+    monkeypatch.setattr(
+        specs_endpoints,
+        "load_datasource_capabilities",
+        lambda: real(AppSettings(datasource_capabilities=raw)),
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_enabled_datasource_is_listed_even_though_oauth_never_heard_of_it(monkeypatch):
+    async def fake_proxy_catalogue(request, settings):
+        return {"items": []}
+
+    monkeypatch.setattr(specs_endpoints.auth_proxy, "proxy_catalogue", fake_proxy_catalogue)
+    _with_capabilities(monkeypatch, ENABLED_POSTGRES)
+
+    result = await specs_endpoints.list_connector_specs(ORG_SCOPE, FakeRequest())
+
+    assert {c.id for c in result} == {"postgres"}
+
+
+@pytest.mark.asyncio
+async def test_a_disabled_datasource_stays_out_of_the_list(monkeypatch):
+    async def fake_proxy_catalogue(request, settings):
+        return {"items": [{"id": "gmail"}]}
+
+    monkeypatch.setattr(specs_endpoints.auth_proxy, "proxy_catalogue", fake_proxy_catalogue)
+    _with_capabilities(monkeypatch, "")
+
+    result = await specs_endpoints.list_connector_specs(ORG_SCOPE, FakeRequest())
+
+    assert {c.id for c in result} == {"gmail"}
+
+
+@pytest.mark.asyncio
+async def test_an_enabled_datasource_reads_as_available_in_the_full_listing(monkeypatch):
+    async def fake_proxy_catalogue(request, settings):
+        return {"items": [{"id": "gmail"}]}
+
+    monkeypatch.setattr(specs_endpoints.auth_proxy, "proxy_catalogue", fake_proxy_catalogue)
+    _with_capabilities(monkeypatch, ENABLED_POSTGRES)
+
+    result = await specs_endpoints.list_connector_specs(ORG_SCOPE, FakeRequest(), include_unavailable=True)
+    by_id = {c.id: c for c in result}
+
+    assert by_id["postgres"].cloud_available is True
+    assert by_id["gmail"].cloud_available is True
+    assert by_id["mysql"].cloud_available is False
+
