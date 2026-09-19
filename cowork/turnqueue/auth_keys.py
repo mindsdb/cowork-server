@@ -14,7 +14,8 @@ from cowork.services.product_permissions import ProductPermissionDenied, Product
 
 
 async def mint_turn_key(*, user_id: str, org_id: str, correlation_id: str,
-                        ttl_seconds: int, settings, purpose: Literal["execution", "artifact_publish"] = "execution") -> str:
+                        ttl_seconds: int, settings, purpose: Literal["execution", "artifact_publish"] = "execution",
+                        workspace_id: str | None = None) -> str:
     expiry = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
     # Cluster-only route: turn-key mint is secret-only (no Bearer factor), so
     # auth serves it under the top-level /internal/ prefix the public LB never
@@ -23,6 +24,11 @@ async def mint_turn_key(*, user_id: str, org_id: str, correlation_id: str,
     headers = {"X-Internal-Auth": settings.auth_internal_secret}
     body = {"user_id": user_id, "organization_id": org_id,
             "instance_id": correlation_id, "expiry_date": expiry, "rotate": False, "purpose": purpose}
+    # Omitted rather than sent empty: auth treats a missing/null workspace_id as
+    # "use the organization's Default", which is also what an unselected
+    # (empty-string) hub_workspace_id means here.
+    if workspace_id:
+        body["workspace_id"] = workspace_id
     if not settings.auth_internal_base_url or not settings.auth_internal_secret:
         raise ProductPermissionUnavailable()
     try:

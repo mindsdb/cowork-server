@@ -731,14 +731,18 @@ def _owner_publish_context(session, folder: Path):
     which exists on an org deployment — which is why the whole `/publish` router
     is local-only.
     """
-    from cowork.services.artifact_autopublish import _publish_url
+    from cowork.services.artifact_autopublish import _active_workspace_id, _publish_url
     from cowork.services.artifact_publish_key import PublishKey
 
     scope = session.scope
     return (
         folder.parent,
         _publish_url(scope),
-        PublishKey(str(scope.user_id), str(scope.org_id), min_ttl_s=_LIVE_PUBLISH_TIMEOUT_S + 60.0),
+        PublishKey(
+            str(scope.user_id), str(scope.org_id),
+            min_ttl_s=_LIVE_PUBLISH_TIMEOUT_S + 60.0,
+            workspace_id=_active_workspace_id(scope),
+        ),
     )
 
 
