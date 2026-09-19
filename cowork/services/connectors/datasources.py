@@ -21,6 +21,7 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 from fastapi import HTTPException, status
 
 from cowork.schemas.connectors import DatasourceCreateRequest
+from cowork.services.connectors.datasource_capabilities import load_datasource_capabilities
 
 #: Connector to its single supported cloud method, mirroring auth.
 SUPPORTED_METHODS = {"postgres": "host-port", "mysql": "host-password"}
@@ -40,6 +41,37 @@ class InvalidDatasourceInput(HTTPException):
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "invalid_connection", "message": message},
         )
+
+
+class UnsupportedDatasourceCapability(HTTPException):
+    """409 for a method this deployment does not run as a cloud datasource.
+
+    Raised by both capture paths, the management routes and the submission
+    relay, so a client branching on `code` sees one answer whichever door it
+    knocked on.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "code": "unsupported_capability",
+                "message": "This connector method is not available in cloud.",
+            },
+        )
+
+
+def require_cloud_method_enabled(connector_id: str | None, method: str | None) -> None:
+    """Refuse a method the capability policy has not enabled.
+
+    Runs before the body is parsed, so a disabled method answers the same way
+    whether or not the connection itself is well formed. Reads and deletes do
+    not call this: a connection captured while a method was enabled must stay
+    visible and removable after it is switched off.
+    """
+    capabilities = load_datasource_capabilities()
+    if not capabilities.is_available((connector_id or "").strip().lower(), (method or "").strip()):
+        raise UnsupportedDatasourceCapability()
 
 
 def _canonical_host(value: Any) -> str:

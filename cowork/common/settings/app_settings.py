@@ -630,6 +630,20 @@ class AppSettings(Settings):
             ]
         return self
 
+    # Which connector methods this deployment may run as a cloud datasource:
+    # `{"manifest_version": 1, "enabled": ["postgres:host-port"]}`. A string,
+    # not a dict: pydantic-settings parses a dict field from the environment
+    # while the settings object is built, so malformed JSON would raise before
+    # any policy code runs and crash the process at import. Parsed, and failed
+    # closed, in services/connectors/datasource_capabilities.py instead.
+    # One spelling only: a second alias would also become an unprefixed
+    # environment name for a policy that decides what this deployment stores.
+    datasource_capabilities: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DATASOURCE_CAPABILITIES"),
+        description="Versioned datasource capability manifest as JSON; empty means nothing is enabled.",
+    )
+
     require_auth: bool = Field(
         default=False,
         validation_alias=AliasChoices("COWORK_REQUIRE_AUTH"),
