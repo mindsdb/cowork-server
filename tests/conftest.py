@@ -134,14 +134,11 @@ def granted_product_permissions(monkeypatch):
     monkeypatch.setattr(artifact_workspace, "has_product_permission", allowed)
 
 
-@pytest.fixture
-def adapter_verified_datasources():
-    """Mark the shipped datasource methods as adapter-verified for one test.
+def _set_datasource_adapter_flag(available: bool):
+    """Set `cloud.available` on the database specs, restoring it afterwards.
 
-    Both database specs ship ``cloud.available: false``, which is the
-    capability policy's first gate, so a test about the deployment's own
-    enable list has to lift it. Mutates the registry's cached spec data and
-    puts it back, because that is what a release flipping the flag looks like.
+    Mutates the registry's cached spec data, because that is what a release
+    flipping the flag looks like from the policy's side.
     """
     from cowork.services.connectors.specs._registry import registry
 
@@ -152,7 +149,27 @@ def adapter_verified_datasources():
             cloud = method.get("cloud")
             if cloud is not None:
                 restore.append((cloud, cloud.get("available", False)))
-                cloud["available"] = True
+                cloud["available"] = available
     yield
     for cloud, previous in restore:
         cloud["available"] = previous
+
+
+@pytest.fixture
+def adapter_verified_datasources():
+    """The database methods report that the hosted path can execute them.
+
+    The capability policy's first gate; a test about the deployment's own
+    enable list has to lift it.
+    """
+    yield from _set_datasource_adapter_flag(True)
+
+
+@pytest.fixture
+def adapter_unverified_datasources():
+    """The database methods report that the hosted path cannot execute them.
+
+    Set rather than assumed, so a test of that gate keeps its meaning on a
+    branch that ships the flag the other way round.
+    """
+    yield from _set_datasource_adapter_flag(False)
