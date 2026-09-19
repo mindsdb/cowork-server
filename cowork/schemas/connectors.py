@@ -1,5 +1,6 @@
 import re
-from typing import Any
+from datetime import datetime
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -71,6 +72,30 @@ class OAuthConfig(BaseModel):
     token_auth_style: str = "body"
 
 
+class CloudMethod(BaseModel):
+    """What a method collects and whether it runs when the deployment is hosted.
+
+    A method without one of these is desktop-only.
+    """
+
+    # False while the hosted path can accept the form but not yet execute
+    # against it. An available form has never been proof of execution
+    # support, so this stays False until adapter tests establish the
+    # driver/server/method row it depends on.
+    available: bool = False
+    # Cloud copy, never inherited from the desktop method. The desktop text
+    # documents choices the hosted path refuses (disabling TLS, pointing at
+    # localhost), so rendering it to a cloud user would describe a form that
+    # cannot be submitted.
+    description: str | None = None
+    how_to: str | None = None
+    # The COMPLETE cloud field list, not a delta on the desktop `fields`.
+    # Two independent lists is what keeps the desktop form fixed while this
+    # one changes, and it is why a cloud CA field never appears beside a
+    # desktop one under a different name.
+    fields: list[ConnectorField] = []
+
+
 class ConnectorMethod(BaseModel):
     id: str
     label: str
@@ -82,6 +107,7 @@ class ConnectorMethod(BaseModel):
     how_to: str | None = None
     help_url: str | None = None
     fields: list[ConnectorField] = []
+    cloud: CloudMethod | None = None
 
     @field_validator("id")
     @classmethod
@@ -287,3 +313,65 @@ class OAuthStartResponse(BaseModel):
 class DisabledConnection(BaseModel):
     engine: str
     name: str
+
+
+class DatasourceTls(BaseModel):
+    """Transport security for a cloud datasource connection."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["system", "custom_ca"] = "system"
+    ca_pem: str | None = None
+
+
+class DatasourceCreateRequest(BaseModel):
+    """A cloud datasource connection as the client submits it.
+
+    Either structured fields or a DSN, never both; the normalizer in
+    services/connectors/datasources.py turns it into auth's payload.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    connector_id: str
+    method: str
+    name: str = Field(min_length=1, max_length=128)
+    input_mode: Literal["structured", "dsn"] = "structured"
+    dsn: str | None = None
+    host: str | None = None
+    port: int | None = None
+    database: str | None = None
+    username: str | None = None
+    password: str | None = None
+    tls: DatasourceTls | None = None
+
+
+class DatasourceEditRequest(DatasourceCreateRequest):
+    """An edit, guarded by the version the client believes it is editing."""
+
+    expected_version: int = Field(ge=1)
+
+
+class DatasourceConnectionResponse(BaseModel):
+    """Auth's connection metadata, allowlisted.
+
+    extra="ignore" so a field auth adds later is dropped here rather than
+    forwarded to a client this server never vetted it for.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    connector_id: str
+    method: str
+    name: str
+    status: str
+    credential_version: int
+    host_masked: str
+    port: int | None = None
+    database: str
+    username: str
+    tls_mode: str
+    validation_error: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None

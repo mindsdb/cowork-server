@@ -35,7 +35,7 @@
         "label": "Host & Password",
         "description": "Enter your MySQL host, port, database name, username, and password. Supports SSL for encrypted connections. Works with any MySQL-compatible server.",
         "recommended": true,
-        "how_to": "## Connect with Host & Password\n\nThis is the standard way to connect Anton to any MySQL-compatible database (MySQL, MariaDB, Percona, PlanetScale, etc.).\n\n### Steps\n\n1. Locate your database connection details — these are typically found in your hosting dashboard, cloud provider console, or from your database administrator.\n2. Enter the **Host** — this is the hostname or IP address of your MySQL server (e.g. `db.example.com` or `127.0.0.1`).\n3. Enter the **Port** — MySQL defaults to `3306`. Change this only if your server uses a non-standard port.\n4. Enter the **Database** name — the specific database (schema) Anton should connect to.\n5. Enter the **Username** and **Password** for a MySQL user that has the permissions you need.\n6. Toggle **Use SSL** on if your server requires or supports encrypted connections (recommended for remote servers).\n7. If using SSL with a custom CA certificate (common with managed cloud databases like AWS RDS or Google Cloud SQL), paste the CA certificate contents into **SSL CA Certificate**.\n\n### Notes\n\n- Make sure the MySQL user has been granted access from the host Anton runs on. If connecting remotely, run: `GRANT ALL ON yourdb.* TO 'user'@'%' IDENTIFIED BY 'password';` and ensure the firewall/security group allows inbound TCP on port 3306.\n- For cloud-managed databases (AWS RDS, Google Cloud SQL, Azure Database for MySQL), SSL is usually required — enable the toggle and paste the provider's CA cert.\n- Anton stores your password locally with restricted file permissions, and never transmits it to Anton's servers.\n",
+        "how_to": "## Connect with Host & Password\n\nThis is the standard way to connect Anton to any MySQL-compatible database (MySQL, MariaDB, Percona, PlanetScale, etc.).\n\n### Steps\n\n1. Locate your database connection details — these are typically found in your hosting dashboard, cloud provider console, or from your database administrator.\n2. Enter the **Host** — this is the hostname or IP address of your MySQL server (e.g. `db.example.com` or `127.0.0.1`).\n3. Enter the **Port** — MySQL defaults to `3306`. Change this only if your server uses a non-standard port.\n4. Enter the **Database** name — the specific database (schema) Anton should connect to.\n5. Enter the **Username** and **Password** for a MySQL user that has the permissions you need.\n6. Toggle **Use SSL** on if your server requires or supports encrypted connections (recommended for remote servers).\n7. If using SSL with a custom CA certificate (common with managed cloud databases like AWS RDS or Google Cloud SQL), paste the CA certificate contents into **SSL CA Certificate**.\n\n### Notes\n\n- Make sure the MySQL user has been granted access from the host Anton runs on. If connecting remotely, run: `GRANT ALL ON yourdb.* TO 'user'@'%' IDENTIFIED BY 'password';` and ensure the firewall/security group allows inbound TCP on port 3306.\n- For cloud-managed databases (AWS RDS, Google Cloud SQL, Azure Database for MySQL), SSL is usually required — enable the toggle and paste the provider's CA cert.\n- On the desktop app your password is stored locally with restricted file permissions.\n",
         "help_url": "https://dev.mysql.com/doc/refman/8.0/en/connecting.html",
         "fields": [
           {
@@ -96,7 +96,83 @@
             "placeholder": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
             "description": "Optional. Paste the PEM-encoded CA certificate to verify the server's identity. Required by some managed cloud databases (e.g. AWS RDS, Google Cloud SQL)."
           }
-        ]
+        ],
+        "cloud": {
+          "available": true,
+          "description": "Enter your MySQL host, port, database name, username, and password. Oracle MySQL 8.0 and 8.4 only; MariaDB, Percona, and other MySQL-compatible servers are not supported here and are refused on connection. The connection is always TLS-verified.",
+          "how_to": "## Connect with host and password\n\nFill in each field separately. This matches the connection panel in tools like MySQL Workbench, DBeaver, or TablePlus.\n\n### Supported servers\n\nOracle MySQL 8.0 and 8.4 only. MariaDB, Percona Server, and Aurora-compatible products are detected on connection and refused, because their read-only and timeout controls differ and have not been verified. Use the MariaDB connector for MariaDB on the desktop app.\n\n### Where to find each value\n\n1. **Host**: The server address, e.g. `db.example.com`. It must be reachable from the public internet and resolve to a public address.\n2. **Port**: `3306`. Only the default MySQL port is accepted in this release.\n3. **Database**: The specific database (schema) to connect to.\n4. **Username / Password**: A MySQL user with `USAGE`, `SELECT`, and `SHOW VIEW` on that schema, authenticating with `caching_sha2_password`. Create a dedicated read-only user; one holding write, `FILE`, or `SUPER` privileges is rejected.\n5. **Certificate trust**: Leave **Public certificate authorities** selected if your provider uses a publicly trusted certificate. Choose **Custom CA certificate** and paste the PEM bundle if your provider issues its own, as AWS RDS and Google Cloud SQL do.\n\n### Notes\n\n- Both the certificate chain and the server hostname are always verified. There is no option to turn either off.\n- Queries run inside a read-only transaction with a server-side execution timeout. Loading local files and multiple statements in one request are disabled.\n- Allow the connection through your firewall or security group before saving.",
+          "fields": [
+            {
+              "name": "host",
+              "label": "Host",
+              "type": "text",
+              "required": true,
+              "placeholder": "db.example.com",
+              "description": "Hostname of your MySQL server. Must resolve to a public address."
+            },
+            {
+              "name": "port",
+              "label": "Port",
+              "type": "text",
+              "required": true,
+              "placeholder": "3306",
+              "default": "3306",
+              "description": "Only the default MySQL port 3306 is accepted in this release."
+            },
+            {
+              "name": "database",
+              "label": "Database",
+              "type": "text",
+              "required": true,
+              "placeholder": "my_database",
+              "description": "The name of the specific database (schema) to connect to."
+            },
+            {
+              "name": "username",
+              "label": "Username",
+              "type": "text",
+              "required": true,
+              "placeholder": "readonly",
+              "description": "A MySQL user with USAGE, SELECT, and SHOW VIEW on the database above."
+            },
+            {
+              "name": "password",
+              "label": "Password",
+              "type": "password",
+              "required": true,
+              "secret": true,
+              "placeholder": "••••••••",
+              "description": "Password for the above user. Stored encrypted and never shown again."
+            },
+            {
+              "name": "tls_mode",
+              "label": "Certificate trust",
+              "type": "select",
+              "required": true,
+              "default": "system",
+              "description": "Which certificate authorities the server's certificate is checked against. The chain and hostname are verified either way.",
+              "options": [
+                {
+                  "value": "system",
+                  "label": "Public certificate authorities (recommended)"
+                },
+                {
+                  "value": "custom_ca",
+                  "label": "Custom CA certificate"
+                }
+              ]
+            },
+            {
+              "name": "ca_pem",
+              "label": "CA certificate",
+              "type": "textarea",
+              "required": false,
+              "secret": false,
+              "placeholder": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
+              "description": "Required when certificate trust is set to a custom CA. Paste the PEM-encoded certificate bundle, up to 64 KiB. A file path or URL is not accepted."
+            }
+          ]
+        }
       },
       {
         "id": "connection-string",

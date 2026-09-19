@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
 from sqlmodel import Session
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.permissions import DesktopOnly, require
 from cowork.db.scoped import ScopedSessionDep
 from cowork.db.session import get_session
 from cowork.handlers.probe import ProbeHandler
@@ -19,12 +19,11 @@ from cowork.schemas.connectors import ConnectorField, SubmitFormRequest
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import store
 
-# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
-# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
-# whenever org mode has no org in scope. Declaring it too makes the
-# requirement visible to a route walker instead of something only
-# discoverable by reading scoped.py.
-router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
+# DesktopOnly until the encrypted relay to auth exists: an org-mode submission
+# is refused before the body model is validated, so no credential reaches the
+# staging store, the probe, the local vault or a 422 echo. ScopedSessionDep
+# still fails closed on its own; the declaration is what the route walker sees.
+router = APIRouter(dependencies=[Depends(require(DesktopOnly))])
 SessionDep = Annotated[Session, Depends(get_session)]
 
 

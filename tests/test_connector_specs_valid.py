@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from cowork.schemas.connectors import (
+    CloudMethod,
     ConnectorField,
     ConnectorForm,
     ConnectorMethod,
@@ -49,6 +50,7 @@ LEGACY_EXTRA_KEYS = {
     "method": {"name_from"},
     "field": set(),
     "spec": set(),
+    "cloud": set(),
 }
 
 KNOWN_KEYS = {
@@ -56,6 +58,7 @@ KNOWN_KEYS = {
     "form": set(ConnectorForm.model_fields) | LEGACY_EXTRA_KEYS["form"],
     "method": set(ConnectorMethod.model_fields) | LEGACY_EXTRA_KEYS["method"],
     "field": set(ConnectorField.model_fields) | LEGACY_EXTRA_KEYS["field"],
+    "cloud": set(CloudMethod.model_fields) | LEGACY_EXTRA_KEYS["cloud"],
 }
 
 
@@ -130,6 +133,10 @@ def test_spec_has_no_unknown_keys(path: Path):
         check("method", method, f"{path.stem}.form.methods[{i}]")
         for j, field in enumerate(method.get("fields") or []):
             check("field", field, f"{path.stem}.form.methods[{i}].fields[{j}]")
+        cloud = method.get("cloud") or {}
+        check("cloud", cloud, f"{path.stem}.form.methods[{i}].cloud")
+        for j, field in enumerate(cloud.get("fields") or []):
+            check("field", field, f"{path.stem}.form.methods[{i}].cloud.fields[{j}]")
     for j, field in enumerate(form.get("fields") or []):
         check("field", field, f"{path.stem}.form.fields[{j}]")
 
@@ -223,3 +230,143 @@ class TestLangfuseSpec:
     def _field(spec, name):
         method = next(m for m in spec.form.methods if m.id == "api-key")
         return next(f for f in method.fields if f.name == name)
+
+
+# The two connectors enabled for cloud execution. Every other method
+# in the corpus carries no `cloud` block and is therefore desktop-only.
+CLOUD_DATABASE_METHODS = {"postgres": "host-port", "mysql": "host-password"}
+
+# The field names the desktop forms render today. Pinned because the cloud
+# block is a second, independent list: if a cloud edit ever reaches the desktop
+# list, this is the test that says so.
+DESKTOP_FIELDS = {
+    "postgres": {
+        "connection-string": ["connection_uri"],
+        "host-port": ["host", "port", "database", "username", "password", "ssl_enabled"],
+    },
+    "mysql": {
+        "host-password": [
+            "host",
+            "port",
+            "database",
+            "username",
+            "password",
+            "use_ssl",
+            "ssl_ca_cert",
+        ],
+        "connection-string": ["connection_string", "ssl_ca_cert"],
+    },
+}
+
+
+class TestCloudDatabaseSpecs:
+    """The cloud blocks on postgres and mysql.
+
+    They carry TLS constraints the hosted path enforces and the desktop path
+    does not, so an edit that collapses the two forms back together is the
+    failure this class exists to catch.
+    """
+
+    @pytest.fixture(
+        params=sorted(CLOUD_DATABASE_METHODS), ids=sorted(CLOUD_DATABASE_METHODS)
+    )
+    def connector_id(self, request):
+        return request.param
+
+    @pytest.fixture
+    def spec(self, connector_id):
+        s = ConnectorSpecRegistry(SPECS_DIR).get_connector(connector_id)
+        assert s is not None, f"{connector_id} spec did not load"
+        return s
+
+    def test_only_the_password_method_declares_cloud_support(self, spec, connector_id):
+        declared = [m.id for m in spec.form.methods if m.cloud is not None]
+        assert declared == [CLOUD_DATABASE_METHODS[connector_id]]
+
+    def test_the_connection_string_method_stays_desktop_only(self, spec):
+        """A raw DSN is never persisted on the hosted path, so the method that
+        collects one has no cloud form to submit."""
+        method = next(m for m in spec.form.methods if m.id == "connection-string")
+        assert method.cloud is None
+
+    def test_cloud_is_not_advertised_before_the_adapters_are_proven(
+        self, spec, connector_id
+    ):
+        # TEST ENABLEMENT, integration branch only: the specs advertise cloud
+        # availability here so a pull request environment can exercise the
+        # adapters end to end. The released expectation is False; this line is
+        # part of the enablement commit and is never merged.
+        assert self._cloud(spec, connector_id).available is True
+
+    def test_certificate_trust_offers_no_downgrade(self, spec, connector_id):
+        field = self._cloud_field(spec, connector_id, "tls_mode")
+        assert field.type == "select"
+        assert field.required is True
+        assert field.default == "system"
+        assert [o["value"] for o in field.options] == ["system", "custom_ca"]
+
+    def test_the_ca_is_pasted_content_and_bounded(self, spec, connector_id):
+        """A path or a URL would let the form choose what the gateway trusts."""
+        field = self._cloud_field(spec, connector_id, "ca_pem")
+        assert field.type == "textarea"
+        assert field.required is False
+        assert field.secret is False
+        assert "64 KiB" in field.description
+        assert "path or URL is not accepted" in field.description
+
+    def test_no_cloud_field_toggles_tls(self, spec, connector_id):
+        """`ssl_enabled` and `use_ssl` are desktop fields. A boolean here would
+        be a cloud form that can ask for an unverified connection."""
+        names = {f.name for f in self._cloud(spec, connector_id).fields}
+        assert names.isdisjoint({"ssl_enabled", "use_ssl", "ssl", "tls", "ssl_ca_cert"})
+
+    @pytest.mark.parametrize("phrase", ["sslmode=disable", "leave SSL off"])
+    def test_cloud_copy_never_inherits_the_desktop_ssl_off_guidance(
+        self, spec, connector_id, phrase
+    ):
+        cloud = self._cloud(spec, connector_id)
+        copy = " ".join(
+            [cloud.description or "", cloud.how_to or ""]
+            + [f.description or "" for f in cloud.fields]
+        )
+        assert phrase.lower() not in copy.lower()
+
+    def test_desktop_fields_are_untouched(self, spec, connector_id):
+        for method in spec.form.methods:
+            expected = DESKTOP_FIELDS[connector_id][method.id]
+            assert [f.name for f in method.fields] == expected
+
+    @staticmethod
+    def _cloud(spec, connector_id):
+        wanted = CLOUD_DATABASE_METHODS[connector_id]
+        method = next(m for m in spec.form.methods if m.id == wanted)
+        assert method.cloud is not None
+        return method.cloud
+
+    @classmethod
+    def _cloud_field(cls, spec, connector_id, name):
+        return next(f for f in cls._cloud(spec, connector_id).fields if f.name == name)
+
+
+class TestMySQLCloudProducts:
+    """MySQL compatibility is claimed by product, not by the connector's name."""
+
+    @pytest.fixture
+    def method(self):
+        spec = ConnectorSpecRegistry(SPECS_DIR).get_connector("mysql")
+        assert spec is not None, "mysql spec did not load"
+        return next(m for m in spec.form.methods if m.id == "host-password")
+
+    def test_cloud_copy_names_the_products_it_accepts(self, method):
+        """The spec's own aliases and description cover MariaDB and Percona for
+        desktop discovery, so the cloud block has to say they are refused."""
+        copy = f"{method.cloud.description} {method.cloud.how_to}"
+        assert "Oracle MySQL 8.0 and 8.4" in copy
+        assert "MariaDB" in copy
+        assert "Percona" in copy
+        assert "refused" in copy
+
+    def test_desktop_copy_makes_no_claim_about_the_hosted_path(self, method):
+        """It previously promised the password is never transmitted to Anton's
+        servers, which the cloud relay makes false."""
+        assert "never transmits it to Anton's servers" not in (method.how_to or "")

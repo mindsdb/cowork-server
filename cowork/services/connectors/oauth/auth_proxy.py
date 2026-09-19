@@ -13,6 +13,10 @@ Connector Lifecycle + Google Drive File Picker) for the design this ports.
 Local-mode desktop flow (`oauth/google.py: OAuthService`) is untouched —
 this module is only ever reached from the org-mode branch of the
 connectors/oauth endpoints.
+
+A second relay family lives here too: the datasource connection routes,
+which forward the same caller credential to auth's `/v1/datasources...`
+endpoints.
 """
 from __future__ import annotations
 
@@ -51,6 +55,7 @@ async def _relay(
     settings: OAuthSettings,
     params: dict | None = None,
     json_body: dict | None = None,
+    keep_code: bool = False,
 ) -> dict:
     url = f"{_auth_base_url(settings)}{path}"
     try:
@@ -73,7 +78,13 @@ async def _relay(
             body = resp.json()
             detail = body.get("detail", resp.text) if isinstance(body, dict) else resp.text
         except ValueError:
-            detail = resp.text
+            body, detail = None, resp.text
+        # Datasource callers pass keep_code so auth's machine-readable code
+        # (invalid_connection, stale_version) survives the hop; OAuth callers
+        # do not, because auth's token view also returns a code and their
+        # error shape is already relied on.
+        if keep_code and isinstance(body, dict) and body.get("code"):
+            detail = {"code": body["code"], "message": detail}
         raise HTTPException(status_code=resp.status_code, detail=detail)
     # Every route but disconnect returns a JSON object; disconnect's 204 has
     # no body at all, so decoding it unconditionally would raise.
@@ -144,4 +155,52 @@ async def proxy_token(engine: str, request: Request, settings: OAuthSettings, *,
     return await _relay(
         "POST", f"/v1/oauth/{engine}/token", request=request, settings=settings,
         json_body={"name": name} if name else {},
+    )
+
+
+# Datasource connection management. Same relay, same forwarded bearer, but
+# auth's `/v1/datasources...` routes instead of `/v1/oauth/...`: auth derives
+# owner and org from that bearer, so no identity ever travels in the body.
+# These paths carry no trailing slash because auth's urls.py registers them
+# without one and the client here does not follow redirects.
+
+
+async def proxy_datasource_create(request: Request, settings: OAuthSettings, payload: dict) -> dict:
+    return await _relay(
+        "POST", "/v1/datasources", request=request, settings=settings, json_body=payload, keep_code=True,
+    )
+
+
+async def proxy_datasource_list(request: Request, settings: OAuthSettings) -> list[dict]:
+    """auth answers with {"items": [...]}; callers here want the rows."""
+    result = await _relay("GET", "/v1/datasources", request=request, settings=settings, keep_code=True)
+    items = result.get("items", [])
+    return items if isinstance(items, list) else []
+
+
+async def proxy_datasource_detail(connection_id: int, request: Request, settings: OAuthSettings) -> dict:
+    return await _relay(
+        "GET", f"/v1/datasources/{connection_id}", request=request, settings=settings, keep_code=True,
+    )
+
+
+async def proxy_datasource_edit(
+    connection_id: int, request: Request, settings: OAuthSettings, payload: dict
+) -> dict:
+    return await _relay(
+        "PATCH", f"/v1/datasources/{connection_id}",
+        request=request, settings=settings, json_body=payload, keep_code=True,
+    )
+
+
+async def proxy_datasource_delete(connection_id: int, request: Request, settings: OAuthSettings) -> None:
+    await _relay(
+        "DELETE", f"/v1/datasources/{connection_id}", request=request, settings=settings, keep_code=True,
+    )
+
+
+async def proxy_datasource_retry(connection_id: int, request: Request, settings: OAuthSettings) -> dict:
+    return await _relay(
+        "POST", f"/v1/datasources/{connection_id}/validation-retry",
+        request=request, settings=settings, keep_code=True,
     )
