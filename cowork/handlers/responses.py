@@ -571,15 +571,25 @@ class ResponsesHandler:
                 or provider_api_key(settings, Provider.MINDS_CLOUD) is not None):
             return None, None
         from anton.core.llm.openai import OpenAIProvider
-        from cowork.turnqueue.producer import _mint_llm_block
+        from cowork.turnqueue.producer import _mint_llm_block, _mint_llm_block_with_turn_key_id
 
         corr = str(uuid4())
-        block = await _mint_llm_block(
-            org_id=self.scoped.scope.org_id,
-            user_id=self.scoped.scope.user_id,
-            correlation_id=corr,
-            settings=TurnQueueSettings(),
-        )
+        queue_settings = TurnQueueSettings()
+        turn_key_id = None
+        if queue_settings.datasource_enabled:
+            block, turn_key_id = await _mint_llm_block_with_turn_key_id(
+                org_id=self.scoped.scope.org_id,
+                user_id=self.scoped.scope.user_id,
+                correlation_id=corr,
+                settings=queue_settings,
+            )
+        else:
+            block = await _mint_llm_block(
+                org_id=self.scoped.scope.org_id,
+                user_id=self.scoped.scope.user_id,
+                correlation_id=corr,
+                settings=queue_settings,
+            )
         provider = OpenAIProvider(
             api_key=block["api_key"],
             base_url=block["base_url"],
@@ -590,7 +600,10 @@ class ResponsesHandler:
             model=settings.resolved_gate_model or MINDS_FREE_MODEL,
             label=Provider.MINDS_CLOUD.value,
         )
-        return binding, {"correlation_id": corr, "llm": block}
+        turn_context = {"correlation_id": corr, "llm": block}
+        if turn_key_id is not None:
+            turn_context["turn_key_id"] = turn_key_id
+        return binding, turn_context
 
     async def _handle_direct_response(
         self,
@@ -1255,6 +1268,7 @@ class ResponsesHandler:
                     started_at=self._remote_started_at(producer_session, conv_id),
                     correlation_id=corr,
                     llm=(turn_llm or {}).get("llm"),
+                    turn_key_id=(turn_llm or {}).get("turn_key_id"),
                     disabled=disabled,
                 ):
                     if kind == "progress" and data.get("phase") == "workspace_authorized":
