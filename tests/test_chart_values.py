@@ -54,8 +54,14 @@ def base() -> list[dict]:
     return _env(BASE)
 
 
+# TEST ENABLEMENT, integration branch only: the base flag is "true" here so a
+# pull request environment runs the feature. The released expectation is
+# "false"; this line is part of the enablement commit and never merged.
+_BASE_ENABLED = "true"
+
+
 def test_datasource_grants_are_off_in_the_base_and_on_only_where_the_gate_passed(base):
-    assert _entry(base, FLAG)["value"] == "false"
+    assert _entry(base, FLAG)["value"] == _BASE_ENABLED
     for env_values in ENVIRONMENTS:
         environment = env_values.stem.removeprefix("values-")
         overrides = [entry.get("value") for entry in _env(env_values) if entry.get("name") == FLAG]
