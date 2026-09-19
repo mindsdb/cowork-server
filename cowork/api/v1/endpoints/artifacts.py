@@ -729,7 +729,11 @@ async def delete_artifact_for_request(
         # Unpublish acts on the viewer, and the viewer scopes by the token's owner,
         # so the credential has to be the acting user's - not a stored provider key
         # (org deployments have none).
-        api_key = await PublishKey(scope.user_id, scope.org_id, min_ttl_s=120.0).get()
+        from cowork.services.artifact_autopublish import _active_workspace_id
+
+        api_key = await PublishKey(
+            scope.user_id, scope.org_id, min_ttl_s=120.0, workspace_id=_active_workspace_id(scope)
+        ).get()
         if not api_key:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

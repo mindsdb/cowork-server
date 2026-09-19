@@ -465,6 +465,40 @@ async def test_delete_by_slug_removes_the_folder(session, tmp_path, org_mode, pu
     assert not folder.exists()
 
 
+async def test_delete_threads_the_active_workspace_into_the_publish_key(
+    session, tmp_path, org_mode, monkeypatch
+):
+    """Unpublishing mints its own credential (the viewer's, not a stored provider
+    key), and that mint must carry the caller's picked workspace too — the same
+    binding the publish and autopublish paths already carry."""
+    from cowork.services.artifact_publish_key import PublishKey
+    import cowork.services.artifact_autopublish as autopublish
+
+    row, folder = _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="dash")
+    monkeypatch.setattr(autopublish, "_active_workspace_id", lambda scope: "ws-1")
+
+    captured = {}
+    real_init = PublishKey.__init__
+
+    def spy_init(self, *args, **kwargs):
+        captured.update(kwargs)
+        real_init(self, *args, **kwargs)
+
+    async def fake_get(self):
+        return "turnkey-1"
+
+    async def fake_revoke(self):
+        return None
+
+    monkeypatch.setattr(PublishKey, "__init__", spy_init)
+    monkeypatch.setattr(PublishKey, "get", fake_get)
+    monkeypatch.setattr(PublishKey, "revoke", fake_revoke)
+
+    await ep.delete_artifact_for_request(_scoped(session, ORG_A), "dash", project_id=row.id)
+
+    assert captured["workspace_id"] == "ws-1"
+
+
 @pytest.mark.parametrize("stage", ["mint", "unpublish"])
 @pytest.mark.parametrize("status", [403, 503])
 async def test_delete_preserves_authority_failures_and_keeps_artifact_files(
