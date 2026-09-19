@@ -436,6 +436,12 @@ class OAuthSettings(Settings):
 
     posthog_client_id: str = Field(default="", validation_alias=AliasChoices("POSTHOG_CLIENT_ID"))
 
+    # HubSpot's MCP Auth App — a fixed client_id/secret pair, same shape as
+    # Google/Linear/GitHub/Supabase, but the resulting token can only call
+    # HubSpot's remote MCP server, never its REST API.
+    hubspot_client_id: str = Field(default="", validation_alias=AliasChoices("HUBSPOT_CLIENT_ID"))
+    hubspot_client_secret: str = Field(default="", validation_alias=AliasChoices("HUBSPOT_CLIENT_SECRET"))
+
     # Browser-side key for the Google Picker widget (drive.file scope only
     # grants access to files the user explicitly picks via this UI).
     google_picker_api_key: str = Field(default="", validation_alias=AliasChoices("GOOGLE_PICKER_API_KEY"))

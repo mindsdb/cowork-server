@@ -179,6 +179,13 @@ def _persist_direct_connection(
             values,
             replace_existing=body.replace_existing,
             default_label=oauth_default_label(values, body.connector_id),
+            # HubSpot's MCP connector has no connect-time read/write/none
+            # picker (see the HubSpot blueprint tab, Stage 0) — every new
+            # connection defaults to "read". Seeded only on a genuinely new
+            # connection; a reconnect (HubSpot session expiring, user
+            # re-authorizing) must not silently reset an "edit access"
+            # upgrade to "write" back to "read".
+            default_fields={"_access_mode": "read"} if body.method == "mcp" else None,
             vault=vault,
         )
     except Exception:
@@ -317,3 +324,41 @@ def delete_picked_file(engine: str, name: str, file_id: str, project: str, scope
     if remaining is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
     return {"ok": True, "files": remaining}
+
+
+_ACCESS_MODES = {"read", "write", "none"}
+
+
+class PatchAccessModeBody(BaseModel):
+    access_mode: str
+
+
+# AuthenticatedInOrgMode: same guard as delete_connection above, copied
+# deliberately rather than just its dual-branch shape — this is the only
+# thing standing between an arbitrary caller and rewriting another user's
+# tool-access mode (see the HubSpot blueprint tab, "found during a later
+# review pass"). Not LoopbackOnly like /save: the "edit access" affordance
+# this backs must work identically from Electron and from the web SPA
+# (CustomizeView.jsx), same as patch_picked_files above.
+@router.patch(
+    "/{engine}/{name}/access-mode",
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
+async def patch_access_mode(engine: str, name: str, body: PatchAccessModeBody, scope: ScopeDep, request: Request):
+    """Change a connection's read/write/none MCP tool-access mode after it's
+    already connected. Introduced for HubSpot's MCP connector — the only
+    connector with an editable-after-connect access setting so far, since
+    every new connection defaults to "read" with no connect-time picker
+    (see the HubSpot blueprint tab, Stage 0). No PKCE, no reconnect, no
+    provider round-trip — a purely local write, same shape as
+    patch_picked_files above."""
+    if body.access_mode not in _ACCESS_MODES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"access_mode must be one of {sorted(_ACCESS_MODES)}.",
+        )
+    if scope.org_mode:
+        return await auth_proxy.proxy_access_mode(engine, name, body.access_mode, request, OAuthSettings())
+    if not ConnectionsService(scope).patch_token(engine, name, {"_access_mode": body.access_mode}):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
+    return {"ok": True, "access_mode": body.access_mode}
