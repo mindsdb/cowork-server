@@ -571,6 +571,15 @@ class TurnQueueSettings(Settings):
         repr=False,
         description="Secret for the dedicated datasource producer service role.",
     )  # COWORK_TURN_DATASOURCE_PRODUCER_KEY
+    datasource_gateway_base_url: str = Field(
+        default="",
+        description=(
+            "In-cluster base URL of the datasource gateway, used to validate a captured "
+            "connection. The Service name, as auth is addressed (http://mindshub-inference): "
+            "the public datasource ingress admits execution alone. Empty means no validation "
+            "runs and a captured connection stays pending."
+        ),
+    )  # COWORK_TURN_DATASOURCE_GATEWAY_BASE_URL
 
 
 class AppSettings(Settings):
