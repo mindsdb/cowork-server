@@ -61,8 +61,9 @@ def test_an_enabled_pair_is_the_only_one_that_reads_as_available(monkeypatch, ad
     assert body["datasources"]["mysql"]["methods"]["host-password"]["available"] is False
 
 
-def test_a_method_the_specs_call_unverified_stays_off_however_it_is_configured(monkeypatch):
-    # No adapter_verified fixture: this is what the release ships today.
+def test_a_method_the_specs_call_unverified_stays_off_however_it_is_configured(
+    monkeypatch, adapter_unverified_datasources
+):
     monkeypatch.setenv("COWORK_DATASOURCE_CAPABILITIES", '{"manifest_version": 1, "enabled": ["postgres:host-port"]}')
 
     body = _client().get(PATH).json()

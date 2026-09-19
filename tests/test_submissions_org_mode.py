@@ -157,8 +157,8 @@ def default_org_client(monkeypatch, adapter_verified_datasources, forbid_local_p
 
 
 @pytest.fixture()
-def unverified_org_client(monkeypatch, forbid_local_paths) -> TestClient:
-    """Org mode with the pair enabled but the specs as the release ships them."""
+def unverified_org_client(monkeypatch, adapter_unverified_datasources, forbid_local_paths) -> TestClient:
+    """Org mode with the pair enabled but the adapters reported as unverified."""
     return _org_client(monkeypatch, ENABLED)
 
 
