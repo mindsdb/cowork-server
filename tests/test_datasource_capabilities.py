@@ -26,7 +26,7 @@ ENABLED_ONE = '{"manifest_version": 1, "enabled": ["postgres:host-port"]}'
 
 
 def _caps(raw: str):
-    return load_datasource_capabilities(AppSettings(datasource_capabilities=raw))
+    return load_datasource_capabilities(AppSettings(COWORK_DATASOURCE_CAPABILITIES=raw))
 
 
 def test_the_default_offers_nothing_while_still_knowing_the_candidates():
@@ -91,7 +91,8 @@ def test_an_unknown_pair_is_ignored_and_named_by_shape_only(adapter_verified_dat
 
     assert caps.is_available("postgres", "host-port") is True
     assert caps.is_available("nope", "whatever") is False
-    assert "1" in caplog.text  # the count, not the pair
+    assert "1 enabled capability pair(s)" in caplog.text
+    assert "nope:whatever" not in caplog.text
 
 
 def test_an_unexpected_manifest_field_fails_closed():
@@ -115,4 +116,6 @@ def test_cloud_fields_come_from_the_spec_and_only_for_a_candidate():
 
 @pytest.mark.parametrize("raw", ["", "   ", "null", "[]"])
 def test_anything_that_is_not_a_manifest_object_is_off(raw):
-    assert load_datasource_capabilities(AppSettings(datasource_capabilities=raw)).available_connector_ids() == set()
+    caps = load_datasource_capabilities(AppSettings(COWORK_DATASOURCE_CAPABILITIES=raw))
+
+    assert caps.available_connector_ids() == set()
