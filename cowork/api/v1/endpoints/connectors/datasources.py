@@ -4,6 +4,11 @@ Every route here is a relay. Nothing on this path opens a session, touches a
 vault or stages a submission: auth holds the encrypted credential and derives
 owner and org from the caller's own bearer, so no identity is ever read from
 the body or the query. Outside org mode the whole surface answers 404.
+
+Capture obeys the deployment's capability policy, the same one the submission
+relay and the capability response read, so a method this deployment does not
+run cannot be stored through the side door. Reading and deleting stay open, so
+switching a method off never traps a connection captured while it was on.
 """
 
 from __future__ import annotations
@@ -20,7 +25,10 @@ from cowork.schemas.connectors import (
     DatasourceCreateRequest,
     DatasourceEditRequest,
 )
-from cowork.services.connectors.datasources import normalize_datasource_input
+from cowork.services.connectors.datasources import (
+    normalize_datasource_input,
+    require_cloud_method_enabled,
+)
 from cowork.services.connectors.oauth import auth_proxy
 
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
@@ -47,6 +55,7 @@ async def create_datasource_connection(
     body: DatasourceCreateRequest, request: Request
 ) -> DatasourceConnectionResponse:
     """Store a new datasource credential in auth's encrypted vault."""
+    require_cloud_method_enabled(body.connector_id, body.method)
     payload = normalize_datasource_input(body)
     result = await auth_proxy.proxy_datasource_create(request, OAuthSettings(), payload)
     return DatasourceConnectionResponse.model_validate(result)
@@ -71,6 +80,7 @@ async def edit_datasource_connection(
     connection_id: int, body: DatasourceEditRequest, request: Request
 ) -> DatasourceConnectionResponse:
     """Replace a connection's credential, guarded by the version the caller saw."""
+    require_cloud_method_enabled(body.connector_id, body.method)
     payload = normalize_datasource_input(body)
     payload["expected_version"] = body.expected_version
     result = await auth_proxy.proxy_datasource_edit(connection_id, request, OAuthSettings(), payload)

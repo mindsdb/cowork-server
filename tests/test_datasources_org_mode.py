@@ -115,14 +115,29 @@ def relay(monkeypatch):
     return recorded, scripted
 
 
-@pytest.fixture()
-def org_client(monkeypatch) -> TestClient:
+ENABLED = '{"manifest_version": 1, "enabled": ["postgres:host-port"]}'
+
+
+def _org_client(monkeypatch, capabilities: str) -> TestClient:
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
     monkeypatch.setenv("AUTH_SERVICE_BASE_URL", "https://auth.example.com")
+    monkeypatch.setenv("COWORK_DATASOURCE_CAPABILITIES", capabilities)
     from cowork.common.settings.app_settings import get_app_settings
 
     get_app_settings.cache_clear()
     return TestClient(create_app())
+
+
+@pytest.fixture()
+def org_client(monkeypatch, adapter_verified_datasources) -> TestClient:
+    """A deployment that runs PostgreSQL connections."""
+    return _org_client(monkeypatch, ENABLED)
+
+
+@pytest.fixture()
+def default_org_client(monkeypatch, adapter_verified_datasources) -> TestClient:
+    """A deployment before anyone enabled a datasource method."""
+    return _org_client(monkeypatch, "")
 
 
 @pytest.fixture()
@@ -401,3 +416,52 @@ def test_every_route_relays_the_callers_credential_and_no_substitute_identity(
     for identity in ("user_id", "organization_id", "org_id"):
         assert identity not in str(sent.url)
         assert identity not in sent.content.decode()
+
+
+def test_capture_is_refused_when_the_deployment_has_not_enabled_the_method(default_org_client, relay):
+    """The capability response says unavailable, so the capture route must agree."""
+    recorded, _ = relay
+
+    res = default_org_client.post("/api/v1/connectors/datasources/", json=CREATE_BODY, headers=AUTH_HEADERS)
+
+    assert res.status_code == 409
+    assert res.json()["detail"]["code"] == "unsupported_capability"
+    assert PASSWORD not in res.text
+    assert recorded == [], "a method this deployment does not run must not reach auth"
+
+
+def test_an_edit_is_refused_on_a_method_the_deployment_does_not_run(default_org_client, relay):
+    recorded, _ = relay
+
+    res = default_org_client.patch(
+        "/api/v1/connectors/datasources/7",
+        json={**CREATE_BODY, "expected_version": 1},
+        headers=AUTH_HEADERS,
+    )
+
+    assert res.status_code == 409
+    assert res.json()["detail"]["code"] == "unsupported_capability"
+    assert recorded == []
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("get", "/api/v1/connectors/datasources/"),
+        ("get", "/api/v1/connectors/datasources/7"),
+        ("delete", "/api/v1/connectors/datasources/7"),
+    ],
+)
+def test_switching_a_method_off_never_traps_a_connection_already_captured(
+    default_org_client, relay, method, path
+):
+    """Reading and deleting stay open, or a disabled method would strand its rows."""
+    recorded, scripted = relay
+    scripted["status"] = 204 if method == "delete" else 200
+    if path.endswith("datasources/"):
+        scripted["body"] = {"items": [CONNECTION]}
+
+    res = default_org_client.request(method.upper(), path, headers=AUTH_HEADERS)
+
+    assert res.status_code == scripted["status"]
+    assert len(recorded) == 1
