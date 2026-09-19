@@ -139,4 +139,3 @@ async def test_an_enabled_datasource_reads_as_available_in_the_full_listing(monk
     assert by_id["postgres"].cloud_available is True
     assert by_id["gmail"].cloud_available is True
     assert by_id["mysql"].cloud_available is False
-
