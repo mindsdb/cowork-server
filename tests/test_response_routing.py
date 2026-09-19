@@ -553,6 +553,7 @@ async def test_produce_direct_persists_before_emitting_and_roots_metadata(monkey
         original_content="Hello",
         route=route,
         buffer=buffer,
+        request_id="direct-test",
     )
 
     assert buffer.closed == "completed"
