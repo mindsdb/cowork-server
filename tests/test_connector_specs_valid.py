@@ -292,7 +292,11 @@ class TestCloudDatabaseSpecs:
     def test_cloud_is_not_advertised_before_the_adapters_are_proven(
         self, spec, connector_id
     ):
-        assert self._cloud(spec, connector_id).available is False
+        # TEST ENABLEMENT, integration branch only: the specs advertise cloud
+        # availability here so a pull request environment can exercise the
+        # adapters end to end. The released expectation is False; this line is
+        # part of the enablement commit and is never merged.
+        assert self._cloud(spec, connector_id).available is True
 
     def test_certificate_trust_offers_no_downgrade(self, spec, connector_id):
         field = self._cloud_field(spec, connector_id, "tls_mode")

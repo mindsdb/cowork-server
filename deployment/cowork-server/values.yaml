@@ -328,8 +328,12 @@ deployment:
     # Set here in the base, so every environment renders the same shape and the
     # gate flips one switch per environment; tests/test_chart_values.py pins
     # which environments are on.
+    # TEST ENABLEMENT, integration branch only, never merged or cherry-picked.
+    # A pull request environment composes base values alone, so this is the only
+    # place that can switch datasource grants on there. On `staging` this line
+    # reads "false" and the guard expects it.
     - name: COWORK_TURN_DATASOURCE_ENABLED
-      value: "false"
+      value: "true"
     - name: COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID
       valueFrom:
         secretKeyRef:
