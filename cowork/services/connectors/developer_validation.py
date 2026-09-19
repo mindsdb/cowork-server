@@ -17,6 +17,12 @@ from urllib.parse import urlparse
 import httpx
 from httpx._utils import get_environment_proxies
 
+from cowork.services.connectors.egress import (
+    EgressHostNotPublic,
+    EgressHostUnresolved,
+    vetted_public_addresses,
+)
+
 
 class DeveloperCredentialError(ValueError):
     """The submitted credential or connector configuration is invalid."""
@@ -127,26 +133,15 @@ def require_public_host(
     """Reject private/custom GitHub endpoints before attaching credentials; return the validated addresses."""
 
     try:
-        literal = ipaddress.ip_address(hostname)
-        addresses = [literal]
-    except ValueError:
-        try:
-            records = resolver(hostname, 443, type=socket.SOCK_STREAM)
-        except OSError as exc:
-            raise DeveloperProviderUnavailable(
-                "The GitHub Enterprise host could not be resolved. Check the base URL."
-            ) from exc
-        addresses = []
-        for record in records:
-            try:
-                addresses.append(ipaddress.ip_address(record[4][0]))
-            except (IndexError, ValueError):
-                continue
-    if not addresses or any(not address.is_global for address in addresses):
+        return vetted_public_addresses(hostname, resolver)
+    except EgressHostUnresolved as exc:
+        raise DeveloperProviderUnavailable(
+            "The GitHub Enterprise host could not be resolved. Check the base URL."
+        ) from exc
+    except EgressHostNotPublic as exc:
         raise DeveloperCredentialError(
             "GitHub Enterprise must use a publicly routable HTTPS host."
-        )
-    return addresses
+        ) from exc
 
 
 class PinnedHostError(httpx.ConnectError):
