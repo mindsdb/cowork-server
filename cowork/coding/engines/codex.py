@@ -154,7 +154,7 @@ class CodexEngine:
         for row in payload.get("data", []) if isinstance(payload, dict) else []:
             if not isinstance(row, dict) or not isinstance(row.get("id"), str):
                 continue
-            if row.get("embedding") is True:
+            if row.get("kind") == "decision" or row.get("embedding") is True:
                 continue
             # Discovery describes what the MindsHub Responses API can run, not
             # what the current wallet can start right now. Keep disabled rows
