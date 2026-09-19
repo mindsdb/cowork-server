@@ -9,6 +9,10 @@ Capture obeys the deployment's capability policy, the same one the submission
 relay and the capability response read, so a method this deployment does not
 run cannot be stored through the side door. Reading and deleting stay open, so
 switching a method off never traps a connection captured while it was on.
+
+Create, edit and retry then drive one validation attempt and answer with what
+auth records, because a connection nobody probed is pending forever and the
+interface excludes it from every conversation.
 """
 
 from __future__ import annotations
@@ -25,6 +29,7 @@ from cowork.schemas.connectors import (
     DatasourceCreateRequest,
     DatasourceEditRequest,
 )
+from cowork.services.connectors.datasource_validation import validate_connection
 from cowork.services.connectors.datasources import (
     normalize_datasource_input,
     require_cloud_method_enabled,
@@ -50,6 +55,22 @@ def _require_org(scope: ScopeDep) -> None:
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode)), Depends(_require_org)])
 
 
+async def _validated(connection: dict, request: Request) -> dict:
+    """Validate a connection auth has just stored, and answer with the outcome.
+
+    A connection auth creates is pending until a probe says otherwise, so a
+    capture that returned here would report a state the user cannot act on and
+    the interface hides. The attempt is best effort: when it could not run, the
+    connection stands as auth left it and the caller can retry.
+    """
+    connection_id = connection.get("id")
+    if not isinstance(connection_id, int):
+        return connection
+    if not await validate_connection(connection_id, request.headers.get("authorization", "")):
+        return connection
+    return await auth_proxy.proxy_datasource_detail(connection_id, request, OAuthSettings())
+
+
 @router.post("/", response_model=DatasourceConnectionResponse, status_code=status.HTTP_201_CREATED)
 async def create_datasource_connection(
     body: DatasourceCreateRequest, request: Request
@@ -58,7 +79,7 @@ async def create_datasource_connection(
     require_cloud_method_enabled(body.connector_id, body.method)
     payload = normalize_datasource_input(body)
     result = await auth_proxy.proxy_datasource_create(request, OAuthSettings(), payload)
-    return DatasourceConnectionResponse.model_validate(result)
+    return DatasourceConnectionResponse.model_validate(await _validated(result, request))
 
 
 @router.get("/", response_model=list[DatasourceConnectionResponse])
@@ -84,7 +105,7 @@ async def edit_datasource_connection(
     payload = normalize_datasource_input(body)
     payload["expected_version"] = body.expected_version
     result = await auth_proxy.proxy_datasource_edit(connection_id, request, OAuthSettings(), payload)
-    return DatasourceConnectionResponse.model_validate(result)
+    return DatasourceConnectionResponse.model_validate(await _validated(result, request))
 
 
 @router.delete("/{connection_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -98,4 +119,4 @@ async def delete_datasource_connection(connection_id: int, request: Request) -> 
 async def retry_datasource_validation(connection_id: int, request: Request) -> DatasourceConnectionResponse:
     """Start a new validation attempt for an owned connection."""
     result = await auth_proxy.proxy_datasource_retry(connection_id, request, OAuthSettings())
-    return DatasourceConnectionResponse.model_validate(result)
+    return DatasourceConnectionResponse.model_validate(await _validated(result, request))
