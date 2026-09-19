@@ -469,7 +469,7 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
     handler = _routing_handler(monkeypatch)
     monkeypatch.setattr(
         responses, "TurnQueueSettings",
-        lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200),
+        lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200, datasource_enabled=False),
     )
     monkeypatch.setattr(
         responses, "get_user_settings",
@@ -495,6 +495,43 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
     assert binding.model == "mindshub_air"
     assert type(binding.provider).__name__ == "OpenAIProvider"
     assert turn_llm == {"correlation_id": minted["corr"], "llm": block}
+
+
+@pytest.mark.asyncio
+async def test_router_binding_hands_the_key_prefix_to_the_turn_when_datasources_are_on(monkeypatch):
+    """With the flag on the gate's mint returns the prefix as well, and the turn
+    context carries it; dropping it would fail every hosted datasource turn."""
+    from unittest.mock import AsyncMock
+
+    import cowork.handlers.responses as responses
+    import cowork.turnqueue.producer as producer
+    from cowork.common.settings.user_settings import Provider
+
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(
+        responses, "TurnQueueSettings",
+        lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200, datasource_enabled=True),
+    )
+    monkeypatch.setattr(
+        responses, "get_user_settings",
+        lambda scope: SimpleNamespace(
+            resolved_router_provider=Provider.MINDS_CLOUD,
+            resolved_router_model="kimi",
+            resolved_gate_model="mindshub_air",
+        ),
+    )
+    block = {"provider": "minds-cloud", "api_key": "mdb_gate.secret", "base_url": "http://gw/v1"}
+
+    async def fake_mint(*, org_id, user_id, correlation_id, settings):
+        return block, "mdb_gate"
+
+    monkeypatch.setattr(producer, "_mint_llm_block_with_turn_key_id", fake_mint)
+    monkeypatch.setattr(producer, "_mint_llm_block", AsyncMock(side_effect=AssertionError("minted without the prefix")))
+
+    _, turn_llm = await handler._router_binding()
+
+    assert turn_llm["llm"] == block
+    assert turn_llm["turn_key_id"] == "mdb_gate"
 
 
 @pytest.mark.asyncio

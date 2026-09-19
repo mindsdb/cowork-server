@@ -864,8 +864,8 @@ roles remain assigned. No new customer or staff permission grants are introduced
 ### Datasource grants on cloud turns
 
 `COWORK_TURN_DATASOURCE_ENABLED` (default `false`) lets a hosted turn query the
-organization's verified PostgreSQL and MySQL connections. When it is on, the
-producer lists the user's verified connections from auth under the dedicated
+user's verified PostgreSQL and MySQL connections in the organization. When it
+is on, the producer lists them from auth under the dedicated
 producer service role (`COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID` and
 `COWORK_TURN_DATASOURCE_PRODUCER_KEY`), bound to the turn key it has just
 minted, registers one grant per connection before enqueueing, and puts only

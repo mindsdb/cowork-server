@@ -79,7 +79,6 @@ async def mint_turn_key_details(*, user_id: str, org_id: str, correlation_id: st
     return MintedTurnKey(key=result["key"], prefix=prefix)
 
 
-
 async def list_active_connections(*, org_id: str, user_id: str, settings) -> list[dict]:
     """Org's active OAuth-builtin connections, for the turn-key `oauth` block
     (Turn-Key Token Handoff). Internal/service-authenticated, same mechanism
