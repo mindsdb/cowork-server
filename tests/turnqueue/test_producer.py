@@ -922,3 +922,58 @@ async def test_artifact_authority_outage_stops_before_queue_side_effects(monkeyp
         ))
     assert permissions == ["product.execute", "artifact.manage"]
     redis.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_datasource_dispatch_without_a_turn_key_prefix_fails_before_any_auth_call(monkeypatch):
+    """A pre-minted llm block without a prefix while the flag is on is a producer
+    misconfiguration; it fails loudly and never reaches auth."""
+    from cowork.common.settings.app_settings import TurnQueueSettings
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+
+    monkeypatch.setattr(
+        prod, "list_verified_datasource_connections", AsyncMock(side_effect=AssertionError("listed without a turn key"))
+    )
+    settings = TurnQueueSettings(
+        datasource_enabled=True, datasource_producer_key_id="producer-v1", datasource_producer_key="producer-secret"
+    )
+    with pytest.raises(ProductPermissionUnavailable):
+        await prod._mint_datasource_block(
+            org_id="o1", user_id="u1", correlation_id="r", turn_key_id=None, disabled=None, settings=settings
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_grant_binding_compares_identifiers_in_canonical_form(monkeypatch):
+    """Auth serialises the echoed ids through UUID fields, lowercase and hyphenated;
+    our own spelling must not fail the compare."""
+    from cowork.common.settings.app_settings import TurnQueueSettings
+
+    org_id = "0F3C2B9A-8D7E-4F6A-9B5C-1D2E3F4A5B6C"
+    user_id = "1A2B3C4D-5E6F-4A7B-8C9D-0E1F2A3B4C5D"
+    monkeypatch.setattr(
+        prod,
+        "list_verified_datasource_connections",
+        AsyncMock(return_value=[{"id": 7, "connector_id": "postgres", "name": "events", "status": "verified",
+                                 "credential_version": 3}]),
+    )
+    monkeypatch.setattr(
+        prod,
+        "register_datasource_grants",
+        AsyncMock(return_value={
+            "user_id": user_id.lower(),
+            "organization_id": org_id.lower(),
+            "turn_key_id": "mdb_prefix",
+            "correlation_id": "r",
+            "audience": "datasource-gateway",
+            "purpose": "execute",
+            "grants": [{"connection_id": 7, "credential_version": 3}],
+        }),
+    )
+    settings = TurnQueueSettings(
+        datasource_enabled=True, datasource_producer_key_id="producer-v1", datasource_producer_key="producer-secret"
+    )
+    block = await prod._mint_datasource_block(
+        org_id=org_id, user_id=user_id, correlation_id="r", turn_key_id="mdb_prefix", disabled=None, settings=settings
+    )
+    assert block == {"protocol_version": 1, "connections": [{"connection_id": 7, "credential_version": 3}]}

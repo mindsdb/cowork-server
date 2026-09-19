@@ -245,6 +245,16 @@ def _datasource_connection_refs(connections: list[dict], disabled: list[dict] | 
     return refs
 
 
+def _same_identifier(echoed: object, ours: str) -> bool:
+    """Auth serialises ids through UUID fields, lowercase and hyphenated; compare canonical forms."""
+    if not isinstance(echoed, str):
+        return False
+    try:
+        return uuid.UUID(echoed) == uuid.UUID(ours)
+    except ValueError:
+        return echoed == ours
+
+
 async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
                                  correlation_id: str, turn_key_id: str | None,
                                  disabled: list[dict] | None,
@@ -252,12 +262,16 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
     """Register verified datasource grants before a datasource block is queued."""
     if not settings.datasource_enabled or not org_id or not user_id:
         return None
-    connections = await list_verified_datasource_connections(org_id=org_id, user_id=user_id, settings=settings)
+    # A datasource-enabled dispatch without the key prefix is a producer
+    # misconfiguration; it fails here rather than reaching auth without it.
+    if not isinstance(turn_key_id, str) or not turn_key_id.strip():
+        raise product_permissions.ProductPermissionUnavailable()
+    connections = await list_verified_datasource_connections(
+        org_id=org_id, user_id=user_id, turn_key_id=turn_key_id, settings=settings
+    )
     refs = _datasource_connection_refs(connections, disabled)
     if not refs:
         return None
-    if not isinstance(turn_key_id, str) or not turn_key_id.strip():
-        raise product_permissions.ProductPermissionUnavailable()
     response = await register_datasource_grants(
         user_id=user_id,
         org_id=org_id,
@@ -267,10 +281,10 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
         settings=settings,
     )
     if (
-        response.get("user_id") != user_id
-        or response.get("organization_id") != org_id
+        not _same_identifier(response.get("user_id"), user_id)
+        or not _same_identifier(response.get("organization_id"), org_id)
         or response.get("turn_key_id") != turn_key_id
-        or response.get("correlation_id") != correlation_id
+        or not _same_identifier(response.get("correlation_id"), correlation_id)
         or response.get("audience") != "datasource-gateway"
         or response.get("purpose") != "execute"
     ):
