@@ -318,6 +318,31 @@ deployment:
     - name: COWORK_TURN_TURN_KEY_TTL_SECONDS
       value: "1200"
 
+    # Cloud datasource grants for hosted turns. Off until the release gate; on,
+    # the producer lists the user's verified connections and registers grants
+    # under the producer role of the datasource-service-keys bundle, an identity
+    # distinct from the shared internal secret above. Optional: without the
+    # Secret the producer refuses every datasource turn (ProductPermissionUnavailable),
+    # the same closed door, and a namespace that has no bundle yet still deploys.
+    # Provision the bundle before the flag turns on, not before this deploys.
+    # Set here in the base, so every environment renders the same shape and the
+    # gate flips one switch per environment; tests/test_chart_values.py pins
+    # which environments are on.
+    - name: COWORK_TURN_DATASOURCE_ENABLED
+      value: "false"
+    - name: COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID
+      valueFrom:
+        secretKeyRef:
+          name: datasource-service-keys
+          key: DATASOURCE_PRODUCER_KEY_ID
+          optional: true
+    - name: COWORK_TURN_DATASOURCE_PRODUCER_KEY
+      valueFrom:
+        secretKeyRef:
+          name: datasource-service-keys
+          key: DATASOURCE_PRODUCER_KEY
+          optional: true
+
     # Inference base URL the pod's turn calls. MUST be this env's own inference:
     # the turn key is minted by this env's auth, and each inference validates
     # against the auth in ITS namespace — PR envs run their own Postgres, so a
