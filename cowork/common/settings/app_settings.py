@@ -594,6 +594,20 @@ class AppSettings(Settings):
     # webSecurity:false so no Origin header is sent — not needed here.
     # Override for cloud/VPC:  COWORK_ALLOWED_ORIGINS='["https://app.example.com"]'
     # Use ["*"] only when an ingress controller enforces origin filtering upstream.
+    # Which connector methods this deployment may run as a cloud datasource:
+    # `{"manifest_version": 1, "enabled": ["postgres:host-port"]}`. A string,
+    # not a dict: pydantic-settings parses a dict field from the environment
+    # while the settings object is built, so malformed JSON would raise before
+    # any policy code runs and crash the process at import. Parsed, and failed
+    # closed, in services/connectors/datasource_capabilities.py instead.
+    datasource_capabilities: str = Field(
+        default="",
+        # Both spellings: the environment name a deployment sets, and the
+        # field name, so a caller can build settings with this value directly.
+        validation_alias=AliasChoices("COWORK_DATASOURCE_CAPABILITIES", "datasource_capabilities"),
+        description="Versioned datasource capability manifest as JSON; empty means nothing is enabled.",
+    )
+
     allowed_origins: list[str] = Field(
         default=[],
         validation_alias=AliasChoices("COWORK_ALLOWED_ORIGINS"),
