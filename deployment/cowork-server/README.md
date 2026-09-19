@@ -46,6 +46,22 @@ The chart references two Secrets that must exist in the target namespace:
   `DATABASE_URI`.
 - `mindsdb-secrets` — provider API keys: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
   `GEMINI_API_KEY`.
+- `datasource-service-keys` — the producer role of the cloud datasource
+  identities: `DATASOURCE_PRODUCER_KEY_ID` and `DATASOURCE_PRODUCER_KEY`,
+  declared and provisioned by the auth repository's secrets inventory. The
+  references are required, so the Secret must exist before this chart version
+  deploys; PR environments get it from the keycloak chart's ephemeral secrets.
+
+## Datasource grants for hosted turns
+
+`COWORK_TURN_DATASOURCE_ENABLED` is `"false"` in `values.yaml`; the release gate
+turns it on per environment in `values-<env>.yaml`, and
+`tests/test_chart_values.py` pins which environments are on. Turn it on only
+after auth serves the datasource endpoints with the bundle above,
+mindshub_inference serves `/v1/datasources/`, and the scratchpad-controller
+carries the gateway origin with a scratchpad image that has the typed helper.
+Rollback is the flag: off, no new grants are registered and no datasource block
+is queued; encrypted records stay in auth and OAuth connections are unaffected.
 
 ## Required cluster permissions
 
