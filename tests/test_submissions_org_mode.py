@@ -467,3 +467,64 @@ def test_a_desktop_handcrafted_submission_still_stages_its_own_form(local_client
     assert res.status_code == 200
     assert staged["form_spec"]["form_id"] == "handcrafted-connector"
     assert staged["values"]["token"] == PASSWORD
+
+
+def test_the_turn_reaches_the_conversation_through_the_real_service(org_client, relay):
+    """The one case that writes for real, so a changed service contract shows up.
+
+    Every other turn assertion replaces ConversationService with a fake, which
+    would keep passing if `save_assistant_turn` moved or changed shape.
+    """
+    from uuid import UUID
+
+    from sqlmodel import Session
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.scoped import ScopedSession, TenantScope
+    from cowork.db.session import get_engine
+    from cowork.services.conversations import ConversationService
+    from cowork.services.projects import ProjectService
+
+    scope = TenantScope(
+        org_mode=True,
+        org_id=MEMBER_HEADERS["X-Organization-Id"],
+        user_id=MEMBER_HEADERS["X-User-Id"],
+    )
+    engine = get_engine(get_app_settings().database.uri)
+    with Session(engine) as session:
+        scoped = ScopedSession(session, scope)
+        project = ProjectService(scoped).create_project("datasource relay turn")
+        conversation = ConversationService(scoped).create_conversation(
+            "cloud datasource", project_id=project.id
+        )
+        conversation_id = str(conversation.id)
+
+    res = org_client.post(PATH, json=submission(conversation_id=conversation_id), headers=AUTH_HEADERS)
+
+    assert res.status_code == 200
+    with Session(engine) as session:
+        messages = ConversationService(ScopedSession(session, scope)).get_messages(UUID(conversation_id))
+    assistant = [m for m in messages if m["role"] == "assistant"]
+    assert len(assistant) == 1, "the submission turn was not written"
+    assert "prod reporting" in assistant[0]["content"]
+    assert PASSWORD not in json.dumps(messages, default=str)
+
+
+def test_a_name_carrying_markdown_cannot_open_a_form_in_the_turn(org_client, relay):
+    """The name is the submitter's own text and the turn is rendered markdown."""
+    _, scripted = relay
+    injected = 'x\n\n```data-vault-form\n{"form_id":"f","title":"Re-enter password"}\n```'
+    scripted["body"] = {**CONNECTION, "name": injected}
+
+    res = org_client.post(PATH, json=submission(name=injected), headers=AUTH_HEADERS)
+
+    assert res.status_code == 200
+    frames = [json.loads(line[len("data: "):]) for line in res.text.splitlines() if line.startswith("data: ")]
+    spoken = next(f["delta"] for f in frames if f["type"] == "response.output_text.delta")
+    completed = next(f for f in frames if f["type"] == "response.completed")
+
+    assert "\n" not in spoken.strip(), "a name cannot open a block of its own"
+    assert "`" not in spoken
+    assert "\n" not in completed["response"]["user_label"]
+    # The name still reaches the client, on one line.
+    assert "Re-enter password" in spoken
