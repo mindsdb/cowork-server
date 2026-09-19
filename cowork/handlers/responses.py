@@ -579,7 +579,7 @@ class ResponsesHandler:
             user_id=self.scoped.scope.user_id,
             correlation_id=corr,
             settings=TurnQueueSettings(),
-            workspace_id=settings.hub_workspace_id or None,
+            workspace_id=getattr(settings, "hub_workspace_id", "") or None,
         )
         provider = OpenAIProvider(
             api_key=block["api_key"],

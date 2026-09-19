@@ -159,6 +159,22 @@ async def test_restore_synchronizes_an_existing_live_artifact(artifact, monkeypa
     assert synced == [(session, folder)]
 
 
+def test_owner_publish_context_threads_the_active_workspace(artifact, monkeypatch):
+    """The manual/live-sync publish path must bind its key to the caller's picked
+    workspace too, not just the autopublish reconciler — the live-editing route and
+    the explicit Publish button both go through this context builder."""
+    import cowork.services.artifact_autopublish as autopublish
+
+    folder, _metadata = artifact
+    monkeypatch.setattr(autopublish, "_active_workspace_id", lambda scope: "ws-1")
+    monkeypatch.setattr(autopublish, "_publish_url", lambda scope: "https://api.staging.example")
+
+    _base, publish_url, key = workspace._owner_publish_context(_Session(), folder)
+
+    assert publish_url == "https://api.staging.example"
+    assert key._workspace_id == "ws-1"
+
+
 @pytest.mark.asyncio
 async def test_org_sync_preserves_audience_and_reuses_live_publish(artifact, monkeypatch):
     folder, _metadata = artifact
