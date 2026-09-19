@@ -39,7 +39,7 @@ Swap `CI_ENVIRONMENT_SLUG` / `K8S_NAMESPACE` for `staging` or `prod` to target t
 
 ## Required cluster secrets
 
-The chart references two Secrets that must exist in the target namespace:
+The chart references these Secrets in the target namespace:
 
 - `cowork-db` — key `database_uri`, a Postgres SQLAlchemy URI. Consumed by the
   `db-migrate` initContainer (`alembic upgrade head`) and the app's
@@ -49,8 +49,10 @@ The chart references two Secrets that must exist in the target namespace:
 - `datasource-service-keys` — the producer role of the cloud datasource
   identities: `DATASOURCE_PRODUCER_KEY_ID` and `DATASOURCE_PRODUCER_KEY`,
   declared and provisioned by the auth repository's secrets inventory. The
-  references are required, so the Secret must exist before this chart version
-  deploys; PR environments get it from the keycloak chart's ephemeral secrets.
+  references are optional: without the Secret the pod starts and every
+  datasource turn is refused, so the bundle must exist before
+  `COWORK_TURN_DATASOURCE_ENABLED` turns on, not before this deploys. PR
+  environments get it from the keycloak chart's ephemeral secrets.
 
 ## Datasource grants for hosted turns
 

@@ -7,12 +7,15 @@ quietly on its own:
 - The flag must be ``"false"`` in the base values and ``"true"`` only in the
   environments this file lists. A PR environment composes the base alone.
 - The producer identity must come from the shared ``datasource-service-keys``
-  bundle, required, and never from the legacy shared internal secret. auth's
-  chart guard covers auth's own references only, so a renamed bundle or key is
-  caught here on this side.
-- No datasource name may be declared twice across the base and a
-  per-environment file: a duplicate renders fine and then either fails the
-  upgrade or silently empties the variable.
+  bundle and never from the legacy shared internal secret. auth's chart guard
+  covers auth's own references only, so a renamed bundle or key is caught here
+  on this side. The references are optional: without the Secret the producer
+  raises ``ProductPermissionUnavailable`` on the first datasource turn, which is
+  the same closed door, and a namespace that has no bundle yet still deploys.
+- No env name may be declared twice across the base and a per-environment
+  file: a duplicate renders fine and then either fails the upgrade or silently
+  empties the variable. The controller's guard exists because that emptied its
+  worker image in prod; this chart had no such guard.
 """
 
 from __future__ import annotations
@@ -67,11 +70,11 @@ def test_the_producer_identity_is_the_producer_role_of_the_shared_bundle(base):
     }
     for name, key in references.items():
         ref = _entry(base, name)["valueFrom"]["secretKeyRef"]
-        assert ref == {"name": BUNDLE, "key": key}, f"{name} must be a required reference to {BUNDLE}/{key}"
+        assert ref == {"name": BUNDLE, "key": key, "optional": True}, f"{name} must reference {BUNDLE}/{key}, optional"
 
 
 @pytest.mark.parametrize("env_values", ENVIRONMENTS, ids=lambda p: p.name)
-def test_no_datasource_name_is_declared_twice_per_environment(base, env_values):
-    names = [entry["name"] for entry in base + _env(env_values) if str(entry.get("name", "")).startswith("COWORK_TURN_DATASOURCE")]
+def test_no_env_name_is_declared_twice_per_environment(base, env_values):
+    names = [entry["name"] for entry in base + _env(env_values) if "name" in entry]
     duplicates = sorted(name for name, count in Counter(names).items() if count > 1)
     assert not duplicates, f"{env_values.name} renders {duplicates} more than once with values.yaml"
