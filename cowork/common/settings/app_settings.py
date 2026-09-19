@@ -555,6 +555,22 @@ class TurnQueueSettings(Settings):
             "alias the env serves. Empty = the minds-cloud coding default (CODING_MODEL_DEFAULTS)."
         ),
     )  # COWORK_TURN_MINDS_CODING_MODEL
+    datasource_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable version-bound datasource grants for cloud turns. Keep false "
+            "until the controller and pod support the datasource block."
+        ),
+    )  # COWORK_TURN_DATASOURCE_ENABLED
+    datasource_producer_key_id: str = Field(
+        default="",
+        description="Key id for the dedicated datasource producer service role.",
+    )  # COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID
+    datasource_producer_key: str = Field(
+        default="",
+        repr=False,
+        description="Secret for the dedicated datasource producer service role.",
+    )  # COWORK_TURN_DATASOURCE_PRODUCER_KEY
 
 
 class AppSettings(Settings):
