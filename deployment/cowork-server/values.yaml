@@ -334,6 +334,13 @@ deployment:
     # reads "false" and the guard expects it.
     - name: COWORK_TURN_DATASOURCE_ENABLED
       value: "true"
+    # TEST ENABLEMENT, integration branch only, never merged or cherry-picked.
+    # The capability policy is default-off and needs both gates: the connector
+    # spec's own cloud.available, set in this branch's spec change, and this
+    # manifest naming the pairs. Without it the connector list shows no
+    # database and the capability response reports every method unavailable.
+    - name: COWORK_DATASOURCE_CAPABILITIES
+      value: '{"manifest_version": 1, "enabled": ["postgres:host-port", "mysql:host-password"]}'
     - name: COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID
       valueFrom:
         secretKeyRef:
