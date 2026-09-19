@@ -104,4 +104,3 @@ def datasource_capabilities(
             for connector_id, methods in caps.methods.items()
         },
     )
-
