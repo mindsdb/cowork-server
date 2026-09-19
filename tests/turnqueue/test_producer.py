@@ -1,5 +1,7 @@
 import asyncio
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -320,6 +322,171 @@ async def test_stream_remote_replies_omits_oauth_block_when_no_connections(monke
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
     assert "oauth" not in params
+
+
+@pytest.mark.asyncio
+async def test_datasource_grants_are_registered_before_refs_are_enqueued(monkeypatch):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    events = []
+
+    async def fake_mint_details(**_kw):
+        events.append("mint")
+        return SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")
+
+    async def fake_list(**kw):
+        events.append("list")
+        assert kw["org_id"] == "o1" and kw["user_id"] == "u1"
+        return [{
+            "id": 7,
+            "connector_id": "postgresql",
+            "name": "events",
+            "status": "verified",
+            "credential_version": 3,
+        }]
+
+    async def fake_register(**kw):
+        events.append("register")
+        assert not fake.added
+        assert kw["turn_key_id"] == "mdb_prefix"
+        assert kw["connection_ids"] == [7]
+        return {
+            "user_id": "u1",
+            "organization_id": "o1",
+            "turn_key_id": "mdb_prefix",
+            "correlation_id": "r",
+            "audience": "datasource-gateway",
+            "purpose": "execute",
+            "grants": [{
+                "connection_id": 7,
+                "credential_version": 3,
+                "token": "must-not-cross-the-queue",
+            }],
+        }
+
+    original_xadd = fake.xadd
+
+    async def tracking_xadd(*args, **kwargs):
+        events.append("enqueue")
+        return await original_xadd(*args, **kwargs)
+
+    monkeypatch.setattr(prod, "mint_turn_key_details", fake_mint_details)
+    monkeypatch.setattr(prod, "list_verified_datasource_connections", fake_list)
+    monkeypatch.setattr(prod, "register_datasource_grants", fake_register)
+    monkeypatch.setattr(fake, "xadd", tracking_xadd)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert events.index("register") < events.index("enqueue")
+    assert params["datasource"] == {
+        "protocol_version": 1,
+        "connections": [{"connection_id": 7, "credential_version": 3}],
+    }
+    assert "must-not-cross-the-queue" not in json.dumps(params)
+    assert "gateway" not in params["datasource"]
+
+
+@pytest.mark.asyncio
+async def test_datasource_grant_mismatch_fails_before_enqueue(monkeypatch):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    monkeypatch.setattr(
+        prod,
+        "mint_turn_key_details",
+        AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")),
+    )
+    monkeypatch.setattr(
+        prod,
+        "list_verified_datasource_connections",
+        AsyncMock(return_value=[{
+            "id": 7,
+            "connector_id": "postgresql",
+            "name": "events",
+            "status": "verified",
+            "credential_version": 3,
+        }]),
+    )
+    monkeypatch.setattr(
+        prod,
+        "register_datasource_grants",
+        AsyncMock(return_value={
+            "user_id": "u1",
+            "organization_id": "o1",
+            "turn_key_id": "mdb_prefix",
+            "correlation_id": "r",
+            "audience": "datasource-gateway",
+            "purpose": "execute",
+            "grants": [{"connection_id": 7, "credential_version": 2}],
+        }),
+    )
+
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+
+    with pytest.raises(ProductPermissionUnavailable):
+        await _drain(prod.stream_remote_replies(
+            conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        ))
+    assert not fake.added
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field",
+    ["user_id", "organization_id", "turn_key_id", "correlation_id", "audience", "purpose"],
+)
+async def test_datasource_grant_binding_mismatch_fails_before_enqueue(monkeypatch, field):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    monkeypatch.setattr(
+        prod,
+        "mint_turn_key_details",
+        AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")),
+    )
+    monkeypatch.setattr(
+        prod,
+        "list_verified_datasource_connections",
+        AsyncMock(return_value=[{
+            "id": 7,
+            "connector_id": "postgresql",
+            "name": "events",
+            "status": "verified",
+            "credential_version": 3,
+        }]),
+    )
+    binding = {
+        "user_id": "u1",
+        "organization_id": "o1",
+        "turn_key_id": "mdb_prefix",
+        "correlation_id": "r",
+        "audience": "datasource-gateway",
+        "purpose": "execute",
+    }
+    binding[field] = "wrong"
+    monkeypatch.setattr(
+        prod,
+        "register_datasource_grants",
+        AsyncMock(return_value={
+            **binding,
+            "grants": [{"connection_id": 7, "credential_version": 3}],
+        }),
+    )
+
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+
+    with pytest.raises(ProductPermissionUnavailable):
+        await _drain(prod.stream_remote_replies(
+            conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        ))
+    assert not fake.added
 
 
 @pytest.mark.asyncio
