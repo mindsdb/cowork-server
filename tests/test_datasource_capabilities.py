@@ -56,9 +56,9 @@ def test_enabling_one_pair_marks_only_that_pair(adapter_verified_datasources):
     assert caps.available_connector_ids() == {"postgres"}
 
 
-def test_configuration_cannot_enable_a_method_the_spec_calls_unverified(caplog):
-    # The shipped specs say the hosted path cannot execute either method yet,
-    # so this runs without the fixture that lifts that flag.
+def test_configuration_cannot_enable_a_method_the_spec_calls_unverified(
+    adapter_unverified_datasources, caplog
+):
     with caplog.at_level(logging.WARNING):
         caps = _caps(ENABLED_ONE)
 
