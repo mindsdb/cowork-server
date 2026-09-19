@@ -75,3 +75,126 @@ async def test_revoke_turn_key_uses_cluster_only_route(monkeypatch):
     assert captured["url"] == "http://auth.internal/internal/turn-keys/corr-1/"
     assert "/v1/internal/turn-keys/" not in captured["url"]
     assert captured["headers"] == {"X-Internal-Auth": "shh"}
+
+
+class _DatasourceSettings(_Settings):
+    datasource_producer_key_id: str = "producer-v1"
+    datasource_producer_key: str = "producer-secret"
+
+
+def _over_mock_transport(monkeypatch, handler):
+    """Swap the client for a real one over MockTransport, keeping the module's own kwargs,
+    so the URL, query and header construction under test is the real thing."""
+    real_client = httpx.AsyncClient
+
+    def factory(*args, **kwargs):
+        return real_client(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+
+
+@pytest.mark.asyncio
+async def test_a_mint_that_returns_no_prefix_is_a_permission_failure(monkeypatch):
+    """The prefix is what every grant is bound to; a mint without it cannot start
+    a datasource turn, and must not be mistaken for a transport error."""
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+    from cowork.turnqueue.auth_keys import mint_turn_key_details
+
+    async def handler(request):
+        return httpx.Response(200, json={"key": "mdb_prefix.secret"})
+
+    _over_mock_transport(monkeypatch, handler)
+    with pytest.raises(ProductPermissionUnavailable):
+        await mint_turn_key_details(
+            user_id="u1", org_id="o1", correlation_id="corr-1", ttl_seconds=1200, settings=_Settings()
+        )
+
+
+@pytest.mark.asyncio
+async def test_a_mint_with_a_prefix_returns_both_halves(monkeypatch):
+    from cowork.turnqueue.auth_keys import MintedTurnKey, mint_turn_key_details
+
+    async def handler(request):
+        return httpx.Response(200, json={"key": "mdb_prefix.secret", "prefix": "mdb_prefix"})
+
+    _over_mock_transport(monkeypatch, handler)
+    minted = await mint_turn_key_details(
+        user_id="u1", org_id="o1", correlation_id="corr-1", ttl_seconds=1200, settings=_Settings()
+    )
+    assert minted == MintedTurnKey(key="mdb_prefix.secret", prefix="mdb_prefix")
+
+
+@pytest.mark.asyncio
+async def test_listing_sends_the_turn_key_prefix_and_the_producer_identity(monkeypatch):
+    """Auth derives the listing's identity from the live turn key, so the prefix is
+    required; without it every datasource-enabled turn is refused at the door."""
+    from cowork.turnqueue.auth_keys import list_verified_datasource_connections
+
+    seen = {}
+
+    async def handler(request):
+        seen["url"] = request.url
+        seen["headers"] = request.headers
+        return httpx.Response(200, json={"items": [{"id": 7, "status": "verified", "credential_version": 3}]})
+
+    _over_mock_transport(monkeypatch, handler)
+    items = await list_verified_datasource_connections(
+        org_id="o1", user_id="u1", turn_key_id="mdb_prefix", settings=_DatasourceSettings()
+    )
+
+    assert items == [{"id": 7, "status": "verified", "credential_version": 3}]
+    assert seen["url"].path == "/internal/datasources/connections/"
+    assert dict(seen["url"].params) == {"organization_id": "o1", "user_id": "u1", "turn_key_id": "mdb_prefix"}
+    assert seen["headers"]["x-datasource-service-key-id"] == "producer-v1"
+    assert seen["headers"]["x-datasource-service-key"] == "producer-secret"
+    assert "authorization" not in seen["headers"]
+    assert "x-internal-auth" not in seen["headers"]
+
+
+@pytest.mark.asyncio
+async def test_a_denied_listing_is_a_permission_failure_not_a_transport_error(monkeypatch):
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+    from cowork.turnqueue.auth_keys import list_verified_datasource_connections
+
+    async def handler(request):
+        return httpx.Response(404, json={"code": "identity_denied", "detail": "Datasource identity is unavailable."})
+
+    _over_mock_transport(monkeypatch, handler)
+    with pytest.raises(ProductPermissionUnavailable):
+        await list_verified_datasource_connections(
+            org_id="o1", user_id="u1", turn_key_id="mdb_prefix", settings=_DatasourceSettings()
+        )
+
+
+@pytest.mark.asyncio
+async def test_grant_registration_sends_the_exact_body_and_the_producer_identity(monkeypatch):
+    import json as _json
+
+    from cowork.turnqueue.auth_keys import register_datasource_grants
+
+    seen = {}
+
+    async def handler(request):
+        seen["url"] = request.url
+        seen["headers"] = request.headers
+        seen["json"] = _json.loads(request.content)
+        return httpx.Response(201, json={**seen["json"], "grants": []})
+
+    _over_mock_transport(monkeypatch, handler)
+    await register_datasource_grants(
+        user_id="u1", org_id="o1", correlation_id="r", turn_key_id="mdb_prefix", connection_ids=[7],
+        settings=_DatasourceSettings(),
+    )
+
+    assert seen["url"].path == "/internal/datasources/turn-grants/"
+    assert seen["json"] == {
+        "user_id": "u1",
+        "organization_id": "o1",
+        "correlation_id": "r",
+        "turn_key_id": "mdb_prefix",
+        "connection_ids": [7],
+        "audience": "datasource-gateway",
+        "purpose": "execute",
+    }
+    assert seen["headers"]["x-datasource-service-key-id"] == "producer-v1"
+    assert "x-internal-auth" not in seen["headers"]

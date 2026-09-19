@@ -95,3 +95,38 @@ def test_turn_reply_parses_turn_history_rows():
     rows = reply.data["rows"]
     assert rows[0]["content"][0]["input"] == {"code": "1"}
     assert rows[1]["content"][0]["tool_use_id"] == "t1"
+
+
+def test_turn_job_carries_a_versioned_datasource_block():
+    datasource = {"protocol_version": 1, "connections": [{"connection_id": 7, "credential_version": 3}]}
+    job = TurnJob(op="anton_turn", conversation_id="c", correlation_id="r",
+                  reply_stream="scratchpad:reply:c", params={"input": "hi", "datasource": datasource})
+    assert TurnJob.model_validate_json(job.model_dump_json()).params["datasource"] == datasource
+
+
+@pytest.mark.parametrize(
+    "datasource",
+    [
+        "tk_abc",
+        {"protocol_version": 2, "connections": [{"connection_id": 7, "credential_version": 3}]},
+        {"protocol_version": 1, "connections": [{"connection_id": 7, "credential_version": 3}], "gateway_url": "x"},
+        {"protocol_version": 1, "connections": []},
+        {"protocol_version": 1, "connections": [{"connection_id": i, "credential_version": 1} for i in range(1, 102)]},
+        {"protocol_version": 1, "connections": [{"connection_id": "7", "credential_version": 3}]},
+        {"protocol_version": 1, "connections": [{"connection_id": True, "credential_version": 3}]},
+        {"protocol_version": 1, "connections": [{"connection_id": 7, "credential_version": 0}]},
+        {"protocol_version": 1, "connections": [{"connection_id": 7, "credential_version": 3, "token": "s"}]},
+        {"protocol_version": 1, "connections": [{"connection_id": 7, "credential_version": 3},
+                                                {"connection_id": 7, "credential_version": 4}]},
+    ],
+    ids=["not_an_object", "version", "extra_field", "empty", "over_the_cap", "string_id", "bool_id",
+         "zero_version", "secret_bearing_reference", "duplicate_id"],
+)
+def test_turn_job_refuses_a_malformed_datasource_block_before_it_is_queued(datasource):
+    """The queue model is the last check before Redis; a block the controller
+    would reject must never leave the producer."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="datasource"):
+        TurnJob(op="anton_turn", conversation_id="c", correlation_id="r",
+                reply_stream="scratchpad:reply:c", params={"input": "hi", "datasource": datasource})
