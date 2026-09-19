@@ -6,6 +6,7 @@ and keeps the long-lived tenant key out of the worker pod.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
 from typing import Literal
 
 import httpx
@@ -13,8 +14,15 @@ import httpx
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 
 
-async def mint_turn_key(*, user_id: str, org_id: str, correlation_id: str,
-                        ttl_seconds: int, settings, purpose: Literal["execution", "artifact_publish"] = "execution") -> str:
+@dataclass(frozen=True)
+class MintedTurnKey:
+    key: str
+    prefix: str
+
+
+async def _request_turn_key(*, user_id: str, org_id: str, correlation_id: str,
+                            ttl_seconds: int, settings,
+                            purpose: Literal["execution", "artifact_publish"]) -> dict:
     expiry = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
     # Cluster-only route: turn-key mint is secret-only (no Bearer factor), so
     # auth serves it under the top-level /internal/ prefix the public LB never
@@ -36,10 +44,39 @@ async def mint_turn_key(*, user_id: str, org_id: str, correlation_id: str,
             result = resp.json()
             if not isinstance(result, dict) or not isinstance(result.get("key"), str) or not result["key"].strip():
                 raise ProductPermissionUnavailable()
-            return result["key"]
+            return result
     except (httpx.HTTPError, TimeoutError, ValueError) as exc:
         raise ProductPermissionUnavailable() from exc
 
+
+async def mint_turn_key(*, user_id: str, org_id: str, correlation_id: str,
+                        ttl_seconds: int, settings, purpose: Literal["execution", "artifact_publish"] = "execution") -> str:
+    result = await _request_turn_key(
+        user_id=user_id,
+        org_id=org_id,
+        correlation_id=correlation_id,
+        ttl_seconds=ttl_seconds,
+        settings=settings,
+        purpose=purpose,
+    )
+    return result["key"]
+
+
+async def mint_turn_key_details(*, user_id: str, org_id: str, correlation_id: str,
+                                ttl_seconds: int, settings,
+                                purpose: Literal["execution", "artifact_publish"] = "execution") -> MintedTurnKey:
+    result = await _request_turn_key(
+        user_id=user_id,
+        org_id=org_id,
+        correlation_id=correlation_id,
+        ttl_seconds=ttl_seconds,
+        settings=settings,
+        purpose=purpose,
+    )
+    prefix = result.get("prefix")
+    if not isinstance(prefix, str) or not prefix.strip():
+        raise ProductPermissionUnavailable()
+    return MintedTurnKey(key=result["key"], prefix=prefix)
 
 
 async def list_active_connections(*, org_id: str, user_id: str, settings) -> list[dict]:
@@ -58,6 +95,70 @@ async def list_active_connections(*, org_id: str, user_id: str, settings) -> lis
         resp = await client.get(url, params=params, headers=headers)
         resp.raise_for_status()
         return resp.json().get("items", [])
+
+
+async def list_verified_datasource_connections(*, org_id: str, user_id: str, turn_key_id: str, settings) -> list[dict]:
+    """List auth-owned, verified datasource metadata for one user and org.
+
+    Auth derives the identity from the live turn key named by ``turn_key_id``
+    (the public prefix the mint returned); the ids are cross-checks only.
+    """
+    if not settings.datasource_producer_key_id or not settings.datasource_producer_key:
+        raise ProductPermissionUnavailable()
+    url = f"{settings.auth_internal_base_url.rstrip('/')}/internal/datasources/connections/"
+    headers = {
+        "X-Datasource-Service-Key-Id": settings.datasource_producer_key_id,
+        "X-Datasource-Service-Key": settings.datasource_producer_key,
+    }
+    params = {"organization_id": org_id, "user_id": user_id, "turn_key_id": turn_key_id}
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+            resp = await client.get(url, params=params, headers=headers)
+            resp.raise_for_status()
+            result = resp.json()
+    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+        raise ProductPermissionUnavailable() from exc
+    if not isinstance(result, dict) or not isinstance(result.get("items"), list):
+        raise ProductPermissionUnavailable()
+    return result["items"]
+
+
+async def register_datasource_grants(
+    *,
+    user_id: str,
+    org_id: str,
+    correlation_id: str,
+    turn_key_id: str,
+    connection_ids: list[int],
+    settings,
+) -> dict:
+    """Register an immutable grant set for the existing turn key."""
+    if not settings.datasource_producer_key_id or not settings.datasource_producer_key:
+        raise ProductPermissionUnavailable()
+    url = f"{settings.auth_internal_base_url.rstrip('/')}/internal/datasources/turn-grants/"
+    headers = {
+        "X-Datasource-Service-Key-Id": settings.datasource_producer_key_id,
+        "X-Datasource-Service-Key": settings.datasource_producer_key,
+    }
+    body = {
+        "user_id": user_id,
+        "organization_id": org_id,
+        "correlation_id": correlation_id,
+        "turn_key_id": turn_key_id,
+        "connection_ids": connection_ids,
+        "audience": "datasource-gateway",
+        "purpose": "execute",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+            resp = await client.post(url, json=body, headers=headers)
+            resp.raise_for_status()
+            result = resp.json()
+    except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+        raise ProductPermissionUnavailable() from exc
+    if not isinstance(result, dict):
+        raise ProductPermissionUnavailable()
+    return result
 
 
 async def revoke_turn_key(*, instance_id: str, settings) -> None:

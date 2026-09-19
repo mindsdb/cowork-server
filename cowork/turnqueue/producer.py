@@ -20,8 +20,14 @@ from cowork.services.providers import minds_chat_base_url
 from cowork.db.scoped import TenantScope
 from cowork.services import product_permissions
 from cowork.services.product_permissions import require_product_permission
-from cowork.turnqueue.auth_keys import list_active_connections, mint_turn_key
-from cowork.turnqueue.models import TurnJob, TurnReply
+from cowork.turnqueue.auth_keys import (
+    list_active_connections,
+    list_verified_datasource_connections,
+    mint_turn_key,
+    mint_turn_key_details,
+    register_datasource_grants,
+)
+from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnReply
 from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.redis_client import cancel_flag_key, get_redis
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host, get_app_settings
@@ -117,6 +123,10 @@ async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
         user_id=user_id, org_id=org_id, correlation_id=correlation_id,
         ttl_seconds=settings.turn_key_ttl_seconds, settings=settings,
     )
+    return _build_llm_block(api_key, settings)
+
+
+def _build_llm_block(api_key: str, settings: TurnQueueSettings) -> dict:
     base_url = settings.minds_base_url or minds_chat_base_url(default_turn_minds_api_host())
     block = {"provider": "minds-cloud", "api_key": api_key, "base_url": base_url}
     # Must be a MINDS alias (the pod runs on minds-cloud). Default to the
@@ -126,6 +136,19 @@ async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
     if coding_model:
         block["coding_model"] = coding_model
     return block
+
+
+async def _mint_llm_block_with_turn_key_id(
+    *, org_id: str | None, user_id: str | None, correlation_id: str, settings: TurnQueueSettings,
+) -> tuple[dict, str]:
+    minted = await mint_turn_key_details(
+        user_id=user_id,
+        org_id=org_id,
+        correlation_id=correlation_id,
+        ttl_seconds=settings.turn_key_ttl_seconds,
+        settings=settings,
+    )
+    return _build_llm_block(minted.key, settings), minted.prefix
 
 
 async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
@@ -180,6 +203,114 @@ async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
     return {
         "connections": connections,
     }
+
+
+def _refuse_datasource_grants(reason: str) -> product_permissions.ProductPermissionUnavailable:
+    """Name the failed check for the operator, who otherwise sees the same
+    permission_unavailable for an outage, a malformed row and a bad binding.
+    The reason is a fixed phrase: never the key, the producer secret or a row."""
+    logger.warning("[producer] datasource grants refused: %s", reason)
+    return product_permissions.ProductPermissionUnavailable()
+
+
+def _datasource_connection_refs(connections: list[dict], disabled: list[dict] | None) -> list[dict]:
+    """The grant set: every verified connection auth listed, minus the
+    conversation's disabled ones. A disabled entry carries ``engine`` and
+    ``name``; auth's ``connector_id`` is the same value, so the join is exact."""
+    disabled_keys = {
+        (entry.get("engine"), entry.get("name")) for entry in (disabled or []) if isinstance(entry, dict)
+    }
+    refs: list[dict] = []
+    seen: set[int] = set()
+    for connection in connections:
+        if not isinstance(connection, dict):
+            raise _refuse_datasource_grants("listing carries a connection that is not an object")
+        connection_id = connection.get("id")
+        credential_version = connection.get("credential_version")
+        if (
+            not isinstance(connection.get("connector_id"), str)
+            or not connection["connector_id"]
+            or not isinstance(connection.get("name"), str)
+            or not connection["name"]
+            or connection.get("status") != "verified"
+        ):
+            raise _refuse_datasource_grants("listing carries a connection without verified metadata")
+        if (connection.get("connector_id"), connection.get("name")) in disabled_keys:
+            continue
+        if (
+            isinstance(connection_id, bool)
+            or not isinstance(connection_id, int)
+            or connection_id < 1
+            or isinstance(credential_version, bool)
+            or not isinstance(credential_version, int)
+            or credential_version < 1
+            or connection_id in seen
+        ):
+            raise _refuse_datasource_grants("listing carries a malformed or repeated connection reference")
+        seen.add(connection_id)
+        refs.append({"connection_id": connection_id, "credential_version": credential_version})
+    # Auth caps what is registered, so the cap applies after the disabled ones are gone.
+    if len(refs) > MAX_DATASOURCE_CONNECTIONS:
+        raise _refuse_datasource_grants("more enabled connections than a grant set may hold")
+    return refs
+
+
+def _same_identifier(echoed: object, ours: str) -> bool:
+    """Auth serialises ids through UUID fields, lowercase and hyphenated; compare canonical forms."""
+    if not isinstance(echoed, str):
+        return False
+    try:
+        return uuid.UUID(echoed) == uuid.UUID(ours)
+    except ValueError:
+        return echoed == ours
+
+
+async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
+                                 correlation_id: str, turn_key_id: str | None,
+                                 disabled: list[dict] | None,
+                                 settings: TurnQueueSettings) -> dict | None:
+    """Register verified datasource grants before a datasource block is queued."""
+    if not settings.datasource_enabled or not org_id or not user_id:
+        return None
+    # A datasource-enabled dispatch without the key prefix is a producer
+    # misconfiguration; it fails here rather than reaching auth without it.
+    if not isinstance(turn_key_id, str) or not turn_key_id.strip():
+        raise _refuse_datasource_grants("dispatch carries no turn key prefix")
+    connections = await list_verified_datasource_connections(
+        org_id=org_id, user_id=user_id, turn_key_id=turn_key_id, settings=settings
+    )
+    refs = _datasource_connection_refs(connections, disabled)
+    if not refs:
+        return None
+    response = await register_datasource_grants(
+        user_id=user_id,
+        org_id=org_id,
+        correlation_id=correlation_id,
+        turn_key_id=turn_key_id,
+        connection_ids=[ref["connection_id"] for ref in refs],
+        settings=settings,
+    )
+    if (
+        not _same_identifier(response.get("user_id"), user_id)
+        or not _same_identifier(response.get("organization_id"), org_id)
+        or response.get("turn_key_id") != turn_key_id
+        or not _same_identifier(response.get("correlation_id"), correlation_id)
+        or response.get("audience") != "datasource-gateway"
+        or response.get("purpose") != "execute"
+    ):
+        raise _refuse_datasource_grants("grant response binding does not match this turn")
+    grants = response.get("grants")
+    if not isinstance(grants, list):
+        raise _refuse_datasource_grants("grant response carries no grant list")
+    returned = {
+        (grant.get("connection_id"), grant.get("credential_version"))
+        for grant in grants
+        if isinstance(grant, dict)
+    }
+    expected = {(ref["connection_id"], ref["credential_version"]) for ref in refs}
+    if returned != expected or len(grants) != len(expected):
+        raise _refuse_datasource_grants("grants differ from the requested connection references")
+    return {"protocol_version": 1, "connections": refs}
 
 
 # What the reply loop reports when the worker stops answering. Shaped like the
@@ -259,6 +390,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 workspace_rel_path: str = "projects/general",
                                 correlation_id: str | None = None,
                                 llm: dict | None = None,
+                                turn_key_id: str | None = None,
                                 disabled: list[dict] | None = None,
                                 started_at: str | None = None):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
@@ -300,10 +432,26 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         llm_block = llm
         oauth_connections = await oauth_connections_coro
     else:
-        llm_block, oauth_connections = await asyncio.gather(
-            _mint_llm_block(org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings),
-            oauth_connections_coro,
-        )
+        if settings.datasource_enabled:
+            (llm_block, turn_key_id), oauth_connections = await asyncio.gather(
+                _mint_llm_block_with_turn_key_id(
+                    org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
+                ),
+                oauth_connections_coro,
+            )
+        else:
+            llm_block, oauth_connections = await asyncio.gather(
+                _mint_llm_block(org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings),
+                oauth_connections_coro,
+            )
+    datasource_block = await _mint_datasource_block(
+        org_id=org_id,
+        user_id=user_id,
+        correlation_id=corr,
+        turn_key_id=turn_key_id,
+        disabled=disabled,
+        settings=settings,
+    )
     # Reuses the turn key already minted for llm_block — never mints a
     # second one. Org/cloud mode only: local-mode turns build in-process
     # and never reach this function at all.
@@ -331,6 +479,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # Absent entirely (not an empty dict) when there's nothing to
               # offer — see _mint_oauth_block's docstring for why.
               **({"oauth": oauth_block} if oauth_block else {}),
+              **({"datasource": datasource_block} if datasource_block else {}),
               # Conversation creation time, ISO 8601. The pod is fresh every
               # turn and would otherwise stamp today's date into the system
               # prompt, changing the cached prefix at midnight.
