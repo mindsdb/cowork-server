@@ -132,3 +132,27 @@ def granted_product_permissions(monkeypatch):
 
     monkeypatch.setattr(product_permissions, "has_product_permission", allowed)
     monkeypatch.setattr(artifact_workspace, "has_product_permission", allowed)
+
+
+@pytest.fixture
+def adapter_verified_datasources():
+    """Mark the shipped datasource methods as adapter-verified for one test.
+
+    Both database specs ship ``cloud.available: false``, which is the
+    capability policy's first gate, so a test about the deployment's own
+    enable list has to lift it. Mutates the registry's cached spec data and
+    puts it back, because that is what a release flipping the flag looks like.
+    """
+    from cowork.services.connectors.specs._registry import registry
+
+    raw = registry.get_connectors()
+    restore: list[tuple[dict, bool]] = []
+    for connector_id in ("postgres", "mysql"):
+        for method in raw[connector_id]["form"].get("methods", []):
+            cloud = method.get("cloud")
+            if cloud is not None:
+                restore.append((cloud, cloud.get("available", False)))
+                cloud["available"] = True
+    yield
+    for cloud, previous in restore:
+        cloud["available"] = previous

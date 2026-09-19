@@ -1,10 +1,14 @@
 """Which connector methods this deployment may run as a cloud datasource.
 
-Two gates, and both have to pass. A method is a *candidate* only when its
+Three gates, and all have to pass. A method is a *candidate* only when its
 spec declares a `cloud` block, so the policy can never offer a form the
 hosted path has no fields for; candidacy comes from the registry, not from
-configuration. A candidate is *available* only when the deployment's manifest
-names it and that manifest is the version this code understands.
+configuration. A candidate is *adapter-verified* only when that block says
+the hosted path can execute it, which is the spec's own statement and not
+something an operator can assert. A verified candidate is *available* only
+when the deployment's manifest names it and that manifest is the version this
+code understands. Configuration can therefore switch a method off but never
+switch one on ahead of the adapter work.
 
 Everything about the configuration fails closed. Unparseable JSON, a version
 this code does not know, or an unexpected field leaves every method
@@ -43,7 +47,7 @@ class DatasourceManifest(BaseModel):
 
 @dataclass(frozen=True)
 class DatasourceCapabilities:
-    """The one policy object. ENG-2807's producer and the relay both read it."""
+    """The one policy object: the submission relay and the turn producer both read it."""
 
     manifest_version: int
     # connector id -> method id -> available. Every candidate appears, so a
@@ -65,10 +69,19 @@ class DatasourceCapabilities:
         return list(self._fields.get((connector_id, method), []))
 
 
-def _candidates(registry) -> tuple[dict[str, dict[str, bool]], dict[tuple[str, str], list[ConnectorField]]]:
-    """Every spec method that declares a cloud block, all switched off."""
+def _candidates(registry) -> tuple[
+    dict[str, dict[str, bool]], dict[tuple[str, str], list[ConnectorField]], set[tuple[str, str]]
+]:
+    """Every spec method that declares a cloud block, all switched off.
+
+    The third value is the subset whose block says the hosted path can execute
+    the method. A candidate outside it stays a known capability that reports
+    itself unavailable, so the response can say "known but off" for a form the
+    adapters do not support yet.
+    """
     methods: dict[str, dict[str, bool]] = {}
     fields: dict[tuple[str, str], list[ConnectorField]] = {}
+    verified: set[tuple[str, str]] = set()
     for metadata in registry.list_connectors():
         spec = registry.get_connector(metadata.id)
         for method in (spec.form.methods or []) if spec and spec.form else []:
@@ -76,7 +89,9 @@ def _candidates(registry) -> tuple[dict[str, dict[str, bool]], dict[tuple[str, s
                 continue
             methods.setdefault(metadata.id, {})[method.id] = False
             fields[(metadata.id, method.id)] = list(method.cloud.fields)
-    return methods, fields
+            if method.cloud.available:
+                verified.add((metadata.id, method.id))
+    return methods, fields, verified
 
 
 def _parse(raw: str) -> DatasourceManifest | None:
@@ -99,7 +114,7 @@ def _parse(raw: str) -> DatasourceManifest | None:
 
 
 def load_datasource_capabilities(settings: AppSettings | None = None, registry=default_registry) -> DatasourceCapabilities:
-    methods, fields = _candidates(registry)
+    methods, fields, verified = _candidates(registry)
     manifest = _parse((settings or get_app_settings()).datasource_capabilities)
 
     if manifest is None:
@@ -113,15 +128,23 @@ def load_datasource_capabilities(settings: AppSettings | None = None, registry=d
         return DatasourceCapabilities(MANIFEST_VERSION, methods, fields)
 
     unknown = 0
+    unverified = 0
     for pair in manifest.enabled:
         connector_id, _, method = str(pair).partition(":")
-        if method and method in methods.get(connector_id, {}):
-            methods[connector_id][method] = True
-        else:
+        if not method or method not in methods.get(connector_id, {}):
             unknown += 1
+        elif (connector_id, method) not in verified:
+            unverified += 1
+        else:
+            methods[connector_id][method] = True
     if unknown:
         logger.warning(
             "[datasources] %s enabled capability pair(s) name no connector method that declares cloud support; ignored",
             unknown,
+        )
+    if unverified:
+        logger.warning(
+            "[datasources] %s enabled capability pair(s) are not adapter-verified in their spec; they stay unavailable",
+            unverified,
         )
     return DatasourceCapabilities(MANIFEST_VERSION, methods, fields)

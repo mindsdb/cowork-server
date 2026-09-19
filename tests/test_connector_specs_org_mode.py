@@ -100,7 +100,9 @@ def _with_capabilities(monkeypatch, raw: str):
 
 
 @pytest.mark.asyncio
-async def test_an_enabled_datasource_is_listed_even_though_oauth_never_heard_of_it(monkeypatch):
+async def test_an_enabled_datasource_is_listed_even_though_oauth_never_heard_of_it(
+    monkeypatch, adapter_verified_datasources
+):
     async def fake_proxy_catalogue(request, settings):
         return {"items": []}
 
@@ -126,7 +128,9 @@ async def test_a_disabled_datasource_stays_out_of_the_list(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_an_enabled_datasource_reads_as_available_in_the_full_listing(monkeypatch):
+async def test_an_enabled_datasource_reads_as_available_in_the_full_listing(
+    monkeypatch, adapter_verified_datasources
+):
     async def fake_proxy_catalogue(request, settings):
         return {"items": [{"id": "gmail"}]}
 
