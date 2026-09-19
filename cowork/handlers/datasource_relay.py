@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from typing import Any
 from uuid import UUID
 
-from fastapi import HTTPException, Request, status
+from fastapi import Request
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
@@ -30,7 +31,11 @@ from cowork.common.settings.app_settings import OAuthSettings
 from cowork.db.scoped import ScopedSession
 from cowork.schemas.connectors import DatasourceCreateRequest, SubmitFormRequest
 from cowork.services.connectors.datasource_capabilities import load_datasource_capabilities
-from cowork.services.connectors.datasources import InvalidDatasourceInput, normalize_datasource_input
+from cowork.services.connectors.datasources import (
+    InvalidDatasourceInput,
+    UnsupportedDatasourceCapability,
+    normalize_datasource_input,
+)
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import missing_required_fields
@@ -39,14 +44,15 @@ from cowork.services.conversations import ConversationService
 logger = logging.getLogger(__name__)
 
 
-def _unsupported() -> HTTPException:
-    return HTTPException(
-        status_code=status.HTTP_409_CONFLICT,
-        detail={
-            "code": "unsupported_capability",
-            "message": "This connector method is not available in cloud.",
-        },
-    )
+def _rendered(name: str) -> str:
+    """The connection name as it may appear inside markdown.
+
+    The name is the submitter's own text and this turn is rendered as
+    markdown, so a newline followed by a fenced block would put a form of
+    their choosing into their conversation. Whitespace collapses and the fence
+    character goes.
+    """
+    return re.sub(r"\s+", " ", name).replace("`", "").strip()
 
 
 def _sse(event_type: str, payload: dict[str, Any]) -> str:
@@ -91,11 +97,14 @@ def _save_turn(scoped: ScopedSession, conversation_id: str | None, text: str, ev
         service = ConversationService(scoped)
         conversation = service.get_conversation(UUID(conversation_id))
         service.save_assistant_turn(conversation.id, text, events)
-    except Exception as exc:
+    except Exception:
+        # With the cause: the text and events hold the connection name and the
+        # connector id, nothing secret, and a silent loss here would otherwise
+        # look like a conversation that never had the turn.
         logger.warning(
-            "[datasources] could not record the submission turn for conversation %s: %s",
+            "[datasources] could not record the submission turn for conversation %s",
             conversation_id,
-            type(exc).__name__,
+            exc_info=True,
         )
 
 
@@ -110,7 +119,7 @@ async def relay_cloud_submission(
     spec = registry.get_connector(connector_id)
     capabilities = load_datasource_capabilities()
     if spec is None or not method or not capabilities.is_available(connector_id, method):
-        raise _unsupported()
+        raise UnsupportedDatasourceCapability()
 
     fields = capabilities.cloud_fields(connector_id, method)
     missing = missing_required_fields(fields, req.values, req.skipped)
@@ -125,12 +134,13 @@ async def relay_cloud_submission(
     saved = await auth_proxy.proxy_datasource_create(request, OAuthSettings(), payload)
 
     name = str(saved.get("name") or payload["name"])
+    shown = _rendered(name)
     response_id = "resp-" + uuid.uuid4().hex[:12]
     message_id = "msg-" + uuid.uuid4().hex[:12]
-    text = f"Saved encrypted draft **{name}** for {connector_id}. Validation has not run yet.\n\n"
+    text = f"Saved encrypted draft **{shown}** for {connector_id}. Validation has not run yet.\n\n"
     patch = {
         "form_id": spec.form.form_id,
-        "title": f"Saved — {name}",
+        "title": f"Saved — {shown}",
         "subtitle": "Stored encrypted. Validation runs separately; the connection shows its result when it finishes.",
         "status_text": None,
         "_is_probing": False,
@@ -153,7 +163,7 @@ async def relay_cloud_submission(
         }),
         ("response.completed", {
             "type": "response.completed",
-            "response": {"id": response_id, "status": "success", "user_label": name},
+            "response": {"id": response_id, "status": "success", "user_label": shown},
         }),
     ]
     recorded = [{**payload_, "sequence_number": index} for index, (_, payload_) in enumerate(events, start=1)]
