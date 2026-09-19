@@ -98,8 +98,12 @@ async def list_active_connections(*, org_id: str, user_id: str, settings) -> lis
         return resp.json().get("items", [])
 
 
-async def list_verified_datasource_connections(*, org_id: str, user_id: str, settings) -> list[dict]:
-    """List auth-owned, verified datasource metadata for one user and org."""
+async def list_verified_datasource_connections(*, org_id: str, user_id: str, turn_key_id: str, settings) -> list[dict]:
+    """List auth-owned, verified datasource metadata for one user and org.
+
+    Auth derives the identity from the live turn key named by ``turn_key_id``
+    (the public prefix the mint returned); the ids are cross-checks only.
+    """
     if not settings.datasource_producer_key_id or not settings.datasource_producer_key:
         raise ProductPermissionUnavailable()
     url = f"{settings.auth_internal_base_url.rstrip('/')}/internal/datasources/connections/"
@@ -107,7 +111,7 @@ async def list_verified_datasource_connections(*, org_id: str, user_id: str, set
         "X-Datasource-Service-Key-Id": settings.datasource_producer_key_id,
         "X-Datasource-Service-Key": settings.datasource_producer_key,
     }
-    params = {"organization_id": org_id, "user_id": user_id}
+    params = {"organization_id": org_id, "user_id": user_id, "turn_key_id": turn_key_id}
     try:
         async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
             resp = await client.get(url, params=params, headers=headers)
