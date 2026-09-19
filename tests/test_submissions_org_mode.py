@@ -171,6 +171,23 @@ def local_client(monkeypatch) -> TestClient:
     return TestClient(create_app())
 
 
+def test_the_route_stays_declared_for_org_members():
+    """A whole-route desktop refusal would make every case below unreachable.
+
+    The org branch is the refusal now, per method rather than per route, so a
+    change that declares this router desktop-only again would turn a relayed
+    submission into a 403 without failing anything else.
+    """
+    from cowork.api.v1.permissions import AuthenticatedInOrgMode
+    from cowork.api.v1.route_walker import declared_permissions
+    from cowork.server import create_app
+
+    app = create_app()
+    route = next(r for r in app.routes if getattr(r, "path", None) == PATH)
+
+    assert declared_permissions(route) == [AuthenticatedInOrgMode]
+
+
 def test_an_enabled_cloud_submission_is_relayed_and_never_staged(org_client, relay, caplog):
     recorded, _ = relay
 
