@@ -71,6 +71,30 @@ class OAuthConfig(BaseModel):
     token_auth_style: str = "body"
 
 
+class CloudMethod(BaseModel):
+    """What a method collects and whether it runs when the deployment is hosted.
+
+    A method without one of these is desktop-only.
+    """
+
+    # False while the hosted path can accept the form but not yet execute
+    # against it. An available form has never been proof of execution
+    # support, so this stays False until adapter tests establish the
+    # driver/server/method row it depends on.
+    available: bool = False
+    # Cloud copy, never inherited from the desktop method. The desktop text
+    # documents choices the hosted path refuses (disabling TLS, pointing at
+    # localhost), so rendering it to a cloud user would describe a form that
+    # cannot be submitted.
+    description: str | None = None
+    how_to: str | None = None
+    # The COMPLETE cloud field list, not a delta on the desktop `fields`.
+    # Two independent lists is what keeps the desktop form fixed while this
+    # one changes, and it is why a cloud CA field never appears beside a
+    # desktop one under a different name.
+    fields: list[ConnectorField] = []
+
+
 class ConnectorMethod(BaseModel):
     id: str
     label: str
@@ -82,6 +106,7 @@ class ConnectorMethod(BaseModel):
     how_to: str | None = None
     help_url: str | None = None
     fields: list[ConnectorField] = []
+    cloud: CloudMethod | None = None
 
     @field_validator("id")
     @classmethod
