@@ -861,6 +861,25 @@ and the publisher's artifact-only authentication path before this server change.
 Keep these admission checks in place during rollback while restrictive custom
 roles remain assigned. No new customer or staff permission grants are introduced.
 
+### Datasource grants on cloud turns
+
+`COWORK_TURN_DATASOURCE_ENABLED` (default `false`) lets a hosted turn query the
+user's verified PostgreSQL and MySQL connections in the organization. When it
+is on, the producer lists them from auth under the dedicated
+producer service role (`COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID` and
+`COWORK_TURN_DATASOURCE_PRODUCER_KEY`), bound to the turn key it has just
+minted, registers one grant per connection before enqueueing, and puts only
+connection ids and credential versions on the queue. No capability, password
+or gateway address crosses Redis. A listing or registration failure fails the
+dispatch as `permission_unavailable` instead of silently dropping the
+datasources.
+
+Turn the flag on only after auth serves the datasource producer and resolver
+endpoints, the inference deployment serves `/v1/datasources/`, the
+scratchpad-controller carries `SCRATCHPAD_CONTROLLER__ANTON_DATASOURCE_GATEWAY_URL`
+and the scratchpad image includes the typed helper. With the flag off nothing
+in this path runs, so the flag is also the rollback.
+
 ## Configuration
 
 Configuration is read from the database (`UserSettings` table) and can be managed through the Settings UI in the desktop app or via `PUT /api/v1/settings/`.
