@@ -9,12 +9,11 @@ has nothing to be told about.
 from __future__ import annotations
 
 import pytest
-from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from cowork.api.v1.router import api_router
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.principal import Principal, get_principal
+from cowork.server import create_app
 
 PATH = "/api/v1/capabilities/datasources"
 PRINCIPAL = Principal(
@@ -31,8 +30,10 @@ def _reset_app_settings():
 
 
 def _client(principal: Principal | None = PRINCIPAL) -> TestClient:
-    app = FastAPI()
-    app.include_router(api_router)
+    # The real application, not a bare router: the no-store guarantee below is
+    # a middleware on the /api/v1/capabilities prefix, and a hand-built app
+    # would pin only the header the handler sets on a success.
+    app = create_app()
     app.dependency_overrides[get_principal] = lambda: principal
     return TestClient(app)
 

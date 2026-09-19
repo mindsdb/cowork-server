@@ -29,6 +29,7 @@ from pydantic import BaseModel, ConfigDict, ValidationError
 
 from cowork.common.settings.app_settings import AppSettings, get_app_settings
 from cowork.schemas.connectors import ConnectorField
+from cowork.services.connectors.specs._registry import ConnectorSpecRegistry
 from cowork.services.connectors.specs._registry import registry as default_registry
 
 logger = logging.getLogger(__name__)
@@ -69,7 +70,7 @@ class DatasourceCapabilities:
         return list(self._fields.get((connector_id, method), []))
 
 
-def _candidates(registry) -> tuple[
+def _candidates(registry: ConnectorSpecRegistry) -> tuple[
     dict[str, dict[str, bool]], dict[tuple[str, str], list[ConnectorField]], set[tuple[str, str]]
 ]:
     """Every spec method that declares a cloud block, all switched off.
@@ -113,7 +114,9 @@ def _parse(raw: str) -> DatasourceManifest | None:
         return None
 
 
-def load_datasource_capabilities(settings: AppSettings | None = None, registry=default_registry) -> DatasourceCapabilities:
+def load_datasource_capabilities(
+    settings: AppSettings | None = None, registry: ConnectorSpecRegistry = default_registry
+) -> DatasourceCapabilities:
     methods, fields, verified = _candidates(registry)
     manifest = _parse((settings or get_app_settings()).datasource_capabilities)
 

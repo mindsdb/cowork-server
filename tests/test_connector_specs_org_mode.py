@@ -95,7 +95,7 @@ def _with_capabilities(monkeypatch, raw: str):
     monkeypatch.setattr(
         specs_endpoints,
         "load_datasource_capabilities",
-        lambda: real(AppSettings(datasource_capabilities=raw)),
+        lambda: real(AppSettings(COWORK_DATASOURCE_CAPABILITIES=raw)),
     )
 
 
