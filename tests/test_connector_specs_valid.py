@@ -259,6 +259,13 @@ DESKTOP_FIELDS = {
 }
 
 
+#: What each cloud form collects. PostgreSQL alone names a schema.
+CLOUD_DATABASE_FIELDS = {
+    "postgres": {"host", "port", "database", "schema", "username", "password"},
+    "mysql": {"host", "port", "database", "username", "password"},
+}
+
+
 class TestCloudDatabaseSpecs:
     """The cloud blocks on postgres and mysql.
 
@@ -300,7 +307,19 @@ class TestCloudDatabaseSpecs:
         certificate, because the question has no answer most people can give
         and the common answer for a self-hosted server is always the same."""
         names = {f.name for f in self._cloud(spec, connector_id).fields}
-        assert names == {"host", "port", "database", "username", "password"}
+        assert names == CLOUD_DATABASE_FIELDS[connector_id]
+
+    def test_only_postgresql_asks_for_a_schema(self, spec, connector_id):
+        """A PostgreSQL database holds many schemas, so a connection may name
+        the one it reads. MySQL's database is already its schema, and asking
+        twice would leave a reader unable to say which won."""
+        field = next(
+            (f for f in self._cloud(spec, connector_id).fields if f.name == "schema"), None
+        )
+        if connector_id != "postgres":
+            assert field is None
+            return
+        assert field is not None and field.required is False
 
     def test_no_cloud_field_toggles_tls(self, spec, connector_id):
         """`ssl_enabled` and `use_ssl` are desktop fields. A boolean here would
