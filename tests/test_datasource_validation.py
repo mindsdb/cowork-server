@@ -182,6 +182,39 @@ def test_a_captured_connection_is_probed_and_answers_with_its_terminal_state(org
     assert "password" not in body and "host" not in body
 
 
+def test_a_refused_probe_leaves_the_gateways_own_reason_in_the_log(org_client, cluster, caplog):
+    """The connection only ever says that validation failed, never why."""
+    _, scripted = cluster
+    scripted["probe"] = (
+        502,
+        {"code": "tls_verification_failed", "detail": "The database's certificate was not trusted.",
+         "request_id": "req-sentinel-1234"},
+    )
+    scripted["detail"] = (200, FAILED)
+
+    with caplog.at_level(logging.INFO):
+        res = org_client.post(CREATE, json=CREATE_BODY, headers=AUTH_HEADERS)
+
+    assert res.status_code == 201
+    assert "tls_verification_failed" in caplog.text
+    assert "req-sentinel-1234" in caplog.text
+    assert PASSWORD not in caplog.text
+    assert CAPABILITY not in caplog.text
+
+
+def test_a_body_that_is_not_the_gateways_shape_is_named_not_echoed(org_client, cluster, caplog):
+    _, scripted = cluster
+    scripted["probe"] = (502, {"unexpected": PASSWORD})
+    scripted["detail"] = (200, FAILED)
+
+    with caplog.at_level(logging.INFO):
+        res = org_client.post(CREATE, json=CREATE_BODY, headers=AUTH_HEADERS)
+
+    assert res.status_code == 201
+    assert "uncoded" in caplog.text
+    assert PASSWORD not in caplog.text
+
+
 def test_a_failing_probe_is_reported_as_the_connection_auth_recorded(org_client, cluster):
     recorded, scripted = cluster
     scripted["probe"] = (502, {"code": "connect_failed", "detail": "The database refused the connection."})

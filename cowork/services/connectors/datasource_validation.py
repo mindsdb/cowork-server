@@ -39,6 +39,29 @@ class _ValidationUnavailable(Exception):
     """This deployment cannot validate, or a hop refused. Never leaves the module."""
 
 
+def _refusal(response: httpx.Response) -> tuple[str, str]:
+    """The gateway's own code and request id for a refused probe.
+
+    Worth a log line because the connection ends up saying only that validation
+    failed: auth records a verdict, not a reason. The gateway's `code` is a
+    closed vocabulary and its `detail` is fixed text by contract, but only the
+    code and the request id are read here, and both are bounded, so a body from
+    something other than the gateway cannot turn this into an echo.
+    """
+    try:
+        body = response.json()
+    except ValueError:
+        return "unreadable", ""
+    if not isinstance(body, dict):
+        return "unreadable", ""
+    code = body.get("code")
+    request_id = body.get("request_id")
+    return (
+        str(code)[:64] if isinstance(code, str) else "uncoded",
+        str(request_id)[:64] if isinstance(request_id, str) else "",
+    )
+
+
 def _producer_headers(settings: TurnQueueSettings) -> dict[str, str]:
     if not settings.auth_internal_base_url or not settings.datasource_producer_key_id:
         raise _ValidationUnavailable("producer identity is not configured")
@@ -109,7 +132,12 @@ async def _run_probe(
     except (httpx.HTTPError, TimeoutError) as exc:
         raise _ValidationUnavailable("the datasource gateway is unreachable") from exc
     if response.status_code >= 400:
-        logger.info("[datasources] probe %s answered %s", probe_id, response.status_code)
+        logger.info(
+            "[datasources] probe %s answered %s, %s, gateway request %s",
+            probe_id,
+            response.status_code,
+            *_refusal(response),
+        )
 
 
 async def validate_connection(connection_id: int, credential: str, settings: TurnQueueSettings | None = None) -> bool:
