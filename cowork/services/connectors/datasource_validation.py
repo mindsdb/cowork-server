@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from dataclasses import dataclass
 
 import httpx
 
@@ -108,7 +109,7 @@ async def _mint_capability(
 
 async def _run_probe(
     probe_id: str, capability: str, credential_version: int, settings: TurnQueueSettings
-) -> None:
+) -> str | None:
     """Spend the capability on the gateway's fixed connection probe.
 
     Returning normally means the gateway answered, not that the database
@@ -131,27 +132,43 @@ async def _run_probe(
             response = await client.post(url, json=body, headers={"Authorization": f"Bearer {capability}"})
     except (httpx.HTTPError, TimeoutError) as exc:
         raise _ValidationUnavailable("the datasource gateway is unreachable") from exc
-    if response.status_code >= 400:
-        logger.info(
-            "[datasources] probe %s answered %s, %s, gateway request %s",
-            probe_id,
-            response.status_code,
-            *_refusal(response),
-        )
+    if response.status_code < 400:
+        return None
+    code, request_id = _refusal(response)
+    logger.info(
+        "[datasources] probe %s answered %s, %s, gateway request %s",
+        probe_id,
+        response.status_code,
+        code,
+        request_id,
+    )
+    return code
 
 
-async def validate_connection(connection_id: int, credential: str, settings: TurnQueueSettings | None = None) -> bool:
-    """Run one validation attempt for a connection, and say whether it ran.
+@dataclass(frozen=True)
+class ValidationOutcome:
+    """What one validation attempt did, for the route that asked for it.
 
-    True means the gateway answered, so auth may have recorded a verdict and
-    the caller should re-read the connection. False means the attempt could not
-    be made at all, and the connection stands exactly as auth left it.
+    `ran` says whether the gateway answered, so the caller knows whether to
+    re-read the connection. `code` is the gateway's own word for a refusal,
+    which is the only place a reason exists: auth records a verdict, not a
+    cause, so without this a failed connection can say nothing more useful than
+    that it failed.
     """
+
+    ran: bool
+    code: str | None = None
+
+
+async def validate_connection(
+    connection_id: int, credential: str, settings: TurnQueueSettings | None = None
+) -> ValidationOutcome:
+    """Run one validation attempt for a connection."""
     settings = settings or TurnQueueSettings()
     try:
         probe_id, capability, credential_version = await _mint_capability(connection_id, credential, settings)
-        await _run_probe(probe_id, capability, credential_version, settings)
+        code = await _run_probe(probe_id, capability, credential_version, settings)
     except _ValidationUnavailable as exc:
         logger.warning("[datasources] connection %s was not validated: %s", connection_id, exc)
-        return False
-    return True
+        return ValidationOutcome(ran=False)
+    return ValidationOutcome(ran=True, code=code)

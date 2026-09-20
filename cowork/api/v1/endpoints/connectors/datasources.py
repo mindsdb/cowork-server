@@ -66,9 +66,13 @@ async def _validated(connection: dict, request: Request) -> dict:
     connection_id = connection.get("id")
     if not isinstance(connection_id, int):
         return connection
-    if not await validate_connection(connection_id, request.headers.get("authorization", "")):
+    outcome = await validate_connection(connection_id, request.headers.get("authorization", ""))
+    if not outcome.ran:
         return connection
-    return await auth_proxy.proxy_datasource_detail(connection_id, request, OAuthSettings())
+    checked = await auth_proxy.proxy_datasource_detail(connection_id, request, OAuthSettings())
+    # Auth's row says only that validation failed. The gateway's code is what
+    # lets a caller offer the user something to do about it.
+    return {**checked, "validation_code": outcome.code} if outcome.code else checked
 
 
 @router.post("/", response_model=DatasourceConnectionResponse, status_code=status.HTTP_201_CREATED)
