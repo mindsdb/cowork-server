@@ -316,11 +316,17 @@ class DisabledConnection(BaseModel):
 
 
 class DatasourceTls(BaseModel):
-    """Transport security for a cloud datasource connection."""
+    """Transport security for a cloud datasource connection.
+
+    `system` and `custom_ca` verify the chain and the hostname and differ only
+    in which authorities they trust. `encrypted` encrypts without checking who
+    answered, and `disabled` does neither; both exist because a self-hosted
+    server often has the certificate its installer generated for it, or none.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    mode: Literal["system", "custom_ca"] = "system"
+    mode: Literal["system", "custom_ca", "encrypted", "disabled"] = "system"
     ca_pem: str | None = None
 
 
@@ -373,5 +379,10 @@ class DatasourceConnectionResponse(BaseModel):
     username: str
     tls_mode: str
     validation_error: str | None = None
+    # The gateway's own word for a refusal, on the three routes that run a
+    # validation attempt. Auth stores a verdict and not a cause, so without
+    # this a failed connection can say nothing a caller could act on. Absent
+    # everywhere no attempt was made.
+    validation_code: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
