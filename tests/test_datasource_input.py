@@ -58,7 +58,7 @@ def test_structured_input_becomes_the_canonical_auth_payload():
         "database": "appdb",
         "username": "dbuser",
         "password": PASSWORD,
-        "tls": {"mode": "system", "ca_pem": None},
+        "tls": {"mode": "prefer", "ca_pem": None},
     }
 
 
@@ -94,7 +94,15 @@ def test_custom_ca_is_carried_through_and_system_mode_rejects_a_ca():
         normalize_datasource_input(_structured(tls={"mode": "system", "ca_pem": CA_PEM}))
 
 
-@pytest.mark.parametrize("mode", ["encrypted", "disabled"])
+def test_a_connection_with_no_trust_block_prefers_encryption():
+    """The form stops asking, so this is what nearly every connection carries:
+    encryption where the server offers it, and no check on who answered."""
+    payload = normalize_datasource_input(_structured(tls=None))
+
+    assert payload["tls"] == {"mode": "prefer", "ca_pem": None}
+
+
+@pytest.mark.parametrize("mode", ["encrypted", "disabled", "prefer"])
 def test_a_mode_that_does_not_verify_is_relayed_as_chosen(mode):
     """A self-hosted server often has an unverifiable certificate or none, and
     the owner says so on the connection rather than being turned away."""
@@ -103,13 +111,13 @@ def test_a_mode_that_does_not_verify_is_relayed_as_chosen(mode):
     assert payload["tls"] == {"mode": mode, "ca_pem": None}
 
 
-@pytest.mark.parametrize("mode", ["encrypted", "disabled"])
+@pytest.mark.parametrize("mode", ["encrypted", "disabled", "prefer"])
 def test_a_bundle_on_a_mode_that_never_reads_one_is_refused(mode):
     with pytest.raises(InvalidDatasourceInput):
         normalize_datasource_input(_structured(tls={"mode": mode, "ca_pem": CA_PEM}))
 
 
-@pytest.mark.parametrize("mode", ["verify-full", "require", "prefer", "off"])
+@pytest.mark.parametrize("mode", ["verify-full", "require", "allow", "off"])
 def test_a_drivers_own_spelling_is_not_a_mode(mode):
     with pytest.raises(ValidationError):
         _structured(tls={"mode": mode, "ca_pem": None})

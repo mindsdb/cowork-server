@@ -320,13 +320,15 @@ class DatasourceTls(BaseModel):
 
     `system` and `custom_ca` verify the chain and the hostname and differ only
     in which authorities they trust. `encrypted` encrypts without checking who
-    answered, and `disabled` does neither; both exist because a self-hosted
-    server often has the certificate its installer generated for it, or none.
+    answered, `disabled` does neither, and `prefer` takes encryption where the
+    server offers it. The default is `prefer`, because a self-hosted server
+    usually has the certificate its installer generated for it, or none, and
+    the form no longer asks.
     """
 
     model_config = ConfigDict(extra="forbid")
 
-    mode: Literal["system", "custom_ca", "encrypted", "disabled"] = "system"
+    mode: Literal["system", "custom_ca", "encrypted", "disabled", "prefer"] = "prefer"
     ca_pem: str | None = None
 
 
