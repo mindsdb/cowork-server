@@ -77,7 +77,14 @@ def _to_payload(req: SubmitFormRequest, connector_id: str, method: str, values: 
             database=values.get("database"),
             username=values.get("username"),
             password=values.get("password"),
-            tls={"mode": values.get("tls_mode") or "system", "ca_pem": values.get("ca_pem") or None},
+            # The cloud form asks nothing about certificates, so this is absent
+            # for nearly every submission and the server applies its own
+            # default. A spec that does ask still travels as it was answered.
+            tls=(
+                {"mode": values["tls_mode"], "ca_pem": values.get("ca_pem") or None}
+                if values.get("tls_mode")
+                else None
+            ),
         )
     except ValidationError as exc:
         raise InvalidDatasourceInput("the submitted connection fields are invalid") from exc
