@@ -298,12 +298,23 @@ class TestCloudDatabaseSpecs:
         # part of the enablement commit and is never merged.
         assert self._cloud(spec, connector_id).available is True
 
-    def test_certificate_trust_offers_no_downgrade(self, spec, connector_id):
+    def test_certificate_trust_defaults_to_the_verified_choice(self, spec, connector_id):
+        """Four choices, the two that verify first and the default among them.
+        A server that cannot be verified is a decision the user makes here,
+        once, rather than something any code picks for them later."""
         field = self._cloud_field(spec, connector_id, "tls_mode")
         assert field.type == "select"
         assert field.required is True
         assert field.default == "system"
-        assert [o["value"] for o in field.options] == ["system", "custom_ca"]
+        # The labels are the security-bearing half: swapping the wording
+        # between the two unverified values would read as the opposite of what
+        # each does, and no other test in any repository would notice.
+        assert [(o["value"], o["label"]) for o in field.options] == [
+            ("system", "Public certificate authorities (recommended)"),
+            ("custom_ca", "A CA certificate I provide"),
+            ("encrypted", "Encrypt, but do not check the certificate"),
+            ("disabled", "No encryption"),
+        ]
 
     def test_the_ca_is_pasted_content_and_bounded(self, spec, connector_id):
         """A path or a URL would let the form choose what the gateway trusts."""
