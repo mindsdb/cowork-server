@@ -75,6 +75,7 @@ def _to_payload(req: SubmitFormRequest, connector_id: str, method: str, values: 
             host=values.get("host"),
             port=values.get("port"),
             database=values.get("database"),
+            schema=values.get("schema"),
             username=values.get("username"),
             password=values.get("password"),
             # The cloud form asks nothing about certificates, so this is absent
