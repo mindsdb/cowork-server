@@ -349,6 +349,9 @@ class DatasourceCreateRequest(BaseModel):
     host: str | None = None
     port: int | None = None
     database: str | None = None
+    # `schema` on the wire, since that is what the engine calls it; the field
+    # is renamed here only because the name shadows an attribute of BaseModel.
+    db_schema: str | None = Field(default=None, alias="schema")
     username: str | None = None
     password: str | None = None
     tls: DatasourceTls | None = None
@@ -378,6 +381,7 @@ class DatasourceConnectionResponse(BaseModel):
     host_masked: str
     port: int | None = None
     database: str
+    db_schema: str | None = Field(default=None, alias="schema")
     username: str
     tls_mode: str
     validation_error: str | None = None

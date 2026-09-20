@@ -56,6 +56,7 @@ def test_structured_input_becomes_the_canonical_auth_payload():
         "host": "db.example.com",
         "port": 5432,
         "database": "appdb",
+        "schema": None,
         "username": "dbuser",
         "password": PASSWORD,
         "tls": {"mode": "prefer", "ca_pem": None},
@@ -82,6 +83,50 @@ def test_dsn_input_is_parsed_into_fields_and_the_dsn_is_dropped():
     assert "dsn" not in payload
     assert "input_mode" not in payload
     assert DSN not in str(payload)
+
+
+def test_the_schema_a_connection_names_is_relayed():
+    """A PostgreSQL database holds many schemas and the customer's tables are
+    rarely in the one the role's search path resolves to."""
+    payload = normalize_datasource_input(_structured(schema="sales_ops"))
+
+    assert payload["schema"] == "sales_ops"
+
+
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_a_blank_schema_is_no_schema_rather_than_a_bad_one(value):
+    """A field the user left blank must not be refused for its length."""
+    assert normalize_datasource_input(_structured(schema=value))["schema"] is None
+
+
+def test_a_schema_is_refused_on_an_engine_that_has_none():
+    """MySQL's database is its schema; two names for one thing would leave a
+    reader unable to say which won."""
+    with pytest.raises(InvalidDatasourceInput):
+        normalize_datasource_input(
+            _structured(connector_id="mysql", method="host-password", schema="sales_ops")
+        )
+
+
+def test_a_schema_longer_than_an_identifier_is_refused():
+    with pytest.raises(InvalidDatasourceInput):
+        normalize_datasource_input(_structured(schema="s" * 64))
+
+
+def test_a_connection_string_cannot_carry_a_schema():
+    """The DSN grammar accepts no schema, so one beside it is a field the
+    parsed connection would silently disagree with."""
+    with pytest.raises(InvalidDatasourceInput):
+        normalize_datasource_input(
+            DatasourceCreateRequest(
+                connector_id="postgres",
+                method="host-port",
+                name="prod reporting",
+                input_mode="dsn",
+                dsn=DSN,
+                schema="sales_ops",
+            )
+        )
 
 
 def test_custom_ca_is_carried_through_and_system_mode_rejects_a_ca():
@@ -323,6 +368,7 @@ def test_the_response_model_drops_an_auth_field_this_server_does_not_know():
             "host_masked": "db***om",
             "port": 5432,
             "database": "appdb",
+            "schema": "sales_ops",
             "username": "dbuser",
             "tls_mode": "system",
             "validation_error": None,
@@ -337,3 +383,7 @@ def test_the_response_model_drops_an_auth_field_this_server_does_not_know():
     assert "validation_attempt_id" not in dumped
     assert "password" not in dumped
     assert PASSWORD not in str(dumped)
+    # `schema` on the wire in both directions: the field is renamed only
+    # because the name shadows an attribute of BaseModel.
+    assert response.db_schema == "sales_ops"
+    assert response.model_dump(by_alias=True)["schema"] == "sales_ops"

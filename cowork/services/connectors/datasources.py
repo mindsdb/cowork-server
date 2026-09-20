@@ -34,8 +34,16 @@ _TLS_MODES_WITHOUT_A_BUNDLE = frozenset({"system", "encrypted", "disabled", "pre
 #: What a connection gets when no block is sent, matching auth's own default.
 _DEFAULT_TLS_MODE = "prefer"
 
+#: PostgreSQL's own bound on an identifier, and the connectors that have a
+#: schema separate from their database. MySQL's database is its schema.
+_MAX_SCHEMA_LENGTH = 63
+_SCHEMA_CONNECTORS = frozenset({"postgres"})
+
 _HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}[A-Za-z0-9]$")
 _STRUCTURED_FIELDS = ("host", "port", "database", "username", "password", "tls")
+#: What a DSN replaces. The schema is spelled `schema` on the wire and carries
+#: its model attribute's name here.
+_STRUCTURED_ATTRIBUTES = (*_STRUCTURED_FIELDS, "db_schema")
 _CERTIFICATE_RE = re.compile(r"-----BEGIN CERTIFICATE-----.+?-----END CERTIFICATE-----", re.DOTALL)
 
 
@@ -138,6 +146,22 @@ def _canonical_port(value: Any, connector_id: str) -> int:
     return port
 
 
+def _canonical_schema(value: Any, connector_id: str) -> str | None:
+    """The one schema a connection reads, where the engine has such a thing.
+
+    Stored as the customer typed it: the gateway quotes it as an identifier
+    when it points a session at it, so nothing here interprets the name.
+    """
+    schema = "" if value is None else str(value).strip()
+    if not schema:
+        return None
+    if connector_id not in _SCHEMA_CONNECTORS:
+        raise InvalidDatasourceInput("this connector has no schema separate from its database")
+    if len(schema) > _MAX_SCHEMA_LENGTH:
+        raise InvalidDatasourceInput("schema must be a name of 63 characters or fewer")
+    return schema
+
+
 def _canonical_tls(tls: Any) -> dict[str, Any]:
     """Check the TLS block's framing and bound; auth re-parses the certificates.
 
@@ -226,7 +250,7 @@ def normalize_datasource_input(model: DatasourceCreateRequest) -> dict[str, Any]
         raise InvalidDatasourceInput("this connector method is not supported for cloud connections")
 
     if model.input_mode == "dsn":
-        supplied = [name for name in _STRUCTURED_FIELDS if getattr(model, name) is not None]
+        supplied = [name for name in _STRUCTURED_ATTRIBUTES if getattr(model, name) is not None]
         if supplied:
             raise InvalidDatasourceInput("a connection string cannot be combined with individual fields")
         fields = parse_datasource_dsn(model.dsn or "", connector_id)
@@ -254,6 +278,7 @@ def normalize_datasource_input(model: DatasourceCreateRequest) -> dict[str, Any]
         "host": _canonical_host(fields.get("host")),
         "port": _canonical_port(fields.get("port"), connector_id),
         "database": database,
+        "schema": _canonical_schema(model.db_schema, connector_id),
         "username": username,
         "password": password,
         "tls": _canonical_tls(tls),
