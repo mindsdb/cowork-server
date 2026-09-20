@@ -316,11 +316,17 @@ class DisabledConnection(BaseModel):
 
 
 class DatasourceTls(BaseModel):
-    """Transport security for a cloud datasource connection."""
+    """Transport security for a cloud datasource connection.
+
+    `system` and `custom_ca` verify the chain and the hostname and differ only
+    in which authorities they trust. `encrypted` encrypts without checking who
+    answered, and `disabled` does neither; both exist because a self-hosted
+    server often has the certificate its installer generated for it, or none.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    mode: Literal["system", "custom_ca"] = "system"
+    mode: Literal["system", "custom_ca", "encrypted", "disabled"] = "system"
     ca_pem: str | None = None
 
 
