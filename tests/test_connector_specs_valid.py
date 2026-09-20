@@ -302,7 +302,15 @@ class TestCloudDatabaseSpecs:
         assert field.type == "select"
         assert field.required is True
         assert field.default == "system"
-        assert [o["value"] for o in field.options] == ["system", "custom_ca", "encrypted", "disabled"]
+        # The labels are the security-bearing half: swapping the wording
+        # between the two unverified values would read as the opposite of what
+        # each does, and no other test in any repository would notice.
+        assert [(o["value"], o["label"]) for o in field.options] == [
+            ("system", "Public certificate authorities (recommended)"),
+            ("custom_ca", "A CA certificate I provide"),
+            ("encrypted", "Encrypt, but do not check the certificate"),
+            ("disabled", "No encryption"),
+        ]
 
     def test_the_ca_is_pasted_content_and_bounded(self, spec, connector_id):
         """A path or a URL would let the form choose what the gateway trusts."""
