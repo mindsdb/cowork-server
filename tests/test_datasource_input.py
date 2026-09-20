@@ -9,6 +9,7 @@ passwords, DSNs and CA material.
 from __future__ import annotations
 
 import pytest
+from pydantic import ValidationError
 
 from cowork.schemas.connectors import (
     DatasourceConnectionResponse,
@@ -91,6 +92,27 @@ def test_custom_ca_is_carried_through_and_system_mode_rejects_a_ca():
 
     with pytest.raises(InvalidDatasourceInput):
         normalize_datasource_input(_structured(tls={"mode": "system", "ca_pem": CA_PEM}))
+
+
+@pytest.mark.parametrize("mode", ["encrypted", "disabled"])
+def test_a_mode_that_does_not_verify_is_relayed_as_chosen(mode):
+    """A self-hosted server often has an unverifiable certificate or none, and
+    the owner says so on the connection rather than being turned away."""
+    payload = normalize_datasource_input(_structured(tls={"mode": mode, "ca_pem": None}))
+
+    assert payload["tls"] == {"mode": mode, "ca_pem": None}
+
+
+@pytest.mark.parametrize("mode", ["encrypted", "disabled"])
+def test_a_bundle_on_a_mode_that_never_reads_one_is_refused(mode):
+    with pytest.raises(InvalidDatasourceInput):
+        normalize_datasource_input(_structured(tls={"mode": mode, "ca_pem": CA_PEM}))
+
+
+@pytest.mark.parametrize("mode", ["verify-full", "require", "prefer", "off"])
+def test_a_drivers_own_spelling_is_not_a_mode(mode):
+    with pytest.raises(ValidationError):
+        _structured(tls={"mode": mode, "ca_pem": None})
 
 
 @pytest.mark.parametrize(
