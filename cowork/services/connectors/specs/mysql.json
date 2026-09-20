@@ -99,8 +99,8 @@
         ],
         "cloud": {
           "available": true,
-          "description": "Enter your MySQL host, port, database name, username, and password. Oracle MySQL 8.0 and 8.4 only; MariaDB, Percona, and other MySQL-compatible servers are not supported here and are refused on connection. Choose how far the server is checked: against the public trust store, against a CA you provide, encrypted without a check, or not encrypted.",
-          "how_to": "## Connect with host and password\n\nFill in each field separately. This matches the connection panel in tools like MySQL Workbench, DBeaver, or TablePlus.\n\n### Supported servers\n\nOracle MySQL 8.0 and 8.4 only. MariaDB, Percona Server, and Aurora-compatible products are detected on connection and refused, because their read-only and timeout controls differ and have not been verified. Use the MariaDB connector for MariaDB on the desktop app.\n\n### Where to find each value\n\n1. **Host**: The server address, e.g. `db.example.com`. It must be reachable from the public internet and resolve to a public address.\n2. **Port**: `3306`. Only the default MySQL port is accepted in this release.\n3. **Database**: The specific database (schema) to connect to.\n4. **Username / Password**: A MySQL user with `USAGE`, `SELECT`, and `SHOW VIEW` on that schema, authenticating with `caching_sha2_password`. Create a dedicated read-only user; one holding write, `FILE`, or `SUPER` privileges is rejected.\n5. **Certificate trust**: Leave **Public certificate authorities** selected if your server has a publicly trusted certificate, which covers most managed databases. Choose **A CA certificate I provide** and paste the PEM bundle if your provider issues its own, as AWS RDS and Google Cloud SQL do. If your server presents the certificate it generated for itself, which is what a self-hosted server usually does, choose **Encrypt, but do not check the certificate**. Choose **No encryption** only if the server offers none.\n\n### Notes\n\n- The last two trust choices do not confirm which server answered, and your credentials are sent after the connection is made, so prefer a verified one where the server allows it. With **No encryption** the statements and the rows that come back are readable by anyone on the path too. Nothing downgrades on its own: a connection keeps the choice you saved it with.\n- Queries run inside a read-only transaction with a server-side execution timeout. Loading local files and multiple statements in one request are disabled.\n- Allow the connection through your firewall or security group before saving.",
+          "description": "Enter your MySQL host, port, database name, username, and password. Oracle MySQL 8.0 and 8.4 only; MariaDB, Percona, and other MySQL-compatible servers are not supported here and are refused on connection. The connection is encrypted when the server supports it.",
+          "how_to": "## Connect with host and password\n\nFill in each field separately. This matches the connection panel in tools like MySQL Workbench, DBeaver, or TablePlus.\n\n### Supported servers\n\nOracle MySQL 8.0 and 8.4 only. MariaDB, Percona Server, and Aurora-compatible products are detected on connection and refused, because their read-only and timeout controls differ and have not been verified. Use the MariaDB connector for MariaDB on the desktop app.\n\n### Where to find each value\n\n1. **Host**: The server address, e.g. `db.example.com`. It must be reachable from the public internet and resolve to a public address.\n2. **Port**: `3306`. Only the default MySQL port is accepted in this release.\n3. **Database**: The specific database (schema) to connect to.\n4. **Username / Password**: A MySQL user with `USAGE`, `SELECT`, and `SHOW VIEW` on that schema, authenticating with `caching_sha2_password`. Create a dedicated read-only user; one holding write, `FILE`, or `SUPER` privileges is rejected.\n\n### Notes\n\n- The connection is encrypted whenever the server supports it, and the server's certificate is not checked. That is what a database client does by default, and it means a server with its own self-signed certificate connects without extra setup.\n- Queries run inside a read-only transaction with a server-side execution timeout. Loading local files and multiple statements in one request are disabled.\n- Allow the connection through your firewall or security group before saving.",
           "fields": [
             {
               "name": "host",
@@ -143,41 +143,6 @@
               "secret": true,
               "placeholder": "••••••••",
               "description": "Password for the above user. Stored encrypted and never shown again."
-            },
-            {
-              "name": "tls_mode",
-              "label": "Certificate trust",
-              "type": "select",
-              "required": true,
-              "default": "system",
-              "description": "How far the server is checked before your credentials are sent to it. The first two verify the certificate chain and the hostname and differ only in which authorities they trust. The last two do not verify, and the last does not encrypt: choose one of those only if your server cannot do better, because the credentials then reach whoever answered for that address.",
-              "options": [
-                {
-                  "value": "system",
-                  "label": "Public certificate authorities (recommended)"
-                },
-                {
-                  "value": "custom_ca",
-                  "label": "A CA certificate I provide"
-                },
-                {
-                  "value": "encrypted",
-                  "label": "Encrypt, but do not check the certificate"
-                },
-                {
-                  "value": "disabled",
-                  "label": "No encryption"
-                }
-              ]
-            },
-            {
-              "name": "ca_pem",
-              "label": "CA certificate",
-              "type": "textarea",
-              "required": false,
-              "secret": false,
-              "placeholder": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
-              "description": "Required when certificate trust is set to a CA you provide. Paste the PEM-encoded certificate bundle, up to 64 KiB; a path or URL is not accepted. Leave empty for every other choice."
             }
           ]
         }
