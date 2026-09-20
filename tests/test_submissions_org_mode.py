@@ -207,6 +207,8 @@ def test_an_enabled_cloud_submission_is_relayed_and_never_staged(org_client, rel
     assert body["host"] == "db.example.com"
     assert body["port"] == 5432
     assert body["database"] == "appdb"
+    # The schema is optional and this submission names none.
+    assert body["schema"] is None
     assert body["username"] == "dbuser"
     assert body["password"] == PASSWORD
     # The form asks nothing about certificates, so the relay sends no choice
@@ -219,6 +221,19 @@ def test_an_enabled_cloud_submission_is_relayed_and_never_staged(org_client, rel
     assert PASSWORD not in caplog.text
     assert "prod reporting" in res.text
     assert "response.completed" in res.text
+
+
+def test_the_schema_a_submitter_names_reaches_auth(org_client, relay):
+    """The one optional field on the PostgreSQL form. Without it the agent
+    reads whatever the role's search path resolves to, which is rarely where
+    the customer's tables are."""
+    recorded, _ = relay
+    values = submission()["values"] | {"schema": "sales_ops"}
+
+    res = org_client.post(PATH, json=submission(values=values), headers=AUTH_HEADERS)
+
+    assert res.status_code == 200
+    assert json.loads(recorded[0].content)["schema"] == "sales_ops"
 
 
 def test_a_field_the_cloud_form_no_longer_has_is_refused(org_client, relay):
