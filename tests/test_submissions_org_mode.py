@@ -67,7 +67,6 @@ def submission(**overrides) -> dict:
             "database": "appdb",
             "username": "dbuser",
             "password": PASSWORD,
-            "tls_mode": "system",
         },
         "skipped": [],
     }
@@ -210,7 +209,9 @@ def test_an_enabled_cloud_submission_is_relayed_and_never_staged(org_client, rel
     assert body["database"] == "appdb"
     assert body["username"] == "dbuser"
     assert body["password"] == PASSWORD
-    assert body["tls"] == {"mode": "system", "ca_pem": None}
+    # The form asks nothing about certificates, so the relay sends no choice
+    # and the server applies its own.
+    assert body["tls"] == {"mode": "prefer", "ca_pem": None}
     # Owner and org are auth's to derive from the bearer.
     assert "user_id" not in body and "organization_id" not in body
     # What the submitter sees back is auth's masked metadata, not their input.
@@ -220,15 +221,17 @@ def test_an_enabled_cloud_submission_is_relayed_and_never_staged(org_client, rel
     assert "response.completed" in res.text
 
 
-def test_a_custom_ca_travels_in_the_tls_block(org_client, relay):
+def test_a_field_the_cloud_form_no_longer_has_is_refused(org_client, relay):
+    """Certificate trust left the form, so a submission naming it is a client
+    sending something this connector does not collect."""
     recorded, _ = relay
     values = submission()["values"] | {"tls_mode": "custom_ca", "ca_pem": CA_PEM}
 
     res = org_client.post(PATH, json=submission(values=values), headers=AUTH_HEADERS)
 
-    assert res.status_code == 200
-    body = json.loads(recorded[0].content)
-    assert body["tls"] == {"mode": "custom_ca", "ca_pem": CA_PEM}
+    assert res.status_code == 400
+    assert res.json()["detail"]["code"] == "invalid_connection"
+    assert recorded == []
 
 
 def test_the_default_deployment_refuses_the_method_without_calling_auth(default_org_client, relay):
