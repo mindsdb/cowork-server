@@ -34,7 +34,7 @@
         "label": "Connection string",
         "description": "Paste a single PostgreSQL connection URI (postgres://user:password@host:port/database). Quickest option if you already have one handy.",
         "recommended": false,
-        "how_to": "## Connect via connection string\n\nA PostgreSQL connection URI bundles all your credentials into one string. Most cloud providers (Supabase, Render, Railway, Neon, etc.) show a ready-to-copy URI in their dashboard.\n\n### Where to find it\n\n1. **Supabase**: Project → Settings → Database → Connection string → URI tab.\n2. **Render**: Service dashboard → Info → Connection → Internal or External database URL.\n3. **Railway**: Project → your Postgres plugin → Connect → Postgres Connection URL.\n4. **Neon**: Project → Connection Details → pick the branch → copy the URI.\n5. For self-hosted instances, construct it manually:\n   `postgres://USER:PASSWORD@HOST:PORT/DATABASE`\n\n### Notes\n\n- The URI must use the `postgres://` or `postgresql://` scheme.\n- URL-encode special characters in the password (e.g. `@` → `%40`).\n- Append `?sslmode=require` to the URI to enforce SSL, or `?sslmode=disable` to turn it off.\n- Anton stores the URI encrypted at rest; the password is never shown again after saving.",
+        "how_to": "## Connect via connection string\n\nA PostgreSQL connection URI bundles all your credentials into one string. Most cloud providers (Supabase, Render, Railway, Neon, etc.) show a ready-to-copy URI in their dashboard.\n\n### Where to find it\n\n1. **Supabase**: Project \u2192 Settings \u2192 Database \u2192 Connection string \u2192 URI tab.\n2. **Render**: Service dashboard \u2192 Info \u2192 Connection \u2192 Internal or External database URL.\n3. **Railway**: Project \u2192 your Postgres plugin \u2192 Connect \u2192 Postgres Connection URL.\n4. **Neon**: Project \u2192 Connection Details \u2192 pick the branch \u2192 copy the URI.\n5. For self-hosted instances, construct it manually:\n   `postgres://USER:PASSWORD@HOST:PORT/DATABASE`\n\n### Notes\n\n- The URI must use the `postgres://` or `postgresql://` scheme.\n- URL-encode special characters in the password (e.g. `@` \u2192 `%40`).\n- Append `?sslmode=require` to the URI to enforce SSL, or `?sslmode=disable` to turn it off.\n- Anton stores the URI encrypted at rest; the password is never shown again after saving.",
         "help_url": "https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING",
         "fields": [
           {
@@ -53,7 +53,7 @@
         "label": "Host / port / credentials",
         "description": "Enter host, port, database name, username, and password individually. Supports SSL toggle. Best when you don't have a ready-made connection URI.",
         "recommended": true,
-        "how_to": "## Connect with host, port, and credentials\n\nFill in each field separately. This matches the connection panel in tools like pgAdmin, DBeaver, or TablePlus.\n\n### Where to find each value\n\n1. **Host**: The server address — e.g. `db.example.com` or an IP. Cloud providers show this on their database info page.\n2. **Port**: Almost always `5432`. Change only if your DBA or cloud provider specifies otherwise.\n3. **Database**: The specific database name (not the server). In Supabase this is `postgres` by default.\n4. **Username / Password**: The Postgres role credentials. For cloud providers, check the database \"Connection details\" or \"Credentials\" panel.\n5. **SSL**: Toggle on if your server requires SSL (recommended for any internet-facing database). Most cloud-hosted Postgres instances require it.\n\n### Notes\n\n- If connecting to a local instance, use `localhost` or `127.0.0.1` as the host and leave SSL off.\n- Make sure the host/port is reachable from your machine — firewalls and VPCs often block external access.\n- The user needs at minimum `CONNECT` + `SELECT` privileges on the target database.\n- For write operations, also grant `INSERT`, `UPDATE`, and `DELETE` as needed.",
+        "how_to": "## Connect with host, port, and credentials\n\nFill in each field separately. This matches the connection panel in tools like pgAdmin, DBeaver, or TablePlus.\n\n### Where to find each value\n\n1. **Host**: The server address \u2014 e.g. `db.example.com` or an IP. Cloud providers show this on their database info page.\n2. **Port**: Almost always `5432`. Change only if your DBA or cloud provider specifies otherwise.\n3. **Database**: The specific database name (not the server). In Supabase this is `postgres` by default.\n4. **Username / Password**: The Postgres role credentials. For cloud providers, check the database \"Connection details\" or \"Credentials\" panel.\n5. **SSL**: Toggle on if your server requires SSL (recommended for any internet-facing database). Most cloud-hosted Postgres instances require it.\n\n### Notes\n\n- If connecting to a local instance, use `localhost` or `127.0.0.1` as the host and leave SSL off.\n- Make sure the host/port is reachable from your machine \u2014 firewalls and VPCs often block external access.\n- The user needs at minimum `CONNECT` + `SELECT` privileges on the target database.\n- For write operations, also grant `INSERT`, `UPDATE`, and `DELETE` as needed.",
         "help_url": "https://www.postgresql.org/docs/current/runtime-config-connection.html",
         "fields": [
           {
@@ -95,7 +95,7 @@
             "type": "password",
             "required": true,
             "secret": true,
-            "placeholder": "••••••••",
+            "placeholder": "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022",
             "description": "Password for the above user. Stored encrypted and never shown again."
           },
           {
@@ -109,8 +109,8 @@
         ],
         "cloud": {
           "available": false,
-          "description": "Enter host, port, database name, username, and password individually. The connection is always TLS-verified; choose whether the server certificate is checked against the public trust store or against a CA you provide.",
-          "how_to": "## Connect with host, port, and credentials\n\nFill in each field separately. This matches the connection panel in tools like pgAdmin, DBeaver, or TablePlus.\n\n### Where to find each value\n\n1. **Host**: The server address, e.g. `db.example.com`. It must be reachable from the public internet and resolve to a public address.\n2. **Port**: `5432`. Only the default PostgreSQL port is accepted in this release.\n3. **Database**: The specific database name (not the server).\n4. **Username / Password**: A PostgreSQL role with `CONNECT` on the database and `USAGE` plus `SELECT` on the schemas you want read. Create a dedicated read-only role rather than reusing an administrative one.\n5. **Certificate trust**: Leave **Public certificate authorities** selected if your provider uses a publicly trusted certificate, which covers most managed PostgreSQL. Choose **Custom CA certificate** and paste the PEM bundle if your provider issues its own, as AWS RDS and Google Cloud SQL do.\n\n### Notes\n\n- The certificate chain and the hostname are always verified. There is no option to turn that off, and a server that cannot present a valid certificate for its hostname will not connect.\n- Queries run inside a read-only transaction against the role you provide. A role with write privileges is rejected rather than downgraded.\n- Allow the connection through your firewall or security group before saving.",
+          "description": "Enter host, port, database name, username, and password individually. Choose how far the server is checked: against the public trust store, against a CA you provide, encrypted without a check, or not encrypted.",
+          "how_to": "## Connect with host, port, and credentials\n\nFill in each field separately. This matches the connection panel in tools like pgAdmin, DBeaver, or TablePlus.\n\n### Where to find each value\n\n1. **Host**: The server address, e.g. `db.example.com`. It must be reachable from the public internet and resolve to a public address.\n2. **Port**: `5432`. Only the default PostgreSQL port is accepted in this release.\n3. **Database**: The specific database name (not the server).\n4. **Username / Password**: A PostgreSQL role with `CONNECT` on the database and `USAGE` plus `SELECT` on the schemas you want read. Create a dedicated read-only role rather than reusing an administrative one.\n5. **Certificate trust**: Leave **Public certificate authorities** selected if your server has a publicly trusted certificate, which covers most managed databases. Choose **A CA certificate I provide** and paste the PEM bundle if your provider issues its own, as AWS RDS and Google Cloud SQL do. If your server presents the certificate it generated for itself, which is what a self-hosted server usually does, choose **Encrypt, but do not check the certificate**. Choose **No encryption** only if the server offers none.\n\n### Notes\n\n- The last two trust choices do not confirm which server answered, and your credentials are sent after the connection is made, so prefer a verified one where the server allows it. Nothing downgrades on its own: a connection keeps the choice you saved it with.\n- Queries run inside a read-only transaction against the role you provide. A role with write privileges is rejected rather than downgraded.\n- Allow the connection through your firewall or security group before saving.",
           "fields": [
             {
               "name": "host",
@@ -151,7 +151,7 @@
               "type": "password",
               "required": true,
               "secret": true,
-              "placeholder": "••••••••",
+              "placeholder": "\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022",
               "description": "Password for the above role. Stored encrypted and never shown again."
             },
             {
@@ -160,7 +160,7 @@
               "type": "select",
               "required": true,
               "default": "system",
-              "description": "Which certificate authorities the server's certificate is checked against. The chain and hostname are verified either way.",
+              "description": "How far the server is checked before your credentials are sent to it. The first two verify the certificate chain and the hostname and differ only in which authorities they trust. The last two do not verify, and the last does not encrypt: choose one of those only if your server cannot do better, because the credentials then reach whoever answered for that address.",
               "options": [
                 {
                   "value": "system",
@@ -168,7 +168,15 @@
                 },
                 {
                   "value": "custom_ca",
-                  "label": "Custom CA certificate"
+                  "label": "A CA certificate I provide"
+                },
+                {
+                  "value": "encrypted",
+                  "label": "Encrypt, but do not check the certificate"
+                },
+                {
+                  "value": "disabled",
+                  "label": "No encryption"
                 }
               ]
             },
@@ -179,7 +187,7 @@
               "required": false,
               "secret": false,
               "placeholder": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----",
-              "description": "Required when certificate trust is set to a custom CA. Paste the PEM-encoded certificate bundle, up to 64 KiB. A file path or URL is not accepted."
+              "description": "Required when certificate trust is set to a CA you provide. Paste the PEM-encoded certificate bundle, up to 64 KiB; a path or URL is not accepted. Leave empty for every other choice."
             }
           ]
         }
