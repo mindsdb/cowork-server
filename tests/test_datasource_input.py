@@ -93,6 +93,12 @@ def test_the_schema_a_connection_names_is_relayed():
     assert payload["schema"] == "sales_ops"
 
 
+@pytest.mark.parametrize("value", [None, "", "   "])
+def test_a_blank_schema_is_no_schema_rather_than_a_bad_one(value):
+    """A field the user left blank must not be refused for its length."""
+    assert normalize_datasource_input(_structured(schema=value))["schema"] is None
+
+
 def test_a_schema_is_refused_on_an_engine_that_has_none():
     """MySQL's database is its schema; two names for one thing would leave a
     reader unable to say which won."""

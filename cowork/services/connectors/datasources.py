@@ -152,12 +152,12 @@ def _canonical_schema(value: Any, connector_id: str) -> str | None:
     Stored as the customer typed it: the gateway quotes it as an identifier
     when it points a session at it, so nothing here interprets the name.
     """
-    if value in (None, ""):
+    schema = "" if value is None else str(value).strip()
+    if not schema:
         return None
     if connector_id not in _SCHEMA_CONNECTORS:
         raise InvalidDatasourceInput("this connector has no schema separate from its database")
-    schema = str(value).strip()
-    if not schema or len(schema) > _MAX_SCHEMA_LENGTH:
+    if len(schema) > _MAX_SCHEMA_LENGTH:
         raise InvalidDatasourceInput("schema must be a name of 63 characters or fewer")
     return schema
 
