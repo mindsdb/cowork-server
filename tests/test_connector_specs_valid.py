@@ -294,21 +294,13 @@ class TestCloudDatabaseSpecs:
     ):
         assert self._cloud(spec, connector_id).available is False
 
-    def test_certificate_trust_offers_no_downgrade(self, spec, connector_id):
-        field = self._cloud_field(spec, connector_id, "tls_mode")
-        assert field.type == "select"
-        assert field.required is True
-        assert field.default == "system"
-        assert [o["value"] for o in field.options] == ["system", "custom_ca"]
-
-    def test_the_ca_is_pasted_content_and_bounded(self, spec, connector_id):
-        """A path or a URL would let the form choose what the gateway trusts."""
-        field = self._cloud_field(spec, connector_id, "ca_pem")
-        assert field.type == "textarea"
-        assert field.required is False
-        assert field.secret is False
-        assert "64 KiB" in field.description
-        assert "path or URL is not accepted" in field.description
+    def test_the_form_asks_nothing_about_certificates(self, spec, connector_id):
+        """The cloud form collects a connection and nothing else. Trust is the
+        server's default, encryption where it is offered and no check on the
+        certificate, because the question has no answer most people can give
+        and the common answer for a self-hosted server is always the same."""
+        names = {f.name for f in self._cloud(spec, connector_id).fields}
+        assert names == {"host", "port", "database", "username", "password"}
 
     def test_no_cloud_field_toggles_tls(self, spec, connector_id):
         """`ssl_enabled` and `use_ssl` are desktop fields. A boolean here would
