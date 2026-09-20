@@ -166,7 +166,7 @@ def test_create_forwards_the_callers_bearer_and_the_canonical_payload(org_client
     assert "user_id" not in body and "organization_id" not in body
     assert "user_id" not in str(sent.url) and "organization_id" not in str(sent.url)
     assert body["password"] == PASSWORD
-    assert body["tls"] == {"mode": "system", "ca_pem": None}
+    assert body["tls"] == {"mode": "prefer", "ca_pem": None}
 
 
 def test_a_dsn_create_relays_structured_fields_and_never_the_dsn(org_client, relay):

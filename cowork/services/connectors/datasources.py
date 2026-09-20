@@ -29,7 +29,10 @@ DEFAULT_PORTS = {"postgres": 5432, "mysql": 3306}
 MAX_CA_PEM_BYTES = 64 * 1024
 
 #: The modes that carry no trust material of their own.
-_TLS_MODES_WITHOUT_A_BUNDLE = frozenset({"system", "encrypted", "disabled"})
+_TLS_MODES_WITHOUT_A_BUNDLE = frozenset({"system", "encrypted", "disabled", "prefer"})
+
+#: What a connection gets when no block is sent, matching auth's own default.
+_DEFAULT_TLS_MODE = "prefer"
 
 _HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}[A-Za-z0-9]$")
 _STRUCTURED_FIELDS = ("host", "port", "database", "username", "password", "tls")
@@ -142,7 +145,7 @@ def _canonical_tls(tls: Any) -> dict[str, Any]:
     disagree with itself about what it trusts.
     """
     if tls is None:
-        return {"mode": "system", "ca_pem": None}
+        return {"mode": _DEFAULT_TLS_MODE, "ca_pem": None}
     mode = tls.mode
     ca_pem = tls.ca_pem
     if mode in _TLS_MODES_WITHOUT_A_BUNDLE:
