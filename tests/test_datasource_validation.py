@@ -215,6 +215,29 @@ def test_a_body_that_is_not_the_gateways_shape_is_named_not_echoed(org_client, c
     assert PASSWORD not in caplog.text
 
 
+def test_the_gateways_reason_reaches_the_caller_on_a_failed_capture(org_client, cluster):
+    """Auth records a verdict, not a cause, so this is the only reason a client
+    could act on: it is what lets the form offer a weaker trust choice."""
+    _, scripted = cluster
+    scripted["probe"] = (502, {"code": "tls_failed", "detail": "The certificate could not be verified.",
+                               "request_id": "req-1"})
+    scripted["detail"] = (200, FAILED)
+
+    res = org_client.post(CREATE, json=CREATE_BODY, headers=AUTH_HEADERS)
+
+    assert res.status_code == 201
+    body = res.json()
+    assert body["status"] == "failed"
+    assert body["validation_code"] == "tls_failed"
+
+
+def test_a_passing_capture_carries_no_reason(org_client, cluster):
+    res = org_client.post(CREATE, json=CREATE_BODY, headers=AUTH_HEADERS)
+
+    assert res.json()["status"] == "verified"
+    assert res.json()["validation_code"] is None
+
+
 def test_a_failing_probe_is_reported_as_the_connection_auth_recorded(org_client, cluster):
     recorded, scripted = cluster
     scripted["probe"] = (502, {"code": "connect_failed", "detail": "The database refused the connection."})

@@ -379,5 +379,10 @@ class DatasourceConnectionResponse(BaseModel):
     username: str
     tls_mode: str
     validation_error: str | None = None
+    # The gateway's own word for a refusal, on the three routes that run a
+    # validation attempt. Auth stores a verdict and not a cause, so without
+    # this a failed connection can say nothing a caller could act on. Absent
+    # everywhere no attempt was made.
+    validation_code: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
