@@ -65,14 +65,14 @@ def build(monkeypatch):
         "anton.core.llm.anthropic.AnthropicProvider", _capture("anthropic")
     )
 
-    def _build(settings: UserSettings, effort_override=None):
+    def _build(settings: UserSettings, effort_override=None, model_override=None):
         monkeypatch.setattr(
             "cowork.common.settings.user_settings.get_user_settings",
             lambda: settings,
         )
         from cowork.services.providers import build_llm_client
 
-        client = build_llm_client(effort_override=effort_override)
+        client = build_llm_client(effort_override=effort_override, model_override=model_override)
         return client, calls
 
     return _build
@@ -141,7 +141,8 @@ def test_anthropic_gets_no_base_url_kwarg(build):
     assert "api_key_provider" not in kw
 
 
-def test_missing_key_error_names_the_actual_provider(build):
+@pytest.mark.parametrize("model", [None, "picked"])
+def test_missing_key_error_names_the_actual_provider(build, model):
     # gemini/openai-compatible go through the OpenAIProvider branch but the
     # "not configured" message must name the real provider, not "OpenAI".
     settings = UserSettings(
@@ -150,7 +151,7 @@ def test_missing_key_error_names_the_actual_provider(build):
         # no key anywhere → no fallback either
     )
     with pytest.raises(ValueError, match="Gemini API key is not configured"):
-        build(settings)
+        build(settings, model_override=model)
 
 
 def test_openai_compatible_without_base_raises(build):
@@ -457,3 +458,40 @@ def test_no_effort_override_falls_back_to_existing_behavior(build):
     )
     _client, calls = build(settings)  # no effort_override — default None
     assert calls["openai"][-1].get("reasoning_effort") == "high"
+
+
+@pytest.mark.parametrize(
+    "model,effort,expected_effort",
+    [("picked", None, None), ("picked", "low", "low"), ("old", None, "high")],
+)
+def test_model_override_keeps_only_applicable_effort(build, model, effort, expected_effort):
+    settings = UserSettings(
+        planning_provider=Provider.OPENAI, coding_provider=Provider.OPENAI,
+        router_provider=Provider.OPENAI, openai_api_key=SecretStr("test-key"),
+        planning_model="old", coding_model="old", router_model="old",
+        planning_reasoning_effort="high", coding_reasoning_effort="high",
+    )
+    client, calls = build(settings, model_override=model, effort_override=effort)
+    assert (client.planning_model, client.coding_model, client.router_model) == (model,) * 3
+    assert [kw.get("reasoning_effort") for kw in calls["openai"]] == [
+        None, expected_effort, expected_effort
+    ]
+    assert (settings.planning_model, settings.coding_model, settings.router_model) == ("old",) * 3
+
+
+@pytest.mark.parametrize("effort", [None, "low"])
+def test_model_override_preserves_other_provider_roles_and_credentials(build, effort):
+    settings = UserSettings(
+        planning_provider=Provider.OPENAI, openai_api_key=SecretStr("openai-key"),
+        coding_provider=Provider.ANTHROPIC, router_provider=Provider.ANTHROPIC,
+        anthropic_api_key=SecretStr("anthropic-key"),
+        planning_model="old", coding_model="claude-coding", router_model="claude-router",
+        coding_reasoning_effort="high",
+    )
+    client, calls = build(settings, model_override="picked-openai", effort_override=effort)
+    assert client.planning_model == "picked-openai"
+    assert client.coding_model == "claude-coding"
+    assert client.router_model == "claude-router"
+    assert calls["openai"][0]["api_key"] == "openai-key"
+    assert all(kw["api_key"] == "anthropic-key" for kw in calls["anthropic"])
+    assert calls["anthropic"][-1]["reasoning_effort"] == "high"
