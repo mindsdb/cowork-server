@@ -1155,11 +1155,18 @@ async def validate_provider(provider: str, api_key: str,
     return {"ok": False, "error": "Unknown provider"}
 
 
-def build_llm_client(effort_override: str | None = None):
+def build_llm_client(
+    effort_override: str | None = None, *, model_override: str | None = None
+):
     """Build an Anton LLMClient from the current user settings.
 
     Shared by the main responses handler and the credential probe handler
     so provider construction logic stays in one place.
+
+    ``model_override`` is a per-turn composer selection from the planning
+    provider's catalogue. Apply it to roles using that provider only; a role
+    configured on a different provider must keep its own compatible model.
+    Persisted settings are never modified.
 
     Reasoning effort is a persisted per-role setting
     (``planning_reasoning_effort`` / ``coding_reasoning_effort``) — chosen in the
@@ -1173,7 +1180,8 @@ def build_llm_client(effort_override: str | None = None):
     coding roles for this call, bypassing the stored-vs-resolved staleness
     guard below (an explicit per-task pick is inherently valid for the model
     actually in use this turn, unlike a stale persisted choice that may have
-    been made for a different model).
+    been made for a different model). With a model override, a coding role
+    on a different provider retains its own model and effort.
     """
     from anton.core.llm.anthropic import AnthropicProvider
     from anton.core.llm.client import LLMClient
@@ -1186,6 +1194,18 @@ def build_llm_client(effort_override: str | None = None):
     )
 
     settings = get_user_settings()
+    same_coding_provider = settings.resolved_coding_provider == settings.resolved_planning_provider
+    planning_model = model_override or settings.resolved_planning_model
+    coding_model = (
+        model_override
+        if model_override and same_coding_provider
+        else settings.resolved_coding_model
+    )
+    router_model = (
+        model_override
+        if model_override and settings.resolved_router_provider == settings.resolved_planning_provider
+        else settings.resolved_router_model
+    )
 
     # The published package still permits Anton releases from before ENG-2116.
     # Inspect the constructor once per client build so those versions keep
@@ -1330,7 +1350,7 @@ def build_llm_client(effort_override: str | None = None):
         if "router_provider" in _params:
             router_kw = {
                 "router_provider": _make_provider(settings.resolved_router_provider, None),
-                "router_model": settings.resolved_router_model,
+                "router_model": router_model,
             }
     except (ValueError, TypeError):
         router_kw = {}
@@ -1346,12 +1366,14 @@ def build_llm_client(effort_override: str | None = None):
 
     planning_effort = effort_override or _effort_for(
         settings.planning_model,
-        settings.resolved_planning_model,
+        planning_model,
         settings.planning_reasoning_effort,
     )
-    coding_effort = effort_override or _effort_for(
+    coding_effort = (
+        effort_override if not model_override or same_coding_provider else None
+    ) or _effort_for(
         settings.coding_model,
-        settings.resolved_coding_model,
+        coding_model,
         settings.coding_reasoning_effort,
     )
 
@@ -1364,12 +1386,12 @@ def build_llm_client(effort_override: str | None = None):
             settings.resolved_planning_provider,
             planning_effort,
         ),
-        planning_model=settings.resolved_planning_model,
+        planning_model=planning_model,
         coding_provider=_make_provider(
             settings.resolved_coding_provider,
             coding_effort,
         ),
-        coding_model=settings.resolved_coding_model,
+        coding_model=coding_model,
         **router_kw,
     )
 
