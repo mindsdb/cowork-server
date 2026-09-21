@@ -414,7 +414,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                     yield "progress", {"phase": "workspace_authorized", "workspace_mode": resolved_mode}
                     continue
                 if kind == "error" or (
-                    kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill", "turn_history", "turn_completed")
+                    kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill", "turn_history",
+                             "turn_compaction", "turn_completed")
                     and authorized_workspace_mode is None
                 ):
                     # Unsupported v2 operations and missing mount-policy
@@ -434,7 +435,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                         conversation_id, corr, data.get("error"),
                     )
                 if kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill",
-                            "turn_history", "turn_completed", "turn_failed"):
+                            "turn_history", "turn_compaction", "turn_completed", "turn_failed"):
                     yield kind, data
                 if kind in ("turn_completed", "turn_failed"):
                     return

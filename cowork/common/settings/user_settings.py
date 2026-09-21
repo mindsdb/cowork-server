@@ -1,3 +1,6 @@
+import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 import json
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -7,7 +10,7 @@ from typing import TYPE_CHECKING, Annotated, Any, Callable, get_args
 if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
 
-from pydantic import Field, PrivateAttr, SecretStr, field_validator, model_validator
+from pydantic import Field, PrivateAttr, SecretStr, ValidationInfo, field_validator, model_validator
 
 from cowork.common.settings.app_settings import (
     AGENT_ROLE_NAMES,
@@ -39,7 +42,7 @@ class Provider(str, Enum):
 
         Single source for the ``value.replace("_", "-")`` normalization that was
         otherwise reinvented at every provider boundary (provider_base_url,
-        _resolve_coding, the hermes harness, the AntonSettings bridge). A future
+        _resolve_coding, the AntonSettings bridge). A future
         provider name can't normalize correctly in one place and wrong in
         another — the latter silently routes to AnthropicProvider."""
         return self.value.replace("_", "-")
@@ -104,11 +107,11 @@ def provider_api_key(settings: "UserSettings", provider: "Provider"):
 def provider_api_key_str(settings: "UserSettings", provider: "Provider") -> str:
     """``provider_api_key`` as a plain unmasked string ('' when unset).
 
-    Most call sites (key reveal, the Test button, hermes env sync, the OC model
+    Most call sites (key reveal, the Test button, the OC model
     overlay) just need the raw value to hand to a client. Folding the
     ``SecretStr → str`` unwrap into one helper removes the per-site inline
     imports and the subtly different empty-handling variants that had drifted
-    across reveal_key / resolve_stored_key / recommended_models / hermes."""
+    across reveal_key / resolve_stored_key / recommended_models."""
     val = provider_api_key(settings, provider)
     return val.get_secret_value() if isinstance(val, SecretStr) else ""
 
@@ -349,6 +352,9 @@ UI_TYPE_TO_PROVIDER: dict[str, "Provider"] = {
 }
 
 
+logger = logging.getLogger(__name__)
+
+
 class _DynamicOptions:
     """Annotated metadata marker for fields whose valid options are resolved lazily from a callable."""
 
@@ -371,6 +377,37 @@ ORG = _OrgScoped()
 def _harness_options() -> list[str]:
     from cowork.harnesses.base import available_harness_ids
     return available_harness_ids()
+
+
+_warned_unknown_harness: set[tuple[str, str]] = set()
+# Set by SettingService while validating an incoming write, so a bad PUT is
+# rejected while a stale stored value still loads. pydantic-settings drops
+# model_validate's `context`, hence a contextvar rather than ValidationInfo.
+_reject_unknown_harness: ContextVar[bool] = ContextVar("_reject_unknown_harness", default=False)
+
+
+@contextmanager
+def reject_unknown_harness():
+    token = _reject_unknown_harness.set(True)
+    try:
+        yield
+    finally:
+        _reject_unknown_harness.reset(token)
+
+
+def _known_harness_or_anton(value: str, field: str) -> str:
+    # "anton" is always registered, so the common case skips the harness import.
+    if value == "anton" or value in _harness_options():
+        return value
+    if (field, value) not in _warned_unknown_harness:
+        _warned_unknown_harness.add((field, value))
+        logger.warning("Unknown harness %r for %s; using 'anton'", value, field)
+    return "anton"
+
+
+def _channels_harness_default() -> str:
+    value = get_app_settings().channels_harness or "anton"
+    return _known_harness_or_anton(value, "channels_harness")
 
 
 def _coding_engine_options() -> list[str]:
@@ -587,7 +624,7 @@ class UserSettings(Settings):
         description="The AI harness used to generate responses.",
     )
     channels_harness: Annotated[str, _DynamicOptions(_harness_options), ORG] = Field(
-        default_factory=lambda: (get_app_settings().channels_harness or "anton"),
+        default_factory=_channels_harness_default,
         title="Channel Agent",
         description="The AI harness that serves messaging-channel conversations.",
     )
@@ -690,20 +727,13 @@ class UserSettings(Settings):
             "an external coding CLI (e.g. Claude Code) instead of the in-app chat."
         ),
     )
-    # Which harnesses appear as options in the per-task harness picker
-    # (Coding Mode's composer pill). All default true — an account that never
-    # visits this setting sees every harness it's otherwise eligible for.
-    # Anton has no enable flag: it's the default agent and always offered —
-    # a picker with every harness disabled would have nothing to run.
-    # `claude-code` isn't a cowork.harnesses.base-registered harness (it runs
-    # the `claude` CLI entirely client-side in the Electron app, never
-    # through this server), so it has no `available_harness_ids()` entry to
-    # validate against — this flag is the only server-side notion of it.
-    harness_hermes_enabled: bool = Field(
-        default=True,
-        title="Enable Hermes in the Harness Picker",
-        description="Offer Hermes as a per-task harness choice in Coding Mode.",
-    )
+    # Whether Claude Code appears in the per-task harness picker (Coding
+    # Mode's composer pill). Defaults true. Anton has no enable flag: it's the
+    # default agent and always offered. `claude-code` isn't a
+    # cowork.harnesses.base-registered harness (it runs the `claude` CLI
+    # entirely client-side in the Electron app, never through this server),
+    # so it has no `available_harness_ids()` entry to validate against — this
+    # flag is the only server-side notion of it.
     harness_claude_code_enabled: bool = Field(
         default=True,
         title="Enable Claude Code in the Harness Picker",
@@ -914,14 +944,19 @@ class UserSettings(Settings):
     # Same, for `minds_role_defaults` (see `_minds_role_default_map`).
     _role_default_cache: dict[str, str] | None = PrivateAttr(default=None)
 
-    @field_validator("harness")
+    @field_validator("harness", "channels_harness")
     @classmethod
-    def validate_harness(cls, v: str) -> str:
-        options = _harness_options()
-        if v not in options:
-            available = ", ".join(options) or "none"
-            raise ValueError(f"Unknown harness '{v}'. Available: {available}")
-        return v
+    def validate_harness(cls, v: str, info: ValidationInfo) -> str:
+        # Reads tolerate an unknown id: a stored row at any scope, ~/.cowork/.env
+        # or process env can still name a harness we no longer ship, and a
+        # raise here would fail every settings load. Writers validate inside
+        # reject_unknown_harness() and keep the rejection.
+        if _reject_unknown_harness.get():
+            options = _harness_options()
+            if v not in options:
+                raise ValueError(f"Unknown harness '{v}'. Available: {', '.join(options) or 'none'}")
+            return v
+        return _known_harness_or_anton(v, info.field_name)
 
     @field_validator("coding_agent_model")
     @classmethod

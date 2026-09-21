@@ -53,7 +53,10 @@ HEADER_EXPECTED_ORG_ID = "X-Cowork-Expected-Organization-Id"
 HEADER_ORG_RELOAD = "X-Cowork-Organization-Reload"
 
 # Always reachable without identity; channel webhooks are added by create_app().
-_EXEMPT_PATHS = frozenset({"/api/v1/health", "/api/v1/health/"})
+_EXEMPT_PATHS = frozenset({
+    "/api/v1/health", "/api/v1/health/",
+    "/api/v1/health/live",
+})
 
 
 @dataclass(frozen=True)
@@ -85,8 +88,17 @@ class TrustedHeaderMiddleware(BaseHTTPMiddleware):
         self._enforce = enforce
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
-        # CORS preflight never carries identity headers.
-        if request.method == "OPTIONS":
+        # A genuine CORS preflight never carries identity headers — but
+        # OPTIONS alone doesn't prove that, and neither does
+        # Access-Control-Request-Method alone: it's caller-controlled, so an
+        # anonymous caller could set it on a bare OPTIONS request with no
+        # Origin to reopen the same bypass. A browser preflight always
+        # carries both together; require both.
+        if (
+            request.method == "OPTIONS"
+            and request.headers.get("origin")
+            and request.headers.get("access-control-request-method")
+        ):
             return await call_next(request)
 
         if request.url.path in _EXEMPT_PATHS or request.url.path in self._exempt_paths:

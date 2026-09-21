@@ -63,7 +63,7 @@ from cowork.coding.task_delivery import TaskDeliveryService
 from cowork.coding.terminal_service import TaskTerminalService
 from cowork.coding.turns import RunningTurn, TurnExecutor
 from cowork.coding.workspace import WorkspaceManager
-from cowork.common.paths import cowork_home
+from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +113,10 @@ class CodingService(
         self._lock = threading.RLock()
         self._running: dict[str, RunningTurn] = {}
         self._maintenance: set[str] = set()
-        self.approvals = ApprovalBroker(self._approval_opened, self._approval_closed)
+        self.approvals = ApprovalBroker(
+            self._approval_opened, self._approval_closed,
+            lambda session_id: self.store.load_session(session_id).command_approval_grants,
+        )
         self.runtimes = RuntimeManager(root, self.registry, self.approvals.request)
         self.lifecycle = SessionLifecycleOperations(
             maintenance_session=self._maintenance_session,
@@ -518,7 +521,15 @@ class CodingService(
             lambda current: self._open_approval(current, pending),
         )
 
-    def _approval_closed(self, session_id: str, pending: PendingApproval, decision: ApprovalDecision) -> None:
+    def _approval_closed(
+        self, session_id: str, pending: PendingApproval, decision: ApprovalDecision,
+        command_grant: str | None = None,
+    ) -> None:
+        def close_and_remember(current: CodingSession) -> None:
+            self._close_approval(current)
+            if command_grant and command_grant not in current.command_approval_grants:
+                current.command_approval_grants = [*current.command_approval_grants[-255:], command_grant]
+
         self._emit(
             session_id,
             CodingEvent(
@@ -528,7 +539,7 @@ class CodingService(
                 phase="completed",
                 data={"approvalId": pending.id, "decision": decision.value},
             ),
-            self._close_approval,
+            close_and_remember,
         )
 
     def _emit(
@@ -559,6 +570,11 @@ class CodingService(
 
     @staticmethod
     def _apply_config_update(session: CodingSession, values: dict) -> None:
+        if any(
+            name in values and values[name] != getattr(session, name)
+            for name in ("permission_mode", "network_access", "additional_dirs")
+        ):
+            session.command_approval_grants = []
         for name, value in values.items():
             setattr(session, name, value)
 
@@ -600,4 +616,4 @@ class CodingService(
 
 @lru_cache(maxsize=1)
 def get_coding_service() -> CodingService:
-    return CodingService(cowork_home() / "coding")
+    return CodingService(Path(get_app_settings().coding.root_dir))

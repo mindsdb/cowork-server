@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
 import random
+import shutil
+import socket
+import stat
 import subprocess
 from pathlib import Path
 
@@ -8,7 +12,9 @@ import pytest
 
 from cowork.coding import workspace as workspace_module
 from cowork.coding.contracts import WorkspaceKind
+from cowork.coding.local_copy import LocalCopyError
 from cowork.coding.workspace import GitIdentityMissingError, GitRunner, GitUnavailableError, WorkspaceError, WorkspaceManager
+from cowork.coding.workspace_key import managed_key
 from cowork.common.settings.app_settings import get_app_settings
 
 
@@ -34,6 +40,18 @@ def repository(tmp_path: Path) -> Path:
 
 def missing_git(*_args, **_kwargs):
     raise FileNotFoundError(2, "not found", "git")
+
+
+def bind_socket(path: Path) -> None:
+    """AF_UNIX caps sun_path at 104 bytes on macOS and a pytest tmp_path already
+    exceeds it, so bind a relative name and restore the directory immediately."""
+    origin = Path.cwd()
+    os.chdir(path.parent)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+            listener.bind(path.name)
+    finally:
+        os.chdir(origin)
 
 
 def test_prepare_uses_detached_worktree_and_preserves_dirty_source(tmp_path: Path) -> None:
@@ -442,6 +460,155 @@ def test_a_local_copy_is_reviewable_and_applies_back_without_git(
     assert sorted(applied) == ["added.txt", "notes.txt"]
     assert (source / "notes.txt").read_text(encoding="utf-8") == "v2\n"
     assert (source / "added.txt").read_text(encoding="utf-8") == "new\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="sockets and FIFOs are POSIX")
+def test_a_local_copy_skips_entries_a_copy_cannot_reproduce(tmp_path: Path) -> None:
+    source = tmp_path / "plain"
+    data = source / "data"
+    data.mkdir(parents=True)
+    (data / "real.txt").write_text("content\n", encoding="utf-8")
+    bind_socket(data / "cli.sock")
+    os.mkfifo(data / "pipe.fifo")
+    manager = WorkspaceManager(tmp_path / "coding")
+
+    prepared = manager.prepare("socket-1", str(source), allow_direct_folder=True)
+    workspace = prepared.workspace_path
+    baseline = manager.local_copies.baselines_root / managed_key("socket-1")
+
+    assert prepared.kind == WorkspaceKind.local_copy
+    assert (workspace / "data" / "real.txt").read_text(encoding="utf-8") == "content\n"
+    for root in (workspace, baseline):
+        assert not (root / "data" / "cli.sock").exists()
+        assert not (root / "data" / "pipe.fifo").exists()
+    assert manager.local_copies.diff(workspace) == []
+
+    # preflight only reads the source for paths that already differ, so change
+    # one to prove the skipped entries raise neither a phantom path nor a
+    # phantom conflict on a real handoff.
+    (workspace / "data" / "real.txt").write_text("from task\n", encoding="utf-8")
+    assert manager.local_copies.preflight(source, workspace) == ["data/real.txt"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="sockets and FIFOs are POSIX")
+def test_fork_and_cleanup_survive_a_socket_made_inside_the_task(tmp_path: Path) -> None:
+    source = tmp_path / "plain"
+    source.mkdir()
+    (source / "notes.txt").write_text("v1\n", encoding="utf-8")
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare("socket-2", str(source), allow_direct_folder=True)
+    workspace = prepared.workspace_path
+    # A task that runs a dev server leaves a socket in its own workspace.
+    (workspace / "notes.txt").write_text("v2\n", encoding="utf-8")
+    bind_socket(workspace / "dev.sock")
+
+    forked = manager.fork("socket-3", str(source), str(workspace), WorkspaceKind.local_copy, None)
+
+    assert forked.kind == WorkspaceKind.local_copy
+    assert (forked.workspace_path / "notes.txt").read_text(encoding="utf-8") == "v2\n"
+    assert not (forked.workspace_path / "dev.sock").exists()
+
+    # A non-empty diff is what makes cleanup take its recovery-snapshot copy.
+    recovery = manager.local_copies.recovery_root / managed_key("socket-2") / "local-copy"
+    manager.cleanup("socket-2", str(source), str(workspace), WorkspaceKind.local_copy, None)
+
+    assert not workspace.exists()
+    assert (recovery / "notes.txt").read_text(encoding="utf-8") == "v2\n"
+    assert not (recovery / "dev.sock").exists()
+
+
+@pytest.mark.parametrize("failure", ["collected", "immediate"])
+def test_a_local_copy_that_fails_reports_the_path_it_failed_on(
+    failure: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "plain"
+    source.mkdir()
+    (source / "notes.txt").write_text("v1\n", encoding="utf-8")
+    manager = WorkspaceManager(tmp_path / "coding")
+    target = str(source / "notes.txt")
+
+    def failing_copytree(*_args, **_kwargs):
+        # Built here rather than in the parametrize list, which is evaluated at
+        # collection time and would share one exception across the whole run.
+        if failure == "collected":
+            raise shutil.Error([(target, "managed-destination", "[Errno 28] No space left on device")])
+        raise FileNotFoundError(2, "No such file or directory", target)
+
+    monkeypatch.setattr(shutil, "copytree", failing_copytree)
+
+    with pytest.raises(WorkspaceError, match="notes.txt") as raised:
+        manager.prepare("copy-fail-1", str(source), allow_direct_folder=True)
+
+    # The destination is a managed path under the coding root; a caller cannot
+    # act on it, so it stays out of the message.
+    assert "managed-destination" not in str(raised.value)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="sockets and FIFOs are POSIX")
+def test_handoff_refuses_to_replace_a_live_special_file_in_the_source(tmp_path: Path) -> None:
+    source = tmp_path / "plain"
+    data = source / "data"
+    data.mkdir(parents=True)
+    bind_socket(data / "cli.sock")
+    os.mkfifo(data / "pipe.fifo")
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare("collide-1", str(source), allow_direct_folder=True)
+
+    # Neither entry was copied, so a task file at the same path looks like a
+    # clean addition to every manifest.
+    (prepared.workspace_path / "data" / "cli.sock").write_text("agent output\n", encoding="utf-8")
+    (prepared.workspace_path / "data" / "pipe.fifo").write_text("agent output\n", encoding="utf-8")
+
+    with pytest.raises(LocalCopyError, match="cli.sock"):
+        manager.local_copies.apply(source, prepared.workspace_path)
+
+    assert stat.S_ISSOCK((data / "cli.sock").lstat().st_mode)
+    assert stat.S_ISFIFO((data / "pipe.fifo").lstat().st_mode)
+
+
+def test_handoff_refuses_a_source_entry_it_cannot_inspect(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "plain"
+    source.mkdir()
+    (source / "notes.txt").write_text("v1\n", encoding="utf-8")
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare("inspect-1", str(source), allow_direct_folder=True)
+    (prepared.workspace_path / "notes.txt").write_text("v2\n", encoding="utf-8")
+
+    blinded = source / "notes.txt"
+    real_lstat = Path.lstat
+
+    def refuse_lstat(self: Path):
+        if self == blinded:
+            raise PermissionError(13, "Permission denied", str(self))
+        return real_lstat(self)
+
+    monkeypatch.setattr(Path, "lstat", refuse_lstat)
+
+    with pytest.raises(LocalCopyError, match="could not be inspected"):
+        manager.local_copies.apply(source, prepared.workspace_path)
+
+    assert (source / "notes.txt").read_text(encoding="utf-8") == "v1\n"
+
+
+def test_a_copy_error_with_shredded_arguments_still_becomes_a_task_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "plain"
+    source.mkdir()
+    (source / "notes.txt").write_text("v1\n", encoding="utf-8")
+    manager = WorkspaceManager(tmp_path / "coding")
+
+    def failing_copytree(*_args, **_kwargs):
+        # CPython's _copytree does errors.extend(err.args[0]), so a nested
+        # SameFileError shreds its message into a list of single characters.
+        raise shutil.Error(list("'/a/notes.txt' and '/b/notes.txt' are the same file"))
+
+    monkeypatch.setattr(shutil, "copytree", failing_copytree)
+
+    with pytest.raises(WorkspaceError):
+        manager.prepare("shredded-1", str(source), allow_direct_folder=True)
 
 
 def isolate_git_identity(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
