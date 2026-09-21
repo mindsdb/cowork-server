@@ -24,6 +24,9 @@ class ConnectorField(BaseModel):
     description: str | None = None
     default: Any = None
     options: list[dict[str, Any]] | None = None
+    #: A checkbox reads as a sentence beside the box, which is longer than the
+    #: label the field is listed under. Only a boolean field uses it.
+    checkbox_label: str | None = None
 
 
 class OAuthConfig(BaseModel):

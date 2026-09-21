@@ -59,6 +59,20 @@ def _sse(event_type: str, payload: dict[str, Any]) -> str:
     return f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"
 
 
+def _tls_block(values: dict[str, Any]) -> dict[str, Any] | None:
+    """The trust the submitter asked for, or nothing and the server decides.
+
+    The cloud form asks one yes-or-no question, because the rest have no
+    answer most people can give: verify the certificate against the public
+    authorities, or take encryption where it is offered and check nothing.
+    """
+    if values.get("tls_mode"):
+        return {"mode": values["tls_mode"], "ca_pem": values.get("ca_pem") or None}
+    if values.get("tls_verify") is True:
+        return {"mode": "system", "ca_pem": None}
+    return None
+
+
 def _to_payload(req: SubmitFormRequest, connector_id: str, method: str, values: dict[str, Any]) -> dict[str, Any]:
     """Build auth's create payload out of the submitted values.
 
@@ -78,14 +92,11 @@ def _to_payload(req: SubmitFormRequest, connector_id: str, method: str, values: 
             schema=values.get("schema"),
             username=values.get("username"),
             password=values.get("password"),
-            # The cloud form asks nothing about certificates, so this is absent
-            # for nearly every submission and the server applies its own
-            # default. A spec that does ask still travels as it was answered.
-            tls=(
-                {"mode": values["tls_mode"], "ca_pem": values.get("ca_pem") or None}
-                if values.get("tls_mode")
-                else None
-            ),
+            # Absent for most submissions, and then the server applies its
+            # own: encryption where the server offers it, no check on who
+            # answered. The form's one question is whether to verify, and a
+            # spec that names a mode outright still travels as answered.
+            tls=_tls_block(values),
         )
     except ValidationError as exc:
         raise InvalidDatasourceInput("the submitted connection fields are invalid") from exc
