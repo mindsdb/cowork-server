@@ -12,6 +12,8 @@ selection/storage/resolution everywhere else.
 """
 import asyncio
 
+import pytest
+
 import cowork.services.providers as providers
 from cowork.services.providers import fetch_minds_models
 
@@ -68,6 +70,35 @@ def test_fetch_minds_models_drops_embedding_rows(monkeypatch):
     # A chat model's label passes through; one with no label is just absent
     # (client falls back to its own id-derived label).
     assert labels == {"sonnet": "Claude Sonnet 4.6"}
+
+
+@pytest.mark.parametrize("model_id", ["jev", "jev-1.13.0", "other-decision-model"])
+@pytest.mark.parametrize("embedding_fields", [{}, {"embedding": False}])
+def test_decision_models_are_excluded_from_picker_and_cached_catalog(monkeypatch, model_id, embedding_fields):
+    rows = [
+        {"id": "mindshub_air"},  # Older catalogs do not declare a kind.
+        {"id": "sonnet", "kind": "chat"},
+        {
+            "id": model_id,
+            "kind": "decision",
+            "enabled": True,
+            "label": "Decision model",
+            "provider": "typesafe",
+            "family": "jev",
+            **embedding_fields,
+        },
+    ]
+    monkeypatch.setattr(providers.httpx, "AsyncClient", _client_returning(rows))
+    providers._minds_models_cache.clear()
+
+    listing = asyncio.run(fetch_minds_models("https://api.mindshub.ai", "mdb_test"))
+
+    assert listing.ids == ["mindshub_air", "sonnet"]
+    assert listing.enabled == {}
+    assert listing.labels == {}
+    assert listing.providers == {}
+    assert listing.families == {}
+    assert providers.cached_minds_models("https://api.mindshub.ai") == listing
 
 
 def test_embedding_ids_are_dropped_when_the_endpoint_has_no_flag(monkeypatch):

@@ -95,27 +95,15 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     return applied
 
 
-def _apply_model_override(anton_settings, model: str | None) -> list[str]:
-    """A per-conversation model pick (the composer's dropdown) overrides
-    planning/coding/router for THIS call only — the account-wide
-    planning_model/coding_model/router_model settings applied by
-    ``_overlay_user_settings`` above are left untouched for every other
-    conversation. Provider is deliberately NOT overridden: the composer's
-    model list is itself scoped to whichever provider is already configured,
-    so the existing planning/coding/router providers stay correct for the
-    picked model.
+def _apply_client_models(anton_settings, llm_client) -> list[str]:
+    """Keep runtime context consistent with the models the client will use.
 
-    No-op (returns []) when ``model`` is falsy, so the account-wide defaults
-    keep governing conversations with no per-conversation pick.
-
-    Same hasattr skew guard as ``_overlay_user_settings`` — see its docstring.
+    Guard both sides for older Anton versions without the router role.
     """
-    if not model:
-        return []
     applied: list[str] = []
     for attr in ("planning_model", "coding_model", "router_model"):
-        if hasattr(anton_settings, attr):
-            setattr(anton_settings, attr, model)
+        if hasattr(anton_settings, attr) and hasattr(llm_client, attr):
+            setattr(anton_settings, attr, getattr(llm_client, attr))
             applied.append(attr)
     return applied
 
@@ -432,7 +420,7 @@ class AntonHarness:
         conversation: Conversation,
         input: list[TextInputBlock | FileInputBlock],
         # Per-conversation model pick (the composer's dropdown) — overrides
-        # planning/coding/router for this call only; see _build_chat_session.
+        # roles on the planning provider for this call only; see _build_chat_session.
         model: str | None = None,
         # Per-task reasoning-effort pick (the composer's Effort sub-picker) —
         # overrides planning/coding effort for this call only; see
@@ -899,8 +887,6 @@ class AntonHarness:
         if router_model is not None and hasattr(anton_settings, "router_model"):
             anton_settings.router_model = router_model
 
-        _apply_model_override(anton_settings, model)
-
         workspace = Workspace(base)
         workspace.initialize()
         workspace_env_overlay = _load_workspace_env_if_safe(workspace)
@@ -930,7 +916,8 @@ class AntonHarness:
         for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir, project_memory_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
-        llm_client = self._build_llm_client(effort=reasoning_effort)
+        llm_client = self._build_llm_client(effort=reasoning_effort, model=model)
+        _apply_client_models(anton_settings, llm_client)
         self_awareness = SelfAwarenessContext(context_dir)
 
         from cowork.common.settings.app_settings import get_app_settings
@@ -1195,6 +1182,6 @@ class AntonHarness:
         return build_chat_session(config), temp_vault_dir, seed_info
 
     @staticmethod
-    def _build_llm_client(effort: str | None = None):
+    def _build_llm_client(effort: str | None = None, *, model: str | None = None):
         from cowork.services.providers import build_llm_client
-        return build_llm_client(effort_override=effort)
+        return build_llm_client(effort_override=effort, model_override=model)
