@@ -265,6 +265,15 @@ def _turn_anchor_id(user_message: Message, assistant_message: Message | None) ->
     return assistant_message.id if assistant_message is not None else user_message.id
 
 
+def _message_id_str(message: Message | None) -> str | None:
+    """The row's id as a string, or None when the producer persisted nothing.
+
+    Shapes a Message for the optional `assistant_message_id` field the
+    failure frames carry.
+    """
+    return str(message.id) if message is not None else None
+
+
 class ResponsesHandler:
     def __init__(self, session: Session, principal: Principal | None = None) -> None:
         self.session = session
@@ -1358,7 +1367,7 @@ class ResponsesHandler:
             assistant_msg = persist()
             await buffer.append("sse", {"sse": response_failed_sse(
                 message, code, request_id=corr,
-                assistant_message_id=str(assistant_msg.id) if assistant_msg else None,
+                assistant_message_id=_message_id_str(assistant_msg),
             )})
             if code == CONTENT_RECOVERY_CODE:
                 # ENG-1992: the remote/org path's twin of the streaming
@@ -1398,7 +1407,7 @@ class ResponsesHandler:
             assistant_msg = persist()
             await buffer.append("sse", {"sse": response_failed_sse(
                 GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
-                assistant_message_id=str(assistant_msg.id) if assistant_msg else None,
+                assistant_message_id=_message_id_str(assistant_msg),
             )})
             await buffer.close("error")
         finally:
@@ -1716,7 +1725,7 @@ class ResponsesHandler:
             assistant_msg = persist()
             await buffer.append("sse", {"sse": response_failed_sse(
                 message, code, **extra,
-                assistant_message_id=str(assistant_msg.id) if assistant_msg else None,
+                assistant_message_id=_message_id_str(assistant_msg),
             )})
             await buffer.close("error")
         finally:
