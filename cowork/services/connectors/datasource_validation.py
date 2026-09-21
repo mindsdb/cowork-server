@@ -37,7 +37,21 @@ _PROBE_TIMEOUT_SECONDS = 45.0
 
 
 class _ValidationUnavailable(Exception):
-    """This deployment cannot validate, or a hop refused. Never leaves the module."""
+    """This deployment cannot validate, or a hop refused. Never leaves the module.
+
+    `code` is auth's own word for a refused mint, where it has one. Auth
+    records a verdict for the refusals a connection can never get past, so the
+    caller has to know which those were and re-read the row.
+    """
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+#: Mint refusals auth records on the connection before answering. Anything else
+#: leaves the row as it was, to be retried.
+_RECORDED_BY_AUTH = frozenset({"port_not_approved"})
 
 
 def _refusal(response: httpx.Response) -> tuple[str, str]:
@@ -94,7 +108,10 @@ async def _mint_capability(
     except (httpx.HTTPError, TimeoutError) as exc:
         raise _ValidationUnavailable("auth is unreachable") from exc
     if response.status_code >= 400:
-        raise _ValidationUnavailable(f"auth refused the capability with {response.status_code}")
+        code, _ = _refusal(response)
+        raise _ValidationUnavailable(
+            f"auth refused the capability with {response.status_code} ({code})", code=code
+        )
     try:
         body = response.json()
     except ValueError as exc:
@@ -149,11 +166,12 @@ async def _run_probe(
 class ValidationOutcome:
     """What one validation attempt did, for the route that asked for it.
 
-    `ran` says whether the gateway answered, so the caller knows whether to
-    re-read the connection. `code` is the gateway's own word for a refusal,
-    which is the only place a reason exists: auth records a verdict, not a
-    cause, so without this a failed connection can say nothing more useful than
-    that it failed.
+    `ran` says whether the connection's stored state may have changed, so the
+    caller knows whether to re-read it: the gateway answered, or auth refused
+    the mint in a way it records on the connection itself. `code` is whichever
+    hop refused, in its own words, which is the only place a reason exists:
+    auth records a verdict, not a cause, so without this a failed connection
+    can say nothing more useful than that it failed.
     """
 
     ran: bool
@@ -170,5 +188,7 @@ async def validate_connection(
         code = await _run_probe(probe_id, capability, credential_version, settings)
     except _ValidationUnavailable as exc:
         logger.warning("[datasources] connection %s was not validated: %s", connection_id, exc)
+        if exc.code in _RECORDED_BY_AUTH:
+            return ValidationOutcome(ran=True, code=exc.code)
         return ValidationOutcome(ran=False)
     return ValidationOutcome(ran=True, code=code)
