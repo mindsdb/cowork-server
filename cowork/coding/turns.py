@@ -108,7 +108,14 @@ class EventBuffer:
             EventType.reasoning,
             EventType.command,
             EventType.file_change,
-        }
+        } or (
+            # Plan snapshots and completion events must remain distinct;
+            # only the streamed text uses the bounded coalescing path.
+            event.type == EventType.plan
+            and event.phase == "progress"
+            and bool(event.text)
+            and not event.data
+        )
         if (
             mergeable
             and pending is not None
