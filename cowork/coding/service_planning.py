@@ -28,13 +28,14 @@ class CodingPlanningOperations:
                 self.runtimes.close_locked(session_id)
                 self.store.update_session(session_id, lambda current: setattr(current, "task_mode", request.task_mode))
                 try:
-                    self._continue_completed_task(self.get_session(session_id))
-                    return self._submit_turn(session_id, request.prompt, credentials, request.attachments, maintenance_reserved=True)
+                    return self._submit_turn(
+                        session_id, request.prompt, credentials, request.attachments,
+                        maintenance_reserved=True, continue_completed=True,
+                    )
                 except Exception as exc:
                     def restore(current: CodingSession) -> None:
                         current.task_mode = previous
-                        # A rejected preflight may have reserved a fresh run,
-                        # but it must not consume the completed plan's decision.
+                        # Rejected preflight leaves the previous run unchanged.
                         # Worker-start failures already have a failed run and
                         # retain the normal recovery flow instead.
                         if current.status == SessionStatus.ready:

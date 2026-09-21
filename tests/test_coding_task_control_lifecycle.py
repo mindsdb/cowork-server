@@ -1,7 +1,9 @@
+import hashlib
+
 import pytest
 
 from coding_service_fakes import CREDS, FakeEngine, repository, service_with, wait_for_status
-from cowork.coding.contracts import ModeTurnRequest, PermissionMode, SessionCreateRequest, SessionStatus
+from cowork.coding.contracts import InputReference, ModeTurnRequest, PermissionMode, SessionCreateRequest, SessionStatus
 from cowork.coding.control_errors import StateConflict
 from cowork.coding.engines.base import EngineSessionConfig
 from cowork.coding.engines.codex_config import prepare_launch
@@ -110,6 +112,74 @@ def test_failed_start_restores_plan_mode(tmp_path, monkeypatch):
     service.submit_mode_turn(created.id, ModeTurnRequest(prompt='Build', task_mode='build', expected_event_count=restored.event_count), CREDS)
     wait_for_status(service, created.id, SessionStatus.completed)
     assert service.get_session(created.id).task_mode == 'build'
+
+
+@pytest.mark.parametrize('failure', ['missing', 'changed'])
+def test_rejected_mode_attachment_does_not_allocate_a_run_and_can_retry(tmp_path, failure):
+    service, engine, created = task(tmp_path)
+    attachment = tmp_path / 'requirements.txt'
+    attachment.write_text('original requirements', encoding='utf-8')
+    reference = InputReference(
+        name=attachment.name, path=str(attachment),
+        content_hash=hashlib.sha256(attachment.read_bytes()).hexdigest(),
+    )
+    if failure == 'missing':
+        attachment.unlink()
+    else:
+        attachment.write_text('changed requirements', encoding='utf-8')
+    original_runs = {run.id for run in service.control.store.list_runs()}
+    original_workspaces = service.control.store.list_workspaces(created.run_id)
+    original_prompts = list(engine.prompts)
+
+    for _ in range(2):
+        current = service.get_session(created.id)
+        with pytest.raises(ValueError, match='unavailable|changed'):
+            service.submit_mode_turn(created.id, ModeTurnRequest(
+                prompt='Build the plan', task_mode='build',
+                expected_event_count=current.event_count, attachments=[reference],
+            ), CREDS)
+        restored = service.get_session(created.id)
+        assert restored.task_mode == 'plan'
+        assert restored.status == created.status
+        assert restored.run_id == created.run_id
+        assert restored.runtime_epoch == created.runtime_epoch
+        assert restored.last_error == created.last_error
+        assert {run.id for run in service.control.store.list_runs()} == original_runs
+        assert service.control.store.list_workspaces(created.run_id) == original_workspaces
+        assert engine.prompts == original_prompts
+
+    attachment.write_text('original requirements', encoding='utf-8')
+    service.submit_mode_turn(created.id, ModeTurnRequest(
+        prompt='Build the plan', task_mode='build',
+        expected_event_count=restored.event_count, attachments=[reference],
+    ), CREDS)
+    wait_for_status(service, created.id, SessionStatus.completed)
+    built = service.get_session(created.id)
+    assert built.task_mode == 'build'
+    assert built.run_id != created.run_id
+    assert built.runtime_epoch == created.runtime_epoch + 1
+    assert len(service.control.store.list_runs()) == len(original_runs) + 1
+    assert engine.attachments[-1][0].path == str(attachment)
+
+
+def test_worker_start_failure_keeps_the_new_run_failed_and_restores_mode(tmp_path, monkeypatch):
+    service, _, created = task(tmp_path)
+    original_runs = {run.id for run in service.control.store.list_runs()}
+
+    def fail_start(_thread):
+        raise RuntimeError('worker could not start')
+
+    monkeypatch.setattr('cowork.coding.service_turns.threading.Thread.start', fail_start)
+    with pytest.raises(RuntimeError, match='worker could not start'):
+        service.submit_mode_turn(created.id, ModeTurnRequest(
+            prompt='Build the plan', task_mode='build', expected_event_count=created.event_count,
+        ), CREDS)
+    failed = service.get_session(created.id)
+    assert failed.task_mode == 'plan'
+    assert failed.status == SessionStatus.failed
+    assert failed.run_id != created.run_id
+    assert service.control.store.get_run(failed.run_id).status == 'failed'
+    assert len(service.control.store.list_runs()) == len(original_runs) + 1
 
 
 def test_plan_launch_cannot_write_or_escalate_even_with_full_access_default(tmp_path):

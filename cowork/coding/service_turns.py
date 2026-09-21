@@ -121,6 +121,7 @@ class CodingTurnOperations:
         attachments: list[InputReference] | tuple[InputReference, ...],
         *,
         maintenance_reserved: bool = False,
+        continue_completed: bool = False,
     ) -> CodingSession:
         """Validate and launch one turn, optionally inside a service reservation."""
         intent = self._validated_command_intent(self.get_session(session_id), prompt, attachments)
@@ -142,6 +143,9 @@ class CodingTurnOperations:
             }:
                 raise RuntimeError("This coding task already has a running turn")
             engine_attachments = validate_references(session, attachments)
+            # Mode changes must finish preflight before allocating a new run.
+            if continue_completed:
+                self._continue_completed_task(session)
             self._emit(
                 session_id,
                 CodingEvent(type=EventType.user_message, title="You", text=prompt, phase="completed"),
