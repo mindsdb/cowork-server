@@ -261,8 +261,8 @@ DESKTOP_FIELDS = {
 
 #: What each cloud form collects. PostgreSQL alone names a schema.
 CLOUD_DATABASE_FIELDS = {
-    "postgres": {"host", "port", "database", "schema", "username", "password"},
-    "mysql": {"host", "port", "database", "username", "password"},
+    "postgres": {"host", "port", "database", "schema", "username", "password", "tls_verify"},
+    "mysql": {"host", "port", "database", "username", "password", "tls_verify"},
 }
 
 
@@ -305,13 +305,19 @@ class TestCloudDatabaseSpecs:
         # part of the enablement commit and is never merged.
         assert self._cloud(spec, connector_id).available is True
 
-    def test_the_form_asks_nothing_about_certificates(self, spec, connector_id):
-        """The cloud form collects a connection and nothing else. Trust is the
-        server's default, encryption where it is offered and no check on the
-        certificate, because the question has no answer most people can give
-        and the common answer for a self-hosted server is always the same."""
-        names = {f.name for f in self._cloud(spec, connector_id).fields}
-        assert names == CLOUD_DATABASE_FIELDS[connector_id]
+    def test_the_form_asks_one_yes_or_no_about_certificates(self, spec, connector_id):
+        """The cloud form collects a connection and one question about trust:
+        verify the certificate, or take the server's default, which encrypts
+        where it is offered and checks nothing. The modes that need a pasted
+        certificate or turn encryption off have no answer most people can give,
+        so the form does not ask them."""
+        fields = {f.name: f for f in self._cloud(spec, connector_id).fields}
+        assert set(fields) == CLOUD_DATABASE_FIELDS[connector_id]
+        assert fields["tls_verify"].type == "boolean"
+        assert fields["tls_verify"].required is False
+        # Unchecked unless the person checks it: a default would decide for
+        # them, and `"false"` reads as true to a checkbox.
+        assert fields["tls_verify"].default is None
 
     def test_only_postgresql_asks_for_a_schema(self, spec, connector_id):
         """A PostgreSQL database holds many schemas, so a connection may name
@@ -325,11 +331,12 @@ class TestCloudDatabaseSpecs:
             return
         assert field is not None and field.required is False
 
-    def test_no_cloud_field_toggles_tls(self, spec, connector_id):
-        """`ssl_enabled` and `use_ssl` are desktop fields. A boolean here would
-        be a cloud form that can ask for an unverified connection."""
+    def test_no_cloud_field_turns_encryption_off_or_pastes_a_certificate(self, spec, connector_id):
+        """`ssl_enabled` and `use_ssl` are desktop fields, and they can turn
+        encryption off. The cloud question only ever tightens: checked verifies,
+        unchecked leaves the server's own default, which still encrypts."""
         names = {f.name for f in self._cloud(spec, connector_id).fields}
-        assert names.isdisjoint({"ssl_enabled", "use_ssl", "ssl", "tls", "ssl_ca_cert"})
+        assert names.isdisjoint({"ssl_enabled", "use_ssl", "ssl", "tls", "ssl_ca_cert", "ca_pem"})
 
     @pytest.mark.parametrize("phrase", ["sslmode=disable", "leave SSL off"])
     def test_cloud_copy_never_inherits_the_desktop_ssl_off_guidance(

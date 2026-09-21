@@ -236,6 +236,28 @@ def test_the_schema_a_submitter_names_reaches_auth(org_client, relay):
     assert json.loads(recorded[0].content)["schema"] == "sales_ops"
 
 
+def test_asking_for_a_verified_certificate_relays_that_choice(org_client, relay):
+    """The form's one trust question. Unchecked it is absent and the server
+    applies its own default, which is the case just above."""
+    recorded, _ = relay
+    values = submission()["values"] | {"tls_verify": True}
+
+    res = org_client.post(PATH, json=submission(values=values), headers=AUTH_HEADERS)
+
+    assert res.status_code == 200
+    assert json.loads(recorded[0].content)["tls"] == {"mode": "system", "ca_pem": None}
+
+
+def test_an_unchecked_box_is_not_a_trust_choice(org_client, relay):
+    recorded, _ = relay
+    values = submission()["values"] | {"tls_verify": False}
+
+    res = org_client.post(PATH, json=submission(values=values), headers=AUTH_HEADERS)
+
+    assert res.status_code == 200
+    assert json.loads(recorded[0].content)["tls"] == {"mode": "prefer", "ca_pem": None}
+
+
 def test_a_field_the_cloud_form_no_longer_has_is_refused(org_client, relay):
     """Certificate trust left the form, so a submission naming it is a client
     sending something this connector does not collect."""
