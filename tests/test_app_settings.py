@@ -112,6 +112,50 @@ def test_app_settings_rejects_invalid_tenancy_mode(monkeypatch):
         AppSettings(_env_file=None)
 
 
+def test_require_auth_defaults_on_in_local_mode(monkeypatch):
+    monkeypatch.delenv("COWORK_REQUIRE_AUTH", raising=False)
+    monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.tenancy_mode == "local"
+    assert settings.require_auth is True
+
+
+def test_require_auth_stays_off_in_org_mode_by_default(monkeypatch):
+    # create_app() refuses to boot with require_auth=True in org mode (the
+    # token would be mirrored into shared storage every org can read) — so
+    # defaulting it on there would turn "nobody configured this" into a boot
+    # failure instead of leaving the ingress as org's own auth boundary.
+    monkeypatch.delenv("COWORK_REQUIRE_AUTH", raising=False)
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.require_auth is False
+
+
+def test_require_auth_explicit_false_is_respected_in_local_mode(monkeypatch):
+    monkeypatch.setenv("COWORK_REQUIRE_AUTH", "false")
+    monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.require_auth is False
+
+
+def test_require_auth_explicit_true_is_respected_in_org_mode(monkeypatch):
+    # Not the recommended shape (create_app() still refuses to boot this
+    # combination) — this only pins that the settings layer itself doesn't
+    # second-guess an explicit choice, boot-time refusal is create_app()'s job.
+    monkeypatch.setenv("COWORK_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.require_auth is True
+
+
 def test_single_tenant_harness_hidden_from_options_in_org_mode(monkeypatch):
     from cowork.common.settings.app_settings import get_app_settings
     from cowork.common.settings.user_settings import _harness_options
