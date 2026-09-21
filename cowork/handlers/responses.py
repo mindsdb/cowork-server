@@ -95,6 +95,32 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Strong references for fire-and-forget probe tasks: asyncio holds only a weak
+# reference to a task once nothing else does, so a bare `create_task` result
+# that's dropped can be garbage-collected mid-flight. Discarded on completion
+# via the done-callback below.
+_jev_shadow_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_jev_shadow_probe(
+    *, conversation_id: UUID, messages: list[dict], llm_block: dict | None,
+    settings: TurnQueueSettings,
+) -> None:
+    """Runs `jev_shadow.probe` detached from the request path and logs its
+    own result. Never awaited by the caller, so a slow or hung probe cannot
+    delay the turn it's shadowing."""
+
+    async def _run() -> None:
+        jev_result = await jev_shadow.probe(messages=messages, llm_block=llm_block, settings=settings)
+        if jev_result is None:
+            return
+        fields = " ".join(f"{k}={v}" for k, v in jev_result.items())
+        logger.info("[jev-shadow] conversation=%s %s", conversation_id, fields)
+
+    task = asyncio.create_task(_run())
+    _jev_shadow_tasks.add(task)
+    task.add_done_callback(_jev_shadow_tasks.discard)
+
 
 class _RemoteTurnFailed(Exception):
     """Terminal turn_failed reply; payload rides the enclosing scope."""
@@ -546,38 +572,30 @@ class ResponsesHandler:
                     binding, turn_llm = await self._router_binding()
                     turn_queue_settings = TurnQueueSettings()
 
-                    async def _timed_gate() -> tuple[RouteDecision, int]:
-                        # Own coroutine so gathering it with the Jev probe below
-                        # doesn't inflate this into their combined wall time.
-                        started = time.monotonic()
-                        result = await decide_route(
-                            history=history,
-                            has_non_text_input=has_non_text_input,
-                            has_attachments=has_attachments,
-                            has_disabled_connections=has_disabled_connections,
-                            binding=binding,
-                        )
-                        return result, round((time.monotonic() - started) * 1000)
-
-                    (decision, gate_ms), jev_result = await asyncio.gather(
-                        _timed_gate(),
-                        jev_shadow.probe(
-                            messages=_text_history(history),
-                            llm_block=(turn_llm or {}).get("llm"),
-                            settings=turn_queue_settings,
-                        ),
+                    gate_started = time.monotonic()
+                    decision = await decide_route(
+                        history=history,
+                        has_non_text_input=has_non_text_input,
+                        has_attachments=has_attachments,
+                        has_disabled_connections=has_disabled_connections,
+                        binding=binding,
                     )
-                    # Logged unconditionally, not only when Jev ran, so the
-                    # gate's own route/timing is readable off plain server logs.
-                    jev_fields = (
-                        " " + " ".join(f"{k}={v}" for k, v in jev_result.items())
-                        if jev_result is not None else ""
-                    )
+                    gate_ms = round((time.monotonic() - gate_started) * 1000)
                     logger.info(
                         "[gate] conversation=%s route=%s reason=%s provider=%s "
-                        "model=%s gate_ms=%d%s",
+                        "model=%s gate_ms=%d",
                         conversation_id, decision.route, decision.reason,
-                        decision.provider, decision.model, gate_ms, jev_fields,
+                        decision.provider, decision.model, gate_ms,
+                    )
+                    # Detached on purpose: awaiting this (even via asyncio.gather)
+                    # would make a ready gate decision wait for Jev, exactly the
+                    # thing a *shadow* probe must never do. Logs on its own once
+                    # it finishes; never read by anything on the request path.
+                    _spawn_jev_shadow_probe(
+                        conversation_id=conversation_id,
+                        messages=_text_history(history),
+                        llm_block=(turn_llm or {}).get("llm"),
+                        settings=turn_queue_settings,
                     )
             finally:
                 reset_trace_context(trace_token)

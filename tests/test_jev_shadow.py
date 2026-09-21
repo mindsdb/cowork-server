@@ -97,6 +97,31 @@ async def test_probe_success_extracts_choice_and_confidence(monkeypatch):
     assert captured["json"]["state"] == [{"role": "user", "content": "hi"}]
 
 
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"choice": "not-a-valid-choice", "confidence": 0.5},
+        {"choice": "needs_agent", "confidence": 9},
+        {"choice": "needs_agent", "confidence": -0.1},
+        {"choice": "needs_agent", "confidence": "0.9"},
+        {"choice": "needs_agent", "confidence": True},
+        {"choice": "needs_agent", "confidence": float("inf")},
+        {"choice": "needs_agent", "confidence": float("nan")},
+    ],
+)
+@pytest.mark.asyncio
+async def test_probe_rejects_invalid_answer_values(monkeypatch, answer):
+    body = {"model": "jev-1.13.0", "answers": {"route": {"type": "choice", **answer}}}
+    fake = _FakeAsyncClient(response=_FakeResponse(200, body))
+    monkeypatch.setattr(jev_shadow.httpx, "AsyncClient", fake)
+
+    result = await jev_shadow.probe(messages=[], llm_block=LLM_BLOCK, settings=_settings())
+
+    assert result["jev_error"] == "malformed_response"
+    assert "jev_choice" not in result
+    assert "jev_confidence" not in result
+
+
 @pytest.mark.asyncio
 async def test_probe_missing_base_url_is_noop(monkeypatch):
     monkeypatch.setattr(jev_shadow.httpx, "AsyncClient", lambda **_: (_ for _ in ()).throw(AssertionError("must not call out")))
