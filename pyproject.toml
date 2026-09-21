@@ -19,8 +19,63 @@ dependencies = [
     # Releases before ENG-2116 remain allowed until Anton ships the supplier;
     # build_llm_client capability-gates that kwarg and reports the degradation.
     "anton-agent>=2.26.8.23.1,<3",
-    # Capped <49: 49+ drops the macOS universal2 wheel, breaking Intel-Mac installs.
+    # Intel macOS is capped <49 and nothing else is. cryptography 48.0.1 ships
+    # `macosx_10_9_universal2`; from 49.0.0 the only macOS wheel is
+    # `macosx_11_0_arm64`, so on x86_64 Macs an unbounded floor resolves to an
+    # sdist and uv tries to COMPILE it (Rust + OpenSSL). The PyPI install
+    # channel deliberately ships no Xcode Command Line Tools step, so that
+    # build fails and the desktop app dead-ends at "Install cowork-server".
+    #
+    # READ THIS BEFORE BUMPING IT. The cap has a real security cost and is a
+    # deliberate trade, not an oversight. 48.x is a FINISHED line: 48.0.1
+    # shipped 2026-06-09 and 49.0.0 three days later, so nothing further will
+    # be backported to it.
+    #
+    # THREE open advisories apply to 48.0.1, all fixed only in 49.0.0 or later:
+    #   - GHSA-g6cj-pr64-35w5 (HIGH)     PKCS#7 EnvelopedData decryption
+    #                                    Bleichenbacher oracle. Fixed 50.0.0.
+    #   - GHSA-jwv3-5hgf-82ww (HIGH)     X.509 path building, exponential blowup
+    #                                    on duplicate self-signed intermediates.
+    #   - GHSA-m2h6-j472-rp4c (MODERATE) X.509 verifier accepts wildcard DNS
+    #                                    names, escaping permittedSubtrees.
+    #
+    # Do not be misled by GitHub's advisory API on the latter two: their
+    # `vulnerable_version_range` ends at `<= 48.0.0`, which reads as though
+    # 48.0.1 were clear, while `first_patched_version` says 49.0.0. The range
+    # is stale, and two independent checks settle it. The 48.0.1 changelog has
+    # exactly ONE entry — "Updated Windows, macOS, and Linux wheels to be
+    # compiled with OpenSSL 4.0.1" — which is GHSA-537c-gmf6-5ccf and nothing
+    # else, and a wheel rebuild cannot carry code fixes for cryptography's own
+    # Rust X.509 verifier. That same 537c advisory is the control showing the
+    # database does record genuine 48.0.1 backports when they exist
+    # (`< 48.0.1`, `first_patched_version: 48.0.1`). OSV agrees: it matches all
+    # three against 48.0.1 and correctly drops 537c.
+    #
+    # Reachability from THIS package is low for all three. Our own use of
+    # cryptography is Fernet (common/encryption.py, services/settings.py) and
+    # Ed25519 signature verification (channels/plugins/discord.py); we never
+    # decrypt PKCS#7 EnvelopedData and never drive the X.509 path builder.
+    # Not audited: transitive use. pyhanko is the notable cryptography consumer
+    # here and the X.509 pair is the half with any bearing on it, so that is
+    # where to look first if this is ever revisited.
+    #
+    # Weighed against an install that cannot complete at all on the affected
+    # hardware, the cap wins — but it is three open advisories, not a free
+    # trade. Re-check that reachability before assuming
+    # it still holds, and do not simply raise the ceiling because a scanner
+    # flagged it. Upstream is not restoring the wheel, so the only real exits
+    # are dropping Intel macOS support or `--no-build` at the install site
+    # (ENG-1629 item 1).
+    #
+    # Scoped by marker rather than capped globally so the cost lands only on
+    # the platform that forces it: a blanket <49 would freeze Apple Silicon,
+    # Windows and Linux on 48.0.1 too and carry all three advisories
+    # fleet-wide, for nothing.
+    #
+    # Enforced by the `wheels-available` CI gate — a bump that deletes the
+    # marker turns that job red. ENG-2864 (regression of #320), ENG-1629.
     "cryptography>=48.0.0,<51",
+    "cryptography<49; sys_platform == 'darwin' and platform_machine == 'x86_64'",
     "fastapi>=0.136.1",
     "httpx>=0.27",
     # Structured app-server integration with a pinned, bundled Codex runtime;
