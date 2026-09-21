@@ -28,6 +28,11 @@ os.environ["COWORK_FILES_DIR"] = str(TMP / "files")
 # Without this, org-scoped tests write into the developer's real ~/.cowork/.
 os.environ["COWORK_SHARED_DIR"] = str(TMP / "shared")
 os.environ["ENV"] = "test"
+# require_auth now defaults on in local mode. Every test in this suite drives
+# create_app() through TestClient/ASGITransport with no bearer token, so
+# leaving the default on would 401 nearly everything. A test that means to
+# exercise the auth-on behavior sets this back explicitly.
+os.environ["COWORK_REQUIRE_AUTH"] = "false"
 
 import pytest
 from sqlmodel import Session, SQLModel
