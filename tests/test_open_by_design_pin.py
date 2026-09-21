@@ -44,6 +44,10 @@ OPEN_BY_DESIGN_REASONS: dict[tuple[str, tuple[str, ...]], str] = {
         "the pre-auth readiness probe every client and the kubelet polls before "
         "anything can authenticate"
     ),
+    ("/api/v1/health/live", ("GET",)): (
+        "the kubelet's liveness probe, which has no identity headers to send "
+        "and nowhere to get them; refusing it kills the pod"
+    ),
     ("/api/v1/connectors/specs/{connector_id}", ("GET",)): (
         "a static connector-registry lookup; the same answer for every caller, "
         "no tenant data and no secret"
