@@ -18,6 +18,7 @@ from cowork.api.v1.router import api_router as v1_router
 from starlette.responses import JSONResponse
 
 from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token, sync_auth_token
+from cowork.coding.inference_proxy import INFERENCE_PATHS
 from cowork.db.scoped import MissingTenantScopeError
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.common.logger import setup_logging
@@ -284,6 +285,13 @@ def create_app() -> FastAPI:
         env_path = cowork_home() / ".env"
         token = settings.auth_token or ensure_auth_token(env_path)
         sync_auth_token(env_path, token)
+        # Codex has a separate, process-local inference credential, not the
+        # desktop's API token. These exact routes retain their own constant-time
+        # credential check and LoopbackDesktopOnly guard. Do not exempt the
+        # coding prefix: that would expose task/filesystem APIs to the agent.
+        channel_webhook_paths.update(
+            f"/api/v1/coding/inference/{path}" for path in INFERENCE_PATHS
+        )
         app.add_middleware(
             BearerTokenMiddleware, token=token, exempt_paths=channel_webhook_paths
         )
