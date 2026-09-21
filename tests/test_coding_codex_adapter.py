@@ -58,8 +58,11 @@ def test_codex_model_discovery_keeps_models_that_need_credits(monkeypatch) -> No
                 "data": [
                     {"id": "mindshub_air", "enabled": True},
                     {"id": "fable", "enabled": False},
-                    {"id": "gpt-codex", "enabled": False},
+                    {"id": "gpt-codex", "kind": "chat", "enabled": False},
                     {"id": "embed-small", "enabled": False, "embedding": True},
+                    {"id": "jev", "kind": "decision", "enabled": True, "embedding": False},
+                    {"id": "jev-1.13.0", "kind": "decision", "enabled": True},
+                    {"id": "other-decision-model", "kind": "decision", "enabled": True},
                 ],
             }
 
