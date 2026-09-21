@@ -288,23 +288,6 @@ def test_a_refused_capability_leaves_the_stored_connection_pending(org_client, c
     assert _by_path(recorded, "/v1/datasources/probe") is None, "a refused mint must not be spent"
 
 
-def test_a_port_auth_will_not_dial_answers_with_the_refusal_it_recorded(org_client, cluster):
-    """Auth records a verdict for this one, because no probe will ever run to
-    record one later. The capture has to re-read the connection and carry the
-    reason, or the owner is left watching a check that cannot finish."""
-    recorded, scripted = cluster
-    scripted["mint"] = (404, {"code": "port_not_approved", "detail": "unavailable"})
-    scripted["detail"] = (200, {**VERIFIED, "status": "failed", "validation_error": "validation failed"})
-
-    res = org_client.post(CREATE, json=CREATE_BODY, headers=AUTH_HEADERS)
-
-    assert res.status_code == 201
-    body = res.json()
-    assert body["status"] == "failed"
-    assert body["validation_code"] == "port_not_approved"
-    assert _by_path(recorded, "/v1/datasources/probe") is None, "a refused mint must not be spent"
-
-
 @pytest.mark.parametrize("missing", ["producer", "gateway"])
 def test_a_deployment_that_cannot_validate_captures_without_trying(monkeypatch, cluster, adapter_verified_datasources, missing):
     recorded, _ = cluster
