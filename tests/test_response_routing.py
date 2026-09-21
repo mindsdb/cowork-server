@@ -306,6 +306,56 @@ async def test_route_request_runs_gate_under_org_scope(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_route_request_ignores_jev_result_even_when_it_contradicts_the_gate(monkeypatch):
+    """The shadow probe is logging-only. A Jev result that confidently
+    disagrees with the gate, or is an error dict, must never change the
+    decision `_route_request` returns."""
+    import cowork.handlers.responses as responses
+    from cowork.handlers import jev_shadow
+
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
+    )
+    async def fake_decide_route(**_kwargs):
+        return RouteDecision(route=DIRECT_CONTEXT, reason="test", text="hi")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+
+    async def loud_wrong_jev(**_kwargs):
+        return {"jev_choice": "needs_agent", "jev_confidence": 0.99, "jev_ms": 5}
+
+    monkeypatch.setattr(jev_shadow, "probe", loud_wrong_jev)
+
+    decision, _turn_llm = await handler._route_request(
+        conversation_id=None,
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+
+    assert decision.route == DIRECT_CONTEXT
+    assert decision.text == "hi"
+
+    async def jev_error(**_kwargs):
+        return {"jev_error": "timeout", "jev_ms": 3000}
+
+    monkeypatch.setattr(jev_shadow, "probe", jev_error)
+
+    decision, _turn_llm = await handler._route_request(
+        conversation_id=None,
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+
+    assert decision.route == DIRECT_CONTEXT
+    assert decision.text == "hi"
+
+
+@pytest.mark.asyncio
 async def test_route_request_scrubs_secrets_from_history_and_current_prompt(monkeypatch):
     """the gate reads history straight from storage, bypassing the
     scrub a normal turn gets via AntonHarness._stamp_message/_scrub_user_input.

@@ -562,7 +562,8 @@ class TurnQueueSettings(Settings):
     )  # COWORK_TURN_JEV_SHADOW_MODEL
     jev_shadow_timeout_seconds: float = Field(
         default=3.0,
-        description="Timeout for the shadow Jev call. Independent of the gate's own budget, since a slow or hung probe must never hold up the turn it's shadowing.",
+        gt=0,
+        description="Hard wall-clock timeout for the shadow Jev call (enforced via asyncio.timeout, not just httpx's own per-phase timeout). Independent of the gate's own budget, since a slow or hung probe must never hold up the turn it's shadowing.",
     )  # COWORK_TURN_JEV_SHADOW_TIMEOUT_SECONDS
     minds_coding_model: str = Field(
         default="",
