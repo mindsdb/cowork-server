@@ -547,10 +547,8 @@ class ResponsesHandler:
                     turn_queue_settings = TurnQueueSettings()
 
                     async def _timed_gate() -> tuple[RouteDecision, int]:
-                        # Timed in its own coroutine so concurrency with the Jev
-                        # probe below doesn't inflate this into their combined
-                        # wall time. It's the two calls' own durations that a
-                        # speed comparison needs.
+                        # Own coroutine so gathering it with the Jev probe below
+                        # doesn't inflate this into their combined wall time.
                         started = time.monotonic()
                         result = await decide_route(
                             history=history,
@@ -569,13 +567,17 @@ class ResponsesHandler:
                             settings=turn_queue_settings,
                         ),
                     )
-                    # Unconditional: this is the gate's own route/timing, and is
-                    # useful on its own for reading real numbers off plain
-                    # server logs, independent of whether Jev ran at all.
+                    # Logged unconditionally, not only when Jev ran, so the
+                    # gate's own route/timing is readable off plain server logs.
+                    jev_fields = (
+                        " " + " ".join(f"{k}={v}" for k, v in jev_result.items())
+                        if jev_result is not None else ""
+                    )
                     logger.info(
-                        "[gate] conversation=%s route=%s reason=%s gate_ms=%d%s",
-                        conversation_id, decision.route, decision.reason, gate_ms,
-                        f" jev={jev_result}" if jev_result is not None else "",
+                        "[gate] conversation=%s route=%s reason=%s provider=%s "
+                        "model=%s gate_ms=%d%s",
+                        conversation_id, decision.route, decision.reason,
+                        decision.provider, decision.model, gate_ms, jev_fields,
                     )
             finally:
                 reset_trace_context(trace_token)
