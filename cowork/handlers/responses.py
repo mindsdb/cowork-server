@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from functools import partial
@@ -24,10 +25,12 @@ from cowork.common.settings.user_settings import (
 )
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import available_harness_ids, get_harness
+from cowork.handlers import jev_shadow
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
     _MAX_HISTORY_MESSAGES,
+    _text_history,
     RouteDecision,
     RouterBinding,
     decide_route,
@@ -541,12 +544,38 @@ class ResponsesHandler:
                 # The gate resolves the router role + key ambiently; bind the org scope.
                 with use_settings_scope(self.scope):
                     binding, turn_llm = await self._router_binding()
-                    decision = await decide_route(
-                        history=history,
-                        has_non_text_input=has_non_text_input,
-                        has_attachments=has_attachments,
-                        has_disabled_connections=has_disabled_connections,
-                        binding=binding,
+                    turn_queue_settings = TurnQueueSettings()
+
+                    async def _timed_gate() -> tuple[RouteDecision, int]:
+                        # Timed in its own coroutine so concurrency with the Jev
+                        # probe below doesn't inflate this into their combined
+                        # wall time. It's the two calls' own durations that a
+                        # speed comparison needs.
+                        started = time.monotonic()
+                        result = await decide_route(
+                            history=history,
+                            has_non_text_input=has_non_text_input,
+                            has_attachments=has_attachments,
+                            has_disabled_connections=has_disabled_connections,
+                            binding=binding,
+                        )
+                        return result, round((time.monotonic() - started) * 1000)
+
+                    (decision, gate_ms), jev_result = await asyncio.gather(
+                        _timed_gate(),
+                        jev_shadow.probe(
+                            messages=_text_history(history),
+                            llm_block=(turn_llm or {}).get("llm"),
+                            settings=turn_queue_settings,
+                        ),
+                    )
+                    # Unconditional: this is the gate's own route/timing, and is
+                    # useful on its own for reading real numbers off plain
+                    # server logs, independent of whether Jev ran at all.
+                    logger.info(
+                        "[gate] conversation=%s route=%s reason=%s gate_ms=%d%s",
+                        conversation_id, decision.route, decision.reason, gate_ms,
+                        f" jev={jev_result}" if jev_result is not None else "",
                     )
             finally:
                 reset_trace_context(trace_token)
