@@ -26,7 +26,14 @@ def _validate_datasource_block(value: object) -> None:
         raise ValueError("datasource must be an object")
     if set(value) != {"protocol_version", "connections"}:
         raise ValueError("datasource contains unsupported fields")
-    if value.get("protocol_version") != DATASOURCE_PROTOCOL_VERSION:
+    block_version = value.get("protocol_version")
+    # `True == 1` and `1.0 == 1`, so an equality check alone accepts a block
+    # that is not v1 and this then treats it as one. Same rule as the ids below.
+    if (
+        isinstance(block_version, bool)
+        or not isinstance(block_version, int)
+        or block_version != DATASOURCE_PROTOCOL_VERSION
+    ):
         raise ValueError("unsupported datasource protocol version")
     connections = value.get("connections")
     if not isinstance(connections, list) or not connections or len(connections) > MAX_DATASOURCE_CONNECTIONS:
