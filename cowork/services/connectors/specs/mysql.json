@@ -143,6 +143,14 @@
               "secret": true,
               "placeholder": "••••••••",
               "description": "Password for the above user. Stored encrypted and never shown again."
+            },
+            {
+              "name": "tls_verify",
+              "label": "Certificate",
+              "type": "boolean",
+              "required": false,
+              "checkbox_label": "Only connect if the certificate is signed by a public authority",
+              "description": "Off by default, because a self-hosted server usually presents a certificate it generated for itself, which no client can verify. The connection is still encrypted whenever the server offers it. Turn this on for a managed provider, whose certificate a public authority signed."
             }
           ]
         }
