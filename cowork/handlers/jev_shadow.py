@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from typing import Any
 
@@ -20,6 +21,8 @@ from cowork.common.settings.app_settings import TurnQueueSettings
 
 logger = logging.getLogger(__name__)
 
+_VALID_CHOICES = frozenset({"answer_directly", "needs_agent"})
+
 # Mirrors every forced-delegate category in response_routing._SYSTEM_PROMPT,
 # not just "needs tools" — otherwise Jev answers a narrower question than the
 # gate does, and a measured disagreement reflects that gap, not Jev's own
@@ -27,25 +30,32 @@ logger = logging.getLogger(__name__)
 _ROUTE_QUESTION: dict[str, Any] = {
     "type": "choice",
     "instructions": (
-        "Given this conversation, decide whether the assistant's next reply "
-        "can be written directly, or needs the full agent. Match these rules "
-        "exactly, even where a plain answer seems possible."
+        "Classify what is required to produce the assistant's next reply. "
+        "Return exactly one of: answer_directly or needs_agent. Classify as "
+        "needs_agent if any condition listed for it applies; otherwise "
+        "classify as answer_directly. When uncertain, choose needs_agent."
     ),
     "criteria": {
         "answer_directly": (
-            "The next reply can be written from the conversation and stable "
-            "general knowledge alone: no tools, no browsing, no file or data "
-            "access, no calculation, no verifying a fact that may be stale, "
-            "no multi-step plan, and it is not a question about the "
-            "assistant itself (which model or provider is running, what it "
-            "can access) or about the Cowork product (what it is, install, "
-            "update, cost, platforms, where a setting lives)."
+            "The reply can be produced solely from text already visible in "
+            "the conversation and stable general knowledge. It requires no "
+            "tool use, external retrieval, access to an attachment, file, "
+            "account, or dataset, calculation, fact verification, or "
+            "multi-step planning. It is not about the assistant's runtime "
+            "identity, provider, model, permissions, or available "
+            "resources, and it is not about using, installing, updating, "
+            "pricing, supporting platforms, or configuring Cowork."
         ),
         "needs_agent": (
-            "The next reply needs code execution, file or data access, "
-            "browsing, a calculation, verifying a fact that may be stale, a "
-            "multi-step plan, or it is a question about the assistant "
-            "itself or about the Cowork product."
+            "The reply requires any tool use; browsing or external "
+            "retrieval; access to an attachment, file, account, or "
+            "dataset; executing or testing code; verifying potentially "
+            "time-sensitive information; a calculation; or a multi-step "
+            "plan. Also choose this for questions about the assistant's "
+            "runtime identity, provider, model, permissions, or available "
+            "resources, and for questions about using, installing, "
+            "updating, pricing, supporting platforms, or configuring "
+            "Cowork. Choose this option when uncertain."
         ),
     },
 }
@@ -108,10 +118,20 @@ async def probe(
     try:
         body = response.json()
         answer = body["answers"]["route"]
+        choice = answer["choice"]
+        confidence = answer["confidence"]
+        if choice not in _VALID_CHOICES:
+            raise ValueError(f"unexpected choice {choice!r}")
+        # bool is an int subclass; excluded explicitly so a JSON `true`/`false`
+        # can't pass as a numeric 1/0 confidence.
+        if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+            raise ValueError(f"confidence is not numeric: {confidence!r}")
+        if not math.isfinite(confidence) or not (0 <= confidence <= 1):
+            raise ValueError(f"confidence out of range: {confidence!r}")
         return {
             "jev_ms": elapsed_ms,
-            "jev_choice": answer["choice"],
-            "jev_confidence": answer["confidence"],
+            "jev_choice": choice,
+            "jev_confidence": confidence,
             "jev_model": body.get("model"),
         }
     except Exception:

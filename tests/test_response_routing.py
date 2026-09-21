@@ -356,6 +356,50 @@ async def test_route_request_ignores_jev_result_even_when_it_contradicts_the_gat
 
 
 @pytest.mark.asyncio
+async def test_route_request_returns_promptly_even_when_jev_is_slow(monkeypatch):
+    """The probe must be detached, not awaited alongside the gate: a ready
+    gate decision returning only after Jev finishes would mean a 'shadow'
+    probe delays every real turn it shadows, exactly what it must never do."""
+    import asyncio
+    import time
+
+    import cowork.handlers.responses as responses
+    from cowork.handlers import jev_shadow
+
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
+    )
+
+    async def fast_decide_route(**_kwargs):
+        return RouteDecision(route=DIRECT_CONTEXT, reason="test", text="hi")
+
+    monkeypatch.setattr(responses, "decide_route", fast_decide_route)
+
+    async def slow_jev(**_kwargs):
+        await asyncio.sleep(0.25)
+        return {"jev_choice": "needs_agent", "jev_confidence": 0.9, "jev_ms": 250}
+
+    monkeypatch.setattr(jev_shadow, "probe", slow_jev)
+
+    started = time.monotonic()
+    decision, _turn_llm = await handler._route_request(
+        conversation_id=None,
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+    elapsed = time.monotonic() - started
+
+    assert decision.route == DIRECT_CONTEXT
+    assert elapsed < 0.1  # nowhere near the slow probe's 0.25s
+
+    await asyncio.sleep(0.3)  # let the detached probe finish before teardown
+
+
+@pytest.mark.asyncio
 async def test_route_request_scrubs_secrets_from_history_and_current_prompt(monkeypatch):
     """the gate reads history straight from storage, bypassing the
     scrub a normal turn gets via AntonHarness._stamp_message/_scrub_user_input.
