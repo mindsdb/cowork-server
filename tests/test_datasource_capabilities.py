@@ -109,7 +109,7 @@ def test_cloud_fields_come_from_the_spec_and_only_for_a_candidate():
     caps = _caps(ENABLED_ONE)
 
     names = [f.name for f in caps.cloud_fields("postgres", "host-port")]
-    assert names == ["host", "port", "database", "schema", "username", "password"]
+    assert names == ["host", "port", "database", "schema", "username", "password", "tls_verify"]
     assert caps.cloud_fields("postgres", "connection-string") == []
 
 
