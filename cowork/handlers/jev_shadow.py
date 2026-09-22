@@ -109,7 +109,7 @@ async def probe(
     except httpx.HTTPError:
         return {"jev_ms": _elapsed_ms(started), "jev_error": "transport_error"}
     except Exception:
-        logger.info("[jev-shadow] probe failed", exc_info=True)
+        logger.warning("[jev-shadow] probe failed", exc_info=True)
         return {"jev_ms": _elapsed_ms(started), "jev_error": "exception"}
 
     elapsed_ms = _elapsed_ms(started)
@@ -135,5 +135,5 @@ async def probe(
             "jev_model": body.get("model"),
         }
     except Exception:
-        logger.info("[jev-shadow] malformed response", exc_info=True)
+        logger.warning("[jev-shadow] malformed response", exc_info=True)
         return {"jev_ms": elapsed_ms, "jev_error": "malformed_response"}
