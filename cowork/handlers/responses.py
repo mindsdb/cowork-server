@@ -103,19 +103,25 @@ _jev_shadow_tasks: set[asyncio.Task] = set()
 
 
 def _spawn_jev_shadow_probe(
-    *, conversation_id: UUID, messages: list[dict], llm_block: dict | None,
-    settings: TurnQueueSettings,
+    *, conversation_id: UUID, correlation_id: str | None, messages: list[dict],
+    llm_block: dict | None, settings: TurnQueueSettings,
 ) -> None:
     """Runs `jev_shadow.probe` detached from the request path and logs its
     own result. Never awaited by the caller, so a slow or hung probe cannot
-    delay the turn it's shadowing."""
+    delay the turn it's shadowing.
+
+    `create_task` copies the caller's context, so the probe runs under the
+    gate's anton TraceContext and `jev_shadow` attributes its Langfuse trace to
+    the same conversation and correlation_id (ENG-2921)."""
 
     async def _run() -> None:
         jev_result = await jev_shadow.probe(messages=messages, llm_block=llm_block, settings=settings)
         if jev_result is None:
             return
         fields = " ".join(f"{k}={v}" for k, v in jev_result.items())
-        logger.warning("[jev-shadow] conversation=%s %s", conversation_id, fields)
+        logger.warning(
+            "[jev-shadow] conversation=%s correlation_id=%s %s", conversation_id, correlation_id, fields,
+        )
 
     task = asyncio.create_task(_run())
     _jev_shadow_tasks.add(task)
@@ -560,16 +566,28 @@ class ResponsesHandler:
                 set_trace_context,
             )
 
-            trace_token = set_trace_context(TraceContext(
-                session_id=str(conversation_id),
-                harness=self.harness_name,
-                tags=("cowork-gate",),
-                metadata=dict(trace_metadata or {}),
-            ))
+            trace_token = None
             try:
                 # The gate resolves the router role + key ambiently; bind the org scope.
                 with use_settings_scope(self.scope):
+                    # Minted before the context goes in (it is an auth call, not
+                    # an LLM call), so the context can carry the turn's
+                    # correlation_id: the gate's trace and the Jev shadow probe's
+                    # (which inherits this context) share it, making gate
+                    # decision <-> Jev answer an exact join (ENG-2921). Never
+                    # turn_id: the gateway renames harness+turn_id traces to
+                    # "{harness}:turn-N", which would count these as user turns.
                     binding, turn_llm = await self._router_binding()
+                    correlation_id = (turn_llm or {}).get("correlation_id")
+                    trace_token = set_trace_context(TraceContext(
+                        session_id=str(conversation_id),
+                        harness=self.harness_name,
+                        tags=("cowork-gate",),
+                        metadata={
+                            **(trace_metadata or {}),
+                            **({"correlation_id": correlation_id} if correlation_id else {}),
+                        },
+                    ))
                     turn_queue_settings = TurnQueueSettings()
 
                     gate_started = time.monotonic()
@@ -587,9 +605,9 @@ class ResponsesHandler:
                     # be read from — found live on staging, zero [gate] lines
                     # across 8 real requests until this was bumped.
                     logger.warning(
-                        "[gate] conversation=%s route=%s reason=%s provider=%s "
-                        "model=%s gate_ms=%d",
-                        conversation_id, decision.route, decision.reason,
+                        "[gate] conversation=%s correlation_id=%s route=%s reason=%s "
+                        "provider=%s model=%s gate_ms=%d",
+                        conversation_id, correlation_id, decision.route, decision.reason,
                         decision.provider, decision.model, gate_ms,
                     )
                     # Detached on purpose: awaiting this (even via asyncio.gather)
@@ -598,12 +616,14 @@ class ResponsesHandler:
                     # it finishes; never read by anything on the request path.
                     _spawn_jev_shadow_probe(
                         conversation_id=conversation_id,
+                        correlation_id=correlation_id,
                         messages=_text_history(history),
                         llm_block=(turn_llm or {}).get("llm"),
                         settings=turn_queue_settings,
                     )
             finally:
-                reset_trace_context(trace_token)
+                if trace_token is not None:
+                    reset_trace_context(trace_token)
             return decision, turn_llm
         except (ProductPermissionDenied, ProductPermissionUnavailable):
             raise
