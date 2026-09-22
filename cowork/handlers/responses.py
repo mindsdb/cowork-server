@@ -59,7 +59,7 @@ from cowork.handlers._turn_history import (
 )
 from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
-    CONTENT_RECOVERY_CODE,
+    CONTENT_REPAIR_CODES,
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
     MODEL_UNAVAILABLE_CODES,
@@ -1489,7 +1489,7 @@ class ResponsesHandler:
             )
             collected_events.append(response_failed_payload(message, code, request_id=corr))
             await buffer.append("sse", {"sse": response_failed_sse(message, code, request_id=corr)})
-            if code == CONTENT_RECOVERY_CODE:
+            if code in CONTENT_REPAIR_CODES:
                 # ENG-1992: the remote/org path's twin of the streaming
                 # handler's repair — producer.py already classified this via
                 # remote_turn_error from the pod's scrubbed error string, so
@@ -1694,7 +1694,7 @@ class ResponsesHandler:
                     "[responses] turn failed for conversation %s correlation_id=%s",
                     conv_id, corr, extra={"request_id": corr},
                 )
-            if code == CONTENT_RECOVERY_CODE:
+            if code in CONTENT_REPAIR_CODES:
                 # ENG-1992: the provider permanently rejected an image block in
                 # this conversation's stored history — repair the DATA once,
                 # here, rather than special-case every future replay. Never
@@ -1891,7 +1891,7 @@ class ResponsesHandler:
                     "[responses] user-facing turn error: %s", exc,
                     extra={"request_id": corr},
                 )
-                if code == CONTENT_RECOVERY_CODE:
+                if code in CONTENT_REPAIR_CODES:
                     # ENG-1992: see the streaming path's twin for the full
                     # rationale — repair the conversation's stored history
                     # once here rather than special-case every future replay.
