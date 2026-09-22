@@ -115,7 +115,7 @@ def _spawn_jev_shadow_probe(
         if jev_result is None:
             return
         fields = " ".join(f"{k}={v}" for k, v in jev_result.items())
-        logger.info("[jev-shadow] conversation=%s %s", conversation_id, fields)
+        logger.warning("[jev-shadow] conversation=%s %s", conversation_id, fields)
 
     task = asyncio.create_task(_run())
     _jev_shadow_tasks.add(task)
@@ -581,7 +581,12 @@ class ResponsesHandler:
                         binding=binding,
                     )
                     gate_ms = round((time.monotonic() - gate_started) * 1000)
-                    logger.info(
+                    # warning, not info: this deployment's LOG_LEVEL defaults to
+                    # WARNING (app_settings.py's own default too), so an info-level
+                    # line here is silently dropped everywhere it would actually
+                    # be read from — found live on staging, zero [gate] lines
+                    # across 8 real requests until this was bumped.
+                    logger.warning(
                         "[gate] conversation=%s route=%s reason=%s provider=%s "
                         "model=%s gate_ms=%d",
                         conversation_id, decision.route, decision.reason,
