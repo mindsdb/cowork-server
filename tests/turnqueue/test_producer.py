@@ -970,6 +970,39 @@ async def test_a_hosted_turn_registers_grants_against_the_gate_minted_key(monkey
 
 
 @pytest.mark.asyncio
+async def test_a_listing_auth_cannot_answer_costs_the_turn_its_databases_not_the_turn(monkeypatch):
+    """Auth being unreachable must not fail the turn. With the flag on every
+    hosted turn goes through this call, including the ones that never mention
+    a database, so a raise here took the whole deployment down with it."""
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    monkeypatch.setattr(
+        prod, "list_verified_datasource_connections",
+        AsyncMock(side_effect=ProductPermissionUnavailable()),
+    )
+    monkeypatch.setattr(prod, "register_datasource_grants", AsyncMock(side_effect=AssertionError("registered")))
+    # The module logger rather than caplog: this suite's caplog capture is
+    # order dependent, and the point of the branch is that it keeps the cause.
+    warnings: list[tuple] = []
+    monkeypatch.setattr(prod.logger, "warning", lambda *a, **k: warnings.append((a, k)))
+    block = {"provider": "minds-cloud", "api_key": "mdb_gate.secret", "base_url": "https://minds.internal/v1"}
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        correlation_id="r", llm=block, turn_key_id="mdb_gate",
+    ))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert "datasource" not in params
+    assert params["llm"] == block
+    omitted = [(a, k) for a, k in warnings if "datasource" in str(a[0])]
+    assert omitted and omitted[-1][1].get("exc_info") is True
+
+
+@pytest.mark.asyncio
 async def test_with_the_flag_off_nothing_datasource_related_runs_or_is_queued(monkeypatch):
     """The rollout's old behaviour, pinned: no listing, no registration, no block."""
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
