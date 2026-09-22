@@ -12,16 +12,11 @@ import pytest
 from cowork.services import artifact_autopublish as ap
 
 
-def test_post_plus_job_budget_fits_inside_lock_ttl_for_defaults():
-    t = ap.DEFAULT_TIMEOUT_S
-    ttl = ap.lock_ttl_for(t)
-    budget = ap.job_budget_for(ttl, t)
-    assert budget == 90.0
-    assert t + ap.PUBLISH_POST_TIMEOUT_S + budget <= ttl
-    assert budget > 0
+def test_default_job_budget_is_90s():
+    assert ap.job_budget_for(ap.lock_ttl_for(ap.DEFAULT_TIMEOUT_S), ap.DEFAULT_TIMEOUT_S) == 90.0
 
 
-@pytest.mark.parametrize("timeout_s", [30.0, 60.0, 120.0])
+@pytest.mark.parametrize("timeout_s", [30.0, ap.DEFAULT_TIMEOUT_S, 120.0])
 def test_invariant_holds_for_supported_timeouts(timeout_s):
     ttl = ap.lock_ttl_for(timeout_s)
     assert timeout_s + ap.PUBLISH_POST_TIMEOUT_S + ap.job_budget_for(ttl, timeout_s) <= ttl
@@ -37,7 +32,7 @@ def test_publish_one_passes_job_budget_and_records_polling_phase(tmp_path):
 
     def slow_publish(folder, **kw):
         seen.update(kw)
-        kw["progress"]["phase"] = "polling"
+        kw["on_job_accepted"]({"job_id": "j"})
         accepted.set()
         # Outlive wait_for by a wide margin; the event above removes the race
         # between the thread start and the timeout.

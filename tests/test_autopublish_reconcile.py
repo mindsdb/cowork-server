@@ -70,7 +70,7 @@ def published(monkeypatch):
     calls = []
 
     def fake_publish(artifact, *, artifacts_base, api_key, publish_url, password=None,
-                     access=None, scope=None, job_budget_s=None, progress=None):
+                     access=None, scope=None, job_budget_s=None, on_job_accepted=None):
         calls.append({"folder": artifact, "api_key": api_key, "access": access, "scope": scope})
         (artifact / ".published.json").write_text(json.dumps({
             "index.html": {"report_id": "rid", "url": "u", "published": True,
