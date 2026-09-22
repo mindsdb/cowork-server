@@ -20,7 +20,7 @@ from urllib.parse import parse_qsl, unquote, urlsplit
 
 from fastapi import HTTPException, status
 
-from cowork.schemas.connectors import DatasourceCreateRequest
+from cowork.schemas.connectors import DatasourceCreateRequest, DatasourceTls
 from cowork.services.connectors.datasource_capabilities import load_datasource_capabilities
 
 #: Connector to its single supported cloud method, mirroring auth.
@@ -191,7 +191,9 @@ def parse_datasource_dsn(dsn: str, connector_id: str) -> dict[str, Any]:
     """Split a DSN into the approved connection fields.
 
     Driver options are refused rather than forwarded: anything beyond
-    PostgreSQL's sslmode=verify-full can change how the client connects.
+    PostgreSQL's sslmode=verify-full can change how the client connects. That
+    one is answered in the returned `tls`, because the caller asked for
+    verification and the default verifies nothing.
     """
     if not isinstance(dsn, str) or not dsn.strip():
         raise InvalidDatasourceInput("a connection string is required")
@@ -217,9 +219,12 @@ def parse_datasource_dsn(dsn: str, connector_id: str) -> dict[str, Any]:
     query = parse_qsl(parsed.query, keep_blank_values=True)
     if len({key for key, _ in query}) != len(query):
         raise InvalidDatasourceInput("the connection string repeats a query option")
+    tls: DatasourceTls | None = None
     if connector_id == "postgres":
         if any(key != "sslmode" or value != "verify-full" for key, value in query):
             raise InvalidDatasourceInput("only sslmode=verify-full is accepted in a PostgreSQL connection string")
+        if query:
+            tls = DatasourceTls(mode="system")
     elif query:
         raise InvalidDatasourceInput("a MySQL connection string cannot carry query options")
 
@@ -234,7 +239,7 @@ def parse_datasource_dsn(dsn: str, connector_id: str) -> dict[str, Any]:
         "database": unquote(parsed.path.lstrip("/")),
         "username": unquote(parsed.username),
         "password": unquote(parsed.password),
-        "tls": None,
+        "tls": tls,
     }
 
 
@@ -254,7 +259,7 @@ def normalize_datasource_input(model: DatasourceCreateRequest) -> dict[str, Any]
         if supplied:
             raise InvalidDatasourceInput("a connection string cannot be combined with individual fields")
         fields = parse_datasource_dsn(model.dsn or "", connector_id)
-        tls = None
+        tls = fields.get("tls")
     else:
         if model.dsn is not None:
             raise InvalidDatasourceInput("a connection string requires input_mode=dsn")
