@@ -276,9 +276,21 @@ async def _mint_datasource_block(*, org_id: str | None, user_id: str | None,
     # misconfiguration; it fails here rather than reaching auth without it.
     if not isinstance(turn_key_id, str) or not turn_key_id.strip():
         raise _refuse_datasource_grants("dispatch carries no turn key prefix")
-    connections = await list_verified_datasource_connections(
-        org_id=org_id, user_id=user_id, turn_key_id=turn_key_id, settings=settings
-    )
+    try:
+        connections = await list_verified_datasource_connections(
+            org_id=org_id, user_id=user_id, turn_key_id=turn_key_id, settings=settings
+        )
+    except Exception:
+        # Never fail a turn over datasource availability, for the same reason
+        # _mint_oauth_block does not: a turn that cannot reach the listing
+        # still runs, just without databases. The checks below stay closed,
+        # because those are answers that contradict this turn rather than
+        # answers that did not arrive.
+        logger.warning(
+            "[producer] could not list verified datasource connections for org %s; datasource block omitted",
+            org_id, exc_info=True,
+        )
+        return None
     refs = _datasource_connection_refs(connections, disabled)
     if not refs:
         return None

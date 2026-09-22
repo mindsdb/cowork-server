@@ -68,7 +68,9 @@ def _tls_block(values: dict[str, Any]) -> dict[str, Any] | None:
     """
     if values.get("tls_mode"):
         return {"mode": values["tls_mode"], "ca_pem": values.get("ca_pem") or None}
-    if values.get("tls_verify") is True:
+    # `"true"` as well as `True`: the value arrives off the wire, where a spec's
+    # own boolean default can reach the form as the JSON string.
+    if values.get("tls_verify") in (True, "true"):
         return {"mode": "system", "ca_pem": None}
     return None
 
