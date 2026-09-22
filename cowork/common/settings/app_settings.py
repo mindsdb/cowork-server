@@ -548,7 +548,7 @@ class TurnQueueSettings(Settings):
         ),
     )  # COWORK_TURN_MINDS_BASE_URL
     jev_shadow_enabled: bool = Field(
-        default=False,
+        default=True,
         description=(
             "Fire a Jev '/v1/decisions' call alongside the LLM gate on every remote turn, "
             "purely for latency/agreement comparison. Never used to route; logged only. "
