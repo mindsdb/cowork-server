@@ -547,6 +547,24 @@ class TurnQueueSettings(Settings):
             "per-PR / non-standard envs whose host the slug logic cannot derive. Empty = derive."
         ),
     )  # COWORK_TURN_MINDS_BASE_URL
+    jev_shadow_enabled: bool = Field(
+        default=True,
+        description=(
+            "Fire a Jev '/v1/decisions' call alongside the LLM gate on every remote turn, "
+            "purely for latency/agreement comparison. Never used to route; logged only. "
+            "Requires a minted minds-cloud credential, so it's a no-op unless backend is "
+            "'remote'."
+        ),
+    )  # COWORK_TURN_JEV_SHADOW_ENABLED
+    jev_shadow_model: str = Field(
+        default="jev",
+        description="MindsHub catalog alias passed to the shadow '/v1/decisions' call.",
+    )  # COWORK_TURN_JEV_SHADOW_MODEL
+    jev_shadow_timeout_seconds: float = Field(
+        default=3.0,
+        gt=0,
+        description="Hard wall-clock timeout for the shadow Jev call (enforced via asyncio.timeout, not just httpx's own per-phase timeout). Independent of the gate's own budget, since a slow or hung probe must never hold up the turn it's shadowing.",
+    )  # COWORK_TURN_JEV_SHADOW_TIMEOUT_SECONDS
     minds_coding_model: str = Field(
         default="",
         description=(
