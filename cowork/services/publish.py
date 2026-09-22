@@ -12,6 +12,7 @@ import logging
 import os
 import tempfile
 import urllib.error
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -392,7 +393,7 @@ def publish_artifact(
     access: dict | None = None,
     scope: TenantScope | None = None,
     job_budget_s: float = PUBLISH_JOB_BUDGET_S,
-    progress: dict | None = None,
+    on_job_accepted: Callable[[dict], None] | None = None,
 ) -> dict:
     """Zip an artifact and upload it, returning its public URL.
 
@@ -415,10 +416,10 @@ def publish_artifact(
     another org's secrets.
 
     `job_budget_s` caps how long an asynchronously accepted publish (server
-    202, ENG-1580) is polled; defaults to anton's. `progress`, when
-    given, gets `phase="polling"` set the moment the server accepts the job,
-    so a caller that abandons the thread on its own timeout can tell "upload
-    still in flight" from "job accepted, still polling".
+    202, ENG-1580) is polled; defaults to anton's. `on_job_accepted` is
+    anton's callback, invoked with the 202 body the moment the server accepts
+    the job, so a caller that abandons the thread on its own timeout can tell
+    "upload still in flight" from "job accepted, still polling".
     """
     if not api_key:
         raise ValueError("Publishing requires an API key")
@@ -474,11 +475,6 @@ def publish_artifact(
         publish_source = _render_markdown_to_html(publish_target, Path(md_tmp_dir.name))
 
     ssl_verify = os.environ.get("ANTON_MINDS_SSL_VERIFY", "true").lower() == "true"
-
-    def on_job_accepted(_accepted: dict) -> None:
-        if progress is not None:
-            progress["phase"] = "polling"
-
     try:
         result = publish(
             publish_source,

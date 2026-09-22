@@ -271,7 +271,9 @@ async def _publish_one(
     `publish_artifact` unchanged.
     """
     folder = Path(artifacts_base) / slug
-    progress: dict = {"phase": "upload"}
+    # Which phase the abandoned thread was in when wait_for gave up: "upload"
+    # (POST in flight) or "polling" (server accepted the job).
+    progress = {"phase": "upload"}
     try:
         await asyncio.wait_for(
             asyncio.to_thread(
@@ -288,7 +290,7 @@ async def _publish_one(
                 # get here with an org scope in hand (see the caller's guard).
                 scope=scope,
                 job_budget_s=job_budget_s,
-                progress=progress,
+                on_job_accepted=lambda _accepted: progress.update(phase="polling"),
             ),
             timeout=timeout_s,
         )
