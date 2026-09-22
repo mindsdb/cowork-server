@@ -85,6 +85,39 @@ def test_dsn_input_is_parsed_into_fields_and_the_dsn_is_dropped():
     assert DSN not in str(payload)
 
 
+def test_the_verification_a_connection_string_asks_for_reaches_the_payload():
+    """sslmode=verify-full is the one option this accepts, and a connection
+    string cannot carry a TLS block beside it, so dropping it stored a
+    connection that asked to verify the certificate without verifying it."""
+    payload = normalize_datasource_input(
+        DatasourceCreateRequest(
+            connector_id="postgres",
+            method="host-port",
+            name="prod reporting",
+            input_mode="dsn",
+            dsn=DSN,
+        )
+    )
+
+    assert payload["tls"] == {"mode": "system", "ca_pem": None}
+
+
+def test_a_connection_string_that_asks_for_nothing_leaves_the_trust_to_the_server():
+    """Same default as a structured body that omits the block. A MySQL DSN
+    carries no options at all, so this is the only trust it can have."""
+    payload = normalize_datasource_input(
+        DatasourceCreateRequest(
+            connector_id="postgres",
+            method="host-port",
+            name="prod reporting",
+            input_mode="dsn",
+            dsn=f"postgres://dbuser:{PASSWORD}@db.example.com:5432/appdb",
+        )
+    )
+
+    assert payload["tls"] == {"mode": "prefer", "ca_pem": None}
+
+
 def test_the_schema_a_connection_names_is_relayed():
     """A PostgreSQL database holds many schemas and the customer's tables are
     rarely in the one the role's search path resolves to."""

@@ -248,6 +248,19 @@ def test_asking_for_a_verified_certificate_relays_that_choice(org_client, relay)
     assert json.loads(recorded[0].content)["tls"] == {"mode": "system", "ca_pem": None}
 
 
+def test_a_checked_box_counts_even_when_it_arrives_as_a_string(org_client, relay):
+    """The spec's boolean default reaches the form as JSON, so a checked box
+    can submit `"true"`. Reading only the literal stored the connection
+    unverified while the form showed the box checked."""
+    recorded, _ = relay
+    values = submission()["values"] | {"tls_verify": "true"}
+
+    res = org_client.post(PATH, json=submission(values=values), headers=AUTH_HEADERS)
+
+    assert res.status_code == 200
+    assert json.loads(recorded[0].content)["tls"] == {"mode": "system", "ca_pem": None}
+
+
 def test_an_unchecked_box_is_not_a_trust_choice(org_client, relay):
     recorded, _ = relay
     values = submission()["values"] | {"tls_verify": False}
