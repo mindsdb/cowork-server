@@ -32,23 +32,10 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
-# The gate name auth declares in `configs/statsig_gates.json` and evaluates with
-# its server SDK. A CONTRACT with auth: a typo here reads exactly like a gate
-# that is switched off, and nothing catches it, so it is written once.
-GATE_AUTHORIZATION_UI = "authorization_ui"
-
-# Where the evaluated gate sits in the entitlements payload. Absent means off,
-# which is also what a version of auth that predates the field reports, so this
-# ships dark and lights up when auth's half lands.
-GATES_FIELD = "feature_gates"
-
-# Same split-TTL shape as the model catalog: an ANSWER is cached long enough that
-# opening the menu repeatedly costs one round trip, and a non-answer is cached
-# briefly so a route that is not deployed yet does not add a round trip to every
-# open. Answer, not verdict: a gate auth evaluated as off is a real answer and
-# gets the long TTL. Both are short because this is a kill switch: a gate flipped
-# off has to reach a running app quickly, and auth caches the entitlements read
-# behind its own TTL as well, so these two add up.
+# Same split-TTL shape as the model catalog: a reachable listing is cached long
+# enough that opening the menu repeatedly costs one round trip, and an
+# unreachable one is cached briefly so a degraded auth does not add a round trip
+# to every open without also going stale for a long stretch.
 _TTL_OK = 60.0
 _TTL_FAIL = 15.0
 
@@ -116,8 +103,6 @@ class HubWorkspaceListing(BaseModel):
 # and turn up in a repr or a heap dump, and nothing here needs to reverse it.
 _CacheKey = tuple[str, str, str, str]
 
-# (stamped, verdict, whether auth answered at all)
-_gate_cache: dict[_CacheKey, tuple[float, bool, bool]] = {}
 _listing_cache: dict[_CacheKey, tuple[float, HubWorkspaceListing]] = {}
 
 # Entries are never read again once the caller goes away, and nothing overwrites
@@ -188,57 +173,6 @@ async def _get_json(path: str, bearer_token: str) -> Optional[Any]:
     except ValueError:
         logger.debug("auth GET %s returned a non-JSON body", path)
         return None
-
-
-async def authorization_ui_enabled(*, bearer_token: str, org_id: str, user_id: str) -> bool:
-    """Whether the authorization surfaces are switched on for this caller.
-
-    Auth evaluates the Statsig gate with its server SDK and reports the verdict
-    in the entitlements payload, so there is one gate governing the console and
-    Cowork rather than two that can disagree. Cowork holds no Statsig client and
-    no SDK key of its own.
-
-    False whenever the answer is not a definite yes: no bearer, auth unreachable,
-    a version of auth with no gates field, or the gate off. Those are all states
-    where nobody knows whether the surface is safe to show, and a dark feature
-    that stays dark is the cheap outcome.
-
-    Cached per caller rather than per organization, because auth evaluates the
-    gate for whoever presents the bearer: `authorization_ui` declares
-    ``idType: userID``, so a rule below 100% or a per-user override answers
-    differently for two people in one organization.
-    """
-    from cowork.common.settings.app_settings import get_app_settings
-
-    # An ON-only development override, the same shape as the console's
-    # staff-limited session override: it can turn the surface on where no gate
-    # rule targets you, and it can never turn one off, so it cannot be used to
-    # escape the kill switch. Not the flag; the gate is the flag.
-    if get_app_settings().hub_workspaces_force_on:
-        return True
-    if not bearer_token:
-        return False
-
-    cache_key = _cache_key(org_id=org_id, user_id=user_id, bearer_token=bearer_token)
-    cached = _gate_cache.get(cache_key)
-    if cached:
-        stamped, value, answered = cached
-        if (time.monotonic() - stamped) < (_TTL_OK if answered else _TTL_FAIL):
-            return value
-
-    payload = await _get_json("/entitlements/me/", bearer_token)
-    gates = payload.get(GATES_FIELD) if isinstance(payload, dict) else None
-    enabled = bool(gates.get(GATE_AUTHORIZATION_UI)) if isinstance(gates, dict) else False
-    # The TTL follows whether AUTH ANSWERED, not what it said. "Auth evaluated
-    # the gate and it is off" is exactly as authoritative as "it is on", and
-    # picking the TTL from the verdict gave the negative one the 15s failure
-    # budget. That is the state this feature ships in, so with per-caller keys it
-    # meant re-asking auth four times more often than needed, per person rather
-    # than per organization.
-    answered = payload is not None
-    _sweep(_gate_cache)
-    _gate_cache[cache_key] = (time.monotonic(), enabled, answered)
-    return enabled
 
 
 async def fetch_hub_workspaces(*, bearer_token: str, org_id: str, user_id: str) -> HubWorkspaceListing:
@@ -340,8 +274,7 @@ def selectable(
 
 
 def reset_caches_for_tests() -> None:
-    """Drop both caches so each test starts from a known state."""
-    _gate_cache.clear()
+    """Drop the cache so each test starts from a known state."""
     _listing_cache.clear()
 
 

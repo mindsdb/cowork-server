@@ -1,6 +1,6 @@
 """The MindsHub workspace selector's two routes.
 
-- GET  /            the gate, the caller's workspaces, and which one is active
+- GET  /            the caller's workspaces and which one is active
 - PUT  /active      switch the caller into another workspace
 
 A MindsHub Workspace is an org-internal container that owns hub resources and
@@ -52,7 +52,6 @@ from cowork.schemas.hub_workspaces import (
     HubWorkspaceView,
 )
 from cowork.services.hub_workspaces import (
-    authorization_ui_enabled,
     fetch_hub_workspaces,
     resolve_active,
     selectable,
@@ -61,12 +60,6 @@ from cowork.services.settings import SettingService
 
 logger = logging.getLogger(__name__)
 
-# AuthenticatedInOrgMode, declared explicitly: both routes have no local check
-# of their own — they rely on authorization_ui_enabled() calling auth's
-# GET /v1/entitlements/me/ with the caller's bearer, which fails closed (no
-# gate = not enabled) on a missing/invalid bearer just as much as on the gate
-# being off. Declaring it too makes the requirement visible to a route walker
-# instead of something only discoverable by reading that fail-closed call.
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -74,28 +67,14 @@ ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 SETTING_KEY = "hub_workspace_id"
 
-# Switched off, so there is nothing to say about workspaces. Deliberately the
-# same body a caller gets when the gate is off for them specifically: the client
-# renders nothing either way, and a response that distinguished the two would
-# tell an unflagged caller that a surface exists.
-_DISABLED = HubWorkspaceView()
-
 
 async def _build_view(
     request: Request, session: Session, scope: TenantScope
 ) -> HubWorkspaceView:
-    """The selector's whole state, gate first.
-
-    The gate is read before the listing, not alongside it, so a switched-off app
-    makes no workspace request at all. That is worth one sequential round trip:
-    the alternative asks auth for a listing nobody is going to render.
-    """
+    """The selector's whole state: the caller's workspaces and which is active."""
     bearer = hub_credential(request)
     org_id = scope.org_id or ""
     user_id = scope.user_id or ""
-    if not await authorization_ui_enabled(bearer_token=bearer, org_id=org_id, user_id=user_id):
-        return _DISABLED
-
     listing = await fetch_hub_workspaces(bearer_token=bearer, org_id=org_id, user_id=user_id)
     stored = SettingService(session, scope).load().hub_workspace_id
     active = resolve_active(listing.workspaces, stored)
@@ -144,12 +123,6 @@ async def set_active_hub_workspace(
     bearer = hub_credential(request)
     org_id = scope.org_id or ""
     user_id = scope.user_id or ""
-    if not await authorization_ui_enabled(bearer_token=bearer, org_id=org_id, user_id=user_id):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="workspace selection is not enabled",
-        )
-
     listing = await fetch_hub_workspaces(bearer_token=bearer, org_id=org_id, user_id=user_id)
     if not listing.reachable:
         raise HTTPException(
