@@ -1,4 +1,4 @@
-"""The MindsHub workspace selector: the gate, the listing, and the stored pick.
+"""The MindsHub workspace selector: the listing and the stored pick.
 
 The org cases call the handlers directly with an explicitly built TenantScope.
 `cowork.server.app` wires the principal middleware only when the process started
@@ -6,8 +6,7 @@ in org mode, so a TestClient request would silently run under LOCAL_SCOPE and
 prove nothing about per-user isolation.
 
 Outbound HTTP is stubbed at `_get_json`, which is also what lets a test assert
-the harder half of the flag contract: with the gate off, the workspace path is
-never requested at all.
+that a caller with no bearer is never asked for a listing at all.
 """
 from __future__ import annotations
 
@@ -39,7 +38,6 @@ WS_DEFAULT = "d0000000-0000-0000-0000-000000000001"
 WS_CLIENT_A = "c0000000-0000-0000-0000-00000000000a"
 WS_ARCHIVED = "a0000000-0000-0000-0000-00000000000f"
 
-ENTITLEMENTS = "/entitlements/me/"
 WORKSPACES = "/organizations/current/workspaces/"
 
 
@@ -142,10 +140,6 @@ def calls(monkeypatch):
     return type("Calls", (), {"asked": asked, "answers": answers})()
 
 
-def _gate(calls, on: bool) -> None:
-    calls.answers[ENTITLEMENTS] = {"feature_gates": {"authorization_ui": on}}
-
-
 def _scope(org_id: str = ORG_A, user_id: str = USER_A) -> TenantScope:
     return TenantScope(org_mode=True, org_id=org_id, user_id=user_id)
 
@@ -154,73 +148,23 @@ def _view(session, scope, bearer: str = "jwt-abc"):
     return asyncio.run(ep._build_view(FakeRequest(bearer), session, scope))
 
 
-# ── The flag ─────────────────────────────────────────────────────────
+# ── The bearer ───────────────────────────────────────────────────────
 
 
-def test_gate_off_reports_disabled_and_never_asks_for_workspaces(session, calls):
-    """The half of the flag contract that a rendering test cannot see."""
-    _gate(calls, False)
-
-    view = _view(session, _scope())
-
-    assert view.enabled is False
-    assert view.workspaces == []
-    assert calls.asked == [ENTITLEMENTS]
-    assert WORKSPACES not in calls.asked
-
-
-def test_absent_gates_field_reads_as_off(session, calls):
-    """A version of auth that predates the field is indistinguishable from off.
-
-    This is what lets the client ship before auth's half lands.
-    """
-    calls.answers[ENTITLEMENTS] = {"org_role": "member", "permissions": {}}
-
-    view = _view(session, _scope())
-
-    assert view.enabled is False
-    assert calls.asked == [ENTITLEMENTS]
-
-
-def test_unreachable_auth_reads_as_off(session, calls):
-    """No answer is not the same as yes."""
-    view = _view(session, _scope())
-
-    assert view.enabled is False
-    assert calls.asked == [ENTITLEMENTS]
-
-
-def test_no_bearer_reads_as_off_without_asking(session, calls):
+def test_no_bearer_reads_as_unreachable_without_asking(session, calls):
+    """No bearer, no request: `fetch_hub_workspaces` short-circuits before it
+    would otherwise ask auth for a listing nobody could be authorized against."""
     view = _view(session, _scope(), bearer="")
 
-    assert view.enabled is False
+    assert view.enabled is True
+    assert view.reachable is False
     assert calls.asked == []
-
-
-def test_force_on_override_needs_no_bearer_and_cannot_turn_the_gate_off(
-    session, calls, monkeypatch
-):
-    """The development override is ON only, so it cannot escape the kill switch."""
-    monkeypatch.setenv("COWORK_HUB_WORKSPACES_FORCE_ON", "true")
-    get_app_settings.cache_clear()
-    try:
-        _gate(calls, False)
-        calls.answers[WORKSPACES] = _rows()
-
-        view = _view(session, _scope(), bearer="")
-
-        assert view.enabled is True
-        # The gate was never consulted: the override short-circuits ahead of it.
-        assert ENTITLEMENTS not in calls.asked
-    finally:
-        get_app_settings.cache_clear()
 
 
 # ── The listing ──────────────────────────────────────────────────────
 
 
 def test_listing_rows_and_default_active_when_nothing_stored(session, calls):
-    _gate(calls, True)
     calls.answers[WORKSPACES] = _rows()
 
     view = _view(session, _scope())
@@ -239,7 +183,6 @@ def test_unreachable_listing_is_not_a_single_workspace_org(session, calls):
     Collapsing the two is how a caller with three workspaces silently loses two
     during an auth outage.
     """
-    _gate(calls, True)
 
     view = _view(session, _scope())
 
@@ -249,7 +192,6 @@ def test_unreachable_listing_is_not_a_single_workspace_org(session, calls):
 
 
 def test_archived_workspace_is_dropped_unless_it_is_the_active_one(session, calls):
-    _gate(calls, True)
     calls.answers[WORKSPACES] = _rows(archived=True)
 
     view = _view(session, _scope())
@@ -258,7 +200,6 @@ def test_archived_workspace_is_dropped_unless_it_is_the_active_one(session, call
     # Stored pick on the archived one: the row under the check must not vanish.
     SettingService(session, _scope()).upsert_setting(ep.SETTING_KEY, WS_ARCHIVED)
     svc.reset_caches_for_tests()
-    _gate(calls, True)
     calls.answers[WORKSPACES] = _rows(archived=True)
 
     view = _view(session, _scope())
@@ -267,7 +208,6 @@ def test_archived_workspace_is_dropped_unless_it_is_the_active_one(session, call
 
 
 def test_a_row_with_no_id_is_dropped_without_losing_the_listing(session, calls):
-    _gate(calls, True)
     calls.answers[WORKSPACES] = {"results": [{"display_name": "nameless"}, *_rows()["results"]]}
 
     view = _view(session, _scope())
@@ -277,7 +217,6 @@ def test_a_row_with_no_id_is_dropped_without_losing_the_listing(session, calls):
 
 def test_a_bare_list_body_is_accepted(session, calls):
     """A pagination change upstream degrades to a full list, not an empty menu."""
-    _gate(calls, True)
     calls.answers[WORKSPACES] = _rows()["results"]
 
     view = _view(session, _scope())
@@ -290,7 +229,6 @@ def test_stored_pick_naming_nothing_live_falls_back_to_default(session, calls):
     SettingService(session, _scope()).upsert_setting(
         ep.SETTING_KEY, "f0000000-0000-0000-0000-00000000dead"
     )
-    _gate(calls, True)
     calls.answers[WORKSPACES] = _rows()
 
     view = _view(session, _scope())
@@ -313,7 +251,6 @@ def _activate(session, scope, workspace_id: str, bearer: str = "jwt-abc"):
 
 
 def test_switching_stores_the_pick_and_reports_it(session, calls):
-    _gate(calls, True)
     calls.answers[WORKSPACES] = _rows()
 
     view = _activate(session, _scope(), WS_CLIENT_A)
@@ -324,7 +261,6 @@ def test_switching_stores_the_pick_and_reports_it(session, calls):
 
 def test_switching_to_a_workspace_not_in_the_listing_is_refused(session, calls):
     """Auth decides who may see which workspace; the listing is that answer."""
-    _gate(calls, True)
     calls.answers[WORKSPACES] = _rows()
 
     with pytest.raises(HTTPException) as caught:
@@ -335,22 +271,11 @@ def test_switching_to_a_workspace_not_in_the_listing_is_refused(session, calls):
 
 
 def test_switching_refuses_rather_than_storing_an_unverifiable_id(session, calls):
-    _gate(calls, True)
 
     with pytest.raises(HTTPException) as caught:
         _activate(session, _scope(), WS_CLIENT_A)
 
     assert caught.value.status_code == 503
-    assert SettingService(session, _scope()).load().hub_workspace_id == ""
-
-
-def test_switching_with_the_gate_off_is_not_a_route(session, calls):
-    _gate(calls, False)
-
-    with pytest.raises(HTTPException) as caught:
-        _activate(session, _scope(), WS_CLIENT_A)
-
-    assert caught.value.status_code == 404
     assert SettingService(session, _scope()).load().hub_workspace_id == ""
 
 
@@ -372,7 +297,6 @@ def test_one_members_listing_is_not_served_to_another(session, calls):
     other member of that org then reads, and this process serves all of them:
     org mode, two replicas, one module-level dict.
     """
-    _gate(calls, True)
     calls.answers[WORKSPACES] = _rows_for(WS_DEFAULT, WS_CLIENT_A)
     admin = _view(session, _scope(user_id=USER_A))
     assert [w.id for w in admin.workspaces] == [WS_DEFAULT, WS_CLIENT_A]
@@ -387,7 +311,6 @@ def test_one_members_listing_is_not_served_to_another(session, calls):
 def test_a_member_cannot_switch_into_a_workspace_from_anothers_cached_listing(session, calls):
     """The grant check reads the same cache the menu does, so a shared entry is
     not only a leak: it is the switch's authorization, and it would pass."""
-    _gate(calls, True)
     calls.answers[WORKSPACES] = _rows_for(WS_DEFAULT, WS_CLIENT_A)
     _view(session, _scope(user_id=USER_A))
 
@@ -399,23 +322,9 @@ def test_a_member_cannot_switch_into_a_workspace_from_anothers_cached_listing(se
     assert SettingService(session, _scope(user_id=USER_A2)).load().hub_workspace_id == ""
 
 
-def test_the_gate_verdict_is_not_shared_across_callers(session, calls):
-    """`authorization_ui` declares `idType: userID`, so auth evaluates it for
-    whoever presents the bearer. A rule below 100%, or one per-user override, and
-    an org-keyed verdict hands one person's answer to everyone beside them."""
-    _gate(calls, True)
-    calls.answers[WORKSPACES] = _rows()
-    assert _view(session, _scope(user_id=USER_A)).enabled is True
-
-    calls.answers[ENTITLEMENTS] = {"feature_gates": {"authorization_ui": False}}
-
-    assert _view(session, _scope(user_id=USER_A2)).enabled is False
-
-
 def test_switching_into_an_archived_workspace_is_refused(session, calls):
     """The writable set is the set the menu offered, and the menu drops archived
     rows. Accepting one stores a pick no client could have made."""
-    _gate(calls, True)
     calls.answers[WORKSPACES] = _rows(archived=True)
 
     with pytest.raises(HTTPException) as caught:
@@ -434,7 +343,6 @@ def test_a_desktop_account_switch_does_not_reuse_the_previous_listing(session, c
     account's workspaces would be served for the rest of the TTL, with the grant
     check on `PUT /active` reading them.
     """
-    _gate(calls, True)
     calls.answers[WORKSPACES] = _rows_for(WS_DEFAULT, WS_CLIENT_A)
     first = _view(session, LOCAL_SCOPE, bearer="jwt-first-account")
     assert [w.id for w in first.workspaces] == [WS_DEFAULT, WS_CLIENT_A]
@@ -448,7 +356,6 @@ def test_a_desktop_account_switch_does_not_reuse_the_previous_listing(session, c
 
 def test_a_desktop_account_switch_cannot_switch_on_the_previous_listing(session, calls):
     """Same key, but on the path where it authorizes rather than renders."""
-    _gate(calls, True)
     calls.answers[WORKSPACES] = _rows_for(WS_DEFAULT, WS_CLIENT_A)
     _view(session, LOCAL_SCOPE, bearer="jwt-first-account")
 
@@ -468,7 +375,6 @@ def test_the_archived_refusal_survives_a_write_through_the_settings_route(sessio
     phrased as "is this in the set the menu offered" would have been talked into
     accepting an archived workspace by one call to that route.
     """
-    _gate(calls, True)
     calls.answers[WORKSPACES] = _rows(archived=True)
     # Exactly what the unguarded second writer does.
     SettingService(session, _scope()).upsert_setting(ep.SETTING_KEY, WS_ARCHIVED)
@@ -479,48 +385,41 @@ def test_the_archived_refusal_survives_a_write_through_the_settings_route(sessio
     assert caught.value.status_code == 409
 
 
-def test_a_gate_off_verdict_is_cached_as_long_as_a_gate_on_one(session, calls):
-    """A verdict auth actually returned is an answer, whichever way it went.
-
-    The TTL used to be picked from the verdict, so a definite "off" got the 15s
-    failure budget. That is the state this ships in, and per-caller keys made it
-    one extra entitlements read per person rather than per organization.
-    """
-    _gate(calls, False)
-    assert _view(session, _scope()).enabled is False
-    asked_once = calls.asked.count(ENTITLEMENTS)
+def test_a_reachable_listing_is_cached_for_the_long_ttl(session, calls):
+    """A listing auth actually answered stays cached well past the short TTL."""
+    calls.answers[WORKSPACES] = _rows()
+    assert _view(session, _scope()).reachable is True
+    asked_once = calls.asked.count(WORKSPACES)
 
     # Age the entry past _TTL_FAIL but leave it well inside _TTL_OK.
-    key = next(iter(svc._gate_cache))
-    stamped, value, answered = svc._gate_cache[key]
-    assert answered is True
-    svc._gate_cache[key] = (stamped - (svc._TTL_FAIL + 1), value, answered)
+    key = next(iter(svc._listing_cache))
+    stamped, listing = svc._listing_cache[key]
+    assert listing.reachable is True
+    svc._listing_cache[key] = (stamped - (svc._TTL_FAIL + 1), listing)
 
-    assert _view(session, _scope()).enabled is False
-    assert calls.asked.count(ENTITLEMENTS) == asked_once, (
-        "an answered gate-off verdict was re-fetched inside its own TTL"
+    assert _view(session, _scope()).reachable is True
+    assert calls.asked.count(WORKSPACES) == asked_once, (
+        "a reachable listing was re-fetched inside its own TTL"
     )
 
 
-def test_an_unanswered_gate_read_keeps_the_short_ttl(session, calls):
-    """The other half: no answer is still cached, but only briefly."""
-    calls.answers.pop(ENTITLEMENTS, None)  # unreachable
-    assert _view(session, _scope()).enabled is False
-    asked_once = calls.asked.count(ENTITLEMENTS)
+def test_an_unreachable_listing_keeps_the_short_ttl(session, calls):
+    """The other half: an unreachable listing is cached, but only briefly."""
+    assert _view(session, _scope()).reachable is False
+    asked_once = calls.asked.count(WORKSPACES)
 
-    key = next(iter(svc._gate_cache))
-    stamped, value, answered = svc._gate_cache[key]
-    assert answered is False
-    svc._gate_cache[key] = (stamped - (svc._TTL_FAIL + 1), value, answered)
+    key = next(iter(svc._listing_cache))
+    stamped, listing = svc._listing_cache[key]
+    assert listing.reachable is False
+    svc._listing_cache[key] = (stamped - (svc._TTL_FAIL + 1), listing)
 
     _view(session, _scope())
 
-    assert calls.asked.count(ENTITLEMENTS) == asked_once + 1
+    assert calls.asked.count(WORKSPACES) == asked_once + 1
 
 
 def test_expired_entries_are_swept_rather_than_held_for_the_process_lifetime(session, calls):
     """Nothing re-reads a departed caller's key, so nothing would ever drop it."""
-    _gate(calls, True)
     calls.answers[WORKSPACES] = _rows()
     _view(session, LOCAL_SCOPE, bearer="jwt-someone-who-leaves")
     assert len(svc._listing_cache) == 1
@@ -541,7 +440,6 @@ def test_expired_entries_are_swept_rather_than_held_for_the_process_lifetime(ses
 
 
 def test_two_people_in_one_org_hold_separate_picks(session, calls):
-    _gate(calls, True)
     calls.answers[WORKSPACES] = _rows()
     _activate(session, _scope(user_id=USER_A), WS_CLIENT_A)
 
@@ -550,7 +448,6 @@ def test_two_people_in_one_org_hold_separate_picks(session, calls):
 
 
 def test_one_person_in_two_orgs_holds_separate_picks(session, calls):
-    _gate(calls, True)
     calls.answers[WORKSPACES] = _rows()
     _activate(session, _scope(org_id=ORG_A), WS_CLIENT_A)
 
@@ -577,7 +474,6 @@ def test_the_settings_writer_cannot_grant_a_workspace_it_only_stores_a_string(
     SettingService(session, _scope()).upsert_setting(
         ep.SETTING_KEY, "b0000000-0000-0000-0000-0000000000bb"
     )
-    _gate(calls, True)
     calls.answers[WORKSPACES] = _rows()
 
     view = _view(session, _scope())
@@ -704,7 +600,6 @@ def test_the_read_goes_to_the_operator_auth_host_with_the_callers_own_bearer(
 
 def test_the_route_answers_the_same_view_its_builder_does(session, calls):
     """Covers the route function itself, not just the builder underneath it."""
-    _gate(calls, True)
     calls.answers[WORKSPACES] = _rows()
 
     view = asyncio.run(
@@ -771,16 +666,12 @@ def test_every_transport_failure_reads_as_unreachable(monkeypatch, failure):
     listing = asyncio.run(
         svc.fetch_hub_workspaces(bearer_token="jwt-abc", org_id=ORG_A, user_id=USER_A)
     )
-    enabled = asyncio.run(
-        svc.authorization_ui_enabled(bearer_token="jwt-abc", org_id=ORG_A, user_id=USER_A)
-    )
     elapsed = time.monotonic() - started
 
     assert listing.reachable is False
     assert listing.workspaces == []
-    assert enabled is False
     if failure == "times-out":
-        assert elapsed < 2.0, f"the total-time ceiling did not fire: two calls took {elapsed:.1f}s"
+        assert elapsed < 1.0, f"the total-time ceiling did not fire: the call took {elapsed:.1f}s"
 
 
 @pytest.mark.parametrize(
