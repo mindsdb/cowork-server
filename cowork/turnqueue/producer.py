@@ -112,18 +112,23 @@ def _new_correlation_id() -> str:
 
 
 async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
-                          correlation_id: str, settings: TurnQueueSettings) -> dict:
+                          correlation_id: str, settings: TurnQueueSettings,
+                          workspace_id: str | None = None) -> dict:
     """Mint a short-TTL MindsHub turn key and build the job's `llm` block.
 
     The mint call is authenticated with the internal shared secret
     (`X-Internal-Auth`) only - there is no per-tenant credential to look up or
     send. `org_id`/`user_id` (the request principal's identity) tell auth
     which tenant the key is scoped to; auth resolves them itself, so no
-    per-user provider key is needed or read here.
+    per-user provider key is needed or read here. `workspace_id` is the
+    caller's active MindsHub workspace (`UserSettings.hub_workspace_id`), if
+    they have picked one; omitted otherwise, so the key binds to the
+    organization's Default the way it always has.
     """
     api_key = await mint_turn_key(
         user_id=user_id, org_id=org_id, correlation_id=correlation_id,
         ttl_seconds=settings.turn_key_ttl_seconds, settings=settings,
+        workspace_id=workspace_id,
     )
     base_url = settings.minds_base_url or minds_chat_base_url(default_turn_minds_api_host())
     block = {"provider": "minds-cloud", "api_key": api_key, "base_url": base_url}
@@ -308,8 +313,13 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         llm_block = llm
         oauth_connections = await oauth_connections_coro
     else:
+        from cowork.common.settings.user_settings import get_user_settings
+        workspace_id = getattr(get_user_settings(scope), "hub_workspace_id", "") or None
         llm_block, oauth_connections = await asyncio.gather(
-            _mint_llm_block(org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings),
+            _mint_llm_block(
+                org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
+                workspace_id=workspace_id,
+            ),
             oauth_connections_coro,
         )
     # Reuses the turn key already minted for llm_block — never mints a

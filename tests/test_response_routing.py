@@ -571,13 +571,15 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
             resolved_router_provider=Provider.MINDS_CLOUD,
             resolved_router_model="kimi",        # the user's summarization pick
             resolved_gate_model="mindshub_air",  # what the gate actually runs on
+            hub_workspace_id="ws-1",
         ),
     )
     block = {"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "http://gw/v1"}
     minted = {}
 
-    async def fake_mint(*, org_id, user_id, correlation_id, settings):
+    async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
         minted["corr"] = correlation_id
+        minted["workspace_id"] = workspace_id
         return block
 
     monkeypatch.setattr(producer, "_mint_llm_block", fake_mint)
@@ -589,6 +591,44 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
     assert binding.model == "mindshub_air"
     assert type(binding.provider).__name__ == "OpenAIProvider"
     assert turn_llm == {"correlation_id": minted["corr"], "llm": block}
+    # The routing gate's own pre-mint must carry the caller's picked workspace
+    # too — this key is what a delegated remote turn ends up reusing as its
+    # `llm` block, so skipping it here would silently exempt every hosted-org
+    # turn that goes through the gate from workspace attribution.
+    assert minted["workspace_id"] == "ws-1"
+
+
+@pytest.mark.asyncio
+async def test_router_binding_omits_workspace_id_when_none_picked(monkeypatch):
+    import cowork.handlers.responses as responses
+    import cowork.turnqueue.producer as producer
+    from cowork.common.settings.user_settings import Provider
+
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(
+        responses, "TurnQueueSettings",
+        lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200),
+    )
+    monkeypatch.setattr(
+        responses, "get_user_settings",
+        lambda scope: SimpleNamespace(
+            resolved_router_provider=Provider.MINDS_CLOUD,
+            resolved_router_model="kimi",
+            resolved_gate_model="mindshub_air",
+            hub_workspace_id="",
+        ),
+    )
+    minted = {}
+
+    async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
+        minted["workspace_id"] = workspace_id
+        return {"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "http://gw/v1"}
+
+    monkeypatch.setattr(producer, "_mint_llm_block", fake_mint)
+
+    await handler._router_binding()
+
+    assert minted["workspace_id"] is None
 
 
 @pytest.mark.asyncio
