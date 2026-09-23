@@ -44,6 +44,80 @@ def _schedule(
     return schedule
 
 
+def _conversation(session: Session, *, topic: str = "run"):
+    from cowork.models.conversation import Conversation
+
+    conv = Conversation(topic=topic, project_id=GENERAL_PROJECT_ID)
+    session.add(conv)
+    session.commit()
+    session.refresh(conv)
+    return conv
+
+
+# --- ENG-770: wire the schedule↔conversation link so the client can collapse a
+# schedule's run-conversations into one grouped task row. The server never sent
+# runs_index, so the grouping was dead on the client and every run listed
+# separately.
+
+def test_runs_index_maps_run_conversations_to_schedules():
+    session = _session()
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
+    s1 = _schedule(session, title="A")
+    s2 = _schedule(session, title="B")
+    c1, c2, c3 = _conversation(session), _conversation(session), _conversation(session)
+    for sched, conv in ((s1, c1), (s1, c2), (s2, c3)):
+        run = run_service.create_run(sched.id, is_manual=False)
+        run_service.set_run_conversation(run.id, conv.id)
+
+    assert run_service.runs_index([s1.id, s2.id]) == {
+        str(c1.id): str(s1.id),
+        str(c2.id): str(s1.id),
+        str(c3.id): str(s2.id),
+    }
+
+
+def test_runs_index_skips_runs_without_a_conversation():
+    session = _session()
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
+    schedule = _schedule(session)
+    run_service.create_run(schedule.id, is_manual=False)  # no conversation attached yet
+
+    assert run_service.runs_index([schedule.id]) == {}
+
+
+def test_runs_index_limited_to_the_given_schedules():
+    session = _session()
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
+    s1 = _schedule(session, title="A")
+    s2 = _schedule(session, title="B")
+    c1, c2 = _conversation(session), _conversation(session)
+    for sched, conv in ((s1, c1), (s2, c2)):
+        run = run_service.create_run(sched.id, is_manual=False)
+        run_service.set_run_conversation(run.id, conv.id)
+
+    # Only s1 requested → s2's run is excluded; empty input → empty map.
+    assert run_service.runs_index([s1.id]) == {str(c1.id): str(s1.id)}
+    assert run_service.runs_index([]) == {}
+
+
+def test_list_schedules_endpoint_includes_runs_index():
+    from cowork.api.v1.endpoints.schedules import list_schedules
+
+    session = _session()
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    run_service = ScheduleRunService(scoped)
+    schedule = _schedule(session, title="Daily report")
+    conv = _conversation(session)
+    run = run_service.create_run(schedule.id, is_manual=False)
+    run_service.set_run_conversation(run.id, conv.id)
+
+    body = list_schedules(scoped)
+
+    assert [s["id"] for s in body["schedules"]] == [schedule.id]
+    # runs_index is str-keyed so it survives JSON round-trip to the client.
+    assert body["runs_index"] == {str(conv.id): str(schedule.id)}
+
+
 def test_has_running_run_false_when_no_runs():
     session = _session()
     schedule = _schedule(session)
