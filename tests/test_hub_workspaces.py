@@ -498,54 +498,6 @@ def test_a_desktop_install_stores_the_pick_in_the_global_row(session):
     assert SettingService(session, LOCAL_SCOPE).load().hub_workspace_id == WS_CLIENT_A
 
 
-# ── What this must not touch ─────────────────────────────────────────
-
-
-def test_nothing_on_the_turn_path_reads_the_stored_workspace():
-    """The selector changes what the client shows, not what a turn is billed to.
-
-    Both turn credentials are workspace-blind: a desktop turn presents a
-    long-lived key bound to a user and an organization, and a cloud turn presents
-    a minted key whose request body has no workspace field. Attributing usage to a
-    workspace is separate work that has not shipped, so this asserts the boundary
-    rather than trusting it.
-    """
-    from pathlib import Path
-
-    repo = Path(__file__).resolve().parents[1]
-    targets = [
-        repo / "cowork" / "turnqueue",
-        repo / "cowork" / "handlers",
-        repo / "cowork" / "harnesses",
-        repo / "cowork" / "services" / "providers.py",
-    ]
-
-    # Read in Python rather than shelling out to grep. The shell version asserted
-    # on stdout alone, so a wrong working directory or a renamed path made grep
-    # error, print nothing, and the guard pass having checked no files at all.
-    missing = [str(t.relative_to(repo)) for t in targets if not t.exists()]
-    assert not missing, f"this guard points at paths that no longer exist: {missing}"
-
-    # Every file, not just `*.py`. The shell version this replaced was a plain
-    # `grep -rln`, so it also read the skill markdown and prompt templates under
-    # `cowork/harnesses/`, and the turn path can name a setting from one of those
-    # as easily as from code.
-    def _walk(target):
-        if target.is_file():
-            return [target]
-        return sorted(f for f in target.rglob("*") if f.is_file())
-
-    files = [f for t in targets for f in _walk(t)]
-    assert files, "the guard matched no files, so it proved nothing"
-    hits = [
-        str(f.relative_to(repo))
-        for f in files
-        if "hub_workspace_id" in f.read_text(encoding="utf-8", errors="ignore")
-    ]
-
-    assert hits == [], f"the turn path reads the stored workspace: {hits}"
-
-
 def test_the_read_goes_to_the_operator_auth_host_with_the_callers_own_bearer(
     monkeypatch, session
 ):
@@ -873,3 +825,53 @@ def test_a_malformed_hub_header_falls_back_rather_than_forwarding_junk(value, mo
 
 def test_hub_credential_with_no_request_is_empty():
     assert hub_credential(None) == ""
+
+
+# ── A pick auth refuses at mint time ─────────────────────────────────
+
+
+def _stored_pick(scope) -> str:
+    engine = get_engine(get_app_settings().database.uri)
+    with Session(engine) as s:
+        return SettingService(s, scope).load().hub_workspace_id
+
+
+def test_a_refused_pick_is_cleared(session):
+    """Grant removed after the pick: the menu already falls back to the default,
+    and clearing the stored value makes the turn path agree with it."""
+    SettingService(session, _scope()).upsert_setting(ep.SETTING_KEY, WS_CLIENT_A)
+
+    svc.forget_stale_hub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
+
+    assert _stored_pick(_scope()) == ""
+
+
+def test_a_newer_pick_is_not_cleared(session):
+    """The person re-picked a live workspace between the turn's read and auth's
+    refusal; that newer choice must survive the stale one being cleared."""
+    SettingService(session, _scope()).upsert_setting(ep.SETTING_KEY, WS_DEFAULT)
+
+    svc.forget_stale_hub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
+
+    assert _stored_pick(_scope()) == WS_DEFAULT
+
+
+def test_clearing_is_scoped_to_the_caller(session):
+    SettingService(session, _scope(ORG_A, USER_A)).upsert_setting(ep.SETTING_KEY, WS_CLIENT_A)
+    SettingService(session, _scope(ORG_A, USER_A2)).upsert_setting(ep.SETTING_KEY, WS_CLIENT_A)
+
+    svc.forget_stale_hub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
+
+    assert _stored_pick(_scope(ORG_A, USER_A)) == ""
+    assert _stored_pick(_scope(ORG_A, USER_A2)) == WS_CLIENT_A
+
+
+def test_a_failed_clear_does_not_raise(monkeypatch):
+    """The turn has already recovered on the default; a settings outage here
+    must not turn that recovery back into a failure."""
+    def broken_session():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr("cowork.db.session.get_open_session", broken_session)
+
+    svc.forget_stale_hub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
