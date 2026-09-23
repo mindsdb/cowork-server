@@ -258,13 +258,20 @@ DESKTOP_FIELDS = {
     },
 }
 
+# Guidance each connector's desktop copy gives for choices the hosted path
+# does not offer. None of it may appear in the cloud copy.
+DESKTOP_ONLY_PHRASES = {
+    "postgres": ["sslmode=disable", "leave SSL off", "127.0.0.1", "localhost"],
+    "mysql": ["127.0.0.1", "Use SSL", "SSL CA Certificate"],
+}
+
 
 class TestCloudDatabaseSpecs:
     """The cloud blocks on postgres and mysql.
 
-    They carry TLS constraints the hosted path enforces and the desktop path
-    does not, so an edit that collapses the two forms back together is the
-    failure this class exists to catch.
+    The desktop forms offer choices the hosted path does not: a TLS toggle, a
+    CA field, a localhost server. An edit that collapses the two forms back
+    together is the failure this class exists to catch.
     """
 
     @pytest.fixture(
@@ -308,16 +315,20 @@ class TestCloudDatabaseSpecs:
         names = {f.name for f in self._cloud(spec, connector_id).fields}
         assert names.isdisjoint({"ssl_enabled", "use_ssl", "ssl", "tls", "ssl_ca_cert"})
 
-    @pytest.mark.parametrize("phrase", ["sslmode=disable", "leave SSL off"])
-    def test_cloud_copy_never_inherits_the_desktop_ssl_off_guidance(
-        self, spec, connector_id, phrase
-    ):
+    def test_cloud_copy_never_inherits_desktop_only_guidance(self, spec, connector_id):
+        """Each phrase must still be in the desktop copy, so the guard cannot
+        pass because the desktop text changed rather than the cloud text."""
+        desktop = " ".join(
+            f"{m.description or ''} {m.how_to or ''}" for m in spec.form.methods
+        ).lower()
         cloud = self._cloud(spec, connector_id)
         copy = " ".join(
             [cloud.description or "", cloud.how_to or ""]
             + [f.description or "" for f in cloud.fields]
-        )
-        assert phrase.lower() not in copy.lower()
+        ).lower()
+        for phrase in DESKTOP_ONLY_PHRASES[connector_id]:
+            assert phrase.lower() in desktop, f"{phrase!r} left the desktop copy"
+            assert phrase.lower() not in copy, f"cloud copy inherited {phrase!r}"
 
     def test_desktop_fields_are_untouched(self, spec, connector_id):
         for method in spec.form.methods:
