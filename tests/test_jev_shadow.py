@@ -229,6 +229,8 @@ async def test_probe_attributes_its_trace_to_the_turn_it_shadows(monkeypatch):
     )
 
     assert headers["Authorization"] == "Bearer turn-key"
+    # Hidden from the user's own Traces list: this is our experiment, not their call.
+    assert headers["X-Minds-Request-Kind"] == "probe"
     assert headers["Langfuse-Session-Id"] == "conv-1"
     # The probe's own tag, not the gate's: a probe trace must not read as a gate call.
     assert headers["Langfuse-Tags"].split(",") == ["anton", "surface:web", jev_shadow.JEV_SHADOW_TAG]
@@ -259,7 +261,7 @@ async def test_probe_never_sends_turn_id(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_probe_outside_a_turn_sends_only_its_credential(monkeypatch):
+async def test_probe_outside_a_turn_sends_only_its_credential_and_kind(monkeypatch):
     headers = await _probe_headers(monkeypatch, None)
 
-    assert headers == {"Authorization": "Bearer turn-key"}
+    assert headers == {"Authorization": "Bearer turn-key", "X-Minds-Request-Kind": "probe"}

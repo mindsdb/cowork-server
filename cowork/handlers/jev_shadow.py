@@ -19,6 +19,7 @@ from typing import Any
 import httpx
 
 from cowork.common.settings.app_settings import TurnQueueSettings
+from cowork.services.providers import MINDS_REQUEST_KIND_HEADER, MINDS_REQUEST_KIND_PROBE
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +144,15 @@ async def probe(
             async with httpx.AsyncClient(timeout=settings.jev_shadow_timeout_seconds) as client:
                 response = await client.post(
                     f"{base_url}/decisions",
-                    headers={"Authorization": f"Bearer {api_key}", **_trace_headers()},
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        # Our experiment, not the user's request: hides the row
+                        # from their Traces list by default, like the key-test
+                        # pings. It only reaches Postgres, never Langfuse, so
+                        # our own attribution below is unaffected (ENG-2921).
+                        MINDS_REQUEST_KIND_HEADER: MINDS_REQUEST_KIND_PROBE,
+                        **_trace_headers(),
+                    },
                     json=payload,
                 )
     except TimeoutError:
