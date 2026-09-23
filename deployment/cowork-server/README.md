@@ -81,22 +81,34 @@ client does not send the expected-organization header and receives 426.
 
 ### Back out through an operator
 
-To back the boundary itself out, an operator must restore an earlier release;
-there is no value to edit. Record the current revision, then inspect the target
-revision's image and values before selecting it. Restoring an earlier image also
-backs out unrelated changes shipped since that revision.
+Backing out the boundary requires an earlier implementation; there is no value
+to edit. A Helm rollback works only if a suitable release revision remains in
+history. Record the current revision, then inspect a candidate's image and
+values. Restoring an earlier image also backs out unrelated changes shipped
+since that revision.
 
 ```bash
-helm history cowork-server -n <namespace>
-helm get manifest cowork-server -n <namespace> --revision <revision>
-helm get values cowork-server -n <namespace> --revision <revision> --all
+helm --kube-context <context> -n <namespace> history cowork-server --max 256
+helm --kube-context <context> -n <namespace> get manifest cowork-server --revision <revision>
+helm --kube-context <context> -n <namespace> get values cowork-server --revision <revision> --all
 ```
 
-After the operator selects the revision and coordinates the deployment hold,
-the operator runs:
+**Staging history checked on 2026-09-23 has no pre-change revision.** The
+read-only query used context `newdev` and namespace `staging`. It returned ten
+revisions, 219 through 228, despite requesting up to 256. The earliest retained
+revision is dated 2026-09-21 08:03 UTC; deployed revision 228 is dated
+2026-09-23 04:13 UTC. None predates the September 13 boundary change.
+
+Do not invent a rollback revision or choose one solely because its number is
+lower. For an enforcement backout without a suitable retained revision, deploy
+a reviewed previous image or a reviewed code revert through CI. Verify its
+compatibility with changes made since that image shipped.
+
+Where a suitable revision is retained, an operator selects it, coordinates the
+deployment hold, and runs:
 
 ```bash
-helm rollback cowork-server <revision> -n <namespace> --wait
+helm --kube-context <context> -n <namespace> rollback cowork-server <verified-revision> --wait
 ```
 
 **The next deployment can overwrite the rollback.** A push to `staging` starts
@@ -111,6 +123,13 @@ missing-expectation, malformed-expectation, mismatch, and valid API-key checks
 through ingress. Record the responses against the selected revision's intended
 behavior. A documented command is not a completed rehearsal: record the rollback
 and restore revisions, timestamps, and results when an operator exercises it.
+
+**Disabling the picker is a separate rehearsal.** In staging, deploy
+`COWORK_ORGANIZATION_SWITCH_ENABLED=false` through CI, verify the result, then
+restore its intended value through CI. The capability's `enabled` becomes
+false, while `expectedOrganizationEnforced` stays true and the 426/409 refusals
+remain. That exercises picker availability, not an enforcement backout. The
+2026-09-23 history check performed no rollback or picker-disable rehearsal.
 
 ### Verify replicas and the gateway separately
 
