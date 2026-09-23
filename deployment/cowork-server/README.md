@@ -76,24 +76,86 @@ picker, by dropping `expectedOrganizationEnforced` from the capability, but it
 reopens the no-principal path and leaves the boundary refusing anyway, so it is
 never the right lever here.
 
-To back the boundary itself out, roll the release back; there is no value to
-edit. Find the revision that predates the change and roll to it:
+Deploy this server only with the capability-aware Cowork client image. An older
+client does not send the expected-organization header and receives 426.
+
+### Back out through an operator
+
+To back the boundary itself out, an operator must restore an earlier release;
+there is no value to edit. Record the current revision, then inspect the target
+revision's image and values before selecting it. Restoring an earlier image also
+backs out unrelated changes shipped since that revision.
 
 ```bash
 helm history cowork-server -n <namespace>
+helm get manifest cowork-server -n <namespace> --revision <revision>
+helm get values cowork-server -n <namespace> --revision <revision> --all
+```
+
+After the operator selects the revision and coordinates the deployment hold,
+the operator runs:
+
+```bash
 helm rollback cowork-server <revision> -n <namespace> --wait
 ```
 
-**That rollback lasts only until the next deploy into the namespace, and nobody
-has to trigger one.** A push to `main` fires `sync-main-to-staging.yml`, which
-pushes `staging`, which fires `publish-staging.yml` and its `helm upgrade`. So
-an unrelated hotfix puts the boundary back hours later. Hold the rollback by
-freezing the branch through `staging-freeze.yml`, or revert the commit and let
-the pipeline deploy the revert, which is the only backout that survives a
-redeploy.
+**The next deployment can overwrite the rollback.** A push to `staging` starts
+`publish-staging.yml`; a push to `main` starts `publish.yml` and also syncs into
+`staging`. Check queued and running deployments before rolling back. A staging
+branch freeze alone does not stop production deployments or a run already in
+progress. To keep the backout through later deployments, revert the change in
+Git and ship that revert through CI.
 
-Deploy this server only with the capability-aware Cowork client image. An older
-client does not send the expected-organization header and receives 426.
+After rollback, verify every replica's image and repeat the capability,
+missing-expectation, malformed-expectation, mismatch, and valid API-key checks
+through ingress. Record the responses against the selected revision's intended
+behavior. A documented command is not a completed rehearsal: record the rollback
+and restore revisions, timestamps, and results when an operator exercises it.
+
+### Verify replicas and the gateway separately
+
+Check the running image and effective environment on every serving replica.
+Each must use org tenancy, enforced identity, and the intended picker setting.
+The retired boundary-mode setting cannot change enforcement.
+
+Then probe each replica with a browser-shaped bearer and controlled identity
+headers. Matching organizations must pass; a missing expectation must return
+426; malformed and mismatched expectations must return 409. Both refusals must
+carry `organization_reload_required`, `X-Cowork-Organization-Reload: required`,
+and `Cache-Control: no-store`. The capability must report protocol version 1
+and enforcement enabled. Its `enabled` value follows the picker setting.
+
+These probes test the server after identity resolution. They do not prove that
+the ingress authenticates a real credential or replaces caller-supplied identity
+headers. Verify that path separately through the public hostname with a valid
+browser session and an `mdb_` API key. Keep the credential out of recorded
+commands and output. Record the environment, UTC time, image digest, replica,
+request class, status, and response headers with each result.
+
+### Count refusals by reason
+
+The server still logs every boundary refusal at WARNING after removal of the
+mode setting. Search the application logs for `organization boundary:` and
+count these message fragments separately:
+
+| Reason | Message fragment | HTTP status |
+| --- | --- | --- |
+| Missing | `missing expected organization` | 426 |
+| Malformed | `malformed expected organization` | 409 |
+| Mismatch | `organization mismatch` | 409 |
+
+Use the same explicit UTC start and end for staging and production. Record the
+namespace and application filter, retained time range, and total matching
+application records. Verify that logging includes WARNING and every serving
+replica reaches the log store. A zero count is meaningful only when that
+environment has other records in the window. Status 409 alone cannot distinguish
+malformed and mismatched expectations, or separate these refusals from unrelated
+conflicts.
+
+Label counts from a retained 48-hour window after deployment as post-deploy
+evidence. They cannot reconstruct an unavailable pre-deploy baseline. Keep
+deliberate verification probes identifiable by timestamp and path when comparing
+traffic before and after a change.
 
 ## Configuration
 
