@@ -268,6 +268,17 @@ DESKTOP_FIELDS = {
     },
 }
 
+@pytest.mark.parametrize("path", SPEC_FILES, ids=lambda p: p.stem)
+def test_no_other_method_declares_cloud_support(path: Path):
+    """Only the methods in CLOUD_DATABASE_METHODS carry a `cloud` block."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.setdefault("id", path.stem)
+    spec = ConnectorSpecResponse(**data)
+    for method in spec.form.methods or []:
+        if CLOUD_DATABASE_METHODS.get(spec.id) != method.id:
+            assert method.cloud is None, f"{spec.id}.{method.id} declares cloud support"
+
+
 # Guidance each connector's desktop copy gives for choices the hosted path
 # does not offer. None of it may appear in the cloud copy.
 DESKTOP_ONLY_PHRASES = {
