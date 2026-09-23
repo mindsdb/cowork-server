@@ -14,7 +14,7 @@ import logging
 import time
 import uuid
 
-from cowork.build_info import KEY_ANTON_VERSION, build_trace_metadata, surface
+from cowork.build_info import KEY_ANTON_VERSION, account_ids, build_trace_metadata, surface
 from cowork.handlers.turn_errors import WORKER_UNRESPONSIVE_TYPE_NAME, remote_turn_error
 from cowork.services.providers import minds_chat_base_url
 from cowork.db.scoped import TenantScope
@@ -35,17 +35,25 @@ _MAX_REQUEST_BYTES = 10 * 1024 * 1024
 _REQUEST_BYTES_MARGIN = 64 * 1024
 
 
-def _trace_block() -> dict[str, str]:
+def _trace_block(*, user_id: str | None = None, org_id: str | None = None) -> dict[str, str]:
     """Attribution the pod cannot work out for itself, for the job's params.
 
     Kept tiny and total-failure-tolerant: telemetry must never be the reason a
     turn does not start, and an absent block reads as "no attribution" on the
     pod side rather than an error. That is also what lets the three repos in
     this chain deploy in any order.
+
+    ``user_id`` / ``org_id`` are the turn's gateway-verified principal. They
+    go as ``user_id`` / ``organization_id`` so anton can key ``turn_completed``
+    on the account (ENG-2121); UUIDs only, anything else is left out. A pod
+    anton from before ENG-2121 forwards unknown keys into the per-turn
+    Langfuse metadata, where the gateway's own verified user and org already
+    sit, so that skew adds nothing the trace does not already hold.
     """
     try:
         resolved = surface()
         block = build_trace_metadata({"surface": resolved} if resolved else None)
+        block.update(account_ids(user_id, org_id))
         # Drop OUR anton version: the pod runs a different anton entirely (its
         # own pinned `minds-anton-scratchpad` image, bumped independently of
         # this server's vendored dep), so the value would be wrong on the wire.
@@ -341,7 +349,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # install channel — measured on prod, 0 of 68 cloud traces carried
               # any of them. Same helper the in-process path uses, so the two
               # cannot drift. Observability only; the pod must never act on it.
-              "trace": _trace_block()}
+              "trace": _trace_block(user_id=user_id, org_id=org_id)}
     params = _fit_request(params, conversation_id)
 
     job = TurnJob(
