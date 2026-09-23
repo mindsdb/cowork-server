@@ -23,6 +23,9 @@ class ConnectorField(BaseModel):
     description: str | None = None
     default: Any = None
     options: list[dict[str, Any]] | None = None
+    #: A checkbox reads as a sentence beside the box, which is longer than the
+    #: label the field is listed under. Only a boolean field uses it.
+    checkbox_label: str | None = None
 
 
 class OAuthConfig(BaseModel):
@@ -87,9 +90,9 @@ class CloudMethod(BaseModel):
     # driver/server/method row it depends on.
     available: bool = False
     # Cloud copy, never inherited from the desktop method. The desktop text
-    # documents a TLS toggle the cloud form does not offer and a localhost
-    # server the hosted path refuses, so rendering it to a cloud user would
-    # describe a form that cannot be submitted.
+    # documents an SSL on/off toggle and a CA field the cloud form does not
+    # offer, and a localhost server the hosted path refuses, so rendering it
+    # to a cloud user would describe a form that cannot be submitted.
     description: str | None = None
     how_to: str | None = None
     # The COMPLETE cloud field list, not a delta on the desktop `fields`.

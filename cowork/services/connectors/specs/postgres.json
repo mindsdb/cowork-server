@@ -110,7 +110,7 @@
         "cloud": {
           "available": false,
           "description": "Enter host, port, database name, username, and password individually.",
-          "how_to": "## Connect with host, port, and credentials\n\nFill in each field separately. This matches the connection panel in tools like pgAdmin, DBeaver, or TablePlus.\n\n### Where to find each value\n\n1. **Host**: The server address, e.g. `db.example.com`. It must be reachable from the public internet and resolve to a public address.\n2. **Port**: `5432` by default. Any port the server listens on is accepted.\n3. **Database**: The specific database name (not the server).\n4. **Username / Password**: A PostgreSQL role with `CONNECT` on the database and `USAGE` plus `SELECT` on the schemas you want read. Create a dedicated read-only role rather than reusing an administrative one.\n\n### Notes\n\n- The connection is encrypted whenever the server supports it, and the server's certificate is not checked. That is what a database client does by default, and it means a server with its own self-signed certificate connects without extra setup.\n- Queries run inside a read-only transaction against the role you provide, whatever privileges it holds.\n- Allow the connection through your firewall or security group before saving.",
+          "how_to": "## Connect with host, port, and credentials\n\nFill in each field separately. This matches the connection panel in tools like pgAdmin, DBeaver, or TablePlus.\n\n### Where to find each value\n\n1. **Host**: The server address, e.g. `db.example.com`. It must be reachable from the public internet and resolve to a public address.\n2. **Port**: whatever your server listens on. `5432` unless you or your provider changed it; a Supabase or pgBouncer pooler answers on `6432`.\n3. **Database**: The specific database name (not the server).\n4. **Schema**: Optional. One schema inside that database, e.g. `public`. Leave it empty and the role's own search path decides what is visible.\n5. **Username / Password**: A PostgreSQL role with `CONNECT` on the database and `USAGE` plus `SELECT` on the schemas you want read. Your application's own role works.\n\n### Notes\n\n- The connection is encrypted whenever the server supports it. The server's certificate is checked only when **Certificate** is on. Left off, which is what a database client does by default, a server with its own self-signed certificate connects without extra setup.\n- Queries run inside a read-only transaction and only SELECT statements are accepted, so an account that can write cannot write through this connection. Any role that can read is accepted, including one that owns its tables.\n- Give this connection the narrowest role that can see what you want read. Nothing here limits what a broad role can be asked to read: a superuser can read the server's stored password hashes, and a role with access to a foreign table can read whatever that table points at, including a file on the database host.\n- Allow the connection through your firewall or security group before saving.",
           "fields": [
             {
               "name": "host",
@@ -127,7 +127,7 @@
               "required": true,
               "placeholder": "5432",
               "default": "5432",
-              "description": "PostgreSQL defaults to 5432. Any port the server listens on is accepted."
+              "description": "Whatever your server listens on, 5432 unless it was changed."
             },
             {
               "name": "database",
@@ -136,6 +136,14 @@
               "required": true,
               "placeholder": "mydb",
               "description": "The name of the specific database (schema container) to connect to."
+            },
+            {
+              "name": "schema",
+              "label": "Schema",
+              "type": "text",
+              "required": false,
+              "placeholder": "public",
+              "description": "Optional. One schema inside that database to read. Leave empty to use the role's own search path."
             },
             {
               "name": "username",
@@ -153,6 +161,14 @@
               "secret": true,
               "placeholder": "••••••••",
               "description": "Password for the above role. Stored encrypted and never shown again."
+            },
+            {
+              "name": "tls_verify",
+              "label": "Certificate",
+              "type": "boolean",
+              "required": false,
+              "checkbox_label": "Only connect if the certificate is signed by a public authority",
+              "description": "Off by default, because a self-hosted server usually presents a certificate it generated for itself, which no client can verify. The connection is still encrypted whenever the server offers it. Turn this on for a managed provider, whose certificate a public authority signed."
             }
           ]
         }
