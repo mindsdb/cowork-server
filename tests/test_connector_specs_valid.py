@@ -296,8 +296,8 @@ DESKTOP_ONLY_PHRASES = {
 class TestCloudDatabaseSpecs:
     """The cloud blocks on postgres and mysql.
 
-    The desktop forms offer choices the hosted path does not: a TLS toggle, a
-    CA field, a localhost server. An edit that collapses the two forms back
+    The desktop forms offer choices the hosted path does not: an SSL on/off
+    toggle, a CA field, a localhost server. An edit that collapses the two forms back
     together is the failure this class exists to catch.
     """
 
@@ -338,6 +338,7 @@ class TestCloudDatabaseSpecs:
         assert set(fields) == CLOUD_DATABASE_FIELDS[connector_id]
         assert fields["tls_verify"].type == "boolean"
         assert fields["tls_verify"].required is False
+        assert fields["tls_verify"].checkbox_label, "the checkbox needs its sentence"
         # Unchecked unless the person checks it: a default would decide for
         # them, and `"false"` reads as true to a checkbox.
         assert fields["tls_verify"].default is None
