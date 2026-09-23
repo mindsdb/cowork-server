@@ -5,12 +5,25 @@ and keeps the long-lived tenant key out of the worker pod.
 """
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 import httpx
 
+from cowork.services.hub_workspaces import forget_stale_hub_workspace
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
+
+logger = logging.getLogger(__name__)
+
+
+def _error_code(resp: httpx.Response) -> str | None:
+    """The ``code`` field of an error body, or None if it has none."""
+    try:
+        error = resp.json()
+    except ValueError:
+        return None
+    return error.get("code") if isinstance(error, dict) else None
 
 
 async def mint_turn_key(*, user_id: str, org_id: str, correlation_id: str,
@@ -34,10 +47,20 @@ async def mint_turn_key(*, user_id: str, org_id: str, correlation_id: str,
     try:
         async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
             resp = await client.post(url, json=body, headers=headers)
-            if resp.status_code == 403:
-                error = resp.json()
-                if isinstance(error, dict) and error.get("code") == "permission_denied":
-                    raise ProductPermissionDenied()
+            if resp.status_code == 404 and workspace_id and _error_code(resp) == "workspace_not_found":
+                # The stored pick names a workspace this person can no longer
+                # use (grant removed, or deleted). The menu has already fallen
+                # back to the default; do the same here instead of failing
+                # every turn, and clear the pick so the next turn skips this.
+                logger.info(
+                    "turn key mint: workspace %s refused for user %s; retrying on the default",
+                    workspace_id, user_id,
+                )
+                forget_stale_hub_workspace(org_id=org_id, user_id=user_id, workspace_id=workspace_id)
+                del body["workspace_id"]
+                resp = await client.post(url, json=body, headers=headers)
+            if resp.status_code == 403 and _error_code(resp) == "permission_denied":
+                raise ProductPermissionDenied()
             resp.raise_for_status()
             result = resp.json()
             if not isinstance(result, dict) or not isinstance(result.get("key"), str) or not result["key"].strip():

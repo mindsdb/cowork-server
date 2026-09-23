@@ -69,6 +69,99 @@ async def test_mint_turn_key_sends_workspace_id_when_given(monkeypatch):
     assert captured["json"]["workspace_id"] == "ws-1"
 
 
+class _SeqResp:
+    def __init__(self, status_code, body):
+        self.status_code = status_code
+        self._body = body
+
+    def json(self):
+        return self._body
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError("error", request=None, response=None)
+
+
+def _sequenced_client(monkeypatch, responses):
+    """Fake AsyncClient answering each POST with the next response; returns the bodies sent."""
+    sent = []
+    queue = list(responses)
+
+    class _Client:
+        def __init__(self, *a, **k): pass
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def post(self, url, json, headers):
+            sent.append(dict(json))
+            return queue.pop(0)
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    return sent
+
+
+@pytest.fixture
+def forgotten(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "cowork.turnqueue.auth_keys.forget_stale_hub_workspace",
+        lambda **kw: calls.append(kw),
+    )
+    return calls
+
+
+@pytest.mark.asyncio
+async def test_refused_workspace_retries_on_the_default_and_forgets_the_pick(monkeypatch, forgotten):
+    """A grant removed after the pick: auth refuses the stale id, and the turn
+    recovers on the default instead of failing every turn from then on."""
+    sent = _sequenced_client(monkeypatch, [
+        _SeqResp(404, {"code": "workspace_not_found", "detail": "not found"}),
+        _SeqResp(201, {"key": "mdb_default"}),
+    ])
+
+    key = await mint_turn_key(
+        user_id="u1", org_id="o1", correlation_id="corr-1",
+        ttl_seconds=1200, settings=_Settings(), workspace_id="ws-stale",
+    )
+
+    assert key == "mdb_default"
+    assert sent[0]["workspace_id"] == "ws-stale"
+    assert "workspace_id" not in sent[1]
+    assert forgotten == [{"org_id": "o1", "user_id": "u1", "workspace_id": "ws-stale"}]
+
+
+@pytest.mark.asyncio
+async def test_any_other_404_still_fails_without_retrying(monkeypatch, forgotten):
+    """Only the workspace refusal is recoverable; an unknown user/org is not."""
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+
+    sent = _sequenced_client(monkeypatch, [_SeqResp(404, {"detail": "user_id u1 not found"})])
+
+    with pytest.raises(ProductPermissionUnavailable):
+        await mint_turn_key(
+            user_id="u1", org_id="o1", correlation_id="corr-1",
+            ttl_seconds=1200, settings=_Settings(), workspace_id="ws-1",
+        )
+
+    assert len(sent) == 1
+    assert forgotten == []
+
+
+@pytest.mark.asyncio
+async def test_workspace_refusal_without_a_workspace_sent_is_not_retried(monkeypatch, forgotten):
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+
+    sent = _sequenced_client(monkeypatch, [_SeqResp(404, {"code": "workspace_not_found"})])
+
+    with pytest.raises(ProductPermissionUnavailable):
+        await mint_turn_key(
+            user_id="u1", org_id="o1", correlation_id="corr-1",
+            ttl_seconds=1200, settings=_Settings(),
+        )
+
+    assert len(sent) == 1
+    assert forgotten == []
+
+
 @pytest.mark.asyncio
 async def test_revoke_turn_key_uses_cluster_only_route(monkeypatch):
     captured = {}

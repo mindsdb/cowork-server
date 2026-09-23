@@ -322,6 +322,37 @@ def resolve_active(
     return workspaces[0] if workspaces else None
 
 
+def forget_stale_hub_workspace(*, org_id: str, user_id: str, workspace_id: str) -> None:
+    """Clear a stored pick auth just refused to mint against.
+
+    The menu already stops showing it (``resolve_active`` falls through to the
+    default), but nothing rewrites the stored value, so every later turn would
+    send it again and be refused again. Cleared only while it still names the
+    refused workspace: the person may have picked a live one since this turn
+    read it, and that newer choice must survive. Best effort — the turn has
+    already recovered on the default, and the next refusal tries this again.
+    """
+    from cowork.db.scoped import TenantScope
+    from cowork.db.session import get_open_session
+    from cowork.services.settings import SettingService
+
+    scope = TenantScope(org_mode=True, org_id=org_id, user_id=user_id)
+    session = None
+    try:
+        session = get_open_session()
+        settings = SettingService(session, scope)
+        if settings.load().hub_workspace_id == workspace_id:
+            settings.upsert_setting("hub_workspace_id", "")
+    except Exception:
+        logger.warning(
+            "could not clear stale hub workspace pick for org %s user %s",
+            org_id, user_id, exc_info=True,
+        )
+    finally:
+        if session is not None:
+            session.close()
+
+
 def selectable(
     workspaces: list[HubWorkspace], active_id: Optional[str]
 ) -> list[HubWorkspace]:
