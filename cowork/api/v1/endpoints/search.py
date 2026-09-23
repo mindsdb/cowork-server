@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, Query
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSessionDep
+from cowork.schemas.search import SearchResponse
 from cowork.services.artifact_roots import artifacts_sources_for_scan as _sources_for_scan
 from cowork.services.artifacts import list_artifacts as _list_artifacts
 from cowork.services.conversations import ConversationService
@@ -36,7 +37,7 @@ def _score(text: str, query: str) -> int:
     return score
 
 
-@router.get("")
+@router.get("", responses={200: {"model": SearchResponse}})
 async def search_cowork(
     scoped: ScopedSessionDep,
     q: str = Query(default=""),
