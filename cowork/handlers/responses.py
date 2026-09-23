@@ -112,7 +112,7 @@ def _spawn_jev_shadow_probe(
 
     `create_task` copies the caller's context, so the probe runs under the
     gate's anton TraceContext and `jev_shadow` attributes its Langfuse trace to
-    the same conversation and correlation_id (ENG-2921)."""
+    the same conversation and correlation_id."""
 
     async def _run() -> None:
         jev_result = await jev_shadow.probe(messages=messages, llm_block=llm_block, settings=settings)
@@ -574,7 +574,7 @@ class ResponsesHandler:
                     # an LLM call), so the context can carry the turn's
                     # correlation_id: the gate's trace and the Jev shadow probe's
                     # (which inherits this context) share it, making gate
-                    # decision <-> Jev answer an exact join (ENG-2921). Never
+                    # decision <-> Jev answer an exact join. Never
                     # turn_id: the gateway renames harness+turn_id traces to
                     # "{harness}:turn-N", which would count these as user turns.
                     binding, turn_llm = await self._router_binding()

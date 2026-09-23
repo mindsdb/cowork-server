@@ -33,7 +33,7 @@ MINDS_PROBE_MODEL = "mindshub_air"
 # Marks a request as our own background call on the user's key, not activity
 # they asked for, so the customer's Traces list hides it by default: the
 # connectivity/health-check pings below and the Jev shadow probe
-# (cowork/handlers/jev_shadow.py, ENG-2921). Read by mindshub_inference; it is
+# (cowork/handlers/jev_shadow.py). Read by mindshub_inference; it is
 # our own header and means nothing to a non-Minds endpoint, so it is only ever
 # sent to a Minds host.
 MINDS_REQUEST_KIND_HEADER = "X-Minds-Request-Kind"

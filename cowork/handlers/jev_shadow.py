@@ -64,7 +64,7 @@ _ROUTE_QUESTION: dict[str, Any] = {
 
 
 # Separates the probe's Jev traces from the gate's own ("cowork-gate") and from
-# user turns in Langfuse (ENG-2921).
+# user turns in Langfuse.
 JEV_SHADOW_TAG = "jev-shadow"
 
 
@@ -77,7 +77,7 @@ def _trace_headers() -> dict[str, str]:
 
     Without them the gateway stamps the call ``origin:direct-api``: from its
     side a probe on the user's minted key is indistinguishable from that user
-    calling Jev directly (ENG-2921). The probe runs under the gate's anton
+    calling Jev directly. The probe runs under the gate's anton
     TraceContext (``_spawn_jev_shadow_probe``), so this reads it rather than
     re-deriving the turn's identity.
 
@@ -156,7 +156,7 @@ async def probe(
                         # Our experiment, not the user's request: hides the row
                         # from their Traces list by default, like the key-test
                         # pings. It only reaches Postgres, never Langfuse, so
-                        # our own attribution below is unaffected (ENG-2921).
+                        # our own attribution below is unaffected.
                         MINDS_REQUEST_KIND_HEADER: MINDS_REQUEST_KIND_PROBE,
                         **_trace_headers(),
                     },

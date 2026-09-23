@@ -357,7 +357,7 @@ async def test_route_request_ignores_jev_result_even_when_it_contradicts_the_gat
 
 @pytest.mark.asyncio
 async def test_gate_and_jev_probe_share_the_turns_correlation_id(monkeypatch):
-    """ENG-2921: the gate's trace context carries the turn's correlation_id, and
+    """The gate's trace context carries the turn's correlation_id, and
     the detached probe inherits it, so the real probe's Jev call is attributed
     to the conversation (origin:harness, not direct-api) and joins the gate
     decision it shadows. Only the HTTP client is faked: the context has to cross

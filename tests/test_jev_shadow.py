@@ -211,7 +211,7 @@ async def _probe_headers(monkeypatch, context):
 
 @pytest.mark.asyncio
 async def test_probe_attributes_its_trace_to_the_turn_it_shadows(monkeypatch):
-    """ENG-2921: without these headers the gateway stamps the probe
+    """Without these headers the gateway stamps the probe
     origin:direct-api, indistinguishable from the user calling Jev directly."""
     import json
 
