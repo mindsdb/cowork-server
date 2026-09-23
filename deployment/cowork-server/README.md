@@ -157,6 +157,24 @@ evidence. They cannot reconstruct an unavailable pre-deploy baseline. Keep
 deliberate verification probes identifiable by timestamp and path when comparing
 traffic before and after a change.
 
+#### Observed 48-hour window, 2026-09-23
+
+Retained OpenSearch logs cover **2026-09-21 08:30:00 UTC inclusive through
+2026-09-23 08:30:00 UTC exclusive**. The queries selected container
+`cowork-server` and namespace `staging` or `prod`, then counted the boundary
+message and each reason above.
+
+| Environment | Missing | Malformed | Mismatch | Application log records |
+| --- | ---: | ---: | ---: | ---: |
+| Staging | 0 | 0 | 0 | 148,937 |
+| Production | 0 | 0 | 1 | 127,446 |
+
+Both queries completed without timeout or failed shards, and every hourly bucket
+contained records. These are post-deploy observations, not a pre-deploy baseline
+or proof that every replica has the intended image. Application log records are
+not a count of requests, so they cannot supply a refusal rate. Hourly coverage
+does not prove that no individual record was dropped.
+
 ## Configuration
 
 For configuration options possible, please see our [helm-charts](#todo) repository.
