@@ -934,3 +934,53 @@ def test_a_malformed_hub_header_falls_back_rather_than_forwarding_junk(value, mo
 
 def test_hub_credential_with_no_request_is_empty():
     assert hub_credential(None) == ""
+
+
+# ── A pick auth refuses at mint time ─────────────────────────────────
+
+
+def _stored_pick(scope) -> str:
+    engine = get_engine(get_app_settings().database.uri)
+    with Session(engine) as s:
+        return SettingService(s, scope).load().hub_workspace_id
+
+
+def test_a_refused_pick_is_cleared(session):
+    """Grant removed after the pick: the menu already falls back to the default,
+    and clearing the stored value makes the turn path agree with it."""
+    SettingService(session, _scope()).upsert_setting(ep.SETTING_KEY, WS_CLIENT_A)
+
+    svc.forget_stale_hub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
+
+    assert _stored_pick(_scope()) == ""
+
+
+def test_a_newer_pick_is_not_cleared(session):
+    """The person re-picked a live workspace between the turn's read and auth's
+    refusal; that newer choice must survive the stale one being cleared."""
+    SettingService(session, _scope()).upsert_setting(ep.SETTING_KEY, WS_DEFAULT)
+
+    svc.forget_stale_hub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
+
+    assert _stored_pick(_scope()) == WS_DEFAULT
+
+
+def test_clearing_is_scoped_to_the_caller(session):
+    SettingService(session, _scope(ORG_A, USER_A)).upsert_setting(ep.SETTING_KEY, WS_CLIENT_A)
+    SettingService(session, _scope(ORG_A, USER_A2)).upsert_setting(ep.SETTING_KEY, WS_CLIENT_A)
+
+    svc.forget_stale_hub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
+
+    assert _stored_pick(_scope(ORG_A, USER_A)) == ""
+    assert _stored_pick(_scope(ORG_A, USER_A2)) == WS_CLIENT_A
+
+
+def test_a_failed_clear_does_not_raise(monkeypatch):
+    """The turn has already recovered on the default; a settings outage here
+    must not turn that recovery back into a failure."""
+    def broken_session():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr("cowork.db.session.get_open_session", broken_session)
+
+    svc.forget_stale_hub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
