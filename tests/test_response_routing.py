@@ -420,11 +420,15 @@ async def test_gate_and_jev_probe_share_the_turns_correlation_id(monkeypatch):
     assert gate.metadata["correlation_id"] == "corr-1"
     assert gate.turn_id is None
     headers = seen["probe_headers"]
-    assert headers["Langfuse-Session-Id"] == "conv-1"
+    assert "Langfuse-Session-Id" not in headers
     assert "cowork-gate" not in headers["Langfuse-Tags"]
     assert jev_shadow.JEV_SHADOW_TAG in headers["Langfuse-Tags"]
     metadata = json.loads(headers["Langfuse-Metadata"])
-    assert (metadata["correlation_id"], metadata["harness"]) == ("corr-1", "anton")
+    assert (metadata["correlation_id"], metadata["harness"], metadata["conversation_id"]) == (
+        "corr-1",
+        "anton",
+        "conv-1",
+    )
     # The context is the gate's alone: it does not leak past the gate block.
     assert get_trace_context() is None
 

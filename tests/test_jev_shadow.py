@@ -231,7 +231,10 @@ async def test_probe_attributes_its_trace_to_the_turn_it_shadows(monkeypatch):
     assert headers["Authorization"] == "Bearer turn-key"
     # Hidden from the user's own Traces list: this is our experiment, not their call.
     assert headers["X-Minds-Request-Kind"] == "probe"
-    assert headers["Langfuse-Session-Id"] == "conv-1"
+    # Never a session: the customer's Sessions view counts every row in a
+    # session whatever its kind, so the probe would join (and could fail) their
+    # conversation. The conversation id rides in the metadata instead.
+    assert "Langfuse-Session-Id" not in headers
     # The probe's own tag, not the gate's: a probe trace must not read as a gate call.
     assert headers["Langfuse-Tags"].split(",") == ["anton", "surface:web", jev_shadow.JEV_SHADOW_TAG]
     metadata = json.loads(headers["Langfuse-Metadata"])
@@ -241,6 +244,7 @@ async def test_probe_attributes_its_trace_to_the_turn_it_shadows(monkeypatch):
         "correlation_id": "corr-1",
         "harness": "anton",
         "surface": "web",
+        "conversation_id": "conv-1",
     }
 
 

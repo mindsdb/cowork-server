@@ -86,6 +86,13 @@ def _trace_headers() -> dict[str, str]:
     gate call), and ``turn_id`` is never sent — the gateway renames any trace
     carrying harness + turn_id to ``{harness}:turn-N``, which would count every
     probe as a user turn.
+
+    No ``Langfuse-Session-Id`` either: the gateway stores it as the row's
+    ``session_id``, and the customer's Traces *Sessions* view counts every row
+    in a session regardless of ``request_kind`` — so the probe would appear in
+    the user's own conversation, and a failed probe would mark it failed. The
+    conversation rides in the metadata instead, and ``correlation_id`` joins
+    the probe to the gate trace, which does carry the session.
     """
     from anton.core.llm.tracing import get_trace_context, surface_tag
 
@@ -93,8 +100,6 @@ def _trace_headers() -> dict[str, str]:
     if ctx is None:
         return {}
     headers: dict[str, str] = {}
-    if ctx.session_id:
-        headers["Langfuse-Session-Id"] = ctx.session_id
     tags = [ctx.harness, surface_tag(ctx.surface) if ctx.surface else None, JEV_SHADOW_TAG]
     headers["Langfuse-Tags"] = ",".join(t for t in tags if t)
     metadata: dict[str, object] = dict(ctx.metadata or {})
@@ -104,6 +109,8 @@ def _trace_headers() -> dict[str, str]:
         metadata["harness"] = ctx.harness
     if ctx.surface:
         metadata["surface"] = ctx.surface
+    if ctx.session_id:
+        metadata["conversation_id"] = ctx.session_id
     headers["Langfuse-Metadata"] = json.dumps(metadata)
     return headers
 
