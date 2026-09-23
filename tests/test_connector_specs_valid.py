@@ -398,7 +398,7 @@ class TestMySQLCloudProducts:
         """The spec's own aliases and description cover MariaDB and Percona for
         desktop discovery, so the cloud block has to say they are refused."""
         copy = f"{method.cloud.description} {method.cloud.how_to}"
-        assert "Oracle MySQL 8.0.46 and 8.4.11" in copy
+        assert "Oracle MySQL 8 or 9" in copy
         assert "MariaDB" in copy
         assert "Percona" in copy
         assert "refused" in copy
