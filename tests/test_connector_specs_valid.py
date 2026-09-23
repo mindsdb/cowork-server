@@ -236,25 +236,35 @@ class TestLangfuseSpec:
 # in the corpus carries no `cloud` block and is therefore desktop-only.
 CLOUD_DATABASE_METHODS = {"postgres": "host-port", "mysql": "host-password"}
 
-# The field names the desktop forms render today. Pinned because the cloud
-# block is a second, independent list: if a cloud edit ever reaches the desktop
-# list, this is the test that says so.
+# The desktop fields as (name, type, required, secret, default), pinned from
+# the specs before the cloud blocks existed. The cloud block is a second,
+# independent list: if a cloud edit ever reaches the desktop list, this says so.
 DESKTOP_FIELDS = {
     "postgres": {
-        "connection-string": ["connection_uri"],
-        "host-port": ["host", "port", "database", "username", "password", "ssl_enabled"],
+        "connection-string": [("connection_uri", "password", True, True, None)],
+        "host-port": [
+            ("host", "text", True, False, None),
+            ("port", "text", True, False, "5432"),
+            ("database", "text", True, False, None),
+            ("username", "text", True, False, None),
+            ("password", "password", True, True, None),
+            ("ssl_enabled", "boolean", False, False, "true"),
+        ],
     },
     "mysql": {
         "host-password": [
-            "host",
-            "port",
-            "database",
-            "username",
-            "password",
-            "use_ssl",
-            "ssl_ca_cert",
+            ("host", "text", True, False, None),
+            ("port", "text", True, False, "3306"),
+            ("database", "text", True, False, None),
+            ("username", "text", True, False, None),
+            ("password", "password", True, True, None),
+            ("use_ssl", "boolean", False, False, "false"),
+            ("ssl_ca_cert", "textarea", False, False, None),
         ],
-        "connection-string": ["connection_string", "ssl_ca_cert"],
+        "connection-string": [
+            ("connection_string", "textarea", True, True, None),
+            ("ssl_ca_cert", "textarea", False, False, None),
+        ],
     },
 }
 
@@ -333,7 +343,9 @@ class TestCloudDatabaseSpecs:
     def test_desktop_fields_are_untouched(self, spec, connector_id):
         for method in spec.form.methods:
             expected = DESKTOP_FIELDS[connector_id][method.id]
-            assert [f.name for f in method.fields] == expected
+            assert [
+                (f.name, f.type, f.required, f.secret, f.default) for f in method.fields
+            ] == expected
 
     @staticmethod
     def _cloud(spec, connector_id):
