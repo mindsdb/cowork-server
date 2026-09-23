@@ -78,7 +78,11 @@ class OAuthConfig(BaseModel):
 class CloudMethod(BaseModel):
     """What a method collects and whether it runs when the deployment is hosted.
 
-    A method without one of these is desktop-only.
+    A method without one of these is desktop-only. Clients render a method's
+    cloud form as submittable only when both flags hold: the connector's
+    `ConnectorMetadataResponse.cloud_available`, computed per request from
+    auth's catalogue, and this method's static `available`. Neither overrides
+    the other, and no server path enforces `available` yet.
     """
 
     # False while the hosted path can accept the form but not yet execute
@@ -87,15 +91,14 @@ class CloudMethod(BaseModel):
     # driver/server/method row it depends on.
     available: bool = False
     # Cloud copy, never inherited from the desktop method. The desktop text
-    # documents choices the hosted path refuses (disabling TLS, pointing at
-    # localhost), so rendering it to a cloud user would describe a form that
-    # cannot be submitted.
+    # documents an SSL on/off toggle and a CA field the cloud form does not
+    # offer, and a localhost server the hosted path refuses, so rendering it
+    # to a cloud user would describe a form that cannot be submitted.
     description: str | None = None
     how_to: str | None = None
     # The COMPLETE cloud field list, not a delta on the desktop `fields`.
     # Two independent lists is what keeps the desktop form fixed while this
-    # one changes, and it is why a cloud CA field never appears beside a
-    # desktop one under a different name.
+    # one changes.
     fields: list[ConnectorField] = []
 
 
