@@ -87,9 +87,9 @@ class CloudMethod(BaseModel):
     # driver/server/method row it depends on.
     available: bool = False
     # Cloud copy, never inherited from the desktop method. The desktop text
-    # documents choices the hosted path refuses (disabling TLS, pointing at
-    # localhost), so rendering it to a cloud user would describe a form that
-    # cannot be submitted.
+    # documents a TLS toggle the cloud form does not offer and a localhost
+    # server the hosted path refuses, so rendering it to a cloud user would
+    # describe a form that cannot be submitted.
     description: str | None = None
     how_to: str | None = None
     # The COMPLETE cloud field list, not a delta on the desktop `fields`.
