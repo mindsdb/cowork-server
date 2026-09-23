@@ -2057,8 +2057,9 @@ async def sse_from_buffer(buffer, from_seq: int = 0) -> AsyncGenerator[str, None
     """Serialize a turn buffer to the SSE wire, replaying from ``from_seq``
     then live-tailing. Used by both the initial POST /responses stream
     (from_seq=0) and reconnects via GET /responses/tail. The terminal record
-    just ends the stream — the harness's own response.completed/failed frame
-    was already written as a normal record.
+    ends the stream — the harness's own response.completed/failed frame was
+    already written as a normal record. A cancelled turn has no such frame, so
+    its terminal is turned into ``response.cancelled`` here.
 
     Emits a comment heartbeat whenever the buffer has been quiet for
     ``SSE_KEEPALIVE_SECONDS``, so an intermediary cannot mistake a pending
@@ -2088,6 +2089,10 @@ async def sse_from_buffer(buffer, from_seq: int = 0) -> AsyncGenerator[str, None
             # Checked BEFORE prefetching: the terminal record ends the stream,
             # so scheduling another __anext__() here would only be cancelled.
             if rec.is_terminal:
+                # A cancel writes no frame of its own, and a bare close is what
+                # the client reads as a dropped connection.
+                if rec.data.get("reason") == "cancelled":
+                    yield sse_frame("response.cancelled", {"type": "response.cancelled"})
                 return
             pending = asyncio.ensure_future(records.__anext__())
             sse = rec.data.get("sse")
