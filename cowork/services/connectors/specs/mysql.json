@@ -100,7 +100,7 @@
         "cloud": {
           "available": false,
           "description": "Enter your MySQL host, port, database name, username, and password. Oracle MySQL 8.0.46 and 8.4.11 only; MariaDB, Percona, and other MySQL-compatible servers are not supported here and are refused on connection. The connection is encrypted when the server supports it.",
-          "how_to": "## Connect with host and password\n\nFill in each field separately. This matches the connection panel in tools like MySQL Workbench, DBeaver, or TablePlus.\n\n### Supported servers\n\nOracle MySQL 8.0.46 and 8.4.11 only. Other 8.0 and 8.4 releases are refused until they have been tested. MariaDB, Percona Server, and Aurora-compatible products are detected on connection and refused, because their read-only and timeout controls differ and have not been verified. Use the MariaDB connector for MariaDB on the desktop app.\n\n### Where to find each value\n\n1. **Host**: The server address, e.g. `db.example.com`. It must be reachable from the public internet and resolve to a public address.\n2. **Port**: `3306` by default. Any port the server listens on is accepted.\n3. **Database**: The specific database (schema) to connect to.\n4. **Username / Password**: A MySQL user with `USAGE`, `SELECT`, and `SHOW VIEW` on that schema, authenticating with `caching_sha2_password`. Create a dedicated read-only user rather than reusing an administrative one.\n\n### Notes\n\n- The connection is encrypted whenever the server supports it, and the server's certificate is not checked. That is what a database client does by default, and it means a server with its own self-signed certificate connects without extra setup.\n- Queries run inside a read-only transaction with a server-side execution timeout. Loading local files and multiple statements in one request are disabled.\n- Allow the connection through your firewall or security group before saving.",
+          "how_to": "## Connect with host and password\n\nFill in each field separately. This matches the connection panel in tools like MySQL Workbench, DBeaver, or TablePlus.\n\n### Supported servers\n\nOracle MySQL 8.0.46 and 8.4.11 only. Other 8.0 and 8.4 releases are refused until they have been tested. MariaDB, Percona Server, and Aurora-compatible products are detected on connection and refused, because their read-only and timeout controls differ and have not been verified. Use the MariaDB connector for MariaDB on the desktop app.\n\n### Where to find each value\n\n1. **Host**: The server address, e.g. `db.example.com`. It must be reachable from the public internet and resolve to a public address.\n2. **Port**: whatever your server listens on. `3306` unless you or your provider changed it; TiDB Cloud answers on `4000`.\n3. **Database**: The specific database (schema) to connect to.\n4. **Username / Password**: A MySQL user with `USAGE`, `SELECT`, and `SHOW VIEW` on that schema, authenticating with `caching_sha2_password`. Your application's own user works, write privileges and all.\n\n### Notes\n\n- The connection is encrypted whenever the server supports it. The server's certificate is checked only when **Certificate** is on. Left off, which is what a database client does by default, a server with its own self-signed certificate connects without extra setup.\n- Queries run inside a read-only transaction with a server-side execution timeout, and only SELECT statements are accepted, so an account that can write cannot write through this connection. Loading local files and multiple statements in one request are disabled. Any account that can read is accepted, including one with write or administrative rights.\n- Give this connection the narrowest account that can see what you want read. Nothing here limits what a broad account can be asked to read: one holding `PROCESS` can read other sessions' statements, which on a shared server are another tenant's.\n- Allow the connection through your firewall or security group before saving.",
           "fields": [
             {
               "name": "host",
@@ -117,7 +117,7 @@
               "required": true,
               "placeholder": "3306",
               "default": "3306",
-              "description": "MySQL defaults to 3306. Any port the server listens on is accepted."
+              "description": "Whatever your server listens on, 3306 unless it was changed."
             },
             {
               "name": "database",
@@ -143,6 +143,14 @@
               "secret": true,
               "placeholder": "••••••••",
               "description": "Password for the above user. Stored encrypted and never shown again."
+            },
+            {
+              "name": "tls_verify",
+              "label": "Certificate",
+              "type": "boolean",
+              "required": false,
+              "checkbox_label": "Only connect if the certificate is signed by a public authority",
+              "description": "Off by default, because a self-hosted server usually presents a certificate it generated for itself, which no client can verify. The connection is still encrypted whenever the server offers it. Turn this on for a managed provider, whose certificate a public authority signed."
             }
           ]
         }

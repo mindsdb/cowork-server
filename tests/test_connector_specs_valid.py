@@ -279,6 +279,12 @@ def test_no_other_method_declares_cloud_support(path: Path):
             assert method.cloud is None, f"{spec.id}.{method.id} declares cloud support"
 
 
+#: What each cloud form collects. PostgreSQL alone names a schema.
+CLOUD_DATABASE_FIELDS = {
+    "postgres": {"host", "port", "database", "schema", "username", "password", "tls_verify"},
+    "mysql": {"host", "port", "database", "username", "password", "tls_verify"},
+}
+
 # Guidance each connector's desktop copy gives for choices the hosted path
 # does not offer. None of it may appear in the cloud copy.
 DESKTOP_ONLY_PHRASES = {
@@ -322,13 +328,31 @@ class TestCloudDatabaseSpecs:
     ):
         assert self._cloud(spec, connector_id).available is False
 
-    def test_the_form_asks_nothing_about_certificates(self, spec, connector_id):
-        """The cloud form collects a connection and nothing else. Trust is the
-        server's default, encryption where it is offered and no check on the
-        certificate, because the question has no answer most people can give
-        and the common answer for a self-hosted server is always the same."""
-        names = {f.name for f in self._cloud(spec, connector_id).fields}
-        assert names == {"host", "port", "database", "username", "password"}
+    def test_the_form_asks_one_yes_or_no_about_certificates(self, spec, connector_id):
+        """The cloud form collects a connection and one question about trust:
+        verify the certificate, or take the server's default, which encrypts
+        where it is offered and checks nothing. The modes that need a pasted
+        certificate or turn encryption off have no answer most people can give,
+        so the form does not ask them."""
+        fields = {f.name: f for f in self._cloud(spec, connector_id).fields}
+        assert set(fields) == CLOUD_DATABASE_FIELDS[connector_id]
+        assert fields["tls_verify"].type == "boolean"
+        assert fields["tls_verify"].required is False
+        # Unchecked unless the person checks it: a default would decide for
+        # them, and `"false"` reads as true to a checkbox.
+        assert fields["tls_verify"].default is None
+
+    def test_only_postgresql_asks_for_a_schema(self, spec, connector_id):
+        """A PostgreSQL database holds many schemas, so a connection may name
+        the one it reads. MySQL's database is already its schema, and asking
+        twice would leave a reader unable to say which won."""
+        field = next(
+            (f for f in self._cloud(spec, connector_id).fields if f.name == "schema"), None
+        )
+        if connector_id != "postgres":
+            assert field is None
+            return
+        assert field is not None and field.required is False
 
     def test_cloud_copy_never_inherits_desktop_only_guidance(self, spec, connector_id):
         """Each phrase must still be in the desktop copy, so the guard cannot
