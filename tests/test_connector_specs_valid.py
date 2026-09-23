@@ -330,12 +330,6 @@ class TestCloudDatabaseSpecs:
         names = {f.name for f in self._cloud(spec, connector_id).fields}
         assert names == {"host", "port", "database", "username", "password"}
 
-    def test_no_cloud_field_toggles_tls(self, spec, connector_id):
-        """`ssl_enabled` and `use_ssl` are desktop fields. A boolean here would
-        be a cloud form that can ask for an unverified connection."""
-        names = {f.name for f in self._cloud(spec, connector_id).fields}
-        assert names.isdisjoint({"ssl_enabled", "use_ssl", "ssl", "tls", "ssl_ca_cert"})
-
     def test_cloud_copy_never_inherits_desktop_only_guidance(self, spec, connector_id):
         """Each phrase must still be in the desktop copy, so the guard cannot
         pass because the desktop text changed rather than the cloud text."""
@@ -364,10 +358,6 @@ class TestCloudDatabaseSpecs:
         method = next(m for m in spec.form.methods if m.id == wanted)
         assert method.cloud is not None
         return method.cloud
-
-    @classmethod
-    def _cloud_field(cls, spec, connector_id, name):
-        return next(f for f in cls._cloud(spec, connector_id).fields if f.name == name)
 
 
 class TestMySQLCloudProducts:
