@@ -236,27 +236,47 @@ class TestLangfuseSpec:
 # in the corpus carries no `cloud` block and is therefore desktop-only.
 CLOUD_DATABASE_METHODS = {"postgres": "host-port", "mysql": "host-password"}
 
-# The field names the desktop forms render today. Pinned because the cloud
-# block is a second, independent list: if a cloud edit ever reaches the desktop
-# list, this is the test that says so.
+# The desktop fields as (name, type, required, secret, default), pinned from
+# the specs before the cloud blocks existed. The cloud block is a second,
+# independent list: if a cloud edit ever reaches the desktop list, this says so.
 DESKTOP_FIELDS = {
     "postgres": {
-        "connection-string": ["connection_uri"],
-        "host-port": ["host", "port", "database", "username", "password", "ssl_enabled"],
+        "connection-string": [("connection_uri", "password", True, True, None)],
+        "host-port": [
+            ("host", "text", True, False, None),
+            ("port", "text", True, False, "5432"),
+            ("database", "text", True, False, None),
+            ("username", "text", True, False, None),
+            ("password", "password", True, True, None),
+            ("ssl_enabled", "boolean", False, False, "true"),
+        ],
     },
     "mysql": {
         "host-password": [
-            "host",
-            "port",
-            "database",
-            "username",
-            "password",
-            "use_ssl",
-            "ssl_ca_cert",
+            ("host", "text", True, False, None),
+            ("port", "text", True, False, "3306"),
+            ("database", "text", True, False, None),
+            ("username", "text", True, False, None),
+            ("password", "password", True, True, None),
+            ("use_ssl", "boolean", False, False, "false"),
+            ("ssl_ca_cert", "textarea", False, False, None),
         ],
-        "connection-string": ["connection_string", "ssl_ca_cert"],
+        "connection-string": [
+            ("connection_string", "textarea", True, True, None),
+            ("ssl_ca_cert", "textarea", False, False, None),
+        ],
     },
 }
+
+@pytest.mark.parametrize("path", SPEC_FILES, ids=lambda p: p.stem)
+def test_no_other_method_declares_cloud_support(path: Path):
+    """Only the methods in CLOUD_DATABASE_METHODS carry a `cloud` block."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.setdefault("id", path.stem)
+    spec = ConnectorSpecResponse(**data)
+    for method in spec.form.methods or []:
+        if CLOUD_DATABASE_METHODS.get(spec.id) != method.id:
+            assert method.cloud is None, f"{spec.id}.{method.id} declares cloud support"
 
 
 #: What each cloud form collects. PostgreSQL alone names a schema.
@@ -265,13 +285,20 @@ CLOUD_DATABASE_FIELDS = {
     "mysql": {"host", "port", "database", "username", "password", "tls_verify"},
 }
 
+# Guidance each connector's desktop copy gives for choices the hosted path
+# does not offer. None of it may appear in the cloud copy.
+DESKTOP_ONLY_PHRASES = {
+    "postgres": ["sslmode=disable", "leave SSL off", "127.0.0.1", "localhost"],
+    "mysql": ["127.0.0.1", "Use SSL", "SSL CA Certificate"],
+}
+
 
 class TestCloudDatabaseSpecs:
     """The cloud blocks on postgres and mysql.
 
-    They carry TLS constraints the hosted path enforces and the desktop path
-    does not, so an edit that collapses the two forms back together is the
-    failure this class exists to catch.
+    The desktop forms offer choices the hosted path does not: an SSL on/off
+    toggle, a CA field, a localhost server. An edit that collapses the two forms back
+    together is the failure this class exists to catch.
     """
 
     @pytest.fixture(
@@ -315,6 +342,7 @@ class TestCloudDatabaseSpecs:
         assert set(fields) == CLOUD_DATABASE_FIELDS[connector_id]
         assert fields["tls_verify"].type == "boolean"
         assert fields["tls_verify"].required is False
+        assert fields["tls_verify"].checkbox_label, "the checkbox needs its sentence"
         # Unchecked unless the person checks it: a default would decide for
         # them, and `"false"` reads as true to a checkbox.
         assert fields["tls_verify"].default is None
@@ -331,28 +359,27 @@ class TestCloudDatabaseSpecs:
             return
         assert field is not None and field.required is False
 
-    def test_no_cloud_field_turns_encryption_off_or_pastes_a_certificate(self, spec, connector_id):
-        """`ssl_enabled` and `use_ssl` are desktop fields, and they can turn
-        encryption off. The cloud question only ever tightens: checked verifies,
-        unchecked leaves the server's own default, which still encrypts."""
-        names = {f.name for f in self._cloud(spec, connector_id).fields}
-        assert names.isdisjoint({"ssl_enabled", "use_ssl", "ssl", "tls", "ssl_ca_cert", "ca_pem"})
-
-    @pytest.mark.parametrize("phrase", ["sslmode=disable", "leave SSL off"])
-    def test_cloud_copy_never_inherits_the_desktop_ssl_off_guidance(
-        self, spec, connector_id, phrase
-    ):
+    def test_cloud_copy_never_inherits_desktop_only_guidance(self, spec, connector_id):
+        """Each phrase must still be in the desktop copy, so the guard cannot
+        pass because the desktop text changed rather than the cloud text."""
+        desktop = " ".join(
+            f"{m.description or ''} {m.how_to or ''}" for m in spec.form.methods
+        ).lower()
         cloud = self._cloud(spec, connector_id)
         copy = " ".join(
             [cloud.description or "", cloud.how_to or ""]
             + [f.description or "" for f in cloud.fields]
-        )
-        assert phrase.lower() not in copy.lower()
+        ).lower()
+        for phrase in DESKTOP_ONLY_PHRASES[connector_id]:
+            assert phrase.lower() in desktop, f"{phrase!r} left the desktop copy"
+            assert phrase.lower() not in copy, f"cloud copy inherited {phrase!r}"
 
     def test_desktop_fields_are_untouched(self, spec, connector_id):
         for method in spec.form.methods:
             expected = DESKTOP_FIELDS[connector_id][method.id]
-            assert [f.name for f in method.fields] == expected
+            assert [
+                (f.name, f.type, f.required, f.secret, f.default) for f in method.fields
+            ] == expected
 
     @staticmethod
     def _cloud(spec, connector_id):
@@ -360,10 +387,6 @@ class TestCloudDatabaseSpecs:
         method = next(m for m in spec.form.methods if m.id == wanted)
         assert method.cloud is not None
         return method.cloud
-
-    @classmethod
-    def _cloud_field(cls, spec, connector_id, name):
-        return next(f for f in cls._cloud(spec, connector_id).fields if f.name == name)
 
 
 class TestMySQLCloudProducts:
@@ -379,7 +402,7 @@ class TestMySQLCloudProducts:
         """The spec's own aliases and description cover MariaDB and Percona for
         desktop discovery, so the cloud block has to say they are refused."""
         copy = f"{method.cloud.description} {method.cloud.how_to}"
-        assert "Oracle MySQL 8.0 and 8.4" in copy
+        assert "Oracle MySQL 8.0.46 and 8.4.11" in copy
         assert "MariaDB" in copy
         assert "Percona" in copy
         assert "refused" in copy
