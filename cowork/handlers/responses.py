@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from functools import partial
@@ -24,10 +25,12 @@ from cowork.common.settings.user_settings import (
 )
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import available_harness_ids, get_harness
+from cowork.handlers import jev_shadow
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
     _MAX_HISTORY_MESSAGES,
+    _text_history,
     RouteDecision,
     RouterBinding,
     decide_route,
@@ -56,7 +59,7 @@ from cowork.handlers._turn_history import (
 )
 from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
-    CONTENT_RECOVERY_CODE,
+    CONTENT_REPAIR_CODES,
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
     INTERRUPTED_TURN_MESSAGE,
@@ -92,6 +95,32 @@ from cowork.services.task_objects import remote_skill_draft_result
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Strong references for fire-and-forget probe tasks: asyncio holds only a weak
+# reference to a task once nothing else does, so a bare `create_task` result
+# that's dropped can be garbage-collected mid-flight. Discarded on completion
+# via the done-callback below.
+_jev_shadow_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_jev_shadow_probe(
+    *, conversation_id: UUID, messages: list[dict], llm_block: dict | None,
+    settings: TurnQueueSettings,
+) -> None:
+    """Runs `jev_shadow.probe` detached from the request path and logs its
+    own result. Never awaited by the caller, so a slow or hung probe cannot
+    delay the turn it's shadowing."""
+
+    async def _run() -> None:
+        jev_result = await jev_shadow.probe(messages=messages, llm_block=llm_block, settings=settings)
+        if jev_result is None:
+            return
+        fields = " ".join(f"{k}={v}" for k, v in jev_result.items())
+        logger.warning("[jev-shadow] conversation=%s %s", conversation_id, fields)
+
+    task = asyncio.create_task(_run())
+    _jev_shadow_tasks.add(task)
+    task.add_done_callback(_jev_shadow_tasks.discard)
 
 
 class _RemoteTurnFailed(Exception):
@@ -542,12 +571,37 @@ class ResponsesHandler:
                 # The gate resolves the router role + key ambiently; bind the org scope.
                 with use_settings_scope(self.scope):
                     binding, turn_llm = await self._router_binding()
+                    turn_queue_settings = TurnQueueSettings()
+
+                    gate_started = time.monotonic()
                     decision = await decide_route(
                         history=history,
                         has_non_text_input=has_non_text_input,
                         has_attachments=has_attachments,
                         has_disabled_connections=has_disabled_connections,
                         binding=binding,
+                    )
+                    gate_ms = round((time.monotonic() - gate_started) * 1000)
+                    # warning, not info: this deployment's LOG_LEVEL defaults to
+                    # WARNING (app_settings.py's own default too), so an info-level
+                    # line here is silently dropped everywhere it would actually
+                    # be read from — found live on staging, zero [gate] lines
+                    # across 8 real requests until this was bumped.
+                    logger.warning(
+                        "[gate] conversation=%s route=%s reason=%s provider=%s "
+                        "model=%s gate_ms=%d",
+                        conversation_id, decision.route, decision.reason,
+                        decision.provider, decision.model, gate_ms,
+                    )
+                    # Detached on purpose: awaiting this (even via asyncio.gather)
+                    # would make a ready gate decision wait for Jev, exactly the
+                    # thing a *shadow* probe must never do. Logs on its own once
+                    # it finishes; never read by anything on the request path.
+                    _spawn_jev_shadow_probe(
+                        conversation_id=conversation_id,
+                        messages=_text_history(history),
+                        llm_block=(turn_llm or {}).get("llm"),
+                        settings=turn_queue_settings,
                     )
             finally:
                 reset_trace_context(trace_token)
@@ -1436,7 +1490,7 @@ class ResponsesHandler:
             )
             collected_events.append(response_failed_payload(message, code, request_id=corr))
             await buffer.append("sse", {"sse": response_failed_sse(message, code, request_id=corr)})
-            if code == CONTENT_RECOVERY_CODE:
+            if code in CONTENT_REPAIR_CODES:
                 # ENG-1992: the remote/org path's twin of the streaming
                 # handler's repair — producer.py already classified this via
                 # remote_turn_error from the pod's scrubbed error string, so
@@ -1663,7 +1717,7 @@ class ResponsesHandler:
                     "[responses] turn failed for conversation %s correlation_id=%s",
                     conv_id, corr, extra={"request_id": corr},
                 )
-            if code == CONTENT_RECOVERY_CODE:
+            if code in CONTENT_REPAIR_CODES:
                 # ENG-1992: the provider permanently rejected an image block in
                 # this conversation's stored history — repair the DATA once,
                 # here, rather than special-case every future replay. Never
@@ -1860,7 +1914,7 @@ class ResponsesHandler:
                     "[responses] user-facing turn error: %s", exc,
                     extra={"request_id": corr},
                 )
-                if code == CONTENT_RECOVERY_CODE:
+                if code in CONTENT_REPAIR_CODES:
                     # ENG-1992: see the streaming path's twin for the full
                     # rationale — repair the conversation's stored history
                     # once here rather than special-case every future replay.
