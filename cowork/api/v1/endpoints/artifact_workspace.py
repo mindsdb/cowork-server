@@ -9,7 +9,7 @@ import os
 import stat
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import quote
 from uuid import UUID
 
@@ -440,6 +440,10 @@ class _AgentRepairBody(BaseModel):
     selector: str | None = Field(default=None, max_length=2000)
     thread: list[_AgentRepairThreadEntry] = Field(min_length=1, max_length=501)
     conversationId: UUID
+    # Deliberately untyped. A typed model would answer 422 on the first odd
+    # entry, which would fail the repair over a diagnostic — the opposite of
+    # what diagnostics are for. create_agent_repair drops anything malformed.
+    previewErrors: Any = None
 
 
 class _RepairDecisionBody(BaseModel):
@@ -1007,6 +1011,7 @@ async def request_agent_repair(
             selector=body.selector,
             thread=[entry.model_dump() for entry in body.thread],
             conversation_id=str(body.conversationId),
+            preview_errors=body.previewErrors,
         )
     except RevisionConflict as exc:
         raise HTTPException(
