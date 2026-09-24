@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from uuid import uuid4
 
 import pytest
+import sqlalchemy as sa
 from sqlmodel import Session, select
 
 from cowork.common.settings.app_settings import get_app_settings
@@ -221,6 +222,24 @@ def test_an_aborted_pass_writes_no_sentinel(org, monkeypatch):
     monkeypatch.setattr(backfill, "_backfill_project", boom)
     with pytest.raises(RuntimeError):
         _run(org[2])
+    with Session(_engine()) as raw:
+        assert raw.exec(select(Setting).where(Setting.key == backfill.SENTINEL_KEY)).first() is None
+
+
+def test_a_transient_db_error_aborts_the_pass_and_writes_no_sentinel(org, monkeypatch):
+    """A short DB outage mid-walk must not mark the rest of the walk `unknown`
+    forever: the pass has to abort so the sentinel is not written and the next
+    start retries the whole project (ENG-2961, F2)."""
+    write_artifact(org[3].base, "no-provenance")
+
+    def boom(*_args, **_kwargs):
+        raise sa.exc.OperationalError("stmt", {}, Exception("db down"))
+
+    monkeypatch.setattr(backfill, "_owner_from_task_objects", boom)
+
+    with pytest.raises(sa.exc.OperationalError):
+        _run(org[2])
+
     with Session(_engine()) as raw:
         assert raw.exec(select(Setting).where(Setting.key == backfill.SENTINEL_KEY)).first() is None
 
