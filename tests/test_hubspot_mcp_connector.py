@@ -9,6 +9,7 @@ existing convention (see test_connectors_endpoints.py, test_connections_org_mode
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
@@ -288,3 +289,39 @@ class TestParseMcpIdentity:
 
     def test_returns_empty_strings_on_unparseable_input(self):
         assert _parse_mcp_identity("not json", "also not json") == ("", "")
+
+
+class TestOAuthIsTheOnlyOfferedMethod:
+    """HubSpot's App Marketplace requires OAuth as the app's *sole*
+    authorization method, so the connect UI must offer nothing else.
+    `DataVaultForm.jsx` filters the picker on `!m.hidden`, so a method is
+    "offered" exactly when it is not hidden.
+
+    `private-app` stays defined rather than deleted on purpose: it is the
+    only HubSpot method that was ever live for users, and existing vault
+    records still carry `method: "private-app"`. Hiding retires it from the
+    UI without breaking those connections; deleting would break them.
+
+    If a listing submission is ever withdrawn and PAT is deliberately
+    brought back, this test is the thing to change — do not just unhide the
+    method and leave the marketplace listing standing.
+    """
+
+    @staticmethod
+    def _methods():
+        spec_path = (
+            Path(__file__).parent.parent
+            / "cowork" / "services" / "connectors" / "specs" / "hubspot.json"
+        )
+        return json.loads(spec_path.read_text())["form"]["methods"]
+
+    def test_exactly_one_method_is_offered_and_it_is_oauth(self):
+        offered = [m for m in self._methods() if not m.get("hidden")]
+        assert [m["id"] for m in offered] == ["mcp"]
+        assert offered[0]["oauth"]["auth_url"].startswith("https://mcp.hubspot.com/")
+
+    def test_the_private_app_token_method_is_retired_but_still_defined(self):
+        by_id = {m["id"]: m for m in self._methods()}
+        assert by_id["private-app"]["hidden"] is True
+        # Still carries its field, so a stored PAT connection stays readable.
+        assert [f["name"] for f in by_id["private-app"]["fields"]] == ["access_token"]
