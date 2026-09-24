@@ -1,0 +1,267 @@
+"""Who owns an artifact in organization mode (ENG-2961).
+
+Project-level roots (ENG-2056) are shared by every member of a project, so the
+owner of an artifact there is a server-written attribution row. Legacy
+per-conversation roots keep path-derived ownership.
+"""
+from __future__ import annotations
+
+from contextlib import contextmanager
+from pathlib import Path
+from uuid import UUID, uuid4
+
+import pytest
+from sqlmodel import Session
+
+from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
+from cowork.db.session import get_engine
+from cowork.models.conversation import Conversation
+from cowork.models.project import Project
+from cowork.services import artifact_ownership as ownership
+from cowork.services.artifacts import ProjectArtifacts
+
+
+def _engine():
+    return get_engine(get_app_settings().database.uri)
+
+
+@contextmanager
+def scoped(org_id: str | None, user_id: str | None = None):
+    with Session(_engine()) as raw:
+        if org_id is None:
+            yield ScopedSession(raw, LOCAL_SCOPE)
+        else:
+            yield ScopedSession(
+                raw, TenantScope(org_mode=True, org_id=org_id, user_id=user_id)
+            )
+
+
+def make_project(tmp_path: Path, org_id: str | None) -> Project:
+    path = tmp_path / f"proj-{uuid4().hex[:8]}"
+    path.mkdir(parents=True)
+    project = Project(id=uuid4(), name=path.name, path=str(path), org_id=org_id)
+    with Session(_engine()) as raw:
+        raw.add(project)
+        raw.commit()
+        raw.refresh(project)
+        raw.expunge(project)
+    return project
+
+
+def make_conversation(project: Project, owner: str | None) -> UUID:
+    conversation_id = uuid4()
+    with Session(_engine()) as raw:
+        raw.add(
+            Conversation(
+                id=conversation_id,
+                topic="task",
+                project_id=project.id,
+                org_id=project.org_id,
+                created_by=owner,
+            )
+        )
+        raw.commit()
+    return conversation_id
+
+
+def project_root(project: Project) -> ProjectArtifacts:
+    parts = (".anton", "artifacts")
+    base = Path(project.path).joinpath(*parts)
+    base.mkdir(parents=True, exist_ok=True)
+    return ProjectArtifacts(
+        base=base,
+        project_id=str(project.id),
+        project_name=project.name,
+        trusted_anchor=Path(project.path),
+        root_parts=parts,
+    )
+
+
+def legacy_root(project: Project, conversation_part: str) -> ProjectArtifacts:
+    parts = ("conversations", conversation_part, ".anton", "artifacts")
+    base = Path(project.path).joinpath(*parts)
+    base.mkdir(parents=True, exist_ok=True)
+    return ProjectArtifacts(
+        base=base,
+        project_id=str(project.id),
+        project_name=project.name,
+        trusted_anchor=Path(project.path),
+        root_parts=parts,
+    )
+
+
+@pytest.fixture
+def org_id() -> str:
+    return str(uuid4())
+
+
+@pytest.fixture
+def users() -> tuple[str, str]:
+    return str(uuid4()), str(uuid4())
+
+
+@pytest.fixture(autouse=True)
+def cleanup_test_projects(tmp_path):
+    """Clean up projects created by tests to avoid database pollution."""
+    from sqlmodel import select
+    from cowork.models.project import Project
+
+    # Run the test
+    yield
+
+    # Clean up: delete all projects created in this test's tmp_path
+    with Session(_engine()) as session:
+        projects = session.exec(select(Project)).all()
+        for project in projects:
+            if tmp_path.as_posix() in project.path:
+                session.delete(project)
+        session.commit()
+
+
+def test_resource_key_is_plain_when_it_fits_and_hashed_when_it_does_not():
+    project_id = uuid4()
+    assert ownership.artifact_resource_key(project_id, "report") == f"{project_id}/report"
+    long_slug = "x" * 255
+    key = ownership.artifact_resource_key(project_id, long_slug)
+    assert key.startswith(f"{project_id}/sha256:")
+    assert len(key) <= 255
+    assert key == ownership.artifact_resource_key(project_id, long_slug)
+
+
+def test_project_root_without_a_row_is_unknown(tmp_path, org_id, users):
+    source = project_root(make_project(tmp_path, org_id))
+    with scoped(org_id, users[0]) as session:
+        resolution = ownership.resolve_artifact_owner(session, source, "report")
+    assert resolution == ownership.OwnerResolution(None, "unknown")
+    assert resolution.unknown
+
+
+def test_recorded_owner_resolves_and_first_writer_wins(tmp_path, org_id, users):
+    project = make_project(tmp_path, org_id)
+    source = project_root(project)
+    with scoped(org_id) as session:
+        assert ownership.record_artifact_owner(
+            session, project.id, "report", users[0], action="create"
+        ) == users[0]
+    with scoped(org_id) as session:
+        assert ownership.record_artifact_owner(
+            session, project.id, "report", users[1], action="backfill"
+        ) == users[0]
+    with scoped(org_id, users[1]) as session:
+        assert ownership.resolve_artifact_owner(session, source, "report") == (
+            ownership.OwnerResolution(users[0], "recorded")
+        )
+
+
+def test_record_with_an_empty_owner_writes_nothing(tmp_path, org_id):
+    project = make_project(tmp_path, org_id)
+    with scoped(org_id) as session:
+        assert ownership.record_artifact_owner(
+            session, project.id, "report", None, action="create"
+        ) is None
+        assert ownership.resolve_artifact_owner(
+            session, project_root(project), "report"
+        ).unknown
+
+
+def test_a_255_character_slug_is_recorded(tmp_path, org_id, users):
+    project = make_project(tmp_path, org_id)
+    slug = "s" * 255
+    with scoped(org_id) as session:
+        ownership.record_artifact_owner(session, project.id, slug, users[0], action="create")
+        assert ownership.resolve_artifact_owner(
+            session, project_root(project), slug
+        ).owner_user_id == users[0]
+
+
+def test_owner_rows_are_invisible_to_another_org(tmp_path, org_id, users):
+    project = make_project(tmp_path, org_id)
+    with scoped(org_id) as session:
+        ownership.record_artifact_owner(session, project.id, "report", users[0], action="create")
+    with scoped(str(uuid4()), users[0]) as session:
+        assert ownership.resolve_artifact_owner(
+            session, project_root(project), "report"
+        ).unknown
+
+
+def test_legacy_root_resolves_from_its_conversation(tmp_path, org_id, users):
+    project = make_project(tmp_path, org_id)
+    conversation_id = make_conversation(project, users[0])
+    source = legacy_root(project, str(conversation_id))
+    with scoped(org_id, users[0]) as session:
+        assert ownership.resolve_artifact_owner(session, source, "old") == (
+            ownership.OwnerResolution(users[0], "legacy_path")
+        )
+
+
+def test_legacy_root_naming_another_projects_conversation_is_unknown(tmp_path, org_id, users):
+    project = make_project(tmp_path, org_id)
+    other = make_project(tmp_path, org_id)
+    conversation_id = make_conversation(other, users[0])
+    source = legacy_root(project, str(conversation_id))
+    with scoped(org_id, users[0]) as session:
+        assert ownership.resolve_artifact_owner(session, source, "old").unknown
+
+
+def test_malformed_legacy_root_is_unknown_without_raising(tmp_path, org_id, users):
+    source = legacy_root(make_project(tmp_path, org_id), "not-a-uuid")
+    with scoped(org_id, users[0]) as session:
+        assert ownership.resolve_artifact_owner(session, source, "old").unknown
+
+
+def test_local_mode_returns_the_scope_user(tmp_path):
+    project = make_project(tmp_path, None)
+    with scoped(None) as session:
+        resolution = ownership.resolve_artifact_owner(session, project_root(project), "a")
+    assert resolution == ownership.OwnerResolution(None, "local")
+    assert not resolution.unknown
+
+
+def test_batch_resolution_matches_single_resolution(tmp_path, org_id, users):
+    project = make_project(tmp_path, org_id)
+    source = project_root(project)
+    with scoped(org_id) as session:
+        ownership.record_artifact_owner(session, project.id, "a", users[0], action="create")
+        ownership.record_artifact_owner(session, project.id, "b", users[1], action="create")
+    with scoped(org_id, users[0]) as session:
+        batch = ownership.resolve_artifact_owners(session, source, ["a", "b", "c"])
+    assert batch == {
+        "a": ownership.OwnerResolution(users[0], "recorded"),
+        "b": ownership.OwnerResolution(users[1], "recorded"),
+        "c": ownership.OwnerResolution(None, "unknown"),
+    }
+
+
+def test_rekey_moves_ownership_to_the_new_project(tmp_path, org_id, users):
+    source_project = make_project(tmp_path, org_id)
+    dest_project = make_project(tmp_path, org_id)
+    with scoped(org_id) as session:
+        ownership.record_artifact_owner(session, source_project.id, "a", users[0], action="create")
+    with scoped(org_id, users[0]) as session:
+        assert ownership.rekey_artifact_owner(
+            session, project_root(source_project), "a", dest_project.id, "a-2",
+            actor_id=users[0],
+        ) is True
+        assert ownership.resolve_artifact_owner(
+            session, project_root(dest_project), "a-2"
+        ).owner_user_id == users[0]
+        assert ownership.resolve_artifact_owner(
+            session, project_root(source_project), "a"
+        ).unknown
+
+
+def test_forget_removes_ownership_only_for_project_roots(tmp_path, org_id, users):
+    project = make_project(tmp_path, org_id)
+    conversation_id = make_conversation(project, users[0])
+    with scoped(org_id) as session:
+        ownership.record_artifact_owner(session, project.id, "a", users[0], action="create")
+    with scoped(org_id, users[0]) as session:
+        # A legacy artifact with the same slug must not drop the project-root row.
+        assert ownership.forget_artifact_owner(
+            session, legacy_root(project, str(conversation_id)), "a", actor_id=users[0]
+        ) is False
+        assert ownership.forget_artifact_owner(
+            session, project_root(project), "a", actor_id=users[0]
+        ) is True
+        assert ownership.resolve_artifact_owner(session, project_root(project), "a").unknown
