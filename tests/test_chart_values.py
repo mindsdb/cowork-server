@@ -69,11 +69,17 @@ def test_datasource_grants_are_off_in_the_base_and_on_only_where_the_gate_passed
         assert overrides == expected, f"{env_values.name} sets {FLAG}={overrides}"
 
 
+# TEST ENABLEMENT, integration branch only, never merged or cherry-picked. The
+# base values name both methods here so a pull request environment offers them;
+# the released expectation is "".
+_BASE_CAPABILITIES = '{"manifest_version": 1, "enabled": ["postgres:host-port", "mysql:host-password"]}'
+
+
 def test_no_datasource_method_is_offered_in_the_released_values(base):
     """The list of methods a deployment may run, empty until a gate says
     otherwise. Declared here so turning one on is an edit to a value rather
     than a new line nobody remembers to add."""
-    assert _entry(base, "COWORK_DATASOURCE_CAPABILITIES")["value"] == ""
+    assert _entry(base, "COWORK_DATASOURCE_CAPABILITIES")["value"] == _BASE_CAPABILITIES
     for env_values in ENVIRONMENTS:
         declared = [e for e in _env(env_values) if e.get("name") == "COWORK_DATASOURCE_CAPABILITIES"]
         assert declared == [], f"{env_values.name} declares the manifest; the base already does"
