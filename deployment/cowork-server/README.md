@@ -68,81 +68,117 @@ is not configurable. An overlay that still carries the retired
 `COWORK_ORGANIZATION_BOUNDARY_MODE` key boots normally and ignores it, so a
 stale entry is safe to leave and safe to delete.
 
-`COWORK_ORGANIZATION_SWITCH_ENABLED` shows or hides the organization picker. It
-is the product enable and the lever to reach for first, because it is a values
-entry the pipeline reapplies on every deploy. To hide the picker, set it to
-`false` and roll the pods. `COWORK_IDENTITY_ENFORCE=audit` also hides the
-picker, by dropping `expectedOrganizationEnforced` from the capability, but it
-reopens the no-principal path and leaves the boundary refusing anyway, so it is
-never the right lever here.
+`COWORK_ORGANIZATION_SWITCH_ENABLED` shows or hides the organization picker.
+`values-dev.yaml`, `values-staging.yaml`, and `values-prod.yaml` set it to
+`"true"`, so the picker is on wherever an overlay applies. PR environments take
+base values, where the code default `false` keeps it off. It is the product
+enable and the lever to reach for first, because it is a values entry the
+pipeline reapplies on every deploy. To hide the picker, set its `value` to
+`"false"` under `deployment.extraEnvs` in that environment's values file and
+ship the commit through CI. Restarting the pods does not apply a values edit,
+and `kubectl set env` lasts only until the next deploy.
+`COWORK_IDENTITY_ENFORCE=audit` also hides the picker, by dropping
+`expectedOrganizationEnforced` from the capability, but it reopens the
+no-principal path and leaves the boundary refusing anyway, so it is never the
+right lever here.
 
 Deploy this server only with the capability-aware Cowork client image. An older
-client does not send the expected-organization header and receives 426.
+client does not send the expected-organization header and receives 426. The
+current client also sends no header until its access token carries a readable
+`activate_organization` id, so a `missing expected organization` count alone
+does not prove an old client is serving.
 
-### Back out through an operator
+### Back out enforcement
 
-Backing out the boundary requires an earlier implementation; there is no value
-to edit. A Helm rollback works only if a suitable release revision remains in
-history. Record the current revision, then inspect a candidate's image and
-values. Restoring an earlier image also backs out unrelated changes shipped
-since that revision.
+No values entry turns enforcement off on the current image. Backing it out
+means running code from before
+[cowork-server#524](https://github.com/mindsdb/cowork-server/pull/524) together
+with that code's values files. An earlier image deployed with today's values
+files still enforces, because that code defaults the boundary mode to `enforce`
+and today's overlays no longer set it.
+
+| Environment | Kube context | Namespace | Helm release |
+| --- | --- | --- | --- |
+| Staging | `newdev` | `staging` | `cowork-server` |
+| Production | `newprod` | `prod` | `cowork-server` |
+
+**A Helm rollback cannot back this change out in either environment.**
+
+- CI runs `helm upgrade` without `--history-max`, so Helm keeps only the last
+  ten revisions of each release. Every upgrade and every rollback adds one and
+  prunes the oldest. `helm history --max 256` only caps the listing and cannot
+  bring a pruned revision back. Staging retains no revision from before the
+  September 13 boundary change.
+- Each pod's `db-migrate` initContainer runs `alembic upgrade head` from its
+  own image. Every production image built before 2026-09-13 lacks
+  `e2262a14c001_artifact_identities.py`, which reached production in the same
+  release as the boundary change. A production rollback to one of those
+  revisions fails with `Can't locate revision identified by 'e2262a14c001'`.
+  The new pod never becomes ready, `--wait` times out, and the old pods keep
+  serving with the boundary on.
+
+To check a candidate yourself, read the history, then list the migrations its
+image lacks, taking each SHA from its image tag:
 
 ```bash
 helm --kube-context <context> -n <namespace> history cowork-server --max 256
-helm --kube-context <context> -n <namespace> get manifest cowork-server --revision <revision>
-helm --kube-context <context> -n <namespace> get values cowork-server --revision <revision> --all
+git diff --name-only --diff-filter=A <candidate-sha> <deployed-sha> -- cowork/db/alembic/versions
 ```
 
-**Staging history checked on 2026-09-23 has no pre-change revision.** The
-read-only query used context `newdev` and namespace `staging`. It returned ten
-revisions, 219 through 228, despite requesting up to 256. The earliest retained
-revision is dated 2026-09-21 08:03 UTC; deployed revision 228 is dated
-2026-09-23 04:13 UTC. None predates the September 13 boundary change.
-
-Do not invent a rollback revision or choose one solely because its number is
-lower. For an enforcement backout without a suitable retained revision, deploy
-a reviewed previous image or a reviewed code revert through CI. Verify its
-compatibility with changes made since that image shipped.
-
-Where a suitable revision is retained, an operator selects it, coordinates the
-deployment hold, and runs:
+**Revert in Git and ship the revert through CI.** Revert the cowork-server#524
+merge and keep its `values-*.yaml` hunks. They restore
+`COWORK_ORGANIZATION_BOUNDARY_MODE: "audit"` together with the code that reads
+it, and they set the picker back to `"false"`:
 
 ```bash
-helm --kube-context <context> -n <namespace> rollback cowork-server <verified-revision> --wait
+git revert -m 1 dc79a531
 ```
 
-**The next deployment can overwrite the rollback.** A push to `staging` starts
-`publish-staging.yml`; a push to `main` starts `publish.yml` and also syncs into
-`staging`. Check queued and running deployments before rolling back. A staging
-branch freeze alone does not stop production deployments or a run already in
-progress. To keep the backout through later deployments, revert the change in
-Git and ship that revert through CI.
+Later commits touched `cowork/principal.py`, so expect conflicts there. The
+revert and its conflict resolution go through review like any other change. A
+revert merged to `staging` deploys through `publish-staging.yml`, which has no
+approval gate. Production takes the revert only from `main`: `publish.yml` then
+waits at the `prod` GitHub Environment for a Devops approval before
+`build-deploy / deploy` runs. A push to `main` also syncs into `staging`. Unlike
+an image rollback, the revert backs out nothing else, and later deploys keep it.
 
-After rollback, verify every replica's image and repeat the capability,
-missing-expectation, malformed-expectation, mismatch, and valid API-key checks
-through ingress. Record the responses against the selected revision's intended
-behavior. A documented command is not a completed rehearsal: record the rollback
-and restore revisions, timestamps, and results when an operator exercises it.
+After the backout, check every replica's image and repeat the probes below.
+Expect the pre-change behavior. Missing, malformed, and mismatched expectations
+reach the route and return its normal status, and each still logs
+`organization boundary: <reason> on <METHOD> <path> (audit mode)` at WARNING.
+The capability reports `expectedOrganizationEnforced: false` and
+`enabled: false`, and a valid `mdb_` API key still succeeds. A documented
+command is not a completed rehearsal: record the revert commit, image tag, UTC
+timestamps, and results when an operator exercises it.
 
-**Disabling the picker is a separate rehearsal.** In staging, deploy
-`COWORK_ORGANIZATION_SWITCH_ENABLED=false` through CI, verify the result, then
-restore its intended value through CI. The capability's `enabled` becomes
-false, while `expectedOrganizationEnforced` stays true and the 426/409 refusals
-remain. That exercises picker availability, not an enforcement backout. The
-2026-09-23 history check performed no rollback or picker-disable rehearsal.
+**Disabling the picker is a separate rehearsal.** In staging, merge a change
+that sets `COWORK_ORGANIZATION_SWITCH_ENABLED` to `"false"` in
+`values-staging.yaml`, verify the result, then merge the restore the same way.
+Each merge runs all of `publish-staging.yml`, which rebuilds the image from
+unchanged code. The capability's `enabled` becomes false, while
+`expectedOrganizationEnforced` stays true and the 426/409 refusals remain. This
+tests the picker switch only; enforcement stays on.
 
 ### Verify replicas and the gateway separately
 
-Check the running image and effective environment on every serving replica.
-Each must use org tenancy, enforced identity, and the intended picker setting.
+Check the running image and effective environment on every serving replica,
+using the contexts above. Each must use org tenancy, enforced identity, and
+`COWORK_ORGANIZATION_SWITCH_ENABLED=true` outside a picker-disable rehearsal.
 The retired boundary-mode setting cannot change enforcement.
 
-Then probe each replica with a browser-shaped bearer and controlled identity
-headers. Matching organizations must pass; a missing expectation must return
-426; malformed and mismatched expectations must return 409. Both refusals must
-carry `organization_reload_required`, `X-Cowork-Organization-Reload: required`,
-and `Cache-Control: no-store`. The capability must report protocol version 1
-and enforcement enabled. Its `enabled` value follows the picker setting.
+Then probe each replica directly with a browser-shaped bearer and the identity
+headers the gateway would inject, `X-User-Id` and `X-Organization-Id`. A
+browser-shaped bearer has three dot-separated parts, does not start with
+`mdb_`, and has a first part that decodes to a JSON header with a non-empty
+`alg`, such as `eyJhbGciOiJSUzI1NiJ9.e30.sig`. A placeholder such as `x.y.z`
+skips the boundary, so every probe returns the route's normal answer. Vary
+`X-Cowork-Expected-Organization-Id`: a matching organization must pass, a
+missing header must return 426, and malformed and mismatched headers must
+return 409. Both refusals must carry `organization_reload_required`,
+`X-Cowork-Organization-Reload: required`, and `Cache-Control: no-store`.
+`GET /api/v1/capabilities/organization-switch` must report `protocolVersion: 1`
+and `expectedOrganizationEnforced: true`. Its `enabled` must be `true` outside a
+picker-disable rehearsal.
 
 These probes test the server after identity resolution. They do not prove that
 the ingress authenticates a real credential or replaces caller-supplied identity
@@ -154,8 +190,10 @@ request class, status, and response headers with each result.
 ### Count refusals by reason
 
 The server still logs every boundary refusal at WARNING after removal of the
-mode setting. Search the application logs for `organization boundary:` and
-count these message fragments separately:
+mode setting. In OpenSearch, filter `kubernetes.container_name.keyword` to
+`cowork-server` and `kubernetes.namespace_name.keyword` to the environment's
+namespace, match `organization boundary` in `message`, and count each fragment
+below as its own `message` phrase:
 
 | Reason | Message fragment | HTTP status |
 | --- | --- | --- |
@@ -174,25 +212,8 @@ conflicts.
 Label counts from a retained 48-hour window after deployment as post-deploy
 evidence. They cannot reconstruct an unavailable pre-deploy baseline. Keep
 deliberate verification probes identifiable by timestamp and path when comparing
-traffic before and after a change.
-
-#### Observed 48-hour window, 2026-09-23
-
-Retained OpenSearch logs cover **2026-09-21 08:30:00 UTC inclusive through
-2026-09-23 08:30:00 UTC exclusive**. The queries selected container
-`cowork-server` and namespace `staging` or `prod`, then counted the boundary
-message and each reason above.
-
-| Environment | Missing | Malformed | Mismatch | Application log records |
-| --- | ---: | ---: | ---: | ---: |
-| Staging | 0 | 0 | 0 | 148,937 |
-| Production | 0 | 0 | 1 | 127,446 |
-
-Both queries completed without timeout or failed shards, and every hourly bucket
-contained records. These are post-deploy observations, not a pre-deploy baseline
-or proof that every replica has the intended image. Application log records are
-not a count of requests, so they cannot supply a refusal rate. Hourly coverage
-does not prove that no individual record was dropped.
+traffic before and after a change. The 2026-09-23 counts for both environments
+are recorded on [ENG-2701](https://linear.app/mindsdb/issue/ENG-2701).
 
 ## Configuration
 

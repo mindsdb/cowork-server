@@ -572,9 +572,13 @@ tenancy alone. It reports `enabled: true` when those hold and
 
 `COWORK_ORGANIZATION_SWITCH_ENABLED` is the product enable for the picker, not a
 safety switch, and it is the lever to reach for to hide the picker without a
-rebuild. `COWORK_IDENTITY_ENFORCE=audit` hides it too, by dropping
+code change. `COWORK_IDENTITY_ENFORCE=audit` hides it too, by dropping
 `expectedOrganizationEnforced`, but it reopens the no-principal path and leaves
 the boundary refusing anyway.
+
+Backing enforcement out needs the code and values from before cowork-server#524.
+[deployment/cowork-server/README.md](deployment/cowork-server/README.md#back-out-enforcement)
+records the procedure and why a Helm rollback cannot do it.
 
 Inside one organization, two different rules apply, and which one you get
 depends on the resource:
