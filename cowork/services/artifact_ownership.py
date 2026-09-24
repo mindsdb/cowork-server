@@ -265,7 +265,14 @@ def provenance_origin(folder: Path) -> UUID | None:
         return None
 
 
-def turn_created_slugs(base, before_slugs: set[str], conversation_id) -> set[str]:
+def turn_created_slugs(
+    base,
+    before_slugs: set[str],
+    conversation_id,
+    *,
+    after: set[str] | None = None,
+    accept_unattributed: bool = False,
+) -> set[str]:
     """Slugs that appeared during this turn AND name it as their creator.
 
     A drop-only filter: every conversation in a project shares one artifacts
@@ -274,17 +281,37 @@ def turn_created_slugs(base, before_slugs: set[str], conversation_id) -> set[str
     in ``provenance``; rewriting it can only remove a slug from this turn, never
     add one, because the slug must also have appeared in this turn's window.
 
+    ``accept_unattributed`` is for a turn that did not finish cleanly (Stop,
+    cancel, failure). Anton writes ``metadata.json`` with an empty provenance
+    first and appends this turn's entry right after, so a turn cut short in
+    between leaves a folder with no provenance at all; dropping it would leave
+    it ownerless forever. Such a slug is then kept, while one naming another
+    conversation is still dropped. The only way this claims a sibling's folder
+    is a Stop that coincides with a parallel sibling turn caught in that same
+    window, which is why a cleanly completed turn never accepts one.
+
+    ``after`` is the caller's post-turn listing of ``base``; given, the root is
+    not listed again.
+
     Never raises: it runs inside a turn's ``finally``.
     """
     try:
         expected = UUID(str(conversation_id))
-        from cowork.services.task_objects import snapshot_artifact_slugs
+        if after is None:
+            from cowork.services.task_objects import snapshot_artifact_slugs
 
-        appeared = snapshot_artifact_slugs(base) - set(before_slugs or ())
+            after = snapshot_artifact_slugs(base)
+        appeared = set(after) - set(before_slugs or ())
         kept: set[str] = set()
         for slug in sorted(appeared):
             origin = provenance_origin(Path(base) / slug)
             if origin == expected:
+                kept.add(slug)
+                continue
+            if origin is None and accept_unattributed:
+                logger.info(
+                    "artifact_attribution accepted slug=%s reason=unfinished_turn", slug
+                )
                 kept.add(slug)
                 continue
             reason = "no_provenance" if origin is None else "foreign_provenance"
