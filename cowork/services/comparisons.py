@@ -26,8 +26,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
-from sqlalchemy import func
-
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
@@ -133,17 +131,20 @@ class ComparisonService:
         raise ComparisonNotFoundError("Comparison side not found")
 
     def turn_count(self, side: ComparisonSide) -> int:
-        """Turns (user messages) in the side's conversation that the comparison shows.
+        """Turns in the side's conversation that the comparison shows.
 
-        Turns rather than message rows: a turn also stores tool rows the
-        transcript API never returns, so a row count could not be mapped onto
-        what a client displays.
+        A turn is a user message the transcript API returns. A turn's tool
+        calls are stored as rows too, and each tool result is a user-role row,
+        so counting rows or user rows would count every tool call as a turn.
         """
-        count = self.session.exec(
+        from cowork.services.conversations import _is_tool_row
+
+        contents = self.session.exec(
             self.session.select(Message)
             .where(Message.conversation_id == side.conversation_id, Message.role == Role.user)
-            .with_only_columns(func.count())
-        ).one()
+            .with_only_columns(Message.content)
+        ).all()
+        count = sum(1 for content in contents if not _is_tool_row(content))
         if side.continued_turn_count is not None:
             return min(count, side.continued_turn_count)
         return count
@@ -273,7 +274,7 @@ class ComparisonService:
         if is_comparison_sandbox(destination.name):
             raise ValueError("Continue into a project, not into a comparison")
         handle = registry.get(str(side.conversation_id))
-        if handle is not None and handle.is_running():
+        if handle is not None and handle.is_running:
             raise ComparisonConflictError("Wait for this side to finish its turn, or stop it, then continue")
 
         conversations = ConversationService(self.session)
@@ -307,7 +308,7 @@ class ComparisonService:
         comparison = self.get_comparison(comparison_id)
         for side in comparison.sides:
             handle = registry.get(str(side.conversation_id))
-            if side.continued_at is None and handle is not None and handle.is_running():
+            if side.continued_at is None and handle is not None and handle.is_running:
                 raise ComparisonConflictError("Stop both sides before deleting the comparison")
         project_ids = [side.project_id for side in comparison.sides]
         self.session.delete(comparison)
