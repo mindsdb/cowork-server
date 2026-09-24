@@ -1281,12 +1281,10 @@ class ResponsesHandler:
                 raise RuntimeError("Remote producer session is not initialized")
             from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
             from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated
-            from cowork.services.artifact_ownership import turn_created_slugs
             from cowork.services.task_objects import (
                 index_turn_artifacts,
                 publish_and_card_turn_artifacts,
                 snapshot_artifact_state,
-                try_snapshot_artifact_slugs,
             )
 
             # Resolved once and held for the whole turn: the pod counts its
@@ -1413,18 +1411,13 @@ class ResponsesHandler:
                 # failed or was stopped, and it is synchronous because an await
                 # in a generator's finally is skipped on cancellation.
                 if artifacts is not None and artifact_writes_allowed:
-                    after = try_snapshot_artifact_slugs(artifacts[1])
                     new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
                         artifacts[0], conv_id, artifacts[2], artifacts[1],
                         before_slugs, before_mtimes,
                         # ENG-2961: the project base is shared, so only folders
                         # whose provenance names this conversation are its own.
-                        tracked_new=turn_created_slugs(
-                            artifacts[1], before_slugs, conv_id,
-                            after=after,
-                            accept_unattributed=not completed_cleanly,
-                        ),
-                        after=after,
+                        attribute_by_provenance=True,
+                        completed_cleanly=completed_cleanly,
                     )
 
             # Clean completion only — a raise inside the try skips this, matching

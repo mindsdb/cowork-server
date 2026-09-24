@@ -19,7 +19,6 @@ from the path. The result is only logged. To run the pass again, delete the
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -31,28 +30,33 @@ from sqlmodel import Session, select
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.session import get_engine
-from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.setting import Setting
 from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.models.task_object import TaskObject
 from cowork.services.artifact_ownership import (
-    ARTIFACT,
     artifact_resource_key,
+    conversation_creator,
     provenance_origin,
     record_artifact_owner,
 )
-from cowork.services.artifact_roots import _ARTIFACTS_SUBPATH, _is_real_directory
+from cowork.services.artifact_roots import (
+    _is_real_directory,
+    _storage_components_are_safe,
+    project_artifacts_base,
+)
+from cowork.services.settings import SettingService
+from cowork.services.shared_resources import (
+    ARTIFACT,
+    _database_lock_engine,
+    advisory_lock_key,
+)
 from cowork.services.task_objects import KIND_ARTIFACT
 
 logger = logging.getLogger(__name__)
 
 SENTINEL_KEY = "_artifact_owner_backfill_v1"
-_LOCK_KEY = int.from_bytes(
-    hashlib.blake2b(b"cowork\0artifact_owner_backfill_v1", digest_size=8).digest(),
-    byteorder="big",
-    signed=True,
-)
+_LOCK_KEY = advisory_lock_key(b"cowork\0artifact_owner_backfill_v1")
 
 
 @dataclass
@@ -68,8 +72,6 @@ def _advisory_try_lock(engine):
     if engine.dialect.name != "postgresql":
         yield True
         return
-    from cowork.services.shared_resources import _database_lock_engine
-
     connection = _database_lock_engine(engine).connect()
     acquired = False
     try:
@@ -91,9 +93,8 @@ def _advisory_try_lock(engine):
 
 def _sentinel_present(engine) -> bool:
     with Session(engine) as raw:
-        return raw.exec(
-            select(Setting).where(Setting.key == SENTINEL_KEY, Setting.scope.is_(None))
-        ).first() is not None
+        # No scope: the settings service then reads the global (NULL-scope) row.
+        return SettingService(raw)._fetch_row(SENTINEL_KEY) is not None
 
 
 def _write_sentinel(engine) -> None:
@@ -116,23 +117,16 @@ def _is_candidate(folder: Path) -> bool:
     return True
 
 
-def _has_owner_row(session, project_id, slug: str) -> bool:
-    return session.exec(
+def _owned_slugs(session, project_id, slugs: list[str]) -> set[str]:
+    """Slugs of ``project_id`` that already have an attribution row. One query."""
+    keys = {artifact_resource_key(project_id, slug): slug for slug in slugs}
+    rows = session.exec(
         session.select(SharedResourceAttribution).where(
             SharedResourceAttribution.resource_kind == ARTIFACT,
-            SharedResourceAttribution.resource_key == artifact_resource_key(project_id, slug),
+            SharedResourceAttribution.resource_key.in_(list(keys)),
         )
-    ).first() is not None
-
-
-def _owner_from_provenance(session, project_id, folder: Path) -> str | None:
-    conversation_id = provenance_origin(folder)
-    if conversation_id is None:
-        return None
-    conversation = session.get(Conversation, conversation_id)
-    if conversation is None or str(conversation.project_id) != str(project_id):
-        return None
-    return conversation.created_by or None
+    ).all()
+    return {keys[row.resource_key] for row in rows}
 
 
 def _owner_from_task_objects(session, project_id, slug: str) -> str | None:
@@ -145,38 +139,47 @@ def _owner_from_task_objects(session, project_id, slug: str) -> str | None:
     ).all()
     if len(rows) != 1:
         return None
-    conversation = session.get(Conversation, rows[0].conversation_id)
-    if conversation is None:
-        return None
-    return conversation.created_by or None
+    return conversation_creator(session, rows[0].conversation_id)
 
 
 def _backfill_project(engine, project_id, project_path: str, org_id: str, summary: BackfillSummary) -> None:
     project_dir = Path(project_path)
-    base = project_dir.joinpath(*_ARTIFACTS_SUBPATH)
-    if not _is_real_directory(project_dir / _ARTIFACTS_SUBPATH[0]) or not _is_real_directory(base):
+    # The same "no link in the writable chain" rule root discovery applies.
+    if not _storage_components_are_safe(project_dir, may_be_absent=False):
         return
-    # One raw session per organization: a raw session can only ever be
-    # wrapped with a single tenant scope, and SYSTEM_SCOPE (local) would write
-    # rows with org_id NULL that no org-scoped request could see.
+    base = project_artifacts_base(project_path)
     try:
-        folders = sorted(base.iterdir())
+        folders = [folder for folder in sorted(base.iterdir()) if _is_candidate(folder)]
     except OSError:
         # One unreadable project must not abort the pass for every other org.
         logger.warning("artifact_owner_backfill cannot list project=%s", project_id, exc_info=True)
         return
+    if not folders:
+        return
+    # One raw session per project, wrapped with that project's org scope: a
+    # raw session can only ever carry a single tenant scope, and SYSTEM_SCOPE
+    # (local) would write rows with org_id NULL that no org-scoped request
+    # could see.
     with Session(engine) as raw:
         session = ScopedSession(raw, TenantScope(org_mode=True, org_id=str(org_id)))
+        owned = _owned_slugs(session, project_id, [folder.name for folder in folders])
+        # Several artifacts of one project usually name the same few
+        # conversations; a miss is cached too, since the identity map does not.
+        creators: dict = {}
         for folder in folders:
-            if not _is_candidate(folder):
-                continue
             slug = folder.name
+            if slug in owned:
+                continue
             try:
-                if _has_owner_row(session, project_id, slug):
-                    continue
-                owner = _owner_from_provenance(session, project_id, folder) or (
-                    _owner_from_task_objects(session, project_id, slug)
-                )
+                owner = None
+                conversation_id = provenance_origin(folder)
+                if conversation_id is not None:
+                    if conversation_id not in creators:
+                        creators[conversation_id] = conversation_creator(
+                            session, conversation_id, project_id=project_id
+                        )
+                    owner = creators[conversation_id]
+                owner = owner or _owner_from_task_objects(session, project_id, slug)
                 if owner and record_artifact_owner(
                     session, project_id, slug, owner, action="backfill"
                 ):

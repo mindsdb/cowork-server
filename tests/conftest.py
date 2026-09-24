@@ -127,6 +127,7 @@ def cleanup_tmp_projects(tmp_path):
     projects. Not autouse: opt in per module with
     `pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")`.
     """
+    from sqlalchemy import delete, or_
     from sqlmodel import select
 
     from cowork.common.settings.app_settings import get_app_settings
@@ -140,22 +141,27 @@ def cleanup_tmp_projects(tmp_path):
 
     engine = get_engine(get_app_settings().database.uri)
     with Session(engine) as session:
-        projects = session.exec(select(Project)).all()
-        leaked = [p for p in projects if tmp_path.as_posix() in p.path]
-        leaked_ids = {p.id for p in leaked}
-        if leaked_ids:
-            for row in session.exec(select(TaskObject)).all():
-                if row.project_id in leaked_ids:
-                    session.delete(row)
-            for row in session.exec(select(Conversation)).all():
-                if row.project_id in leaked_ids:
-                    session.delete(row)
-            for row in session.exec(select(SharedResourceAttribution)).all():
-                key = row.resource_key or ""
-                if any(str(pid) in key for pid in leaked_ids):
-                    session.delete(row)
-        for project in leaked:
-            session.delete(project)
+        leaked_ids = list(
+            session.exec(
+                select(Project.id).where(Project.path.startswith(tmp_path.as_posix()))
+            ).all()
+        )
+        if not leaked_ids:
+            return
+        session.exec(delete(TaskObject).where(TaskObject.project_id.in_(leaked_ids)))
+        session.exec(delete(Conversation).where(Conversation.project_id.in_(leaked_ids)))
+        # `artifact_resource_key` always starts with "<project_id>/".
+        session.exec(
+            delete(SharedResourceAttribution).where(
+                or_(
+                    *(
+                        SharedResourceAttribution.resource_key.startswith(f"{pid}/")
+                        for pid in leaked_ids
+                    )
+                )
+            )
+        )
+        session.exec(delete(Project).where(Project.id.in_(leaked_ids)))
         session.commit()
 
 

@@ -95,6 +95,15 @@ async def _warm_model_map_on_boot() -> bool:
         warm_session.close()
 
 
+async def _cancel_and_wait(task: asyncio.Task | None) -> None:
+    """Stop one background task at shutdown and wait for it to finish."""
+    if task is None:
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
 async def _run_artifact_owner_backfill() -> None:
     """Background, one-time owner backfill (ENG-2961). Never affects startup."""
     try:
@@ -181,17 +190,8 @@ async def lifespan(app: FastAPI):
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
         from cowork.coding.service import get_coding_service
 
-        reconciler = getattr(app.state, "channel_ingress_reconciler", None)
-        if reconciler is not None:
-            reconciler.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await reconciler
-
-        backfill_task = getattr(app.state, "artifact_owner_backfill", None)
-        if backfill_task is not None:
-            backfill_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await backfill_task
+        await _cancel_and_wait(getattr(app.state, "channel_ingress_reconciler", None))
+        await _cancel_and_wait(getattr(app.state, "artifact_owner_backfill", None))
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
