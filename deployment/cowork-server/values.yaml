@@ -334,20 +334,6 @@ deployment:
     # reads "false" and the guard expects it.
     - name: COWORK_TURN_DATASOURCE_ENABLED
       value: "true"
-    # TEST ENABLEMENT, integration branch only, never merged or cherry-picked.
-    # The capability policy is default-off and needs both gates: the connector
-    # spec's own cloud.available, set in this branch's spec change, and this
-    # manifest naming the pairs. Without it the connector list shows no
-    # database and the capability response reports every method unavailable.
-    - name: COWORK_DATASOURCE_CAPABILITIES
-      value: '{"manifest_version": 1, "enabled": ["postgres:host-port", "mysql:host-password"]}'
-    # TEST ENABLEMENT, integration branch only, never merged or cherry-picked.
-    # The gateway's probe route is cluster-only, so this is the inference
-    # Service by name, namespace-relative like the auth address beside it.
-    # Without it a captured connection is never probed and stays pending, which
-    # is the released behaviour until the gate opens.
-    - name: COWORK_TURN_DATASOURCE_GATEWAY_BASE_URL
-      value: "http://mindshub-inference"
     - name: COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID
       valueFrom:
         secretKeyRef:
@@ -367,8 +353,11 @@ deployment:
     # this value per environment. It is the second of two gates: a method whose
     # own spec says the adapters cannot run it stays unavailable however this
     # reads, so enabling one here can never get ahead of the adapter work.
+    # TEST ENABLEMENT, integration branch only, never merged or cherry-picked:
+    # both methods are named so a pull request environment offers them. On
+    # `staging` this value is "" and the guard expects it.
     - name: COWORK_DATASOURCE_CAPABILITIES
-      value: ""
+      value: '{"manifest_version": 1, "enabled": ["postgres:host-port", "mysql:host-password"]}'
 
     # Where this server reaches the datasource gateway to check a connection
     # someone just saved. The gateway's probe route is cluster-only, so this is
