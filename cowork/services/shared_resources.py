@@ -730,6 +730,105 @@ class SharedResourceAccess:
         self.session.commit()
         return True
 
+    # ── actor-explicit writes ─────────────────────────────────────────
+    # Server-owned attribution for resources no request actor creates. An
+    # artifact is claimed at the end of the turn that wrote it, and by the
+    # one-time startup backfill (ENG-2961); neither path has a Principal, so
+    # these take the actor explicitly instead of calling `_require_actor`.
+    # They still need an organization scope: ScopedSession stamps and filters
+    # every row by it, and a NULL-org row would be invisible to every request.
+
+    def _require_org_scope(self) -> None:
+        if not self.session.scope.org_id:
+            raise RuntimeError(
+                "Actor-explicit attribution requires an organization scope"
+            )
+
+    def claim_as(
+        self,
+        kind: str,
+        key: str,
+        *,
+        creator_id: str,
+        action: str,
+    ) -> tuple[SharedResourceAttribution | None, bool]:
+        """First-writer-wins attribution on behalf of ``creator_id``.
+
+        Same race arbiter as ``claim``: the unique key decides, and a loser
+        re-reads the winner instead of overwriting it.
+        """
+        if not self.org_mode:
+            return None, False
+        self._require_org_scope()
+        existing = self._find(kind, key)
+        if existing is not None:
+            return existing, False
+        row = SharedResourceAttribution(
+            resource_kind=kind,
+            resource_key=key,
+            created_by_id=creator_id,
+            updated_by_id=creator_id,
+        )
+        try:
+            self.session.add(row)
+            self._append_event_as(kind, key, action, actor_id=creator_id)
+            self.session.commit()
+        except sa.exc.IntegrityError:
+            self.session.rollback()
+            winner = self._find(kind, key)
+            if winner is None:
+                raise
+            return winner, False
+        return row, True
+
+    def rekey_as(
+        self,
+        kind: str,
+        key: str,
+        new_key: str,
+        *,
+        actor_id: str,
+    ) -> SharedResourceAttribution | None:
+        """Move attribution from ``key`` to ``new_key``.
+
+        The caller guarantees no resource exists under ``new_key``, so a row
+        already there is stale (a delete whose attribution cleanup failed) and
+        is removed, with its own ``delete`` event, before the move.
+        """
+        if not self.org_mode:
+            return None
+        self._require_org_scope()
+        row = self._find(kind, key)
+        if row is None:
+            return None
+        if new_key == key:
+            return row
+        stale = self._find(kind, new_key)
+        if stale is not None:
+            self._append_event_as(kind, new_key, "delete", actor_id=actor_id)
+            self.session.delete(stale)
+            self.session.flush()
+        row.resource_key = new_key
+        row.updated_by_id = actor_id
+        row.modified_at = _next_modified_at(row.modified_at)
+        self.session.add(row)
+        self._append_event_as(kind, new_key, "move", actor_id=actor_id)
+        self.session.commit()
+        return row
+
+    def delete_as(self, kind: str, key: str, *, actor_id: str) -> bool:
+        """Remove current attribution and keep a ``delete`` event."""
+        if not self.org_mode:
+            return False
+        self._require_org_scope()
+        row = self._find(kind, key)
+        if row is None:
+            return False
+        self._append_event_as(kind, key, "delete", actor_id=actor_id)
+        self.session.delete(row)
+        self.session.commit()
+        return True
+
     def finalize_claim(
         self,
         row: SharedResourceAttribution,
