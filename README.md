@@ -869,15 +869,17 @@ is on, the producer lists them from auth under the dedicated
 producer service role (`COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID` and
 `COWORK_TURN_DATASOURCE_PRODUCER_KEY`), bound to the turn key it has just
 minted, registers one grant per connection before enqueueing, and puts only
-connection ids and credential versions on the queue. No capability, password
-or gateway address crosses Redis. A listing or registration failure fails the
+connection ids and credential versions on the queue. No capability or
+password crosses Redis; the pod reaches the gateway on the inference host the
+turn's `llm` block already names. A listing or registration failure fails the
 dispatch as `permission_unavailable` instead of silently dropping the
 datasources.
 
 Turn the flag on only after auth serves the datasource producer and resolver
 endpoints, the inference deployment serves `/v1/datasources/`, the
-scratchpad-controller carries `SCRATCHPAD_CONTROLLER__ANTON_DATASOURCE_GATEWAY_URL`
-and the scratchpad image includes the typed helper. With the flag off nothing
+scratchpad-controller passes the `datasource` block on, and the scratchpad image
+includes the typed helper that reads the gateway from the turn's inference host.
+With the flag off nothing
 in this path runs, so the flag is also the rollback.
 
 ## Configuration
