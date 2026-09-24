@@ -104,22 +104,7 @@ def users() -> tuple[str, str]:
     return str(uuid4()), str(uuid4())
 
 
-@pytest.fixture(autouse=True)
-def cleanup_test_projects(tmp_path):
-    """Clean up projects created by tests to avoid database pollution."""
-    from sqlmodel import select
-    from cowork.models.project import Project
-
-    # Run the test
-    yield
-
-    # Clean up: delete all projects created in this test's tmp_path
-    with Session(_engine()) as session:
-        projects = session.exec(select(Project)).all()
-        for project in projects:
-            if tmp_path.as_posix() in project.path:
-                session.delete(project)
-        session.commit()
+pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")
 
 
 def test_resource_key_is_plain_when_it_fits_and_hashed_when_it_does_not():

@@ -117,6 +117,49 @@ def trust_test_client_host():
 
 
 @pytest.fixture
+def cleanup_tmp_projects(tmp_path):
+    """Delete Project rows created under this test's `tmp_path`, plus their
+    dependent TaskObject, Conversation, and SharedResourceAttribution rows.
+
+    Several artifact-ownership test modules create real Project rows against
+    the session-scoped test DB; a leaked row (especially one with a real
+    `.anton/artifacts` dir) pollutes other modules that scan or query all
+    projects. Not autouse: opt in per module with
+    `pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")`.
+    """
+    from sqlmodel import select
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.session import get_engine
+    from cowork.models.conversation import Conversation
+    from cowork.models.project import Project
+    from cowork.models.shared_resource import SharedResourceAttribution
+    from cowork.models.task_object import TaskObject
+
+    yield
+
+    engine = get_engine(get_app_settings().database.uri)
+    with Session(engine) as session:
+        projects = session.exec(select(Project)).all()
+        leaked = [p for p in projects if tmp_path.as_posix() in p.path]
+        leaked_ids = {p.id for p in leaked}
+        if leaked_ids:
+            for row in session.exec(select(TaskObject)).all():
+                if row.project_id in leaked_ids:
+                    session.delete(row)
+            for row in session.exec(select(Conversation)).all():
+                if row.project_id in leaked_ids:
+                    session.delete(row)
+            for row in session.exec(select(SharedResourceAttribution)).all():
+                key = row.resource_key or ""
+                if any(str(pid) in key for pid in leaked_ids):
+                    session.delete(row)
+        for project in leaked:
+            session.delete(project)
+        session.commit()
+
+
+@pytest.fixture
 def granted_product_permissions(monkeypatch):
     """Model built-in Member grants only for suites testing resource ownership.
 
