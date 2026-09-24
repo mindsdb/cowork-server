@@ -30,7 +30,7 @@ def test_shim_never_precedes_the_doctype():
     # A script before the doctype puts the document into quirks mode and moves
     # the page's layout under the user.
     # Explicit escape: a literal BOM in the source is invisible to a reader.
-    out = inject_shim("﻿<!DOCTYPE html><body>x</body>")
+    out = inject_shim("\ufeff<!DOCTYPE html><body>x</body>")
     assert out.index("<!DOCTYPE html>") < out.index("anton-preview")
 
 
