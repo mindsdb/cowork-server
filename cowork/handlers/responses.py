@@ -1281,6 +1281,7 @@ class ResponsesHandler:
                 raise RuntimeError("Remote producer session is not initialized")
             from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
             from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated
+            from cowork.services.artifact_ownership import turn_created_slugs
             from cowork.services.task_objects import (
                 index_turn_artifacts,
                 publish_and_card_turn_artifacts,
@@ -1409,6 +1410,9 @@ class ResponsesHandler:
                     new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
                         artifacts[0], conv_id, artifacts[2], artifacts[1],
                         before_slugs, before_mtimes,
+                        # ENG-2961: the project base is shared, so only folders
+                        # whose provenance names this conversation are its own.
+                        tracked_new=turn_created_slugs(artifacts[1], before_slugs, conv_id),
                     )
 
             # Clean completion only — a raise inside the try skips this, matching

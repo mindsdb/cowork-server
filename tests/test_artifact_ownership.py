@@ -6,6 +6,8 @@ per-conversation roots keep path-derived ownership.
 """
 from __future__ import annotations
 
+import json
+import os
 from contextlib import contextmanager
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -19,6 +21,7 @@ from cowork.db.session import get_engine
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.services import artifact_ownership as ownership
+from cowork.services import task_objects
 from cowork.services.artifacts import ProjectArtifacts
 
 
@@ -265,3 +268,74 @@ def test_forget_removes_ownership_only_for_project_roots(tmp_path, org_id, users
             session, project_root(project), "a", actor_id=users[0]
         ) is True
         assert ownership.resolve_artifact_owner(session, project_root(project), "a").unknown
+
+
+def write_artifact(base: Path, slug: str, conversation=None) -> Path:
+    folder = base / slug
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "index.html").write_text("<html></html>")
+    meta = {"id": uuid4().hex, "slug": slug, "type": "html-app"}
+    if conversation is not None:
+        meta["provenance"] = [{"conversation": str(conversation), "turns": []}]
+    (folder / "metadata.json").write_text(json.dumps(meta))
+    return folder
+
+
+def test_provenance_origin_reads_the_first_conversation(tmp_path):
+    conversation = uuid4()
+    folder = write_artifact(tmp_path, "a", conversation)
+    assert ownership.provenance_origin(folder) == conversation
+
+
+@pytest.mark.parametrize("raw", ["{ not json", json.dumps({"provenance": "x"}), json.dumps([])])
+def test_provenance_origin_of_unreadable_metadata_is_none(tmp_path, raw):
+    folder = tmp_path / "a"
+    folder.mkdir()
+    (folder / "metadata.json").write_text(raw)
+    assert ownership.provenance_origin(folder) is None
+
+
+def test_provenance_origin_refuses_a_symlinked_metadata_file(tmp_path):
+    real = write_artifact(tmp_path / "elsewhere", "real", uuid4())
+    folder = tmp_path / "a"
+    folder.mkdir()
+    os.symlink(real / "metadata.json", folder / "metadata.json")
+    assert ownership.provenance_origin(folder) is None
+
+
+def test_turn_created_slugs_keeps_only_this_turns_own_artifacts(tmp_path):
+    conversation, sibling = uuid4(), uuid4()
+    write_artifact(tmp_path, "old", conversation)
+    before = {"old"}
+    write_artifact(tmp_path, "mine", str(conversation).upper())  # spelling differs
+    write_artifact(tmp_path, "sibling", sibling)
+    write_artifact(tmp_path, "handmade")  # no provenance
+    assert ownership.turn_created_slugs(tmp_path, before, conversation) == {"mine"}
+
+
+def test_turn_created_slugs_never_raises(tmp_path):
+    assert ownership.turn_created_slugs(object(), set(), uuid4()) == set()
+    assert ownership.turn_created_slugs(tmp_path, set(), "not-a-uuid") == set()
+
+
+def test_index_turn_artifacts_records_the_creator_as_owner(tmp_path, org_id, users):
+    project = make_project(tmp_path, org_id)
+    conversation_id = make_conversation(project, users[0])
+    source = project_root(project)
+    before, before_mtimes = task_objects.snapshot_artifact_state(source.base)
+    write_artifact(source.base, "fresh", conversation_id)
+    scope = TenantScope(org_mode=True, org_id=org_id, user_id=users[0])
+    with Session(_engine()) as raw:
+        session = ScopedSession(raw, scope)
+        conversation = session.get(Conversation, conversation_id)
+        new, touched, turn_scope = task_objects.index_turn_artifacts(
+            conversation, conversation_id, project.id, source.base,
+            before, before_mtimes,
+            tracked_new=ownership.turn_created_slugs(source.base, before, conversation_id),
+        )
+    assert new == ["fresh"]
+    assert turn_scope == scope
+    with scoped(org_id, users[1]) as session:
+        assert ownership.resolve_artifact_owner(session, source, "fresh") == (
+            ownership.OwnerResolution(users[0], "recorded")
+        )
