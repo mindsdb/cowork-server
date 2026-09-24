@@ -164,13 +164,15 @@ class CodingSessionFactory:
             raise RuntimeError("MindsHub is not connected. Sign in or configure a MindsHub API key first.")
 
         session_id = str(uuid.uuid4())
+        if request.task_mode == "plan" and request.computer_id not in {None, self.control.local_computer.id}:
+            raise ValueError("Plan mode is available on this computer; choose Build for a connected computer")
         control_snapshot = self.control.create_task_run(
             task_id=session_id,
             title=task_title(request.prompt),
             prompt=request.prompt,
             project=project,
             requested_resource_ids=request.resource_ids,
-            computer_id=request.computer_id,
+            computer_id=self.control.local_computer.id if request.task_mode == "plan" else request.computer_id,
             engine_id=engine_id,
             standalone_computer_id=self.control.local_computer.id if project is None else None,
         )
@@ -332,6 +334,7 @@ class CodingSessionFactory:
             engine_adapter_version=adapter_version,
             model=model,
             permission_mode=preparation.permission_mode,
+            task_mode=request.task_mode,
             reasoning_effort=reasoning_effort,
             service_tier=request.service_tier,
             personality=request.personality,

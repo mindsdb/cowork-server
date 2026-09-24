@@ -5,7 +5,7 @@ from pathlib import Path
 import shutil
 import tempfile
 
-from cowork.build_info import supported_kwargs, surface_kwarg
+from cowork.build_info import account_kwargs, supported_kwargs, surface_kwarg
 from cowork.common.chat_session import build_chat_session
 from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.logger import get_logger
@@ -1153,6 +1153,11 @@ class AntonHarness:
             # and both report harness="anton" (ENG-1459). Only the deployment
             # knows which, so it is resolved here rather than by anton.
             **surface_kwarg(ChatSessionConfig),
+            # WHO the user is, so anton keys `turn_completed` on the account
+            # rather than the machine (ENG-2121). Opaque ids from the held
+            # MindsHub JWT only; {} when there is none or the pinned anton
+            # predates the fields.
+            **account_kwargs(ChatSessionConfig),
             proactive_dashboards=anton_settings.proactive_dashboards,
             act_first=anton_settings.act_first,
             # "Conversation started" stamp for the cache-stable prompt prefix

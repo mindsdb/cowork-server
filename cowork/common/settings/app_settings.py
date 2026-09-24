@@ -705,20 +705,6 @@ class AppSettings(Settings):
             "mount and is gone on pod restart."
         ),
     )
-    hub_workspaces_force_on: bool = Field(
-        default=False,
-        validation_alias=AliasChoices("COWORK_HUB_WORKSPACES_FORCE_ON"),
-        description=(
-            "Development override that turns the MindsHub workspace surfaces on "
-            "where no Statsig rule targets you. ON only: it cannot switch the "
-            "surfaces off, so it can never be used to escape the kill switch. "
-            "The switch itself is auth's `authorization_ui` gate, declared in "
-            "that repo's configs/statsig_gates.json and read through the "
-            "entitlements payload; this exists so the surface can be walked "
-            "before a rule exists for your environment. Never set in a deployed "
-            "environment."
-        ),
-    )
     ask_user_enabled: bool = Field(
         default=True,
         validation_alias=AliasChoices("COWORK_ASK_USER_ENABLED"),

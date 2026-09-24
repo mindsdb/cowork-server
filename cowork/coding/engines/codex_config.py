@@ -207,10 +207,11 @@ STREAM_MAX_RETRIES = 2
 
 def prepare_launch(config: EngineSessionConfig, workspace: Path, endpoint: str) -> CodexLaunchConfig:
     """Translate Cowork runtime controls into one consistent Codex launch policy."""
-    resolved_approval = approval_policy(config.permission_mode)
-    resolved_sandbox = sandbox_mode(config.permission_mode)
+    permission = PermissionMode.read_only if config.task_mode == "plan" else config.permission_mode
+    resolved_approval = "never" if config.task_mode == "plan" else approval_policy(permission)
+    resolved_sandbox = sandbox_mode(permission)
     resolved_policy = sandbox_policy(
-        config.permission_mode,
+        permission,
         workspace,
         config.additional_dirs,
         config.network_access,

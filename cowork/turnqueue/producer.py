@@ -14,7 +14,7 @@ import logging
 import time
 import uuid
 
-from cowork.build_info import KEY_ANTON_VERSION, build_trace_metadata, surface
+from cowork.build_info import KEY_ANTON_VERSION, account_ids, build_trace_metadata, surface
 from cowork.handlers.turn_errors import WORKER_UNRESPONSIVE_TYPE_NAME, remote_turn_error
 from cowork.services.providers import minds_chat_base_url
 from cowork.db.scoped import TenantScope
@@ -41,17 +41,25 @@ _MAX_REQUEST_BYTES = 10 * 1024 * 1024
 _REQUEST_BYTES_MARGIN = 64 * 1024
 
 
-def _trace_block() -> dict[str, str]:
+def _trace_block(*, user_id: str | None = None, org_id: str | None = None) -> dict[str, str]:
     """Attribution the pod cannot work out for itself, for the job's params.
 
     Kept tiny and total-failure-tolerant: telemetry must never be the reason a
     turn does not start, and an absent block reads as "no attribution" on the
     pod side rather than an error. That is also what lets the three repos in
     this chain deploy in any order.
+
+    ``user_id`` / ``org_id`` are the turn's gateway-verified principal. They
+    go as ``user_id`` / ``organization_id`` so anton can key ``turn_completed``
+    on the account (ENG-2121); UUIDs only, anything else is left out. A pod
+    anton from before ENG-2121 forwards unknown keys into the per-turn
+    Langfuse metadata, where the gateway's own verified user and org already
+    sit, so that skew adds nothing the trace does not already hold.
     """
     try:
         resolved = surface()
         block = build_trace_metadata({"surface": resolved} if resolved else None)
+        block.update(account_ids(user_id, org_id))
         # Drop OUR anton version: the pod runs a different anton entirely (its
         # own pinned `minds-anton-scratchpad` image, bumped independently of
         # this server's vendored dep), so the value would be wrong on the wire.
@@ -110,18 +118,23 @@ def _new_correlation_id() -> str:
 
 
 async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
-                          correlation_id: str, settings: TurnQueueSettings) -> dict:
+                          correlation_id: str, settings: TurnQueueSettings,
+                          workspace_id: str | None = None) -> dict:
     """Mint a short-TTL MindsHub turn key and build the job's `llm` block.
 
     The mint call is authenticated with the internal shared secret
     (`X-Internal-Auth`) only - there is no per-tenant credential to look up or
     send. `org_id`/`user_id` (the request principal's identity) tell auth
     which tenant the key is scoped to; auth resolves them itself, so no
-    per-user provider key is needed or read here.
+    per-user provider key is needed or read here. `workspace_id` is the
+    caller's active MindsHub workspace (`UserSettings.hub_workspace_id`), if
+    they have picked one; omitted otherwise, so the key binds to the
+    organization's Default the way it always has.
     """
     api_key = await mint_turn_key(
         user_id=user_id, org_id=org_id, correlation_id=correlation_id,
         ttl_seconds=settings.turn_key_ttl_seconds, settings=settings,
+        workspace_id=workspace_id,
     )
     return _build_llm_block(api_key, settings)
 
@@ -140,13 +153,16 @@ def _build_llm_block(api_key: str, settings: TurnQueueSettings) -> dict:
 
 async def _mint_llm_block_with_turn_key_id(
     *, org_id: str | None, user_id: str | None, correlation_id: str, settings: TurnQueueSettings,
+    workspace_id: str | None = None,
 ) -> tuple[dict, str]:
+    """As _mint_llm_block, also returning the key's public prefix the datasource grants bind to."""
     minted = await mint_turn_key_details(
         user_id=user_id,
         org_id=org_id,
         correlation_id=correlation_id,
         ttl_seconds=settings.turn_key_ttl_seconds,
         settings=settings,
+        workspace_id=workspace_id,
     )
     return _build_llm_block(minted.key, settings), minted.prefix
 
@@ -435,16 +451,22 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
             llm_block = llm
             oauth_connections = await oauth_connections_coro
         else:
+            from cowork.common.settings.user_settings import get_user_settings
+            workspace_id = getattr(get_user_settings(scope), "hub_workspace_id", "") or None
             if settings.datasource_enabled:
                 (llm_block, turn_key_id), oauth_connections = await asyncio.gather(
                     _mint_llm_block_with_turn_key_id(
                         org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
+                        workspace_id=workspace_id,
                     ),
                     oauth_connections_coro,
                 )
             else:
                 llm_block, oauth_connections = await asyncio.gather(
-                    _mint_llm_block(org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings),
+                    _mint_llm_block(
+                        org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
+                        workspace_id=workspace_id,
+                    ),
                     oauth_connections_coro,
                 )
         datasource_block = await _mint_datasource_block(
@@ -501,7 +523,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # install channel — measured on prod, 0 of 68 cloud traces carried
               # any of them. Same helper the in-process path uses, so the two
               # cannot drift. Observability only; the pod must never act on it.
-              "trace": _trace_block()}
+              "trace": _trace_block(user_id=user_id, org_id=org_id)}
     params = _fit_request(params, conversation_id)
 
     job = TurnJob(
