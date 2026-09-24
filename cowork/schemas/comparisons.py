@@ -34,7 +34,7 @@ class ComparisonSideResponse(CamelResponse):
     reasoning_effort: str | None = None
     project_id: UUID
     conversation_id: UUID
-    message_count: int
+    turn_count: int
     continued_at: datetime | None = None
     continued_turn_count: int | None = None
 

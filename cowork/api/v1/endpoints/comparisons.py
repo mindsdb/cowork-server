@@ -45,7 +45,7 @@ def _response(service: ComparisonService, comparison: Comparison) -> dict:
                 "reasoning_effort": side.reasoning_effort,
                 "project_id": side.project_id,
                 "conversation_id": side.conversation_id,
-                "message_count": service.turn_count(side),
+                "turn_count": service.turn_count(side),
                 "continued_at": side.continued_at,
                 "continued_turn_count": side.continued_turn_count,
             }

@@ -59,7 +59,7 @@ class ComparisonSide(BaseSQLModel, table=True):
         description="When the user continued with this side; its conversation left the sandbox then",
     )
     continued_turn_count: int | None = Field(
-        default=None, description="Messages the conversation had when it was continued; the comparison shows those"
+        default=None, description="Turns the conversation had when it was continued; the comparison shows those"
     )
     org_id: str | None = Field(default=None, max_length=36, description="Owning organization; NULL on local/desktop rows")
     created_by: str | None = Field(default=None, max_length=36, description="User who created the row; NULL on local/desktop rows")
