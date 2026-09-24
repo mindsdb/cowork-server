@@ -18,7 +18,7 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from cowork.api.v1.artifact_preview import wants_comment_layer
+from cowork.api.v1.artifact_preview import wants_comment_layer, wants_download
 from cowork.common.paths import (
     O_NOFOLLOW,
     dir_lstat,
@@ -1164,6 +1164,11 @@ async def serve_private_draft(
     header changes how the response is labelled, not who may read it.
     ``Annotated[..., Query()] = False`` rather than ``= Query(False)`` so a
     direct call (the tests') gets a real ``False``, not the ``Query`` object.
+    The effective flag below also folds in ``wants_download(request)``, the
+    same predicate `/serve` and `/preview-asset` use, so all three routes
+    agree on what a raw query string like ``?download=0`` means; a direct
+    call still controls the outcome through the keyword argument, since its
+    bare ``request`` carries no query string of its own.
     """
     # Parse before taking basename so a path ending in a valid UUID is rejected,
     # never silently accepted. Keep the recognized sanitizer at this filesystem
@@ -1220,6 +1225,7 @@ async def serve_private_draft(
                 detail="Artifact file not found",
             )
 
+    download = download or wants_download(request)
     media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
     resources, fd, file_stat = _open_pinned_draft_file(source, folder, parts)
     try:

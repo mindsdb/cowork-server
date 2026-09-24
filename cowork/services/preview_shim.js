@@ -55,7 +55,8 @@
         if (ev instanceof ErrorEvent) {
           var file = ev.filename || '';
           var line = typeof ev.lineno === 'number' ? ev.lineno : 0;
-          if (file === String(window.location.href)) {
+          var href = String(window.location.href);
+          if (file === href) {
             /* Only this document's own inline scripts shifted; an external
                file carries its own coordinates. lineno is 0 for "Script
                error." and for some parse failures, hence the guard. */
@@ -65,6 +66,14 @@
                desktop. An empty file tells the server to print the artifact's
                source path instead. */
             file = '';
+          } else if (file) {
+            /* An external <script src> under the same document (e.g. a
+               desktop draft's "static/app.js") still carries the loopback
+               origin and full server path, which names nothing the agent can
+               open either. Strip the document's own directory so what is left
+               is the path the agent actually edits. */
+            var dir = href.slice(0, href.lastIndexOf('/') + 1);
+            if (dir && file.indexOf(dir) === 0) file = file.slice(dir.length);
           }
           report('e|' + ev.message + '|' + file + '|' + line, {
             type: 'error',
@@ -155,6 +164,16 @@
       },
       set: function (t, p, v) {
         if (typeof p === 'string' && !(p in t)) { map.set(p, String(v)); return true; }
+        /* `length` is an accessor with no setter, and this whole file is
+           'use strict', so `t[p] = v` below would throw TypeError for it —
+           trading the SecurityError this shim exists to avoid for a new
+           throw from inside the trap. Native Storage just drops that write,
+           so an accessor-only own member does the same here. A page
+           reassigning a method (e.g. `localStorage.clear = fn`) hits a
+           plain writable data property instead, which falls through to the
+           assignment below and shadows it, matching native Storage. */
+        var desc = Object.getOwnPropertyDescriptor(t, p);
+        if (desc && desc.get && !desc.set) return true;
         t[p] = v;
         return true;
       },

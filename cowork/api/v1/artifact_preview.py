@@ -34,6 +34,26 @@ def wants_comment_layer(request: Request) -> bool:
     return ACTIVATION_PARAM in request.query_params
 
 
+# Mirrors the string forms Pydantic's bool coercion accepts for a `Query()`
+# parameter. Anything else -- garbage, or the empty string FastAPI itself
+# would 422 on -- is treated as "no", the same as the key being absent.
+_TRUE_DOWNLOAD_VALUES = frozenset({"1", "true", "yes", "on", "y", "t"})
+
+
+def wants_download(request: Request) -> bool:
+    """Whether this request asked for the raw file instead of the preview.
+
+    `/serve` and `/preview-asset` used to gate this on mere key presence
+    (`"download" not in request.query_params`), so `?download=0` suppressed
+    the shim there while the `/drafts` route -- which parses `download` as a
+    real `Query(bool)` -- kept injecting it for the same query string. One
+    predicate, with the same truthiness `Query(bool)` gives, keeps the three
+    routes agreeing on what `?download=0` means.
+    """
+    raw = request.query_params.get("download")
+    return raw is not None and raw.strip().lower() in _TRUE_DOWNLOAD_VALUES
+
+
 def artifact_response_headers(media_type: str) -> dict[str, str]:
     """Cache headers for any artifact response; HTML responses additionally
     get the sandbox CSP above, since only those can carry executable script."""
