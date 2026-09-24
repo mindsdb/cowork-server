@@ -261,3 +261,28 @@ async def test_without_a_principal_there_is_no_admin_exception(
             await artifacts_ep.delete_artifact_for_request(session, orphan_id, project_id=project.id)
         assert refused.value.detail == "Artifact owner is unknown"
     assert orphan.exists()
+
+
+@pytest.mark.asyncio
+async def test_delete_resolves_the_owner_once(
+    world, org_deployment, granted_product_permissions, no_publish_side_effects, monkeypatch
+):
+    """The admin exception and the owner check read one resolution, so they
+    cannot disagree and the owner row is queried once."""
+    org_id, creator, _member, project, source = world
+    local_id, folder = _write(source, "mine")
+    calls = []
+    real = ownership.resolve_artifact_owner
+
+    def counting(session, src, slug):
+        calls.append(slug)
+        return real(session, src, slug)
+
+    monkeypatch.setattr(ownership, "resolve_artifact_owner", counting)
+    with scoped(org_id, creator) as session:
+        await artifacts_ep.delete_artifact_for_request(
+            session, local_id, project_id=project.id,
+            principal=_principal(org_id, creator, admin=True),
+        )
+    assert not folder.exists()
+    assert calls == ["mine"]

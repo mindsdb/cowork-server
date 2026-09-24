@@ -727,15 +727,20 @@ async def delete_artifact_for_request(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
     folder_name = _artifact_folder_name(source, folder)
 
+    from cowork.services.artifact_ownership import resolve_artifact_owner
     from cowork.services.artifact_permissions import (
         may_delete_ownerless_artifact,
         require_artifact_owner,
     )
 
+    # One resolution for both decisions, so they cannot disagree.
+    resolution = resolve_artifact_owner(session, source, folder_name)
     # D7: the only thing an unknown owner grants anyone is an org admin's delete.
-    admin_delete = may_delete_ownerless_artifact(session, source, folder_name, principal)
+    admin_delete = may_delete_ownerless_artifact(
+        session, source, folder_name, principal, resolution=resolution
+    )
     if not admin_delete:
-        require_artifact_owner(session, source, folder_name)
+        require_artifact_owner(session, source, folder_name, resolution=resolution)
     expected_artifact_id = artifact_id if ref.artifact_id is not None else None
     publish_url, api_key = _resolve_publish_endpoint(get_user_settings())
     if _org_mode():

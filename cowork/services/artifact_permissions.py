@@ -55,8 +55,8 @@ def artifact_capabilities(session, source, slug: str, *, resolution=None) -> dic
     return capabilities
 
 
-def require_artifact_owner(session, source, slug: str) -> dict:
-    capabilities = artifact_capabilities(session, source, slug)
+def require_artifact_owner(session, source, slug: str, *, resolution=None) -> dict:
+    capabilities = artifact_capabilities(session, source, slug, resolution=resolution)
     if not capabilities["canEdit"]:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -65,12 +65,16 @@ def require_artifact_owner(session, source, slug: str) -> dict:
     return capabilities
 
 
-def may_delete_ownerless_artifact(session, source, slug: str, principal) -> bool:
+def may_delete_ownerless_artifact(
+    session, source, slug: str, principal, *, resolution=None
+) -> bool:
     """D7: an org admin may delete an artifact whose owner is unknown.
 
     The only thing `unknown` grants anyone. The principal must be the request's
     own (same user and org as the scope), and `can_manage_org` alone is not
     enough: without a principal there is no admin exception at all.
+
+    ``resolution`` lets a caller that also checks ownership resolve once.
     """
     scope = getattr(session, "scope", None)
     if not scope or not scope.org_mode or not isinstance(principal, Principal):
@@ -79,6 +83,8 @@ def may_delete_ownerless_artifact(session, source, slug: str, principal) -> bool
         return False
     if not can_manage_org(principal):
         return False
-    from cowork.services.artifact_ownership import resolve_artifact_owner
+    if resolution is None:
+        from cowork.services.artifact_ownership import resolve_artifact_owner
 
-    return resolve_artifact_owner(session, source, slug).unknown
+        resolution = resolve_artifact_owner(session, source, slug)
+    return resolution.unknown
