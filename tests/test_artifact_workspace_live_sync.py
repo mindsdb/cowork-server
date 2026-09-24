@@ -70,7 +70,7 @@ async def test_manual_save_synchronizes_an_existing_live_artifact(artifact, monk
         lambda *_args: (_source_for(folder), folder, metadata, {}),
     )
 
-    async def fake_sync(session, live_folder):
+    async def fake_sync(session, live_folder, **_kwargs):
         synced.append((session, live_folder))
         return True
 
@@ -140,7 +140,7 @@ async def test_restore_synchronizes_an_existing_live_artifact(artifact, monkeypa
         lambda *_args: (_source_for(folder), folder, metadata, {}),
     )
 
-    async def fake_sync(session, live_folder):
+    async def fake_sync(session, live_folder, **_kwargs):
         synced.append((session, live_folder))
         return True
 
@@ -206,7 +206,7 @@ async def test_org_sync_preserves_audience_and_reuses_live_publish(artifact, mon
 
     monkeypatch.setattr("cowork.services.publish.publish_artifact", fake_publish)
 
-    result = await workspace._sync_live_artifact(_Session(), folder)
+    result = await workspace._sync_live_artifact(_Session(), folder, project_id="project-1")
 
     assert result is True
     assert calls[0][0] == folder
@@ -221,6 +221,7 @@ async def test_org_sync_preserves_audience_and_reuses_live_publish(artifact, mon
     }
     assert calls[0][1]["scope"] is ORG_SCOPE
     assert revoked == [True]
+    assert calls[0][1]["project_id"] == "project-1"
 
 
 @pytest.mark.asyncio
@@ -309,7 +310,7 @@ async def test_publish_failure_does_not_undo_the_source_save(artifact, monkeypat
         lambda *_args: (_source_for(folder), folder, metadata, {}),
     )
 
-    async def failed_sync(*_args):
+    async def failed_sync(*_args, **_kwargs):
         return False
 
     monkeypatch.setattr(workspace, "_sync_live_artifact", failed_sync)
