@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 import httpx
 import pytest
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from cowork.api.v1.endpoints import artifact_workspace, artifacts, comments
 from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
@@ -277,6 +277,7 @@ async def test_draft_grant_publish_proxy_and_delete_use_one_server_identity(
         api_key="test-publish-key",
         publish_url="https://view.test",
         scope=scope,
+        project_id=str(project.id),
     )
     assert seen["artifact_key"] == canonical
     assert comments.resolve_comments_route(
@@ -304,10 +305,11 @@ async def test_draft_grant_publish_proxy_and_delete_use_one_server_identity(
 def test_publish_refuses_another_conversation_owner_before_allocating(
     issuer, scope, local_id, owned_artifact
 ):
-    _session, _project, _conversation, folder = owned_artifact
+    _session, project, _conversation, folder = owned_artifact
     peer = TenantScope(org_mode=True, org_id=scope.org_id, user_id=str(uuid4()))
-    with pytest.raises(ArtifactAccessUnavailable, match="Only the artifact owner"):
-        identities.publish_authorization_key(local_id, folder.parent, peer)
+    # The peer cannot even see the creator's private legacy root.
+    with pytest.raises(ArtifactAccessUnavailable, match="does not belong|Only the artifact owner"):
+        identities.publish_authorization_key(local_id, folder.parent, "demo", project.id, peer)
     assert issuer.calls == []
 
 
@@ -350,6 +352,7 @@ async def test_live_editor_sync_preserves_canonical_identity_and_refuses_peer(
         publish_url="https://view.test",
         access={"mode": "restricted", "emails": ["reviewer@example.com"]},
         scope=scope,
+        project_id=str(project.id),
     )
     metadata = json.loads((folder / "metadata.json").read_text())
     initial = current_source(folder, metadata, local_id)
@@ -384,7 +387,7 @@ async def test_live_editor_sync_preserves_canonical_identity_and_refuses_peer(
 def test_first_publish_allocates_before_upload_without_requiring_a_draft_grant(
     issuer, scope, local_id, owned_artifact, monkeypatch
 ):
-    _session, _project, _conversation, folder = owned_artifact
+    _session, project, _conversation, folder = owned_artifact
     uploads = []
 
     def publish(_source, **kwargs):
@@ -404,6 +407,7 @@ def test_first_publish_allocates_before_upload_without_requiring_a_draft_grant(
         api_key="key",
         publish_url="https://view.test",
         scope=scope,
+        project_id=str(project.id),
     )
     assert uploads == [identities.existing_authorization_key(local_id, scope)]
     assert result["artifactKey"] == uploads[0]
@@ -515,6 +519,147 @@ def test_identity_migration_preserves_aliases_across_application_rollback():
                 assert "artifact_identities" in inspect(connection).get_table_names()
     finally:
         engine.dispose()
+
+
+@pytest.fixture
+def project_root_artifact(tmp_path, monkeypatch, scope, local_id):
+    """The ENG-2056 layout: the artifact sits in the shared project root.
+
+    Unlike `owned_artifact` (a legacy per-conversation root nested under
+    `conversations/<uuid>/`), this fixture creates `<project.path>/.anton/
+    artifacts/` directly — exactly the shape `_sources_outside_the_projects_root`
+    treats as an adopted desktop project. The test DB is session-scoped (see
+    `tests/conftest.py`), so without teardown this `Project` row and its
+    on-disk folder would keep being listed by every later LOCAL_SCOPE query in
+    the same pytest run (e.g. `tests/test_artifact_roots.py`).
+    """
+    from cowork.models.artifact_identity import ArtifactIdentity
+    from cowork.models.shared_resource import SharedResourceAttribution
+    from cowork.services.artifact_ownership import record_artifact_owner
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        session = ScopedSession(raw, scope)
+        project = Project(name="Shared project", path=str(tmp_path / "shared"), org_id=scope.org_id)
+        session.add(project)
+        session.commit()
+        folder = Path(project.path) / ".anton" / "artifacts" / "demo"
+        folder.mkdir(parents=True)
+        (folder / "metadata.json").write_text(
+            json.dumps({"id": local_id, "slug": "demo", "type": "html-app"})
+        )
+        (folder / "index.html").write_text("<html>Owner bytes</html>")
+        try:
+            yield session, project, folder, record_artifact_owner
+        finally:
+            with Session(get_engine(get_app_settings().database.uri)) as cleanup:
+                for row in cleanup.exec(
+                    select(SharedResourceAttribution).where(
+                        SharedResourceAttribution.org_id == scope.org_id,
+                        SharedResourceAttribution.resource_key.startswith(f"{project.id}/"),
+                    )
+                ).all():
+                    cleanup.delete(row)
+                for row in cleanup.exec(
+                    select(ArtifactIdentity).where(
+                        ArtifactIdentity.org_id == scope.org_id,
+                        ArtifactIdentity.local_artifact_id == UUID(local_id).hex,
+                    )
+                ).all():
+                    cleanup.delete(row)
+                stale_project = cleanup.get(Project, project.id)
+                if stale_project is not None:
+                    cleanup.delete(stale_project)
+                cleanup.commit()
+    get_app_settings.cache_clear()
+
+
+def test_project_root_publish_uses_the_recorded_owner(
+    issuer, scope, local_id, project_root_artifact
+):
+    session, project, folder, record = project_root_artifact
+    record(session, project.id, "demo", scope.user_id, action="create")
+    key = identities.publish_authorization_key(local_id, folder.parent, "demo", project.id, scope)
+    assert key == identities.existing_authorization_key(local_id, scope)
+
+
+def test_project_root_publish_without_an_owner_is_refused(
+    issuer, scope, local_id, project_root_artifact
+):
+    from cowork.services.artifact_ownership import ArtifactOwnerUnknown
+
+    _session, project, folder, _record = project_root_artifact
+    with pytest.raises(ArtifactOwnerUnknown):
+        identities.publish_authorization_key(local_id, folder.parent, "demo", project.id, scope)
+    assert issuer.calls == []
+
+
+def test_identity_bound_to_another_owner_is_refused(
+    issuer, scope, local_id, project_root_artifact
+):
+    session, project, folder, record = project_root_artifact
+    record(session, project.id, "demo", scope.user_id, action="create")
+    other = str(uuid4())
+    with identities._session(scope) as identity_session:
+        identity_session.add(
+            identities.ArtifactIdentity(
+                org_id=scope.org_id, owner_keycloak_id=other, local_artifact_id=local_id
+            )
+        )
+        identity_session.commit()
+    with pytest.raises(ArtifactAccessUnavailable, match="bound to a different owner"):
+        identities.publish_authorization_key(local_id, folder.parent, "demo", project.id, scope)
+
+
+def test_project_root_publish_does_not_rediscover_roots(
+    issuer, scope, local_id, project_root_artifact, monkeypatch
+):
+    from cowork.services import artifact_roots
+
+    session, project, folder, record = project_root_artifact
+    record(session, project.id, "demo", scope.user_id, action="create")
+
+    def _no_discovery(*_args, **_kwargs):
+        raise AssertionError("the project root must not trigger root discovery")
+
+    monkeypatch.setattr(artifact_roots, "artifacts_sources_for_project", _no_discovery)
+    assert identities.publish_authorization_key(
+        local_id, folder.parent, "demo", project.id, scope
+    )
+
+
+def test_publish_from_a_root_outside_the_project_is_refused(
+    issuer, scope, local_id, project_root_artifact, tmp_path
+):
+    session, project, _folder, record = project_root_artifact
+    record(session, project.id, "demo", scope.user_id, action="create")
+    stray = tmp_path / "elsewhere" / ".anton" / "artifacts"
+    (stray / "demo").mkdir(parents=True)
+    with pytest.raises(ArtifactAccessUnavailable, match="does not belong to its project"):
+        identities.publish_authorization_key(local_id, stray, "demo", project.id, scope)
+    assert issuer.calls == []
+
+
+def test_publish_for_a_project_outside_the_scope_is_refused(
+    issuer, scope, local_id, project_root_artifact
+):
+    _session, project, folder, _record = project_root_artifact
+    other = TenantScope(org_mode=True, org_id=str(uuid4()), user_id=scope.user_id)
+    with pytest.raises(ArtifactAccessUnavailable, match="could not be resolved"):
+        identities.publish_authorization_key(local_id, folder.parent, "demo", project.id, other)
+    with pytest.raises(ArtifactAccessUnavailable, match="could not be resolved"):
+        identities.publish_authorization_key(local_id, folder.parent, "demo", "not-a-uuid", scope)
+    assert issuer.calls == []
+
+
+def test_publish_artifact_requires_project_id_in_org_mode(scope, project_root_artifact):
+    _session, _project, folder, _record = project_root_artifact
+    with pytest.raises(ValueError, match="requires project_id"):
+        publish_artifact(
+            folder, artifacts_base=folder.parent, api_key="k",
+            publish_url="https://view.test", scope=scope,
+        )
 
 
 pytestmark = pytest.mark.usefixtures("granted_product_permissions")

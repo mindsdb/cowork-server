@@ -14,6 +14,7 @@ from cowork.services import artifact_autopublish as ap
 from cowork.services import artifact_locks as locks
 
 ORG_SCOPE = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
+PROJECT_ID = "project-1"
 
 
 def _make(base, slug, *, files: dict[str, str], meta: dict):
@@ -70,8 +71,9 @@ def published(monkeypatch):
     calls = []
 
     def fake_publish(artifact, *, artifacts_base, api_key, publish_url, password=None,
-                     access=None, scope=None):
-        calls.append({"folder": artifact, "api_key": api_key, "access": access, "scope": scope})
+                     access=None, scope=None, project_id=None):
+        calls.append({"folder": artifact, "api_key": api_key, "access": access, "scope": scope,
+                      "project_id": project_id})
         (artifact / ".published.json").write_text(json.dumps({
             "index.html": {"report_id": "rid", "url": "u", "published": True,
                            "last_md5": "m", "published_mtime": 9_999_999_999},
@@ -80,6 +82,18 @@ def published(monkeypatch):
 
     monkeypatch.setattr(ap, "publish_artifact", fake_publish)
     return calls
+
+
+@pytest.fixture(autouse=True)
+def owned_slugs(monkeypatch):
+    """Keep testing reconciliation logic in isolation from the owner filter.
+
+    `_owned_slugs` opens its own DB session and resolves real ownership rows;
+    this module's fixtures use a non-UUID project id ("project-1") and write no
+    DB rows, so the default here is "everything is owned" and individual tests
+    override it to exercise the filter itself.
+    """
+    monkeypatch.setattr(ap, "_owned_slugs", lambda base, scope, project_id, slugs: (list(slugs), 0, 0))
 
 
 pytestmark = pytest.mark.usefixtures("publish_url")
@@ -92,7 +106,7 @@ async def test_disabled_setting_publishes_nothing(base, key, published, monkeypa
     _make(base, "rep", files={"report.html": "<html></html>"},
           meta={"slug": "rep", "type": "html-app"})
 
-    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert out == set()
     assert published == []
@@ -102,7 +116,7 @@ async def test_local_mode_publishes_nothing(base, enabled, key, published):
     _make(base, "rep", files={"report.html": "<html></html>"},
           meta={"slug": "rep", "type": "html-app"})
 
-    out = await ap.autopublish_project_artifacts(base, LOCAL_SCOPE, touched={"rep"})
+    out = await ap.autopublish_project_artifacts(base, LOCAL_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert out == set()
     assert published == []
@@ -112,7 +126,7 @@ async def test_missing_scope_publishes_nothing(base, enabled, key, published):
     _make(base, "rep", files={"report.html": "<html></html>"},
           meta={"slug": "rep", "type": "html-app"})
 
-    out = await ap.autopublish_project_artifacts(base, None, touched={"rep"})
+    out = await ap.autopublish_project_artifacts(base, None, project_id=PROJECT_ID, touched={"rep"})
 
     assert out == set()
     assert published == []
@@ -123,7 +137,7 @@ async def test_scope_without_user_id_publishes_nothing(base, enabled, key, publi
     _make(base, "rep", files={"report.html": "<html></html>"},
           meta={"slug": "rep", "type": "html-app"})
 
-    out = await ap.autopublish_project_artifacts(base, partial, touched={"rep"})
+    out = await ap.autopublish_project_artifacts(base, partial, project_id=PROJECT_ID, touched={"rep"})
 
     assert out == set()
     assert published == []
@@ -157,7 +171,7 @@ async def test_settings_are_read_with_the_passed_scope_not_the_ambient_one(
     _make(base, "rep", files={"report.html": "<html></html>"},
           meta={"slug": "rep", "type": "html-app"})
 
-    await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+    await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert seen and all(s is ORG_SCOPE for s in seen)
 
@@ -173,7 +187,7 @@ async def test_new_artifact_is_published_owner_only(base, enabled, key, publishe
     _make(base, "rep", files={"report.html": "<html></html>"},
           meta={"slug": "rep", "type": "html-app"})
 
-    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert out == {"rep"}
     assert published[0]["access"] == {"mode": "restricted", "emails": [], "owner_only": True}
@@ -196,7 +210,7 @@ async def test_republish_keeps_the_access_the_owner_chose(base, enabled, key, pu
         },
     }))
 
-    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert out == {"rep"}
     assert published[0]["access"] == {
@@ -219,7 +233,7 @@ async def test_republish_of_an_owner_only_artifact_stays_owner_only(base, enable
         },
     }))
 
-    await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+    await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert published[0]["access"]["owner_only"] is True
     assert published[0]["access"]["mode"] == "restricted"
@@ -235,7 +249,7 @@ async def test_scope_is_threaded_into_the_publisher(base, enabled, key, publishe
     _make(base, "rep", files={"report.html": "<html></html>"},
           meta={"slug": "rep", "type": "html-app"})
 
-    await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+    await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert published[0]["scope"] is ORG_SCOPE
 
@@ -263,7 +277,7 @@ async def test_publish_key_carries_the_active_hub_workspace(base, enabled, publi
     _make(base, "rep", files={"report.html": "<html></html>"},
           meta={"slug": "rep", "type": "html-app"})
 
-    await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+    await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert captured["workspace_id"] == "ws-1"
 
@@ -272,7 +286,7 @@ async def test_key_is_revoked_after_reconciliation(base, enabled, key, published
     _make(base, "rep", files={"report.html": "<html></html>"},
           meta={"slug": "rep", "type": "html-app"})
 
-    await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+    await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert key.revoked is True
 
@@ -296,7 +310,7 @@ async def test_nothing_to_publish_mints_no_key(base, enabled, published, monkeyp
     monkeypatch.setattr(ap, "PublishKey", FakeKey)
     _make(base, "data", files={"rows.csv": "a,b"}, meta={"slug": "data", "type": "dataset"})
 
-    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"data"})
+    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"data"})
 
     assert out == set()
     assert minted == []
@@ -319,7 +333,7 @@ async def test_no_key_available_publishes_nothing(base, enabled, published, monk
     _make(base, "rep", files={"report.html": "<html></html>"},
           meta={"slug": "rep", "type": "html-app"})
 
-    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert out == set()
     assert published == []
@@ -337,7 +351,7 @@ async def test_authority_failure_skips_autopublish_and_releases_lock(
     monkeypatch.setattr("cowork.services.artifact_publish_key.mint_turn_key", reject)
     _make(base, "rep", files={"report.html": "<html></html>"},
           meta={"slug": "rep", "type": "html-app"})
-    assert await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"}) == set()
+    assert await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"}) == set()
     assert published == []
     assert locks.acquire(base, "rep", ttl_s=60)
     locks.release(base, "rep")
@@ -348,7 +362,7 @@ async def test_authority_failure_skips_autopublish_and_releases_lock(
 async def test_untouched_unpublished_artifact_is_picked_up_by_phase_two(base, enabled, key, published):
     _make(base, "old", files={"a.md": "x"}, meta={"slug": "old", "type": "document"})
 
-    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched=set())
+    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched=set())
 
     assert out == {"old"}
 
@@ -360,7 +374,7 @@ async def test_touched_artifact_publishes_before_the_backlog(base, enabled, key,
     _make(base, "hot", files={"report.html": "<html></html>"},
           meta={"slug": "hot", "type": "html-app"})
 
-    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"hot"}, limit=1)
+    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"hot"}, limit=1)
 
     assert out == {"hot"}
     assert [c["folder"].name for c in published] == ["hot"]
@@ -371,7 +385,7 @@ async def test_limit_caps_the_number_of_publishes(base, enabled, key, published)
         _make(base, f"a-{i}", files={"a.md": str(i)},
               meta={"slug": f"a-{i}", "type": "document"})
 
-    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched=set(), limit=2)
+    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched=set(), limit=2)
 
     assert len(out) == 2
     assert len(published) == 2
@@ -383,7 +397,7 @@ async def test_static_is_published_before_fullstack(base, enabled, key, publishe
           meta={"slug": "app", "type": "fullstack-stateless-app"})
     _make(base, "doc", files={"a.md": "x"}, meta={"slug": "doc", "type": "document"})
 
-    await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"app", "doc"})
+    await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"app", "doc"})
 
     assert [c["folder"].name for c in published] == ["doc", "app"]
 
@@ -394,7 +408,7 @@ async def test_exhausted_budget_skips_the_rest(base, enabled, key, published):
               meta={"slug": f"a-{i}", "type": "document"})
 
     out = await ap.autopublish_project_artifacts(
-        base, ORG_SCOPE, touched=set(), budget_s=0.0, touched_budget_s=0.0,
+        base, ORG_SCOPE, project_id=PROJECT_ID, touched=set(), budget_s=0.0, touched_budget_s=0.0,
     )
 
     assert out == set()
@@ -406,7 +420,7 @@ async def test_locks_dir_is_not_treated_as_a_candidate(base, enabled, key, publi
     _make(base, "rep", files={"report.html": "<html></html>"},
           meta={"slug": "rep", "type": "html-app"})
 
-    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert out == {"rep"}
 
@@ -426,7 +440,7 @@ async def test_timeout_does_not_fail_the_call_and_keeps_the_lock(base, enabled, 
     monkeypatch.setattr(ap, "publish_artifact", slow_publish)
 
     out = await ap.autopublish_project_artifacts(
-        base, ORG_SCOPE, touched={"rep"}, timeout_s=0.05,
+        base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"}, timeout_s=0.05,
     )
 
     assert out == set()
@@ -446,7 +460,7 @@ async def test_lock_is_released_after_a_failed_publish(base, enabled, key, monke
 
     monkeypatch.setattr(ap, "publish_artifact", boom)
 
-    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert out == set()
     assert locks.acquire(base, "rep", ttl_s=600) is True
@@ -458,7 +472,7 @@ async def test_lock_is_released_after_a_successful_publish(base, enabled, key, p
     _make(base, "rep", files={"report.html": "<html></html>"},
           meta={"slug": "rep", "type": "html-app"})
 
-    await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+    await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert locks.acquire(base, "rep", ttl_s=600) is True
 
@@ -472,7 +486,7 @@ async def test_publish_failure_leaves_no_record_so_next_turn_retries(base, enabl
 
     monkeypatch.setattr(ap, "publish_artifact", boom)
 
-    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert out == set()
     assert not (base / "rep" / ".published.json").exists()
@@ -484,7 +498,7 @@ async def test_busy_lock_skips_the_slug(base, enabled, key, published):
           meta={"slug": "rep", "type": "html-app"})
     locks.acquire(base, "rep", ttl_s=600)
 
-    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     assert out == set()
     assert published == []
@@ -508,8 +522,58 @@ async def test_metric_is_emitted_above_the_deployment_log_level(
           meta={"slug": "rep", "type": "html-app"})
 
     with caplog.at_level(logging.WARNING, logger="cowork.services.artifact_autopublish"):
-        await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+        await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
 
     lines = [r for r in caplog.records if r.message.startswith("artifact_autopublish")]
     assert lines, "the metric must be visible at WARNING"
     assert any("result=published" in r.getMessage() for r in lines)
+
+
+async def test_missing_project_id_skips_the_reconcile_in_org_mode(base, enabled, key, published, caplog):
+    _make(base, "rep", files={"report.html": "<html></html>"},
+          meta={"slug": "rep", "type": "html-app"})
+
+    out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, touched={"rep"})
+
+    assert out == set()
+    assert published == []
+    assert "result=skipped reason=no_project_id" in caplog.text
+
+
+async def test_project_id_reaches_publish_artifact(base, enabled, key, published):
+    _make(base, "rep", files={"report.html": "<html></html>"},
+          meta={"slug": "rep", "type": "html-app"})
+
+    await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
+
+    assert published[0]["project_id"] == PROJECT_ID
+
+
+# ─── owner filter (F1) ───────────────────────────────────────────────────
+
+
+async def test_not_owned_slugs_are_dropped_and_logged(
+    base, enabled, key, published, monkeypatch, caplog,
+):
+    """Only slugs this scope's user owns are planned; a drop is logged once,
+    not per artifact retried and failed downstream on every turn."""
+    import logging
+
+    _make(base, "mine", files={"report.html": "<html></html>"},
+          meta={"slug": "mine", "type": "html-app"})
+    _make(base, "theirs", files={"other.html": "<html></html>"},
+          meta={"slug": "theirs", "type": "html-app"})
+
+    def fake_owned(base_, scope, project_id, slugs):
+        return ([s for s in slugs if s == "mine"], 1, 0)
+
+    monkeypatch.setattr(ap, "_owned_slugs", fake_owned)
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.artifact_autopublish"):
+        out = await ap.autopublish_project_artifacts(
+            base, ORG_SCOPE, project_id=PROJECT_ID, touched={"mine", "theirs"},
+        )
+
+    assert out == {"mine"}
+    assert [c["folder"].name for c in published] == ["mine"]
+    assert "result=skipped not_owner=1" in caplog.text
