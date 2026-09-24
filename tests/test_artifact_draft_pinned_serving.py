@@ -120,14 +120,14 @@ async def test_comment_layer_reads_the_pinned_file_not_its_replaced_name(
     served.write_text("<html><body>authorized html</body></html>")
     outside = tmp_path / "outside.html"
     outside.write_text("<html><body>outside secret</body></html>")
-    read_pinned = workspace_ep._comment_layer_from_fd
+    read_pinned = workspace_ep._preview_html_from_fd
 
-    def swap_then_read(fd):
+    def swap_then_read(fd, **kwargs):
         served.unlink()
         served.symlink_to(outside)
-        return read_pinned(fd)
+        return read_pinned(fd, **kwargs)
 
-    monkeypatch.setattr(workspace_ep, "_comment_layer_from_fd", swap_then_read)
+    monkeypatch.setattr(workspace_ep, "_preview_html_from_fd", swap_then_read)
 
     response = await _serve(
         monkeypatch, source, folder, metadata, "index.html", comments=True

@@ -35,7 +35,7 @@ from cowork.services.artifact_permissions import (
     artifact_owner_id,
     require_artifact_owner,
 )
-from cowork.services.comments_layer import inject_layer
+from cowork.services.preview_html import prepare_preview_html
 from cowork.services.artifact_identity import opened_artifact_folder
 from cowork.services.artifact_revisions import (
     JOURNAL_DIRNAME,
@@ -322,8 +322,8 @@ def _recorded_source_selector(source, folder: Path, metadata: dict) -> str | Non
         return None
 
 
-def _comment_layer_from_fd(fd: int) -> HTMLResponse | None:
-    """Build the review HTML from the already-authorized file descriptor."""
+def _preview_html_from_fd(fd: int, *, comments: bool) -> HTMLResponse | None:
+    """Build the preview HTML from the already-authorized file descriptor."""
     payload = bytearray()
     try:
         while chunk := os.read(fd, 1 << 16):
@@ -339,7 +339,9 @@ def _comment_layer_from_fd(fd: int) -> HTMLResponse | None:
             os.lseek(fd, 0, os.SEEK_SET)
         except OSError:
             pass
-    return HTMLResponse(inject_layer(html), headers=_DRAFT_RESPONSE_HEADERS)
+    return HTMLResponse(
+        prepare_preview_html(html, comments=comments), headers=_DRAFT_RESPONSE_HEADERS
+    )
 
 
 def _draft_stream(
@@ -1216,8 +1218,12 @@ async def serve_private_draft(
     media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
     resources, fd, file_stat = _open_pinned_draft_file(source, folder, parts)
     try:
-        if not download and wants_comment_layer(media_type, request):
-            resp = await run_in_threadpool(_comment_layer_from_fd, fd)
+        if not download and media_type == "text/html":
+            resp = await run_in_threadpool(
+                _preview_html_from_fd,
+                fd,
+                comments=wants_comment_layer(media_type, request),
+            )
             if resp is not None:
                 resources.close()
                 return resp
