@@ -361,6 +361,26 @@ deployment:
           key: DATASOURCE_PRODUCER_KEY
           optional: true
 
+    # Which connector methods this deployment may run as a cloud datasource,
+    # as a versioned manifest: {"manifest_version": 1, "enabled": ["postgres:host-port"]}.
+    # Empty means none, which is the released state, and the release gate edits
+    # this value per environment. It is the second of two gates: a method whose
+    # own spec says the adapters cannot run it stays unavailable however this
+    # reads, so enabling one here can never get ahead of the adapter work.
+    - name: COWORK_DATASOURCE_CAPABILITIES
+      value: ""
+
+    # Where this server reaches the datasource gateway to check a connection
+    # someone just saved. The gateway's probe route is cluster-only, so this is
+    # the inference Service by name, resolved namespace-relative exactly as the
+    # auth address above is, and correct in every environment without an
+    # override. Set here rather than left to the release gate because it is an
+    # address and not a permission: it does nothing at all while the feature is
+    # off, and forgetting it later is the confusing failure, a connection that
+    # saves and then waits forever to be checked.
+    - name: COWORK_TURN_DATASOURCE_GATEWAY_BASE_URL
+      value: "http://mindshub-inference"
+
     # Inference base URL the pod's turn calls. MUST be this env's own inference:
     # the turn key is minted by this env's auth, and each inference validates
     # against the auth in ITS namespace — PR envs run their own Postgres, so a

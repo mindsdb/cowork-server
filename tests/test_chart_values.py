@@ -69,6 +69,23 @@ def test_datasource_grants_are_off_in_the_base_and_on_only_where_the_gate_passed
         assert overrides == expected, f"{env_values.name} sets {FLAG}={overrides}"
 
 
+def test_no_datasource_method_is_offered_in_the_released_values(base):
+    """The list of methods a deployment may run, empty until a gate says
+    otherwise. Declared here so turning one on is an edit to a value rather
+    than a new line nobody remembers to add."""
+    assert _entry(base, "COWORK_DATASOURCE_CAPABILITIES")["value"] == ""
+    for env_values in ENVIRONMENTS:
+        declared = [e for e in _env(env_values) if e.get("name") == "COWORK_DATASOURCE_CAPABILITIES"]
+        assert declared == [], f"{env_values.name} declares the manifest; the base already does"
+
+
+def test_the_gateway_address_is_the_service_name_and_is_set(base):
+    """An address, not a permission: it does nothing while the feature is off,
+    and without it a saved connection is never checked and waits forever. The
+    Service name resolves namespace-relative, so one value is right everywhere."""
+    assert _entry(base, "COWORK_TURN_DATASOURCE_GATEWAY_BASE_URL")["value"] == "http://mindshub-inference"
+
+
 def test_the_producer_identity_is_the_producer_role_of_the_shared_bundle(base):
     references = {
         "COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID": "DATASOURCE_PRODUCER_KEY_ID",
