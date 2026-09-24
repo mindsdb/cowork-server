@@ -356,6 +356,114 @@ async def test_route_request_ignores_jev_result_even_when_it_contradicts_the_gat
 
 
 @pytest.mark.asyncio
+async def test_gate_and_jev_probe_share_the_turns_correlation_id(monkeypatch):
+    """The gate's trace context carries the turn's correlation_id, and
+    the detached probe inherits it, so the real probe's Jev call is attributed
+    to the conversation (origin:harness, not direct-api) and joins the gate
+    decision it shadows. Only the HTTP client is faked: the context has to cross
+    the gate's create_task for this to pass."""
+    import asyncio
+    import json
+
+    import cowork.handlers.responses as responses
+    from anton.core.llm.tracing import get_trace_context
+    from cowork.handlers import jev_shadow
+
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
+    )
+    llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
+
+    async def fake_binding():
+        return None, {"correlation_id": "corr-1", "llm": llm_block}
+
+    handler._router_binding = fake_binding
+    seen = {}
+
+    async def fake_decide_route(**_kwargs):
+        seen["gate_context"] = get_trace_context()
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+    sent = asyncio.Event()
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def post(self, _url, *, headers, json):
+            seen["probe_headers"] = headers
+            sent.set()
+            return SimpleNamespace(status_code=500, json=lambda: {})
+
+    monkeypatch.setattr(jev_shadow.httpx, "AsyncClient", _Client)
+
+    await handler._route_request(
+        conversation_id="conv-1",
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+        trace_metadata={"cowork_server_version": "1.2.3"},
+    )
+    await asyncio.wait_for(sent.wait(), timeout=2)
+
+    gate = seen["gate_context"]
+    assert gate.metadata["correlation_id"] == "corr-1"
+    assert gate.turn_id is None
+    headers = seen["probe_headers"]
+    assert "Langfuse-Session-Id" not in headers
+    assert "cowork-gate" not in headers["Langfuse-Tags"]
+    assert jev_shadow.JEV_SHADOW_TAG in headers["Langfuse-Tags"]
+    metadata = json.loads(headers["Langfuse-Metadata"])
+    assert (metadata["correlation_id"], metadata["harness"], metadata["conversation_id"]) == (
+        "corr-1",
+        "anton",
+        "conv-1",
+    )
+    # The context is the gate's alone: it does not leak past the gate block.
+    assert get_trace_context() is None
+
+
+@pytest.mark.asyncio
+async def test_gate_without_a_minted_turn_key_carries_no_correlation_id(monkeypatch):
+    import cowork.handlers.responses as responses
+    from anton.core.llm.tracing import get_trace_context
+
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
+    )
+    seen = {}
+
+    async def fake_decide_route(**_kwargs):
+        seen["gate_context"] = get_trace_context()
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+
+    await handler._route_request(
+        conversation_id="conv-1",
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+        trace_metadata={"cowork_server_version": "1.2.3"},
+    )
+
+    assert seen["gate_context"].metadata == {"cowork_server_version": "1.2.3"}
+
+
+@pytest.mark.asyncio
 async def test_route_request_returns_promptly_even_when_jev_is_slow(monkeypatch):
     """The probe must be detached, not awaited alongside the gate: a ready
     gate decision returning only after Jev finishes would mean a 'shadow'
