@@ -129,6 +129,16 @@ deployment:
   # neither the buffer nor the handle and 404s.
   replicaCount: 2
 
+  # The two switches for cloud datasource turns, templated into
+  # COWORK_TURN_DATASOURCE_ENABLED and COWORK_DATASOURCE_CAPABILITIES below. The
+  # release gate replaces these scalars in values-<env>.yaml, since an extraEnvs
+  # entry would render a second copy of the variable.
+  # TEST ENABLEMENT, integration branch only, never merged or cherry-picked:
+  # a pull request environment renders the base alone, so both switches are
+  # on here. On `staging` they are "false" and "", and the guard expects that.
+  datasourceTurnsEnabled: "true"
+  datasourceCapabilities: '{"manifest_version": 1, "enabled": ["postgres:host-port", "mysql:host-password"]}'
+
   image:
     # The build-push-ecr action derives the ECR repo name from the GitHub repo
     # slug, so this must track the GitHub repo name (cowork-server).
@@ -333,15 +343,10 @@ deployment:
     # Secret the producer refuses every datasource turn (ProductPermissionUnavailable),
     # the same closed door, and a namespace that has no bundle yet still deploys.
     # Provision the bundle before the flag turns on, not before this deploys.
-    # Set here in the base, so every environment renders the same shape and the
-    # gate flips one switch per environment; tests/test_chart_values.py pins
-    # which environments are on.
-    # TEST ENABLEMENT, integration branch only, never merged or cherry-picked.
-    # A pull request environment composes base values alone, so this is the only
-    # place that can switch datasource grants on there. On `staging` this line
-    # reads "false" and the guard expects it.
+    # Read from deployment.datasourceTurnsEnabled, so the gate flips that scalar
+    # per environment; tests/test_chart_values.py pins which environments are on.
     - name: COWORK_TURN_DATASOURCE_ENABLED
-      value: "true"
+      value: '{{ $.Values.datasourceTurnsEnabled }}'
     - name: COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID
       valueFrom:
         secretKeyRef:
@@ -357,15 +362,12 @@ deployment:
 
     # Which connector methods this deployment may run as a cloud datasource,
     # as a versioned manifest: {"manifest_version": 1, "enabled": ["postgres:host-port"]}.
-    # Empty means none, which is the released state, and the release gate edits
-    # this value per environment. It is the second of two gates: a method whose
-    # own spec says the adapters cannot run it stays unavailable however this
-    # reads, so enabling one here can never get ahead of the adapter work.
-    # TEST ENABLEMENT, integration branch only, never merged or cherry-picked:
-    # both methods are named so a pull request environment offers them. On
-    # `staging` this value is "" and the guard expects it.
+    # Empty means none, which is the released state, and the release gate sets
+    # deployment.datasourceCapabilities per environment. A method whose own spec
+    # says the adapters cannot run it stays unavailable however this reads, so
+    # enabling one here can never get ahead of the adapter work.
     - name: COWORK_DATASOURCE_CAPABILITIES
-      value: '{"manifest_version": 1, "enabled": ["postgres:host-port", "mysql:host-password"]}'
+      value: '{{ $.Values.datasourceCapabilities }}'
 
     # Where this server reaches the datasource gateway to check a connection
     # someone just saved. The gateway's probe route is cluster-only, so this is
