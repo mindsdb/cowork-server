@@ -467,7 +467,7 @@ def _owner_workspace(session, project_ref: str, artifact_id: str):
     source, folder, metadata, _is_own = review_artifact_for_request(
         session, project_ref, artifact_id
     )
-    capabilities = require_artifact_owner(session, source)
+    capabilities = require_artifact_owner(session, source, folder.name)
     return source, folder, metadata, capabilities
 
 
@@ -694,7 +694,9 @@ async def artifact_review_entry(
     source, folder, metadata, _is_own = review_artifact_for_request(
         session, project_ref, artifact_id
     )
-    capabilities = await _current_capabilities(session, artifact_capabilities(session, source))
+    capabilities = await _current_capabilities(
+        session, artifact_capabilities(session, source, folder.name)
+    )
     current_revision = None
     try:
         draft = await run_in_threadpool(current_source, folder, metadata, artifact_id)
@@ -877,7 +879,7 @@ async def enable_artifact_comments(
 
     source, folder, metadata, capabilities = _owner_workspace(session, project_ref, artifact_id)
     capabilities = await _current_capabilities(session, capabilities)
-    owner_user_id = artifact_owner_id(session, source)
+    owner_user_id = artifact_owner_id(session, source, folder.name)
     try:
         canonical_key = await run_in_threadpool(
             ensure_authorization_key,
