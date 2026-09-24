@@ -32,6 +32,14 @@ def inject_shim(html: str) -> str:
     after the doctype, at the very start. The doctype rule is not cosmetic —
     a script in front of it switches the document to quirks mode and changes
     the page's layout.
+
+    These patterns match the FIRST occurrence, unlike comments_layer.inject_layer's
+    LAST ``</body>``: a literal ``<head>`` earlier in the document — inside a
+    comment, or a JavaScript string — mis-targets the insertion, and in the
+    string case the injected ``</script>`` terminates the page's own script.
+    inject_layer can anchor on the last match because it only needs to land
+    somewhere before the document ends; this function has to land before the
+    page's own scripts run, which the first-match risk is accepted for.
     """
     # The offset a later inline script shifts by is the number of newlines this
     # very injection adds, so it is measured on the rendered tag rather than

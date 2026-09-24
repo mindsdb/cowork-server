@@ -919,11 +919,11 @@ async def preview_asset(token: str, rel_path: str, request: Request):
     if not target.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-    if media_type == "text/html":
+    if media_type == "text/html" and "download" not in request.query_params:
         # Offload the (potentially large) synchronous read so it doesn't stall
         # the event loop / other in-flight SSE streams — this endpoint is async.
         resp = await run_in_threadpool(
-            html_preview_response, target, comments=wants_comment_layer(media_type, request)
+            html_preview_response, target, comments=wants_comment_layer(request)
         )
         if resp is not None:
             return resp
@@ -956,8 +956,8 @@ def serve_artifact_file(
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
     # This endpoint is a sync `def`, so FastAPI already runs it in a threadpool
     # — the blocking read here doesn't touch the event loop.
-    if media_type == "text/html":
-        resp = html_preview_response(target, comments=wants_comment_layer(media_type, request))
+    if media_type == "text/html" and "download" not in request.query_params:
+        resp = html_preview_response(target, comments=wants_comment_layer(request))
         if resp is not None:
             return resp
     return FileResponse(target, media_type=media_type, headers=artifact_response_headers(media_type))
