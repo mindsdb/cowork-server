@@ -89,3 +89,59 @@ async def test_owned_slugs_fails_closed_for_a_project_outside_the_scope(tmp_path
 
     other_org = TenantScope(org_mode=True, org_id=str(uuid4()), user_id=mine)
     assert ap._owned_slugs(source.base, other_org, str(project.id), ["mine"]) == ([], 0, 1)
+
+
+async def test_reconcile_publishes_only_the_scope_users_artifact(tmp_path, monkeypatch, caplog):
+    """End to end with the REAL owner filter: of two artifacts touched in a
+    shared project root, only the one recorded for the scope's user is
+    published; the other is skipped and counted once."""
+    import json
+    import logging
+
+    org_id, mine, theirs = str(uuid4()), str(uuid4()), str(uuid4())
+    project = make_project(tmp_path, org_id)
+    source = project_root(project)
+    write_artifact(source.base, "mine")
+    write_artifact(source.base, "theirs")
+    with Session(_engine()) as raw:
+        session = ScopedSession(raw, TenantScope(org_mode=True, org_id=org_id))
+        ownership.record_artifact_owner(session, project.id, "mine", mine, action="create")
+        ownership.record_artifact_owner(session, project.id, "theirs", theirs, action="create")
+
+    class FakeKey:
+        instance_id = "inst-1"
+
+        def __init__(self, *a, **kw):
+            pass
+
+        async def get(self):
+            return "turnkey-1"
+
+        async def revoke(self):
+            pass
+
+    published = []
+
+    def fake_publish(artifact, *, artifacts_base, api_key, publish_url, password=None,
+                     access=None, scope=None, project_id=None):
+        published.append(artifact.name)
+        (artifact / ".published.json").write_text(json.dumps({
+            "index.html": {"report_id": "rid", "url": "u", "published": True,
+                           "last_md5": "m", "published_mtime": 9_999_999_999},
+        }))
+        return {"status": "ok", "url": "u"}
+
+    monkeypatch.setattr(ap, "_is_enabled", lambda scope: True)
+    monkeypatch.setattr(ap, "_publish_url", lambda scope: "https://api.staging.mindshub.ai")
+    monkeypatch.setattr(ap, "PublishKey", FakeKey)
+    monkeypatch.setattr(ap, "publish_artifact", fake_publish)
+
+    scope = TenantScope(org_mode=True, org_id=org_id, user_id=mine)
+    with caplog.at_level(logging.WARNING, logger=ap.__name__):
+        out = await ap.autopublish_project_artifacts(
+            source.base, scope, project_id=str(project.id), touched={"mine", "theirs"},
+        )
+
+    assert out == {"mine"}
+    assert published == ["mine"]
+    assert "result=skipped not_owner=1" in caplog.text
