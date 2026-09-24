@@ -86,9 +86,6 @@ def _real_project(client, name: str) -> dict:
     return r.json()
 
 
-# ── Create ───────────────────────────────────────────────────────────────
-
-
 def test_create_makes_two_sides_each_in_its_own_sandbox(client):
     r = _create(client)
     assert r.status_code == 201, r.text
@@ -140,9 +137,6 @@ def test_create_from_an_unknown_project_is_404(client):
     assert r.status_code == 404, r.text
 
 
-# ── Hidden from what a person browses ─────────────────────────────────────
-
-
 def test_sandboxes_and_their_tasks_are_hidden_from_lists(client):
     body = _create(client, title="hidden-from-lists").json()
     project_ids = {s["projectId"] for s in body["sides"]}
@@ -190,9 +184,6 @@ def test_sandbox_artifacts_are_hidden_from_the_unfiltered_list_only(client):
     assert slug in titles(own)
     everything = client.get("/api/v1/artifacts/").json()
     assert slug not in titles(everything)
-
-
-# ── Copy from a project ─────────────────────────────────────────────────
 
 
 def _seed_source(root: Path) -> None:
@@ -290,9 +281,6 @@ def test_copy_budget_counts_bytes_as_read(tmp_path, monkeypatch):
         comparisons.copy_project_files(src, dest, org_mode=False)
 
 
-# ── Verdicts ─────────────────────────────────────────────────────────────
-
-
 def test_verdicts_are_kept_per_turn_and_the_latest_is_the_verdict(client):
     cid = _create(client).json()["id"]
     r = client.put(f"/api/v1/comparisons/{cid}/verdicts/0", json={"winner": "a"})
@@ -326,9 +314,6 @@ def test_list_and_get(client):
     assert cid in {c["id"] for c in listed}
     assert client.get(f"/api/v1/comparisons/{cid}").json()["title"] == "listed one"
     assert client.get(f"/api/v1/comparisons/{uuid4()}").status_code == 404
-
-
-# ── Continue ─────────────────────────────────────────────────────────────
 
 
 def test_continue_moves_the_side_into_a_real_project(client):
@@ -386,9 +371,6 @@ def test_continue_rejects_an_unknown_side(client):
     assert r.status_code == 422
 
 
-# ── Delete ───────────────────────────────────────────────────────────────
-
-
 def test_delete_removes_the_sandboxes_but_not_a_continued_task(client):
     body = _create(client).json()
     a, b = body["sides"]
@@ -412,9 +394,6 @@ def test_delete_refuses_while_a_side_is_running(client):
     with patch("cowork.streaming.registry.registry.get", return_value=running):
         assert client.delete(f"/api/v1/comparisons/{body['id']}").status_code == 409
     assert client.get(f"/api/v1/comparisons/{body['id']}").status_code == 200
-
-
-# ── The turn path ────────────────────────────────────────────────────────
 
 
 def _turn(client, conversation_id, **extra):
@@ -494,9 +473,6 @@ def test_ineligible_reason_puts_a_side_first():
     ) is None
 
 
-# ── Connectors ───────────────────────────────────────────────────────────
-
-
 def test_blocked_connections_are_the_messaging_ones(monkeypatch):
     from cowork.services import comparisons
     from cowork.services.connectors import connections
@@ -538,9 +514,6 @@ def test_every_blocked_category_exists_in_the_catalog():
     assert BLOCKED_CONNECTOR_CATEGORIES <= categories
 
 
-# ── Memory ───────────────────────────────────────────────────────────────
-
-
 def test_a_side_never_writes_memory_in_process():
     from cowork.harnesses.anton_harness.harness import _memory_mode
 
@@ -564,9 +537,6 @@ def test_a_side_never_writes_memory_remotely(client):
         apply.assert_not_called()
         ResponsesHandler._persist_turn_memory(session, UUID(conv["id"]), [{"x": 1}], None)
         apply.assert_called_once()
-
-
-# ── Publishing ───────────────────────────────────────────────────────────
 
 
 def test_publishing_from_a_side_is_refused_before_anything_else(tmp_path):
@@ -605,9 +575,6 @@ def test_autopublish_skips_a_side(tmp_path, monkeypatch):
     assert candidates == [ordinary]
 
 
-# ── Personal, like conversations ─────────────────────────────────────────
-
-
 def test_a_comparison_is_invisible_to_another_member(tmp_path, monkeypatch):
     monkeypatch.setenv("COWORK_HOME", str(tmp_path))
     monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
@@ -639,9 +606,6 @@ def test_a_comparison_is_invisible_to_another_member(tmp_path, monkeypatch):
         assert [c.id for c in alice.list_comparisons()] == [comparison.id]
     finally:
         get_app_settings.cache_clear()
-
-
-# ── Artifact backends ────────────────────────────────────────────────────
 
 
 def test_same_slug_backends_in_two_projects_are_tracked_apart(tmp_path, monkeypatch):
@@ -691,9 +655,6 @@ def test_scratchpad_pool_keys_by_workspace(tmp_path, monkeypatch):
     assert scratchpad_runtime.get_or_create("dash", workspace_path=str(tmp_path / "one")) is one
     assert [name for name, _ in made] == ["dash", "dash"]
     assert scratchpad_runtime.list_pads() == ["dash", "dash"]
-
-
-# ── Gaps found before mutation testing ───────────────────────────────────
 
 
 def test_sandboxes_are_hidden_from_search_and_memories(client):
