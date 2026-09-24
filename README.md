@@ -878,8 +878,8 @@ datasources.
 Turn the flag on only after auth serves the datasource producer and resolver
 endpoints, the inference deployment serves `/v1/datasources/`, the
 scratchpad-controller passes the `datasource` block on, and the scratchpad image
-includes the typed helper that reads the gateway from the turn's inference host.
-With the flag off nothing
+includes the typed helper that reads the gateway from the turn's inference host,
+with live pods from an older image recycled first. With the flag off nothing
 in this path runs, so the flag is also the rollback.
 
 ## Configuration
