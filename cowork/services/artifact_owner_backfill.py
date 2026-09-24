@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import stat
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,11 +42,12 @@ from cowork.services.artifact_ownership import (
     provenance_origin,
     record_artifact_owner,
 )
+from cowork.services.artifact_roots import _ARTIFACTS_SUBPATH, _is_real_directory
+from cowork.services.task_objects import KIND_ARTIFACT
 
 logger = logging.getLogger(__name__)
 
 SENTINEL_KEY = "_artifact_owner_backfill_v1"
-_ARTIFACTS_SUBPATH = (".anton", "artifacts")
 _LOCK_KEY = int.from_bytes(
     hashlib.blake2b(b"cowork\0artifact_owner_backfill_v1", digest_size=8).digest(),
     byteorder="big",
@@ -105,13 +105,6 @@ def _write_sentinel(engine) -> None:
             raw.rollback()  # another replica finished first
 
 
-def _is_real_directory(path: Path) -> bool:
-    try:
-        return stat.S_ISDIR(path.lstat().st_mode)
-    except OSError:
-        return False
-
-
 def _is_candidate(folder: Path) -> bool:
     """A real artifact folder: not a link, not the locks dir, has metadata."""
     if folder.name.startswith(".") or not _is_real_directory(folder):
@@ -146,9 +139,7 @@ def _owner_from_task_objects(session, project_id, slug: str) -> str | None:
     rows = session.exec(
         session.select(TaskObject).where(
             TaskObject.project_id == project_id,
-            # task_objects.KIND_ARTIFACT; importing it would cycle through
-            # artifact_ownership -> task_objects.
-            TaskObject.kind == "artifact",
+            TaskObject.kind == KIND_ARTIFACT,
             TaskObject.ref == slug,
         )
     ).all()

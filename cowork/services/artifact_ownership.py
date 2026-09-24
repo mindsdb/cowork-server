@@ -32,13 +32,13 @@ from uuid import UUID
 from cowork.models.conversation import Conversation
 from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.services.artifact_access import ArtifactAccessUnavailable
+from cowork.services.artifact_roots import _ARTIFACTS_SUBPATH
 
 logger = logging.getLogger(__name__)
 
 ARTIFACT = "artifact"
 
 _KEY_MAX_LENGTH = 255  # SharedResourceAttribution.resource_key
-_ARTIFACTS_SUBPATH = (".anton", "artifacts")
 _CONVERSATIONS_DIRNAME = "conversations"
 
 OwnerState = Literal["recorded", "legacy_path", "unknown", "local"]
