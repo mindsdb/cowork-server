@@ -95,6 +95,18 @@ async def _warm_model_map_on_boot() -> bool:
         warm_session.close()
 
 
+async def _run_artifact_owner_backfill() -> None:
+    """Background, one-time owner backfill (ENG-2961). Never affects startup."""
+    try:
+        from cowork.services.artifact_owner_backfill import run_artifact_owner_backfill
+
+        await asyncio.to_thread(run_artifact_owner_backfill)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("artifact owner backfill failed (non-fatal)")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_dev_setup()
@@ -149,11 +161,16 @@ async def lifespan(app: FastAPI):
     start_scheduler()
     await _start_channels(app)
     app.state.channel_ingress_reconciler = None
+    app.state.artifact_owner_backfill = None
     if get_app_settings().tenancy_mode == "org":
         from cowork.channels.ingress import start_reconciler
 
         app.state.channel_ingress_reconciler = start_reconciler(
             app.state.channel_ingress, app.state.channel_adapters
+        )
+        # Background so the port binds without waiting for an EFS walk.
+        app.state.artifact_owner_backfill = asyncio.create_task(
+            _run_artifact_owner_backfill()
         )
     try:
         yield
@@ -169,6 +186,12 @@ async def lifespan(app: FastAPI):
             reconciler.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await reconciler
+
+        backfill_task = getattr(app.state, "artifact_owner_backfill", None)
+        if backfill_task is not None:
+            backfill_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await backfill_task
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
