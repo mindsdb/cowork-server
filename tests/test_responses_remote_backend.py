@@ -1640,6 +1640,103 @@ async def test_produce_remote_does_not_card_a_failed_turn(monkeypatch, tmp_path)
     assert not [e for e in saved["events"] if e.get("type") == "response.artifact_created"]
 
 
+@pytest.mark.asyncio
+async def test_produce_remote_claims_an_unattributed_artifact_of_a_failed_turn(monkeypatch, tmp_path):
+    """ENG-2961 R1: anton writes metadata.json with empty provenance first and
+    appends the turn's entry right after, so a turn cut short in between leaves
+    a folder with no provenance. On a non-clean exit that folder is still this
+    turn's; one naming another conversation is still dropped."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    project_dir = tmp_path / "proj"
+    artifacts_base = project_dir / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    conversation = _conversation_at(project_dir)
+    monkeypatch.setattr(
+        responses_mod.ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: (
+            conversation, artifacts_base,
+            str(conversation.project_id), conversation.project.name,
+        )),
+    )
+
+    from cowork.services import task_objects
+
+    indexed = {}
+
+    def spy_index(*args, **kwargs):
+        indexed["tracked_new"] = set(kwargs["tracked_new"])
+        return [], set(), None
+
+    monkeypatch.setattr(task_objects, "index_turn_artifacts", spy_index)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        _artifact(artifacts_base, "half-written")
+        _artifact(artifacts_base, "sibling", conversation_id=uuid4())
+        yield "turn_failed", {"error": "boom", "code": "anton_error", "message": "failed"}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert indexed["tracked_new"] == {"half-written"}
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_drops_an_unattributed_artifact_of_a_clean_turn(monkeypatch, tmp_path):
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    project_dir = tmp_path / "proj"
+    artifacts_base = project_dir / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    conversation = _conversation_at(project_dir)
+    monkeypatch.setattr(
+        responses_mod.ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: (
+            conversation, artifacts_base,
+            str(conversation.project_id), conversation.project.name,
+        )),
+    )
+
+    from cowork.services import task_objects
+
+    indexed = {}
+
+    def spy_index(*args, **kwargs):
+        indexed["tracked_new"] = set(kwargs["tracked_new"])
+        return [], set(), None
+
+    monkeypatch.setattr(task_objects, "index_turn_artifacts", spy_index)
+
+    async def fake_autopublish(base, scope, *, touched, **kwargs):
+        return set(touched)
+
+    monkeypatch.setattr(
+        "cowork.services.artifact_autopublish.autopublish_project_artifacts",
+        fake_autopublish,
+    )
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        _artifact(artifacts_base, "handmade")
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert indexed["tracked_new"] == set()
+
+
 # ── turn history ─────────────────────────────────────────────────────────────
 
 _TOOL_ROWS = [

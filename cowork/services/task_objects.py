@@ -270,6 +270,20 @@ def snapshot_artifact_slugs(artifacts_base) -> set[str]:
     }
 
 
+def try_snapshot_artifact_slugs(artifacts_base) -> set[str] | None:
+    """`snapshot_artifact_slugs`, or None when the listing fails.
+
+    For a turn's `finally`: the producers list the root once and hand the result
+    to both `turn_created_slugs` and `index_turn_artifacts`. None makes each fall
+    back to its own guarded listing instead of raising out of the `finally`.
+    """
+    try:
+        return snapshot_artifact_slugs(artifacts_base)
+    except Exception:
+        logger.warning("could not list artifacts at the end of a turn", exc_info=True)
+        return None
+
+
 def snapshot_artifact_state(artifacts_base) -> tuple[set[str], dict[str, int]]:
     """Pre-turn snapshot of folder names and nanosecond content mtimes.
 
@@ -387,6 +401,7 @@ def index_turn_artifacts(
     before_mtimes: dict[str, int],
     tracked_new: set[str] | None = None,
     tracked_edits: set[str] | None = None,
+    after: set[str] | None = None,
 ) -> tuple[list[str], set[str], TenantScope | None]:
     """End-of-turn artifact bookkeeping.
 
@@ -421,9 +436,14 @@ def index_turn_artifacts(
     remote producer's pure diff carries the same concurrent-sibling caveat as
     the desktop; the pod reports no tracked sets yet.
 
+    `after` is the caller's post-turn listing of the root, so a producer that
+    already listed it for `turn_created_slugs` does not list it twice. None
+    lists it here.
+
     conversation_id/project_id are captured by the caller while the row is
-    unambiguously attached (not read here, to avoid depending on the session
-    still being live/unexpired in this end-of-turn path).
+    unambiguously attached, so the ids never depend on the session still being
+    live/unexpired in this end-of-turn path. `conversation` itself is read only
+    for the tenant scope and, when owners are recorded, `created_by`.
 
     Never raises. This runs in a turn's `finally`, so an exception here would
     replace the turn's real outcome; on any internal failure it degrades to
@@ -437,7 +457,7 @@ def index_turn_artifacts(
         )
 
         base = Path(artifacts_base)
-        after = snapshot_artifact_slugs(base)
+        after = snapshot_artifact_slugs(base) if after is None else set(after)
         appeared = after - set(before or ())
         # Intersected with `after` throughout, so a slug the agent opened and
         # then deleted can't produce a card for a folder that is gone.

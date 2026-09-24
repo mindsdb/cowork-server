@@ -201,3 +201,35 @@ async def test_only_authorized_persistent_turns_touch_saved_artifacts(monkeypatc
     assert events[0].text == "model still runs"
     assert index.call_count == int(workspace_mode == "persistent")
     assert publish.await_count == int(workspace_mode == "persistent" and not failed)
+
+
+@pytest.mark.parametrize("failed", [False, True])
+async def test_only_an_unfinished_turn_claims_unattributed_artifacts(monkeypatch, failed):
+    """ENG-2961 R1: a turn cut short between anton's metadata write and its
+    provenance append leaves a folder with no provenance; only a non-clean exit
+    may claim it. The root is listed once and shared by both end-of-turn calls."""
+    from unittest.mock import AsyncMock, Mock
+    from cowork.services import artifact_ownership, task_objects
+
+    context = (object(), object(), "project", "Project")
+    _fake_handler(monkeypatch, remote_artifacts_context=lambda *_: context)
+    monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_: (set(), {}))
+    monkeypatch.setattr(task_objects, "try_snapshot_artifact_slugs", lambda *_: {"a"})
+    created = Mock(return_value=set())
+    index = Mock(return_value=([], set(), None))
+    monkeypatch.setattr(artifact_ownership, "turn_created_slugs", created)
+    monkeypatch.setattr(task_objects, "index_turn_artifacts", index)
+    monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", AsyncMock(return_value=[]))
+
+    async def replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield ("turn_failed" if failed else "turn_completed"), {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+    await _drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org", user_id="user",
+        input_text="run", model="m", turn_rows=[],
+    ))
+    assert created.call_args.kwargs["accept_unattributed"] is failed
+    assert created.call_args.kwargs["after"] == {"a"}
+    assert index.call_args.kwargs["after"] == {"a"}

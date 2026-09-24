@@ -1286,6 +1286,7 @@ class ResponsesHandler:
                 index_turn_artifacts,
                 publish_and_card_turn_artifacts,
                 snapshot_artifact_state,
+                try_snapshot_artifact_slugs,
             )
 
             # Resolved once and held for the whole turn: the pod counts its
@@ -1305,6 +1306,10 @@ class ResponsesHandler:
             touched_slugs: set[str] = set()
             turn_scope = None
             artifact_writes_allowed = False
+            # Set only on turn_completed: any other exit (Stop, cancel, failure)
+            # may have cut anton off between writing an artifact's metadata and
+            # appending its provenance, see `turn_created_slugs`.
+            completed_cleanly = False
             # Off the loop: this reads the project's memory slots off the shared
             # mount, and one worker serves every other request on this process
             # while a blocking EFS round trip is in flight.
@@ -1385,6 +1390,7 @@ class ResponsesHandler:
                     elif kind == "turn_completed":
                         # `break`, not `return`: the publish/card block below the
                         # try must still run on a clean finish.
+                        completed_cleanly = True
                         break
                     elif kind == "turn_failed":
                         if await _remote_cancel_confirmed(data.get("error"), corr):
@@ -1407,12 +1413,18 @@ class ResponsesHandler:
                 # failed or was stopped, and it is synchronous because an await
                 # in a generator's finally is skipped on cancellation.
                 if artifacts is not None and artifact_writes_allowed:
+                    after = try_snapshot_artifact_slugs(artifacts[1])
                     new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
                         artifacts[0], conv_id, artifacts[2], artifacts[1],
                         before_slugs, before_mtimes,
                         # ENG-2961: the project base is shared, so only folders
                         # whose provenance names this conversation are its own.
-                        tracked_new=turn_created_slugs(artifacts[1], before_slugs, conv_id),
+                        tracked_new=turn_created_slugs(
+                            artifacts[1], before_slugs, conv_id,
+                            after=after,
+                            accept_unattributed=not completed_cleanly,
+                        ),
+                        after=after,
                     )
 
             # Clean completion only — a raise inside the try skips this, matching

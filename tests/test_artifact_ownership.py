@@ -298,6 +298,41 @@ def test_turn_created_slugs_keeps_only_this_turns_own_artifacts(tmp_path):
     assert ownership.turn_created_slugs(tmp_path, before, conversation) == {"mine"}
 
 
+def test_unfinished_turn_keeps_unattributed_but_not_foreign_artifacts(tmp_path, caplog):
+    # A Stop between anton's metadata write and its provenance append leaves a
+    # folder with no provenance; only a non-clean exit may claim it.
+    conversation, sibling = uuid4(), uuid4()
+    write_artifact(tmp_path, "mine", conversation)
+    write_artifact(tmp_path, "half_written")  # no provenance
+    write_artifact(tmp_path, "sibling", sibling)
+    with caplog.at_level("INFO", logger=ownership.__name__):
+        kept = ownership.turn_created_slugs(
+            tmp_path, set(), conversation, accept_unattributed=True
+        )
+    assert kept == {"mine", "half_written"}
+    assert "artifact_attribution accepted slug=half_written reason=unfinished_turn" in caplog.text
+
+
+def test_clean_turn_still_drops_unattributed_artifacts(tmp_path):
+    conversation = uuid4()
+    write_artifact(tmp_path, "half_written")
+    assert ownership.turn_created_slugs(tmp_path, set(), conversation) == set()
+
+
+def test_turn_created_slugs_uses_the_given_after_listing(tmp_path, monkeypatch):
+    conversation = uuid4()
+    write_artifact(tmp_path, "mine", conversation)
+    write_artifact(tmp_path, "unlisted", conversation)
+
+    def _no_listing(_base):
+        raise AssertionError("the caller's listing must be reused")
+
+    monkeypatch.setattr(task_objects, "snapshot_artifact_slugs", _no_listing)
+    assert ownership.turn_created_slugs(
+        tmp_path, set(), conversation, after={"mine"}
+    ) == {"mine"}
+
+
 def test_turn_created_slugs_never_raises(tmp_path):
     assert ownership.turn_created_slugs(object(), set(), uuid4()) == set()
     assert ownership.turn_created_slugs(tmp_path, set(), "not-a-uuid") == set()
@@ -324,3 +359,21 @@ def test_index_turn_artifacts_records_the_creator_as_owner(tmp_path, org_id, use
         assert ownership.resolve_artifact_owner(session, source, "fresh") == (
             ownership.OwnerResolution(users[0], "recorded")
         )
+
+
+def test_index_turn_artifacts_uses_the_given_after_listing(tmp_path, monkeypatch):
+    conversation_id = uuid4()
+    write_artifact(tmp_path, "listed", conversation_id)
+    write_artifact(tmp_path, "unlisted", conversation_id)
+
+    def _no_listing(_base):
+        raise AssertionError("the caller's listing must be reused")
+
+    monkeypatch.setattr(task_objects, "snapshot_artifact_slugs", _no_listing)
+    monkeypatch.setattr(task_objects, "_recover_turn_scope", lambda _c: None)
+    monkeypatch.setattr(task_objects, "_index_new_slugs", lambda *a: None)
+    new, touched, _scope = task_objects.index_turn_artifacts(
+        None, conversation_id, None, tmp_path, set(), {}, after={"listed"},
+    )
+    assert new == ["listed"]
+    assert touched == {"listed"}
