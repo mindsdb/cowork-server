@@ -17,7 +17,6 @@ from cowork.common.settings.app_settings import TurnQueueSettings, get_app_setti
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.session import get_engine
 from cowork.models.artifact_identity import ArtifactIdentity
-from cowork.models.conversation import Conversation
 from cowork.services.artifact_access import ArtifactAccessUnavailable
 from cowork.services.artifact_identity import artifact_key
 
@@ -159,31 +158,48 @@ def ensure_authorization_key(
 
 
 def publish_authorization_key(
-    local_id: str, artifacts_base: Path, scope: TenantScope
+    local_id: str, artifacts_base: Path, slug: str, project_id, scope: TenantScope
 ) -> str:
-    """Verify the server conversation root before minting publish identity."""
+    """Verify the artifact's recorded owner before minting publish identity.
+
+    The root must be one of the project's own artifact roots, and the owner is
+    what `artifact_ownership` resolves for the artifact under that root: the
+    attribution row for a project-level root (ENG-2961), the conversation's
+    creator for a legacy per-conversation root. The attribution row wins over
+    an `ArtifactIdentity` alias bound to someone else; that mismatch is refused
+    and nothing is rewritten.
+    """
+    from cowork.services.artifact_ownership import (
+        ArtifactOwnerUnknown,
+        resolve_artifact_owner,
+    )
     from cowork.services.artifact_roots import artifacts_sources_for_project
 
-    try:
-        conversation_id = UUID(Path(artifacts_base).parent.parent.name)
-    except (TypeError, ValueError) as exc:
-        raise ArtifactAccessUnavailable(
-            "Artifact ownership could not be established"
-        ) from exc
     with _session(scope) as session:
-        conversation = session.get(Conversation, conversation_id)
-        if (
-            conversation is None
-            or not conversation.created_by
-            or str(conversation.created_by) != str(scope.user_id)
-        ):
+        try:
+            sources = artifacts_sources_for_project(session, UUID(str(project_id)))
+        except (TypeError, ValueError) as exc:
+            raise ArtifactAccessUnavailable(
+                "Artifact project could not be resolved"
+            ) from exc
+        source = next(
+            (s for s in sources if Path(s.base) == Path(artifacts_base)), None
+        )
+        if source is None:
+            raise ArtifactAccessUnavailable(
+                "Artifact root does not belong to its project"
+            )
+        resolution = resolve_artifact_owner(session, source, slug)
+        if resolution.unknown:
+            raise ArtifactOwnerUnknown("Artifact owner is unknown")
+        owner_user_id = resolution.owner_user_id
+        if not owner_user_id or str(owner_user_id) != str(scope.user_id):
             raise ArtifactAccessUnavailable(
                 "Only the artifact owner can publish this draft"
             )
-        sources = artifacts_sources_for_project(session, conversation.project_id)
-        if not any(Path(source.base) == Path(artifacts_base) for source in sources):
+        row = _row(session, local_id)
+        if row is not None and row.owner_keycloak_id != str(owner_user_id):
             raise ArtifactAccessUnavailable(
-                "Artifact root does not belong to its owner"
+                "Artifact identity is bound to a different owner"
             )
-        owner_user_id = conversation.created_by
     return ensure_authorization_key(local_id, scope, owner_user_id=owner_user_id)

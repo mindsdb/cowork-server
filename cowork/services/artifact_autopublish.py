@@ -236,6 +236,7 @@ async def _publish_one(
     timeout_s: float,
     scope,
     access: dict | None = None,
+    project_id: str | None = None,
 ) -> bool:
     """Publish one artifact. True when it landed. Never raises.
 
@@ -258,6 +259,7 @@ async def _publish_one(
                 # than falling back to the shared namespace root. We only ever
                 # get here with an org scope in hand (see the caller's guard).
                 scope=scope,
+                project_id=project_id,
             ),
             timeout=timeout_s,
         )
@@ -287,6 +289,7 @@ async def autopublish_project_artifacts(
     scope,
     *,
     touched: set[str],
+    project_id: str | None = None,
     limit: int = 5,
     budget_s: float = 60.0,
     touched_budget_s: float = 30.0,
@@ -309,6 +312,9 @@ async def autopublish_project_artifacts(
     with no ambient scope bound, and an unscoped `get_user_settings()` silently
     resolves LOCAL_SCOPE — which would read the global row for the org-scoped
     enable flag and the wrong provider for the publish URL.
+
+    `project_id` is required in org mode: publishing resolves the artifact's
+    owner by it (ENG-2961).
     """
     # Scope guards first: the enable flag is an org setting, so reading it is
     # only meaningful once we know we have an org scope to read it for.
@@ -318,6 +324,10 @@ async def autopublish_project_artifacts(
         _record("skipped", reason="no_scope_identity")
         return set()
     if not _is_enabled(scope):
+        return set()
+    if not project_id:
+        # Fail closed once, instead of raising in `_publish_one` for every slug.
+        _record("skipped", reason="no_project_id")
         return set()
 
     base = Path(artifacts_base)
@@ -370,7 +380,7 @@ async def autopublish_project_artifacts(
                     return published
                 if await _publish_one(
                     base, slug, api_key, publish_url, min(timeout_s, remaining), scope,
-                    _access_for(decision),
+                    _access_for(decision), project_id=project_id,
                 ):
                     published.add(slug)
     except asyncio.CancelledError:

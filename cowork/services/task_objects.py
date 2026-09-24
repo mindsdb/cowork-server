@@ -495,7 +495,7 @@ async def publish_and_card_turn_artifacts(
     from cowork.services.artifact_autopublish import autopublish_project_artifacts
 
     republished = await autopublish_project_artifacts(
-        artifacts_base, scope, touched=set(touched_slugs),
+        artifacts_base, scope, touched=set(touched_slugs), project_id=project_id,
     )
     if getattr(scope, "org_mode", False):
         carded = set(new_slugs) | (republished & set(touched_slugs))

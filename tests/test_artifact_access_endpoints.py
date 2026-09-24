@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 from fastapi import HTTPException
@@ -45,7 +46,9 @@ def as_owner(monkeypatch, folder):
     """Owner resolution succeeds and yields this folder."""
     monkeypatch.setattr(
         aw, "_owner_workspace",
-        lambda session, project_ref, artifact_id: (object(), folder, {"slug": "rep"}, {}),
+        lambda session, project_ref, artifact_id: (
+            SimpleNamespace(project_id="proj-1"), folder, {"slug": "rep"}, {},
+        ),
     )
     return folder
 
@@ -55,10 +58,11 @@ def publish_calls(monkeypatch):
     calls = []
 
     def fake_publish(artifact, *, artifacts_base, api_key, publish_url,
-                     password=None, access=None, scope=None):
+                     password=None, access=None, scope=None, project_id=None):
         calls.append({
             "folder": artifact, "artifacts_base": artifacts_base, "api_key": api_key,
             "publish_url": publish_url, "access": access, "scope": scope,
+            "project_id": project_id,
         })
         return {"status": "ok", "url": "https://view.example/r/1"}
 
@@ -104,6 +108,7 @@ async def test_setting_access_republishes_with_the_chosen_audience(
     # this kwarg would fail every share rather than read the wrong vault.
     assert publish_calls[0]["scope"] is ORG_SCOPE
     assert publish_calls[0]["artifacts_base"] == as_owner.parent
+    assert publish_calls[0]["project_id"] == "proj-1"
 
 
 async def test_sharing_publicly_is_passed_through_verbatim(
