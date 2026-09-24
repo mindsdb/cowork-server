@@ -1,0 +1,234 @@
+"""Who owns an artifact in organization mode (ENG-2961).
+
+Project-level artifacts roots (ENG-2056) are shared by every member of a
+project, so a position in the tree no longer names a creator. The owner of an
+artifact under a project root is a server-written row in
+``shared_resource_attributions`` (kind ``artifact``), recorded when the turn
+that created it ends, or by the one-time startup backfill.
+
+Legacy per-conversation roots (``<project>/conversations/<uuid>/.anton/
+artifacts``) keep path-derived ownership. That is a deliberate exception to
+"never derive an owner from a directory name": nothing new is written there,
+the directory is server-controlled, and on prod those roots hold almost every
+artifact created before 2026-09-23.
+
+``metadata.json`` provenance sits on the project-wide writable mount, so any
+agent in the project can rewrite it. At runtime it may only DROP a slug from a
+turn's claim (``turn_created_slugs``), never grant ownership.
+"""
+from __future__ import annotations
+
+import hashlib
+import logging
+from collections.abc import Iterable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+from uuid import UUID
+
+from cowork.models.conversation import Conversation
+from cowork.models.shared_resource import SharedResourceAttribution
+from cowork.services.artifact_access import ArtifactAccessUnavailable
+
+logger = logging.getLogger(__name__)
+
+ARTIFACT = "artifact"
+
+_KEY_MAX_LENGTH = 255  # SharedResourceAttribution.resource_key
+_ARTIFACTS_SUBPATH = (".anton", "artifacts")
+_CONVERSATIONS_DIRNAME = "conversations"
+
+OwnerState = Literal["recorded", "legacy_path", "unknown", "local"]
+
+# Keys already reported as `unknown`, so a polled listing logs each one once
+# per process instead of on every refresh (deployments run at WARNING).
+# Bounded: cleared when it grows past the cap, which at worst repeats a line.
+_REPORTED_UNKNOWN: set[tuple[str, str]] = set()
+_REPORTED_UNKNOWN_CAP = 10_000
+
+
+class ArtifactOwnerUnknown(ArtifactAccessUnavailable):
+    """No owner is recorded for this artifact, so no one may act as owner."""
+
+
+@dataclass(frozen=True)
+class OwnerResolution:
+    owner_user_id: str | None
+    state: OwnerState
+
+    @property
+    def unknown(self) -> bool:
+        return self.state == "unknown"
+
+
+def artifact_resource_key(project_id, slug: str) -> str:
+    """The attribution key of one project-root artifact.
+
+    Slugs may be 255 characters long (`TaskObjectService._unique_slug`), which
+    with the project id would overflow the column; a long slug is hashed so the
+    claim never fails on length and silently leaves the artifact ownerless.
+    """
+    key = f"{project_id}/{slug}"
+    if len(key) <= _KEY_MAX_LENGTH:
+        return key
+    digest = hashlib.sha256(slug.encode("utf-8")).hexdigest()
+    return f"{project_id}/sha256:{digest}"
+
+
+def _org_scope(session):
+    scope = getattr(session, "scope", None)
+    return scope if scope is not None and scope.org_mode else None
+
+
+def _root_parts(source) -> tuple[str, ...]:
+    return tuple(getattr(source, "root_parts", ()) or ())
+
+
+def _anchored(source, parts: tuple[str, ...]) -> bool:
+    anchor = getattr(source, "trusted_anchor", None)
+    return anchor is not None and Path(source.base) == Path(anchor).joinpath(*parts)
+
+
+def is_project_root(source) -> bool:
+    """True for the shared ``<project>/.anton/artifacts`` root."""
+    parts = _root_parts(source)
+    return parts == _ARTIFACTS_SUBPATH and _anchored(source, parts)
+
+
+def _legacy_conversation_id(source) -> UUID | None:
+    """The conversation a legacy root belongs to, or None for any other shape."""
+    parts = _root_parts(source)
+    if (
+        len(parts) != 4
+        or parts[0] != _CONVERSATIONS_DIRNAME
+        or parts[2:] != _ARTIFACTS_SUBPATH
+        or not _anchored(source, parts)
+    ):
+        return None
+    try:
+        return UUID(parts[1])
+    except ValueError:
+        return None
+
+
+def _legacy_owner(session, source, conversation_id: UUID) -> str | None:
+    conversation = session.get(Conversation, conversation_id)
+    if conversation is None or str(conversation.project_id) != str(source.project_id):
+        return None
+    return conversation.created_by or None
+
+
+def _report_unknown(project_id, slug: str) -> None:
+    key = (str(project_id), slug)
+    if key in _REPORTED_UNKNOWN:
+        return
+    if len(_REPORTED_UNKNOWN) >= _REPORTED_UNKNOWN_CAP:
+        _REPORTED_UNKNOWN.clear()
+    _REPORTED_UNKNOWN.add(key)
+    logger.warning("artifact_owner unknown project=%s slug=%s", project_id, slug)
+
+
+def resolve_artifact_owners(session, source, slugs: Iterable[str]) -> dict[str, OwnerResolution]:
+    """Owner of each slug under one root. Read-only; one query per root."""
+    wanted = list(dict.fromkeys(slugs))
+    scope = _org_scope(session)
+    if scope is None:
+        user_id = getattr(getattr(session, "scope", None), "user_id", None)
+        return {slug: OwnerResolution(user_id, "local") for slug in wanted}
+
+    conversation_id = _legacy_conversation_id(source)
+    if conversation_id is not None:
+        owner = _legacy_owner(session, source, conversation_id)
+        state: OwnerState = "legacy_path" if owner else "unknown"
+        return {slug: OwnerResolution(owner, state) for slug in wanted}
+
+    if source.project_id and getattr(source, "trusted_anchor", None) is None:
+        # Every org root built by `artifact_roots._sources_for` carries an anchor;
+        # one without it would silently resolve `unknown` for every artifact.
+        logger.error(
+            "artifact_owner source without trusted_anchor project=%s base=%s",
+            source.project_id, source.base,
+        )
+    if not is_project_root(source) or not source.project_id or not wanted:
+        return {slug: OwnerResolution(None, "unknown") for slug in wanted}
+
+    keys = {artifact_resource_key(source.project_id, slug): slug for slug in wanted}
+    rows = session.exec(
+        session.select(SharedResourceAttribution).where(
+            SharedResourceAttribution.resource_kind == ARTIFACT,
+            SharedResourceAttribution.resource_key.in_(list(keys)),
+        )
+    ).all()
+    owners = {
+        keys[row.resource_key]: row.created_by_id
+        for row in rows
+        if row.created_by_id and not row.pending_claim_token
+    }
+    resolutions: dict[str, OwnerResolution] = {}
+    for slug in wanted:
+        owner = owners.get(slug)
+        if owner:
+            resolutions[slug] = OwnerResolution(owner, "recorded")
+        else:
+            _report_unknown(source.project_id, slug)
+            resolutions[slug] = OwnerResolution(None, "unknown")
+    return resolutions
+
+
+def resolve_artifact_owner(session, source, slug: str) -> OwnerResolution:
+    return resolve_artifact_owners(session, source, [slug])[slug]
+
+
+def record_artifact_owner(
+    session, project_id, slug: str, owner_user_id: str | None, *, action: str
+) -> str | None:
+    """Claim ``slug`` for ``owner_user_id``; the first writer wins.
+
+    Returns the owner actually recorded, which differs from the argument when
+    another writer got there first. None outside org mode or without an owner.
+    """
+    if _org_scope(session) is None or not owner_user_id or not project_id:
+        return None
+    from cowork.services.shared_resources import SharedResourceAccess
+
+    row, _created = SharedResourceAccess(session).claim_as(
+        ARTIFACT,
+        artifact_resource_key(project_id, slug),
+        creator_id=str(owner_user_id),
+        action=action,
+    )
+    winner = row.created_by_id if row is not None else None
+    if winner and winner != str(owner_user_id):
+        logger.warning(
+            "artifact_owner conflict project=%s slug=%s kept=%s rejected=%s",
+            project_id, slug, winner, owner_user_id,
+        )
+    return winner
+
+
+def rekey_artifact_owner(
+    session, source, old_slug: str, new_project_id, new_slug: str, *, actor_id: str
+) -> bool:
+    """Carry ownership along when a task moves an artifact to another project."""
+    if _org_scope(session) is None or not is_project_root(source) or not source.project_id:
+        return False
+    from cowork.services.shared_resources import SharedResourceAccess
+
+    row = SharedResourceAccess(session).rekey_as(
+        ARTIFACT,
+        artifact_resource_key(source.project_id, old_slug),
+        artifact_resource_key(new_project_id, new_slug),
+        actor_id=actor_id,
+    )
+    return row is not None
+
+
+def forget_artifact_owner(session, source, slug: str, *, actor_id: str) -> bool:
+    """Drop ownership of a deleted project-root artifact. Legacy roots have none."""
+    if _org_scope(session) is None or not is_project_root(source) or not source.project_id:
+        return False
+    from cowork.services.shared_resources import SharedResourceAccess
+
+    return SharedResourceAccess(session).delete_as(
+        ARTIFACT, artifact_resource_key(source.project_id, slug), actor_id=actor_id
+    )
