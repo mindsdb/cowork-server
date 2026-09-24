@@ -48,38 +48,7 @@ def org_deployment(monkeypatch):
     get_app_settings.cache_clear()
 
 
-@pytest.fixture(autouse=True)
-def cleanup_test_projects(tmp_path):
-    """Clean up projects (and their dependent rows) created by this test to
-    avoid database pollution: the session-scoped test DB is shared across
-    modules, and a leaked Project row (especially one with a real
-    ``.anton/artifacts`` dir, as this module's tests create) can break other
-    modules' tests that scan or query all projects."""
-    from sqlmodel import select
-    from cowork.models.conversation import Conversation
-    from cowork.models.project import Project
-    from cowork.models.shared_resource import SharedResourceAttribution
-
-    yield
-
-    with Session(_engine()) as session:
-        projects = session.exec(select(Project)).all()
-        leaked = [p for p in projects if tmp_path.as_posix() in p.path]
-        leaked_ids = {p.id for p in leaked}
-        if leaked_ids:
-            for row in session.exec(select(TaskObject)).all():
-                if row.project_id in leaked_ids:
-                    session.delete(row)
-            for row in session.exec(select(Conversation)).all():
-                if row.project_id in leaked_ids:
-                    session.delete(row)
-            for row in session.exec(select(SharedResourceAttribution)).all():
-                key = row.resource_key or ""
-                if any(str(pid) in key for pid in leaked_ids):
-                    session.delete(row)
-        for project in leaked:
-            session.delete(project)
-        session.commit()
+pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")
 
 
 def _owner(org_id, source, slug):

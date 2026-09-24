@@ -29,26 +29,7 @@ from test_artifact_ownership import (
 )
 
 
-@pytest.fixture(autouse=True)
-def cleanup_test_projects(tmp_path):
-    """Clean up projects created by tests to avoid database pollution.
-
-    Mirrors `test_artifact_ownership.cleanup_test_projects`: autouse fixtures
-    do not carry over through imports, and this file creates its own
-    org_id=None Project row in `test_desktop_is_a_single_owner_boundary` that
-    would otherwise leak into `tests/test_artifact_roots.py`.
-    """
-    from sqlmodel import select
-    from cowork.models.project import Project
-
-    yield
-
-    with Session(get_engine(get_app_settings().database.uri)) as session:
-        projects = session.exec(select(Project)).all()
-        for project in projects:
-            if tmp_path.as_posix() in project.path:
-                session.delete(project)
-        session.commit()
+pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")
 
 
 @contextmanager

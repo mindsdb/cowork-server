@@ -50,28 +50,7 @@ def _relocate(org_id, user_id, conversation_id, source_id, dest_id) -> int:
         )
 
 
-@pytest.fixture(autouse=True)
-def cleanup_test_projects(tmp_path):
-    """Delete Project (and their TaskObject) rows created by this module's
-    tests under this test's tmp_path. Autouse fixtures in
-    test_artifact_ownership.py do not carry over through import, and this
-    module creates its own Project/Conversation/TaskObject rows against the
-    shared session-scoped test DB, so it needs equivalent teardown to avoid
-    leaking rows into other test modules (see test_artifact_roots.py)."""
-    yield
-
-    with Session(_engine()) as session:
-        projects = session.exec(select(Project)).all()
-        stale = [p for p in projects if tmp_path.as_posix() in p.path]
-        stale_ids = {p.id for p in stale}
-        if stale_ids:
-            for row in session.exec(
-                select(TaskObject).where(TaskObject.project_id.in_(stale_ids))
-            ).all():
-                session.delete(row)
-        for project in stale:
-            session.delete(project)
-        session.commit()
+pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")
 
 
 def test_relocation_moves_owned_artifacts_and_rekeys_their_owner(tmp_path):
