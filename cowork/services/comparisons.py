@@ -43,6 +43,7 @@ from cowork.models.comparison import Comparison, ComparisonSide, ComparisonVerdi
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.models.project import Project
+from cowork.schemas.responses import Role
 from cowork.services.projects import (
     ProjectNotFoundError,
     ProjectService,
@@ -132,10 +133,15 @@ class ComparisonService:
         raise ComparisonNotFoundError("Comparison side not found")
 
     def turn_count(self, side: ComparisonSide) -> int:
-        """Messages in the side's conversation that the comparison shows."""
+        """Turns (user messages) in the side's conversation that the comparison shows.
+
+        Turns rather than message rows: a turn also stores tool rows the
+        transcript API never returns, so a row count could not be mapped onto
+        what a client displays.
+        """
         count = self.session.exec(
             self.session.select(Message)
-            .where(Message.conversation_id == side.conversation_id)
+            .where(Message.conversation_id == side.conversation_id, Message.role == Role.user)
             .with_only_columns(func.count())
         ).one()
         if side.continued_turn_count is not None:

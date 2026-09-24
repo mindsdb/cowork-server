@@ -98,7 +98,7 @@ def test_create_makes_two_sides_each_in_its_own_sandbox(client):
     for side, model, effort in ((a, "kimi", None), (b, "qwen", "xhigh")):
         assert side["model"] == model
         assert side["reasoningEffort"] == effort
-        assert side["messageCount"] == 0
+        assert side["turnCount"] == 0
         project = _project(side["projectId"])
         assert project.name.startswith(COMPARISON_SANDBOX_PREFIX)
         assert Path(project.path).is_dir()
@@ -751,7 +751,9 @@ def test_a_continued_side_shows_the_turns_it_was_compared_on(client):
     session = get_open_session()
     try:
         session.add(Message(conversation_id=conversation_id, role="user", content="q", seq=1))
-        session.add(Message(conversation_id=conversation_id, role="assistant", content="a", seq=2))
+        # A tool row: stored with the turn, never returned by the transcript API.
+        session.add(Message(conversation_id=conversation_id, role="assistant", content=[{"type": "tool_use"}], seq=2))
+        session.add(Message(conversation_id=conversation_id, role="assistant", content="a", seq=3))
         session.commit()
     finally:
         session.close()
@@ -760,13 +762,13 @@ def test_a_continued_side_shows_the_turns_it_was_compared_on(client):
 
     session = get_open_session()
     try:
-        session.add(Message(conversation_id=conversation_id, role="user", content="later", seq=3))
+        session.add(Message(conversation_id=conversation_id, role="user", content="later", seq=4))
         session.commit()
     finally:
         session.close()
     side = client.get(f"/api/v1/comparisons/{body['id']}").json()["sides"][0]
-    assert side["continuedTurnCount"] == 2
-    assert side["messageCount"] == 2
+    assert side["continuedTurnCount"] == 1
+    assert side["turnCount"] == 1
 
 
 def test_a_sandbox_gets_the_desktop_skill_links(client):
