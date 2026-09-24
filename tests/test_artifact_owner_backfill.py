@@ -213,6 +213,48 @@ def test_a_transient_db_error_aborts_the_pass_and_writes_no_sentinel(org, monkey
         assert raw.exec(select(Setting).where(Setting.key == backfill.SENTINEL_KEY)).first() is None
 
 
+def test_a_data_error_on_one_artifact_marks_only_it_unknown(org, monkeypatch, caplog):
+    """Only connection-level errors abort the pass. A `DataError` (like any
+    statement error) is about one artifact: that one stays unknown and the rest
+    of the walk, and the sentinel, still happen."""
+    org_id, owner, project, source = org
+    write_artifact(source.base, "bad")
+    write_artifact(source.base, "good", make_conversation(project, owner))
+    real = backfill._owner_from_task_objects
+
+    def data_error_for_bad(session, project_id, slug):
+        if slug == "bad":
+            raise sa.exc.DataError("stmt", {}, Exception("invalid input"))
+        return real(session, project_id, slug)
+
+    monkeypatch.setattr(backfill, "_owner_from_task_objects", data_error_for_bad)
+
+    with caplog.at_level("WARNING", logger=backfill.__name__):
+        summary = _run(project)
+
+    assert summary is not None
+    assert (str(project.id), "bad") in summary.unknown
+    assert _owner(org_id, source, "good").owner_user_id == owner
+    assert f"artifact_owner_backfill failed project={project.id} slug=bad" in caplog.text
+    with Session(_engine()) as raw:
+        assert raw.exec(select(Setting).where(Setting.key == backfill.SENTINEL_KEY)).first() is not None
+
+
+def test_an_interface_error_aborts_the_pass_and_logs_where(org, monkeypatch, caplog):
+    write_artifact(org[3].base, "no-provenance")
+
+    def boom(*_args, **_kwargs):
+        raise sa.exc.InterfaceError("stmt", {}, Exception("connection closed"))
+
+    monkeypatch.setattr(backfill, "_owner_from_task_objects", boom)
+
+    with caplog.at_level("WARNING", logger=backfill.__name__):
+        with pytest.raises(sa.exc.InterfaceError):
+            _run(org[2])
+
+    assert f"artifact_owner_backfill aborted project={org[2].id} slug=no-provenance" in caplog.text
+
+
 def test_local_mode_never_runs(monkeypatch):
     monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
     get_app_settings.cache_clear()
