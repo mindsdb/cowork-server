@@ -194,3 +194,89 @@ async def test_creator_can_open_the_workspace_of_a_project_root_artifact(
         with pytest.raises(HTTPException) as refused:
             await artifact_workspace.artifact_source(str(project.id), local_id, session, path=None)
         assert refused.value.status_code == 403
+
+
+from cowork.services import artifact_access
+from cowork.services.artifact_authorization_identity import ArtifactIdentity, _session as identity_session
+
+
+@pytest.fixture
+def no_publish_side_effects(monkeypatch):
+    async def mint(_self):
+        return "test-publish-key"
+
+    async def no_revoke(*_args, **_kwargs):
+        return False
+
+    monkeypatch.setattr("cowork.services.artifact_publish_key.PublishKey.get", mint)
+    monkeypatch.setattr("anton.publisher.unpublish", lambda *_a, **_kw: None)
+    monkeypatch.setattr(artifact_access, "revoke_draft_review_access", no_revoke)
+
+
+def _write(source, slug):
+    local_id = uuid4().hex
+    folder = source.base / slug
+    folder.mkdir(exist_ok=True)
+    (folder / "index.html").write_text("<html></html>")
+    (folder / "metadata.json").write_text(
+        json.dumps({"id": local_id, "slug": slug, "type": "html-app", "primary": "index.html"})
+    )
+    return local_id, folder
+
+
+@pytest.mark.asyncio
+async def test_owner_delete_removes_the_owner_row(
+    world, org_deployment, granted_product_permissions, no_publish_side_effects
+):
+    org_id, creator, _member, project, source = world
+    local_id, folder = _write(source, "mine")
+    with scoped(org_id, creator) as session:
+        await artifacts_ep.delete_artifact_for_request(session, local_id, project_id=project.id)
+    assert not folder.exists()
+    with scoped(org_id, creator) as session:
+        assert ownership.resolve_artifact_owner(session, source, "mine").unknown
+
+
+@pytest.mark.asyncio
+async def test_admin_may_delete_an_ownerless_artifact_but_not_an_owned_one(
+    world, org_deployment, granted_product_permissions, no_publish_side_effects
+):
+    org_id, _creator, _member, project, source = world
+    admin = str(uuid4())
+    principal = _principal(org_id, admin, admin=True)
+    orphan_id, orphan = _write(source, "orphan")
+    owned_id, owned = _write(source, "mine")
+    # An identity row naming someone else must not turn the admin delete into a 503.
+    with identity_session(TenantScope(org_mode=True, org_id=org_id, user_id=admin)) as ids:
+        ids.add(ArtifactIdentity(
+            org_id=org_id,
+            owner_keycloak_id=str(uuid4()),
+            local_artifact_id=orphan_id,
+            # Allocated, not pending: a pending alias refuses every read.
+            canonical_artifact_id=f"artifact/{uuid4()}",
+        ))
+        ids.commit()
+    with scoped(org_id, admin) as session:
+        await artifacts_ep.delete_artifact_for_request(
+            session, orphan_id, project_id=project.id, principal=principal
+        )
+        with pytest.raises(HTTPException) as refused:
+            await artifacts_ep.delete_artifact_for_request(
+                session, owned_id, project_id=project.id, principal=principal
+            )
+        assert refused.value.status_code == 403
+    assert not orphan.exists()
+    assert owned.exists()
+
+
+@pytest.mark.asyncio
+async def test_without_a_principal_there_is_no_admin_exception(
+    world, org_deployment, granted_product_permissions, no_publish_side_effects
+):
+    org_id, _creator, _member, project, source = world
+    orphan_id, orphan = _write(source, "orphan")
+    with scoped(org_id, str(uuid4())) as session:
+        with pytest.raises(HTTPException) as refused:
+            await artifacts_ep.delete_artifact_for_request(session, orphan_id, project_id=project.id)
+        assert refused.value.detail == "Artifact owner is unknown"
+    assert orphan.exists()
