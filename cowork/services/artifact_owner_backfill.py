@@ -192,6 +192,14 @@ def _backfill_project(engine, project_id, project_path: str, org_id: str, summar
                     summary.recorded += 1
                 else:
                     summary.unknown.append((str(project_id), slug))
+            except (sa.exc.OperationalError, sa.exc.DBAPIError):
+                # A transient DB error (a connection blip mid-walk) must abort
+                # the whole pass rather than mark the rest of this project's
+                # artifacts `unknown` forever: the sentinel is written even if
+                # the DB is back by the time the pass finishes, so a partial
+                # walk would never be retried.
+                session.rollback()
+                raise
             except Exception:
                 session.rollback()
                 logger.warning(
