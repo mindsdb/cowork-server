@@ -19,6 +19,13 @@ dependencies = [
     # Releases before ENG-2116 remain allowed until Anton ships the supplier;
     # build_llm_client capability-gates that kwarg and reports the degradation.
     "anton-agent>=2.26.8.23.1,<3",
+    # Floor for GHSA-8bx3-mgpq-m8m9 (IDNA 2003 vs IDNA 2009 host-name encoding
+    # mismatch in TLSStream/connect_tcp() lets a hijacked connection to an
+    # internationalized domain present a certificate that validates against
+    # the IDNA-2003 encoding while the client meant the IDNA-2009 one).
+    # Transitive via fastapi/anton-agent/httpx, none of which pin it
+    # themselves, so it floats to whatever the resolver picks without this.
+    "anyio>=4.14.2",
     # Intel macOS is capped <49 and nothing else is. cryptography 48.0.1 ships
     # `macosx_10_9_universal2`; from 49.0.0 the only macOS wheel is
     # `macosx_11_0_arm64`, so on x86_64 Macs an unbounded floor resolves to an
