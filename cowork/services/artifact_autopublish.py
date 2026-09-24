@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from anton.minds_client import DEFAULT_REQUEST_TIMEOUT_S
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
@@ -44,6 +45,33 @@ AUTOPUBLISH_ACCESS: dict = {"mode": "restricted", "emails": [], "owner_only": Tr
 # `wait_for` with a sliver of time only guarantees a timeout, an abandoned upload
 # thread and a held lock.
 _MIN_START_BUDGET_S = 5.0
+
+# Time budgets (ENG-1580). Three numbers must agree:
+#   PUBLISH_POST_TIMEOUT_S      anton's urllib timeout on the POST /upload itself
+#                               (imported, so a change in anton moves the budget)
+#   job_budget_for(ttl, t)      how long anton polls an accepted (202) job
+#   lock_ttl_for(t)             how long the slug lock is held
+# The publish runs in a thread that asyncio.wait_for(...) abandons but cannot
+# cancel; it may still write .published.json up to
+# PUBLISH_POST_TIMEOUT_S + job_budget after it started, plus the wait_for
+# window itself. The lock must outlive all of it:
+#   timeout_s + PUBLISH_POST_TIMEOUT_S + job_budget <= lock_ttl
+# The budget is computed ONCE per reconciliation from the full timeout_s
+# (not from the per-slug min(timeout_s, remaining), which can be as small as
+# _MIN_START_BUDGET_S and would make the budget negative).
+# Enforced by tests/test_autopublish_budgets.py. Defaults: 60 + 30 + 90 = 180.
+PUBLISH_POST_TIMEOUT_S = float(DEFAULT_REQUEST_TIMEOUT_S)
+DEFAULT_TIMEOUT_S = 60.0
+LOCK_TTL_FACTOR = 3
+
+
+def lock_ttl_for(timeout_s: float) -> float:
+    return timeout_s * LOCK_TTL_FACTOR
+
+
+def job_budget_for(lock_ttl: float, timeout_s: float) -> float:
+    return lock_ttl - timeout_s - PUBLISH_POST_TIMEOUT_S
+
 
 # Reasons a candidate is skipped. Kept distinct because a single None would make
 # the skip log unusable: "nothing to do" and "cannot be published at all" demand
@@ -205,9 +233,10 @@ def _plan(artifacts_base: Path, slugs: list[str]) -> list[tuple[str, PublishDeci
     """Decide and order one phase's work: static before fullstack, newest first.
 
     Static goes first because publishing a fullstack artifact triggers a dependency
-    install on the backend and regularly hits the gateway timeout
-    (ENG-1547/ENG-1580); with the opposite order one slow fullstack would eat the
-    whole budget and the static artifacts would never get a link.
+    install on the backend and regularly runs longer than this reconciler's
+    per-turn budget (the server builds it asynchronously since ENG-1580, but the
+    poll still takes minutes); with the opposite order one slow fullstack would
+    eat the whole budget and the static artifacts would never get a link.
 
     Skips are counted, not logged per artifact: `needs_publish` runs for every
     candidate on every turn, so a per-artifact line would bury `published` and
@@ -236,13 +265,22 @@ async def _publish_one(
     timeout_s: float,
     scope,
     access: dict | None = None,
+    *,
+    job_budget_s: float,
 ) -> bool:
     """Publish one artifact. True when it landed. Never raises.
 
     `access` defaults to the first-publish owner-only access; callers pass
     `_access_for(decision)` so a re-publish keeps the owner's own choice.
+
+    `job_budget_s` is the caller's per-reconciliation budget for polling an
+    asynchronously accepted (202) publish job; it is threaded through to
+    `publish_artifact` unchanged.
     """
     folder = Path(artifacts_base) / slug
+    # Which phase the abandoned thread was in when wait_for gave up: "upload"
+    # (POST in flight) or "polling" (server accepted the job).
+    progress = {"phase": "upload"}
     try:
         await asyncio.wait_for(
             asyncio.to_thread(
@@ -258,6 +296,8 @@ async def _publish_one(
                 # than falling back to the shared namespace root. We only ever
                 # get here with an org scope in hand (see the caller's guard).
                 scope=scope,
+                job_budget_s=job_budget_s,
+                on_job_accepted=lambda _accepted: progress.update(phase="polling"),
             ),
             timeout=timeout_s,
         )
@@ -266,7 +306,7 @@ async def _publish_one(
         # write .published.json. So the lock is deliberately NOT released and no
         # retry is attempted — the next turn reads the record and sees the real
         # state. The TTL is what eventually frees the slug.
-        _record("timeout", slug=slug, timeout_s=f"{timeout_s:.1f}")
+        _record("timeout", slug=slug, timeout_s=f"{timeout_s:.1f}", phase=progress["phase"])
         return False
     except Exception as exc:
         # A synchronous failure (a 502 a second in, ValueError from the target
@@ -290,7 +330,7 @@ async def autopublish_project_artifacts(
     limit: int = 5,
     budget_s: float = 60.0,
     touched_budget_s: float = 30.0,
-    timeout_s: float = 60.0,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
 ) -> set[str]:
     """Publish every artifact in this project that needs it. Returns the slugs
     actually (re)published, so the caller can build their cards.
@@ -331,7 +371,8 @@ async def autopublish_project_artifacts(
     )
     started = time.monotonic()
     published: set[str] = set()
-    lock_ttl = timeout_s * 3
+    lock_ttl = lock_ttl_for(timeout_s)
+    job_budget_s = job_budget_for(lock_ttl, timeout_s)
 
     try:
         for phase_slugs, phase_deadline in (
@@ -370,7 +411,7 @@ async def autopublish_project_artifacts(
                     return published
                 if await _publish_one(
                     base, slug, api_key, publish_url, min(timeout_s, remaining), scope,
-                    _access_for(decision),
+                    _access_for(decision), job_budget_s=job_budget_s,
                 ):
                     published.add(slug)
     except asyncio.CancelledError:
