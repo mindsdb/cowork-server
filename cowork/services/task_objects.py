@@ -41,19 +41,6 @@ def _artifact_owner(folder: Path) -> str | None:
     return origin_conversation_id(data) or None
 
 
-def _project_root_source(project: Project):
-    """The project's shared artifacts root as the ownership module addresses it."""
-    from cowork.services.artifacts import ProjectArtifacts
-
-    return ProjectArtifacts(
-        base=_artifacts_base(project),
-        project_id=str(project.id),
-        project_name=project.name,
-        trusted_anchor=Path(project.path),
-        root_parts=(".anton", "artifacts"),
-    )
-
-
 class TaskObjectService:
     """Indexes the artifacts/files a task owns and relocates them when the
     task moves to another project."""
@@ -180,7 +167,12 @@ class TaskObjectService:
         dest_base.mkdir(parents=True, exist_ok=True)
         org_mode = bool(getattr(self.session.scope, "org_mode", False))
         creator = str(conversation.created_by) if conversation.created_by else None
-        src_root = _project_root_source(source) if org_mode else None
+        src_root = None
+        if org_mode:
+            # Lazy: artifact_ownership imports this module back (lazily too).
+            from cowork.services.artifact_ownership import project_root_source
+
+            src_root = project_root_source(source)
         rekeys: list[tuple[str, str]] = []
         moved = 0
         for row in rows:

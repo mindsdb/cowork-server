@@ -333,6 +333,16 @@ def test_turn_created_slugs_uses_the_given_after_listing(tmp_path, monkeypatch):
     ) == {"mine"}
 
 
+def test_project_root_source_is_the_shared_project_root(tmp_path, org_id):
+    project = make_project(tmp_path, org_id)
+    source = ownership.project_root_source(project)
+    assert source.base == Path(project.path) / ".anton" / "artifacts"
+    assert source.project_id == str(project.id)
+    assert source.project_name == project.name
+    assert source.trusted_anchor == Path(project.path)
+    assert ownership.is_project_root(source)
+
+
 def test_turn_created_slugs_never_raises(tmp_path):
     assert ownership.turn_created_slugs(object(), set(), uuid4()) == set()
     assert ownership.turn_created_slugs(tmp_path, set(), "not-a-uuid") == set()

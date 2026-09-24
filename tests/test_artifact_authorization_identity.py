@@ -612,6 +612,47 @@ def test_identity_bound_to_another_owner_is_refused(
         identities.publish_authorization_key(local_id, folder.parent, "demo", project.id, scope)
 
 
+def test_project_root_publish_does_not_rediscover_roots(
+    issuer, scope, local_id, project_root_artifact, monkeypatch
+):
+    from cowork.services import artifact_roots
+
+    session, project, folder, record = project_root_artifact
+    record(session, project.id, "demo", scope.user_id, action="create")
+
+    def _no_discovery(*_args, **_kwargs):
+        raise AssertionError("the project root must not trigger root discovery")
+
+    monkeypatch.setattr(artifact_roots, "artifacts_sources_for_project", _no_discovery)
+    assert identities.publish_authorization_key(
+        local_id, folder.parent, "demo", project.id, scope
+    )
+
+
+def test_publish_from_a_root_outside_the_project_is_refused(
+    issuer, scope, local_id, project_root_artifact, tmp_path
+):
+    session, project, _folder, record = project_root_artifact
+    record(session, project.id, "demo", scope.user_id, action="create")
+    stray = tmp_path / "elsewhere" / ".anton" / "artifacts"
+    (stray / "demo").mkdir(parents=True)
+    with pytest.raises(ArtifactAccessUnavailable, match="does not belong to its project"):
+        identities.publish_authorization_key(local_id, stray, "demo", project.id, scope)
+    assert issuer.calls == []
+
+
+def test_publish_for_a_project_outside_the_scope_is_refused(
+    issuer, scope, local_id, project_root_artifact
+):
+    _session, project, folder, _record = project_root_artifact
+    other = TenantScope(org_mode=True, org_id=str(uuid4()), user_id=scope.user_id)
+    with pytest.raises(ArtifactAccessUnavailable, match="could not be resolved"):
+        identities.publish_authorization_key(local_id, folder.parent, "demo", project.id, other)
+    with pytest.raises(ArtifactAccessUnavailable, match="could not be resolved"):
+        identities.publish_authorization_key(local_id, folder.parent, "demo", "not-a-uuid", scope)
+    assert issuer.calls == []
+
+
 def test_publish_artifact_requires_project_id_in_org_mode(scope, project_root_artifact):
     _session, _project, folder, _record = project_root_artifact
     with pytest.raises(ValueError, match="requires project_id"):
