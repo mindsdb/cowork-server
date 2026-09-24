@@ -81,13 +81,19 @@ from cowork.handlers.turn_errors import (
 )
 from cowork.db.scoped import ScopedSession, TenantScope, scope_from_principal
 from cowork.principal import Principal, identity_trace_metadata
+from cowork.schemas.connectors import DisabledConnection
+from cowork.services.comparisons import (
+    COMPARISON_HARNESS,
+    ComparisonService,
+    blocked_connections,
+)
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
 )
 from cowork.services.memory import apply_turn_memory, build_turn_memory
-from cowork.services.projects import ProjectService
+from cowork.services.projects import ProjectService, is_comparison_sandbox
 from cowork.services.skills import SkillService
 from cowork.services.task_objects import remote_skill_draft_result
 
@@ -409,6 +415,34 @@ class ResponsesHandler:
 
         self.last_conversation_id = str(conversation.id)
 
+        # A model-comparison side runs on what it was set up with, whatever
+        # the client sent: a stale composer pick or a second tab must not
+        # change what is being compared. Its messaging connectors are off, so
+        # two agents doing the same task don't each send the message.
+        comparison_side = ComparisonService(self.scoped).contained_side(conversation)
+        if comparison_side is not None:
+            self.harness_name = COMPARISON_HARNESS
+            try:
+                blocked = await blocked_connections(self.scope)
+            except Exception:
+                # Fail closed: running without the list could reach a
+                # messaging app the side must not use.
+                logger.exception(
+                    "[responses] could not list connections for comparison side %s", conversation.id
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Couldn't check this comparison's connections. Try again in a moment.",
+                )
+            request = request.model_copy(update={
+                "model": comparison_side.model,
+                "reasoning_effort": comparison_side.reasoning_effort,
+                "disabled_connections": [
+                    *(request.disabled_connections or []),
+                    *(DisabledConnection(**entry) for entry in blocked),
+                ] or None,
+            })
+
         # Pre-load messages before adding the new user message so the ORM
         # cache (and thus the harness's initial_history) doesn't include the
         # current turn's input — it's passed separately via `input`.
@@ -427,6 +461,7 @@ class ResponsesHandler:
             harness_input=harness_input,
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=bool(disabled),
+            is_comparison_side=comparison_side is not None,
             trace_metadata=trace_metadata,
         )
         trace_metadata = {
@@ -543,6 +578,7 @@ class ResponsesHandler:
         harness_input: list[dict],
         has_attachments: bool,
         has_disabled_connections: bool,
+        is_comparison_side: bool = False,
         trace_metadata: dict[str, str] | None = None,
     ) -> tuple[RouteDecision, dict | None]:
         """Run Cowork's narrow pre-Anton gate with only safe text context.
@@ -559,6 +595,7 @@ class ResponsesHandler:
             has_non_text_input=has_non_text_input,
             has_attachments=has_attachments,
             has_disabled_connections=has_disabled_connections,
+            is_comparison_side=is_comparison_side,
         )
         if reason:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
@@ -1101,6 +1138,14 @@ class ResponsesHandler:
                 if project is None:
                     raise ValueError("Project not found")
                 session.refresh(project)
+                if is_comparison_sandbox(getattr(project, "name", None)):
+                    # A comparison side reads memory but never writes it,
+                    # same as the in-process harness's Cortex in "off" mode.
+                    logger.info(
+                        "[responses] dropped %d memory entr(ies) from comparison side %s",
+                        len(entries), conv_id,
+                    )
+                    return
                 applied = apply_turn_memory(
                     session.scope,
                     project.path,

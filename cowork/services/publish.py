@@ -50,6 +50,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class ComparisonPublishRefused(ValueError):
+    """Publishing from a model-comparison side, which is never allowed.
+
+    A ValueError so every caller's existing mapping applies unchanged: 400 on
+    the REST paths, a failed tool result for the agent.
+    """
+
+
 class PublisherUnavailable(RuntimeError):
     """A local publish dependency (anton.publisher, markdown) failed to import.
 
@@ -407,6 +415,17 @@ def publish_artifact(
     `project_id` is the artifact's project; required in organization mode,
     where the owner lookup is keyed by it.
     """
+    # Checked first, before anything that needs a credential: every publish
+    # path -- the agent's tool, the desktop endpoint, the owner's access
+    # change, autopublish -- ends here, so this is the one place a comparison
+    # side is kept from sharing anything.
+    from cowork.services.projects import path_in_comparison_sandbox
+
+    if path_in_comparison_sandbox(artifacts_base):
+        raise ComparisonPublishRefused(
+            "Publishing is turned off while models are being compared. The user can "
+            "publish this after continuing with this side as a task; do not try again here."
+        )
     if scope is not None and scope.org_mode and project_id is None:
         raise ValueError("publish_artifact requires project_id in organization mode")
     if not api_key:
