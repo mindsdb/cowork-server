@@ -29,7 +29,7 @@ from cowork.db.session import get_session
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, OpenByDesign, require
 from cowork.api.v1.artifact_preview import (
     artifact_response_headers,
-    html_with_comment_layer,
+    html_preview_response,
     wants_comment_layer,
 )
 from cowork.api.v1.artifact_scope import (
@@ -919,10 +919,12 @@ async def preview_asset(token: str, rel_path: str, request: Request):
     if not target.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-    if wants_comment_layer(media_type, request):
+    if media_type == "text/html":
         # Offload the (potentially large) synchronous read so it doesn't stall
         # the event loop / other in-flight SSE streams — this endpoint is async.
-        resp = await run_in_threadpool(html_with_comment_layer, target)
+        resp = await run_in_threadpool(
+            html_preview_response, target, comments=wants_comment_layer(media_type, request)
+        )
         if resp is not None:
             return resp
     return FileResponse(target, media_type=media_type, headers=artifact_response_headers(media_type))
@@ -954,8 +956,8 @@ def serve_artifact_file(
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
     # This endpoint is a sync `def`, so FastAPI already runs it in a threadpool
     # — the blocking read here doesn't touch the event loop.
-    if wants_comment_layer(media_type, request):
-        resp = html_with_comment_layer(target)
+    if media_type == "text/html":
+        resp = html_preview_response(target, comments=wants_comment_layer(media_type, request))
         if resp is not None:
             return resp
     return FileResponse(target, media_type=media_type, headers=artifact_response_headers(media_type))

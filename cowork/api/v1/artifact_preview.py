@@ -6,7 +6,8 @@ from pathlib import Path
 from fastapi import Request
 from fastapi.responses import HTMLResponse
 
-from cowork.services.comments_layer import ACTIVATION_PARAM, inject_layer
+from cowork.services.comments_layer import ACTIVATION_PARAM
+from cowork.services.preview_html import prepare_preview_html
 
 NO_CACHE_HEADERS = {"Cache-Control": "no-cache, must-revalidate"}
 
@@ -37,10 +38,13 @@ def artifact_response_headers(media_type: str) -> dict[str, str]:
     return NO_CACHE_HEADERS
 
 
-def html_with_comment_layer(target: Path) -> HTMLResponse | None:
-    """Return injected HTML, or ``None`` when the file is not UTF-8 text."""
+def html_preview_response(target: Path, *, comments: bool) -> HTMLResponse | None:
+    """Return the prepared HTML, or ``None`` when the file is not UTF-8 text."""
     try:
         html = target.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
-    return HTMLResponse(inject_layer(html), headers=artifact_response_headers("text/html"))
+    return HTMLResponse(
+        prepare_preview_html(html, comments=comments),
+        headers=artifact_response_headers("text/html"),
+    )
