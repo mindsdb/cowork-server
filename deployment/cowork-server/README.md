@@ -56,14 +56,33 @@ The chart references these Secrets in the target namespace:
 
 ## Datasource grants for hosted turns
 
-`COWORK_TURN_DATASOURCE_ENABLED` is `"false"` in `values.yaml`; the release gate
-turns it on per environment in `values-<env>.yaml`, and
-`tests/test_chart_values.py` pins which environments are on. Turn it on only
-after auth serves the datasource endpoints with the bundle above,
-mindshub_inference serves `/v1/datasources/`, and the scratchpad-controller
-carries the gateway origin with a scratchpad image that has the typed helper.
-Rollback is the flag: off, no new grants are registered and no datasource block
-is queued; encrypted records stay in auth and OAuth connections are unaffected.
+Two switches, both off in `values.yaml`, and both set per environment by the
+release gate as scalars under `deployment:` in `values-<env>.yaml`. Never add
+the env names themselves there: `extraEnvs` appends to the base list, so the
+variable would render twice. `tests/test_chart_values.py` pins which
+environments are on.
+
+- `deployment.datasourceTurnsEnabled`, rendered as
+  `COWORK_TURN_DATASOURCE_ENABLED`: `"true"` registers grants and queues the
+  datasource block for hosted turns.
+- `deployment.datasourceCapabilities`, rendered as
+  `COWORK_DATASOURCE_CAPABILITIES`: the methods this deployment may run, as a
+  versioned manifest such as
+  `{"manifest_version": 1, "enabled": ["postgres:host-port"]}`. Empty offers
+  none, so with only the first switch on no method is available. A method
+  whose own spec says the adapters cannot run it stays unavailable whatever
+  this lists.
+
+`COWORK_TURN_DATASOURCE_GATEWAY_BASE_URL` is not a switch. It is where this
+server reaches the gateway to check a connection someone just saved, the
+inference Service by name, and the same in every environment.
+
+Turn the switches on only after auth serves the datasource endpoints with the
+bundle above, mindshub_inference serves `/v1/datasources/`, and a scratchpad
+image with the datasource helper is deployed and older pods are recycled.
+Rollback is `datasourceTurnsEnabled` off: no new grants are registered and no
+datasource block is queued; encrypted records stay in auth and OAuth
+connections are unaffected.
 
 ## Required cluster permissions
 
