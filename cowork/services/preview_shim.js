@@ -14,12 +14,15 @@
  *      aborts its script before any listener is bound and every control on
  *      the rendered page is dead.
  *
- * Verified against a real browser by
- * the repository's preview-shim sandbox check — re-run it
- * after any edit here; no automated test exercises this file in a sandbox.
+ * Verified by hand against a real browser; no automated test exercises this
+ * file in a sandbox, so re-check manually after any edit here.
  */
 (function () {
   'use strict';
+  // Captured once, before the page's own script runs: unlike window.top, an
+  // assignment to window.parent sticks, so a page could otherwise repoint it
+  // later and silently swallow every diagnostic this shim reports.
+  var PARENT = window.parent, IS_TOP = window.parent === window;
   var TAG = 'anton-preview';
   var LINE_OFFSET = __LINE_OFFSET__;
   var MAX_REPORTS = 20;
@@ -28,9 +31,9 @@
 
   function post(payload) {
     try {
-      if (window.parent === window) return;
+      if (IS_TOP) return;
       payload.source = TAG;
-      window.parent.postMessage(payload, '*');
+      PARENT.postMessage(payload, '*');
     } catch (e) { /* frame detached mid-report */ }
   }
 

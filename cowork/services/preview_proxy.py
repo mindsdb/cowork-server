@@ -207,7 +207,8 @@ async def proxy_artifact_request(
         #
         # Only the root document is patched, so an HTML page on another path of
         # a fullstack artifact gets neither. Accepted: the anton template
-        # generates a single static/index.html (design §7, risk 6).
+        # generates a single static/index.html, so no generated artifact has
+        # a second HTML entry point for this gap to affect today.
         try:
             patched = prepare_preview_html(
                 patched.decode("utf-8"),

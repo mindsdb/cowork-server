@@ -1227,7 +1227,7 @@ async def serve_private_draft(
             resp = await run_in_threadpool(
                 _preview_html_from_fd,
                 fd,
-                comments=wants_comment_layer(media_type, request),
+                comments=wants_comment_layer(request),
             )
             if resp is not None:
                 resources.close()

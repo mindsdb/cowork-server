@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -748,6 +749,21 @@ def capture_agent_revision(folder: Path, *, conversation_id: str | None = None) 
 _MAX_PREVIEW_ERRORS = 10
 _MAX_PREVIEW_MESSAGE = 300
 _MAX_PREVIEW_FILE = 200
+# A malformed entry (no message) never counts toward _MAX_PREVIEW_ERRORS, so an
+# attacker-controlled list of those must still be bounded on its own.
+_MAX_PREVIEW_ENTRIES_SCANNED = 200
+
+_WHITESPACE_RUN_RE = re.compile(r"\s+")
+
+
+def _flatten(value: str) -> str:
+    """Collapse whitespace runs, including embedded newlines, to one space.
+
+    Must run before truncation: the diagnostics block is a line-oriented
+    numbered list under a line-oriented label, so an untruncated newline in a
+    reported message could forge lines that look like they sit outside it.
+    """
+    return _WHITESPACE_RUN_RE.sub(" ", value).strip()
 
 
 def _preview_error_lines(entries: object, source_path: str) -> list[str]:
@@ -762,17 +778,17 @@ def _preview_error_lines(entries: object, source_path: str) -> list[str]:
     if not isinstance(entries, list):
         return []
     lines: list[str] = []
-    for entry in entries:
+    for entry in entries[:_MAX_PREVIEW_ENTRIES_SCANNED]:
         if not isinstance(entry, dict):
             continue
-        message = str(entry.get("message") or "").strip()[:_MAX_PREVIEW_MESSAGE]
+        message = _flatten(str(entry.get("message") or ""))[:_MAX_PREVIEW_MESSAGE]
         if not message:
             continue
-        where = str(entry.get("file") or "").strip()[:_MAX_PREVIEW_FILE]
+        where = _flatten(str(entry.get("file") or ""))[:_MAX_PREVIEW_FILE]
         if where == "about:srcdoc":
             where = ""
         line = entry.get("line")
-        positioned = isinstance(line, int) and line > 0
+        positioned = isinstance(line, int) and not isinstance(line, bool) and line > 0
         # A blank file with a line number is the document's own inline script,
         # which the shim blanks on purpose — name the file the agent will edit.
         # A blank file with no line is a failed resource or a policy violation:

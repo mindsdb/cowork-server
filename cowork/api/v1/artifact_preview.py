@@ -25,9 +25,13 @@ NO_CACHE_HEADERS = {"Cache-Control": "no-cache, must-revalidate"}
 HTML_SANDBOX_CSP = "sandbox allow-scripts allow-popups allow-forms allow-modals"
 
 
-def wants_comment_layer(media_type: str, request: Request) -> bool:
-    """Whether this top-level HTML request opted into review markers."""
-    return media_type == "text/html" and ACTIVATION_PARAM in request.query_params
+def wants_comment_layer(request: Request) -> bool:
+    """Whether this top-level HTML request opted into review markers.
+
+    Callers only reach here after already establishing the response is
+    text/html, so that check is not repeated.
+    """
+    return ACTIVATION_PARAM in request.query_params
 
 
 def artifact_response_headers(media_type: str) -> dict[str, str]:
