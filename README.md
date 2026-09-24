@@ -436,7 +436,13 @@ resources (API keys, artifacts, model entitlements) and lives in the auth
 service. It has nothing to do with the filesystem directories this repo calls
 workspaces, which is why the stored key is `hub_workspace_id`.
 
-Five things about it are worth knowing before changing it.
+The selector used to be switched by auth's `authorization_ui` Statsig gate,
+read out of the entitlements payload: no local Statsig client, one gate
+governing the console and Cowork alike. It was retired once its surfaces had
+been live in production long enough to trust (ENG-2043), so the selector is
+unconditionally on now and this service no longer calls entitlements at all.
+
+Four things about it are worth knowing before changing it.
 
 **The sidecar makes the call, not the renderer.** Auth's ingress allows three
 console origins per environment and no Cowork host, and a per-PR Cowork host
@@ -459,32 +465,22 @@ scopes to the loopback origin. `hub_credential` reads both, and it is
 deliberately a different function from `caller_bearer` so a client cannot steer
 the credential on the org model-catalog fetch by setting a header.
 
-**The switch is auth's Statsig gate, not a local setting.** Auth declares
-`authorization_ui` in its `configs/statsig_gates.json`, evaluates it with its
-server SDK, and reports the verdict in the entitlements payload; this service
-reads it from there. One gate governs the console and Cowork rather than two that
-can disagree, and Cowork holds no Statsig client and no SDK key. Every answer
-short of a definite yes reads as off: no bearer, auth unreachable, a version of
-auth with no gates field, or the gate off. `COWORK_HUB_WORKSPACES_FORCE_ON` is an
-ON-only development override for walking the surface where no rule targets you;
-it cannot switch the surface off, so it cannot escape the kill switch.
-
-**Both caches are keyed on the credential, not just the caller.** Auth answers
-the listing and the gate per caller: an owner or admin sees every workspace in
-the organization, a member only the ones they hold a grant on, and
-`authorization_ui` declares `idType: userID`. So an organization-keyed cache
-served one admin's menu to every member for the whole TTL, and the grant check on
-`PUT /active` reads the same entry. The key is
+**The listing cache is keyed on the credential, not just the caller.** Auth
+answers the listing per caller: an owner or admin sees every workspace in the
+organization, a member only the ones they hold a grant on. So an
+organization-keyed cache served one admin's menu to every member for the whole
+TTL, and the grant check on `PUT /active` reads the same entry. The key is
 `(auth host, organization, user, credential digest)`. The digest is not
 belt-and-braces: `user_id` comes from the gateway-set principal and is `None` on
 every desktop request, because `scope_from_principal` returns `LOCAL_SCOPE`
 outside org mode, so identity alone collapses to one shared entry and a
 sign-out/sign-in as another account would be served the previous one's
 workspaces. A new session means a new token means a new entry. Entries are swept
-on write, since nothing re-reads a departed caller's key and the dicts would
+on write, since nothing re-reads a departed caller's key and the dict would
 otherwise grow for the process lifetime. The TTL follows whether **auth
-answered**, not what it said: a gate auth evaluated as off is a real answer and
-keeps the long TTL, which matters because off is the state this ships in.
+answered**, not what it said: a reachable listing keeps the long TTL, and an
+unreachable one the short failure budget, so a degraded auth does not add a
+round trip to every menu open without also going stale for a long stretch.
 
 **Two refusals on `PUT /active`, and neither may read the stored pick.** A
 workspace missing from the caller's listing is a 403; one in the listing but
@@ -572,9 +568,13 @@ tenancy alone. It reports `enabled: true` when those hold and
 
 `COWORK_ORGANIZATION_SWITCH_ENABLED` is the product enable for the picker, not a
 safety switch, and it is the lever to reach for to hide the picker without a
-rebuild. `COWORK_IDENTITY_ENFORCE=audit` hides it too, by dropping
+code change. `COWORK_IDENTITY_ENFORCE=audit` hides it too, by dropping
 `expectedOrganizationEnforced`, but it reopens the no-principal path and leaves
 the boundary refusing anyway.
+
+Backing enforcement out needs the code and values from before cowork-server#524.
+[deployment/cowork-server/README.md](deployment/cowork-server/README.md#back-out-enforcement)
+records the procedure and why a Helm rollback cannot do it.
 
 Inside one organization, two different rules apply, and which one you get
 depends on the resource:
@@ -869,15 +869,17 @@ is on, the producer lists them from auth under the dedicated
 producer service role (`COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID` and
 `COWORK_TURN_DATASOURCE_PRODUCER_KEY`), bound to the turn key it has just
 minted, registers one grant per connection before enqueueing, and puts only
-connection ids and credential versions on the queue. No capability, password
-or gateway address crosses Redis. A listing or registration failure fails the
+connection ids and credential versions on the queue. No capability or
+password crosses Redis; the pod reaches the gateway on the inference host the
+turn's `llm` block already names. A listing or registration failure fails the
 dispatch as `permission_unavailable` instead of silently dropping the
 datasources.
 
 Turn the flag on only after auth serves the datasource producer and resolver
 endpoints, the inference deployment serves `/v1/datasources/`, the
-scratchpad-controller carries `SCRATCHPAD_CONTROLLER__ANTON_DATASOURCE_GATEWAY_URL`
-and the scratchpad image includes the typed helper. With the flag off nothing
+scratchpad-controller passes the `datasource` block on, and the scratchpad image
+includes the typed helper that reads the gateway from the turn's inference host,
+with live pods from an older image recycled first. With the flag off nothing
 in this path runs, so the flag is also the rollback.
 
 ## Configuration
@@ -901,7 +903,6 @@ Environment variables fall into two namespaces:
 | `COWORK_SKILLS_DIR` | `~/.cowork/skills` | Skills store root (local mode only) |
 | `COWORK_MEMORY_DIR` | `~/.cowork/memory` | Memory store root (local mode only) |
 | `COWORK_VAULT_DIR` | `~/.cowork/data-vault` | Connector credential vault |
-| `COWORK_HUB_WORKSPACES_FORCE_ON` | `false` | Development override that turns the MindsHub workspace surfaces on where no Statsig rule targets you. ON only, so it can never switch them off and never escape the kill switch. The switch itself is auth's `authorization_ui` gate; see "The MindsHub workspace selector" above. Never set in a deployed environment. |
 
 **Harness-level** (`ANTON_*`) — configure a specific agent harness. These are read by the harness adapter, not by cowork-server core. They use the harness prefix because the upstream agent library (anton) defines them:
 

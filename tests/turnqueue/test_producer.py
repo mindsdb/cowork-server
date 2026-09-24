@@ -427,12 +427,10 @@ async def test_datasource_grant_mismatch_fails_before_enqueue(monkeypatch):
         }),
     )
 
-    from cowork.services.product_permissions import ProductPermissionUnavailable
-
-    with pytest.raises(ProductPermissionUnavailable):
-        await _drain(prod.stream_remote_replies(
-            conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
-        ))
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+    assert [(kind, data["code"]) for kind, data in items] == [("turn_failed", "permission_unavailable")]
     assert not fake.added
 
 
@@ -480,12 +478,45 @@ async def test_datasource_grant_binding_mismatch_fails_before_enqueue(monkeypatc
         }),
     )
 
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+    assert [(kind, data["code"]) for kind, data in items] == [("turn_failed", "permission_unavailable")]
+    assert not fake.added
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing", ["mint_turn_key_details", "register_datasource_grants"])
+async def test_an_auth_outage_during_turn_setup_ends_the_turn_as_permission_unavailable(monkeypatch, failing):
+    """Setup runs before anything is queued, so an outage there must still reach the
+    client as permission_unavailable, which the responses producer only keeps when it
+    arrives as a turn_failed; a raised exception becomes a generic error. A listing
+    outage is the exception: the turn runs without databases, tested separately."""
     from cowork.services.product_permissions import ProductPermissionUnavailable
 
-    with pytest.raises(ProductPermissionUnavailable):
-        await _drain(prod.stream_remote_replies(
-            conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
-        ))
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    calls = {
+        "mint_turn_key_details": AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")),
+        "list_verified_datasource_connections": AsyncMock(return_value=[{
+            "id": 7, "connector_id": "postgres", "name": "events", "status": "verified", "credential_version": 3,
+        }]),
+        "register_datasource_grants": AsyncMock(return_value={}),
+    }
+    calls[failing] = AsyncMock(side_effect=ProductPermissionUnavailable())
+    for name, mock in calls.items():
+        monkeypatch.setattr(prod, name, mock)
+
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+
+    assert items == [("turn_failed", {
+        "error": "ProductPermissionUnavailable: turn setup could not be authorized",
+        **ProductPermissionUnavailable().detail,
+    })]
     assert not fake.added
 
 
@@ -556,6 +587,100 @@ async def test_stream_remote_replies_mints_and_attaches_llm_block(monkeypatch):
     assert captured["correlation_id"] == "r"
     assert captured["user_id"] == "u1"
     assert captured["org_id"] == "o1"
+
+
+@pytest.mark.asyncio
+async def test_stream_remote_replies_forwards_the_active_hub_workspace(monkeypatch):
+    """cowork's own workspace selector (hub_workspaces.py) stores the caller's
+    pick as UserSettings.hub_workspace_id; the mint must forward it so the
+    key's spend lands in that workspace instead of always the org Default."""
+    from types import SimpleNamespace
+    from cowork.common.settings import user_settings
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(resolved_planning_model="m", hub_workspace_id="ws-1"),
+    )
+
+    captured = {}
+
+    async def _fake_mint(**kw):
+        captured.update(kw)
+        return "mdb_turnkey"
+
+    monkeypatch.setattr(prod, "mint_turn_key", _fake_mint)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
+        model="mindshub_air",
+    ))
+
+    assert captured["workspace_id"] == "ws-1"
+
+
+@pytest.mark.asyncio
+async def test_the_active_hub_workspace_binds_the_key_with_datasources_on_too(monkeypatch):
+    """The datasource path mints through mint_turn_key_details, not mint_turn_key;
+    the picked workspace must reach it as well, or turning datasources on would
+    move every hosted turn's spend back to the org Default."""
+    from types import SimpleNamespace
+    from cowork.common.settings import user_settings
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(resolved_planning_model="m", hub_workspace_id="ws-1"),
+    )
+    captured = {}
+
+    async def _fake_mint(**kw):
+        captured.update(kw)
+        return SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")
+
+    monkeypatch.setattr(prod, "mint_turn_key_details", _fake_mint)
+    monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=[]))
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
+        model="mindshub_air",
+    ))
+
+    assert captured["workspace_id"] == "ws-1"
+
+
+@pytest.mark.asyncio
+async def test_stream_remote_replies_omits_workspace_id_when_none_picked(monkeypatch):
+    from types import SimpleNamespace
+    from cowork.common.settings import user_settings
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(resolved_planning_model="m", hub_workspace_id=""),
+    )
+
+    captured = {}
+
+    async def _fake_mint(**kw):
+        captured.update(kw)
+        return "mdb_turnkey"
+
+    monkeypatch.setattr(prod, "mint_turn_key", _fake_mint)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
+        model="mindshub_air",
+    ))
+
+    assert captured["workspace_id"] is None
 
 
 @pytest.mark.asyncio

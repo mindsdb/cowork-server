@@ -356,6 +356,114 @@ async def test_route_request_ignores_jev_result_even_when_it_contradicts_the_gat
 
 
 @pytest.mark.asyncio
+async def test_gate_and_jev_probe_share_the_turns_correlation_id(monkeypatch):
+    """The gate's trace context carries the turn's correlation_id, and
+    the detached probe inherits it, so the real probe's Jev call is attributed
+    to the conversation (origin:harness, not direct-api) and joins the gate
+    decision it shadows. Only the HTTP client is faked: the context has to cross
+    the gate's create_task for this to pass."""
+    import asyncio
+    import json
+
+    import cowork.handlers.responses as responses
+    from anton.core.llm.tracing import get_trace_context
+    from cowork.handlers import jev_shadow
+
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
+    )
+    llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
+
+    async def fake_binding():
+        return None, {"correlation_id": "corr-1", "llm": llm_block}
+
+    handler._router_binding = fake_binding
+    seen = {}
+
+    async def fake_decide_route(**_kwargs):
+        seen["gate_context"] = get_trace_context()
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+    sent = asyncio.Event()
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def post(self, _url, *, headers, json):
+            seen["probe_headers"] = headers
+            sent.set()
+            return SimpleNamespace(status_code=500, json=lambda: {})
+
+    monkeypatch.setattr(jev_shadow.httpx, "AsyncClient", _Client)
+
+    await handler._route_request(
+        conversation_id="conv-1",
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+        trace_metadata={"cowork_server_version": "1.2.3"},
+    )
+    await asyncio.wait_for(sent.wait(), timeout=2)
+
+    gate = seen["gate_context"]
+    assert gate.metadata["correlation_id"] == "corr-1"
+    assert gate.turn_id is None
+    headers = seen["probe_headers"]
+    assert "Langfuse-Session-Id" not in headers
+    assert "cowork-gate" not in headers["Langfuse-Tags"]
+    assert jev_shadow.JEV_SHADOW_TAG in headers["Langfuse-Tags"]
+    metadata = json.loads(headers["Langfuse-Metadata"])
+    assert (metadata["correlation_id"], metadata["harness"], metadata["conversation_id"]) == (
+        "corr-1",
+        "anton",
+        "conv-1",
+    )
+    # The context is the gate's alone: it does not leak past the gate block.
+    assert get_trace_context() is None
+
+
+@pytest.mark.asyncio
+async def test_gate_without_a_minted_turn_key_carries_no_correlation_id(monkeypatch):
+    import cowork.handlers.responses as responses
+    from anton.core.llm.tracing import get_trace_context
+
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
+    )
+    seen = {}
+
+    async def fake_decide_route(**_kwargs):
+        seen["gate_context"] = get_trace_context()
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+
+    await handler._route_request(
+        conversation_id="conv-1",
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+        trace_metadata={"cowork_server_version": "1.2.3"},
+    )
+
+    assert seen["gate_context"].metadata == {"cowork_server_version": "1.2.3"}
+
+
+@pytest.mark.asyncio
 async def test_route_request_returns_promptly_even_when_jev_is_slow(monkeypatch):
     """The probe must be detached, not awaited alongside the gate: a ready
     gate decision returning only after Jev finishes would mean a 'shadow'
@@ -571,13 +679,15 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
             resolved_router_provider=Provider.MINDS_CLOUD,
             resolved_router_model="kimi",        # the user's summarization pick
             resolved_gate_model="mindshub_air",  # what the gate actually runs on
+            hub_workspace_id="ws-1",
         ),
     )
     block = {"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "http://gw/v1"}
     minted = {}
 
-    async def fake_mint(*, org_id, user_id, correlation_id, settings):
+    async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
         minted["corr"] = correlation_id
+        minted["workspace_id"] = workspace_id
         return block
 
     monkeypatch.setattr(producer, "_mint_llm_block", fake_mint)
@@ -589,6 +699,44 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
     assert binding.model == "mindshub_air"
     assert type(binding.provider).__name__ == "OpenAIProvider"
     assert turn_llm == {"correlation_id": minted["corr"], "llm": block}
+    # The routing gate's own pre-mint must carry the caller's picked workspace
+    # too — this key is what a delegated remote turn ends up reusing as its
+    # `llm` block, so skipping it here would silently exempt every hosted-org
+    # turn that goes through the gate from workspace attribution.
+    assert minted["workspace_id"] == "ws-1"
+
+
+@pytest.mark.asyncio
+async def test_router_binding_omits_workspace_id_when_none_picked(monkeypatch):
+    import cowork.handlers.responses as responses
+    import cowork.turnqueue.producer as producer
+    from cowork.common.settings.user_settings import Provider
+
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(
+        responses, "TurnQueueSettings",
+        lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200, datasource_enabled=False),
+    )
+    monkeypatch.setattr(
+        responses, "get_user_settings",
+        lambda scope: SimpleNamespace(
+            resolved_router_provider=Provider.MINDS_CLOUD,
+            resolved_router_model="kimi",
+            resolved_gate_model="mindshub_air",
+            hub_workspace_id="",
+        ),
+    )
+    minted = {}
+
+    async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
+        minted["workspace_id"] = workspace_id
+        return {"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "http://gw/v1"}
+
+    monkeypatch.setattr(producer, "_mint_llm_block", fake_mint)
+
+    await handler._router_binding()
+
+    assert minted["workspace_id"] is None
 
 
 @pytest.mark.asyncio
@@ -612,11 +760,14 @@ async def test_router_binding_hands_the_key_prefix_to_the_turn_when_datasources_
             resolved_router_provider=Provider.MINDS_CLOUD,
             resolved_router_model="kimi",
             resolved_gate_model="mindshub_air",
+            hub_workspace_id="ws-picked",
         ),
     )
     block = {"provider": "minds-cloud", "api_key": "mdb_gate.secret", "base_url": "http://gw/v1"}
+    minted = {}
 
-    async def fake_mint(*, org_id, user_id, correlation_id, settings):
+    async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
+        minted["workspace_id"] = workspace_id
         return block, "mdb_gate"
 
     monkeypatch.setattr(producer, "_mint_llm_block_with_turn_key_id", fake_mint)
@@ -626,6 +777,8 @@ async def test_router_binding_hands_the_key_prefix_to_the_turn_when_datasources_
 
     assert turn_llm["llm"] == block
     assert turn_llm["turn_key_id"] == "mdb_gate"
+    # The workspace a person picked binds the key whether or not datasources are on.
+    assert minted["workspace_id"] == "ws-picked"
 
 
 @pytest.mark.asyncio
