@@ -80,6 +80,16 @@ def _conversation(conversation_id) -> Conversation | None:
         session.close()
 
 
+def _handle(*, running: bool):
+    """A real RunHandle, so `is_running` has the shape production code sees."""
+    from cowork.streaming.registry import RunHandle
+
+    return RunHandle(
+        conversation_id="c", turn_id=0, buffer=None,
+        task=SimpleNamespace(done=lambda: not running),
+    )
+
+
 def _real_project(client, name: str) -> dict:
     r = client.post("/api/v1/projects/", json={"name": name})
     assert r.status_code == 201, r.text
@@ -354,7 +364,7 @@ def test_continue_refuses_a_sandbox_as_the_destination(client):
 def test_continue_refuses_while_the_side_is_running(client):
     body = _create(client).json()
     project = _real_project(client, "busy-target")
-    running = SimpleNamespace(is_running=lambda: True)
+    running = _handle(running=True)
     with patch("cowork.streaming.registry.registry.get", return_value=running):
         r = client.post(
             f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": project["id"]}
@@ -390,7 +400,7 @@ def test_delete_removes_the_sandboxes_but_not_a_continued_task(client):
 
 def test_delete_refuses_while_a_side_is_running(client):
     body = _create(client).json()
-    running = SimpleNamespace(is_running=lambda: True)
+    running = _handle(running=True)
     with patch("cowork.streaming.registry.registry.get", return_value=running):
         assert client.delete(f"/api/v1/comparisons/{body['id']}").status_code == 409
     assert client.get(f"/api/v1/comparisons/{body['id']}").status_code == 200
@@ -751,9 +761,13 @@ def test_a_continued_side_shows_the_turns_it_was_compared_on(client):
     session = get_open_session()
     try:
         session.add(Message(conversation_id=conversation_id, role="user", content="q", seq=1))
-        # A tool row: stored with the turn, never returned by the transcript API.
-        session.add(Message(conversation_id=conversation_id, role="assistant", content=[{"type": "tool_use"}], seq=2))
-        session.add(Message(conversation_id=conversation_id, role="assistant", content="a", seq=3))
+        # A tool call as a turn really stores it: the call on an assistant row,
+        # its result on a USER row. Neither is returned by the transcript API.
+        session.add(Message(conversation_id=conversation_id, role="assistant",
+                            content=[{"type": "tool_use", "id": "t1", "name": "web_search", "input": {}}], seq=2))
+        session.add(Message(conversation_id=conversation_id, role="user",
+                            content=[{"type": "tool_result", "tool_use_id": "t1", "content": "found"}], seq=3))
+        session.add(Message(conversation_id=conversation_id, role="assistant", content="a", seq=4))
         session.commit()
     finally:
         session.close()
@@ -762,7 +776,7 @@ def test_a_continued_side_shows_the_turns_it_was_compared_on(client):
 
     session = get_open_session()
     try:
-        session.add(Message(conversation_id=conversation_id, role="user", content="later", seq=4))
+        session.add(Message(conversation_id=conversation_id, role="user", content="later", seq=5))
         session.commit()
     finally:
         session.close()
@@ -885,3 +899,16 @@ def test_a_continue_that_fails_part_way_can_be_retried(client):
     r = client.post(url, json={"projectId": project["id"]})
     assert r.status_code == 200, r.text
     assert str(_conversation(body["sides"][0]["conversationId"]).project_id) == project["id"]
+
+
+def test_a_finished_turn_does_not_block_continue_or_delete(client):
+    # The registry keeps a handle after its turn ends, so "there is a handle"
+    # must not read as "a turn is running".
+    body = _create(client).json()
+    project = _real_project(client, "finished-target")
+    with patch("cowork.streaming.registry.registry.get", return_value=_handle(running=False)):
+        r = client.post(
+            f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": project["id"]}
+        )
+        assert r.status_code == 200, r.text
+        assert client.delete(f"/api/v1/comparisons/{body['id']}").status_code == 204
