@@ -32,7 +32,6 @@ from cowork.db.scoped import ScopedSession, ScopedSessionDep, get_scoped_session
 from cowork.services.product_permissions import has_product_permission, require_product_permission
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
-    artifact_owner_id,
     require_artifact_owner,
 )
 from cowork.services.comments_layer import inject_layer
@@ -467,11 +466,13 @@ def _owner_workspace(session, project_ref: str, artifact_id: str):
     source, folder, metadata, _is_own = review_artifact_for_request(
         session, project_ref, artifact_id
     )
-    capabilities = require_artifact_owner(session, source)
+    capabilities = require_artifact_owner(session, source, folder.name)
     return source, folder, metadata, capabilities
 
 
-async def _sync_live_artifact(session, folder: Path) -> bool | None:
+async def _sync_live_artifact(
+    session, folder: Path, *, project_id: str | None = None
+) -> bool | None:
     """Re-publish a live artifact after an editor write.
 
     ``None`` means the artifact is only a draft, ``True`` means its stable URL
@@ -530,6 +531,7 @@ async def _sync_live_artifact(session, folder: Path) -> bool | None:
                     publish_url=publish_url,
                     access=access,
                     scope=scope,
+                    project_id=project_id,
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
@@ -647,7 +649,7 @@ async def update_artifact_source(
             summary=body.summary,
         )
         if saved["revision"]["id"] != body.expectedRevisionId:
-            await _sync_live_artifact(session, folder)
+            await _sync_live_artifact(session, folder, project_id=source.project_id)
         return saved
     except RevisionConflict as exc:
         raise HTTPException(
@@ -694,7 +696,9 @@ async def artifact_review_entry(
     source, folder, metadata, _is_own = review_artifact_for_request(
         session, project_ref, artifact_id
     )
-    capabilities = await _current_capabilities(session, artifact_capabilities(session, source))
+    capabilities = await _current_capabilities(
+        session, artifact_capabilities(session, source, folder.name)
+    )
     current_revision = None
     try:
         draft = await run_in_threadpool(current_source, folder, metadata, artifact_id)
@@ -731,14 +735,18 @@ def _owner_publish_context(session, folder: Path):
     which exists on an org deployment — which is why the whole `/publish` router
     is local-only.
     """
-    from cowork.services.artifact_autopublish import _publish_url
+    from cowork.services.artifact_autopublish import _active_workspace_id, _publish_url
     from cowork.services.artifact_publish_key import PublishKey
 
     scope = session.scope
     return (
         folder.parent,
         _publish_url(scope),
-        PublishKey(str(scope.user_id), str(scope.org_id), min_ttl_s=_LIVE_PUBLISH_TIMEOUT_S + 60.0),
+        PublishKey(
+            str(scope.user_id), str(scope.org_id),
+            min_ttl_s=_LIVE_PUBLISH_TIMEOUT_S + 60.0,
+            workspace_id=_active_workspace_id(scope),
+        ),
     )
 
 
@@ -792,7 +800,7 @@ async def set_artifact_access(
     from cowork.services.publish import publish_artifact as _publish_bundle
     from cowork.services.artifact_access import ArtifactAccessUnavailable
 
-    _source, folder, metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
+    source, folder, metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
     if _artifact_primary(folder, metadata) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -827,6 +835,7 @@ async def set_artifact_access(
                     publish_url=publish_url,
                     access=dict(body.access or {}),
                     scope=session.scope,
+                    project_id=source.project_id,
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
@@ -873,18 +882,20 @@ async def enable_artifact_comments(
 
     source, folder, metadata, capabilities = _owner_workspace(session, project_ref, artifact_id)
     capabilities = await _current_capabilities(session, capabilities)
-    owner_user_id = artifact_owner_id(session, source)
+    # `_owner_workspace` already refused anyone but the owner, so the owner is
+    # the caller; resolving it again would only repeat that query.
+    owner_user_id = str(session.scope.user_id) if session.scope.user_id else None
     try:
         canonical_key = await run_in_threadpool(
             ensure_authorization_key,
             artifact_id,
             session.scope,
-            owner_user_id=str(owner_user_id) if owner_user_id else None,
+            owner_user_id=owner_user_id,
         )
         await provision_draft_review_access(
             canonical_key.split("/", 1)[1],
             session.scope,
-            owner_user_id=str(owner_user_id) if owner_user_id else None,
+            owner_user_id=owner_user_id,
         )
     except ArtifactAccessUnavailable as exc:
         raise HTTPException(
@@ -945,7 +956,7 @@ async def restore_artifact_revision(
     session: ScopedSessionDep,
 ):
     await require_product_permission(session.scope, "artifact.manage")
-    _source, folder, metadata, _capabilities = _owner_workspace(
+    source, folder, metadata, _capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
     try:
@@ -965,7 +976,7 @@ async def restore_artifact_revision(
             summary=f"Restored revision {restored['number']}",
         )
         if saved["revision"]["id"] != body.expectedRevisionId:
-            await _sync_live_artifact(session, folder)
+            await _sync_live_artifact(session, folder, project_id=source.project_id)
         return saved
     except RevisionConflict as exc:
         raise HTTPException(

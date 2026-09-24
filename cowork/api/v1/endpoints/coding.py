@@ -46,6 +46,8 @@ from cowork.coding.contracts import (
     GitIdentityRequest,
 )
 from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, StateConflict
+from cowork.coding.contracts import ModeTurnRequest
+from cowork.coding.questions import QuestionResponse
 from cowork.coding.control_models import TaskResourceScope
 from cowork.coding.delivery_automation import DeliveryAutomationService
 from cowork.coding.engines.base import EngineCredentials
@@ -672,6 +674,11 @@ def steer(session_id: str, body: TurnRequest):
     return _call(_service().steer, session_id, body.prompt, body.attachments)
 
 
+@router.post("/sessions/{session_id}/mode-turns")
+def submit_mode_turn(session_id: str, body: ModeTurnRequest, session: SessionDep, scope: ScopeDep):
+    return _call(_service().submit_mode_turn, session_id, body, _credentials(_settings(session, scope)))
+
+
 @router.post("/sessions/{session_id}/queue")
 def queue_turn(session_id: str, body: TurnRequest):
     return _call(_service().queue_turn, session_id, body.prompt, body.attachments)
@@ -705,6 +712,11 @@ def run_next_queued(
 @router.post("/sessions/{session_id}/cancel")
 def cancel(session_id: str):
     return _call(_service().cancel, session_id)
+
+
+@router.post("/sessions/{session_id}/questions/{question_id}")
+def answer_question(session_id: str, question_id: str, body: QuestionResponse):
+    return _call(_service().answer_question, session_id, question_id, body)
 
 
 @router.post("/sessions/{session_id}/recover")

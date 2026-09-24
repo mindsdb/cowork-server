@@ -1416,13 +1416,15 @@ async def test_a_bad_draft_does_not_break_the_turn(monkeypatch):
 # them into the same shared tree cowork-server reads, which is what lets the
 # before/after diff work from here at all.
 
-def _artifact(folder, slug, *, body="<html>report</html>"):
+def _artifact(folder, slug, *, body="<html>report</html>", conversation_id=None):
     target = folder / slug
     target.mkdir(parents=True, exist_ok=True)
     (target / "report.html").write_text(body)
-    (target / "metadata.json").write_text(
-        json.dumps({"slug": slug, "type": "html-app", "title": slug})
-    )
+    meta = {"slug": slug, "type": "html-app", "title": slug}
+    if conversation_id is not None:
+        # What anton's artifact tools write: the creating conversation first.
+        meta["provenance"] = [{"conversation": str(conversation_id), "turns": []}]
+    (target / "metadata.json").write_text(json.dumps(meta))
     return target
 
 
@@ -1505,17 +1507,19 @@ async def test_produce_remote_cards_an_artifact_the_worker_wrote(monkeypatch, tm
         fake_autopublish,
     )
 
+    conv_id = uuid4()
+
     async def fake_replies(**kwargs):
         yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
         yield "turn_delta", {"text": "done"}
         # The worker writes into the shared tree mid-turn.
-        _artifact(artifacts_base, "sales-report")
+        _artifact(artifacts_base, "sales-report", conversation_id=conv_id)
         yield "turn_completed", {}
 
     monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
 
     await handler._produce_remote(
-        conv_id=uuid4(), input_text="hi", original_content="hi",
+        conv_id=conv_id, input_text="hi", original_content="hi",
         model="anton", harness_id="anton", buffer=_FakeBuffer(),
     )
 
@@ -1528,6 +1532,56 @@ async def test_produce_remote_cards_an_artifact_the_worker_wrote(monkeypatch, tm
     assert len(cards) == 1
     assert cards[0]["artifact"]["slug"] == "sales-report"
     assert cards[0]["artifact"]["projectName"] == "proj"
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_does_not_claim_a_concurrent_siblings_artifact(monkeypatch, tmp_path):
+    """ENG-2961: the project base is shared, so a folder that merely appeared
+    during this turn may be a sibling turn's. Only artifacts whose provenance
+    names this conversation are indexed, owned and carded."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    project_dir = tmp_path / "proj"
+    artifacts_base = project_dir / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    conversation = _conversation_at(project_dir)
+    monkeypatch.setattr(
+        responses_mod.ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: (
+            conversation, artifacts_base,
+            str(conversation.project_id), conversation.project.name,
+        )),
+    )
+
+    published = {}
+
+    async def fake_autopublish(base, scope, *, touched, **kwargs):
+        published["touched"] = set(touched)
+        return set(touched)
+
+    monkeypatch.setattr(
+        "cowork.services.artifact_autopublish.autopublish_project_artifacts",
+        fake_autopublish,
+    )
+    conv_id = uuid4()
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        _artifact(artifacts_base, "mine", conversation_id=conv_id)
+        _artifact(artifacts_base, "sibling", conversation_id=uuid4())
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=conv_id, input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert published["touched"] == {"mine"}
+    cards = [e for e in saved["events"] if e.get("type") == "response.artifact_created"]
+    assert [c["artifact"]["slug"] for c in cards] == ["mine"]
 
 
 @pytest.mark.asyncio
@@ -1584,6 +1638,105 @@ async def test_produce_remote_does_not_card_a_failed_turn(monkeypatch, tmp_path)
 
     assert indexed.get("ran") is True
     assert not [e for e in saved["events"] if e.get("type") == "response.artifact_created"]
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_claims_an_unattributed_artifact_of_a_failed_turn(monkeypatch, tmp_path):
+    """ENG-2961 R1: anton writes metadata.json with empty provenance first and
+    appends the turn's entry right after, so a turn cut short in between leaves
+    a folder with no provenance. On a non-clean exit that folder is still this
+    turn's; one naming another conversation is still dropped."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    project_dir = tmp_path / "proj"
+    artifacts_base = project_dir / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    conversation = _conversation_at(project_dir)
+    monkeypatch.setattr(
+        responses_mod.ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: (
+            conversation, artifacts_base,
+            str(conversation.project_id), conversation.project.name,
+        )),
+    )
+
+    from cowork.services import task_objects
+
+    # The provenance filter now runs inside `index_turn_artifacts`; what it
+    # kept is what reaches the index step.
+    indexed = {"new": set()}
+
+    def spy_index_new(conversation, conversation_id, project_id, slugs, scope):
+        indexed["new"] = set(slugs)
+
+    monkeypatch.setattr(task_objects, "_index_new_slugs", spy_index_new)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        _artifact(artifacts_base, "half-written")
+        _artifact(artifacts_base, "sibling", conversation_id=uuid4())
+        yield "turn_failed", {"error": "boom", "code": "anton_error", "message": "failed"}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert indexed["new"] == {"half-written"}
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_drops_an_unattributed_artifact_of_a_clean_turn(monkeypatch, tmp_path):
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    project_dir = tmp_path / "proj"
+    artifacts_base = project_dir / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    conversation = _conversation_at(project_dir)
+    monkeypatch.setattr(
+        responses_mod.ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: (
+            conversation, artifacts_base,
+            str(conversation.project_id), conversation.project.name,
+        )),
+    )
+
+    from cowork.services import task_objects
+
+    # The provenance filter now runs inside `index_turn_artifacts`; what it
+    # kept is what reaches the index step.
+    indexed = {"new": set()}
+
+    def spy_index_new(conversation, conversation_id, project_id, slugs, scope):
+        indexed["new"] = set(slugs)
+
+    monkeypatch.setattr(task_objects, "_index_new_slugs", spy_index_new)
+
+    async def fake_autopublish(base, scope, *, touched, **kwargs):
+        return set(touched)
+
+    monkeypatch.setattr(
+        "cowork.services.artifact_autopublish.autopublish_project_artifacts",
+        fake_autopublish,
+    )
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        _artifact(artifacts_base, "handmade")
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert indexed["new"] == set()
 
 
 # ── turn history ─────────────────────────────────────────────────────────────

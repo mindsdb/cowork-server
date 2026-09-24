@@ -296,8 +296,16 @@ deployment:
     - name: COWORK_TURN_BACKEND
       value: "remote"
 
+    # Populated by the redis-auth ExternalSecret (terraform-custom-*-redis-auth).
+    # Listed before the URL so Kubernetes can expand $(REDIS_PASSWORD) into it.
+    - name: REDIS_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: redis-auth
+          key: redis-password
+
     - name: COWORK_TURN_REDIS_URL
-      value: "redis://redis-master:6379/0"
+      value: "redis://default:$(REDIS_PASSWORD)@redis-master:6379/0"
 
     # Turn buffers and the turn index in Redis rather than on the pod's disk,
     # so any replica can serve a reconnect or a stop for a turn another replica
