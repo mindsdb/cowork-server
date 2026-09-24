@@ -620,7 +620,7 @@ async def list_artifacts(
         # Local requests that carry both parameters have always preferred the
         # UUID. Do not let the ignored compatibility field enter resolution.
         if project_id is None:
-            catalog = _desktop_registered_path_catalog()
+            catalog = await run_in_threadpool(_desktop_registered_path_catalog)
             if not project_path or "\x00" in project_path:
                 return []
             requested = os.path.normpath(os.path.expanduser(project_path))
@@ -634,7 +634,7 @@ async def list_artifacts(
             source = _desktop_registered_source(catalog, requested, project_name)
             if source is None:
                 return []
-            return _artifact_cards(session, [source])
+            return await run_in_threadpool(_artifact_cards, session, [source])
     if project_id is not None:
         raw_project_ref = str(project_id)
         # Although FastAPI has already parsed this as UUID, make the recognized
@@ -645,8 +645,8 @@ async def list_artifacts(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid project",
             )
-        return _scoped_project_cards(session, project_ref)
-    return _all_artifact_cards(session)
+        return await run_in_threadpool(_scoped_project_cards, session, project_ref)
+    return await run_in_threadpool(_all_artifact_cards, session)
 
 
 
@@ -729,7 +729,11 @@ async def delete_artifact_for_request(
         # Unpublish acts on the viewer, and the viewer scopes by the token's owner,
         # so the credential has to be the acting user's - not a stored provider key
         # (org deployments have none).
-        api_key = await PublishKey(scope.user_id, scope.org_id, min_ttl_s=120.0).get()
+        from cowork.services.artifact_autopublish import _active_workspace_id
+
+        api_key = await PublishKey(
+            scope.user_id, scope.org_id, min_ttl_s=120.0, workspace_id=_active_workspace_id(scope)
+        ).get()
         if not api_key:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

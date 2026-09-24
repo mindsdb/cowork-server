@@ -157,15 +157,15 @@ deployment:
               key: database_uri
 
   # Liveness restarts the pod if it fails. Kept tolerant (failureThreshold * periodSeconds = 60s)
-  # so a transient stall doesn't take the pod down. cowork-server exposes a single
-  # health endpoint (no separate live/ready); both probes point at it.
+  # so a transient stall doesn't take the pod down. Points at the zero-I/O /live
+  # route so a database outage can't be misread as "this process is dead".
   livenessProbe:
     enabled: true
     initialDelaySeconds: 60
     periodSeconds: 10
     timeoutSeconds: 5
     failureThreshold: 6
-    path: /api/v1/health/
+    path: /api/v1/health/live
 
   # Readiness gates traffic. Polls quickly so the pod returns to service fast after a hiccup.
   # failureThreshold * periodSeconds = 15s before the pod is pulled from endpoints.
@@ -182,10 +182,10 @@ deployment:
   resources:
     limits:
       cpu: 1
-      memory: 512Mi
+      memory: 1Gi
     requests:
       cpu: 1
-      memory: 512Mi
+      memory: 1Gi
 
   autoscaling:
     enabled: false
@@ -296,8 +296,16 @@ deployment:
     - name: COWORK_TURN_BACKEND
       value: "remote"
 
+    # Populated by the redis-auth ExternalSecret (terraform-custom-*-redis-auth).
+    # Listed before the URL so Kubernetes can expand $(REDIS_PASSWORD) into it.
+    - name: REDIS_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: redis-auth
+          key: redis-password
+
     - name: COWORK_TURN_REDIS_URL
-      value: "redis://redis-master:6379/0"
+      value: "redis://default:$(REDIS_PASSWORD)@redis-master:6379/0"
 
     # Turn buffers and the turn index in Redis rather than on the pod's disk,
     # so any replica can serve a reconnect or a stop for a turn another replica

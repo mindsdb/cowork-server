@@ -1,0 +1,51 @@
+name: Wheels Available (weekly)
+
+# Trigger-shaped caller, following the same split as `dev-build-deploy.yml` and
+# `build-deploy.yml`: the check lives in `wheels-available.yml`, this file holds
+# the schedule and the alerting.
+#
+# Why a weekly run at all. The PR and publish gates catch a change WE make and a
+# broken artifact at publish time, but neither covers the gap between releases: a
+# dependency can drop a wheel for a platform with no commit in this repo, and we
+# do not publish on a fixed cadence, so a tree that was green when it published
+# can be broken for every new install a week later with nothing red anywhere.
+# That is exactly how the incident behind this check reached a user — cryptography
+# dropped the macOS x86_64 wheel on 2026-06-12 and it surfaced two months later as
+# a blocked first run. This turns "caught at the next publish, whenever that is"
+# into "caught within a week".
+#
+# Why the schedule is NOT in wheels-available.yml: that file is also called by
+# `dev-build-deploy.yml`, whose `permissions: contents: read` caps what the
+# called workflow may request. The notify job below needs `actions: read`, and
+# requesting it inside the reusable fails the PR workflow at startup validation
+# — taking every check on every pull request down with it.
+
+on:
+  schedule:
+    # Mondays 06:17 UTC, ahead of the weekly release train.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheels-available:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/wheels-available.yml
+
+  notify:
+    # A scheduled run has no PR and no release to surface a failure through, so
+    # without this it goes red where nobody looks.
+    needs: wheels-available
+    if: ${{ !cancelled() }}
+    permissions:
+      contents: read
+      actions: read  # the prior-run lookup behind the recovery message
+    uses: mindsdb/github-actions/.github/workflows/notify-main-failure.yml@main
+    with:
+      env-name: "wheel availability (weekly check)"
+      status: ${{ needs.wheels-available.result == 'failure' && 'failed' || 'recovered' }}
+      runs-on: ubuntu-latest
+    secrets: inherit

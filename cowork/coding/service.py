@@ -8,6 +8,9 @@ from functools import lru_cache
 from pathlib import Path
 
 from cowork.coding.approvals import ApprovalBroker
+from cowork.coding.questions import QuestionBroker
+from cowork.coding.service_questions import CodingQuestionOperations
+from cowork.coding.service_planning import CodingPlanningOperations
 from cowork.coding.commands import CodingCommandHandler
 from cowork.coding.context import (
     validate_directories,
@@ -63,12 +66,14 @@ from cowork.coding.task_delivery import TaskDeliveryService
 from cowork.coding.terminal_service import TaskTerminalService
 from cowork.coding.turns import RunningTurn, TurnExecutor
 from cowork.coding.workspace import WorkspaceManager
-from cowork.common.paths import cowork_home
+from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
 
 
 class CodingService(
+    CodingPlanningOperations,
+    CodingQuestionOperations,
     CodingWorkspaceFilesOperations,
     CodingDeliveryOperations,
     CodingTerminalOperations,
@@ -113,8 +118,12 @@ class CodingService(
         self._lock = threading.RLock()
         self._running: dict[str, RunningTurn] = {}
         self._maintenance: set[str] = set()
-        self.approvals = ApprovalBroker(self._approval_opened, self._approval_closed)
-        self.runtimes = RuntimeManager(root, self.registry, self.approvals.request)
+        self.approvals = ApprovalBroker(
+            self._approval_opened, self._approval_closed,
+            lambda session_id: self.store.load_session(session_id).command_approval_grants,
+        )
+        self.questions = QuestionBroker(self._question_opened, self._question_closed)
+        self.runtimes = RuntimeManager(root, self.registry, self._engine_request)
         self.lifecycle = SessionLifecycleOperations(
             maintenance_session=self._maintenance_session,
             emit=self._emit,
@@ -489,13 +498,18 @@ class CodingService(
         """Checkpoint active turns before the desktop terminates the sidecar tree."""
         with self._lock:
             active_sessions = list(self._running)
+            for running in self._running.values():
+                running.cancel_requested = True
         for session_id in active_sessions:
             try:
-                self.approvals.cancel_session(session_id)
+                try:
+                    self.questions.cancel_session(session_id)
+                finally:
+                    self.approvals.cancel_session(session_id)
             except Exception:
                 # Shutdown must continue releasing the remaining tasks and
                 # runtimes even if one persisted approval cannot be updated.
-                logger.exception("Could not cancel approval while shutting down task %s", session_id)
+                logger.exception("Could not cancel pending input while shutting down task %s", session_id)
         return self.turns.interrupt(active_sessions)
 
     def _approval_opened(self, session_id: str, pending: PendingApproval) -> None:
@@ -518,7 +532,15 @@ class CodingService(
             lambda current: self._open_approval(current, pending),
         )
 
-    def _approval_closed(self, session_id: str, pending: PendingApproval, decision: ApprovalDecision) -> None:
+    def _approval_closed(
+        self, session_id: str, pending: PendingApproval, decision: ApprovalDecision,
+        command_grant: str | None = None,
+    ) -> None:
+        def close_and_remember(current: CodingSession) -> None:
+            self._close_approval(current)
+            if command_grant and command_grant not in current.command_approval_grants:
+                current.command_approval_grants = [*current.command_approval_grants[-255:], command_grant]
+
         self._emit(
             session_id,
             CodingEvent(
@@ -528,7 +550,7 @@ class CodingService(
                 phase="completed",
                 data={"approvalId": pending.id, "decision": decision.value},
             ),
-            self._close_approval,
+            close_and_remember,
         )
 
     def _emit(
@@ -559,6 +581,11 @@ class CodingService(
 
     @staticmethod
     def _apply_config_update(session: CodingSession, values: dict) -> None:
+        if any(
+            name in values and values[name] != getattr(session, name)
+            for name in ("permission_mode", "network_access", "additional_dirs")
+        ):
+            session.command_approval_grants = []
         for name, value in values.items():
             setattr(session, name, value)
 
@@ -600,4 +627,4 @@ class CodingService(
 
 @lru_cache(maxsize=1)
 def get_coding_service() -> CodingService:
-    return CodingService(cowork_home() / "coding")
+    return CodingService(Path(get_app_settings().coding.root_dir))

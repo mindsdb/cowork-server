@@ -1,13 +1,14 @@
-"""Optional bearer-token auth middleware for the Cowork server.
+"""Bearer-token auth middleware for the Cowork server.
 
-When COWORK_REQUIRE_AUTH=true the server validates every request (except
+When COWORK_REQUIRE_AUTH is true the server validates every request (except
 OPTIONS preflight and the /health endpoint) against a shared secret token
 stored in ~/.cowork/.env as COWORK_AUTH_TOKEN.  If no token is set, one is
 auto-generated at startup and written back to that file so the desktop app
 can read it.
 
-The feature is off by default — existing installs see no behaviour change
-unless they explicitly set COWORK_REQUIRE_AUTH=true.
+Defaults on in local/desktop tenancy (see AppSettings.require_auth) and stays
+off in org mode, where it isn't supported at all — see create_app()'s
+RuntimeError for why.
 """
 
 from __future__ import annotations
@@ -28,7 +29,10 @@ from starlette.types import ASGIApp
 logger = logging.getLogger(__name__)
 
 # Paths that are always accessible without a token (health probe + CORS preflight).
-_EXEMPT_PATHS = frozenset({"/api/v1/health", "/api/v1/health/"})
+_EXEMPT_PATHS = frozenset({
+    "/api/v1/health", "/api/v1/health/",
+    "/api/v1/health/live",
+})
 
 
 class BearerTokenMiddleware(BaseHTTPMiddleware):

@@ -95,6 +95,8 @@ class CodexEngine:
                 "terminal": "supported",
                 "goals": "supported",
                 "forking": "supported",
+                "planning": "supported",
+                "questions": "supported",
             },
             commands=[
                 EngineCommand(name="goal", label="Goal", description="View it alone, or set, edit, pause, resume, or clear a durable objective", argument_hint="set|edit|pause|resume|clear", action="goal"),
@@ -154,7 +156,7 @@ class CodexEngine:
         for row in payload.get("data", []) if isinstance(payload, dict) else []:
             if not isinstance(row, dict) or not isinstance(row.get("id"), str):
                 continue
-            if row.get("embedding") is True:
+            if row.get("kind") == "decision" or row.get("embedding") is True:
                 continue
             # Discovery describes what the MindsHub Responses API can run, not
             # what the current wallet can start right now. Keep disabled rows
@@ -212,6 +214,7 @@ class CodexEngineSession:
         )
         self._skill_roots = None if config.skill_roots is None else tuple(config.skill_roots)
         self._model = config.model
+        self._task_mode = config.task_mode
         self._reasoning_effort = config.reasoning_effort
         self._service_tier = config.service_tier
         self._personality = config.personality
@@ -275,6 +278,14 @@ class CodexEngineSession:
                 "approvalsReviewer": "user",
                 "sandboxPolicy": self._sandbox_policy,
                 "summary": "concise",
+                "collaborationMode": {
+                    "mode": "plan" if self._task_mode == "plan" else "default",
+                    "settings": {
+                        "model": self._model,
+                        "reasoning_effort": self._reasoning_effort,
+                        "developer_instructions": None,
+                    },
+                },
             },
         )
         return response.turn.id

@@ -30,10 +30,12 @@ logger = logging.getLogger(__name__)
 # ENG-576 ("MindsHub failed its last test" / "Invalid API key" false-negatives).
 MINDS_PROBE_MODEL = "mindshub_air"
 
-# Marks a request as a connectivity/health-check probe so the Traces list can
-# hide it by default. Read by mindshub_inference on the
-# /chat/completions path; it is our own header and means nothing to a non-Minds
-# endpoint, so it is only ever sent to a Minds host.
+# Marks a request as our own background call on the user's key, not activity
+# they asked for, so the customer's Traces list hides it by default: the
+# connectivity/health-check pings below and the Jev shadow probe
+# (cowork/handlers/jev_shadow.py). Read by mindshub_inference; it is
+# our own header and means nothing to a non-Minds endpoint, so it is only ever
+# sent to a Minds host.
 MINDS_REQUEST_KIND_HEADER = "X-Minds-Request-Kind"
 MINDS_REQUEST_KIND_PROBE = "probe"
 
@@ -326,8 +328,8 @@ async def fetch_minds_models(
     treated as available. ``labels`` is purely a display aid for the picker — the
     model id remains the value used everywhere else (selection, storage,
     resolution); a model missing from ``labels`` falls back to the client's
-    id-derived label. Embeddings models are dropped entirely — they share this
-    listing but aren't chat/completion models (see ``_is_embedding_row``).
+    id-derived label. Embedding and decision models are dropped entirely — they
+    share this listing but cannot serve planning/coding roles.
 
     ``force_refresh`` skips the cache *read* for a cached success (a fresh
     result is still cached for subsequent calls) — used when the caller knows
@@ -432,11 +434,11 @@ async def fetch_minds_models(
         model_id = str(row.get("id")).strip()
         if not model_id:
             continue
-        # Embedding models share this listing but aren't chat/completion
+        # Embedding and decision models share this listing but aren't chat/completion
         # models — chosen for planning/coding roles they'd error every turn.
         # Filtered here, the single place every row is parsed, so neither the
         # picker nor default-resolution ever sees them.
-        if _is_embedding_row(row, model_id):
+        if row.get("kind") == "decision" or _is_embedding_row(row, model_id):
             continue
         ids.append(model_id)
         # A model the org's wallet can't currently pay for (or whose free
@@ -1155,11 +1157,18 @@ async def validate_provider(provider: str, api_key: str,
     return {"ok": False, "error": "Unknown provider"}
 
 
-def build_llm_client(effort_override: str | None = None):
+def build_llm_client(
+    effort_override: str | None = None, *, model_override: str | None = None
+):
     """Build an Anton LLMClient from the current user settings.
 
     Shared by the main responses handler and the credential probe handler
     so provider construction logic stays in one place.
+
+    ``model_override`` is a per-turn composer selection from the planning
+    provider's catalogue. Apply it to roles using that provider only; a role
+    configured on a different provider must keep its own compatible model.
+    Persisted settings are never modified.
 
     Reasoning effort is a persisted per-role setting
     (``planning_reasoning_effort`` / ``coding_reasoning_effort``) — chosen in the
@@ -1173,7 +1182,8 @@ def build_llm_client(effort_override: str | None = None):
     coding roles for this call, bypassing the stored-vs-resolved staleness
     guard below (an explicit per-task pick is inherently valid for the model
     actually in use this turn, unlike a stale persisted choice that may have
-    been made for a different model).
+    been made for a different model). With a model override, a coding role
+    on a different provider retains its own model and effort.
     """
     from anton.core.llm.anthropic import AnthropicProvider
     from anton.core.llm.client import LLMClient
@@ -1186,6 +1196,18 @@ def build_llm_client(effort_override: str | None = None):
     )
 
     settings = get_user_settings()
+    same_coding_provider = settings.resolved_coding_provider == settings.resolved_planning_provider
+    planning_model = model_override or settings.resolved_planning_model
+    coding_model = (
+        model_override
+        if model_override and same_coding_provider
+        else settings.resolved_coding_model
+    )
+    router_model = (
+        model_override
+        if model_override and settings.resolved_router_provider == settings.resolved_planning_provider
+        else settings.resolved_router_model
+    )
 
     # The published package still permits Anton releases from before ENG-2116.
     # Inspect the constructor once per client build so those versions keep
@@ -1330,7 +1352,7 @@ def build_llm_client(effort_override: str | None = None):
         if "router_provider" in _params:
             router_kw = {
                 "router_provider": _make_provider(settings.resolved_router_provider, None),
-                "router_model": settings.resolved_router_model,
+                "router_model": router_model,
             }
     except (ValueError, TypeError):
         router_kw = {}
@@ -1346,12 +1368,14 @@ def build_llm_client(effort_override: str | None = None):
 
     planning_effort = effort_override or _effort_for(
         settings.planning_model,
-        settings.resolved_planning_model,
+        planning_model,
         settings.planning_reasoning_effort,
     )
-    coding_effort = effort_override or _effort_for(
+    coding_effort = (
+        effort_override if not model_override or same_coding_provider else None
+    ) or _effort_for(
         settings.coding_model,
-        settings.resolved_coding_model,
+        coding_model,
         settings.coding_reasoning_effort,
     )
 
@@ -1364,12 +1388,12 @@ def build_llm_client(effort_override: str | None = None):
             settings.resolved_planning_provider,
             planning_effort,
         ),
-        planning_model=settings.resolved_planning_model,
+        planning_model=planning_model,
         coding_provider=_make_provider(
             settings.resolved_coding_provider,
             coding_effort,
         ),
-        coding_model=settings.resolved_coding_model,
+        coding_model=coding_model,
         **router_kw,
     )
 

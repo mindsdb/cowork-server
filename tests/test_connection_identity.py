@@ -308,6 +308,37 @@ class TestConnectionLabel:
         assert set_connection_label("gmail", "nope", "X", vault=vault) is None
 
 
+class TestPersistConnectionSecretCarryForward:
+    """A re-save must not silently drop a previously-stored secret field the
+    connector spec declares (e.g. Google Ads' developer_token) just because
+    this particular save didn't resupply it — same reasoning as the label/
+    picked-files carry-forward above, extended to any spec-marked secret."""
+
+    def test_developer_token_preserved_when_later_save_omits_it(self, tmp_path):
+        vault = LocalDataVault(tmp_path)
+        first = {"account_email": "user@example.com", "access_token": "tok1", "developer_token": "ABCDE-FGHIJ-KLMNO"}
+        slug = persist_connection("google_ads", "browser_oauth_builtin", "", first, vault=vault)
+
+        # Reconnect (e.g. token refresh flow) that doesn't re-collect the field.
+        second = {"account_email": "user@example.com", "access_token": "tok2"}
+        persist_connection("google_ads", "browser_oauth_builtin", "", second, vault=vault)
+
+        rec = vault.read_record("google_ads", slug)
+        assert rec["fields"]["developer_token"] == "ABCDE-FGHIJ-KLMNO"
+        assert "developer_token" in rec["secure_keys"]
+        assert rec["fields"]["access_token"] == "tok2"
+
+    def test_resupplied_developer_token_overwrites_the_prior_value(self, tmp_path):
+        vault = LocalDataVault(tmp_path)
+        first = {"account_email": "user@example.com", "access_token": "tok1", "developer_token": "OLD-TOKEN"}
+        slug = persist_connection("google_ads", "browser_oauth_builtin", "", first, vault=vault)
+
+        second = {"account_email": "user@example.com", "access_token": "tok2", "developer_token": "NEW-TOKEN"}
+        persist_connection("google_ads", "browser_oauth_builtin", "", second, vault=vault)
+
+        assert vault.read_record("google_ads", slug)["fields"]["developer_token"] == "NEW-TOKEN"
+
+
 class TestDisplayName:
     """The card/detail display name: derived identity only (email/host) —
     no longer prefers `_label`/`_user_label`; the connection's title comes

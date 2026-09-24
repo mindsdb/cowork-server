@@ -28,6 +28,11 @@ os.environ["COWORK_FILES_DIR"] = str(TMP / "files")
 # Without this, org-scoped tests write into the developer's real ~/.cowork/.
 os.environ["COWORK_SHARED_DIR"] = str(TMP / "shared")
 os.environ["ENV"] = "test"
+# require_auth now defaults on in local mode. Every test in this suite drives
+# create_app() through TestClient/ASGITransport with no bearer token, so
+# leaving the default on would 401 nearly everything. A test that means to
+# exercise the auth-on behavior sets this back explicitly.
+os.environ["COWORK_REQUIRE_AUTH"] = "false"
 
 import pytest
 from sqlmodel import Session, SQLModel
@@ -56,6 +61,40 @@ def db_schema():
             session.add(Project(id=GENERAL_PROJECT_ID, name=GENERAL_PROJECT, path=str(general_dir)))
             session.commit()
     yield
+
+
+@pytest.fixture(autouse=True)
+def keep_seeded_general_path():
+    """Put the seeded ``general`` row's path back after each test.
+
+    The default-project resolver writes on a read path: it re-points this row
+    onto whatever ``COWORK_PROJECTS_DIR`` currently names, so a test that moves
+    the root and then reaches a route leaves the row inside its own
+    ``tmp_path``, which pytest deletes. Later tests that resolve ``general``
+    from settings rather than from the row then disagree with it.
+
+    This repairs leakage only, at teardown. The write itself is asserted in
+    tests/test_general_project_root_change.py, so hiding it here costs no
+    coverage.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.session import get_engine
+    from cowork.models.project import Project
+    from cowork.services.projects import GENERAL_PROJECT_ID
+
+    engine = get_engine(get_app_settings().database.uri)
+    with Session(engine) as read:
+        seeded = read.get(Project, GENERAL_PROJECT_ID)
+        original = seeded.path if seeded is not None else None
+    yield
+    if original is None:
+        return
+    with Session(engine) as write:
+        row = write.get(Project, GENERAL_PROJECT_ID)
+        if row is not None and row.path != original:
+            row.path = original
+            write.add(row)
+            write.commit()
 
 
 @pytest.fixture(autouse=True)
