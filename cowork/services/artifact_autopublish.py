@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from uuid import UUID
 
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
 from cowork.services.artifact_publish_key import PublishKey
@@ -187,6 +188,63 @@ def _record(result: str, **fields: object) -> None:
     logger.warning("artifact_autopublish result=%s %s", result, tail)
 
 
+def _owned_slugs(
+    artifacts_base: Path, scope, project_id: str, slugs: list[str]
+) -> tuple[list[str], int, int]:
+    """Filter ``slugs`` down to the ones this scope's user owns.
+
+    The project root is shared by every member (ENG-2056), so `_candidate_slugs`
+    lists every member's artifacts, not just the caller's. Without this filter
+    `autopublish_project_artifacts` plans a publish for artifacts it cannot
+    legally publish, and each one fails downstream in `publish_authorization_key`
+    with `ArtifactOwnerUnknown` or "Only the artifact owner can publish" — on
+    every turn of every member, forever.
+
+    Read-only, one query. Fails closed: if the source cannot be found or
+    anything raises, nothing is treated as owned rather than risking a publish
+    attempt on someone else's artifact.
+
+    Returns (owned, not_owner_count, owner_unknown_count).
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.scoped import ScopedSession
+    from cowork.db.session import get_engine, get_session_factory
+    from cowork.services.artifact_ownership import resolve_artifact_owners
+    from cowork.services.artifact_roots import artifacts_sources_for_project
+
+    try:
+        factory = get_session_factory(get_engine(get_app_settings().database.uri))
+        with factory() as raw_session:
+            session = ScopedSession(raw_session, scope)
+            sources = artifacts_sources_for_project(session, UUID(str(project_id)))
+            source = next(
+                (s for s in sources if Path(s.base) == Path(artifacts_base)), None
+            )
+            if source is None:
+                logger.warning(
+                    "artifact_autopublish owner filter: root not found for project=%s base=%s",
+                    project_id, artifacts_base,
+                )
+                return [], 0, len(slugs)
+            resolutions = resolve_artifact_owners(session, source, slugs)
+    except Exception:
+        logger.warning("artifact_autopublish owner filter failed", exc_info=True)
+        return [], 0, len(slugs)
+
+    owned: list[str] = []
+    not_owner = 0
+    owner_unknown = 0
+    for slug in slugs:
+        resolution = resolutions.get(slug)
+        if resolution is None or resolution.unknown:
+            owner_unknown += 1
+        elif resolution.owner_user_id == scope.user_id:
+            owned.append(slug)
+        else:
+            not_owner += 1
+    return owned, not_owner, owner_unknown
+
+
 def _candidate_slugs(artifacts_base: Path) -> list[str]:
     try:
         children = sorted(Path(artifacts_base).iterdir())
@@ -332,6 +390,9 @@ async def autopublish_project_artifacts(
 
     base = Path(artifacts_base)
     all_slugs = _candidate_slugs(base)
+    all_slugs, not_owner, owner_unknown = _owned_slugs(base, scope, project_id, all_slugs)
+    if not_owner or owner_unknown:
+        _record("skipped", not_owner=not_owner or None, owner_unknown=owner_unknown or None)
     phase_one = [s for s in all_slugs if s in touched]
     phase_two = [s for s in all_slugs if s not in touched]
 
