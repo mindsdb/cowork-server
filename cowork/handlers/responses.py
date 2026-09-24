@@ -59,7 +59,7 @@ from cowork.handlers._turn_history import (
 )
 from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
-    CONTENT_RECOVERY_CODE,
+    CONTENT_REPAIR_CODES,
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
     MODEL_UNAVAILABLE_CODES,
@@ -103,19 +103,25 @@ _jev_shadow_tasks: set[asyncio.Task] = set()
 
 
 def _spawn_jev_shadow_probe(
-    *, conversation_id: UUID, messages: list[dict], llm_block: dict | None,
-    settings: TurnQueueSettings,
+    *, conversation_id: UUID, correlation_id: str | None, messages: list[dict],
+    llm_block: dict | None, settings: TurnQueueSettings,
 ) -> None:
     """Runs `jev_shadow.probe` detached from the request path and logs its
     own result. Never awaited by the caller, so a slow or hung probe cannot
-    delay the turn it's shadowing."""
+    delay the turn it's shadowing.
+
+    `create_task` copies the caller's context, so the probe runs under the
+    gate's anton TraceContext and `jev_shadow` attributes its Langfuse trace to
+    the same conversation and correlation_id."""
 
     async def _run() -> None:
         jev_result = await jev_shadow.probe(messages=messages, llm_block=llm_block, settings=settings)
         if jev_result is None:
             return
         fields = " ".join(f"{k}={v}" for k, v in jev_result.items())
-        logger.warning("[jev-shadow] conversation=%s %s", conversation_id, fields)
+        logger.warning(
+            "[jev-shadow] conversation=%s correlation_id=%s %s", conversation_id, correlation_id, fields,
+        )
 
     task = asyncio.create_task(_run())
     _jev_shadow_tasks.add(task)
@@ -560,16 +566,28 @@ class ResponsesHandler:
                 set_trace_context,
             )
 
-            trace_token = set_trace_context(TraceContext(
-                session_id=str(conversation_id),
-                harness=self.harness_name,
-                tags=("cowork-gate",),
-                metadata=dict(trace_metadata or {}),
-            ))
+            trace_token = None
             try:
                 # The gate resolves the router role + key ambiently; bind the org scope.
                 with use_settings_scope(self.scope):
+                    # Minted before the context goes in (it is an auth call, not
+                    # an LLM call), so the context can carry the turn's
+                    # correlation_id: the gate's trace and the Jev shadow probe's
+                    # (which inherits this context) share it, making gate
+                    # decision <-> Jev answer an exact join. Never
+                    # turn_id: the gateway renames harness+turn_id traces to
+                    # "{harness}:turn-N", which would count these as user turns.
                     binding, turn_llm = await self._router_binding()
+                    correlation_id = (turn_llm or {}).get("correlation_id")
+                    trace_token = set_trace_context(TraceContext(
+                        session_id=str(conversation_id),
+                        harness=self.harness_name,
+                        tags=("cowork-gate",),
+                        metadata={
+                            **(trace_metadata or {}),
+                            **({"correlation_id": correlation_id} if correlation_id else {}),
+                        },
+                    ))
                     turn_queue_settings = TurnQueueSettings()
 
                     gate_started = time.monotonic()
@@ -587,9 +605,9 @@ class ResponsesHandler:
                     # be read from — found live on staging, zero [gate] lines
                     # across 8 real requests until this was bumped.
                     logger.warning(
-                        "[gate] conversation=%s route=%s reason=%s provider=%s "
-                        "model=%s gate_ms=%d",
-                        conversation_id, decision.route, decision.reason,
+                        "[gate] conversation=%s correlation_id=%s route=%s reason=%s "
+                        "provider=%s model=%s gate_ms=%d",
+                        conversation_id, correlation_id, decision.route, decision.reason,
                         decision.provider, decision.model, gate_ms,
                     )
                     # Detached on purpose: awaiting this (even via asyncio.gather)
@@ -598,12 +616,14 @@ class ResponsesHandler:
                     # it finishes; never read by anything on the request path.
                     _spawn_jev_shadow_probe(
                         conversation_id=conversation_id,
+                        correlation_id=correlation_id,
                         messages=_text_history(history),
                         llm_block=(turn_llm or {}).get("llm"),
                         settings=turn_queue_settings,
                     )
             finally:
-                reset_trace_context(trace_token)
+                if trace_token is not None:
+                    reset_trace_context(trace_token)
             return decision, turn_llm
         except (ProductPermissionDenied, ProductPermissionUnavailable):
             raise
@@ -630,12 +650,14 @@ class ResponsesHandler:
         corr = str(uuid4())
         queue_settings = TurnQueueSettings()
         turn_key_id = None
+        workspace_id = getattr(settings, "hub_workspace_id", "") or None
         if queue_settings.datasource_enabled:
             block, turn_key_id = await _mint_llm_block_with_turn_key_id(
                 org_id=self.scoped.scope.org_id,
                 user_id=self.scoped.scope.user_id,
                 correlation_id=corr,
                 settings=queue_settings,
+                workspace_id=workspace_id,
             )
         else:
             block = await _mint_llm_block(
@@ -643,6 +665,7 @@ class ResponsesHandler:
                 user_id=self.scoped.scope.user_id,
                 correlation_id=corr,
                 settings=queue_settings,
+                workspace_id=workspace_id,
             )
         provider = OpenAIProvider(
             api_key=block["api_key"],
@@ -1296,6 +1319,10 @@ class ResponsesHandler:
             touched_slugs: set[str] = set()
             turn_scope = None
             artifact_writes_allowed = False
+            # Set only on turn_completed: any other exit (Stop, cancel, failure)
+            # may have cut anton off between writing an artifact's metadata and
+            # appending its provenance, see `turn_created_slugs`.
+            completed_cleanly = False
             # Off the loop: this reads the project's memory slots off the shared
             # mount, and one worker serves every other request on this process
             # while a blocking EFS round trip is in flight.
@@ -1377,6 +1404,7 @@ class ResponsesHandler:
                     elif kind == "turn_completed":
                         # `break`, not `return`: the publish/card block below the
                         # try must still run on a clean finish.
+                        completed_cleanly = True
                         break
                     elif kind == "turn_failed":
                         if await _remote_cancel_confirmed(data.get("error"), corr):
@@ -1402,6 +1430,10 @@ class ResponsesHandler:
                     new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
                         artifacts[0], conv_id, artifacts[2], artifacts[1],
                         before_slugs, before_mtimes,
+                        # ENG-2961: the project base is shared, so only folders
+                        # whose provenance names this conversation are its own.
+                        attribute_by_provenance=True,
+                        completed_cleanly=completed_cleanly,
                     )
 
             # Clean completion only — a raise inside the try skips this, matching
@@ -1503,7 +1535,7 @@ class ResponsesHandler:
             )
             collected_events.append(response_failed_payload(message, code, request_id=corr))
             await buffer.append("sse", {"sse": response_failed_sse(message, code, request_id=corr)})
-            if code == CONTENT_RECOVERY_CODE:
+            if code in CONTENT_REPAIR_CODES:
                 # ENG-1992: the remote/org path's twin of the streaming
                 # handler's repair — producer.py already classified this via
                 # remote_turn_error from the pod's scrubbed error string, so
@@ -1708,7 +1740,7 @@ class ResponsesHandler:
                     "[responses] turn failed for conversation %s correlation_id=%s",
                     conv_id, corr, extra={"request_id": corr},
                 )
-            if code == CONTENT_RECOVERY_CODE:
+            if code in CONTENT_REPAIR_CODES:
                 # ENG-1992: the provider permanently rejected an image block in
                 # this conversation's stored history — repair the DATA once,
                 # here, rather than special-case every future replay. Never
@@ -1905,7 +1937,7 @@ class ResponsesHandler:
                     "[responses] user-facing turn error: %s", exc,
                     extra={"request_id": corr},
                 )
-                if code == CONTENT_RECOVERY_CODE:
+                if code in CONTENT_REPAIR_CODES:
                     # ENG-1992: see the streaming path's twin for the full
                     # rationale — repair the conversation's stored history
                     # once here rather than special-case every future replay.

@@ -109,6 +109,8 @@ def test_turn_job_carries_a_versioned_datasource_block():
     [
         "tk_abc",
         {"protocol_version": 2, "connections": [{"connection_id": 7, "credential_version": 3}]},
+        {"protocol_version": True, "connections": [{"connection_id": 7, "credential_version": 3}]},
+        {"protocol_version": 1.0, "connections": [{"connection_id": 7, "credential_version": 3}]},
         {"protocol_version": 1, "connections": [{"connection_id": 7, "credential_version": 3}], "gateway_url": "x"},
         {"protocol_version": 1, "connections": []},
         {"protocol_version": 1, "connections": [{"connection_id": i, "credential_version": 1} for i in range(1, 102)]},
@@ -119,8 +121,9 @@ def test_turn_job_carries_a_versioned_datasource_block():
         {"protocol_version": 1, "connections": [{"connection_id": 7, "credential_version": 3},
                                                 {"connection_id": 7, "credential_version": 4}]},
     ],
-    ids=["not_an_object", "version", "extra_field", "empty", "over_the_cap", "string_id", "bool_id",
-         "zero_version", "secret_bearing_reference", "duplicate_id"],
+    ids=["not_an_object", "version", "bool_version", "float_version", "extra_field", "empty",
+         "over_the_cap", "string_id", "bool_id", "zero_version", "secret_bearing_reference",
+         "duplicate_id"],
 )
 def test_turn_job_refuses_a_malformed_datasource_block_before_it_is_queued(datasource):
     """The queue model is the last check before Redis; a block the controller

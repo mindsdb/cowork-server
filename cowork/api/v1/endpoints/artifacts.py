@@ -6,6 +6,7 @@ agent-produced artifacts.
 """
 from __future__ import annotations
 
+import logging
 import mimetypes
 import os
 import re
@@ -26,6 +27,7 @@ from sqlmodel import Session
 from cowork.services.product_permissions import require_product_permission
 from cowork.db.scoped import ScopedSession, ScopedSessionDep, get_scoped_session
 from cowork.db.session import get_session
+from cowork.principal import Principal, get_principal
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, OpenByDesign, require
 from cowork.api.v1.artifact_preview import (
     artifact_response_headers,
@@ -56,6 +58,8 @@ from cowork.services.artifacts import (
     reveal_in_file_manager,
 )
 from cowork.services.projects import ProjectService
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -150,22 +154,26 @@ def _artifact_cards(session, sources) -> list[dict]:
     # cards use the same builder and would otherwise still carry the plaintext
     # password.
     cards = _list_artifacts(sources)
+    from cowork.services.artifact_ownership import resolve_artifact_owners
     from cowork.services.artifact_permissions import artifact_capabilities
 
-    # Capabilities are a property of the ROOT, not of the artifact: in org mode
-    # they come from the owning conversation, and every artifact under one root
-    # shares it. Derived once per root, so a project with 50 artifacts across 50
-    # conversations costs 50 conversation reads instead of 50 per card.
+    # Capabilities are a property of each ARTIFACT: in org mode a project root is
+    # shared by every member (ENG-2056), so each card's owner is resolved on its
+    # own. Owners are read in one query per root (the unfiltered listing spans
+    # every project of the organization, so one query per project root).
     by_base = {Path(source.base): source for source in sources}
-    capabilities_by_base: dict[Path, dict] = {}
+    cards_by_base: dict[Path, list[tuple[str, dict]]] = {}
     for card in cards:
-        base = Path(str(card.get("folder") or "")).parent
-        source = by_base.get(base)
-        if source is None:
-            continue
-        if base not in capabilities_by_base:
-            capabilities_by_base[base] = artifact_capabilities(session, source)
-        card["capabilities"] = capabilities_by_base[base]
+        folder = Path(str(card.get("folder") or ""))
+        if folder.parent in by_base:
+            cards_by_base.setdefault(folder.parent, []).append((folder.name, card))
+    for base, entries in cards_by_base.items():
+        source = by_base[base]
+        resolutions = resolve_artifact_owners(session, source, [slug for slug, _ in entries])
+        for slug, card in entries:
+            card["capabilities"] = artifact_capabilities(
+                session, source, slug, resolution=resolutions[slug]
+            )
     return cards
 
 
@@ -662,13 +670,17 @@ async def delete_artifact_by_slug(
     # parameter, then incorrectly taints the server-owned artifact roots.
     session: ScopedSession = Depends(get_scoped_session),
     project_id: UUID = Query(...),
+    # D7: an org admin may delete an artifact whose owner is unknown.
+    principal: Principal | None = Depends(get_principal),
 ):
     ref = _artifact_delete_ref(slug)
-    return await delete_artifact_for_request(session, ref, project_id=project_id)
+    return await delete_artifact_for_request(
+        session, ref, project_id=project_id, principal=principal
+    )
 
 
 async def delete_artifact_for_request(
-    session, slug: str | _ArtifactDeleteRef, *, project_id: UUID
+    session, slug: str | _ArtifactDeleteRef, *, project_id: UUID, principal: Principal | None = None
 ) -> None:
     """Delete one artifact of one project. Unpublishes first; a failed unpublish
     leaves the folder in place and surfaces the error."""
@@ -715,9 +727,20 @@ async def delete_artifact_for_request(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
     folder_name = _artifact_folder_name(source, folder)
 
-    from cowork.services.artifact_permissions import require_artifact_owner
+    from cowork.services.artifact_ownership import resolve_artifact_owner
+    from cowork.services.artifact_permissions import (
+        may_delete_ownerless_artifact,
+        require_artifact_owner,
+    )
 
-    require_artifact_owner(session, source)
+    # One resolution for both decisions, so they cannot disagree.
+    resolution = resolve_artifact_owner(session, source, folder_name)
+    # D7: the only thing an unknown owner grants anyone is an org admin's delete.
+    admin_delete = may_delete_ownerless_artifact(
+        session, source, folder_name, principal, resolution=resolution
+    )
+    if not admin_delete:
+        require_artifact_owner(session, source, folder_name, resolution=resolution)
     expected_artifact_id = artifact_id if ref.artifact_id is not None else None
     publish_url, api_key = _resolve_publish_endpoint(get_user_settings())
     if _org_mode():
@@ -729,7 +752,11 @@ async def delete_artifact_for_request(
         # Unpublish acts on the viewer, and the viewer scopes by the token's owner,
         # so the credential has to be the acting user's - not a stored provider key
         # (org deployments have none).
-        api_key = await PublishKey(scope.user_id, scope.org_id, min_ttl_s=120.0).get()
+        from cowork.services.artifact_autopublish import _active_workspace_id
+
+        api_key = await PublishKey(
+            scope.user_id, scope.org_id, min_ttl_s=120.0, workspace_id=_active_workspace_id(scope)
+        ).get()
         if not api_key:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -749,12 +776,18 @@ async def delete_artifact_for_request(
                 existing_authorization_key,
                 expected_artifact_id,
                 scope,
-                owner_user_id=str(scope.user_id),
+                # The admin is not the identity's owner; passing their id would
+                # refuse the delete over an alias bound to the original creator.
+                owner_user_id=None if admin_delete else str(scope.user_id),
             )
             # A historical grant may predate the SQL alias. The auth delete
-            # checks its existing owner binding and never creates one.
-            authorization_id = canonical_key.split("/", 1)[1] if canonical_key else expected_artifact_id
-            await revoke_draft_review_access(authorization_id, scope)
+            # checks its existing owner binding and never creates one. An
+            # ownerless artifact without an alias never had a draft rule
+            # provisioned (provisioning needs an owner), so there is nothing
+            # to revoke on the admin path.
+            if canonical_key is not None or not admin_delete:
+                authorization_id = canonical_key.split("/", 1)[1] if canonical_key else expected_artifact_id
+                await revoke_draft_review_access(authorization_id, scope)
         except ArtifactAccessUnavailable as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -791,6 +824,22 @@ async def delete_artifact_for_request(
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail="Could not delete artifact") from e
+
+    from cowork.services.artifact_ownership import forget_artifact_owner
+
+    # After the bytes are gone: a later artifact with the same slug starts with
+    # its own owner (a no-op outside org mode). Best-effort; a stale row is
+    # replaced on rekey and never grants anything to a folder that does not
+    # exist. Synchronous on purpose: it uses the request session, which must
+    # not cross threads, and it is one indexed lookup plus one delete.
+    try:
+        forget_artifact_owner(
+            session, source, folder_name, actor_id=str(session.scope.user_id)
+        )
+    except Exception:
+        logger.warning(
+            "Could not drop the owner of deleted artifact %s", folder_name, exc_info=True
+        )
 
 
 # The routes below (through delete_artifact_endpoint) are DesktopOnly, which
