@@ -136,6 +136,203 @@ def test_remote_content_validation_error_maps_to_curated_copy():
     assert message == te.CONTENT_RECOVERY_USER_MESSAGE
 
 
+# ── ENG-2689: too-large is its own card, and still repairs the conversation ──
+
+
+# anton's REAL parent type, deliberately. cowork-server pins anton from a git
+# branch, so `ContentTooLargeError` is not installed here yet — but production's
+# object is a real subclass of a real `ContentValidationError`, and that is the
+# whole point: BOTH detectors match it, so only their ORDER decides the card.
+# A hand-rolled stand-in would satisfy neither detector's isinstance check and
+# these tests would pass without the ordering ever being exercised.
+from anton.core.llm.provider import ContentValidationError as _AntonContentValidationError
+
+
+class ContentTooLargeError(_AntonContentValidationError):
+    """Named to match anton's class exactly — the name is the discriminator on
+    both transports (the remote wire carries only "<Type>: <message>")."""
+
+    def __init__(self, message, code="content_too_large"):
+        super().__init__(message, code=code)
+
+
+_RESIZE_COPY = (
+    "An image in this conversation is too large for the model to accept. The "
+    "provider said: The image you provided requires 32400 patches after "
+    "processing, exceeding the limit of 30000. Please resize the image and "
+    "try again. That image will be removed automatically so the conversation "
+    "can continue."
+)
+
+
+def test_the_too_large_fixture_is_also_matched_by_the_broader_detector():
+    """Guards the two tests below from passing for the wrong reason. If this
+    ever fails, the fixture stopped being a ContentValidationError and the
+    ordering assertions became vacuous."""
+    exc = ContentTooLargeError(_RESIZE_COPY)
+    assert te.is_content_validation_error(exc)
+    assert te.is_content_too_large_error(exc)
+
+
+def test_too_large_wins_over_the_content_recovery_detector():
+    """The ranking that matters. anton's too-large type SUBCLASSES the
+    content-validation one, so the broader detector matches it too — checked
+    in the wrong order, a user whose image is too big is told the problem was
+    already fixed and they can keep going, which is false."""
+    result = te.friendly_turn_error(ContentTooLargeError(_RESIZE_COPY))
+    assert result is not None
+    code, message = result
+    assert code == te.CONTENT_TOO_LARGE_CODE
+    assert message != te.CONTENT_RECOVERY_USER_MESSAGE
+
+
+def test_too_large_keeps_the_providers_resize_instruction():
+    """The sentence the user needed. This module normally replaces anton's
+    message with curated copy; here anton's is the more specific of the two
+    because it carries the provider's own remedy."""
+    _, message = te.friendly_turn_error(ContentTooLargeError(_RESIZE_COPY))
+    assert "resize the image" in message.lower()
+    assert "temporarily unavailable" not in message.lower()
+
+
+def test_a_plain_content_validation_error_keeps_its_own_card():
+    """The ENG-1992 behaviour must not move: that failure IS already fixed
+    server-side, and telling the user to attach a smaller image would be
+    nonsense advice for a serialization mismatch."""
+    result = te.friendly_turn_error(
+        _AntonContentValidationError("bad image block")
+    )
+    assert result is not None
+    code, message = result
+    assert code == te.CONTENT_RECOVERY_CODE
+    assert message == te.CONTENT_RECOVERY_USER_MESSAGE
+
+
+def test_remote_too_large_maps_to_its_own_code_and_passes_the_message():
+    """The hosted/pod path. Only the scrubbed "<Type>: <message>" string
+    crosses that wire, so the class name is the entire discriminator — which
+    is why anton raises a distinct subclass rather than varying a `code` the
+    wire does not carry."""
+    code, message = te.remote_turn_error(f"ContentTooLargeError: {_RESIZE_COPY}")
+    assert code == te.CONTENT_TOO_LARGE_CODE
+    assert "resize the image" in message.lower()
+
+
+@pytest.mark.parametrize("param,value,allowed", [
+    ("reasoning_effort", "ultra", "'low', 'medium', 'high'"),
+    ("tool_choice", "always", "'none', 'auto', 'required'"),
+    ("service_tier", "turbo", "'auto', 'default', 'flex'"),
+])
+def test_an_unrelated_enum_error_is_not_a_content_rejection(param, value, allowed):
+    """The destructive false positive (review of ENG-2689). These phrases are
+    generic enum-validation prose, and answering them with a content rejection
+    makes the caller strip EVERY image from the conversation and tell the user
+    it fixed things — while the real configuration error goes unmentioned.
+
+    Verified as a live defect before the guard: a `reasoning_effort` typo
+    returned `content_recovery` from this very function.
+    """
+    exc = Exception(
+        "Error code: 400 - {'error': {'message': \"Invalid value: '%s'. "
+        "Supported values are: %s.\", 'param': '%s'}}" % (value, allowed, param)
+    )
+    assert not te.is_content_validation_error(exc)
+    assert not te.is_content_too_large_error(exc)
+    assert te.friendly_turn_error(exc) is None
+
+
+def test_a_param_that_legitimately_takes_image_is_not_a_content_rejection():
+    """Found by adversarially reviewing the first version of this guard, not by
+    the reviewer. `modalities` legitimately accepts the value 'image', so
+    "Supported values are: 'image', 'audio'" names a content-block token while
+    having nothing to do with content — and the corroboration rule as first
+    written still sent it down the path that deletes every image in the
+    conversation. A param the provider named is decisive when recoverable."""
+    exc = Exception(
+        "Error code: 400 - {'error': {'message': \"Invalid value: 'text'. "
+        "Supported values are: 'image', 'audio'.\", 'param': 'modalities'}}"
+    )
+    assert not te.is_content_validation_error(exc)
+    assert te.friendly_turn_error(exc) is None
+
+
+def test_the_real_shape_dialects_still_qualify():
+    """The guard must not be so tight it kills ENG-1992. Both live dialects
+    name a content-block type, which is exactly the corroboration required."""
+    openai_dialect = Exception(
+        "Invalid value: 'image'. Supported values are: 'input_text', "
+        "'input_image', 'input_file'."
+    )
+    anthropic_dialect = Exception(
+        "Input tag 'image_url' found using 'type' does not match any of the "
+        "expected tags: 'image'"
+    )
+    for exc in (openai_dialect, anthropic_dialect):
+        assert te.is_content_validation_error(exc)
+        assert te.friendly_turn_error(exc)[0] == te.CONTENT_RECOVERY_CODE
+
+
+def test_every_repair_guard_consults_the_shared_set():
+    """The two tests above cover the local streaming and non-streaming sites
+    behaviourally. The remote site (`_produce_remote`) needs a producer session,
+    seeded history, an artifact snapshot and a memory read before it reaches its
+    guard — mocking all of that would produce a test that passes for reasons
+    unrelated to the guard, which is the failure mode this whole exercise is
+    about. So that third site is pinned structurally instead, in the same style
+    as `test_no_return_emits_a_literal_code` below.
+
+    This is the exact mutation that went undetected: replacing the three guards
+    with `code == "content_recovery"` while leaving `CONTENT_REPAIR_CODES`
+    defined kept 191 checked-in tests green with ENG-2689's next-turn repair
+    gone. Asserting set membership proved a property of a constant; nothing
+    proved a handler consulted it.
+    """
+    import ast
+    import inspect
+
+    from cowork.handlers import responses as responses_mod
+
+    tree = ast.parse(inspect.getsource(responses_mod))
+    parent = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent[child] = node
+
+    calls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "repair_image_content"
+    ]
+    assert len(calls) == 3, f"expected 3 repair sites, found {len(calls)}"
+
+    banned = {te.CONTENT_RECOVERY_CODE, te.CONTENT_TOO_LARGE_CODE}
+    for call in calls:
+        # Nearest enclosing `if`, walking up — `ast.walk` alone double-counts,
+        # since the guard's own body contains further `if`s.
+        node, guard = call, None
+        while node in parent:
+            node = parent[node]
+            if isinstance(node, ast.If):
+                guard = node
+                break
+        assert guard is not None, "a repair call is not behind any guard at all"
+
+        names = {n.id for n in ast.walk(guard.test) if isinstance(n, ast.Name)}
+        assert "CONTENT_REPAIR_CODES" in names, (
+            "a repair site does not consult CONTENT_REPAIR_CODES, so it handles "
+            "only one of the two permanent-content families"
+        )
+        literals = {
+            n.value for n in ast.walk(guard.test)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+        }
+        assert not (literals & banned), (
+            "a repair site compares `code` to a bare code literal; that is how "
+            "one family silently stops being repaired"
+        )
+
+
 def test_response_failed_sse_shape():
     frame = te.response_failed_sse("oops", "image_format")
     assert frame.startswith("event: response.failed\ndata: ")
@@ -347,10 +544,27 @@ def test_collect_raises_500_generic_for_unmapped_error():
 
 # ── Conversation repair on content validation error (ENG-1992) ────
 
-def test_stream_repairs_conversation_on_content_validation_error():
+# Both permanent-content families, because they enter through different
+# detectors and only the repair GUARD is shared. Before ENG-2689 these tests
+# only ever drove the shape family, so reverting all three handler guards to
+# `code == "content_recovery"` left 191 checked-in tests green with the
+# oversized-image repair gone entirely (review of ENG-2689).
+_REPAIR_FAMILIES = [
+    pytest.param(
+        lambda: Exception(
+            "Invalid value: 'image'. Supported values are: 'input_text', 'input_image'"
+        ),
+        id="shape",
+    ),
+    pytest.param(lambda: ContentTooLargeError(_RESIZE_COPY), id="too_large"),
+]
+
+
+@pytest.mark.parametrize("make_exc", _REPAIR_FAMILIES)
+def test_stream_repairs_conversation_on_content_validation_error(make_exc):
     from unittest.mock import MagicMock, patch
 
-    exc = Exception("Invalid value: 'image'. Supported values are: 'input_text', 'input_image'")
+    exc = make_exc()
     handler = _handler_with_raising_formatter(exc)
 
     class _Buffer:
@@ -413,10 +627,11 @@ def test_stream_does_not_repair_conversation_for_unrelated_errors():
         conv_svc.return_value.repair_image_content.assert_not_called()
 
 
-def test_collect_repairs_conversation_on_content_validation_error():
+@pytest.mark.parametrize("make_exc", _REPAIR_FAMILIES)
+def test_collect_repairs_conversation_on_content_validation_error(make_exc):
     from unittest.mock import MagicMock, patch
 
-    exc = Exception("Invalid value: 'image'. Supported values are: 'input_text', 'input_image'")
+    exc = make_exc()
     handler = _handler_with_raising_formatter(exc)
     handler.scoped = MagicMock()  # __init__ bypassed; _collect's repair path needs this
     conv_id = uuid4()
@@ -426,7 +641,7 @@ def test_collect_repairs_conversation_on_content_validation_error():
         with pytest.raises(HTTPException) as err:
             asyncio.run(handler._collect(stream=None, conversation_id=conv_id, model="anton", original_content="hi"))
         assert err.value.status_code == 400
-        assert err.value.detail["code"] == te.CONTENT_RECOVERY_CODE
+        assert err.value.detail["code"] in te.CONTENT_REPAIR_CODES
         conv_svc.return_value.repair_image_content.assert_called_once_with(conv_id)
 
 
@@ -1631,6 +1846,11 @@ def test_wire_code_inventory_matches_the_renderer_contract():
         # ENG-1992 — a content-shaped rejection the server already repaired;
         # distinct copy from image_format (no re-upload needed).
         "content_recovery",
+        # ENG-2689 — an image the provider refused as too LARGE. Split off
+        # content_recovery because the copy is the opposite: that one says
+        # "fixed, keep going", this one needs the user to attach something
+        # smaller. The renderer branch lands in mindsdb/cowork's ChatView.jsx.
+        "content_too_large",
         # ENG-2126 — the worker never answered, so the turn never ran. Split off
         # anton_error because the two need opposite next steps: this one is ours
         # to fix, and reads as an agent bug while it shares that code.

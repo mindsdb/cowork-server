@@ -591,6 +591,100 @@ async def test_stream_remote_replies_mints_and_attaches_llm_block(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stream_remote_replies_forwards_the_active_hub_workspace(monkeypatch):
+    """cowork's own workspace selector (hub_workspaces.py) stores the caller's
+    pick as UserSettings.hub_workspace_id; the mint must forward it so the
+    key's spend lands in that workspace instead of always the org Default."""
+    from types import SimpleNamespace
+    from cowork.common.settings import user_settings
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(resolved_planning_model="m", hub_workspace_id="ws-1"),
+    )
+
+    captured = {}
+
+    async def _fake_mint(**kw):
+        captured.update(kw)
+        return "mdb_turnkey"
+
+    monkeypatch.setattr(prod, "mint_turn_key", _fake_mint)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
+        model="mindshub_air",
+    ))
+
+    assert captured["workspace_id"] == "ws-1"
+
+
+@pytest.mark.asyncio
+async def test_the_active_hub_workspace_binds_the_key_with_datasources_on_too(monkeypatch):
+    """The datasource path mints through mint_turn_key_details, not mint_turn_key;
+    the picked workspace must reach it as well, or turning datasources on would
+    move every hosted turn's spend back to the org Default."""
+    from types import SimpleNamespace
+    from cowork.common.settings import user_settings
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(resolved_planning_model="m", hub_workspace_id="ws-1"),
+    )
+    captured = {}
+
+    async def _fake_mint(**kw):
+        captured.update(kw)
+        return SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")
+
+    monkeypatch.setattr(prod, "mint_turn_key_details", _fake_mint)
+    monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=[]))
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
+        model="mindshub_air",
+    ))
+
+    assert captured["workspace_id"] == "ws-1"
+
+
+@pytest.mark.asyncio
+async def test_stream_remote_replies_omits_workspace_id_when_none_picked(monkeypatch):
+    from types import SimpleNamespace
+    from cowork.common.settings import user_settings
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(resolved_planning_model="m", hub_workspace_id=""),
+    )
+
+    captured = {}
+
+    async def _fake_mint(**kw):
+        captured.update(kw)
+        return "mdb_turnkey"
+
+    monkeypatch.setattr(prod, "mint_turn_key", _fake_mint)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
+        model="mindshub_air",
+    ))
+
+    assert captured["workspace_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_mint_llm_block_uses_minds_coding_default():
     # The pod runs on minds-cloud, so the coding model must be a minds alias.
     # Default = the free-bucket model (mindshub_air): a fresh org has no wallet
