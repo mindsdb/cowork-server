@@ -41,6 +41,19 @@ def _artifact_owner(folder: Path) -> str | None:
     return origin_conversation_id(data) or None
 
 
+def _project_root_source(project: Project):
+    """The project's shared artifacts root as the ownership module addresses it."""
+    from cowork.services.artifacts import ProjectArtifacts
+
+    return ProjectArtifacts(
+        base=_artifacts_base(project),
+        project_id=str(project.id),
+        project_name=project.name,
+        trusted_anchor=Path(project.path),
+        root_parts=(".anton", "artifacts"),
+    )
+
+
 class TaskObjectService:
     """Indexes the artifacts/files a task owns and relocates them when the
     task moves to another project."""
@@ -92,7 +105,11 @@ class TaskObjectService:
         harness, or before this index existed. Returns the conversation's
         artifact rows."""
         base = _artifacts_base(project)
-        if base.is_dir():
+        # Org mode (ENG-2961, D8): provenance is agent-writable on the shared
+        # project root, so it must not create index rows that a relocation would
+        # then act on. Rows there come only from the end of the creating turn.
+        org_mode = bool(getattr(self.session.scope, "org_mode", False))
+        if not org_mode and base.is_dir():
             for folder in base.iterdir():
                 if not folder.is_dir():
                     continue
@@ -148,12 +165,23 @@ class TaskObjectService:
         return self._relocate_artifacts(conversation, source, dest)
 
     def _relocate_artifacts(self, conversation: Conversation, source: Project, dest: Project) -> int:
+        """Move the task's artifact folders and retarget its index rows.
+
+        Org mode (ENG-2961, D8): only folders owned by the task's creator move,
+        and their owner rows follow them. A row whose folder is already gone is
+        retargeted without an ownership check or a "not moved" log line — there
+        is nothing on disk to move or to protect.
+        """
         rows = self.reconcile_conversation(conversation, source)
         if not rows:
             return 0
         src_base = _artifacts_base(source)
         dest_base = _artifacts_base(dest)
         dest_base.mkdir(parents=True, exist_ok=True)
+        org_mode = bool(getattr(self.session.scope, "org_mode", False))
+        creator = str(conversation.created_by) if conversation.created_by else None
+        src_root = _project_root_source(source) if org_mode else None
+        rekeys: list[tuple[str, str]] = []
         moved = 0
         for row in rows:
             src_folder = src_base / row.ref
@@ -162,17 +190,48 @@ class TaskObjectService:
                 row.project_id = dest.id
                 self.session.add(row)
                 continue
+            if org_mode:
+                from cowork.services.artifact_ownership import resolve_artifact_owner
+
+                # D8: a task carries only what its creator owns. Anything else
+                # indexed to it (someone else's, or ownerless) stays put, and its
+                # row keeps pointing at the source project.
+                resolution = resolve_artifact_owner(self.session, src_root, row.ref)
+                if not creator or resolution.owner_user_id != creator:
+                    logger.warning(
+                        "artifact not moved with task: project=%s slug=%s owner_state=%s",
+                        source.id, row.ref, resolution.state,
+                    )
+                    continue
             dest_slug = self._unique_slug(dest_base, row.ref, conversation.id)
             try:
                 shutil.move(str(src_folder), str(dest_base / dest_slug))
             except OSError:
                 logger.warning("Could not move artifact %r to project %r", row.ref, dest.name, exc_info=True)
                 continue
+            if org_mode:
+                rekeys.append((row.ref, dest_slug))
             row.project_id = dest.id
             row.ref = dest_slug
             self.session.add(row)
             moved += 1
         self.session.commit()
+        # After the index commit: each rekey commits on its own, and must not
+        # commit a half-applied batch of index rows along with it.
+        if rekeys:
+            from cowork.services.artifact_ownership import rekey_artifact_owner
+
+            actor = str(self.session.scope.user_id or creator)
+            for old_slug, new_slug in rekeys:
+                try:
+                    rekey_artifact_owner(
+                        self.session, src_root, old_slug, dest.id, new_slug, actor_id=actor
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not move the owner of artifact %r to project %r",
+                        old_slug, dest.name, exc_info=True,
+                    )
         return moved
 
     @staticmethod
