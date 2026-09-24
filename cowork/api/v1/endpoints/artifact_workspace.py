@@ -471,7 +471,9 @@ def _owner_workspace(session, project_ref: str, artifact_id: str):
     return source, folder, metadata, capabilities
 
 
-async def _sync_live_artifact(session, folder: Path) -> bool | None:
+async def _sync_live_artifact(
+    session, folder: Path, *, project_id: str | None = None
+) -> bool | None:
     """Re-publish a live artifact after an editor write.
 
     ``None`` means the artifact is only a draft, ``True`` means its stable URL
@@ -530,6 +532,7 @@ async def _sync_live_artifact(session, folder: Path) -> bool | None:
                     publish_url=publish_url,
                     access=access,
                     scope=scope,
+                    project_id=project_id,
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
@@ -647,7 +650,7 @@ async def update_artifact_source(
             summary=body.summary,
         )
         if saved["revision"]["id"] != body.expectedRevisionId:
-            await _sync_live_artifact(session, folder)
+            await _sync_live_artifact(session, folder, project_id=source.project_id)
         return saved
     except RevisionConflict as exc:
         raise HTTPException(
@@ -798,7 +801,7 @@ async def set_artifact_access(
     from cowork.services.publish import publish_artifact as _publish_bundle
     from cowork.services.artifact_access import ArtifactAccessUnavailable
 
-    _source, folder, metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
+    source, folder, metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
     if _artifact_primary(folder, metadata) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -833,6 +836,7 @@ async def set_artifact_access(
                     publish_url=publish_url,
                     access=dict(body.access or {}),
                     scope=session.scope,
+                    project_id=source.project_id,
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
@@ -951,7 +955,7 @@ async def restore_artifact_revision(
     session: ScopedSessionDep,
 ):
     await require_product_permission(session.scope, "artifact.manage")
-    _source, folder, metadata, _capabilities = _owner_workspace(
+    source, folder, metadata, _capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
     try:
@@ -971,7 +975,7 @@ async def restore_artifact_revision(
             summary=f"Restored revision {restored['number']}",
         )
         if saved["revision"]["id"] != body.expectedRevisionId:
-            await _sync_live_artifact(session, folder)
+            await _sync_live_artifact(session, folder, project_id=source.project_id)
         return saved
     except RevisionConflict as exc:
         raise HTTPException(
