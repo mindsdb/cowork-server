@@ -21,7 +21,11 @@ from typing import Optional
 MAX_PADS = int(os.environ.get("ANTON_SERVER_MAX_PADS", "5"))
 
 
-_pads: dict[str, object] = {}  # name -> LocalScratchpadRuntime
+# (workspace, name) -> LocalScratchpadRuntime. Keyed by workspace as well as
+# name because artifact slugs are only unique within a project: two projects
+# each holding a `sales-dashboard` would otherwise share one runtime, and the
+# second project's backend would start on the first project's venv.
+_pads: dict[tuple[str, str], object] = {}
 last_activity: float = time.time()
 
 
@@ -124,9 +128,13 @@ def _make_runtime(
     )
 
 
-def get(name: str):
+def _key(name: str, workspace_path: Optional[str]) -> tuple[str, str]:
+    return (str(_resolve_workspace(workspace_path)), name)
+
+
+def get(name: str, *, workspace_path: Optional[str] = None):
     _touch_activity()
-    return _pads.get(name)
+    return _pads.get(_key(name, workspace_path))
 
 
 def get_or_create(
@@ -139,8 +147,9 @@ def get_or_create(
     coding_base_url: str = "",
 ):
     _touch_activity()
-    if name in _pads:
-        return _pads[name]
+    key = _key(name, workspace_path)
+    if key in _pads:
+        return _pads[key]
     if len(_pads) >= MAX_PADS:
         raise RuntimeError(
             f"Maximum concurrent scratchpads ({MAX_PADS}) reached. "
@@ -160,22 +169,22 @@ def get_or_create(
         coding_api_key=api_key,
         coding_base_url=base_url,
     )
-    _pads[name] = pad
+    _pads[key] = pad
     return pad
 
 
-def remove(name: str) -> None:
-    _pads.pop(name, None)
+def remove(name: str, *, workspace_path: Optional[str] = None) -> None:
+    _pads.pop(_key(name, workspace_path), None)
 
 
 def list_pads() -> list[str]:
-    return list(_pads.keys())
+    return [name for _workspace, name in _pads]
 
 
 async def close_all() -> None:
-    for name in list(_pads):
+    for key in list(_pads):
         try:
-            pad = _pads[name]
+            pad = _pads[key]
             await pad.close()
         except Exception:
             pass

@@ -9,7 +9,7 @@ from cowork.services.artifact_roots import artifacts_sources_for_scan as _source
 from cowork.services.artifacts import list_artifacts as _list_artifacts
 from cowork.services.conversations import ConversationService
 from cowork.services.pins import PinService
-from cowork.services.projects import ProjectService
+from cowork.services.projects import ProjectService, is_comparison_sandbox
 from cowork.services.schedules import ScheduleService
 
 # AuthenticatedInOrgMode, declared explicitly: the conversation/project/
@@ -66,7 +66,7 @@ async def search_cowork(
             })
 
     # Projects
-    for project in ProjectService(scoped).list_projects():
+    for project in ProjectService(scoped).list_visible_projects():
         text = " ".join([project.name or "", project.path or ""])
         score = _score(text, query)
         if score:
@@ -80,7 +80,10 @@ async def search_cowork(
             })
 
     # Artifacts
-    for artifact in _list_artifacts(_sources_for_scan()):
+    visible_sources = [
+        source for source in _sources_for_scan() if not is_comparison_sandbox(source.project_name)
+    ]
+    for artifact in _list_artifacts(visible_sources):
         text = " ".join([
             artifact.get("title") or "",
             artifact.get("description") or "",
