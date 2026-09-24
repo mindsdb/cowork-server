@@ -31,6 +31,7 @@ from cowork.api.v1.artifact_preview import (
     artifact_response_headers,
     html_preview_response,
     wants_comment_layer,
+    wants_download,
 )
 from cowork.api.v1.artifact_scope import (
     artifact_sources_for_request,
@@ -919,7 +920,7 @@ async def preview_asset(token: str, rel_path: str, request: Request):
     if not target.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-    if media_type == "text/html" and "download" not in request.query_params:
+    if media_type == "text/html" and not wants_download(request):
         # Offload the (potentially large) synchronous read so it doesn't stall
         # the event loop / other in-flight SSE streams — this endpoint is async.
         resp = await run_in_threadpool(
@@ -956,7 +957,7 @@ def serve_artifact_file(
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
     # This endpoint is a sync `def`, so FastAPI already runs it in a threadpool
     # — the blocking read here doesn't touch the event loop.
-    if media_type == "text/html" and "download" not in request.query_params:
+    if media_type == "text/html" and not wants_download(request):
         resp = html_preview_response(target, comments=wants_comment_layer(request))
         if resp is not None:
             return resp

@@ -60,6 +60,13 @@ def test_serve_download_is_byte_identical_to_disk(projects_root):
     assert downloaded.content == on_disk.read_bytes() == _HTML
     assert b"anton-preview" not in downloaded.content
 
+    # `?download=0` must mean "no", the same as omitting the flag — it used to
+    # be spelled as mere key presence here, so this string suppressed the shim
+    # the same as `?download=1`.
+    not_downloaded = client.get("/api/v1/artifacts/serve/proj/dash/index.html?download=0")
+    assert not_downloaded.status_code == 200
+    assert b"anton-preview" in not_downloaded.content
+
 
 def test_preview_asset_download_is_byte_identical_to_disk(projects_root):
     artifact = projects_root / "mount-source"
@@ -81,5 +88,12 @@ def test_preview_asset_download_is_byte_identical_to_disk(projects_root):
         assert downloaded.status_code == 200
         assert downloaded.content == on_disk.read_bytes() == _HTML
         assert b"anton-preview" not in downloaded.content
+
+        # Same `?download=0` regression as the /serve route above.
+        not_downloaded = client.get(
+            f"/api/v1/artifacts/preview-asset/{token}/index.html?download=0"
+        )
+        assert not_downloaded.status_code == 200
+        assert b"anton-preview" in not_downloaded.content
     finally:
         _PREVIEW_MOUNTS.pop(token, None)
