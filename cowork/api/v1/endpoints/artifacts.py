@@ -150,22 +150,26 @@ def _artifact_cards(session, sources) -> list[dict]:
     # cards use the same builder and would otherwise still carry the plaintext
     # password.
     cards = _list_artifacts(sources)
+    from cowork.services.artifact_ownership import resolve_artifact_owners
     from cowork.services.artifact_permissions import artifact_capabilities
 
-    # Capabilities are a property of the ROOT, not of the artifact: in org mode
-    # they come from the owning conversation, and every artifact under one root
-    # shares it. Derived once per root, so a project with 50 artifacts across 50
-    # conversations costs 50 conversation reads instead of 50 per card.
+    # Capabilities are a property of each ARTIFACT: in org mode a project root is
+    # shared by every member (ENG-2056), so each card's owner is resolved on its
+    # own. Owners are read in one query per root (the unfiltered listing spans
+    # every project of the organization, so one query per project root).
     by_base = {Path(source.base): source for source in sources}
-    capabilities_by_base: dict[Path, dict] = {}
+    cards_by_base: dict[Path, list[tuple[str, dict]]] = {}
     for card in cards:
-        base = Path(str(card.get("folder") or "")).parent
-        source = by_base.get(base)
-        if source is None:
-            continue
-        if base not in capabilities_by_base:
-            capabilities_by_base[base] = artifact_capabilities(session, source)
-        card["capabilities"] = capabilities_by_base[base]
+        folder = Path(str(card.get("folder") or ""))
+        if folder.parent in by_base:
+            cards_by_base.setdefault(folder.parent, []).append((folder.name, card))
+    for base, entries in cards_by_base.items():
+        source = by_base[base]
+        resolutions = resolve_artifact_owners(session, source, [slug for slug, _ in entries])
+        for slug, card in entries:
+            card["capabilities"] = artifact_capabilities(
+                session, source, slug, resolution=resolutions[slug]
+            )
     return cards
 
 
@@ -717,7 +721,7 @@ async def delete_artifact_for_request(
 
     from cowork.services.artifact_permissions import require_artifact_owner
 
-    require_artifact_owner(session, source)
+    require_artifact_owner(session, source, folder_name)
     expected_artifact_id = artifact_id if ref.artifact_id is not None else None
     publish_url, api_key = _resolve_publish_endpoint(get_user_settings())
     if _org_mode():
