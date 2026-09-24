@@ -191,12 +191,13 @@ class TaskObjectService:
 
 
 # ── run-boundary attribution ──────────────────────────────────────────────
-# Anton runs with its own episodic session id and never tags artifacts with
-# the cowork conversation_id, so provenance can't tell us which task created
-# which artifact. Instead cowork-server (which DOES know the conversation it's
-# running) snapshots the project's artifact folders before a turn and records
-# any that appear afterward as owned by that conversation. Harness-agnostic
-# and needs no agent change.
+# cowork-server snapshots the project's artifact folders before a turn and
+# attributes the ones that appear afterward to the turn. Since anton #399 the
+# artifact tools also write the cowork conversation id first in each folder's
+# `provenance`; the remote producers use it to drop folders a concurrent
+# sibling turn created (`artifact_ownership.turn_created_slugs`). Provenance is
+# agent-writable, so it only ever narrows a claim; ownership itself is a
+# server-written attribution row (ENG-2961).
 
 def snapshot_artifact_slugs(artifacts_base) -> set[str]:
     """The set of artifact folder names under a project's artifacts dir."""
@@ -286,6 +287,38 @@ def _index_new_slugs(conversation_id, project_id, slugs: list[str], scope: Tenan
         logger.warning("Could not index artifacts created this turn", exc_info=True)
 
 
+def _record_new_owners(conversation, project_id, slugs: list[str], scope: TenantScope | None) -> None:
+    """Record the conversation's creator as owner of what this turn created.
+
+    Org mode only (ENG-2961): a project-level root is shared by every member,
+    so the owner is written down when the turn ends rather than read from the
+    path later. Skipped under the same condition as `_index_new_slugs` (no
+    recoverable turn scope). Best-effort: a missed write leaves the artifact
+    `unknown`, never fails the turn.
+    """
+    if scope is None or not scope.org_mode or not slugs or not project_id:
+        return
+    try:
+        owner = getattr(conversation, "created_by", None)
+        if not owner:
+            logger.warning(
+                "artifact owner not recorded: conversation %s has no creator",
+                getattr(conversation, "id", None),
+            )
+            return
+        from cowork.common.settings.app_settings import get_app_settings
+        from cowork.db.session import get_engine, get_session_factory
+        from cowork.services.artifact_ownership import record_artifact_owner
+
+        factory = get_session_factory(get_engine(get_app_settings().database.uri))
+        with factory() as session:
+            scoped = ScopedSession(session, scope)
+            for slug in slugs:
+                record_artifact_owner(scoped, project_id, slug, owner, action="create")
+    except Exception:
+        logger.warning("Could not record owners of artifacts created this turn", exc_info=True)
+
+
 def index_turn_artifacts(
     conversation,
     conversation_id,
@@ -373,6 +406,7 @@ def index_turn_artifacts(
         scope = _recover_turn_scope(conversation)
         if new:
             _index_new_slugs(conversation_id, project_id, new, scope)
+            _record_new_owners(conversation, project_id, new, scope)
         return new, touched, scope
     except Exception:
         logger.warning("index_turn_artifacts failed", exc_info=True)

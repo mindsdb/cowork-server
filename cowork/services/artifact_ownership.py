@@ -19,7 +19,10 @@ turn's claim (``turn_created_slugs``), never grant ownership.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
+import os
+import stat
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -232,3 +235,63 @@ def forget_artifact_owner(session, source, slug: str, *, actor_id: str) -> bool:
     return SharedResourceAccess(session).delete_as(
         ARTIFACT, artifact_resource_key(source.project_id, slug), actor_id=actor_id
     )
+
+
+def provenance_origin(folder: Path) -> UUID | None:
+    """``provenance[0].conversation`` of one artifact folder, or None.
+
+    Opened with O_NOFOLLOW and checked with lstat so a link planted on the
+    shared mount cannot point the server at a file outside the project.
+    """
+    try:
+        if not stat.S_ISDIR(Path(folder).lstat().st_mode):
+            return None
+        fd = os.open(Path(folder) / "metadata.json", os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                return None
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    from cowork.services.artifacts import origin_conversation_id
+
+    raw = origin_conversation_id(data if isinstance(data, dict) else None)
+    try:
+        return UUID(raw) if raw else None
+    except ValueError:
+        return None
+
+
+def turn_created_slugs(base, before_slugs: set[str], conversation_id) -> set[str]:
+    """Slugs that appeared during this turn AND name it as their creator.
+
+    A drop-only filter: every conversation in a project shares one artifacts
+    root, so a folder that merely appeared may be a concurrent sibling turn's
+    (ENG-1933). Anton's artifact tools record the cowork conversation id first
+    in ``provenance``; rewriting it can only remove a slug from this turn, never
+    add one, because the slug must also have appeared in this turn's window.
+
+    Never raises: it runs inside a turn's ``finally``.
+    """
+    try:
+        expected = UUID(str(conversation_id))
+        from cowork.services.task_objects import snapshot_artifact_slugs
+
+        appeared = snapshot_artifact_slugs(base) - set(before_slugs or ())
+        kept: set[str] = set()
+        for slug in sorted(appeared):
+            origin = provenance_origin(Path(base) / slug)
+            if origin == expected:
+                kept.add(slug)
+                continue
+            reason = "no_provenance" if origin is None else "foreign_provenance"
+            logger.info("artifact_attribution skipped slug=%s reason=%s", slug, reason)
+        return kept
+    except Exception:
+        # ERROR, not WARNING: WARNING is kept for write-time conflicts and the
+        # backfill summary, and reaching this means a bug or an unreadable root.
+        logger.error("artifact attribution failed; claiming nothing this turn", exc_info=True)
+        return set()

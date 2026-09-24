@@ -37,6 +37,7 @@ async def remote_turn_events(
     from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
     from cowork.handlers._turn_history import sanitize_turn_history_rows
     from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated
+    from cowork.services.artifact_ownership import turn_created_slugs
     from cowork.services.task_objects import (
         index_turn_artifacts,
         publish_and_card_turn_artifacts,
@@ -101,6 +102,7 @@ async def remote_turn_events(
             new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
                 artifacts[0], conv_id, artifacts[2], artifacts[1],
                 before_slugs, before_mtimes,
+                tracked_new=turn_created_slugs(artifacts[1], before_slugs, conv_id),
             )
 
     if artifacts is not None and artifact_writes_allowed:
