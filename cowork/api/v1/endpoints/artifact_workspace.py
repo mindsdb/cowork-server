@@ -32,7 +32,6 @@ from cowork.db.scoped import ScopedSession, ScopedSessionDep, get_scoped_session
 from cowork.services.product_permissions import has_product_permission, require_product_permission
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
-    artifact_owner_id,
     require_artifact_owner,
 )
 from cowork.services.comments_layer import inject_layer
@@ -883,18 +882,20 @@ async def enable_artifact_comments(
 
     source, folder, metadata, capabilities = _owner_workspace(session, project_ref, artifact_id)
     capabilities = await _current_capabilities(session, capabilities)
-    owner_user_id = artifact_owner_id(session, source, folder.name)
+    # `_owner_workspace` already refused anyone but the owner, so the owner is
+    # the caller; resolving it again would only repeat that query.
+    owner_user_id = str(session.scope.user_id) if session.scope.user_id else None
     try:
         canonical_key = await run_in_threadpool(
             ensure_authorization_key,
             artifact_id,
             session.scope,
-            owner_user_id=str(owner_user_id) if owner_user_id else None,
+            owner_user_id=owner_user_id,
         )
         await provision_draft_review_access(
             canonical_key.split("/", 1)[1],
             session.scope,
-            owner_user_id=str(owner_user_id) if owner_user_id else None,
+            owner_user_id=owner_user_id,
         )
     except ArtifactAccessUnavailable as exc:
         raise HTTPException(

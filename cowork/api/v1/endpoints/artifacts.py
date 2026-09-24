@@ -825,22 +825,21 @@ async def delete_artifact_for_request(
     except Exception as e:
         raise HTTPException(status_code=500, detail="Could not delete artifact") from e
 
-    if _org_mode():
-        from cowork.services.artifact_ownership import forget_artifact_owner
+    from cowork.services.artifact_ownership import forget_artifact_owner
 
-        # After the bytes are gone: a later artifact with the same slug starts
-        # with its own owner. Best-effort; a stale row is replaced on rekey and
-        # never grants anything to a folder that does not exist. Synchronous on
-        # purpose: it uses the request session, which must not cross threads,
-        # and it is one indexed lookup plus one delete.
-        try:
-            forget_artifact_owner(
-                session, source, folder_name, actor_id=str(session.scope.user_id)
-            )
-        except Exception:
-            logger.warning(
-                "Could not drop the owner of deleted artifact %s", folder_name, exc_info=True
-            )
+    # After the bytes are gone: a later artifact with the same slug starts with
+    # its own owner (a no-op outside org mode). Best-effort; a stale row is
+    # replaced on rekey and never grants anything to a folder that does not
+    # exist. Synchronous on purpose: it uses the request session, which must
+    # not cross threads, and it is one indexed lookup plus one delete.
+    try:
+        forget_artifact_owner(
+            session, source, folder_name, actor_id=str(session.scope.user_id)
+        )
+    except Exception:
+        logger.warning(
+            "Could not drop the owner of deleted artifact %s", folder_name, exc_info=True
+        )
 
 
 # The routes below (through delete_artifact_endpoint) are DesktopOnly, which

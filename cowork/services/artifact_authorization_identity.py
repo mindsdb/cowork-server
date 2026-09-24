@@ -169,37 +169,19 @@ def publish_authorization_key(
     an `ArtifactIdentity` alias bound to someone else; that mismatch is refused
     and nothing is rewritten.
     """
-    from cowork.models.project import Project
     from cowork.services.artifact_ownership import (
         ArtifactOwnerUnknown,
-        project_root_source,
+        artifact_root_for_base,
         resolve_artifact_owner,
     )
-    from cowork.services.artifact_roots import artifacts_sources_for_project
 
     with _session(scope) as session:
         try:
-            project = session.get(Project, UUID(str(project_id)))
+            source = artifact_root_for_base(session, project_id, artifacts_base)
         except (TypeError, ValueError) as exc:
             raise ArtifactAccessUnavailable(
                 "Artifact project could not be resolved"
             ) from exc
-        if project is None:
-            # Another organization's project is not returned by the scoped read.
-            raise ArtifactAccessUnavailable("Artifact project could not be resolved")
-        source = project_root_source(project)
-        if Path(source.base) != Path(artifacts_base):
-            # Only a legacy per-conversation root needs discovery, which lists
-            # the caller's own conversation roots on the shared mount; any base
-            # it does not return either is refused below.
-            source = next(
-                (
-                    s
-                    for s in artifacts_sources_for_project(session, project.id)
-                    if Path(s.base) == Path(artifacts_base)
-                ),
-                None,
-            )
         if source is None:
             raise ArtifactAccessUnavailable(
                 "Artifact root does not belong to its project"
@@ -207,8 +189,9 @@ def publish_authorization_key(
         resolution = resolve_artifact_owner(session, source, slug)
         if resolution.unknown:
             raise ArtifactOwnerUnknown("Artifact owner is unknown")
+        # A non-unknown org resolution always carries an owner.
         owner_user_id = resolution.owner_user_id
-        if not owner_user_id or str(owner_user_id) != str(scope.user_id):
+        if str(owner_user_id) != str(scope.user_id):
             raise ArtifactAccessUnavailable(
                 "Only the artifact owner can publish this draft"
             )

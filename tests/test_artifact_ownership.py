@@ -371,19 +371,32 @@ def test_index_turn_artifacts_records_the_creator_as_owner(tmp_path, org_id, use
         )
 
 
-def test_index_turn_artifacts_uses_the_given_after_listing(tmp_path, monkeypatch):
+@pytest.mark.parametrize("completed_cleanly", [True, False])
+def test_index_turn_artifacts_attributes_by_provenance_with_one_listing(
+    tmp_path, monkeypatch, completed_cleanly
+):
+    """The producers' path: the root is listed once, and the provenance filter
+    keeps this turn's own folder, drops a sibling's, and keeps an unattributed
+    one only when the turn did not complete cleanly."""
     conversation_id = uuid4()
-    write_artifact(tmp_path, "listed", conversation_id)
-    write_artifact(tmp_path, "unlisted", conversation_id)
+    write_artifact(tmp_path, "mine", conversation_id)
+    write_artifact(tmp_path, "sibling", uuid4())
+    write_artifact(tmp_path, "handmade")
+    listings = []
+    real_listing = task_objects.snapshot_artifact_slugs
 
-    def _no_listing(_base):
-        raise AssertionError("the caller's listing must be reused")
+    def _counted(base):
+        listings.append(base)
+        return real_listing(base)
 
-    monkeypatch.setattr(task_objects, "snapshot_artifact_slugs", _no_listing)
+    monkeypatch.setattr(task_objects, "snapshot_artifact_slugs", _counted)
     monkeypatch.setattr(task_objects, "_recover_turn_scope", lambda _c: None)
     monkeypatch.setattr(task_objects, "_index_new_slugs", lambda *a: None)
     new, touched, _scope = task_objects.index_turn_artifacts(
-        None, conversation_id, None, tmp_path, set(), {}, after={"listed"},
+        None, conversation_id, None, tmp_path, set(), {},
+        attribute_by_provenance=True, completed_cleanly=completed_cleanly,
     )
-    assert new == ["listed"]
-    assert touched == {"listed"}
+    expected = ["mine"] if completed_cleanly else ["handmade", "mine"]
+    assert new == expected
+    assert touched == set(expected)
+    assert len(listings) == 1

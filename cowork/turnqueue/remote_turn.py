@@ -37,13 +37,11 @@ async def remote_turn_events(
     from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
     from cowork.handlers._turn_history import sanitize_turn_history_rows
     from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated
-    from cowork.services.artifact_ownership import turn_created_slugs
     from cowork.services.task_objects import (
         index_turn_artifacts,
         publish_and_card_turn_artifacts,
         remote_skill_draft_result,
         snapshot_artifact_state,
-        try_snapshot_artifact_slugs,
     )
 
     seeded_history, seed_info = ResponsesHandler._remote_seed_history(session, conv_id)
@@ -103,16 +101,11 @@ async def remote_turn_events(
                 raise RemoteTurnFailed(code, message)
     finally:
         if artifacts is not None and artifact_writes_allowed:
-            after = try_snapshot_artifact_slugs(artifacts[1])
             new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
                 artifacts[0], conv_id, artifacts[2], artifacts[1],
                 before_slugs, before_mtimes,
-                tracked_new=turn_created_slugs(
-                    artifacts[1], before_slugs, conv_id,
-                    after=after,
-                    accept_unattributed=not completed_cleanly,
-                ),
-                after=after,
+                attribute_by_provenance=True,
+                completed_cleanly=completed_cleanly,
             )
 
     if artifacts is not None and artifact_writes_allowed:

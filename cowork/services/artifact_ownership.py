@@ -29,18 +29,23 @@ from pathlib import Path
 from typing import Literal
 from uuid import UUID
 
+from cowork.common.paths import O_NOFOLLOW, dir_open, pinned_dir
 from cowork.models.conversation import Conversation
+from cowork.models.project import Project
 from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.services.artifact_access import ArtifactAccessUnavailable
-from cowork.services.artifact_roots import _ARTIFACTS_SUBPATH
+from cowork.services.artifact_roots import (
+    _ARTIFACTS_SUBPATH,
+    CONVERSATIONS_DIRNAME,
+    artifacts_sources_for_project,
+    project_artifacts_base,
+)
 from cowork.services.artifacts import ProjectArtifacts
+from cowork.services.shared_resources import ARTIFACT, SharedResourceAccess
 
 logger = logging.getLogger(__name__)
 
-ARTIFACT = "artifact"
-
 _KEY_MAX_LENGTH = 255  # SharedResourceAttribution.resource_key
-_CONVERSATIONS_DIRNAME = "conversations"
 
 OwnerState = Literal["recorded", "legacy_path", "unknown", "local"]
 
@@ -102,13 +107,38 @@ def project_root_source(project) -> ProjectArtifacts:
     discover. It is the same shape `artifact_roots._sources_for` gives that
     root, so `is_project_root` holds for it.
     """
-    project_path = Path(project.path)
     return ProjectArtifacts(
-        base=project_path.joinpath(*_ARTIFACTS_SUBPATH),
+        base=project_artifacts_base(project.path),
         project_id=str(project.id),
         project_name=project.name,
-        trusted_anchor=project_path,
+        trusted_anchor=Path(project.path),
         root_parts=_ARTIFACTS_SUBPATH,
+    )
+
+
+def artifact_root_for_base(session, project_id, artifacts_base) -> ProjectArtifacts | None:
+    """The project's root that sits at ``artifacts_base``, or None.
+
+    Raises ``ValueError`` for a project the scope cannot see (the row is read
+    through the org scope, so another organization's project is unknown), the
+    same as `artifacts_sources_for_project`. The project root needs no
+    discovery; only a legacy per-conversation base goes through
+    `artifacts_sources_for_project`, which lists the caller's own conversation
+    roots on the shared mount and returns nothing for anyone else's.
+    """
+    project = session.get(Project, UUID(str(project_id)))
+    if project is None:
+        raise ValueError("Unknown project")
+    source = project_root_source(project)
+    if Path(source.base) == Path(artifacts_base):
+        return source
+    return next(
+        (
+            s
+            for s in artifacts_sources_for_project(session, project.id)
+            if Path(s.base) == Path(artifacts_base)
+        ),
+        None,
     )
 
 
@@ -123,7 +153,7 @@ def _legacy_conversation_id(source) -> UUID | None:
     parts = _root_parts(source)
     if (
         len(parts) != 4
-        or parts[0] != _CONVERSATIONS_DIRNAME
+        or parts[0] != CONVERSATIONS_DIRNAME
         or parts[2:] != _ARTIFACTS_SUBPATH
         or not _anchored(source, parts)
     ):
@@ -134,9 +164,16 @@ def _legacy_conversation_id(source) -> UUID | None:
         return None
 
 
-def _legacy_owner(session, source, conversation_id: UUID) -> str | None:
+def conversation_creator(session, conversation_id, *, project_id=None) -> str | None:
+    """``created_by`` of a conversation visible in this scope, or None.
+
+    With ``project_id`` the conversation must also belong to that project: a
+    conversation owns artifacts only inside its own project.
+    """
     conversation = session.get(Conversation, conversation_id)
-    if conversation is None or str(conversation.project_id) != str(source.project_id):
+    if conversation is None:
+        return None
+    if project_id is not None and str(conversation.project_id) != str(project_id):
         return None
     return conversation.created_by or None
 
@@ -158,21 +195,23 @@ def resolve_artifact_owners(session, source, slugs: Iterable[str]) -> dict[str, 
     if scope is None:
         user_id = getattr(getattr(session, "scope", None), "user_id", None)
         return {slug: OwnerResolution(user_id, "local") for slug in wanted}
+    if not wanted:
+        return {}
 
     conversation_id = _legacy_conversation_id(source)
     if conversation_id is not None:
-        owner = _legacy_owner(session, source, conversation_id)
+        owner = conversation_creator(session, conversation_id, project_id=source.project_id)
         state: OwnerState = "legacy_path" if owner else "unknown"
         return {slug: OwnerResolution(owner, state) for slug in wanted}
 
-    if source.project_id and getattr(source, "trusted_anchor", None) is None:
-        # Every org root built by `artifact_roots._sources_for` carries an anchor;
-        # one without it would silently resolve `unknown` for every artifact.
-        logger.error(
-            "artifact_owner source without trusted_anchor project=%s base=%s",
-            source.project_id, source.base,
-        )
-    if not is_project_root(source) or not source.project_id or not wanted:
+    if not source.project_id or not is_project_root(source):
+        if source.project_id and getattr(source, "trusted_anchor", None) is None:
+            # Every org root built by `artifact_roots._sources_for` carries an
+            # anchor; one without it resolves `unknown` for every artifact.
+            logger.error(
+                "artifact_owner source without trusted_anchor project=%s base=%s",
+                source.project_id, source.base,
+            )
         return {slug: OwnerResolution(None, "unknown") for slug in wanted}
 
     keys = {artifact_resource_key(source.project_id, slug): slug for slug in wanted}
@@ -212,8 +251,6 @@ def record_artifact_owner(
     """
     if _org_scope(session) is None or not owner_user_id or not project_id:
         return None
-    from cowork.services.shared_resources import SharedResourceAccess
-
     row, _created = SharedResourceAccess(session).claim_as(
         ARTIFACT,
         artifact_resource_key(project_id, slug),
@@ -235,8 +272,6 @@ def rekey_artifact_owner(
     """Carry ownership along when a task moves an artifact to another project."""
     if _org_scope(session) is None or not is_project_root(source) or not source.project_id:
         return False
-    from cowork.services.shared_resources import SharedResourceAccess
-
     row = SharedResourceAccess(session).rekey_as(
         ARTIFACT,
         artifact_resource_key(source.project_id, old_slug),
@@ -250,8 +285,6 @@ def forget_artifact_owner(session, source, slug: str, *, actor_id: str) -> bool:
     """Drop ownership of a deleted project-root artifact. Legacy roots have none."""
     if _org_scope(session) is None or not is_project_root(source) or not source.project_id:
         return False
-    from cowork.services.shared_resources import SharedResourceAccess
-
     return SharedResourceAccess(session).delete_as(
         ARTIFACT, artifact_resource_key(source.project_id, slug), actor_id=actor_id
     )
@@ -260,20 +293,22 @@ def forget_artifact_owner(session, source, slug: str, *, actor_id: str) -> bool:
 def provenance_origin(folder: Path) -> UUID | None:
     """``provenance[0].conversation`` of one artifact folder, or None.
 
-    Opened with O_NOFOLLOW and checked with lstat so a link planted on the
-    shared mount cannot point the server at a file outside the project.
+    The folder and its ``metadata.json`` are opened without following links,
+    so a link planted on the shared mount cannot point the server at a file
+    outside the project. Never raises.
     """
     try:
-        if not stat.S_ISDIR(Path(folder).lstat().st_mode):
-            return None
-        fd = os.open(Path(folder) / "metadata.json", os.O_RDONLY | os.O_NOFOLLOW)
-    except OSError:
-        return None
-    try:
-        with os.fdopen(fd, "r", encoding="utf-8") as handle:
-            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
-                return None
-            data = json.load(handle)
+        with pinned_dir(folder, nofollow_base=True) as pinned:
+            fd = dir_open(pinned, "metadata.json", os.O_RDONLY | O_NOFOLLOW)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    return None
+                with os.fdopen(fd, "r", encoding="utf-8") as handle:
+                    fd = -1
+                    data = json.load(handle)
+            finally:
+                if fd >= 0:
+                    os.close(fd)
     except (OSError, ValueError):
         return None
     from cowork.services.artifacts import origin_conversation_id

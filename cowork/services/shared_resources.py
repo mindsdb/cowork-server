@@ -36,6 +36,7 @@ SKILL = "skill"
 PROJECT_MEMORY = "project_memory"
 PROJECT_INSTRUCTIONS = "project_instructions"
 SKILL_PROJECT_REFERENCES = "skill_project_references"
+ARTIFACT = "artifact"
 CLAIM_TTL = timedelta(minutes=5)
 RESOURCE_LOCK_TIMEOUT_SECONDS = 10.0
 ADVISORY_LOCK_RETRY_SECONDS = 0.05
@@ -138,6 +139,15 @@ def _resource_busy() -> HTTPException:
     )
 
 
+def advisory_lock_key(identity: bytes) -> int:
+    """The signed 64-bit PostgreSQL advisory-lock key for one identity."""
+    return int.from_bytes(
+        hashlib.blake2b(identity, digest_size=8).digest(),
+        byteorder="big",
+        signed=True,
+    )
+
+
 def _database_lock_engine(bind: Any) -> Any:
     """Return an unpooled engine reserved for session advisory locks.
 
@@ -201,12 +211,7 @@ class _DatabaseResourceLocks:
         connection = self.connection or _database_lock_engine(bind).connect()
         if owns_connection:
             self.connection = connection
-        identity = f"{org_id}\0{kind}\0{key}".encode()
-        lock_key = int.from_bytes(
-            hashlib.blake2b(identity, digest_size=8).digest(),
-            byteorder="big",
-            signed=True,
-        )
+        lock_key = advisory_lock_key(f"{org_id}\0{kind}\0{key}".encode())
         acquired = False
         try:
             while True:
@@ -622,10 +627,31 @@ class SharedResourceAccess:
         if not self.org_mode:
             return None, False
         actor_id = self._require_actor()
+        return self._claim(
+            kind,
+            key,
+            created_by_id=creator_id if creator_id is not None else actor_id,
+            actor_id=actor_id,
+            action=action,
+        )
+
+    def _claim(
+        self,
+        kind: str,
+        key: str,
+        *,
+        created_by_id: str,
+        actor_id: str,
+        action: str,
+    ) -> tuple[SharedResourceAttribution, bool]:
+        """Create attribution and its first event; the unique key arbitrates.
+
+        A loser rolls back and re-reads the winner instead of overwriting it.
+        Shared by ``claim`` (request actor) and ``claim_as`` (explicit actor).
+        """
         existing = self._find(kind, key)
         if existing is not None:
             return existing, False
-        created_by_id = creator_id if creator_id is not None else actor_id
         row = SharedResourceAttribution(
             resource_kind=kind,
             resource_key=key,
@@ -634,7 +660,7 @@ class SharedResourceAccess:
         )
         try:
             self.session.add(row)
-            self._append_event(kind, key, action)
+            self._append_event_as(kind, key, action, actor_id=actor_id)
             self.session.commit()
         except sa.exc.IntegrityError:
             self.session.rollback()
@@ -754,32 +780,15 @@ class SharedResourceAccess:
     ) -> tuple[SharedResourceAttribution | None, bool]:
         """First-writer-wins attribution on behalf of ``creator_id``.
 
-        Same race arbiter as ``claim``: the unique key decides, and a loser
-        re-reads the winner instead of overwriting it.
+        Same race arbiter as ``claim`` (``_claim``); the creator is also the
+        actor of the first event, since no request actor exists here.
         """
         if not self.org_mode:
             return None, False
         self._require_org_scope()
-        existing = self._find(kind, key)
-        if existing is not None:
-            return existing, False
-        row = SharedResourceAttribution(
-            resource_kind=kind,
-            resource_key=key,
-            created_by_id=creator_id,
-            updated_by_id=creator_id,
+        return self._claim(
+            kind, key, created_by_id=creator_id, actor_id=creator_id, action=action
         )
-        try:
-            self.session.add(row)
-            self._append_event_as(kind, key, action, actor_id=creator_id)
-            self.session.commit()
-        except sa.exc.IntegrityError:
-            self.session.rollback()
-            winner = self._find(kind, key)
-            if winner is None:
-                raise
-            return winner, False
-        return row, True
 
     def rekey_as(
         self,

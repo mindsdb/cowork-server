@@ -1663,13 +1663,14 @@ async def test_produce_remote_claims_an_unattributed_artifact_of_a_failed_turn(m
 
     from cowork.services import task_objects
 
-    indexed = {}
+    # The provenance filter now runs inside `index_turn_artifacts`; what it
+    # kept is what reaches the index step.
+    indexed = {"new": set()}
 
-    def spy_index(*args, **kwargs):
-        indexed["tracked_new"] = set(kwargs["tracked_new"])
-        return [], set(), None
+    def spy_index_new(conversation, conversation_id, project_id, slugs, scope):
+        indexed["new"] = set(slugs)
 
-    monkeypatch.setattr(task_objects, "index_turn_artifacts", spy_index)
+    monkeypatch.setattr(task_objects, "_index_new_slugs", spy_index_new)
 
     async def fake_replies(**kwargs):
         yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
@@ -1684,7 +1685,7 @@ async def test_produce_remote_claims_an_unattributed_artifact_of_a_failed_turn(m
         model="anton", harness_id="anton", buffer=_FakeBuffer(),
     )
 
-    assert indexed["tracked_new"] == {"half-written"}
+    assert indexed["new"] == {"half-written"}
 
 
 @pytest.mark.asyncio
@@ -1706,13 +1707,14 @@ async def test_produce_remote_drops_an_unattributed_artifact_of_a_clean_turn(mon
 
     from cowork.services import task_objects
 
-    indexed = {}
+    # The provenance filter now runs inside `index_turn_artifacts`; what it
+    # kept is what reaches the index step.
+    indexed = {"new": set()}
 
-    def spy_index(*args, **kwargs):
-        indexed["tracked_new"] = set(kwargs["tracked_new"])
-        return [], set(), None
+    def spy_index_new(conversation, conversation_id, project_id, slugs, scope):
+        indexed["new"] = set(slugs)
 
-    monkeypatch.setattr(task_objects, "index_turn_artifacts", spy_index)
+    monkeypatch.setattr(task_objects, "_index_new_slugs", spy_index_new)
 
     async def fake_autopublish(base, scope, *, touched, **kwargs):
         return set(touched)
@@ -1734,7 +1736,7 @@ async def test_produce_remote_drops_an_unattributed_artifact_of_a_clean_turn(mon
         model="anton", harness_id="anton", buffer=_FakeBuffer(),
     )
 
-    assert indexed["tracked_new"] == set()
+    assert indexed["new"] == set()
 
 
 # ── turn history ─────────────────────────────────────────────────────────────

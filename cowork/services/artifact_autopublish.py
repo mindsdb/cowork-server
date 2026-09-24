@@ -208,33 +208,16 @@ def _owned_slugs(
     """
     from cowork.common.settings.app_settings import get_app_settings
     from cowork.db.scoped import ScopedSession
-    from cowork.db.session import get_engine, get_session_factory
-    from cowork.models.project import Project
+    from cowork.db.session import get_open_session
     from cowork.services.artifact_ownership import (
-        project_root_source,
+        artifact_root_for_base,
         resolve_artifact_owners,
     )
-    from cowork.services.artifact_roots import artifacts_sources_for_project
 
     try:
-        factory = get_session_factory(get_engine(get_app_settings().database.uri))
-        with factory() as raw_session:
+        with get_open_session(get_app_settings().database.uri) as raw_session:
             session = ScopedSession(raw_session, scope)
-            # Org-scoped read: another organization's project is not returned.
-            project = session.get(Project, UUID(str(project_id)))
-            source = None
-            if project is not None:
-                source = project_root_source(project)
-                if Path(source.base) != Path(artifacts_base):
-                    # A legacy per-conversation root: only discovery knows the
-                    # caller's own ones. The project root, which is every
-                    # reconcile of a new artifact, needs no listing of the
-                    # shared mount.
-                    sources = artifacts_sources_for_project(session, project.id)
-                    source = next(
-                        (s for s in sources if Path(s.base) == Path(artifacts_base)),
-                        None,
-                    )
+            source = artifact_root_for_base(session, project_id, artifacts_base)
             if source is None:
                 logger.warning(
                     "artifact_autopublish owner filter: root not found for project=%s base=%s",
@@ -250,10 +233,10 @@ def _owned_slugs(
     not_owner = 0
     owner_unknown = 0
     for slug in slugs:
-        resolution = resolutions.get(slug)
-        if resolution is None or resolution.unknown:
+        resolution = resolutions[slug]
+        if resolution.unknown:
             owner_unknown += 1
-        elif resolution.owner_user_id == scope.user_id:
+        elif str(resolution.owner_user_id) == str(scope.user_id):
             owned.append(slug)
         else:
             not_owner += 1

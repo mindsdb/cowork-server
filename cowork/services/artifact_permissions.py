@@ -9,13 +9,6 @@ _OWNER_ONLY = "Only the artifact owner can change this draft"
 _OWNER_UNKNOWN = "Artifact owner is unknown"
 
 
-def artifact_owner_id(session, source, slug: str):
-    """The user who owns ``slug`` under ``source``, or None when unknown."""
-    from cowork.services.artifact_ownership import resolve_artifact_owner
-
-    return resolve_artifact_owner(session, source, slug).owner_user_id
-
-
 def artifact_capabilities(session, source, slug: str, *, resolution=None) -> dict:
     """Return the permissions the API will enforce for this artifact.
 
