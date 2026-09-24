@@ -33,6 +33,7 @@ from cowork.models.conversation import Conversation
 from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.services.artifact_access import ArtifactAccessUnavailable
 from cowork.services.artifact_roots import _ARTIFACTS_SUBPATH
+from cowork.services.artifacts import ProjectArtifacts
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,25 @@ def _root_parts(source) -> tuple[str, ...]:
 def _anchored(source, parts: tuple[str, ...]) -> bool:
     anchor = getattr(source, "trusted_anchor", None)
     return anchor is not None and Path(source.base) == Path(anchor).joinpath(*parts)
+
+
+def project_root_source(project) -> ProjectArtifacts:
+    """The project's shared ``<project>/.anton/artifacts`` root, from its row.
+
+    Built directly rather than picked out of `artifacts_sources_for_project`,
+    which also lists every legacy conversation root on the shared mount: a
+    caller that already knows its base is the project root has nothing to
+    discover. It is the same shape `artifact_roots._sources_for` gives that
+    root, so `is_project_root` holds for it.
+    """
+    project_path = Path(project.path)
+    return ProjectArtifacts(
+        base=project_path.joinpath(*_ARTIFACTS_SUBPATH),
+        project_id=str(project.id),
+        project_name=project.name,
+        trusted_anchor=project_path,
+        root_parts=_ARTIFACTS_SUBPATH,
+    )
 
 
 def is_project_root(source) -> bool:

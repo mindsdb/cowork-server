@@ -209,17 +209,32 @@ def _owned_slugs(
     from cowork.common.settings.app_settings import get_app_settings
     from cowork.db.scoped import ScopedSession
     from cowork.db.session import get_engine, get_session_factory
-    from cowork.services.artifact_ownership import resolve_artifact_owners
+    from cowork.models.project import Project
+    from cowork.services.artifact_ownership import (
+        project_root_source,
+        resolve_artifact_owners,
+    )
     from cowork.services.artifact_roots import artifacts_sources_for_project
 
     try:
         factory = get_session_factory(get_engine(get_app_settings().database.uri))
         with factory() as raw_session:
             session = ScopedSession(raw_session, scope)
-            sources = artifacts_sources_for_project(session, UUID(str(project_id)))
-            source = next(
-                (s for s in sources if Path(s.base) == Path(artifacts_base)), None
-            )
+            # Org-scoped read: another organization's project is not returned.
+            project = session.get(Project, UUID(str(project_id)))
+            source = None
+            if project is not None:
+                source = project_root_source(project)
+                if Path(source.base) != Path(artifacts_base):
+                    # A legacy per-conversation root: only discovery knows the
+                    # caller's own ones. The project root, which is every
+                    # reconcile of a new artifact, needs no listing of the
+                    # shared mount.
+                    sources = artifacts_sources_for_project(session, project.id)
+                    source = next(
+                        (s for s in sources if Path(s.base) == Path(artifacts_base)),
+                        None,
+                    )
             if source is None:
                 logger.warning(
                     "artifact_autopublish owner filter: root not found for project=%s base=%s",
