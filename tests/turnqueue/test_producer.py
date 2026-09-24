@@ -427,12 +427,10 @@ async def test_datasource_grant_mismatch_fails_before_enqueue(monkeypatch):
         }),
     )
 
-    from cowork.services.product_permissions import ProductPermissionUnavailable
-
-    with pytest.raises(ProductPermissionUnavailable):
-        await _drain(prod.stream_remote_replies(
-            conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
-        ))
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+    assert [(kind, data["code"]) for kind, data in items] == [("turn_failed", "permission_unavailable")]
     assert not fake.added
 
 
@@ -480,12 +478,46 @@ async def test_datasource_grant_binding_mismatch_fails_before_enqueue(monkeypatc
         }),
     )
 
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+    assert [(kind, data["code"]) for kind, data in items] == [("turn_failed", "permission_unavailable")]
+    assert not fake.added
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failing", ["mint_turn_key_details", "list_verified_datasource_connections", "register_datasource_grants"]
+)
+async def test_an_auth_outage_during_turn_setup_ends_the_turn_as_permission_unavailable(monkeypatch, failing):
+    """Setup runs before anything is queued, so an outage there must still reach the
+    client as permission_unavailable, which the responses producer only keeps when it
+    arrives as a turn_failed; a raised exception becomes a generic error."""
     from cowork.services.product_permissions import ProductPermissionUnavailable
 
-    with pytest.raises(ProductPermissionUnavailable):
-        await _drain(prod.stream_remote_replies(
-            conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
-        ))
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    calls = {
+        "mint_turn_key_details": AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")),
+        "list_verified_datasource_connections": AsyncMock(return_value=[{
+            "id": 7, "connector_id": "postgres", "name": "events", "status": "verified", "credential_version": 3,
+        }]),
+        "register_datasource_grants": AsyncMock(return_value={}),
+    }
+    calls[failing] = AsyncMock(side_effect=ProductPermissionUnavailable())
+    for name, mock in calls.items():
+        monkeypatch.setattr(prod, name, mock)
+
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+
+    assert items == [("turn_failed", {
+        "error": "ProductPermissionUnavailable: turn setup could not be authorized",
+        **ProductPermissionUnavailable().detail,
+    })]
     assert not fake.added
 
 

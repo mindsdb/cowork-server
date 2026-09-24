@@ -425,33 +425,44 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # in sequence on every turn's hot path. Skipped for llm when a turn key
     # was already minted upstream (the `llm` param), since there's nothing
     # to overlap with in that case.
-    oauth_connections_coro = _mint_oauth_block(
-        org_id=org_id, user_id=user_id, disabled=disabled, settings=settings,
-    )
-    if llm:
-        llm_block = llm
-        oauth_connections = await oauth_connections_coro
-    else:
-        if settings.datasource_enabled:
-            (llm_block, turn_key_id), oauth_connections = await asyncio.gather(
-                _mint_llm_block_with_turn_key_id(
-                    org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
-                ),
-                oauth_connections_coro,
-            )
+    # An outage here happens before anything is queued. Reported as a
+    # turn_failed so both callers stream permission_unavailable, not a generic error.
+    try:
+        oauth_connections_coro = _mint_oauth_block(
+            org_id=org_id, user_id=user_id, disabled=disabled, settings=settings,
+        )
+        if llm:
+            llm_block = llm
+            oauth_connections = await oauth_connections_coro
         else:
-            llm_block, oauth_connections = await asyncio.gather(
-                _mint_llm_block(org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings),
-                oauth_connections_coro,
-            )
-    datasource_block = await _mint_datasource_block(
-        org_id=org_id,
-        user_id=user_id,
-        correlation_id=corr,
-        turn_key_id=turn_key_id,
-        disabled=disabled,
-        settings=settings,
-    )
+            if settings.datasource_enabled:
+                (llm_block, turn_key_id), oauth_connections = await asyncio.gather(
+                    _mint_llm_block_with_turn_key_id(
+                        org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
+                    ),
+                    oauth_connections_coro,
+                )
+            else:
+                llm_block, oauth_connections = await asyncio.gather(
+                    _mint_llm_block(org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings),
+                    oauth_connections_coro,
+                )
+        datasource_block = await _mint_datasource_block(
+            org_id=org_id,
+            user_id=user_id,
+            correlation_id=corr,
+            turn_key_id=turn_key_id,
+            disabled=disabled,
+            settings=settings,
+        )
+    except product_permissions.ProductPermissionUnavailable:
+        logger.warning(
+            "[producer] turn setup unavailable conversation=%s correlation_id=%s", conversation_id, corr,
+            exc_info=True,
+        )
+        yield "turn_failed", _setup_permission_failure()
+        return
+
     # Reuses the turn key already minted for llm_block — never mints a
     # second one. Org/cloud mode only: local-mode turns build in-process
     # and never reach this function at all.
@@ -588,6 +599,14 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                     yield kind, data
                 if kind in ("turn_completed", "turn_failed"):
                     return
+
+
+def _setup_permission_failure() -> dict:
+    """The terminal payload for a turn whose key, connections or grants auth could not provide."""
+    return {
+        "error": "ProductPermissionUnavailable: turn setup could not be authorized",
+        **product_permissions.ProductPermissionUnavailable().detail,
+    }
 
 
 def _workspace_permission_failure() -> dict:
