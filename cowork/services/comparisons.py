@@ -106,8 +106,6 @@ class ComparisonService:
     def __init__(self, session: ScopedSession) -> None:
         self.session = session
 
-    # ── Reads ────────────────────────────────────────────────────────────
-
     def _own(self):
         stmt = self.session.select(Comparison)
         if self.session.scope.org_mode:
@@ -160,8 +158,6 @@ class ComparisonService:
                 ComparisonSide.conversation_id == conversation.id
             )
         ).first()
-
-    # ── Create ───────────────────────────────────────────────────────────
 
     def create_comparison(
         self,
@@ -234,8 +230,6 @@ class ComparisonService:
         self.session.refresh(comparison)
         return comparison
 
-    # ── Verdicts ─────────────────────────────────────────────────────────
-
     def record_verdict(self, comparison_id: UUID, *, turn_index: int, winner: str) -> ComparisonVerdict:
         if winner not in VERDICT_WINNERS:
             raise ValueError(f"winner must be one of {sorted(VERDICT_WINNERS)}")
@@ -253,8 +247,6 @@ class ComparisonService:
         self.session.commit()
         self.session.refresh(verdict)
         return verdict
-
-    # ── Continue ─────────────────────────────────────────────────────────
 
     def continue_side(self, comparison_id: UUID, label: str, destination_project_id: UUID) -> Conversation:
         """Turn one side into an ordinary task in a real project.
@@ -298,8 +290,6 @@ class ComparisonService:
         self.session.refresh(conversation)
         return conversation
 
-    # ── Delete ───────────────────────────────────────────────────────────
-
     def delete_comparison(self, comparison_id: UUID) -> None:
         """Remove the comparison and both sandboxes with everything in them.
 
@@ -330,9 +320,6 @@ class ComparisonService:
                 # The comparison is gone either way; a leftover sandbox is
                 # hidden from every list and is only disk.
                 logger.exception("Could not remove comparison sandbox %s", project_id)
-
-
-# ── Connectors ───────────────────────────────────────────────────────────
 
 
 def _blocked(engine: str | None) -> bool:
@@ -367,9 +354,6 @@ async def blocked_connections(scope: TenantScope) -> list[dict]:
         for item in items
         if _blocked(item.get("engine"))
     ]
-
-
-# ── Project copy ─────────────────────────────────────────────────────────
 
 
 @dataclass
