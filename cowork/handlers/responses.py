@@ -421,7 +421,7 @@ class ResponsesHandler:
 
         # Before the gate: it and the producer task both scrub history in this
         # request's context, and nothing registered the vault's secrets yet.
-        register_vault_secrets(self.scope)
+        await register_vault_secrets(self.scope)
 
         disabled = (
             [dc.model_dump() for dc in request.disabled_connections]

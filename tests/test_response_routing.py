@@ -576,7 +576,7 @@ async def test_route_request_scrubs_a_registered_vault_secret_by_value(monkeypat
     request.addfinalizer(_reset_registered_ds_vars)
 
     handler = _routing_handler(monkeypatch)
-    register_vault_secrets(handler.scope)
+    await register_vault_secrets(handler.scope)
 
     cid = uuid4()
     rows = [Message(conversation_id=cid, role=Role.user, content="the password is hunter2xyz")]
@@ -623,9 +623,11 @@ async def test_handle_registers_vault_secrets_before_routing(monkeypatch):
         lambda scoped: SimpleNamespace(get_conversation=lambda _cid: conversation),
     )
     calls = []
-    monkeypatch.setattr(
-        responses, "register_vault_secrets", lambda scope: calls.append(("register", scope))
-    )
+
+    async def fake_register(scope):
+        calls.append(("register", scope))
+
+    monkeypatch.setattr(responses, "register_vault_secrets", fake_register)
 
     class _StopHere(Exception):
         pass

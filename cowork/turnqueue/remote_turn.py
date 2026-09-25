@@ -47,7 +47,7 @@ async def remote_turn_events(
 
     # A channel turn never goes through handle(), which registers these for
     # a web turn; the seed history below is scrubbed against them.
-    register_vault_secrets(session.scope)
+    await register_vault_secrets(session.scope)
     seeded_history, seed_info = ResponsesHandler._remote_seed_history(session, conv_id)
     artifacts = ResponsesHandler._remote_artifacts_context(session, conv_id)
     before_slugs, before_mtimes = (

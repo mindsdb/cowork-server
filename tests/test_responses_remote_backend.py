@@ -107,7 +107,7 @@ def test_remote_history_scrubs_secrets(monkeypatch):
     assert "[REDACTED_API_KEY]" in history[0]["content"]
 
 
-def test_remote_history_scrubs_a_registered_vault_secret_by_value(monkeypatch, tmp_path, request):
+async def test_remote_history_scrubs_a_registered_vault_secret_by_value(monkeypatch, tmp_path, request):
     """A datasource password has no API-key shape, so only its registered
     value can redact it before the seed lands in the Redis job. The call
     sites are pinned by their own ordering tests."""
@@ -122,10 +122,9 @@ def test_remote_history_scrubs_a_registered_vault_secret_by_value(monkeypatch, t
         "host": "db.example.com", "port": "5432", "database": "app",
         "user": "svc", "password": "hunter2xyz",
     })
-    # A sync test sets the registry in the shared test context, so drop it.
     request.addfinalizer(_reset_registered_ds_vars)
 
-    register_vault_secrets(LOCAL_SCOPE)
+    await register_vault_secrets(LOCAL_SCOPE)
     _fake_history(monkeypatch, [_msg("user", "the password is hunter2xyz")])
 
     history, _ = ResponsesHandler._remote_seed_history(_FakeScoped(), uuid4())
