@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from uuid import UUID
 
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
 from cowork.services.artifact_publish_key import PublishKey
@@ -187,6 +188,61 @@ def _record(result: str, **fields: object) -> None:
     logger.warning("artifact_autopublish result=%s %s", result, tail)
 
 
+def _owned_slugs(
+    artifacts_base: Path, scope, project_id: str, slugs: list[str]
+) -> tuple[list[str], int, int]:
+    """Filter ``slugs`` down to the ones this scope's user owns.
+
+    The project root is shared by every member (ENG-2056), so `_candidate_slugs`
+    lists every member's artifacts, not just the caller's. Without this filter
+    `autopublish_project_artifacts` plans a publish for artifacts it cannot
+    legally publish, and each one fails downstream in `publish_authorization_key`
+    with `ArtifactOwnerUnknown` or "Only the artifact owner can publish" — on
+    every turn of every member, forever.
+
+    Read-only, one query. Fails closed: if the source cannot be found or
+    anything raises, nothing is treated as owned rather than risking a publish
+    attempt on someone else's artifact.
+
+    Returns (owned, not_owner_count, owner_unknown_count).
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.scoped import ScopedSession
+    from cowork.db.session import get_open_session
+    from cowork.services.artifact_ownership import (
+        artifact_root_for_base,
+        resolve_artifact_owners,
+    )
+
+    try:
+        with get_open_session(get_app_settings().database.uri) as raw_session:
+            session = ScopedSession(raw_session, scope)
+            source = artifact_root_for_base(session, project_id, artifacts_base)
+            if source is None:
+                logger.warning(
+                    "artifact_autopublish owner filter: root not found for project=%s base=%s",
+                    project_id, artifacts_base,
+                )
+                return [], 0, len(slugs)
+            resolutions = resolve_artifact_owners(session, source, slugs)
+    except Exception:
+        logger.warning("artifact_autopublish owner filter failed", exc_info=True)
+        return [], 0, len(slugs)
+
+    owned: list[str] = []
+    not_owner = 0
+    owner_unknown = 0
+    for slug in slugs:
+        resolution = resolutions[slug]
+        if resolution.unknown:
+            owner_unknown += 1
+        elif str(resolution.owner_user_id) == str(scope.user_id):
+            owned.append(slug)
+        else:
+            not_owner += 1
+    return owned, not_owner, owner_unknown
+
+
 def _candidate_slugs(artifacts_base: Path) -> list[str]:
     try:
         children = sorted(Path(artifacts_base).iterdir())
@@ -236,6 +292,7 @@ async def _publish_one(
     timeout_s: float,
     scope,
     access: dict | None = None,
+    project_id: str | None = None,
 ) -> bool:
     """Publish one artifact. True when it landed. Never raises.
 
@@ -258,6 +315,7 @@ async def _publish_one(
                 # than falling back to the shared namespace root. We only ever
                 # get here with an org scope in hand (see the caller's guard).
                 scope=scope,
+                project_id=project_id,
             ),
             timeout=timeout_s,
         )
@@ -287,6 +345,7 @@ async def autopublish_project_artifacts(
     scope,
     *,
     touched: set[str],
+    project_id: str | None = None,
     limit: int = 5,
     budget_s: float = 60.0,
     touched_budget_s: float = 30.0,
@@ -309,6 +368,9 @@ async def autopublish_project_artifacts(
     with no ambient scope bound, and an unscoped `get_user_settings()` silently
     resolves LOCAL_SCOPE — which would read the global row for the org-scoped
     enable flag and the wrong provider for the publish URL.
+
+    `project_id` is required in org mode: publishing resolves the artifact's
+    owner by it (ENG-2961).
     """
     # Scope guards first: the enable flag is an org setting, so reading it is
     # only meaningful once we know we have an org scope to read it for.
@@ -319,9 +381,16 @@ async def autopublish_project_artifacts(
         return set()
     if not _is_enabled(scope):
         return set()
+    if not project_id:
+        # Fail closed once, instead of raising in `_publish_one` for every slug.
+        _record("skipped", reason="no_project_id")
+        return set()
 
     base = Path(artifacts_base)
     all_slugs = _candidate_slugs(base)
+    all_slugs, not_owner, owner_unknown = _owned_slugs(base, scope, project_id, all_slugs)
+    if not_owner or owner_unknown:
+        _record("skipped", not_owner=not_owner or None, owner_unknown=owner_unknown or None)
     phase_one = [s for s in all_slugs if s in touched]
     phase_two = [s for s in all_slugs if s not in touched]
 
@@ -370,7 +439,7 @@ async def autopublish_project_artifacts(
                     return published
                 if await _publish_one(
                     base, slug, api_key, publish_url, min(timeout_s, remaining), scope,
-                    _access_for(decision),
+                    _access_for(decision), project_id=project_id,
                 ):
                     published.add(slug)
     except asyncio.CancelledError:
