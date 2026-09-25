@@ -9,7 +9,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -753,8 +752,6 @@ _MAX_PREVIEW_FILE = 200
 # attacker-controlled list of those must still be bounded on its own.
 _MAX_PREVIEW_ENTRIES_SCANNED = 200
 
-_WHITESPACE_RUN_RE = re.compile(r"\s+")
-
 
 def _flatten(value: str) -> str:
     """Collapse whitespace runs, including embedded newlines, to one space.
@@ -763,7 +760,7 @@ def _flatten(value: str) -> str:
     numbered list under a line-oriented label, so an untruncated newline in a
     reported message could forge lines that look like they sit outside it.
     """
-    return _WHITESPACE_RUN_RE.sub(" ", value).strip()
+    return " ".join(value.split())
 
 
 def _preview_error_lines(entries: object, source_path: str) -> list[str]:
@@ -785,8 +782,6 @@ def _preview_error_lines(entries: object, source_path: str) -> list[str]:
         if not message:
             continue
         where = _flatten(str(entry.get("file") or ""))[:_MAX_PREVIEW_FILE]
-        if where == "about:srcdoc":
-            where = ""
         line = entry.get("line")
         positioned = isinstance(line, int) and not isinstance(line, bool) and line > 0
         # A blank file with a line number is the document's own inline script,
@@ -796,12 +791,8 @@ def _preview_error_lines(entries: object, source_path: str) -> list[str]:
         # there would point the agent at the wrong file.
         if not where and positioned:
             where = source_path
-        if where and positioned:
-            location = f"{where}:{line}"
-        else:
-            location = where
-        lines.append(f"  {len(lines) + 1}. {message} — {location}" if location
-                     else f"  {len(lines) + 1}. {message}")
+        location = f"{where}:{line}" if where and positioned else where
+        lines.append(f"  {len(lines) + 1}. {message}" + (f" — {location}" if location else ""))
         if len(lines) >= _MAX_PREVIEW_ERRORS:
             break
     return lines

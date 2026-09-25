@@ -8,8 +8,9 @@ before it has already thrown.
 from __future__ import annotations
 
 import re
-from functools import lru_cache
 from pathlib import Path
+
+from cowork.services.comments_layer import script_tag
 
 SHIM_JS = Path(__file__).with_name("preview_shim.js").read_text(encoding="utf-8")
 
@@ -20,22 +21,21 @@ _DOCTYPE_RE = re.compile(r"<!doctype[^>]*>", re.IGNORECASE)
 
 
 def _script_tag(shim_js: str, line_offset: int) -> str:
-    body = shim_js.replace(_LINE_OFFSET_TOKEN, str(line_offset))
-    # Precedent: comments_layer.py escapes the same sequence for the same
-    # reason — a literal </script> would close the injected tag early.
-    return "<script>%s</script>" % body.replace("</script>", "<\\/script>")
+    return script_tag(shim_js.replace(_LINE_OFFSET_TOKEN, str(line_offset)))
 
 
-@lru_cache(maxsize=4)
-def _built_markup(shim_js: str) -> str:
-    """Build the offset-corrected <script> tag once per distinct shim source.
+def _build_markup(shim_js: str) -> str:
+    """Render the shim's <script> tag with its own line offset filled in.
 
-    Keyed on the ``SHIM_JS`` string itself, not on the module attribute, so
-    the result changes when a test monkeypatches ``preview_shim.SHIM_JS``
-    instead of serving a build cached under the real shim's content.
+    The offset a later inline script shifts by is the number of newlines this
+    injection adds, so it is measured on the rendered tag rather than
+    maintained by hand.
     """
-    offset = _script_tag(shim_js, 0).count("\n")
-    return _script_tag(shim_js, offset)
+    return _script_tag(shim_js, _script_tag(shim_js, 0).count("\n"))
+
+
+# Built once: SHIM_JS is a constant, and inject_shim runs in the hot preview path.
+SHIM_MARKUP = _build_markup(SHIM_JS)
 
 
 def inject_shim(html: str) -> str:
@@ -54,13 +54,8 @@ def inject_shim(html: str) -> str:
     somewhere before the document ends; this function has to land before the
     page's own scripts run, which the first-match risk is accepted for.
     """
-    # The offset a later inline script shifts by is the number of newlines this
-    # very injection adds, so it is measured on the rendered tag rather than
-    # maintained by hand. Built once per distinct SHIM_JS value instead of on
-    # every request: this runs in the hot preview path.
-    markup = _built_markup(SHIM_JS)
     for pattern in (_HEAD_OPEN_RE, _HTML_OPEN_RE, _DOCTYPE_RE):
         match = pattern.search(html)
         if match:
-            return html[: match.end()] + markup + html[match.end() :]
-    return markup + html
+            return html[: match.end()] + SHIM_MARKUP + html[match.end() :]
+    return SHIM_MARKUP + html

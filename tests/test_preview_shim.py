@@ -7,7 +7,7 @@ before the shim runs is exactly the failure this exists to prevent.
 
 from __future__ import annotations
 
-from cowork.services.preview_shim import SHIM_JS, inject_shim
+from cowork.services.preview_shim import SHIM_JS, _script_tag, inject_shim
 
 
 def test_shim_goes_first_inside_head():
@@ -48,14 +48,7 @@ def test_shim_js_has_no_script_terminator():
 def test_a_script_terminator_would_be_escaped_if_one_ever_appeared():
     # The guard above is a review rule; this is the mechanism that holds when a
     # future edit slips one in.
-    import cowork.services.preview_shim as module
-
-    original = module.SHIM_JS
-    try:
-        module.SHIM_JS = "var s = '</script>';"
-        out = module.inject_shim("<html><head></head></html>")
-    finally:
-        module.SHIM_JS = original
+    out = _script_tag("var s = '</script>';", 0)
     assert "<\\/script>" in out
     assert out.count("</script>") == 1
 

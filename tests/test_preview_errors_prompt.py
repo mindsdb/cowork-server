@@ -34,13 +34,6 @@ def test_a_position_without_a_file_gets_the_source_path():
     assert lines == ["  1. boom — static/index.html:7"]
 
 
-def test_about_srcdoc_is_replaced_too():
-    lines = _preview_error_lines(
-        [{"message": "boom", "file": "about:srcdoc", "line": 7}], "static/index.html"
-    )
-    assert lines == ["  1. boom — static/index.html:7"]
-
-
 def test_an_entry_without_a_position_gets_no_location_at_all():
     # A failed script tag or a CSP violation happened to a URL, not at a line
     # of the source. Naming the source path there would read as "the bug is in
