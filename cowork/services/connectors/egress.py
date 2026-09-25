@@ -75,10 +75,11 @@ def connection_attempts(
     Families alternate, starting with the resolver's first answer, so a family
     with no route costs one short attempt rather than one per record. Every
     attempt but the last gets ``fallback_seconds`` and the last gets what is
-    left of ``total_seconds``, so trying more addresses never lengthens the
-    connect phase. ``None`` is httpx's "no limit" and stays that on the last
-    attempt. Takes the output of ``vetted_public_addresses`` and never adds an
-    address to it.
+    left of ``total_seconds``, so the connect timeouts of all attempts add up
+    to the one a single attempt would have had. A budget too small for every
+    short attempt tries fewer addresses. ``None`` is httpx's "no limit" and
+    stays that on the last attempt. Takes the output of
+    ``vetted_public_addresses`` and never adds an address to it.
     """
     if not addresses:
         return []
@@ -91,7 +92,7 @@ def connection_attempts(
 
     last_seconds = None
     if total_seconds is not None:
+        while len(ordered) > 1 and total_seconds - fallback_seconds * (len(ordered) - 1) <= 0:
+            ordered.pop()
         last_seconds = total_seconds - fallback_seconds * (len(ordered) - 1)
-        if last_seconds <= 0:
-            raise ValueError("total_seconds must leave the last attempt a positive connect timeout")
     return [(address, fallback_seconds) for address in ordered[:-1]] + [(ordered[-1], last_seconds)]
