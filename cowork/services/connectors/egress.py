@@ -13,6 +13,11 @@ import ipaddress
 import socket
 from collections.abc import Callable
 
+#: Connect timeout for an attempt that has another address after it.
+FALLBACK_CONNECT_SECONDS = 3.0
+#: Addresses tried per request. A cloud host can answer with a dozen or more.
+MAX_CONNECTION_ATTEMPTS = 4
+
 
 class EgressHostUnresolved(RuntimeError):
     """The hostname could not be resolved."""
@@ -56,3 +61,34 @@ def vetted_public_addresses(
     if not addresses or any(not address.is_global for address in addresses):
         raise EgressHostNotPublic(hostname)
     return addresses
+
+
+def connection_attempts(
+    addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address],
+    *,
+    total_seconds: float,
+    fallback_seconds: float = FALLBACK_CONNECT_SECONDS,
+    max_attempts: int = MAX_CONNECTION_ATTEMPTS,
+) -> list[tuple[ipaddress.IPv4Address | ipaddress.IPv6Address, float]]:
+    """Return the vetted addresses to try, in order, each with its connect timeout.
+
+    Families alternate, starting with the resolver's first answer, so a family
+    with no route costs one short attempt rather than one per record. Every
+    attempt but the last gets ``fallback_seconds`` and the last gets what is
+    left of ``total_seconds``, so trying more addresses never lengthens the
+    connect phase. Takes the output of ``vetted_public_addresses`` and never
+    adds an address to it.
+    """
+    if not addresses:
+        return []
+    first_family = [address for address in addresses if address.version == addresses[0].version]
+    other_family = [address for address in addresses if address.version != addresses[0].version]
+    ordered = []
+    for index in range(max(len(first_family), len(other_family))):
+        ordered.extend(family[index] for family in (first_family, other_family) if index < len(family))
+    ordered = ordered[:max_attempts]
+
+    last_seconds = total_seconds - fallback_seconds * (len(ordered) - 1)
+    if last_seconds <= 0:
+        raise ValueError("total_seconds must leave the last attempt a positive connect timeout")
+    return [(address, fallback_seconds) for address in ordered[:-1]] + [(ordered[-1], last_seconds)]
