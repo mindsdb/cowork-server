@@ -116,7 +116,9 @@ def test_other_org_cannot_see_or_touch(db):
     with pytest.raises(ValueError, match="not found"):
         b.update_conversation(conv.id, topic="stolen")
     with pytest.raises(ValueError, match="not found"):
-        b.delete_turn(conv.id, 0)
+        # get_conversation rejects the foreign conversation id before any
+        # message_id anchor is even looked at, so an arbitrary uuid works.
+        b.delete_turn(conv.id, uuid4())
     assert b.delete_conversation(conv.id) is False  # same answer as nonexistent
     assert a.get_conversation(conv.id).topic == "secret"
 
