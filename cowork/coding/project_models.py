@@ -301,15 +301,6 @@ class CodeProject(BaseModel):
             raise ValueError("project resource ids must be unique")
         if len(locations) != len(set(locations)):
             raise ValueError("the same folder cannot be added twice")
-        github_connections = [item.name for item in self.connections if item.provider == "github"]
-        if len(github_connections) == 1:
-            for resource in self.resources:
-                if (
-                    isinstance(resource, RepositoryResource)
-                    and resource.provider == "github"
-                    and not resource.connector_name
-                ):
-                    resource.connector_name = github_connections[0]
         self.folders = [resource_folder(resource) for resource in self.resources]
         connections = [(item.provider, item.name) for item in self.connections]
         if len(connections) != len(set(connections)):

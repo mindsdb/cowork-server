@@ -180,6 +180,52 @@ def test_existing_local_checkout_does_not_need_connector_credentials(tmp_path):
     assert manager._runtime_folder(resource, project).path == str(tmp_path)
 
 
+def test_manual_public_repository_does_not_inherit_a_projects_github_connection(tmp_path):
+    project = CodeProject(
+        id="project", name="Project",
+        resources=[RepositoryResource(id="public", name="Public", source_url="https://github.com/acme/public.git")],
+        connections=[ProjectConnection(provider="github", name="unavailable-or-enterprise")],
+    )
+    # Saving and loading must not bind a pasted URL to the sole connection.
+    project = CodeProject.model_validate_json(project.model_dump_json())
+    resource = project.resources[0]
+    resolve_credentials = Mock(side_effect=WorkspaceError("Connection unavailable"))
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path), repository_credentials=resolve_credentials)
+
+    def run(cwd, *args, **kwargs):
+        if args[0] == "clone":
+            Path(args[-1]).mkdir()
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    manager.workspaces.git.run = Mock(side_effect=run)
+    first = manager._runtime_folder(resource, project)
+    assert manager._runtime_folder(resource, project).path == first.path
+    assert resource.connector_name is None
+    resolve_credentials.assert_not_called()
+    calls = manager.workspaces.git.run.call_args_list
+    assert [call.args[1] for call in calls][:2] == ["clone", "fetch"]
+    assert all(call.kwargs.get("environment") is None for call in calls)
+
+
+def test_explicit_repository_connection_survives_reload_and_does_not_fall_back_on_auth_failure(tmp_path):
+    project = CodeProject(
+        id="project", name="Project",
+        resources=[RepositoryResource(id="private", name="Private", source_url="https://github.com/acme/private.git", connector_name="work")],
+        connections=[ProjectConnection(provider="github", name="work")],
+    )
+    project = CodeProject.model_validate_json(project.model_dump_json())
+    resource = project.resources[0]
+    resolve_credentials = Mock(side_effect=WorkspaceError("Connection unavailable"))
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path), repository_credentials=resolve_credentials)
+    manager.workspaces.git.run = Mock()
+
+    assert resource.connector_name == "work"
+    with pytest.raises(WorkspaceError, match="Connection unavailable"):
+        manager._runtime_folder(resource, project)
+    resolve_credentials.assert_called_once_with(project, resource)
+    manager.workspaces.git.run.assert_not_called()
+
+
 def test_removed_connector_does_not_fall_back_to_another_projects_connection():
     resource = RepositoryResource(id="repo", name="Private", source_url="https://github.com/acme/private.git", connector_name="removed")
     project = CodeProject(id="project", name="Project", resources=[resource], connections=[ProjectConnection(provider="github", name="other")])
