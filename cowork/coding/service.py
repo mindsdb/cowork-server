@@ -35,6 +35,7 @@ from cowork.coding.control_models import RunStatus
 from cowork.coding.control_service import ControlPlaneService
 from cowork.coding.control_store import ControlPlaneStore
 from cowork.coding.delivery import ProjectDeliveryService
+from cowork.coding.integrations import local_repository_credentials
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.engines.registry import CodingEngineRegistry, engine_registry
 from cowork.coding.playbooks import PlaybookService
@@ -113,7 +114,7 @@ class CodingService(
         )
         self.playbooks = PlaybookService(root, self.project_store, self.workspaces.git)
         self.skill_runtime = SkillRuntimeResolver(self.skill_library)
-        self.project_workspaces = ProjectWorkspaceManager(self.workspaces)
+        self.project_workspaces = ProjectWorkspaceManager(self.workspaces, repository_credentials=local_repository_credentials)
         self.delivery = ProjectDeliveryService(self.workspaces.git)
         self._lock = threading.RLock()
         self._running: dict[str, RunningTurn] = {}
