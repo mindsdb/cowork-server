@@ -113,6 +113,11 @@ class ConnectorMetadataResponse(BaseModel):
     logo_color: str | None = None
     aliases: list[str] = []
     featured: bool = False
+    # A short caveat the directory shows as a badge + tooltip on the tile —
+    # something true about connecting that the user is better off knowing
+    # before they start, not a status field. Set only where there is one;
+    # None renders no badge at all.
+    notice: str | None = None
     # Org (cloud) mode only: False marks a connector the hosted build can't
     # run yet, so the directory can list it under a desktop-only group instead
     # of hiding it. Always True on desktop, where the whole registry works.

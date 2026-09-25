@@ -136,10 +136,19 @@ class ConnectionsService:
         return dict(record.get("fields") or {})
 
     def patch_token(self, engine: str, name: str, updates: dict) -> bool:
-        """Partially update token fields on an existing vault entry.
+        """Merge ``updates`` into an existing vault entry's fields.
 
-        Only ``access_token``, ``expires_at``, and ``status`` are written;
-        ``refresh_token`` is never stored in the vault — it lives in the OS keychain.
+        Generic by design — it writes whatever keys ``updates`` contains,
+        merged over the record's existing fields; it does not itself
+        restrict which keys can be written. Two real callers rely on that:
+        the `PATCH .../token` endpoint restricts itself to
+        ``access_token``/``expires_at``/``status`` (``refresh_token`` is
+        never stored here — it lives in the OS keychain) via its own
+        ``_PATCH_TOKEN_VAULT_FIELDS`` allowlist before calling this; the
+        `PATCH .../access-mode` endpoint (ENG-487) reuses this same method
+        to write ``_access_mode`` instead. Don't add a key restriction
+        here — it would silently break the second caller.
+
         Returns ``False`` if the entry does not exist.
         """
         vault = self._vault()

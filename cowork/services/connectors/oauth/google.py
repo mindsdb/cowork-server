@@ -37,6 +37,7 @@ _SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str | None]] = {
     "github":           ("github_client_id",            "github_client_secret"),
     "supabase":         ("supabase_client_id",          "supabase_client_secret"),
     "posthog":          ("posthog_client_id",           None),
+    "hubspot":          ("hubspot_client_id",           "hubspot_client_secret"),
 }
 
 # engine name (e.g. "google_drive") → service id (e.g. "google-drive")
