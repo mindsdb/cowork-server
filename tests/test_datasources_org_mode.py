@@ -32,6 +32,7 @@ CONNECTION = {
     "name": "prod reporting",
     "status": "pending",
     "credential_version": 1,
+    "revision": 6,
     "host_masked": "db***om",
     "port": 5432,
     "database": "appdb",
@@ -234,11 +235,14 @@ def test_detail_edit_delete_and_retry_hit_the_exact_auth_paths(org_client, relay
 
     edit = org_client.patch(
         "/api/v1/connectors/datasources/7",
-        json={**CREATE_BODY, "expected_version": 3},
+        json={**CREATE_BODY, "expected_revision": 6},
         headers=AUTH_HEADERS,
     )
     assert edit.status_code == 200
-    assert json.loads(recorded[1].content)["expected_version"] == 3
+    sent = json.loads(recorded[1].content)
+    assert sent["expected_revision"] == 6
+    assert "expected_version" not in sent
+    assert (edit.json()["revision"], edit.json()["credential_version"]) == (6, 1)
 
     scripted["status"] = 204
     assert org_client.delete("/api/v1/connectors/datasources/7", headers=AUTH_HEADERS).status_code == 204
@@ -274,7 +278,7 @@ def test_a_coded_conflict_keeps_its_code_and_a_codeless_one_does_not_invent_one(
 
     coded = org_client.patch(
         "/api/v1/connectors/datasources/7",
-        json={**CREATE_BODY, "expected_version": 3},
+        json={**CREATE_BODY, "expected_revision": 3},
         headers=AUTH_HEADERS,
     )
     assert coded.status_code == 409
@@ -284,7 +288,7 @@ def test_a_coded_conflict_keeps_its_code_and_a_codeless_one_does_not_invent_one(
     scripted["body"] = {"detail": "A connection with this name already exists."}
     codeless = org_client.patch(
         "/api/v1/connectors/datasources/7",
-        json={**CREATE_BODY, "expected_version": 3},
+        json={**CREATE_BODY, "expected_revision": 3},
         headers=AUTH_HEADERS,
     )
     assert codeless.status_code == 409
@@ -338,7 +342,7 @@ def test_an_org_request_without_identity_headers_never_reaches_auth(org_client, 
         ("post", "/api/v1/connectors/datasources/", CREATE_BODY),
         ("get", "/api/v1/connectors/datasources/", None),
         ("get", "/api/v1/connectors/datasources/7", None),
-        ("patch", "/api/v1/connectors/datasources/7", {**CREATE_BODY, "expected_version": 1}),
+        ("patch", "/api/v1/connectors/datasources/7", {**CREATE_BODY, "expected_revision": 1}),
         ("delete", "/api/v1/connectors/datasources/7", None),
         ("post", "/api/v1/connectors/datasources/7/validation-retry", None),
     ],
@@ -382,7 +386,7 @@ def test_a_malformed_body_is_still_absent_in_local_mode(local_client, relay, met
         ("post", "/api/v1/connectors/datasources/", CREATE_BODY),
         ("get", "/api/v1/connectors/datasources/", None),
         ("get", "/api/v1/connectors/datasources/7", None),
-        ("patch", "/api/v1/connectors/datasources/7", {**CREATE_BODY, "expected_version": 1}),
+        ("patch", "/api/v1/connectors/datasources/7", {**CREATE_BODY, "expected_revision": 1}),
         ("delete", "/api/v1/connectors/datasources/7", None),
         ("post", "/api/v1/connectors/datasources/7/validation-retry", None),
     ],
@@ -435,7 +439,7 @@ def test_an_edit_is_refused_on_a_method_the_deployment_does_not_run(default_org_
 
     res = default_org_client.patch(
         "/api/v1/connectors/datasources/7",
-        json={**CREATE_BODY, "expected_version": 1},
+        json={**CREATE_BODY, "expected_revision": 1},
         headers=AUTH_HEADERS,
     )
 

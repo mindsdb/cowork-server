@@ -45,6 +45,7 @@ CONNECTION = {
     "name": "prod reporting",
     "status": "pending",
     "credential_version": 1,
+    "revision": 6,
     "host_masked": "db***om",
     "port": 5432,
     "database": "appdb",

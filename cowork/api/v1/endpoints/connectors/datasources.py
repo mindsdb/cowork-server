@@ -104,10 +104,10 @@ async def get_datasource_connection(connection_id: int, request: Request) -> Dat
 async def edit_datasource_connection(
     connection_id: int, body: DatasourceEditRequest, request: Request
 ) -> DatasourceConnectionResponse:
-    """Replace a connection's credential, guarded by the version the caller saw."""
+    """Edit a connection, guarded by the revision the caller read."""
     require_cloud_method_enabled(body.connector_id, body.method)
     payload = normalize_datasource_input(body)
-    payload["expected_version"] = body.expected_version
+    payload["expected_revision"] = body.expected_revision
     result = await auth_proxy.proxy_datasource_edit(connection_id, request, OAuthSettings(), payload)
     return DatasourceConnectionResponse.model_validate(await _validated(result, request))
 
