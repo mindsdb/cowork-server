@@ -25,6 +25,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.services.connectors.egress import (
     EgressHostNotPublic,
     EgressHostUnresolved,
+    connection_attempts,
     vetted_public_addresses,
 )
 
@@ -93,8 +94,10 @@ async def _fetch_cloud(
     Resolving once and dialing the address as a literal is what closes the
     window between the check and the connection. The hostname stays on ``Host``
     and on SNI, so the certificate is still verified against it. Addresses are
-    tried in the resolver's order, because a dual-stack answer on a host with
-    no egress for one family would otherwise fail outright.
+    tried in ``connection_attempts`` order within one connect budget, because
+    a dual-stack answer on a host with no egress for one family would
+    otherwise fail outright. Only a failure to connect moves on, since the
+    key is written after the connection is made.
     """
     url = httpx.URL(f"{origin}/api/projects/")
     hostname = url.host
@@ -115,12 +118,24 @@ async def _fetch_cloud(
         trust_env=False,
         transport=transport,
     ) as client:
-        for address in addresses[:-1]:
+        attempts = connection_attempts(addresses, total_seconds=_TIMEOUT_SECONDS)
+        for address, connect_seconds in attempts[:-1]:
             try:
-                return await client.get(url.copy_with(host=str(address)), headers=headers, extensions=extensions)
-            except httpx.ConnectError:
+                return await client.get(
+                    url.copy_with(host=str(address)),
+                    headers=headers,
+                    extensions=extensions,
+                    timeout=httpx.Timeout(_TIMEOUT_SECONDS, connect=connect_seconds),
+                )
+            except (httpx.ConnectError, httpx.ConnectTimeout):
                 continue
-        return await client.get(url.copy_with(host=str(addresses[-1])), headers=headers, extensions=extensions)
+        address, connect_seconds = attempts[-1]
+        return await client.get(
+            url.copy_with(host=str(address)),
+            headers=headers,
+            extensions=extensions,
+            timeout=httpx.Timeout(_TIMEOUT_SECONDS, connect=connect_seconds),
+        )
 
 
 async def _fetch_direct(
