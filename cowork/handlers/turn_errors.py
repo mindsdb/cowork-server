@@ -1146,7 +1146,8 @@ def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
     """Map an ``X-MindsHub-Reason`` header value to ``(code, user_message)``.
 
     An empty wallet is "out of credits". A spent or absent free allowance is
-    NOT, because that user has never paid, so it has its own code and copy. The free-Air spend fuse is neither: free serving is paused for
+    NOT, because that user has never paid, so it has its own code and copy.
+    The free-Air spend fuse is neither: free serving is paused for
     every org whose wallet cannot pay, not just this one, so it has its own code
     and copy too. A policy outage is transient. An unknown model can't be fixed
     with credits.
