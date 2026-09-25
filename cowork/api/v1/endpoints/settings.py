@@ -34,6 +34,8 @@ from cowork.db.session import get_session
 from cowork.principal import Principal, caller_bearer, can_manage_org, get_principal
 from cowork.schemas.base import CamelRequest
 from cowork.schemas.settings import (
+    ProviderPingResponse,
+    ProviderProbeDenial,
     SettingResponse,
     SettingsBulkUpsertRequest,
     SettingUpsertRequest,
@@ -190,6 +192,7 @@ async def _reject_unservable_models(
             key,
             value,
             org_id=scope.org_id if scope and scope.org_mode else None,
+            user_id=scope.user_id if scope and scope.org_mode else None,
             bearer_token=caller_bearer(request),
         )
         if rejection:
@@ -462,8 +465,14 @@ def _stored_origins_for(settings: UserSettings, ptype: str) -> set[str]:
 # _foreign_ping_url_field below stops ANY caller, member included, choosing
 # the host a stored key is sent to. Two layers because they answer different
 # questions and the second one is the one that was missing.
-@router.post("/test-providers", dependencies=[Depends(require(AuthenticatedInOrgMode))])
-async def test_providers(session: SessionDep, scope: ScopeDep, body: _TestProvidersBody | None = None):
+@router.post(
+    "/test-providers",
+    response_model=ProviderPingResponse,
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
+async def test_providers(
+    session: SessionDep, scope: ScopeDep, body: _TestProvidersBody | None = None
+) -> dict[str, Any]:
     """Ping the given (or all stored) providers and return connectivity results.
 
     Read-only: a test is a point-in-time check and no longer writes to the DB.
@@ -475,6 +484,14 @@ async def test_providers(session: SessionDep, scope: ScopeDep, body: _TestProvid
     how the Settings UI re-tests a provider it only ever received masked. That
     substitution is what makes the URL check below load-bearing: without it a
     caller who never knew the key could still choose the host it is sent to.
+
+    ``providerStatusReasons`` names why the MindsHub gateway refused a
+    minds-cloud probe, in the gateway's own reason words, so the Settings
+    notice can tell a velocity limit or the free-Air fuse from an empty wallet.
+    A refused provider was never pinged, so it gets no reason.
+
+    Returns the dumped model rather than the model, so a direct caller can
+    still subscript the result by its wire keys.
     """
     s = SettingService(session, scope).load()
 
@@ -508,14 +525,26 @@ async def test_providers(session: SessionDep, scope: ScopeDep, body: _TestProvid
             p["apiKey"] = resolve_stored_key(s, p.get("type", ""))
         pingable.append(p)
 
-    statuses, details = await ping_providers(pingable)
+    results = await ping_providers(pingable)
+    statuses, details = results.statuses, results.details
     for ptype, reason in refused.items():
         # setdefault, not update: ping_providers keys by type, so two cards of
         # one type collapse into a single slot. Overwriting would report a card
         # that pinged perfectly well as failed.
         statuses.setdefault(ptype, "fail")
         details.setdefault(ptype, reason)
-    return {"providerStatus": statuses, "providerStatusDetails": details}
+    # Keyed by str(type) because the body is loose (`list[dict[str, Any]]`) and
+    # lets a non-string type through, which the typed response would refuse.
+    # JSON object keys are strings, so a numeric type keeps the key the wire
+    # already carried for it.
+    return ProviderPingResponse(
+        provider_status={str(t): v for t, v in statuses.items()},
+        provider_status_details={str(t): v for t, v in details.items()},
+        provider_status_reasons={
+            str(t): ProviderProbeDenial(code=d.reason, reset_at=d.reset_at)
+            for t, d in results.denials.items()
+        },
+    ).model_dump(by_alias=True)
 
 
 def _foreign_ping_url_field(settings: UserSettings, provider: dict[str, Any]) -> str | None:
@@ -582,7 +611,8 @@ def _fill_missing(target: dict, extra: dict, *, skip: Optional[set[str]] = None)
 
 
 # AuthenticatedInOrgMode, not OpenByDesign: the MindsHub overlay does need
-# the caller's own bearer and scope.org_id (fetch_org_model_catalog below),
+# the caller's own bearer, scope.org_id and scope.user_id
+# (fetch_org_model_catalog below),
 # but the openai-compatible overlay further down does not — it resolves the
 # stored key and fetches the stored baseUrl on any caller's behalf, and
 # `?refresh=true` bypasses its cache every time. So this is not a static
@@ -620,6 +650,15 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
     # alongside modelEfforts — consumers that ignore it keep working.
     model_enabled: dict[str, bool] = {}
 
+    # `modelDisabledReasons` maps a model id that `modelEnabled` marks false to
+    # the gateway's reason for it: "model_restricted" (an admin in the org
+    # restricted it, so credits cannot unlock it), "wallet_empty" or
+    # "included_allowance_exhausted". Filled from the MindsHub listing only,
+    # never from a custom endpoint: a BYO base URL must not be able to label a
+    # model "restricted by your admin". A model absent from this map keeps
+    # today's locked, add-credits treatment.
+    model_disabled_reasons: dict[str, str] = {}
+
     # `modelLabels` maps a model id → MindsHub's human-readable display label.
     # Display-only: the picker uses this to render the option text, but the id
     # remains the value used for selection/storage/resolution everywhere else.
@@ -654,13 +693,15 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
     s = SettingService(session, scope).load()
     listing = None
     if scope.org_mode:
-        # Org catalog: operator endpoint + the caller's own bearer, per org.
-        # Never the stored key or s.minds_url (both tenant-settable), or a
-        # member's JWT could be forwarded to an admin-chosen host.
+        # Org catalog: operator endpoint + the caller's own bearer, cached per
+        # org and caller. Never the stored key or s.minds_url (both
+        # tenant-settable), or a member's JWT could be forwarded to an
+        # admin-chosen host.
         token = caller_bearer(request)
-        if token and scope.org_id:
+        if token and scope.org_id and scope.user_id:
             listing = await fetch_org_model_catalog(
-                org_id=scope.org_id, bearer_token=token, refresh=refresh
+                org_id=scope.org_id, user_id=scope.user_id, bearer_token=token,
+                refresh=refresh,
             )
     elif s.minds_api_key is not None and s.minds_url:
         # Desktop / BYOK: the user's stored key against its configured URL.
@@ -728,6 +769,7 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
             )
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
+        model_disabled_reasons.update(listing.disabled_reasons)
         model_labels.update(live_labels)
         model_providers.update(listing.providers)
         model_families.update(listing.families)
@@ -776,6 +818,8 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         _fill_missing(model_efforts, live_efforts)
         _fill_missing(model_enabled, live_enabled)
         _fill_missing(model_labels, live_labels)
+        # modelDisabledReasons is left alone on purpose: only MindsHub may say
+        # an admin restricted a model (see where it is declared above).
         # Same precedence for the grouping metadata, for the same reason: a BYO
         # endpoint must not be able to move a MindsHub model into another vendor's
         # section or relabel it as an old version of something. But here the
@@ -826,6 +870,7 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         "recommendedPair": pair,
         "modelEfforts": model_efforts,
         "modelEnabled": model_enabled,
+        "modelDisabledReasons": model_disabled_reasons,
         "modelLabels": model_labels,
         "modelProviders": model_providers,
         "modelFamilies": model_families,

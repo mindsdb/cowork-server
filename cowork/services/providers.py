@@ -14,6 +14,7 @@ import httpx
 
 from cowork.common.settings import runtime_credential
 from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
+from cowork.handlers.turn_errors import GatewayDenial, gateway_denial
 
 if TYPE_CHECKING:
     from cowork.common.settings.user_settings import UserSettings
@@ -24,7 +25,7 @@ logger = logging.getLogger(__name__)
 # validation). MUST be universally callable: MindsHub bills per model (a model
 # the org's wallet can't pay for is denied), so probing a paid model would fail
 # for an out-of-credits account even though the key is valid. mindshub_air is
-# the free included model (drawn from the monthly allowance), so it resolves
+# the free included model (drawn from the included allowance), so it resolves
 # without depending on wallet balance — the probe then reflects reachability +
 # key validity only, not billing availability. Probing a paid model here caused
 # ENG-576 ("MindsHub failed its last test" / "Invalid API key" false-negatives).
@@ -251,6 +252,14 @@ class MindsModelListing(NamedTuple):
     # hazard ``_empty_listing`` is a factory to avoid; a default would reintroduce
     # it for the sake of not touching three test fakes.
     role_defaults: dict[str, str]
+    # Why a model the ``enabled`` map marks false is unavailable, in the
+    # gateway's own reason words: "model_restricted" (an admin in the org
+    # restricted it), "wallet_empty" or "included_allowance_exhausted". Keyed
+    # only by ids that ``enabled`` marks false, so the two maps cannot
+    # disagree. Empty whenever the gateway publishes no reasons, which includes
+    # every MindsHub that predates the field and every plain OpenAI-compatible
+    # endpoint. Required for the same reason as ``role_defaults``.
+    disabled_reasons: dict[str, str]
 
 
 def _empty_listing() -> MindsModelListing:
@@ -262,12 +271,26 @@ def _empty_listing() -> MindsModelListing:
     objects means one in-place write downstream would corrupt the cached failure
     of every gateway at once. Nothing mutates them today.
     """
-    return MindsModelListing(None, {}, {}, {}, {}, {}, {})
+    return MindsModelListing(None, {}, {}, {}, {}, {}, {}, {})
 
 
-# Keyed by (base_url, tenant): tenant is the org id for an org-scoped catalog
-# (the `enabled` map is wallet-specific) and None for a single-user/BYOK fetch.
-_minds_models_cache: dict[tuple[str, str | None], tuple[float, MindsModelListing]] = {}
+class _ListingCacheKey(NamedTuple):
+    """Whose ``/v1/models`` answer one ``_minds_models_cache`` entry holds."""
+
+    base_url: str
+    # The org id for an org-scoped catalog (the `enabled` map is
+    # wallet-specific), None for a single-user/BYOK fetch.
+    tenant_key: str | None
+    # The caller's user id when the gateway answers per caller, None when the
+    # answer depends on the credential alone. The org catalog is per caller:
+    # auth resolves each row's `enabled` and `disabled_reason` from the model
+    # rules for the caller's org, workspace and team, so two members of one org
+    # can get different rows. The user id rather than the bearer, because the
+    # bearer rotates and every rotation would add an entry.
+    user_id: str | None
+
+
+_minds_models_cache: dict[_ListingCacheKey, tuple[float, MindsModelListing]] = {}
 
 
 # Substrings that identify an embeddings model by id, used only for endpoints
@@ -293,25 +316,35 @@ def _is_embedding_row(row: dict, model_id: str) -> bool:
     return any(hint in lowered for hint in _EMBEDDING_ID_HINTS)
 
 
-def cached_minds_models(minds_url: str, tenant_key: str | None = None) -> MindsModelListing | None:
+def cached_minds_models(
+    minds_url: str, tenant_key: str | None = None, *, user_id: str | None = None
+) -> MindsModelListing | None:
     """The last successful ``/v1/models`` listing for this gateway, however old.
 
     A synchronous read for callers that cannot await the fetch (the coding
     endpoints run in a threadpool) and need only what the gateway advertises per
     model, which changes on the gateway's release cadence rather than the cache
     TTL's. None until something has fetched the listing since the process
-    started, and None for a negatively cached failure.
+    started, and None for a negatively cached failure. ``tenant_key`` and
+    ``user_id`` pick the entry the same way they do in ``fetch_minds_models``.
     """
     if not minds_url:
         return None
-    cached = _minds_models_cache.get((minds_chat_base_url(minds_url), tenant_key))
+    cached = _minds_models_cache.get(
+        _ListingCacheKey(minds_chat_base_url(minds_url), tenant_key, user_id)
+    )
     if not cached or not cached[1].ids:
         return None
     return cached[1]
 
 
 async def fetch_minds_models(
-    minds_url: str, api_key: str, *, force_refresh: bool = False, tenant_key: str | None = None
+    minds_url: str,
+    api_key: str,
+    *,
+    force_refresh: bool = False,
+    tenant_key: str | None = None,
+    user_id: str | None = None,
 ) -> MindsModelListing:
     """Fetch supported models from MindsHub's OpenAI-compatible `/v1/models`.
 
@@ -325,7 +358,10 @@ async def fetch_minds_models(
     to. MindsHub marks a model the org's wallet can't currently pay for / whose
     free allowance is spent as ``"enabled": false`` so the picker can show it as
     locked with an "add credits" affordance; a model missing from ``enabled`` is
-    treated as available. ``labels`` is purely a display aid for the picker — the
+    treated as available. It also marks a model an admin in the org restricted
+    as ``"enabled": false``, and ``disabled_reasons`` carries the row's
+    ``disabled_reason`` so the picker can tell that lock from a billing one.
+    ``labels`` is purely a display aid for the picker — the
     model id remains the value used everywhere else (selection, storage,
     resolution); a model missing from ``labels`` falls back to the client's
     id-derived label. Embedding and decision models are dropped entirely — they
@@ -341,6 +377,10 @@ async def fetch_minds_models(
     the picker opens on demand, so bypassing it would make every open pay the
     fetch budget for as long as the outage lasts.
 
+    ``tenant_key`` and ``user_id`` scope the cache entry (see
+    ``_ListingCacheKey``): pass the org id for an org-scoped catalog, and the
+    caller's user id too when the gateway answers per caller.
+
     Never raises and never runs longer than ``_MINDS_MODELS_TIMEOUT_S`` — a
     slow/degraded gateway (hang, redirect loop, trickled body) returns an empty
     listing that is negatively cached, so callers on the boot path can't hang.
@@ -348,7 +388,7 @@ async def fetch_minds_models(
     if not minds_url or not api_key:
         return _empty_listing()
     base = minds_chat_base_url(minds_url)
-    cache_key = (base, tenant_key)
+    cache_key = _ListingCacheKey(base, tenant_key, user_id)
 
     now = time.monotonic()
     cached = _minds_models_cache.get(cache_key)
@@ -414,6 +454,7 @@ async def fetch_minds_models(
     providers: dict[str, str] = {}
     families: dict[str, str] = {}
     role_defaults: dict[str, str] = {}
+    disabled_reasons: dict[str, str] = {}
 
     def _text(row: dict, key: str) -> Optional[str]:
         """A non-empty string field, or None. Anything else is treated as absent.
@@ -442,10 +483,16 @@ async def fetch_minds_models(
             continue
         ids.append(model_id)
         # A model the org's wallet can't currently pay for (or whose free
-        # allowance is spent) is listed with enabled=false so the picker can
-        # show it as locked with an "add credits" affordance. Missing → available.
+        # allowance is spent, or that an admin restricted) is listed with
+        # enabled=false so the picker can show it as locked. Missing → available.
         if "enabled" in row:
             enabled[model_id] = bool(row.get("enabled"))
+        # Why it is locked, when the gateway says: an admin rule is not
+        # something credits can lift, so the picker must not offer them for it.
+        # Read only for a row the map marks false, so no reason outlives the
+        # lock it explains.
+        if enabled.get(model_id) is False and (reason := _text(row, "disabled_reason")):
+            disabled_reasons[model_id] = reason
         levels = row.get("reasoning_efforts")
         if isinstance(levels, list) and levels:
             entry: dict = {"efforts": [str(x) for x in levels]}
@@ -487,28 +534,36 @@ async def fetch_minds_models(
                 role_defaults.setdefault(role, model_id)
     return _remember(
         MindsModelListing(
-            (ids or None), efforts, enabled, labels, providers, families, role_defaults
+            (ids or None), efforts, enabled, labels, providers, families, role_defaults,
+            disabled_reasons,
         )
     )
 
 
 async def fetch_org_model_catalog(
-    *, org_id: str, bearer_token: str, refresh: bool = False
+    *, org_id: str, user_id: str, bearer_token: str, refresh: bool = False
 ) -> MindsModelListing:
-    """MindsHub catalog for an org, cached per org.
+    """MindsHub catalog for an org member, cached per org and caller.
 
     Uses the OPERATOR endpoint (env/namespace-derived), never a tenant-settable
     URL, and the caller's own bearer — so a member's JWT can't be forwarded to an
     admin-chosen host. `org_id` is required; the `enabled` map is wallet-specific.
+    `user_id` is required too: auth resolves each row's `enabled` and
+    `disabled_reason` for the caller, so an entry keyed by the org alone would
+    serve one member's listing to every member of the org for the TTL.
     """
     if not org_id:
         raise ValueError("org catalog requires an organization id")
+    if not user_id:
+        raise ValueError("org catalog requires the caller's user id")
     from cowork.common.settings.app_settings import (
         TurnQueueSettings,
         default_turn_minds_api_host,
     )
     url = TurnQueueSettings().minds_base_url or f"{default_turn_minds_api_host()}/v1"
-    return await fetch_minds_models(url, bearer_token, force_refresh=refresh, tenant_key=org_id)
+    return await fetch_minds_models(
+        url, bearer_token, force_refresh=refresh, tenant_key=org_id, user_id=user_id
+    )
 
 
 # ── Model-value validation on write (ENG-1358) ───────────────────────
@@ -587,6 +642,7 @@ async def model_value_rejection(
     value: str,
     *,
     org_id: str | None = None,
+    user_id: str | None = None,
     bearer_token: str = "",
 ) -> str | None:
     """Why ``value`` is not a servable model for ``key``, or None to allow it.
@@ -601,9 +657,9 @@ async def model_value_rejection(
 
     In org (hosted) tenancy no MindsHub key is stored at all (a per-turn key is
     minted, ``user_settings._has_key``), so the catalog comes from the operator
-    endpoint keyed by ``org_id`` + the caller's own bearer, exactly as
-    ``recommended_models`` does. Without those the org path has no evidence and
-    allows the write.
+    endpoint keyed by ``org_id`` + ``user_id`` + the caller's own bearer,
+    exactly as ``recommended_models`` does. Without those the org path has no
+    evidence and allows the write.
 
     **Soft-fail is the whole contract.** This returns None — allow the write —
     for every case except "we hold a real catalog and this id is definitively
@@ -648,9 +704,9 @@ async def model_value_rejection(
         return None
 
     try:
-        if org_id and bearer_token:
+        if org_id and user_id and bearer_token:
             listing = await fetch_org_model_catalog(
-                org_id=org_id, bearer_token=bearer_token
+                org_id=org_id, user_id=user_id, bearer_token=bearer_token
             )
         elif api_key and settings.minds_url:
             listing = await fetch_minds_models(settings.minds_url, api_key)
@@ -910,24 +966,89 @@ def _is_auth_error(status_code: int, msg: Optional[str]) -> bool:
     return bool(msg and _AUTH_SHAPED_RE.search(msg))
 
 
-async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
-    """Ping a single provider and return (status, detail)."""
+class ProviderPing(NamedTuple):
+    """One provider's health-probe result."""
+
+    # "ok" or "fail".
+    status: str
+    # Shown in the Settings dot's tooltip, e.g. "HTTP 429: <gateway message>".
+    detail: str
+    # The denial the MindsHub gateway named when it refused the probe. Only a
+    # minds-cloud probe answered by the configured gateway carries one.
+    denial: GatewayDenial | None = None
+
+
+class ProviderPingResults(NamedTuple):
+    """Every probed provider's result, each map keyed by provider type."""
+
+    statuses: dict[str, str]
+    details: dict[str, str]
+    # Only the types whose probe carries a denial.
+    denials: dict[str, GatewayDenial]
+
+
+class _ProbeStatusError(httpx.HTTPStatusError):
+    """A failed probe response, carried the way the SDKs' status errors carry one.
+
+    The OpenAI and Anthropic SDK errors hold ``status_code`` and the parsed JSON
+    ``body`` beside ``response``, and turn_errors reads all three. httpx's own
+    error holds only ``response``. Without ``status_code`` turn_errors finds no
+    host for a response that lacks the reason header, and without ``body`` it
+    finds no body ``code``, so the body rung of ``gateway_denial`` never fires.
+    """
+
+    def __init__(self, *, response: httpx.Response) -> None:
+        super().__init__(
+            f"HTTP {response.status_code}", request=response.request, response=response
+        )
+        self.status_code = response.status_code
+        # None for a body that is not JSON (an HTML error page from a proxy),
+        # so the header rung still classifies it.
+        self.body: object = None
+        try:
+            self.body = response.json()
+        except ValueError:
+            pass
+
+
+def _probe_denial(*, response: httpx.Response) -> GatewayDenial | None:
+    """The denial the gateway named on a failed MindsHub probe, or None.
+
+    Wraps the response in an ``httpx.HTTPStatusError`` shaped like the SDK
+    errors (``_ProbeStatusError``), so turn_errors' origin-checked readers apply
+    unchanged: a reason header from a host other than the configured
+    ``minds_url`` host counts for nothing, and a body ``code`` counts only from
+    that host. The wrap is guarded because a response with no request attached
+    (or a test double) has no host to check, and a probe result must never
+    raise.
+    """
+    try:
+        return gateway_denial(exc=_ProbeStatusError(response=response))
+    except Exception:
+        return None
+
+
+async def ping_provider(p: dict[str, Any]) -> ProviderPing:
+    """Ping a single provider and return its :class:`ProviderPing`."""
     ptype = p.get("type")
     key = (p.get("apiKey") or "").strip()
     timeout = httpx.Timeout(12.0)
 
-    async def _check(url: str, headers: dict[str, str]) -> tuple[str, str]:
+    async def _check(url: str, headers: dict[str, str]) -> ProviderPing:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.get(url, headers=headers)
         if r.status_code < 400:
-            return ("ok", f"HTTP {r.status_code}")
+            return ProviderPing(status="ok", detail=f"HTTP {r.status_code}")
         # Include the provider's own message in the fail detail so the Settings
         # dot tooltip distinguishes a bad key from a real outage — Gemini returns
         # 400 "Please pass a valid API key", not 401 (ENG-1145).
         msg = _provider_error_message(r)
-        return ("fail", f"HTTP {r.status_code}: {msg}" if msg else f"HTTP {r.status_code}")
+        return ProviderPing(
+            status="fail",
+            detail=f"HTTP {r.status_code}: {msg}" if msg else f"HTTP {r.status_code}",
+        )
 
-    async def _chat_probe(url: str, headers: dict[str, str], model: str) -> tuple[str, str]:
+    async def _chat_probe(url: str, headers: dict[str, str], model: str) -> ProviderPing:
         """Exercise the actual inference path with a tiny completion.
 
         This is the only route guaranteed to behave the same as a real
@@ -944,40 +1065,47 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.post(url, headers=headers, json=payload)
         if r.status_code < 400:
-            return ("ok", f"HTTP {r.status_code}")
+            return ProviderPing(status="ok", detail=f"HTTP {r.status_code}")
         # Same as _check: surface the gateway's own message so minds-cloud's
         # Settings dot carries the actionable reason (wallet/allowance/model)
         # instead of a bare "HTTP 502"/"HTTP 429". _chat_probe exercises real
         # chat completions, so its failures carry exactly that (ENG-1145 review,
         # ENG-576). Body read after close is safe — non-streaming POST.
         msg = _provider_error_message(r)
-        return ("fail", f"HTTP {r.status_code}: {msg}" if msg else f"HTTP {r.status_code}")
+        # The message is prose. The denial is the gateway's reason word, so the
+        # Settings notice can tell a velocity limit or the free-Air fuse from
+        # an empty wallet without matching on "HTTP 429".
+        return ProviderPing(
+            status="fail",
+            detail=f"HTTP {r.status_code}: {msg}" if msg else f"HTTP {r.status_code}",
+            denial=_probe_denial(response=r),
+        )
 
     try:
         if ptype == "anthropic":
             if not key:
-                return "fail", "missing API key"
+                return ProviderPing(status="fail", detail="missing API key")
             return await _check("https://api.anthropic.com/v1/models",
                                 {"x-api-key": key, "anthropic-version": "2023-06-01"})
         if ptype == "openai":
             if not key:
-                return "fail", "missing API key"
+                return ProviderPing(status="fail", detail="missing API key")
             return await _check("https://api.openai.com/v1/models",
                                 {"Authorization": f"Bearer {key}"})
         if ptype == "gemini":
             if not key:
-                return "fail", "missing API key"
+                return ProviderPing(status="fail", detail="missing API key")
             return await _check("https://generativelanguage.googleapis.com/v1beta/openai/models",
                                 {"Authorization": f"Bearer {key}"})
         if ptype == "openai-compatible":
             base = (p.get("baseUrl") or "").rstrip("/")
             if not base:
-                return "fail", "missing base URL"
+                return ProviderPing(status="fail", detail="missing base URL")
             headers = {"Authorization": f"Bearer {key}"} if key else {}
             return await _check(f"{base}/models", headers)
         if ptype == "minds-cloud":
             if not key:
-                return "fail", "missing API key"
+                return ProviderPing(status="fail", detail="missing API key")
             base = (p.get("mindsUrl") or default_minds_api_host()).rstrip("/")
             chat_url = minds_chat_base_url(base)
             # Probe with a UNIVERSALLY-CALLABLE model, never the configured/
@@ -987,7 +1115,7 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
             # CODING_MODEL_DEFAULTS["minds_cloud"] = "haiku" (paid), so every
             # out-of-credits account saw "MindsHub failed its last test" even
             # though chat worked on mindshub_air (ENG-576). mindshub_air is the
-            # free included model (drawn from the monthly allowance), so it
+            # free included model (drawn from the included allowance), so it
             # resolves without depending on wallet balance — the dot then
             # reflects reachability/key validity only. (Testing the user's role
             # model was also rejected in the ENG-577 review for adding
@@ -1002,25 +1130,36 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
                 MINDS_PROBE_MODEL,
             )
     except httpx.HTTPError as e:
-        return "fail", f"{type(e).__name__}: {e}"
+        return ProviderPing(status="fail", detail=f"{type(e).__name__}: {e}")
     except Exception as e:
         logger.warning("Provider %s ping error: %s", ptype, e)
-        return "fail", f"{type(e).__name__}: {e}"
-    return "fail", "unknown provider type"
+        return ProviderPing(status="fail", detail=f"{type(e).__name__}: {e}")
+    return ProviderPing(status="fail", detail="unknown provider type")
 
 
-async def ping_providers(providers: list[dict[str, Any]]) -> tuple[dict[str, str], dict[str, str]]:
-    """Ping multiple providers in parallel. Returns (statuses, details) dicts keyed by type."""
+async def ping_providers(providers: list[dict[str, Any]]) -> ProviderPingResults:
+    """Ping multiple providers in parallel. Returns their results keyed by type."""
     results = await asyncio.gather(*[ping_provider(p) for p in providers], return_exceptions=True)
     statuses: dict[str, str] = {}
     details: dict[str, str] = {}
+    denials: dict[str, GatewayDenial] = {}
     for p, r in zip(providers, results):
+        ptype = p["type"]
         if isinstance(r, Exception):
-            statuses[p["type"]] = "fail"
-            details[p["type"]] = f"{type(r).__name__}: {r}"
+            statuses[ptype] = "fail"
+            details[ptype] = f"{type(r).__name__}: {r}"
+            denial = None
         else:
-            statuses[p["type"]], details[p["type"]] = r
-    return statuses, details
+            statuses[ptype], details[ptype] = r.status, r.detail
+            denial = r.denial
+        # Two cards of one type share one slot, and the last card's status
+        # wins it. Its denial has to win too, or an earlier card's reason would
+        # sit beside a later card's status.
+        if denial is None:
+            denials.pop(ptype, None)
+        else:
+            denials[ptype] = denial
+    return ProviderPingResults(statuses=statuses, details=details, denials=denials)
 
 
 # ── Provider credential validation ───────────────────────────────────

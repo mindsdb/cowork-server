@@ -842,10 +842,11 @@ class UserSettings(Settings):
         title="Max Tokens per Task",
         description=(
             "The most tokens the agent may spend on one request before it "
-            "pauses and checks in with you. Tokens are the unit your plan's "
-            "monthly allowance is measured in — including tokens re-read from "
-            "cache — so a task that gets stuck can burn a large share of the "
-            "month without finishing. Raise it if you routinely give the agent "
+            "pauses and checks in with you. On MindsHub, every token the agent "
+            "reads or writes counts against your credits or your free MindsHub "
+            "Air allowance, including tokens re-read from cache, so a task that "
+            "gets stuck can use up a large share of either without finishing. "
+            "Raise it if you routinely give the agent "
             "big jobs; lower it to cap what any single request can cost. "
             "Applies to the Anton agent and, for Cowork sessions, replaces the "
             "ANTON_MAX_TURN_TOKENS environment variable."

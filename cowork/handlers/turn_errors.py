@@ -10,10 +10,12 @@ JSON is useless (and unsafe) to show a user, so we recognise the failure
 and trade it for a clean, actionable message plus a stable ``code``.
 
 A turn can also die on a billing decision from the wallet-model inference
-gateway: 402 (wallet empty), 429 (free monthly allowance spent), 404
-(unknown model), or 503 (billing/auth policy service down). The gateway
-names each with an ``X-MindsHub-Reason`` header, which we prefer over
-status/message heuristics to route to the right, actionable copy.
+gateway: 402 (wallet empty), 429 (free allowance spent, free serving paused
+fleet-wide, or a velocity limit), 404 (unknown model), or 503 (billing/auth
+policy service down). The gateway names each with an ``X-MindsHub-Reason``
+header, which we prefer over status/message heuristics to route to the right,
+actionable copy. A 403 refused by an admin model rule keeps the credential
+rejection's reason and names the rule on ``X-MindsHub-Deny-Detail`` instead.
 
 Everything we haven't explicitly mapped stays generic — provider
 internals must never leak into the chat, so unmapped failures surface as
@@ -25,6 +27,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timedelta, timezone
+from typing import NamedTuple
 from urllib.parse import urlparse
 
 from cowork.common.settings.app_settings import default_minds_url
@@ -82,8 +85,8 @@ CONTENT_REPAIR_CODES: frozenset[str] = frozenset(
 
 # Curated copy for the out-of-credits case. In the wallet billing model this
 # fires when either the org's wallet is empty (gateway 402 `wallet_empty`) or
-# the free monthly included-token allowance is spent (gateway 429
-# `included_allowance_exhausted`). Without this the turn would die mid-stream
+# the free allowance is spent (gateway 429 `included_allowance_exhausted`).
+# Without this the turn would die mid-stream
 # with no completion event and no error frame — the SSE connection just closes
 # and the renderer's spinner stops, which reads as "Anton is dead" rather than
 # an out-of-credits message. The desktop renders a card for the `token_limit`
@@ -115,25 +118,51 @@ TOKEN_LIMIT_USER_MESSAGE = (
 # empty-wallet and spent-allowance reasons above.
 TOKEN_LIMIT_CODE = "token_limit"
 
-# Curated copy + wire code for a spent FREE monthly allowance (gateway 429
-# `included_allowance_exhausted`). Split from `token_limit` in ENG-1537: both
-# denials used to share the out-of-credits card, but they are different
-# situations. `access.py` in auth decides it, and the logic is exact — this
-# reason fires ONLY for a free-bucket model on an org that has NEVER topped up
-# ("a non-free model always needs the wallet"). So the person seeing this card
-# has not spent money; they have used the monthly grant. Two consequences the
-# copy leans on:
-#   * There is a FREE way forward — the allowance resets, and the gate tells us
-#     when on `X-MindsHub-Reset-At`. Hiding that while asking for money is the
-#     defect.
-#   * Credits genuinely unlock the rest of the catalogue for this user, because
-#     non-free models need a wallet they do not have.
-# The date is interpolated client-side from `reset_at`; this string is the
-# fallback for consumers that don't render the card.
+# Curated copy + wire code for a spent or absent FREE allowance (gateway 429
+# `included_allowance_exhausted`). Split from `token_limit`: both denials used
+# to share the out-of-credits card, but they are different situations.
+# `access.py` in auth decides it, and the logic is exact. This reason fires
+# ONLY for a free-bucket model on an org that has NEVER topped up ("a non-free
+# model always needs the wallet"). So the person seeing this card has not spent
+# money. Credits genuinely unlock the rest of the catalogue for them, because
+# non-free models need a wallet they do not have.
+# The same reason also fires for an org with NO free grant at all: auth zeroes
+# the allowance of an org that is not `free_grant_eligible`, so its first
+# free-bucket request lands here and nothing ever refills. Only the gate knows
+# which case it is. It sends `X-MindsHub-Reset-At` when the allowance refills
+# and omits it when there is none, and the desktop card reads that `reset_at`
+# to offer waiting or to say there is no grant. This string is the fallback for
+# consumers that don't render the card, including the channel replies
+# `cowork/channels/runtime.py` posts to Slack and Discord, and the remote wire
+# never carries a reset instant. So it makes no refill claim and never states
+# how large the allowance or its window is: either would be false for one of
+# the two cases, and the window is plan config.
 ALLOWANCE_EXHAUSTED_CODE = "included_allowance_exhausted"
 ALLOWANCE_EXHAUSTED_USER_MESSAGE = (
-    "You've used this month's free tokens. Add credits to keep working now and "
-    "unlock Claude, GPT, Gemini, Kimi, DeepSeek and more."
+    "You have no free MindsHub Air allowance left. "
+    "Add credits to keep working now."
+)
+
+# Curated copy + wire code for the fleet-wide free-Air spend fuse (gateway 429
+# `free_air_daily_spend_fuse_exceeded`). The gate trips it when the day's
+# budget for free MindsHub Air serving is spent, and then denies every org
+# whose wallet cannot pay until the end of the UTC day. The gate names that
+# instant on `X-MindsHub-Reset-At`, which rides the failure frame as
+# `reset_at`. The user did nothing to cause this, so the copy must not read as
+# their own allowance running out. Adding credits lifts it at once, because a
+# wallet that can pay is not subject to the fuse.
+FREE_SERVING_PAUSED_CODE = "free_serving_paused"
+FREE_SERVING_PAUSED_USER_MESSAGE = (
+    "Free MindsHub Air is paused for everyone until the daily budget resets. "
+    "Add credits to keep working now."
+)
+
+# Codes whose failure frame carries the gate's `X-MindsHub-Reset-At` instant as
+# `reset_at`, so the card can say when the free way forward comes back.
+# responses.py branches on this set. Not named `*_CODE` on purpose: the
+# wire-vocabulary inventory test collects those, and this is not a wire code.
+RESET_AT_CODES: frozenset[str] = frozenset(
+    {ALLOWANCE_EXHAUSTED_CODE, FREE_SERVING_PAUSED_CODE}
 )
 
 # Curated copy + wire code for a VELOCITY rate-limit (gateway 429
@@ -230,15 +259,35 @@ LEGACY_AUTH_ERROR_MESSAGE_PREFIX = "invalid api key"
 # nothing is lost in translation, and the renderer keys its card on them.
 MODEL_ACCESS_DENIED_CODE = "model_access_denied"
 MODEL_DISABLED_CODE = "model_disabled"
+
+# Curated copy + wire code for an admin model rule: an administrator in the
+# caller's organization restricted this model. The gateway refuses the call
+# with a 403 whose reason stays `permission_denied`, and names the rule on its
+# own `X-MindsHub-Deny-Detail: model_restricted` header and in the body's
+# `error.deny_detail`. Credits cannot lift it, so the card offers another model
+# and never a top-up. The card names the model from the frame's `model`; this
+# string is the fallback for consumers that don't render the card, such as the
+# channel replies.
+MODEL_RESTRICTED_CODE = "model_restricted"
+MODEL_RESTRICTED_USER_MESSAGE = (
+    "An admin in your organization restricted this model. "
+    "Choose another model in Settings."
+)
+
 # Every code that means "the turn died on the MODEL, and picking another one is
-# the remedy" — the two legacy 403s plus the live 404. They share a renderer
-# card; only its copy differs. model_not_found is the one that still occurs.
+# the remedy": the two legacy 403s, the live 404, and the admin model rule. They
+# share a renderer card; only its copy differs.
 # Public: responses.py branches on this to decide whether the failure frame
 # carries `model`. Shared rather than re-listed there, so the two can't drift —
 # and so a merge conflict in that elif-chain has no tuple members to silently
 # drop (the ENG-1358 re-review's rebase hazard).
 MODEL_UNAVAILABLE_CODES = frozenset(
-    {MODEL_ACCESS_DENIED_CODE, MODEL_DISABLED_CODE, MODEL_NOT_FOUND_CODE}
+    {
+        MODEL_ACCESS_DENIED_CODE,
+        MODEL_DISABLED_CODE,
+        MODEL_NOT_FOUND_CODE,
+        MODEL_RESTRICTED_CODE,
+    }
 )
 
 # Fallback copy if the exception somehow carries no usable message — anton
@@ -252,16 +301,30 @@ MODEL_UNAVAILABLE_FALLBACK_MESSAGE = (
 # The X-MindsHub-Reason header values the inference gateway sets to name the
 # billing decision precisely. Preferred over status/message heuristics.
 #
-# This is the COMPLETE set the gateway can emit: `denial_error()`
-# (minds/inference/errors.py) maps four gate reasons explicitly and fails closed
-# to `policy_unavailable` for anything else, so no sixth value reaches a client.
-# Verified 2026-08-13 — `rate_limited` was the one missing here (ENG-1537), and
-# its absence is why a velocity limit read as out-of-credits.
+# mindshub_inference (`denial_error()` and `credential_rejected()` in
+# minds/inference/errors.py) emits eight reasons today: unknown_model,
+# rate_limited, wallet_empty, included_allowance_exhausted,
+# free_air_daily_spend_fuse_exceeded, policy_unavailable, permission_denied and
+# invalid_credentials. Any other gate reason fails closed to policy_unavailable.
+#
+# This module maps the first six, below. permission_denied (403) and
+# invalid_credentials (401) are credential rejections with no reason mapping
+# here: they fall through to the rest of `friendly_turn_error`'s ladder, where
+# `is_auth_error` picks up anton's typed ProviderAuthError for a 401 and a 403
+# stays generic. The one exception is a permission_denied that carries the
+# deny detail below: `_is_model_restricted` maps that to MODEL_RESTRICTED_CODE.
 _REASON_WALLET_EMPTY = "wallet_empty"
 _REASON_ALLOWANCE_EXHAUSTED = "included_allowance_exhausted"
+_REASON_FREE_AIR_FUSE = "free_air_daily_spend_fuse_exceeded"
 _REASON_POLICY_UNAVAILABLE = "policy_unavailable"
 _REASON_UNKNOWN_MODEL = "unknown_model"
 _REASON_RATE_LIMITED = "rate_limited"
+
+# Not a reason. The gateway adds this detail beside a `permission_denied` 403
+# when an admin model rule refused the call rather than the credential. It
+# rides the `X-MindsHub-Deny-Detail` header and the body's `error.deny_detail`,
+# so a client that reads only the reason still sees the same 403 as before.
+_DENY_DETAIL_MODEL_RESTRICTED = "model_restricted"
 
 # Wire-level code for a transient provider incident that didn't clear within
 # anton's retry budget (ENG-673) — the model provider (or an upstream it depends
@@ -578,6 +641,9 @@ def model_unavailable_info(exc: Exception) -> tuple[str, str] | None:
     model-403 — anton's ``ModelUnavailableError`` carrying
     ``code ∈ {model_access_denied, model_disabled}`` and the model alias.
     Only pre-wallet gateway/anton versions raise it; kept as back-compat.
+    The duck-typed fallback accepts any code in ``MODEL_UNAVAILABLE_CODES``, so
+    anton's ``model_not_found`` 404 and its ``ModelRestrictedError`` subclass
+    (``model_restricted``) still name the model when the type isn't importable.
 
     Prefers the typed check; falls back to duck-typing on the ``code``/
     ``model`` attributes so a version-skewed anton (type not importable /
@@ -812,6 +878,7 @@ def _gateway_denial_code(exc: BaseException) -> str | None:
     known = (
         _REASON_WALLET_EMPTY,
         _REASON_ALLOWANCE_EXHAUSTED,
+        _REASON_FREE_AIR_FUSE,
         _REASON_POLICY_UNAVAILABLE,
         _REASON_UNKNOWN_MODEL,
         _REASON_RATE_LIMITED,
@@ -918,18 +985,21 @@ def retry_at_instant(retry_after: float | None) -> str | None:
     ).isoformat().replace("+00:00", "Z")
 
 
-def allowance_reset_at(exc: BaseException) -> str | None:
+def gate_reset_at(exc: BaseException) -> str | None:
     """The ``X-MindsHub-Reset-At`` instant from anywhere in the cause chain.
 
-    The auth gate sets it from the billing window's end on an allowance denial
-    (`inference_authorize.py`, ``reset_at=window.end``) and deliberately leaves
-    it unset on a velocity denial — so its presence is itself a signal.
+    Read whatever the denial reason, so the caller decides which codes carry
+    it (``RESET_AT_CODES``). The auth gate sets it from the billing window's
+    end on an allowance denial (`inference_authorize.py`,
+    ``reset_at=window.end``) and from the end of the UTC day on the free-Air
+    spend fuse, and deliberately leaves it unset on a velocity denial — so its
+    presence is itself a signal.
 
     Passed through as the opaque ISO string the gate sent; the renderer owns
-    formatting and the "resets next month" fallback, because only it knows the
-    viewer's locale and timezone. Returned as-is rather than parsed here: a
+    formatting and the fallback copy for a missing value, because only it knows
+    the viewer's locale and timezone. Returned as-is rather than parsed here: a
     server-side parse would have to pick a timezone, and picking the wrong one
-    shifts the date the user reads by a day (ENG-1537).
+    shifts the time the user reads (ENG-1537).
     """
     seen: set[int] = set()
     cur: BaseException | None = exc
@@ -979,12 +1049,106 @@ def _origin_is_known_third_party(host: str | None) -> bool:
     return host is not None and not _from_minds_gateway(host)
 
 
+class _DenyDetail(NamedTuple):
+    """The gateway's deny detail, read off one response in a failure's cause chain."""
+
+    detail: str
+    # Status and host of the same response that carries the detail, never a
+    # mix of chain entries, as in `_http_error_context`.
+    status: int | None
+    host: str | None
+    # True for the X-MindsHub-Deny-Detail header, False for the body's
+    # `error.deny_detail`. The two carriers are trusted differently.
+    from_header: bool
+
+
+def _body_deny_detail(*, body: object) -> str | None:
+    """``deny_detail`` from a gateway error body, in either SDK's dialect.
+
+    The OpenAI SDK peels the ``error`` envelope, so the field sits at top
+    level; the Anthropic SDK keeps the envelope, so it sits under ``error``.
+    """
+    if not isinstance(body, dict):
+        return None
+    envelope = body.get("error") if isinstance(body.get("error"), dict) else {}
+    value = body.get("deny_detail") or envelope.get("deny_detail")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip().lower()
+
+
+def _deny_detail(*, exc: BaseException) -> _DenyDetail | None:
+    """The first deny detail anywhere in the cause chain, header before body.
+
+    Walks the chain the same way `_http_error_context` does, because anton
+    wraps the SDK error that carries the response (``raise ... from exc``).
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        resp = getattr(cur, "response", None)
+        code = getattr(cur, "status_code", None)
+        if not isinstance(code, int):
+            code = getattr(resp, "status_code", None)
+        status = code if isinstance(code, int) else None
+        headers = getattr(resp, "headers", None)
+        if headers is None:
+            headers = getattr(cur, "headers", None)
+        header_value = None
+        if headers is not None:
+            try:
+                header_value = headers.get("x-mindshub-deny-detail") or headers.get(
+                    "X-MindsHub-Deny-Detail"
+                )
+            except Exception:
+                header_value = None
+        if header_value:
+            return _DenyDetail(
+                detail=str(header_value).strip().lower(),
+                status=status,
+                host=_response_url_host(resp),
+                from_header=True,
+            )
+        body_value = _body_deny_detail(body=getattr(cur, "body", None))
+        if body_value is not None:
+            return _DenyDetail(
+                detail=body_value,
+                status=status,
+                host=_response_url_host(resp),
+                from_header=False,
+            )
+        cur = cur.__cause__ or cur.__context__
+    return None
+
+
+def _is_model_restricted(*, exc: BaseException) -> bool:
+    """Whether the MindsHub gateway refused this turn over an admin model rule.
+
+    Needs a 403 carrying the ``model_restricted`` deny detail, trusted by the
+    same origin rules as the reason: the header unless the response provably
+    came from someone else (``_origin_is_known_third_party``), the body only
+    from the configured gateway host (``_from_minds_gateway``). A BYOK
+    endpoint controls its whole response, so without these rules it could put
+    the admin copy in front of a user whose organization restricted nothing.
+    """
+    found = _deny_detail(exc=exc)
+    if found is None or found.status != 403:
+        return False
+    if found.detail != _DENY_DETAIL_MODEL_RESTRICTED:
+        return False
+    if found.from_header:
+        return not _origin_is_known_third_party(found.host)
+    return _from_minds_gateway(found.host)
+
+
 def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
     """Map an ``X-MindsHub-Reason`` header value to ``(code, user_message)``.
 
-    An empty wallet is "out of credits". A spent free allowance is NOT — that
-    user has never paid, and the grant resets — so it has its own code and copy
-    (ENG-1537). A policy outage is transient. An unknown model can't be fixed
+    An empty wallet is "out of credits". A spent or absent free allowance is
+    NOT, because that user has never paid, so it has its own code and copy. The free-Air spend fuse is neither: free serving is paused for
+    every org whose wallet cannot pay, not just this one, so it has its own code
+    and copy too. A policy outage is transient. An unknown model can't be fixed
     with credits.
 
     A velocity ``rate_limited`` is NOT out of credits and must never share that
@@ -997,12 +1161,58 @@ def _map_gateway_reason(reason: str) -> tuple[str, str] | None:
         return RATE_LIMITED_CODE, RATE_LIMITED_USER_MESSAGE
     if reason == _REASON_ALLOWANCE_EXHAUSTED:
         return ALLOWANCE_EXHAUSTED_CODE, ALLOWANCE_EXHAUSTED_USER_MESSAGE
+    if reason == _REASON_FREE_AIR_FUSE:
+        return FREE_SERVING_PAUSED_CODE, FREE_SERVING_PAUSED_USER_MESSAGE
     if reason == _REASON_WALLET_EMPTY:
         return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
     if reason == _REASON_POLICY_UNAVAILABLE:
         return POLICY_UNAVAILABLE_CODE, POLICY_UNAVAILABLE_USER_MESSAGE
     if reason == _REASON_UNKNOWN_MODEL:
         return MODEL_NOT_FOUND_CODE, MODEL_NOT_FOUND_USER_MESSAGE
+    return None
+
+
+class GatewayDenial(NamedTuple):
+    """A denial the MindsHub gateway named for one request, in its own words."""
+
+    # One of PROBE_DENIAL_REASONS: the X-MindsHub-Reason value, or the body
+    # `code` that carries the same value.
+    reason: str
+    # The gate's X-MindsHub-Reset-At instant, as the opaque ISO string it sent.
+    # The gate sets it on the allowance and free-Air fuse denials only.
+    reset_at: str | None
+
+
+# The gateway reasons `gateway_denial` reports. The credential and model
+# reasons (invalid_credentials, permission_denied, unknown_model) stay out:
+# the Settings probe reads a 401 or 403 as a rejected key by its status, and it
+# always sends a model the gateway serves.
+PROBE_DENIAL_REASONS: frozenset[str] = frozenset(
+    {
+        _REASON_WALLET_EMPTY,
+        _REASON_ALLOWANCE_EXHAUSTED,
+        _REASON_FREE_AIR_FUSE,
+        _REASON_RATE_LIMITED,
+        _REASON_POLICY_UNAVAILABLE,
+    }
+)
+
+
+def gateway_denial(*, exc: BaseException) -> GatewayDenial | None:
+    """The billing or policy denial the gateway named for ``exc``, or None.
+
+    The Settings health probe's classifier. It reads the same two carriers as
+    `friendly_turn_error`, with the same trust rules: the X-MindsHub-Reason
+    header unless the response provably came from someone else, then the body
+    `code` only from the configured gateway host. Never raises; every helper
+    it calls is guarded.
+    """
+    _status, reason, host = _http_error_context(exc)
+    if reason in PROBE_DENIAL_REASONS and not _origin_is_known_third_party(host):
+        return GatewayDenial(reason=reason, reset_at=gate_reset_at(exc))
+    code = _gateway_denial_code(exc)
+    if code in PROBE_DENIAL_REASONS and _from_minds_gateway(host):
+        return GatewayDenial(reason=code, reset_at=gate_reset_at(exc))
     return None
 
 
@@ -1068,6 +1278,17 @@ def friendly_turn_error(
         mapped = _map_gateway_reason(denial_code)
         if mapped is not None:
             return mapped
+
+    # An admin model rule. Its reason is `permission_denied`, which neither rung
+    # above maps, so the deny detail decides it, under the same origin rules.
+    # anton's typed error names the model while the fallback copy cannot, so
+    # its message wins when present, as for unknown_model above.
+    if _is_model_restricted(exc=exc):
+        if model_info is _UNSET:
+            model_info = model_unavailable_info(exc)
+        if model_info is not None and model_info[0] == MODEL_RESTRICTED_CODE and str(exc):
+            return MODEL_RESTRICTED_CODE, str(exc)
+        return MODEL_RESTRICTED_CODE, MODEL_RESTRICTED_USER_MESSAGE
 
     # anton exhausted its rate-limit wait budget and re-raised with the code
     # (ENG-1537). Checked here, above the bare-status rule, because that
@@ -1153,14 +1374,104 @@ def friendly_turn_error(
     return None
 
 
+class _RemoteTypeMapping(NamedTuple):
+    """What ``remote_turn_error`` returns for one scrubbed exception type name."""
+
+    code: str
+    message: str
+    # True when anton's own message is curated copy that beats `message`, which
+    # is then only the fallback for an empty one. False discards the pod's text.
+    passes_message_through: bool = False
+
+
+# The exception type names `remote_turn_error` recognises, keyed by the name
+# anton's `_scrub` puts before the colon. The name is the only discriminator
+# that survives the remote hop, so the table maps names, never imported types:
+# this repo's pinned anton can be older than the worker image's, and an import
+# of a class it lacks would fail on the error path.
+_REMOTE_TYPE_MAPPINGS: dict[str, _RemoteTypeMapping] = {
+    # Not a model or provider failure: nothing ran. The producer synthesises
+    # this when the reply stream stays silent past its idle bound, so the
+    # remedy is to look at the worker, not at the turn's content.
+    WORKER_UNRESPONSIVE_TYPE_NAME: _RemoteTypeMapping(
+        WORKER_UNRESPONSIVE_CODE, WORKER_UNRESPONSIVE_MESSAGE
+    ),
+    # The three MindsHub billing stops, each named by its own anton type so the
+    # hosted card matches the desktop one. The remote wire carries no
+    # X-MindsHub-Reset-At, so these codes reach the client without reset_at.
+    "WalletEmptyError": _RemoteTypeMapping(TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE),
+    "AllowanceExhaustedError": _RemoteTypeMapping(
+        ALLOWANCE_EXHAUSTED_CODE, ALLOWANCE_EXHAUSTED_USER_MESSAGE
+    ),
+    "FreeServingPausedError": _RemoteTypeMapping(
+        FREE_SERVING_PAUSED_CODE, FREE_SERVING_PAUSED_USER_MESSAGE
+    ),
+    # Older worker images raise the parent type for every billing stop, and so
+    # does any plain raise of it. Both keep the out-of-credits card.
+    "TokenLimitExceeded": _RemoteTypeMapping(TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE),
+    "ProviderOverloadedError": _RemoteTypeMapping(
+        PROVIDER_OVERLOADED_CODE, PROVIDER_OVERLOADED_FALLBACK_MESSAGE,
+        passes_message_through=True,
+    ),
+    # _scrub sends "Type: message" — the structured `code` doesn't survive,
+    # so 403-gate and 404-not-found are indistinguishable here. Default to
+    # the CONSERVATIVE one: model_not_found steers to Settings and promises
+    # nothing, while model_access_denied renders a "Top up balance" button
+    # that is simply wrong for a model that doesn't exist — and since the
+    # current gateway no longer emits the 403 codes at all, not-found is
+    # also the likelier case.
+    #
+    # The message is returned for the SSE `error` field and the DB sidecar,
+    # not for the card: both model cards render their own literal copy and
+    # never read `m.content` (ChatView.jsx). So the choice of code decides
+    # everything the user sees, which is why it errs conservative.
+    #
+    # Known gap, not fixed here: this path also can't supply `model` —
+    # producer.py emits response_failed_sse without it, so a remote/hosted
+    # turn still shows the UNNAMED copy. Naming it needs anton to carry the
+    # code+model through _scrub's wire format (tracked separately).
+    "ModelUnavailableError": _RemoteTypeMapping(
+        MODEL_NOT_FOUND_CODE, MODEL_UNAVAILABLE_FALLBACK_MESSAGE,
+        passes_message_through=True,
+    ),
+    # An admin in the organization restricted the model. anton raises this
+    # subclass of ModelUnavailableError only for the gateway's own 403, and its
+    # message names the model, so it passes through like its parent's. The
+    # name is matched exactly, so the parent's row above never catches it.
+    "ModelRestrictedError": _RemoteTypeMapping(
+        MODEL_RESTRICTED_CODE, MODEL_RESTRICTED_USER_MESSAGE,
+        passes_message_through=True,
+    ),
+    PROVIDER_AUTH_ERROR_TYPE_NAME: _RemoteTypeMapping(AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE),
+    # Unlike its sibling below, the message is passed through: anton built
+    # it around the provider's own "resize the image" sentence, which is
+    # more actionable than any constant here. A remote payload
+    # names the concrete subclass, never the parent.
+    CONTENT_TOO_LARGE_TYPE_NAME: _RemoteTypeMapping(
+        CONTENT_TOO_LARGE_CODE, CONTENT_TOO_LARGE_USER_MESSAGE,
+        passes_message_through=True,
+    ),
+    # The repair itself (stripping the offending image blocks
+    # from stored history) is triggered by the caller, keyed on this
+    # same code — see producer.py. The curated message anton constructs
+    # is already safe to show verbatim, but the code is what the client
+    # keys its (different, "already fixed") copy on, so return the
+    # stable curated constant rather than passing `message` through.
+    "ContentValidationError": _RemoteTypeMapping(
+        CONTENT_RECOVERY_CODE, CONTENT_RECOVERY_USER_MESSAGE
+    ),
+}
+
+
 def remote_turn_error(error: str | None) -> tuple[str, str]:
     """Map a remote pod's ``turn_failed`` error STRING to ``(code, message)``.
 
     The in-process path classifies exceptions (`friendly_turn_error`); remote
     turns arrive as scrubbed strings shaped ``"ExceptionType: message"`` (see
-    anton.cloud_turn._scrub), so this keys on the type-name prefix. Curated
-    anton copy (overloaded / model-gate) passes through; everything unmapped
-    gets the generic redacted message — never the raw provider text.
+    anton.cloud_turn._scrub), so this keys on the type-name prefix through
+    ``_REMOTE_TYPE_MAPPINGS``. Curated anton copy (overloaded / model-gate /
+    too-large) passes through; everything unmapped gets the generic redacted
+    message — never the raw provider text.
     """
     text = (error or "").strip()
     # Our own curated sentences, matched whole. Same generic code as any other
@@ -1191,53 +1502,17 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
         return GENERIC_TURN_ERROR_CODE, POD_IDENTITY_MISMATCH_USER_MESSAGE
     type_name, _, message = text.partition(":")
     message = message.strip()
-    if type_name == WORKER_UNRESPONSIVE_TYPE_NAME:
-        # Not a model or provider failure: nothing ran. The producer synthesises
-        # this when the reply stream stays silent past its idle bound, so the
-        # remedy is to look at the worker, not at the turn's content.
-        return WORKER_UNRESPONSIVE_CODE, WORKER_UNRESPONSIVE_MESSAGE
-    if type_name == "TokenLimitExceeded":
-        return TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE
-    if type_name == "ProviderOverloadedError":
-        return PROVIDER_OVERLOADED_CODE, message or PROVIDER_OVERLOADED_FALLBACK_MESSAGE
-    if type_name == "ModelUnavailableError":
-        # _scrub sends "Type: message" — the structured `code` doesn't survive,
-        # so 403-gate and 404-not-found are indistinguishable here. Default to
-        # the CONSERVATIVE one: model_not_found steers to Settings and promises
-        # nothing, while model_access_denied renders a "Top up balance" button
-        # that is simply wrong for a model that doesn't exist — and since the
-        # current gateway no longer emits the 403 codes at all, not-found is
-        # also the likelier case.
-        #
-        # The message is returned for the SSE `error` field and the DB sidecar,
-        # not for the card: both model cards render their own literal copy and
-        # never read `m.content` (ChatView.jsx). So the choice of code decides
-        # everything the user sees, which is why it errs conservative.
-        #
-        # Known gap, not fixed here: this path also can't supply `model` —
-        # producer.py emits response_failed_sse without it, so a remote/hosted
-        # turn still shows the UNNAMED copy. Naming it needs anton to carry the
-        # code+model through _scrub's wire format (tracked separately).
-        return MODEL_NOT_FOUND_CODE, message or MODEL_UNAVAILABLE_FALLBACK_MESSAGE
-    if type_name == PROVIDER_AUTH_ERROR_TYPE_NAME or (
-        type_name == "ConnectionError"
-        and message.lower().startswith(LEGACY_AUTH_ERROR_MESSAGE_PREFIX)
+    mapping = _REMOTE_TYPE_MAPPINGS.get(type_name)
+    if mapping is not None:
+        if mapping.passes_message_through and message:
+            return mapping.code, message
+        return mapping.code, mapping.message
+    # anton's pre-typed 401 copy from older worker images. Keyed on the message
+    # as well as the name, so it cannot live in the name-only table above.
+    if type_name == "ConnectionError" and message.lower().startswith(
+        LEGACY_AUTH_ERROR_MESSAGE_PREFIX
     ):
         return AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE
-    if type_name == CONTENT_TOO_LARGE_TYPE_NAME:
-        # Unlike its sibling below, the message is passed through: anton built
-        # it around the provider's own "resize the image" sentence, which is
-        # more actionable than any constant here (ENG-2689). Ranked first —
-        # a remote payload names the concrete subclass, never the parent.
-        return CONTENT_TOO_LARGE_CODE, message or CONTENT_TOO_LARGE_USER_MESSAGE
-    if type_name == "ContentValidationError":
-        # ENG-1992: the repair itself (stripping the offending image blocks
-        # from stored history) is triggered by the caller, keyed on this
-        # same code — see producer.py. The curated message anton constructs
-        # is already safe to show verbatim, but the code is what the client
-        # keys its (different, "already fixed") copy on, so return the
-        # stable curated constant rather than passing `message` through.
-        return CONTENT_RECOVERY_CODE, CONTENT_RECOVERY_USER_MESSAGE
     return GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
 
 

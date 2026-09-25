@@ -18,12 +18,13 @@ def _listing(ids):
     return providers.MindsModelListing(
         ids=ids, efforts={"gpt": {"efforts": ["low", "max"], "default": "low"}} if ids else {},
         enabled={}, labels={}, providers={}, families={}, role_defaults={},
+        disabled_reasons={},
     )
 
 
 def test_the_cached_listing_is_read_without_a_fetch_even_when_stale() -> None:
     url = "https://api.mindshub.ai/v1"
-    key = (providers.minds_chat_base_url(url), None)
+    key = providers._ListingCacheKey(providers.minds_chat_base_url(url), None, None)
     providers._minds_models_cache[key] = (time.monotonic() - 10_000, _listing(["gpt"]))
 
     listing = providers.cached_minds_models(url)
@@ -37,13 +38,25 @@ def test_nothing_cached_or_a_cached_failure_reads_as_unknown() -> None:
     assert providers.cached_minds_models(url) is None
     assert providers.cached_minds_models("") is None
 
-    providers._minds_models_cache[(providers.minds_chat_base_url(url), None)] = (time.monotonic(), _listing(None))
+    key = providers._ListingCacheKey(providers.minds_chat_base_url(url), None, None)
+    providers._minds_models_cache[key] = (time.monotonic(), _listing(None))
     assert providers.cached_minds_models(url) is None
 
 
 def test_the_read_is_tenant_scoped_like_the_fetch() -> None:
     url = "https://api.mindshub.ai/v1"
-    providers._minds_models_cache[(providers.minds_chat_base_url(url), "org-1")] = (time.monotonic(), _listing(["gpt"]))
+    key = providers._ListingCacheKey(providers.minds_chat_base_url(url), "org-1", None)
+    providers._minds_models_cache[key] = (time.monotonic(), _listing(["gpt"]))
 
     assert providers.cached_minds_models(url) is None
     assert providers.cached_minds_models(url, tenant_key="org-1") is not None
+
+
+def test_the_read_is_caller_scoped_like_the_org_catalog_fetch() -> None:
+    url = "https://api.mindshub.ai/v1"
+    key = providers._ListingCacheKey(providers.minds_chat_base_url(url), "org-1", "user-1")
+    providers._minds_models_cache[key] = (time.monotonic(), _listing(["gpt"]))
+
+    assert providers.cached_minds_models(url, tenant_key="org-1") is None
+    assert providers.cached_minds_models(url, tenant_key="org-1", user_id="user-2") is None
+    assert providers.cached_minds_models(url, tenant_key="org-1", user_id="user-1") is not None

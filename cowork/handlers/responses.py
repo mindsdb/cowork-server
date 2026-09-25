@@ -63,16 +63,16 @@ from cowork.handlers.turn_errors import (
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
     MODEL_UNAVAILABLE_CODES,
-    ALLOWANCE_EXHAUSTED_CODE,
     PROVIDER_OVERLOADED_CODE,
     RATE_LIMITED_CODE,
     REMOTE_CANCEL_LITERAL,
     REMOTE_CANCEL_VIA_FAIL_JOB,
+    RESET_AT_CODES,
     auth_error_detail,
     friendly_turn_error,
+    gate_reset_at,
     model_unavailable_info,
     provider_overloaded_info,
-    allowance_reset_at,
     response_failed_payload,
     retry_after_seconds,
     retry_at_instant,
@@ -1780,11 +1780,13 @@ class ResponsesHandler:
                 # resolved_planning_provider would name the wrong provider when
                 # the *coding* model was the one rejected.
                 extra = {"model": model_info[1] if model_info else ""}
-            elif code == ALLOWANCE_EXHAUSTED_CODE:
-                # When the free grant refreshes (ENG-1537). The gate sends it on
-                # this denial and only this one, so the card can offer waiting as
-                # a real alternative to paying instead of only asking for money.
-                _reset = allowance_reset_at(exc)
+            elif code in RESET_AT_CODES:
+                # When the free way forward comes back: the spent allowance
+                # refills, or the free-Air fuse resets at the end of the UTC
+                # day. The gate sends it on these denials and not on a
+                # velocity one, so the card can offer waiting as a real
+                # alternative to paying instead of only asking for money.
+                _reset = gate_reset_at(exc)
                 if _reset is not None:
                     extra = {"reset_at": _reset}
             elif code == RATE_LIMITED_CODE:
