@@ -185,10 +185,11 @@ async def test_vault_secrets_are_registered_before_the_seed_history_is_built(mon
         calls.append(("seed_history", None))
         return [], None
 
+    async def fake_register(scope):
+        calls.append(("register", scope))
+
     _fake_handler(monkeypatch, remote_seed_history=fake_seed_history)
-    monkeypatch.setattr(
-        remote_turn_mod, "register_vault_secrets", lambda scope: calls.append(("register", scope))
-    )
+    monkeypatch.setattr(remote_turn_mod, "register_vault_secrets", fake_register)
 
     async def fake_replies(**kwargs):
         yield "turn_completed", {}

@@ -6,6 +6,7 @@ the remote seed) needs that registration done at request entry.
 """
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
 from anton.utils.datasources import begin_ds_turn_scope, restore_namespaced_env
@@ -19,7 +20,11 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-def register_vault_secrets(scope: TenantScope | None) -> None:
+def _restore_from_vault(scope: TenantScope | None) -> None:
+    restore_namespaced_env(vault_for_scope(scope))
+
+
+async def register_vault_secrets(scope: TenantScope | None) -> None:
     """Register this request's DS_* secrets so `scrub_credentials` redacts
     them by exact value, not only by API-key shape.
 
@@ -27,9 +32,13 @@ def register_vault_secrets(scope: TenantScope | None) -> None:
     is this request's own and reaches every task spawned from it. A failure
     must not fail the turn: scrubbing falls back to the shape-based regex.
     """
+    # The scope opens here, in the request's context, and the rebuild runs in
+    # a worker thread so the vault reads don't stall other orgs' streams. The
+    # thread gets a copy of the context, which holds the same containers, and
+    # anton fills them in place, so the rebuild lands in this request's scope.
     begin_ds_turn_scope()
     try:
-        restore_namespaced_env(vault_for_scope(scope))
+        await asyncio.to_thread(_restore_from_vault, scope)
     except Exception:
         logger.warning(
             "Could not register vault secrets; this turn's history is scrubbed "
