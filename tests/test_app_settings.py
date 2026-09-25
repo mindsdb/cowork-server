@@ -115,11 +115,55 @@ def test_app_settings_rejects_invalid_tenancy_mode(monkeypatch):
 def test_require_auth_defaults_on_in_local_mode(monkeypatch):
     monkeypatch.delenv("COWORK_REQUIRE_AUTH", raising=False)
     monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+    monkeypatch.delenv("COWORK_SERVER_HOST", raising=False)
 
     settings = AppSettings(_env_file=None)
 
     assert settings.tenancy_mode == "local"
     assert settings.require_auth is True
+
+
+def test_require_auth_defaults_on_for_token_aware_desktop(monkeypatch):
+    monkeypatch.delenv("COWORK_REQUIRE_AUTH", raising=False)
+    monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+    monkeypatch.setenv("COWORK_SERVER_HOST", "127.0.0.1")
+    monkeypatch.setenv("COWORK_SERVER_OWNER", "abc123")
+
+    assert AppSettings(_env_file=None).require_auth is True
+
+
+@pytest.mark.parametrize("owner", [None, ""])
+def test_require_auth_defaults_off_for_pre_token_desktop(monkeypatch, owner):
+    # Desktop builds before 2026-07-05 launch the auto-updated server with
+    # host/port but no owner, and never send the bearer token.
+    monkeypatch.delenv("COWORK_REQUIRE_AUTH", raising=False)
+    monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+    if owner is None:
+        monkeypatch.delenv("COWORK_SERVER_OWNER", raising=False)
+    else:
+        monkeypatch.setenv("COWORK_SERVER_OWNER", owner)
+    monkeypatch.setenv("COWORK_SERVER_HOST", "127.0.0.1")
+
+    assert AppSettings(_env_file=None).require_auth is False
+
+
+def test_require_auth_defaults_on_for_docker_image(monkeypatch):
+    # The all-in-one image binds every interface and sets no owner.
+    monkeypatch.delenv("COWORK_REQUIRE_AUTH", raising=False)
+    monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+    monkeypatch.delenv("COWORK_SERVER_OWNER", raising=False)
+    monkeypatch.setenv("COWORK_SERVER_HOST", "0.0.0.0")
+
+    assert AppSettings(_env_file=None).require_auth is True
+
+
+def test_require_auth_explicit_true_wins_for_pre_token_desktop(monkeypatch):
+    monkeypatch.setenv("COWORK_REQUIRE_AUTH", "true")
+    monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+    monkeypatch.delenv("COWORK_SERVER_OWNER", raising=False)
+    monkeypatch.setenv("COWORK_SERVER_HOST", "127.0.0.1")
+
+    assert AppSettings(_env_file=None).require_auth is True
 
 
 def test_require_auth_stays_off_in_org_mode_by_default(monkeypatch):
