@@ -247,7 +247,7 @@ def normalize_datasource_input(model: DatasourceCreateRequest) -> dict[str, Any]
     """Turn a create or edit body into the payload auth accepts.
 
     Returns only the canonical fields: never `dsn`, never `input_mode`, and
-    never `expected_version`, which travels as its own relay argument.
+    never `expected_revision`, which travels as its own relay argument.
     """
     connector_id = (model.connector_id or "").strip().lower()
     method = (model.method or "").strip()

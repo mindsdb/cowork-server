@@ -44,6 +44,7 @@ PENDING = {
     "name": "prod reporting",
     "status": "pending",
     "credential_version": 1,
+    "revision": 6,
     "host_masked": "db***om",
     "port": 5432,
     "database": "appdb",
@@ -313,18 +314,35 @@ def test_a_retry_runs_a_fresh_validation_attempt(org_client, cluster):
     assert _by_path(recorded, "/v1/datasources/probe") is not None
 
 
+def test_a_rename_that_leaves_the_connection_verified_is_not_probed_again(org_client, cluster):
+    recorded, scripted = cluster
+    scripted["relay"] = (200, {**VERIFIED, "name": "renamed", "revision": 7})
+
+    res = org_client.patch(
+        "/api/v1/connectors/datasources/7",
+        json={**CREATE_BODY, "name": "renamed", "expected_revision": 6},
+        headers=AUTH_HEADERS,
+    )
+
+    assert res.status_code == 200
+    assert (res.json()["status"], res.json()["name"], res.json()["revision"]) == ("verified", "renamed", 7)
+    assert _by_path(recorded, "/internal/datasources/connections/7/probes/") is None
+    assert _by_path(recorded, "/v1/datasources/probe") is None
+
+
 def test_an_edit_revalidates_the_new_credential(org_client, cluster):
     recorded, scripted = cluster
-    scripted["relay"] = (200, {**PENDING, "credential_version": 2})
+    scripted["relay"] = (200, {**PENDING, "credential_version": 2, "revision": 6})
     scripted["mint"] = (201, {**MINT, "credential_version": 2})
 
     res = org_client.patch(
         "/api/v1/connectors/datasources/7",
-        json={**CREATE_BODY, "expected_version": 1},
+        json={**CREATE_BODY, "expected_revision": 5},
         headers=AUTH_HEADERS,
     )
 
     assert res.status_code == 200
     assert res.json()["status"] == "verified"
+    # The edit is guarded by the revision, the probe by the credential version.
     probe = _by_path(recorded, "/v1/datasources/probe")
     assert json.loads(probe.content)["credential_version"] == 2, "the probe must name the version it is checking"
