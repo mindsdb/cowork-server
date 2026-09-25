@@ -231,6 +231,17 @@ def default_publish_url() -> str:
     return f"https://view.{slug}.mindshub.ai" if slug else "https://view.mindshub.ai"
 
 
+def _launched_by_pre_token_desktop() -> bool:
+    # Desktop builds before 2026-07-05 never send the bearer token but still
+    # auto-update this server, so defaulting auth on would 401 them. They set
+    # host 127.0.0.1 and no COWORK_SERVER_OWNER; every token-aware build sets the
+    # owner, and the Docker image binds 0.0.0.0.
+    return (
+        os.environ.get("COWORK_SERVER_HOST") == "127.0.0.1"
+        and not os.environ.get("COWORK_SERVER_OWNER")
+    )
+
+
 def _env_file_chain() -> list[str]:
     """The ``.env`` search path (pydantic-settings is "last wins").
 
@@ -652,7 +663,7 @@ class AppSettings(Settings):
         failure instead of leaving org's own ingress auth as the boundary.
         """
         if self.tenancy_mode != "org" and "require_auth" not in self.model_fields_set:
-            self.require_auth = True
+            self.require_auth = not _launched_by_pre_token_desktop()
         return self
 
     auth_token: str = Field(
