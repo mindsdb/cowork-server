@@ -19,13 +19,15 @@ class _FakeSession:
     scope = _FakeScope()
 
 
-def _fake_handler(monkeypatch, *, persist_turn_memory=None, remote_artifacts_context=None):
+def _fake_handler(
+    monkeypatch, *, persist_turn_memory=None, remote_artifacts_context=None, remote_seed_history=None
+):
     """Replace ResponsesHandler with a stand-in exposing only the methods
     remote_turn_events calls, resolved at call time like every other name here."""
     monkeypatch.setattr(remote_turn_mod, "ResponsesHandler", type(
         "FakeResponsesHandler", (), {
             "_remote_artifacts_context": staticmethod(remote_artifacts_context or (lambda s, c: None)),
-            "_remote_seed_history": staticmethod(lambda s, c: ([], None)),
+            "_remote_seed_history": staticmethod(remote_seed_history or (lambda s, c: ([], None))),
             "_persist_remote_compaction": staticmethod(lambda c, d, si, sc: None),
             "_remote_workspace": staticmethod(lambda s, c: {}),
             "_remote_started_at": staticmethod(lambda s, c: None),
@@ -171,6 +173,36 @@ async def test_no_artifacts_context_skips_indexing_without_error(monkeypatch):
 
     assert failure is None
     assert events == []
+
+
+@pytest.mark.asyncio
+async def test_vault_secrets_are_registered_before_the_seed_history_is_built(monkeypatch):
+    """A channel turn skips handle(), so this module registers the vault's
+    secrets itself, and must do it before the seed history is scrubbed."""
+    calls = []
+
+    def fake_seed_history(_session, _conv_id):
+        calls.append(("seed_history", None))
+        return [], None
+
+    _fake_handler(monkeypatch, remote_seed_history=fake_seed_history)
+    monkeypatch.setattr(
+        remote_turn_mod, "register_vault_secrets", lambda scope: calls.append(("register", scope))
+    )
+
+    async def fake_replies(**kwargs):
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    session = _FakeSession()
+    _, failure = await _drain(remote_turn_events(
+        session=session, conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[],
+    ))
+
+    assert failure is None
+    assert calls == [("register", session.scope), ("seed_history", None)]
 
 
 @pytest.mark.parametrize("workspace_mode", [None, "ephemeral", "persistent"])
