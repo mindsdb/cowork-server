@@ -110,18 +110,15 @@ class TestToolProgressRoleMapping:
         assert len(done) == 1
         assert done[0]["ok"] is False
 
-    async def test_only_the_first_progress_per_id_is_throttle_exempt_but_tool_done_always_is(self, monkeypatch):
-        # Mirrors production's throttle window (PROGRESS_THROTTLE = 0.25s).
+    async def test_every_progress_line_is_throttle_exempt_and_tool_done_always_is(self, monkeypatch):
+        # ENG-2981: anton's generate_artifact emits a step line and, right
+        # next to it, a reasoning_start from the pipeline's own LLM call.
+        # reasoning_start used to take the throttle window and the step line
+        # was dropped, so the chat missed pipeline steps. Every tool_progress
+        # line must now survive, however close together they arrive.
         #
-        # A plain `iter([...])` fed to `time.time` (one value per call)
-        # is NOT enough here: `_event()` stamps `at_ms` via its own
-        # `time.time()` call on every emitted event (not just the
-        # throttle check), and `response.created`/StreamToolUseStart/
-        # StreamToolUseEnd all emit before the first tool_progress is even
-        # reached — the iterator runs out mid-stream and the generator
-        # raises "async generator raised StopIteration" before any assert
-        # runs, on both old and new code. Use a clock that holds its value
-        # until explicitly advanced instead.
+        # The clock holds its value until advanced (see `_timed`): `_event()`
+        # also calls `time.time()` to stamp `at_ms` on every emitted event.
         clock = {"t": 100.0}
         monkeypatch.setattr(sf.time, "time", lambda: clock["t"])
 
@@ -129,14 +126,16 @@ class TestToolProgressRoleMapping:
             c async for c in format_responses_stream(
                 _timed(
                     clock,
-                    (100.0, StreamToolUseStart(id="tc_1", name="streaming_probe")),
+                    (100.0, StreamToolUseStart(id="tc_1", name="generate_artifact")),
                     (100.0, StreamToolUseEnd(id="tc_1")),
-                    (100.0, StreamTaskProgress(phase="tool_progress", message="step 1", id="tc_1")),
-                    (100.05, StreamTaskProgress(phase="tool_progress", message="step 2", id="tc_1")),
-                    (100.1, StreamTaskProgress(phase="tool_progress", message="step 3", id="tc_1")),
-                    (100.1, StreamTaskProgress(
-                        phase="tool_done", message="streaming_probe",
-                        eta_seconds=0.1, id="tc_1",
+                    (100.0, StreamTaskProgress(phase="tool_progress", message="Gathering", id="tc_1")),
+                    (100.5, StreamTaskProgress(phase="reasoning_start", message="Thinking...")),
+                    (100.501, StreamTaskProgress(phase="tool_progress", message="step 1", id="tc_1")),
+                    (100.55, StreamTaskProgress(phase="tool_progress", message="step 2", id="tc_1")),
+                    (100.6, StreamTaskProgress(phase="tool_progress", message="step 3", id="tc_1")),
+                    (100.6, StreamTaskProgress(
+                        phase="tool_done", message="generate_artifact",
+                        eta_seconds=0.6, id="tc_1",
                     )),
                 ),
                 model="claude-sonnet-4-6",
@@ -145,16 +144,58 @@ class TestToolProgressRoleMapping:
         events = _parse_sse(chunks)
 
         progress = [e for e in events if e.get("thought_role") == "thought.tool_call.progress"]
-        # "step 1" (first-for-id, exempt) emits at t=100.0. "step 2" is not
-        # exempt, but the throttle anchor (last_progress) is still its
-        # initial 0.0 because step 1 was exempt and never updated it, so
-        # 100.05 - 0.0 clears the window — it emits and becomes the new
-        # anchor. "step 3" arrives only 0.05s after that anchor — inside
-        # the 0.25s window — and is dropped.
-        assert [e["content"] for e in progress] == ["step 1", "step 2"]
+        assert [e["content"] for e in progress] == ["Gathering", "step 1", "step 2", "step 3"]
+
+        reasoning = [e for e in events if e.get("phase") == "reasoning_start"]
+        assert len(reasoning) == 1
 
         done = [e for e in events if e.get("thought_role") == "thought.tool_call.end"]
         assert len(done) == 1  # tool_done is never throttled
+
+    async def test_progress_lines_do_not_move_the_throttle_anchor(self, monkeypatch):
+        # A step line must not take the window from the next ordinary phase
+        # either. Old code: the SECOND line for an id was throttled like any
+        # phase and, once emitted, became the anchor — the reasoning_start
+        # after it was then dropped.
+        clock = {"t": 100.0}
+        monkeypatch.setattr(sf.time, "time", lambda: clock["t"])
+
+        chunks = [
+            c async for c in format_responses_stream(
+                _timed(
+                    clock,
+                    (100.0, StreamToolUseStart(id="tc_1", name="generate_artifact")),
+                    (100.0, StreamToolUseEnd(id="tc_1")),
+                    (100.0, StreamTaskProgress(phase="tool_progress", message="a", id="tc_1")),
+                    (100.0, StreamTaskProgress(phase="reasoning_start", message="Thinking...")),
+                    (100.3, StreamTaskProgress(phase="tool_progress", message="b", id="tc_1")),
+                    (100.3, StreamTaskProgress(phase="reasoning_start", message="Thinking...")),
+                ),
+                model="claude-sonnet-4-6",
+            )
+        ]
+        events = _parse_sse(chunks)
+
+        progress = [e for e in events if e.get("thought_role") == "thought.tool_call.progress"]
+        assert [e["content"] for e in progress] == ["a", "b"]
+        # 100.3 - 100.0 >= PROGRESS_THROTTLE: the second reasoning_start is
+        # emitted because line "b" did not become the anchor.
+        reasoning = [e for e in events if e.get("phase") == "reasoning_start"]
+        assert len(reasoning) == 2
+
+    async def test_progress_without_an_id_is_still_dropped(self):
+        chunks = [
+            c async for c in format_responses_stream(
+                _events(
+                    StreamTaskProgress(phase="tool_progress", message="orphan"),
+                ),
+                model="claude-sonnet-4-6",
+            )
+        ]
+        events = _parse_sse(chunks)
+
+        assert [e for e in events if e.get("thought_role") == "thought.tool_call.progress"] == []
+        assert all(e.get("content") != "orphan" for e in events)
 
     async def test_tool_done_without_any_progress_keeps_the_old_fallback_role(self):
         # Regression: the 8 generic tools that never stream ToolProgress

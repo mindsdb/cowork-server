@@ -231,6 +231,17 @@ def default_publish_url() -> str:
     return f"https://view.{slug}.mindshub.ai" if slug else "https://view.mindshub.ai"
 
 
+def _launched_by_pre_token_desktop() -> bool:
+    # Desktop builds before 2026-07-05 never send the bearer token but still
+    # auto-update this server, so defaulting auth on would 401 them. They set
+    # host 127.0.0.1 and no COWORK_SERVER_OWNER; every token-aware build sets the
+    # owner, and the Docker image binds 0.0.0.0.
+    return (
+        os.environ.get("COWORK_SERVER_HOST") == "127.0.0.1"
+        and not os.environ.get("COWORK_SERVER_OWNER")
+    )
+
+
 def _env_file_chain() -> list[str]:
     """The ``.env`` search path (pydantic-settings is "last wins").
 
@@ -652,7 +663,7 @@ class AppSettings(Settings):
         failure instead of leaving org's own ingress auth as the boundary.
         """
         if self.tenancy_mode != "org" and "require_auth" not in self.model_fields_set:
-            self.require_auth = True
+            self.require_auth = not _launched_by_pre_token_desktop()
         return self
 
     auth_token: str = Field(
@@ -687,20 +698,6 @@ class AppSettings(Settings):
             "resolving under COWORK_HOME exactly as before. Defaults to the "
             "container's own temp directory, which is never the shared EFS "
             "mount and is gone on pod restart."
-        ),
-    )
-    hub_workspaces_force_on: bool = Field(
-        default=False,
-        validation_alias=AliasChoices("COWORK_HUB_WORKSPACES_FORCE_ON"),
-        description=(
-            "Development override that turns the MindsHub workspace surfaces on "
-            "where no Statsig rule targets you. ON only: it cannot switch the "
-            "surfaces off, so it can never be used to escape the kill switch. "
-            "The switch itself is auth's `authorization_ui` gate, declared in "
-            "that repo's configs/statsig_gates.json and read through the "
-            "entitlements payload; this exists so the surface can be walked "
-            "before a rule exists for your environment. Never set in a deployed "
-            "environment."
         ),
     )
     ask_user_enabled: bool = Field(

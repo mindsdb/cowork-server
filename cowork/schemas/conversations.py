@@ -44,3 +44,16 @@ class ConversationListItem(CamelResponse):
     harness: str | None = None
     model: str | None = None
     reasoning_effort: str | None = None
+
+
+class ConversationItemsPage(CamelResponse):
+    """Cursor-paginated envelope for GET /conversations/{id}/items. `items`
+    is a plain list[dict] passthrough (NOT nested CamelResponse models) —
+    only the envelope's own keys (`items`/`hasMore`/`nextBefore`) go through
+    the camelCase alias; per-item fields keep their existing names exactly
+    (e.g. `created_at`, not `createdAt`) so this doesn't silently change
+    what an item dict looks like."""
+
+    items: list[dict]
+    has_more: bool
+    next_before: str | None = None
