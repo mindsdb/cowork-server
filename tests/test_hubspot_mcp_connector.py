@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 
 import pytest
 from fastapi import HTTPException
@@ -208,6 +209,23 @@ class TestPatchAccessMode:
         assert calls == [("hubspot", "acme-hubspot", "write")]
 
 
+#: These tests monkeypatch `anton.core.mcp.wiring.call_mcp_tool`, which needs
+#: the module to exist. cowork-server's published anton floor
+#: (`anton-agent>=2.26.8.23.1`) still resolves builds that predate the MCP
+#: client — promoting it to anton's `main` is a separate release step
+#: (ENG-1816) — so on those builds there is genuinely nothing to exercise.
+#: Skipping is the honest outcome; the endpoint's own behaviour under that
+#: skew is covered by `TestMcpIdentityBridgeWithoutAntonMcp` below, which
+#: runs either way.
+try:  # pragma: no cover - import probe, not logic
+    import anton.core.mcp.wiring  # noqa: F401
+
+    HAS_ANTON_MCP = True
+except ImportError:  # pragma: no cover
+    HAS_ANTON_MCP = False
+
+
+@pytest.mark.skipif(not HAS_ANTON_MCP, reason="installed anton has no anton.core.mcp (ENG-1816 not yet on anton main)")
 class TestMcpIdentityBridge:
     async def test_resolves_email_and_portal_name_from_json_string_tool_results(self, monkeypatch):
         """Real shapes, live-verified 2026-09-15 against an actual HubSpot
@@ -236,11 +254,6 @@ class TestMcpIdentityBridge:
 
         result = await oauth_endpoints.get_mcp_identity("hubspot", McpIdentityRequest(access_token="tok"))
         assert result == {"account_email": "user@acme.com", "account_name": "Jordan Lee"}
-
-    async def test_unknown_engine_404s(self):
-        with pytest.raises(HTTPException) as exc:
-            await oauth_endpoints.get_mcp_identity("linear", McpIdentityRequest(access_token="tok"))
-        assert exc.value.status_code == 404
 
     async def test_missing_email_502s_instead_of_returning_a_blank_identity(self, monkeypatch):
         async def fake_call_mcp_tool(engine, access_token, tool_name, **kwargs):
@@ -277,6 +290,33 @@ class TestMcpIdentityBridge:
 
         result = await oauth_endpoints.get_mcp_identity("hubspot", McpIdentityRequest(access_token="tok"))
         assert result == {"account_email": "user@acme.com", "account_name": "Jordan Lee"}
+
+
+class TestMcpIdentityBridgeWithoutAntonMcp:
+    """The two paths that must hold on an anton with no MCP client.
+
+    Deliberately NOT skipped: these run on every build, including ones that
+    do have `anton.core.mcp`, by making the import fail on demand — otherwise
+    the skew behaviour would only ever be exercised on the builds least
+    likely to be the ones running CI.
+    """
+
+    async def test_unknown_engine_404s_before_anton_is_imported_at_all(self):
+        """The engine guard precedes the import, so this answers correctly
+        even where there is no MCP client to import."""
+        with pytest.raises(HTTPException) as exc:
+            await oauth_endpoints.get_mcp_identity("linear", McpIdentityRequest(access_token="tok"))
+        assert exc.value.status_code == 404
+
+    async def test_501_when_the_installed_anton_has_no_mcp_client(self, monkeypatch):
+        """A `None` in sys.modules makes `import anton.core.mcp.wiring` raise
+        ImportError, which is exactly what an older anton does. Before the
+        guard this surfaced to Electron as an opaque 500."""
+        monkeypatch.setitem(sys.modules, "anton.core.mcp.wiring", None)
+
+        with pytest.raises(HTTPException) as exc:
+            await oauth_endpoints.get_mcp_identity("hubspot", McpIdentityRequest(access_token="tok"))
+        assert exc.value.status_code == 501
 
 
 class TestParseMcpIdentity:

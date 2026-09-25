@@ -163,7 +163,19 @@ async def get_mcp_identity(engine: str, body: McpIdentityRequest):
     table rather than a second MCP implementation here)."""
     if engine not in _MCP_IDENTITY_ENGINES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"No MCP identity resolution for {engine!r}.")
-    from anton.core.mcp.wiring import call_mcp_tool
+    # Capability-gated like the harness's own discovery call: this repo's
+    # published anton floor still resolves builds without anton.core.mcp
+    # (ENG-1816 reaches anton's main on its own cadence). A bare ImportError
+    # here would surface to Electron as an opaque 500; 501 says what is
+    # actually true — this build cannot do MCP identity resolution at all.
+    try:
+        from anton.core.mcp.wiring import call_mcp_tool
+    except ImportError as exc:
+        _log.warning("MCP identity resolution unavailable for %s: installed anton has no anton.core.mcp", engine)
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=f"This build's anton has no MCP client, so {engine} identity cannot be resolved.",
+        ) from exc
 
     try:
         user_details = await call_mcp_tool(engine, body.access_token, "get_user_details")

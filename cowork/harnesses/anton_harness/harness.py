@@ -24,6 +24,32 @@ from cowork.services.projects import display_label
 logger = get_logger(__name__)
 
 
+def _anton_mcp_wiring():
+    """anton's MCP wiring module, or ``None`` when the installed anton predates it.
+
+    cowork-server pins anton from a git branch, but its *published* floor
+    (``anton-agent>=2.26.8.23.1``) still resolves builds with no
+    ``anton.core.mcp`` package — the MCP client (ENG-1816) reaches anton's
+    ``main`` on its own release cadence, so there is a real window where a
+    perfectly valid dependency lacks it.
+
+    Importing it unconditionally turns that window into an ImportError on the
+    session-construction path, i.e. every turn fails, not just the MCP ones.
+    Same reasoning and same shape as ``services/providers.py``'s
+    ``router_provider`` gate and ``handlers/turn_errors.py``'s deliberate
+    refusal to import a type this repo can be deployed ahead of.
+    """
+    try:
+        from anton.core.mcp import wiring
+    except ImportError:
+        logger.info(
+            "Installed anton has no anton.core.mcp — MCP-based connectors are "
+            "inactive for this build; every other connector is unaffected."
+        )
+        return None
+    return wiring
+
+
 def _vault_scratch_dir() -> Path:
     """Where the temporary filtered data-vault directory is staged when a
     turn disables one or more connections (see ``_build_chat_session``).
@@ -1032,12 +1058,18 @@ class AntonHarness:
         # vars already are. discover_mcp_tools_async itself skips every
         # connection whose `_method` isn't "mcp" — safe to pass the full,
         # unfiltered connection list for every other connector.
+        #
+        # Capability-gated on the installed anton, the same way
+        # services/providers.py gates ENG-648's router kwargs: this repo's
+        # published floor (anton-agent>=2.26.8.23.1) still resolves builds
+        # that predate the MCP client, and promoting it to anton's `main` is
+        # a separate release step (ENG-1816). An unguarded import would turn
+        # that window into a failure on EVERY turn, not just MCP ones.
         mcp_tool_defs: list = []
         mcp_sessions: list = []
-        if data_vault is not None:
-            from anton.core.mcp.wiring import discover_mcp_tools_async
-
-            mcp_tool_defs, mcp_sessions = await discover_mcp_tools_async(
+        mcp_wiring = _anton_mcp_wiring() if data_vault is not None else None
+        if mcp_wiring is not None:
+            mcp_tool_defs, mcp_sessions = await mcp_wiring.discover_mcp_tools_async(
                 data_vault, data_vault.list_connections()
             )
 
@@ -1196,7 +1228,12 @@ class AntonHarness:
                     *([RECALL_HISTORY_TOOL] if RECALL_HISTORY_TOOL else []),
                     *mcp_tool_defs,
                 ],
-                mcp_sessions=mcp_sessions,
+                # Same gate as the discovery call above, not a second one:
+                # `ChatSessionConfig.mcp_sessions` and `anton.core.mcp` ship
+                # together (anton#478), so an anton without the wiring module
+                # also rejects this kwarg — passing it there is a TypeError
+                # that takes down every turn.
+                **({"mcp_sessions": mcp_sessions} if mcp_wiring is not None else {}),
                 cells=cells
             )
             # Not `ChatSession(config)` directly: every construction of anton's
@@ -1216,10 +1253,10 @@ class AntonHarness:
             # every MCP transport this turn opened (found in review: the
             # original narrower try/except here missed object_session()/
             # _seed_history() raising before build_chat_session is ever called).
+            # A non-empty mcp_sessions implies mcp_wiring resolved above, so
+            # no second import and no second capability check is needed here.
             if mcp_sessions:
-                from anton.core.mcp.wiring import close_mcp_sessions
-
-                await close_mcp_sessions(mcp_sessions)
+                await mcp_wiring.close_mcp_sessions(mcp_sessions)
             raise
 
     @staticmethod
