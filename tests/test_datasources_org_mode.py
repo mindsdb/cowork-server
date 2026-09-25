@@ -235,12 +235,12 @@ def test_detail_edit_delete_and_retry_hit_the_exact_auth_paths(org_client, relay
 
     edit = org_client.patch(
         "/api/v1/connectors/datasources/7",
-        json={**CREATE_BODY, "expected_revision": 6},
+        json={**CREATE_BODY, "expected_revision": 5},
         headers=AUTH_HEADERS,
     )
     assert edit.status_code == 200
     sent = json.loads(recorded[1].content)
-    assert sent["expected_revision"] == 6
+    assert sent["expected_revision"] == 5
     assert "expected_version" not in sent
     assert (edit.json()["revision"], edit.json()["credential_version"]) == (6, 1)
 
