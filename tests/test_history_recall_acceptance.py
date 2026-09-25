@@ -14,7 +14,14 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from sqlmodel import Session
 
-from anton.core.llm.provider import LLMResponse, ProviderConnectionInfo, ToolCall, Usage
+from anton.core.llm.provider import (
+    LLMResponse,
+    ProviderConnectionInfo,
+    StreamComplete,
+    StreamTextDelta,
+    ToolCall,
+    Usage,
+)
 from anton.core.session import ChatSession, ChatSessionConfig
 
 from cowork.common.settings.app_settings import get_app_settings
@@ -49,6 +56,18 @@ def _base_llm():
     return llm
 
 
+def _streamed(plan):
+    """`plan` as the `plan_stream` event stream anton's turn loop consumes."""
+    def _plan_stream(messages, **kwargs):
+        async def gen():
+            resp = plan(messages, **kwargs)
+            if resp.content:
+                yield StreamTextDelta(text=resp.content)
+            yield StreamComplete(response=resp)
+        return gen()
+    return _plan_stream
+
+
 def _forgetful_llm():
     """Answers "ack", and summarizes by dropping everything but the goal.
 
@@ -69,6 +88,7 @@ def _forgetful_llm():
         )
 
     llm.plan = AsyncMock(side_effect=_plan)
+    llm.plan_stream = _streamed(_plan)
     llm.summarize = AsyncMock(
         side_effect=lambda *a, **kw: LLMResponse(content="## Goal\nSet up the staging deploy.")
     )
@@ -96,6 +116,7 @@ def _recalling_llm(query: str):
         return LLMResponse(content=f"From the archive: {json.dumps(messages[-1]['content'])}")
 
     llm.plan = AsyncMock(side_effect=_plan)
+    llm.plan_stream = _streamed(_plan)
     return llm
 
 
@@ -172,7 +193,13 @@ class TestDroppedFactIsRecoverable:
             initial_history=initial_history,
             tools=[tool],
         ))
-        reply = await session.turn("What was the staging password again?")
+        # turn_stream, not turn(): turn() opens no emitter, and dispatching a
+        # tool call without one fails.
+        parts: list[str] = []
+        async for event in session.turn_stream("What was the staging password again?"):
+            if isinstance(event, StreamTextDelta):
+                parts.append(event.text)
+        reply = "".join(parts)
 
         assert SECRET in reply
 
