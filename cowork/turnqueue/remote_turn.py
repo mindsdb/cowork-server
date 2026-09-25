@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
+from cowork.common.history_scrub import register_vault_secrets
 from cowork.db.scoped import ScopedSession
 from cowork.handlers.responses import ResponsesHandler
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
@@ -44,6 +45,9 @@ async def remote_turn_events(
         snapshot_artifact_state,
     )
 
+    # A channel turn never goes through handle(), which registers these for
+    # a web turn; the seed history below is scrubbed against them.
+    register_vault_secrets(session.scope)
     seeded_history, seed_info = ResponsesHandler._remote_seed_history(session, conv_id)
     artifacts = ResponsesHandler._remote_artifacts_context(session, conv_id)
     before_slugs, before_mtimes = (
