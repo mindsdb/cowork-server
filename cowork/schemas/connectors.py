@@ -1,5 +1,6 @@
 import re
-from typing import Any
+from datetime import datetime
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -23,6 +24,9 @@ class ConnectorField(BaseModel):
     description: str | None = None
     default: Any = None
     options: list[dict[str, Any]] | None = None
+    #: A checkbox reads as a sentence beside the box, which is longer than the
+    #: label the field is listed under. Only a boolean field uses it.
+    checkbox_label: str | None = None
 
 
 class OAuthConfig(BaseModel):
@@ -71,6 +75,33 @@ class OAuthConfig(BaseModel):
     token_auth_style: str = "body"
 
 
+class CloudMethod(BaseModel):
+    """What a method collects and whether it runs when the deployment is hosted.
+
+    A method without one of these is desktop-only. Clients render a method's
+    cloud form as submittable only when both flags hold: the connector's
+    `ConnectorMetadataResponse.cloud_available`, computed per request from
+    auth's catalogue, and this method's static `available`. Neither overrides
+    the other, and no server path enforces `available` yet.
+    """
+
+    # False while the hosted path can accept the form but not yet execute
+    # against it. An available form has never been proof of execution
+    # support, so this stays False until adapter tests establish the
+    # driver/server/method row it depends on.
+    available: bool = False
+    # Cloud copy, never inherited from the desktop method. The desktop text
+    # documents an SSL on/off toggle and a CA field the cloud form does not
+    # offer, and a localhost server the hosted path refuses, so rendering it
+    # to a cloud user would describe a form that cannot be submitted.
+    description: str | None = None
+    how_to: str | None = None
+    # The COMPLETE cloud field list, not a delta on the desktop `fields`.
+    # Two independent lists is what keeps the desktop form fixed while this
+    # one changes.
+    fields: list[ConnectorField] = []
+
+
 class ConnectorMethod(BaseModel):
     id: str
     label: str
@@ -82,6 +113,7 @@ class ConnectorMethod(BaseModel):
     how_to: str | None = None
     help_url: str | None = None
     fields: list[ConnectorField] = []
+    cloud: CloudMethod | None = None
 
     @field_validator("id")
     @classmethod
@@ -287,3 +319,87 @@ class OAuthStartResponse(BaseModel):
 class DisabledConnection(BaseModel):
     engine: str
     name: str
+
+
+class DatasourceTls(BaseModel):
+    """Transport security for a cloud datasource connection.
+
+    `system` and `custom_ca` verify the chain and the hostname and differ only
+    in which authorities they trust. `encrypted` encrypts without checking who
+    answered, `disabled` does neither, and `prefer` takes encryption where the
+    server offers it. The default is `prefer`, because a self-hosted server
+    usually has the certificate its installer generated for it, or none, and
+    the form no longer asks.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["system", "custom_ca", "encrypted", "disabled", "prefer"] = "prefer"
+    ca_pem: str | None = None
+
+
+class DatasourceCreateRequest(BaseModel):
+    """A cloud datasource connection as the client submits it.
+
+    Either structured fields or a DSN, never both; the normalizer in
+    services/connectors/datasources.py turns it into auth's payload.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    connector_id: str
+    method: str
+    name: str = Field(min_length=1, max_length=128)
+    input_mode: Literal["structured", "dsn"] = "structured"
+    dsn: str | None = None
+    host: str | None = None
+    port: int | None = None
+    database: str | None = None
+    # `schema` on the wire, since that is what the engine calls it; the field
+    # is renamed here only because the name shadows an attribute of BaseModel.
+    db_schema: str | None = Field(default=None, alias="schema")
+    username: str | None = None
+    password: str | None = None
+    tls: DatasourceTls | None = None
+
+
+class DatasourceEditRequest(DatasourceCreateRequest):
+    """An edit, guarded by the connection revision the client read.
+
+    Auth moves the revision on every edit, a rename included, so an edit made
+    from a stale read is refused; the credential version is not the guard.
+    """
+
+    expected_revision: int = Field(ge=1)
+
+
+class DatasourceConnectionResponse(BaseModel):
+    """Auth's connection metadata, allowlisted.
+
+    extra="ignore" so a field auth adds later is dropped here rather than
+    forwarded to a client this server never vetted it for.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    connector_id: str
+    method: str
+    name: str
+    status: str
+    credential_version: int
+    revision: int
+    host_masked: str
+    port: int | None = None
+    database: str
+    db_schema: str | None = Field(default=None, alias="schema")
+    username: str
+    tls_mode: str
+    validation_error: str | None = None
+    # The gateway's own word for a refusal, on the three routes that run a
+    # validation attempt. Auth stores a verdict and not a cause, so without
+    # this a failed connection can say nothing a caller could act on. Absent
+    # everywhere no attempt was made.
+    validation_code: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
