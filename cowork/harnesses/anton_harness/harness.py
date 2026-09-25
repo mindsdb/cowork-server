@@ -18,7 +18,7 @@ from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
-from cowork.services.projects import display_label
+from cowork.services.projects import display_label, is_comparison_sandbox
 
 
 logger = get_logger(__name__)
@@ -206,6 +206,22 @@ def _split_turn_into_rows(history_slice: list) -> list[dict]:
     from anton.cloud_turn.history_rows import split_turn_into_rows
 
     return split_turn_into_rows(history_slice)
+
+
+def _memory_mode(anton_settings, conversation) -> str:
+    """The Cortex mode for this conversation's turn.
+
+    A model-comparison side reads memory like any task but never writes it:
+    two agents on the same task would each record the same lessons. "off"
+    stops every write, which all go through `Cortex.encode`; compaction is the
+    one path that ignores the mode, and it cannot fire on a Cortex rebuilt
+    every turn (its interval counts turns within one instance).
+    """
+    if not anton_settings.memory_enabled:
+        return "off"
+    if is_comparison_sandbox(getattr(getattr(conversation, "project", None), "name", None)):
+        return "off"
+    return anton_settings.memory_mode
 
 
 def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_dir: Path, LocalDataVault):
@@ -935,7 +951,7 @@ class AntonHarness:
         cortex = Cortex(
             global_hc=Hippocampus(global_memory_dir),
             project_hc=Hippocampus(project_memory_dir),
-            mode=anton_settings.memory_mode if anton_settings.memory_enabled else "off",
+            mode=_memory_mode(anton_settings, conversation),
             llm_client=llm_client,
         )
         # TODO: Is episodic memory required given that we are handling history outside of the harness?

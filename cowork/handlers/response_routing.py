@@ -454,8 +454,20 @@ def _text_history(history: list[dict]) -> list[dict]:
     return result
 
 
-def ineligible_reason(*, has_non_text_input: bool, has_attachments: bool, has_disabled_connections: bool) -> str | None:
-    """Return a deterministic delegation reason for unsupported turn shapes."""
+def ineligible_reason(
+    *,
+    has_non_text_input: bool,
+    has_attachments: bool,
+    has_disabled_connections: bool,
+    is_comparison_side: bool = False,
+) -> str | None:
+    """Return a deterministic delegation reason for unsupported turn shapes.
+
+    A model-comparison side always goes to the agent: the gate answers on its
+    own model, so a direct answer would compare the gate against itself.
+    """
+    if is_comparison_side:
+        return "comparison_side"
     if has_non_text_input:
         return "non_text_input"
     if has_attachments:

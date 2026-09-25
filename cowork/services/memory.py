@@ -537,6 +537,12 @@ class MemoryService:
         projects = list(self.session.exec(self.session.select(Project)).all())
         if project_id is not None:
             projects = [p for p in projects if p.id == project_id]
+        else:
+            # The unfiltered list is the Memories screen. A comparison side
+            # never writes memory, so its project has nothing to show there.
+            from cowork.services.projects import is_comparison_sandbox
+
+            projects = [p for p in projects if not is_comparison_sandbox(p.name)]
 
         for project in projects:
             store = ProjectMemoryStore(Path(project.path))

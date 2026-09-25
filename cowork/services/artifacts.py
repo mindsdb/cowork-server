@@ -112,14 +112,20 @@ class ExecutionRefused(RuntimeError):
 # `kind` field on the preview-mount response payload discriminates.
 _PREVIEW_MOUNTS: dict[str, Path] = {}
 
-# Launched-by-cowork-server backend tracking, keyed by artifact slug.
-# Shape matches anton's launcher: {"proc", "port", "pid", "log_path"}.
+# Launched-by-cowork-server backend tracking: project root -> the dict anton's
+# launcher tracks by slug, {"proc", "port", "pid", "log_path"} per entry.
 # Used to avoid double-launching and to reap on shutdown.
-_LAUNCHED_BACKENDS: dict[str, dict] = {}
+#
+# One dict per project because the launcher keys by slug alone and reaps the
+# tracked process for a slug before it spawns a new one. Slugs are only unique
+# within a project, so a single shared dict let opening project B's
+# `sales-dashboard` kill project A's.
+_LAUNCHED_BACKENDS: dict[str, dict[str, dict]] = {}
 
-# Per-slug mutex so two parallel `preview-mount` requests (React
+# Per-artifact mutex so two parallel `preview-mount` requests (React
 # StrictMode double-effects, a double-click) can't both decide the port
-# is dead and spawn two backends side by side.
+# is dead and spawn two backends side by side. Keyed by the artifact folder,
+# not the slug, for the same reason as above.
 _BACKEND_LAUNCH_LOCKS: dict[str, asyncio.Lock] = {}
 
 # ─── Type / kind mapping ──────────────────────────────────────────
@@ -1811,9 +1817,9 @@ async def _ensure_backend_running(
     if _probe_port(port):
         return True, "already_running", port
 
-    # Serialize launches per-slug. Whichever request wins the lock does
+    # Serialize launches per artifact. Whichever request wins the lock does
     # the actual work; the rest just re-probe after it releases.
-    async with _launch_lock(slug):
+    async with _launch_lock(str(artifact_dir.resolve())):
         if _probe_port(port):
             return True, "already_running", port
         return await _launch_backend_locked(artifact_dir, slug)
@@ -1890,7 +1896,7 @@ async def _launch_backend_locked(
         slug=slug,
         artifact_folder=artifact_dir,
         scratchpad_pool=pool,
-        tracked_backends=_LAUNCHED_BACKENDS,
+        tracked_backends=_LAUNCHED_BACKENDS.setdefault(str(project_root), {}),
         **env_kwargs,
         health_timeout=45.0,
     )
@@ -1936,11 +1942,12 @@ def shutdown_launched_backends() -> None:
     the kernel SIGTERM the backends when we go. macOS relies on the
     explicit `terminate()` call.
     """
-    for slug, entry in list(_LAUNCHED_BACKENDS.items()):
-        proc = entry.get("proc")
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.terminate()
-            except (OSError, ProcessLookupError):
-                pass
-        _LAUNCHED_BACKENDS.pop(slug, None)
+    for project_root, tracked in list(_LAUNCHED_BACKENDS.items()):
+        for entry in list(tracked.values()):
+            proc = entry.get("proc")
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.terminate()
+                except (OSError, ProcessLookupError):
+                    pass
+        _LAUNCHED_BACKENDS.pop(project_root, None)
