@@ -54,6 +54,15 @@ def wants_download(request: Request) -> bool:
     return raw is not None and raw.strip().lower() in _TRUE_DOWNLOAD_VALUES
 
 
+def wants_html_preview(media_type: str, request: Request) -> bool:
+    """Whether to serve the injected HTML preview rather than the raw file.
+
+    The one predicate the file-serving routes share, so a change to what
+    counts as previewable HTML lands in every route at once.
+    """
+    return media_type == "text/html" and not wants_download(request)
+
+
 def artifact_response_headers(media_type: str) -> dict[str, str]:
     """Cache headers for any artifact response; HTML responses additionally
     get the sandbox CSP above, since only those can carry executable script."""
