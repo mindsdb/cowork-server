@@ -212,7 +212,9 @@ async def test_a_family_that_drops_packets_costs_one_short_attempt(org_mode):
 
 
 @pytest.mark.asyncio
-async def test_when_every_address_times_out_the_connect_phase_fits_the_request_timeout(org_mode):
+async def test_when_every_address_times_out_the_attempts_share_one_connect_timeout(org_mode):
+    """httpcore applies the connect timeout to the TCP connect and to the TLS
+    handshake separately, so this bounds the timeouts handed out, not wall time."""
     seen: list[httpx.Request] = []
 
     def handle(request: httpx.Request) -> httpx.Response:

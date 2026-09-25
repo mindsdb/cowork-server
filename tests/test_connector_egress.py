@@ -55,6 +55,17 @@ def test_no_addresses_means_no_attempts():
     assert connection_attempts([], total_seconds=15.0) == []
 
 
-def test_a_budget_that_leaves_the_last_attempt_nothing_is_refused():
-    with pytest.raises(ValueError):
-        connection_attempts(V6 + V4, total_seconds=9.0, fallback_seconds=3.0, max_attempts=4)
+@pytest.mark.parametrize(
+    ("total_seconds", "expected"),
+    [
+        (9.0, [(V6[0], 3.0), (V4[0], 3.0), (V6[1], 3.0)]),
+        (3.0, [(V6[0], 3.0)]),
+        (1.0, [(V6[0], 1.0)]),
+    ],
+)
+def test_a_budget_too_small_for_every_short_attempt_tries_fewer_addresses(total_seconds, expected):
+    """A request's own timeout sets the budget on the pinned transport, so a
+    short one is legal and must still leave the last attempt time to connect."""
+    attempts = connection_attempts(V6 + V4, total_seconds=total_seconds, fallback_seconds=3.0, max_attempts=4)
+
+    assert attempts == expected
