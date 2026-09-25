@@ -208,12 +208,26 @@ _DENIES_PRODUCT_RE = re.compile(
     rf"|{_DENIAL_ADJ_ATTRIBUTIVE}"
 )
 
+# A direct answer is persisted as history, so one naming the gate's own tool
+# teaches the agent that tool exists. Two shapes reach here as text: a call the
+# endpoint failed to parse (local servers stream it as content), and a small
+# model describing its one visible tool. Whole word, because the paraphrases
+# vary far more than the name does; a false positive costs one hop.
+_TEXT_TOOL_CALL_MARKERS = (
+    r"<tool_call>", r"<\|tool_call\|>", r"\[TOOL_CALLS\]", r"<function=", r"tool▁call▁begin",
+)
+_GATE_TOOL_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])%s(?![A-Za-z0-9_-])|%s"
+    % (re.escape(_DELEGATE_TOOL["name"]), "|".join(_TEXT_TOOL_CALL_MARKERS)),
+    re.IGNORECASE,
+)
+
 
 class _RejectedAnswer(Exception):
     """The gate produced an answer we will not ship; delegate instead.
 
-    ``reason`` is the delegation reason the decision carries, so the two
-    rejection shapes stay countable apart in traces.
+    ``reason`` is the delegation reason the decision carries, so each
+    rejection shape stays countable apart in traces.
     """
 
     def __init__(self, reason: str, evidence: str) -> None:
@@ -239,6 +253,15 @@ def denies_our_product(text: str) -> str | None:
     """
     match = _DENIES_PRODUCT_RE.search(text or "")
     return " ".join(match.group(0).split())[:120] if match else None
+
+
+def names_gate_tool(text: str) -> str | None:
+    """The gate's tool name or a text tool-call marker found in ``text``, or None.
+
+    Exported for the same reason as :func:`names_foreign_product`.
+    """
+    match = _GATE_TOOL_RE.search(text or "")
+    return match.group(0) if match else None
 
 
 @dataclass(frozen=True)
@@ -269,7 +292,7 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
     denying that our own product can be identified or exists (ENG-2423): also
     delegations, but raised rather than returned as None so the decision can
     carry its own reason instead of reporting that the model declined, which it
-    did not.
+    did not. An answer naming the gate's own tool raises it the same way.
 
     Streaming is what makes the budget meetable: the delegate decision is the
     first event, so the ~100% delegate path pays only
@@ -330,7 +353,10 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
     answer = text.strip()
     if not answer:
         return None
-    # The fifth discard condition (ENG-2423).  An answer that names another AI
+    if names_gate_tool(answer) is not None:
+        logger.info("[gate] discarding direct answer naming the gate's own tool; delegating")
+        raise _RejectedAnswer("router_answer_named_gate_tool", "gate tool")
+    # An answer that names another AI
     # product is, on this gate, overwhelmingly the model describing itself as
     # that product — telling a user to install the ChatGPT desktop app when they
     # asked how to install Cowork.  Discarding here rather than post-hoc is what
