@@ -8,7 +8,7 @@ from anton.utils.datasources import _reset_registered_ds_vars, begin_ds_turn_sco
 
 import cowork.services.connectors.vault_secrets as vault_secrets_mod
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.scoped import MissingTenantScopeError, TenantScope
+from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError, TenantScope
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 
 
@@ -57,3 +57,15 @@ async def test_concurrent_orgs_each_redact_only_their_own_secret(monkeypatch, tm
 
     assert "alphaSecret1" not in seen_by_a and "bravoSecret2" in seen_by_a
     assert "bravoSecret2" not in seen_by_b and "alphaSecret1" in seen_by_b
+
+
+async def test_an_empty_vault_skips_the_registry_rebuild(monkeypatch, tmp_path):
+    """An org with no connections has nothing to register, so its turns must
+    not pay for anton re-parsing the datasource registry."""
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "vault"))
+    rebuilds = []
+    monkeypatch.setattr(vault_secrets_mod, "restore_namespaced_env", rebuilds.append)
+
+    await register_vault_secrets(LOCAL_SCOPE)
+
+    assert rebuilds == []

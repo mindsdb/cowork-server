@@ -21,7 +21,12 @@ logger = get_logger(__name__)
 
 
 def _restore_from_vault(scope: TenantScope | None) -> None:
-    restore_namespaced_env(vault_for_scope(scope))
+    vault = vault_for_scope(scope)
+    # Nothing to register, and the rebuild re-parses anton's datasource
+    # registry every time, which is most of its per-turn cost.
+    if not vault.list_connections():
+        return
+    restore_namespaced_env(vault)
 
 
 async def register_vault_secrets(scope: TenantScope | None) -> None:
@@ -32,10 +37,10 @@ async def register_vault_secrets(scope: TenantScope | None) -> None:
     is this request's own and reaches every task spawned from it. A failure
     must not fail the turn: scrubbing falls back to the shape-based regex.
     """
-    # The scope opens here, in the request's context, and the rebuild runs in
-    # a worker thread so the vault reads don't stall other orgs' streams. The
-    # thread gets a copy of the context, which holds the same containers, and
-    # anton fills them in place, so the rebuild lands in this request's scope.
+    # The scope opens here, in the request's context, and the vault reads and
+    # rebuild run in a worker thread, off the event loop. The thread gets a
+    # copy of the context, which holds the same containers, and anton fills
+    # them in place, so the rebuild lands in this request's scope.
     begin_ds_turn_scope()
     try:
         await asyncio.to_thread(_restore_from_vault, scope)
