@@ -364,9 +364,13 @@ class DatasourceCreateRequest(BaseModel):
 
 
 class DatasourceEditRequest(DatasourceCreateRequest):
-    """An edit, guarded by the version the client believes it is editing."""
+    """An edit, guarded by the connection revision the client read.
 
-    expected_version: int = Field(ge=1)
+    Auth moves the revision on every edit, a rename included, so an edit made
+    from a stale read is refused; the credential version is not the guard.
+    """
+
+    expected_revision: int = Field(ge=1)
 
 
 class DatasourceConnectionResponse(BaseModel):
@@ -384,6 +388,7 @@ class DatasourceConnectionResponse(BaseModel):
     name: str
     status: str
     credential_version: int
+    revision: int
     host_masked: str
     port: int | None = None
     database: str

@@ -359,7 +359,7 @@ def test_an_unknown_key_is_rejected_by_the_schema():
         )
 
 
-def test_edit_requires_a_positive_expected_version():
+def test_edit_requires_a_positive_expected_revision():
     import pydantic
 
     edit = DatasourceEditRequest(
@@ -371,9 +371,9 @@ def test_edit_requires_a_positive_expected_version():
         database="appdb",
         username="dbuser",
         password=PASSWORD,
-        expected_version=3,
+        expected_revision=3,
     )
-    assert edit.expected_version == 3
+    assert edit.expected_revision == 3
     assert normalize_datasource_input(edit)["host"] == "db.example.com"
 
     with pytest.raises(pydantic.ValidationError):
@@ -385,7 +385,24 @@ def test_edit_requires_a_positive_expected_version():
             database="appdb",
             username="dbuser",
             password=PASSWORD,
-            expected_version=0,
+            expected_revision=0,
+        )
+
+
+def test_an_edit_that_still_sends_the_credential_version_as_its_guard_is_refused():
+    """Once a rename has moved the revision the two counters differ, so the old
+    field cannot be mapped onto the new one; refusing it is the only safe answer."""
+    with pytest.raises(ValidationError, match="expected_version"):
+        DatasourceEditRequest(
+            connector_id="postgres",
+            method="host-port",
+            name="prod reporting",
+            host="db.example.com",
+            database="appdb",
+            username="dbuser",
+            password=PASSWORD,
+            expected_revision=6,
+            expected_version=2,
         )
 
 
@@ -398,6 +415,7 @@ def test_the_response_model_drops_an_auth_field_this_server_does_not_know():
             "name": "prod reporting",
             "status": "pending",
             "credential_version": 1,
+            "revision": 6,
             "host_masked": "db***om",
             "port": 5432,
             "database": "appdb",
