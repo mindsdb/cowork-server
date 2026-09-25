@@ -406,13 +406,20 @@ async def format_responses_stream(
                 # on nothing.
                 pass
             else:
-                # First tool_progress for a given id must never be dropped
-                # by throttling — losing it would mean the lazily-created
-                # step in the renderer is never created, and a later
-                # tool_done for the same id would then have nothing to
-                # close (thought.tool_call.end on the frontend is a no-op
-                # when there's no matching step).
-                is_first_progress_for_id = is_tool_progress and event.id not in progress_tool_ids
+                # Every tool_progress line is a step announcement and is
+                # never throttled (ENG-2981): reasoning_start from a tool's
+                # own LLM calls lands in the same window, and dropping the
+                # line loses a pipeline step from the chat. Losing the FIRST
+                # line would also leave the renderer's lazily-created tool
+                # step missing, so a later tool_done would close nothing.
+                #
+                # Invariant: a tool emits a handful of these per run (today
+                # only anton's generate_artifact, one line per pipeline
+                # step). A tool that streams many lines must not use
+                # tool_progress — the live tail has its own tool_peek phase,
+                # relayed only to hosts that set live_tool_peek (this server
+                # does not). If that ever changes, revisit this exemption,
+                # e.g. drop only a repeat of the same line for the same id.
                 if is_tool_progress:
                     progress_tool_ids.add(event.id)
 
@@ -423,7 +430,7 @@ async def format_responses_stream(
                 never_throttle = (
                     is_scratchpad_phase
                     or is_tool_done
-                    or is_first_progress_for_id
+                    or is_tool_progress
                     or is_rate_limited_notice
                     or is_skill_draft_notice
                 )
