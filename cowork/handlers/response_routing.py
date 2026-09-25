@@ -226,8 +226,8 @@ _GATE_TOOL_RE = re.compile(
 class _RejectedAnswer(Exception):
     """The gate produced an answer we will not ship; delegate instead.
 
-    ``reason`` is the delegation reason the decision carries, so the two
-    rejection shapes stay countable apart in traces.
+    ``reason`` is the delegation reason the decision carries, so each
+    rejection shape stays countable apart in traces.
     """
 
     def __init__(self, reason: str, evidence: str) -> None:
@@ -288,12 +288,11 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
     Returns the direct answer, or None to delegate — on a tool call (as an
     event, or reported on the completed response), an empty answer, or one that
     overran ``_DIRECT_MAX_TOKENS``, which is evidence the turn was not trivial.
-    Raises ``_RejectedAnswer`` on an answer naming the gate's own tool, one
-    naming another AI product, or one denying that our own product can be
-    identified or exists (ENG-2423): also
+    Raises ``_RejectedAnswer`` on an answer naming another AI product, or one
+    denying that our own product can be identified or exists (ENG-2423): also
     delegations, but raised rather than returned as None so the decision can
     carry its own reason instead of reporting that the model declined, which it
-    did not.
+    did not. An answer naming the gate's own tool raises it the same way.
 
     Streaming is what makes the budget meetable: the delegate decision is the
     first event, so the ~100% delegate path pays only
@@ -357,7 +356,7 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
     if names_gate_tool(answer) is not None:
         logger.info("[gate] discarding direct answer naming the gate's own tool; delegating")
         raise _RejectedAnswer("router_answer_named_gate_tool", "gate tool")
-    # The fifth discard condition (ENG-2423).  An answer that names another AI
+    # An answer that names another AI
     # product is, on this gate, overwhelmingly the model describing itself as
     # that product — telling a user to install the ChatGPT desktop app when they
     # asked how to install Cowork.  Discarding here rather than post-hoc is what

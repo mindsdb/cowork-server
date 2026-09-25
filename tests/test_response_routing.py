@@ -1627,12 +1627,13 @@ def test_known_gate_tool_over_fires_are_accepted_and_pinned(sentence):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("answer", _GATE_TOOL_ANSWERS[:1] + _GATE_TOOL_ANSWERS[4:5])
+@pytest.mark.parametrize("answer", _GATE_TOOL_ANSWERS)
 async def test_streamed_gate_answer_naming_the_gate_tool_is_discarded_and_delegated(answer):
     """Streamed as text, as a local endpoint sends it, and never shipped.
 
-    Empty `text` is what keeps `_handle_direct_response` from persisting it, so
-    the agent's next turn never sees the gate's tool in its history.
+    Only a DIRECT_CONTEXT route reaches `_handle_direct_response`, which is what
+    persists an answer, so the delegated route keeps the gate's tool out of the
+    agent's history.
     """
     provider = _StreamProvider([_text(answer[:20]), _text(answer[20:]), _complete()])
 
