@@ -229,7 +229,7 @@ async def test_when_every_address_times_out_the_attempts_share_one_connect_timeo
             resolver=_dual_stack_answer(),
         )
 
-    assert len(seen) > 1
+    assert len(seen) == 4
     assert sum(request.extensions["timeout"]["connect"] for request in seen) <= 15.0
     assert KEY not in str(refused.value)
 
