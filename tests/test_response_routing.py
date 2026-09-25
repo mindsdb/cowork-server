@@ -1567,3 +1567,85 @@ def test_the_adjective_denial_still_catches_the_prod_failure():
 
     assert denies_our_product("There is no verified Cowork desktop app that I could find.")
     assert denies_our_product("There's no such app as MindsHub Cowork that I know of.")
+
+
+# ── the gate's own tool must never reach history as a direct answer ──────────
+
+
+_GATE_TOOL_ANSWERS = [
+    # A local server that fails to parse the model's call streams it as text.
+    '<tool_call>\n{"name": "delegate", "arguments": {"reason": "needs files"}}\n</tool_call>',
+    'delegate(reason="the user wants a file created")',
+    "[TOOL_CALLS][{\"name\": \"delegate\", \"arguments\": {}}]",
+    "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>handoff",
+    # A small model answering "list your tools" from its one visible tool.
+    "I have one tool available:\n\n- **delegate**: forwards the task to the assistant's backend.",
+    "The only tool I can use is the delegate tool.",
+    "Tools:\n- delegate: Delegate when a request requires the full agent.",
+]
+
+
+@pytest.mark.parametrize("answer", _GATE_TOOL_ANSWERS)
+def test_gate_tool_matcher_catches_text_calls_and_self_descriptions(answer):
+    from cowork.handlers.response_routing import names_gate_tool
+
+    assert names_gate_tool(answer) is not None
+
+
+def test_gate_tool_matcher_does_not_fire_on_related_words():
+    """Whole word only: inflections and compounds of the tool name still ship."""
+    from cowork.handlers.response_routing import names_gate_tool
+
+    for benign in (
+        "Those permissions were delegated to the admin group.",
+        "Delegation works best when the owner of each task is clear.",
+        "Use redelegate to move your stake to another validator.",
+        "Hi there, how can I help?",
+    ):
+        assert names_gate_tool(benign) is None, benign
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "Try to delegate tasks to your team so you can focus on the roadmap.",
+        "Set the table view's delegate property to your view controller.",
+        "In C#, a delegate is a type that references a method.",
+    ],
+)
+def test_known_gate_tool_over_fires_are_accepted_and_pinned(sentence):
+    """Ordinary uses of the word DO fire, deliberately.
+
+    The paraphrases a model uses to describe its one visible tool vary far more
+    than the name does, so the name is matched as a whole word. A false positive
+    costs one hop on a path that fails open. Narrowing the matcher means updating
+    this test on purpose, not deleting it.
+    """
+    from cowork.handlers.response_routing import names_gate_tool
+
+    assert names_gate_tool(sentence) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", _GATE_TOOL_ANSWERS[:1] + _GATE_TOOL_ANSWERS[4:5])
+async def test_streamed_gate_answer_naming_the_gate_tool_is_discarded_and_delegated(answer):
+    """Streamed as text, as a local endpoint sends it, and never shipped.
+
+    Empty `text` is what keeps `_handle_direct_response` from persisting it, so
+    the agent's next turn never sees the gate's tool in its history.
+    """
+    provider = _StreamProvider([_text(answer[:20]), _text(answer[20:]), _complete()])
+
+    decision = await decide_route(
+        history=[{"role": "user", "content": "list the tools you have access to"}],
+        has_non_text_input=False,
+        has_attachments=False,
+        has_disabled_connections=False,
+        binding=_binding(provider),
+    )
+
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.reason == "router_answer_named_gate_tool"
+    assert decision.text == ""
+    assert decision.fallback is False
+    assert decision.model == "gate-model"

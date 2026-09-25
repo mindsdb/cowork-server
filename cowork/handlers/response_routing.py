@@ -208,6 +208,20 @@ _DENIES_PRODUCT_RE = re.compile(
     rf"|{_DENIAL_ADJ_ATTRIBUTIVE}"
 )
 
+# A direct answer is persisted as history, so one naming the gate's own tool
+# teaches the agent that tool exists. Two shapes reach here as text: a call the
+# endpoint failed to parse (local servers stream it as content), and a small
+# model describing its one visible tool. Whole word, because the paraphrases
+# vary far more than the name does; a false positive costs one hop.
+_TEXT_TOOL_CALL_MARKERS = (
+    r"<tool_call>", r"<\|tool_call\|>", r"\[TOOL_CALLS\]", r"<function=", r"tool▁call▁begin",
+)
+_GATE_TOOL_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])%s(?![A-Za-z0-9_-])|%s"
+    % (re.escape(_DELEGATE_TOOL["name"]), "|".join(_TEXT_TOOL_CALL_MARKERS)),
+    re.IGNORECASE,
+)
+
 
 class _RejectedAnswer(Exception):
     """The gate produced an answer we will not ship; delegate instead.
@@ -241,6 +255,15 @@ def denies_our_product(text: str) -> str | None:
     return " ".join(match.group(0).split())[:120] if match else None
 
 
+def names_gate_tool(text: str) -> str | None:
+    """The gate's tool name or a text tool-call marker found in ``text``, or None.
+
+    Exported for the same reason as :func:`names_foreign_product`.
+    """
+    match = _GATE_TOOL_RE.search(text or "")
+    return match.group(0) if match else None
+
+
 @dataclass(frozen=True)
 class RouterBinding:
     """A resolved gate target: an anton LLMProvider, model, and display label."""
@@ -265,8 +288,9 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
     Returns the direct answer, or None to delegate — on a tool call (as an
     event, or reported on the completed response), an empty answer, or one that
     overran ``_DIRECT_MAX_TOKENS``, which is evidence the turn was not trivial.
-    Raises ``_RejectedAnswer`` on an answer naming another AI product, or one
-    denying that our own product can be identified or exists (ENG-2423): also
+    Raises ``_RejectedAnswer`` on an answer naming the gate's own tool, one
+    naming another AI product, or one denying that our own product can be
+    identified or exists (ENG-2423): also
     delegations, but raised rather than returned as None so the decision can
     carry its own reason instead of reporting that the model declined, which it
     did not.
@@ -330,6 +354,9 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
     answer = text.strip()
     if not answer:
         return None
+    if names_gate_tool(answer) is not None:
+        logger.info("[gate] discarding direct answer naming the gate's own tool; delegating")
+        raise _RejectedAnswer("router_answer_named_gate_tool", "gate tool")
     # The fifth discard condition (ENG-2423).  An answer that names another AI
     # product is, on this gate, overwhelmingly the model describing itself as
     # that product — telling a user to install the ChatGPT desktop app when they
