@@ -168,6 +168,11 @@ packages = ["cowork"]
 # without rebuilding an active session (ENG-2116). Neither feature needs a rev
 # pin any more, so this tracks the branch and the lockfile records the resolved
 # commit that `uv sync --frozen` installs.
+#
+# The version-skew fallbacks in `services/providers.py` (the live supplier's
+# capability gate) and `handlers/turn_errors.py` (the legacy 401 classifier)
+# predate the `anton-agent` floor above, which no longer admits a release that
+# needs them.
 anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
 
 [dependency-groups]
