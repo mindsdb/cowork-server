@@ -180,6 +180,58 @@ async def test_a_dual_stack_answer_falls_back_to_the_next_vetted_address(org_mod
     assert seen == [PUBLIC_V6, PUBLIC_V4]
 
 
+def _dual_stack_answer() -> Callable[..., list[tuple]]:
+    """Eight records per family, IPv6 first, the shape PostHog's cloud hosts answer with."""
+    return _answer(*(f"2600:1f18::{index}" for index in range(1, 9)), *(f"93.184.216.{index}" for index in range(1, 9)))
+
+
+@pytest.mark.asyncio
+async def test_a_family_that_drops_packets_costs_one_short_attempt(org_mode):
+    """A route that silently drops packets raises a connect timeout rather than a
+    connect error, and waiting it out on each of eight records would take longer
+    than the request timeout before IPv4 was tried."""
+    seen: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if ":" in request.url.host:
+            raise httpx.ConnectTimeout("timed out", request=request)
+        return httpx.Response(200, json=PAYLOAD)
+
+    projects = await discover_projects(
+        personal_api_key=KEY,
+        host="https://us.posthog.com",
+        transport=httpx.MockTransport(handle),
+        resolver=_dual_stack_answer(),
+    )
+
+    assert [project.id for project in projects] == ["12"]
+    assert [request.url.host for request in seen] == ["2600:1f18::1", "93.184.216.1"]
+    assert seen[0].extensions["timeout"]["connect"] < 15.0
+    assert seen[0].extensions["timeout"]["read"] == 15.0
+
+
+@pytest.mark.asyncio
+async def test_when_every_address_times_out_the_connect_phase_fits_the_request_timeout(org_mode):
+    seen: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        raise httpx.ConnectTimeout("timed out", request=request)
+
+    with pytest.raises(PostHogDiscoveryError, match="Could not reach PostHog") as refused:
+        await discover_projects(
+            personal_api_key=KEY,
+            host="https://us.posthog.com",
+            transport=httpx.MockTransport(handle),
+            resolver=_dual_stack_answer(),
+        )
+
+    assert len(seen) > 1
+    assert sum(request.extensions["timeout"]["connect"] for request in seen) <= 15.0
+    assert KEY not in str(refused.value)
+
+
 @pytest.mark.asyncio
 async def test_a_redirect_is_not_followed(org_mode):
     """A 302 from an approved origin would otherwise be re-dialed wherever it
