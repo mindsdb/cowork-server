@@ -181,3 +181,44 @@ def granted_product_permissions(monkeypatch):
 
     monkeypatch.setattr(product_permissions, "has_product_permission", allowed)
     monkeypatch.setattr(artifact_workspace, "has_product_permission", allowed)
+
+
+def _set_datasource_adapter_flag(available: bool):
+    """Set `cloud.available` on the database specs, restoring it afterwards.
+
+    Mutates the registry's cached spec data, because that is what a release
+    flipping the flag looks like from the policy's side.
+    """
+    from cowork.services.connectors.specs._registry import registry
+
+    raw = registry.get_connectors()
+    restore: list[tuple[dict, bool]] = []
+    for connector_id in ("postgres", "mysql"):
+        for method in raw[connector_id]["form"].get("methods", []):
+            cloud = method.get("cloud")
+            if cloud is not None:
+                restore.append((cloud, cloud.get("available", False)))
+                cloud["available"] = available
+    yield
+    for cloud, previous in restore:
+        cloud["available"] = previous
+
+
+@pytest.fixture
+def adapter_verified_datasources():
+    """The database methods report that the hosted path can execute them.
+
+    The capability policy's first gate; a test about the deployment's own
+    enable list has to lift it.
+    """
+    yield from _set_datasource_adapter_flag(True)
+
+
+@pytest.fixture
+def adapter_unverified_datasources():
+    """The database methods report that the hosted path cannot execute them.
+
+    Set rather than assumed, so a test of that gate keeps its meaning on a
+    branch that ships the flag the other way round.
+    """
+    yield from _set_datasource_adapter_flag(False)
