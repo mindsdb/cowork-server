@@ -45,6 +45,12 @@ def test_a_single_address_gets_the_whole_budget():
     assert connection_attempts(V4[:1], total_seconds=15.0) == [(V4[0], 15.0)]
 
 
+def test_no_connect_limit_stays_unlimited_on_the_last_attempt_only():
+    attempts = connection_attempts(V6[:1] + V4[:1], total_seconds=None, fallback_seconds=3.0)
+
+    assert attempts == [(V6[0], 3.0), (V4[0], None)]
+
+
 def test_no_addresses_means_no_attempts():
     assert connection_attempts([], total_seconds=15.0) == []
 
