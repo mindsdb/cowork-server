@@ -109,6 +109,10 @@ async def edit_datasource_connection(
     payload = normalize_datasource_input(body)
     payload["expected_revision"] = body.expected_revision
     result = await auth_proxy.proxy_datasource_edit(connection_id, request, OAuthSettings(), payload)
+    # Auth keeps a connection verified only when the edit left its credential
+    # untouched, as a rename does; probing it again would dial the same database.
+    if result.get("status") == "verified":
+        return DatasourceConnectionResponse.model_validate(result)
     return DatasourceConnectionResponse.model_validate(await _validated(result, request))
 
 
