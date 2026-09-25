@@ -575,13 +575,13 @@ def test_autopublish_skips_a_side(tmp_path, monkeypatch):
     scope = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
 
     side_base = tmp_path / f"{COMPARISON_SANDBOX_PREFIX}abc" / ".anton" / "artifacts"
-    assert asyncio.run(artifact_autopublish.autopublish_project_artifacts(side_base, scope, touched=set())) == set()
+    assert asyncio.run(artifact_autopublish.autopublish_project_artifacts(side_base, scope, touched=set(), project_id="p-side")) == set()
     assert candidates == []
 
     ordinary = tmp_path / "reports" / ".anton" / "artifacts"
     monkeypatch.setattr(artifact_autopublish, "_publish_url", lambda scope: "https://x")
     monkeypatch.setattr(artifact_autopublish, "_active_workspace_id", lambda scope: None)
-    asyncio.run(artifact_autopublish.autopublish_project_artifacts(ordinary, scope, touched=set()))
+    asyncio.run(artifact_autopublish.autopublish_project_artifacts(ordinary, scope, touched=set(), project_id="p-real"))
     assert candidates == [ordinary]
 
 
