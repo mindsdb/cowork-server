@@ -5,7 +5,7 @@ from pathlib import Path
 import shutil
 import tempfile
 
-from cowork.build_info import supported_kwargs, surface_kwarg
+from cowork.build_info import account_kwargs, supported_kwargs, surface_kwarg
 from cowork.common.chat_session import build_chat_session
 from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.logger import get_logger
@@ -95,27 +95,15 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     return applied
 
 
-def _apply_model_override(anton_settings, model: str | None) -> list[str]:
-    """A per-conversation model pick (the composer's dropdown) overrides
-    planning/coding/router for THIS call only — the account-wide
-    planning_model/coding_model/router_model settings applied by
-    ``_overlay_user_settings`` above are left untouched for every other
-    conversation. Provider is deliberately NOT overridden: the composer's
-    model list is itself scoped to whichever provider is already configured,
-    so the existing planning/coding/router providers stay correct for the
-    picked model.
+def _apply_client_models(anton_settings, llm_client) -> list[str]:
+    """Keep runtime context consistent with the models the client will use.
 
-    No-op (returns []) when ``model`` is falsy, so the account-wide defaults
-    keep governing conversations with no per-conversation pick.
-
-    Same hasattr skew guard as ``_overlay_user_settings`` — see its docstring.
+    Guard both sides for older Anton versions without the router role.
     """
-    if not model:
-        return []
     applied: list[str] = []
     for attr in ("planning_model", "coding_model", "router_model"):
-        if hasattr(anton_settings, attr):
-            setattr(anton_settings, attr, model)
+        if hasattr(anton_settings, attr) and hasattr(llm_client, attr):
+            setattr(anton_settings, attr, getattr(llm_client, attr))
             applied.append(attr)
     return applied
 
@@ -432,7 +420,7 @@ class AntonHarness:
         conversation: Conversation,
         input: list[TextInputBlock | FileInputBlock],
         # Per-conversation model pick (the composer's dropdown) — overrides
-        # planning/coding/router for this call only; see _build_chat_session.
+        # roles on the planning provider for this call only; see _build_chat_session.
         model: str | None = None,
         # Per-task reasoning-effort pick (the composer's Effort sub-picker) —
         # overrides planning/coding effort for this call only; see
@@ -736,15 +724,28 @@ class AntonHarness:
         )
 
     @staticmethod
+    def compaction_cutoff_index(seed_info: dict, covered_through: int, total: int) -> int | None:
+        """Index of the last seeded message a compaction covers, or None.
+
+        `covered_through` counts entries of the `initial_history` that was
+        seeded, which starts with `synthetic_prefix_len` non-real entries (the
+        summary, plus an assistant separator when one was needed) — so they
+        come off before the count maps onto real messages.
+
+        Returns None when the compaction covers nothing real or lands outside
+        the list: both mean "don't save a cutoff", not an error. The hosted
+        path shares this because `covered_through` arrives from the pod there,
+        where an out-of-range value is untrusted input rather than a bug.
+        """
+        covered = covered_through - seed_info["synthetic_prefix_len"]
+        if covered <= 0:
+            return None
+        idx = seed_info["tail_start"] + covered - 1
+        return idx if 0 <= idx < total else None
+
+    @staticmethod
     def _persist_history_compaction(conversation: Conversation, session, seed_info: dict) -> None:
         """Save anton's compacted summary + cutoff if it compacted this turn.
-
-        `seed_info["ordered_messages"]`/`["tail_start"]` are what this turn's
-        `initial_history` was built from; `["synthetic_prefix_len"]` is how
-        many non-real entries (summary, plus an assistant separator if one was
-        needed) were prepended ahead of them — `covered_through` from
-        `session.last_compaction` counts those too, so they must be subtracted
-        before mapping onto `ordered_messages`.
 
         `getattr` (not `session.last_compaction` directly): an anton build
         predating this property must no-op here, not raise — cowork-server and
@@ -753,13 +754,11 @@ class AntonHarness:
         compaction = getattr(session, "last_compaction", None)
         if compaction is None:
             return
-        offset = seed_info["synthetic_prefix_len"]
-        covered = compaction["covered_through"] - offset
-        if covered <= 0:
-            return
         ordered_messages = seed_info["ordered_messages"]
-        idx = seed_info["tail_start"] + covered - 1
-        if not (0 <= idx < len(ordered_messages)):
+        idx = AntonHarness.compaction_cutoff_index(
+            seed_info, compaction["covered_through"], len(ordered_messages),
+        )
+        if idx is None:
             return
         from sqlalchemy.orm import object_session
         from cowork.db.scoped import adopt_scoped_session
@@ -888,8 +887,6 @@ class AntonHarness:
         if router_model is not None and hasattr(anton_settings, "router_model"):
             anton_settings.router_model = router_model
 
-        _apply_model_override(anton_settings, model)
-
         workspace = Workspace(base)
         workspace.initialize()
         workspace_env_overlay = _load_workspace_env_if_safe(workspace)
@@ -919,7 +916,8 @@ class AntonHarness:
         for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir, project_memory_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
-        llm_client = self._build_llm_client(effort=reasoning_effort)
+        llm_client = self._build_llm_client(effort=reasoning_effort, model=model)
+        _apply_client_models(anton_settings, llm_client)
         self_awareness = SelfAwarenessContext(context_dir)
 
         from cowork.common.settings.app_settings import get_app_settings
@@ -1156,6 +1154,11 @@ class AntonHarness:
             # and both report harness="anton" (ENG-1459). Only the deployment
             # knows which, so it is resolved here rather than by anton.
             **surface_kwarg(ChatSessionConfig),
+            # WHO the user is, so anton keys `turn_completed` on the account
+            # rather than the machine (ENG-2121). Opaque ids from the held
+            # MindsHub JWT only; {} when there is none or the pinned anton
+            # predates the fields.
+            **account_kwargs(ChatSessionConfig),
             proactive_dashboards=anton_settings.proactive_dashboards,
             act_first=anton_settings.act_first,
             # "Conversation started" stamp for the cache-stable prompt prefix
@@ -1185,6 +1188,6 @@ class AntonHarness:
         return build_chat_session(config), temp_vault_dir, seed_info
 
     @staticmethod
-    def _build_llm_client(effort: str | None = None):
+    def _build_llm_client(effort: str | None = None, *, model: str | None = None):
         from cowork.services.providers import build_llm_client
-        return build_llm_client(effort_override=effort)
+        return build_llm_client(effort_override=effort, model_override=model)

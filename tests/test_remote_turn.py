@@ -20,12 +20,13 @@ class _FakeSession:
 
 
 def _fake_handler(monkeypatch, *, persist_turn_memory=None, remote_artifacts_context=None):
-    """Replace ResponsesHandler with a stand-in exposing only the 5 methods
+    """Replace ResponsesHandler with a stand-in exposing only the methods
     remote_turn_events calls, resolved at call time like every other name here."""
     monkeypatch.setattr(remote_turn_mod, "ResponsesHandler", type(
         "FakeResponsesHandler", (), {
             "_remote_artifacts_context": staticmethod(remote_artifacts_context or (lambda s, c: None)),
-            "_remote_history": staticmethod(lambda s, c: []),
+            "_remote_seed_history": staticmethod(lambda s, c: ([], None)),
+            "_persist_remote_compaction": staticmethod(lambda c, d, si, sc: None),
             "_remote_workspace": staticmethod(lambda s, c: {}),
             "_remote_started_at": staticmethod(lambda s, c: None),
             "_persist_turn_memory": staticmethod(persist_turn_memory or (lambda s, c, e: None)),
@@ -200,3 +201,32 @@ async def test_only_authorized_persistent_turns_touch_saved_artifacts(monkeypatc
     assert events[0].text == "model still runs"
     assert index.call_count == int(workspace_mode == "persistent")
     assert publish.await_count == int(workspace_mode == "persistent" and not failed)
+
+
+@pytest.mark.parametrize("failed", [False, True])
+async def test_only_an_unfinished_turn_claims_unattributed_artifacts(monkeypatch, failed):
+    """ENG-2961 R1: a turn cut short between anton's metadata write and its
+    provenance append leaves a folder with no provenance; only a non-clean exit
+    may claim it. The producer tells `index_turn_artifacts` how the turn ended
+    and leaves the provenance filter to it."""
+    from unittest.mock import AsyncMock, Mock
+    from cowork.services import task_objects
+
+    context = (object(), object(), "project", "Project")
+    _fake_handler(monkeypatch, remote_artifacts_context=lambda *_: context)
+    monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_: (set(), {}))
+    index = Mock(return_value=([], set(), None))
+    monkeypatch.setattr(task_objects, "index_turn_artifacts", index)
+    monkeypatch.setattr(task_objects, "publish_and_card_turn_artifacts", AsyncMock(return_value=[]))
+
+    async def replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield ("turn_failed" if failed else "turn_completed"), {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", replies)
+    await _drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org", user_id="user",
+        input_text="run", model="m", turn_rows=[],
+    ))
+    assert index.call_args.kwargs["attribute_by_provenance"] is True
+    assert index.call_args.kwargs["completed_cleanly"] is (not failed)

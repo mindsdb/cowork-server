@@ -44,6 +44,7 @@ async def remote_turn_events(
         snapshot_artifact_state,
     )
 
+    seeded_history, seed_info = ResponsesHandler._remote_seed_history(session, conv_id)
     artifacts = ResponsesHandler._remote_artifacts_context(session, conv_id)
     before_slugs, before_mtimes = (
         snapshot_artifact_state(artifacts[1]) if artifacts else (set(), {})
@@ -52,6 +53,8 @@ async def remote_turn_events(
     touched_slugs: set[str] = set()
     turn_scope = None
     artifact_writes_allowed = False
+    # Set only on turn_completed; see `turn_created_slugs(accept_unattributed=)`.
+    completed_cleanly = False
 
     try:
         async for kind, data in stream_remote_replies(
@@ -61,7 +64,7 @@ async def remote_turn_events(
             input_text=input_text,
             model=model,
             turn_id=turn_id,
-            history=ResponsesHandler._remote_history(session, conv_id),
+            history=seeded_history,
             **ResponsesHandler._remote_workspace(session, conv_id),
             started_at=ResponsesHandler._remote_started_at(session, conv_id),
             correlation_id=correlation_id,
@@ -78,6 +81,10 @@ async def remote_turn_events(
                 ResponsesHandler._persist_turn_memory(session, conv_id, data.get("entries") or [])
             elif kind == "turn_history":
                 turn_rows[:] = sanitize_turn_history_rows(data.get("rows"))
+            elif kind == "turn_compaction":
+                ResponsesHandler._persist_remote_compaction(
+                    conv_id, data, seed_info, session.scope,
+                )
             elif kind == "turn_skill":
                 for entry in data.get("entries") or []:
                     payload, reasons = remote_skill_draft_result(entry)
@@ -86,6 +93,7 @@ async def remote_turn_events(
                     for reason in reasons:
                         yield StreamTaskProgress(phase="skill_draft_dropped", message=reason)
             elif kind == "turn_completed":
+                completed_cleanly = True
                 break
             elif kind == "turn_failed":
                 message = data.get("message") or GENERIC_TURN_ERROR_MESSAGE
@@ -96,6 +104,8 @@ async def remote_turn_events(
             new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
                 artifacts[0], conv_id, artifacts[2], artifacts[1],
                 before_slugs, before_mtimes,
+                attribute_by_provenance=True,
+                completed_cleanly=completed_cleanly,
             )
 
     if artifacts is not None and artifact_writes_allowed:

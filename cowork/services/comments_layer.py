@@ -1079,9 +1079,18 @@ LAYER_JS = (LAYER_JS
             .replace("__LAYER_CSS__", json.dumps(_LAYER_CSS)))
 
 
-# Precomputed once: the JS is a constant blob, and a literal ``</script>`` in it
-# would break out of the injected tag.
-_SCRIPT_TAG = "<script>%s</script>" % LAYER_JS.replace("</script>", "<\\/script>")
+def script_tag(js: str) -> str:
+    """Wrap ``js`` in a ``<script>`` element safe to splice into a document.
+
+    A literal ``</script>`` in the payload would break out of the injected tag,
+    so it is escaped. Shared with preview_shim: the escaping rule is a
+    boundary, and both injected scripts must apply the same one.
+    """
+    return "<script>%s</script>" % js.replace("</script>", "<\\/script>")
+
+
+# Precomputed once: the JS is a constant blob.
+_SCRIPT_TAG = script_tag(LAYER_JS)
 # Case-insensitive so we anchor to the real body close in mixed-case documents,
 # without allocating a full lowercased copy of the (possibly large) HTML.
 _BODY_CLOSE_RE = re.compile(r"</body\s*>", re.IGNORECASE)
