@@ -562,7 +562,7 @@ async def test_route_request_scrubs_a_registered_vault_secret_by_value(monkeypat
     from anton.core.datasources.data_vault import LocalDataVault
     from anton.utils.datasources import _reset_registered_ds_vars
 
-    from cowork.common.history_scrub import register_vault_secrets
+    from cowork.services.connectors.vault_secrets import register_vault_secrets
     from cowork.models.message_event import MessageEvent  # noqa: F401 — resolves the ORM relationship
     from cowork.models.message import Message
     from cowork.schemas.responses import Role

@@ -114,7 +114,7 @@ def test_remote_history_scrubs_a_registered_vault_secret_by_value(monkeypatch, t
     from anton.core.datasources.data_vault import LocalDataVault
     from anton.utils.datasources import _reset_registered_ds_vars
 
-    from cowork.common.history_scrub import register_vault_secrets
+    from cowork.services.connectors.vault_secrets import register_vault_secrets
     from cowork.db.scoped import LOCAL_SCOPE
 
     monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "vault"))

@@ -15,7 +15,7 @@ from sqlmodel import Session
 
 from cowork.build_info import build_trace_metadata
 from cowork.common.chat_session import in_process_agent_allowed
-from cowork.common.history_scrub import register_vault_secrets, scrub_credentials, scrubbed_openai_dump
+from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings
 from cowork.common.settings.user_settings import (
     Provider,
@@ -81,6 +81,7 @@ from cowork.handlers.turn_errors import (
 )
 from cowork.db.scoped import ScopedSession, TenantScope, scope_from_principal
 from cowork.principal import Principal, identity_trace_metadata
+from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.product_permissions import (

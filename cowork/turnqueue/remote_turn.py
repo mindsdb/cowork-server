@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from cowork.common.history_scrub import register_vault_secrets
 from cowork.db.scoped import ScopedSession
 from cowork.handlers.responses import ResponsesHandler
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
+from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
 
 
