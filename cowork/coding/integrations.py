@@ -16,6 +16,7 @@ from cowork.coding.project_models import (
     DeliveryRecord,
     IntegrationStatus,
     ProjectConnection,
+    RepositoryResource,
     PublishRequest,
     PullRequestActionRequest,
     PullRequestStatus,
@@ -26,8 +27,9 @@ from cowork.coding.project_models import (
     WorkItemSearchRequest,
 )
 from cowork.coding.work_discovery import DeveloperWorkDiscovery
+from cowork.coding.repository_discovery import GitHubRepositoryPage, github_repositories
 from cowork.coding.workspace import WorkspaceError
-from cowork.db.scoped import TenantScope
+from cowork.db.scoped import TenantScope, scope_for_background_context
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.developer_validation import (
     DeveloperCredentialError,
@@ -48,6 +50,17 @@ class SlackTarget:
 class GitPushCredentials:
     remote_url: str
     environment: dict[str, str]
+
+
+def local_repository_credentials(project: CodeProject, resource: RepositoryResource) -> GitPushCredentials:
+    """Resolve credentials at use time, only on the local desktop execution plane."""
+    if not any(connection.provider == "github" and connection.name == resource.connector_name for connection in project.connections):
+        raise WorkspaceError("Add this repository's GitHub connection to the Code Project before starting a task")
+    integration = DeveloperIntegrationService(scope_for_background_context())
+    try:
+        return integration.git_push_credentials(project, resource.source_url or "", resource.connector_name)
+    finally:
+        integration.close()
 
 
 class DeveloperIntegrationService:
@@ -122,6 +135,13 @@ class DeveloperIntegrationService:
             query=request.query,
             limit=request.limit,
             connection_name=connection.name,
+        )
+
+    def repositories(self, connection_name: str, page: int = 1) -> GitHubRepositoryPage:
+        connection, fields = self._account_connection("github", connection_name)
+        api, token, host = self._github_credentials(fields)
+        return github_repositories(
+            self._request, api=api, token=token, host=host, connection_name=connection.name, page=page,
         )
 
     def _account_connection(

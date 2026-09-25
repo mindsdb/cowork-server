@@ -65,6 +65,7 @@ from cowork.coding.inference_proxy import (
     proxy_inference,
 )
 from cowork.coding.integrations import DeveloperIntegrationService
+from cowork.coding.repository_discovery import GitHubRepositoryPage
 from cowork.coding.project_models import (
     DraftPullRequestRequest,
     PlaybookConfigureRequest,
@@ -156,6 +157,15 @@ def _integration_service(scope: ScopeDep):
 
 
 IntegrationsDep = Annotated[DeveloperIntegrationService, Depends(_integration_service)]
+
+
+@router.get("/github/repositories", response_model=GitHubRepositoryPage)
+def list_github_repositories(
+    integrations: IntegrationsDep,
+    connection_name: Annotated[str, Query(min_length=1, max_length=512)],
+    page: Annotated[int, Query(ge=1, le=10_000)] = 1,
+):
+    return _call(integrations.repositories, connection_name, page)
 
 
 def _http_error(exc: Exception) -> HTTPException:

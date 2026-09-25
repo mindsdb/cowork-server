@@ -6,8 +6,10 @@ import shutil
 import socket
 import subprocess
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from cowork.coding.contracts import DiffFile, GitState, TaskWorkspace, WorkspaceKind
 from cowork.coding.control_models import ExecutionWorkspace, WorkspaceStatus
@@ -29,6 +31,9 @@ from cowork.coding.workspace import (
     _org_mode,
 )
 from cowork.coding.workspace_key import managed_key
+
+if TYPE_CHECKING:
+    from cowork.coding.integrations import GitPushCredentials
 
 
 @dataclass(frozen=True)
@@ -157,10 +162,12 @@ class ProjectWorkspaceManager:
         workspaces: WorkspaceManager,
         ports: PortAllocator | None = None,
         commands: ProjectCommandRunner | None = None,
+        repository_credentials: Callable[[CodeProject, RepositoryResource], GitPushCredentials] | None = None,
     ) -> None:
         self.workspaces = workspaces
         self.ports = ports or PortAllocator()
         self.commands = commands or ProjectCommandRunner()
+        self.repository_credentials = repository_credentials
         self._lock = threading.RLock()
 
     def prepare(self, session_id: str, project: CodeProject) -> PreparedProjectWorkspace:
@@ -168,7 +175,7 @@ class ProjectWorkspaceManager:
             prepared: list[TaskWorkspace] = []
             try:
                 for resource in project.resources:
-                    folder = self._runtime_folder(resource)
+                    folder = self._runtime_folder(resource, project)
                     key = self._key(session_id, folder.id)
                     item = self.workspaces.prepare(key, folder.path, True, folder.base_branch)
                     prepared.append(self._task_workspace(session_id, project.name, folder, item))
@@ -197,7 +204,7 @@ class ProjectWorkspaceManager:
                 record = by_resource[resource.id]
                 if record.status != WorkspaceStatus.ready or not record.path:
                     raise WorkspaceError(f"The workspace for {resource.name} is no longer available")
-                folder = self._runtime_folder(resource)
+                folder = self._runtime_folder(resource, project)
                 expected = (self.workspaces.worktrees_root / managed_key(self._key(session_id, folder.id))).resolve()
                 actual = Path(record.path).expanduser().resolve()
                 if actual != expected or not actual.is_dir():
@@ -224,26 +231,41 @@ class ProjectWorkspaceManager:
             ports = self.ports.allocate(session_id, project.environment.port_names)
             return PreparedProjectWorkspace(primary=restored[0], workspaces=tuple(restored), ports=ports)
 
-    def _runtime_folder(self, resource: ProjectResource) -> ProjectFolder:
+    def _runtime_folder(self, resource: ProjectResource, project: CodeProject) -> ProjectFolder:
         if isinstance(resource, LocalFolderResource):
             return resource_folder(resource)
         path = Path(resource.local_path).expanduser() if resource.local_path else None
         if path is None or not path.is_dir():
             if not resource.source_url:
                 raise WorkspaceError(f"Repository is unavailable on this computer: {resource.name}")
-            path = self._repository_cache(resource)
+            credentials = None
+            if resource.connector_name and self.repository_credentials:
+                credentials = self.repository_credentials(project, resource)
+            path = self._repository_cache(resource, credentials)
         return resource_folder(resource.model_copy(update={"local_path": str(path)}))
 
-    def _repository_cache(self, resource: RepositoryResource) -> Path:
+    def _repository_cache(self, resource: RepositoryResource, credentials: GitPushCredentials | None = None) -> Path:
         assert resource.source_url is not None
         try:
             source_url = validate_git_source(resource.source_url)
         except ValueError as exc:
             raise WorkspaceError(str(exc)) from exc
         key = hashlib.sha256(source_url.encode()).hexdigest()[:24]
+        environment = None
+        if credentials:
+            source_url = validate_git_source(credentials.remote_url)
+            # Auth is process-local and URL-scoped. Do not forward it through
+            # redirects or save it in the repository's config.
+            config_count = int(credentials.environment.get("GIT_CONFIG_COUNT", "0"))
+            environment = {
+                **credentials.environment,
+                "GIT_CONFIG_COUNT": str(config_count + 1),
+                f"GIT_CONFIG_KEY_{config_count}": "http.followRedirects",
+                f"GIT_CONFIG_VALUE_{config_count}": "false",
+            }
         root = self.workspaces.root / "repositories" / key
         if root.is_dir():
-            self._refresh_repository_cache(root, resource)
+            self._refresh_repository_cache(root, resource, environment)
             return root
         root.parent.mkdir(parents=True, exist_ok=True)
         temporary = root.with_name(f".{root.name}.tmp")
@@ -257,6 +279,7 @@ class ProjectWorkspaceManager:
                 source_url,
                 str(temporary),
                 check=False,
+                environment=environment,
             )
             if result.returncode != 0:
                 detail = (result.stderr or result.stdout or "Git clone failed").strip()
@@ -267,7 +290,9 @@ class ProjectWorkspaceManager:
                 shutil.rmtree(temporary)
         return root
 
-    def _refresh_repository_cache(self, root: Path, resource: RepositoryResource) -> None:
+    def _refresh_repository_cache(
+        self, root: Path, resource: RepositoryResource, environment: dict[str, str] | None = None,
+    ) -> None:
         fetched = self.workspaces.git.run(
             root,
             "fetch",
@@ -275,6 +300,7 @@ class ProjectWorkspaceManager:
             "--prune",
             "origin",
             check=False,
+            environment=environment,
         )
         if fetched.returncode != 0:
             detail = (fetched.stderr or fetched.stdout or "Git fetch failed").strip()
