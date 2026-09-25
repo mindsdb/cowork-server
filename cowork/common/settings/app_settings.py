@@ -558,6 +558,24 @@ class TurnQueueSettings(Settings):
             "per-PR / non-standard envs whose host the slug logic cannot derive. Empty = derive."
         ),
     )  # COWORK_TURN_MINDS_BASE_URL
+    jev_shadow_enabled: bool = Field(
+        default=True,
+        description=(
+            "Fire a Jev '/v1/decisions' call alongside the LLM gate on every remote turn, "
+            "purely for latency/agreement comparison. Never used to route; logged only. "
+            "Requires a minted minds-cloud credential, so it's a no-op unless backend is "
+            "'remote'."
+        ),
+    )  # COWORK_TURN_JEV_SHADOW_ENABLED
+    jev_shadow_model: str = Field(
+        default="jev",
+        description="MindsHub catalog alias passed to the shadow '/v1/decisions' call.",
+    )  # COWORK_TURN_JEV_SHADOW_MODEL
+    jev_shadow_timeout_seconds: float = Field(
+        default=3.0,
+        gt=0,
+        description="Hard wall-clock timeout for the shadow Jev call (enforced via asyncio.timeout, not just httpx's own per-phase timeout). Independent of the gate's own budget, since a slow or hung probe must never hold up the turn it's shadowing.",
+    )  # COWORK_TURN_JEV_SHADOW_TIMEOUT_SECONDS
     minds_coding_model: str = Field(
         default="",
         description=(
@@ -680,20 +698,6 @@ class AppSettings(Settings):
             "resolving under COWORK_HOME exactly as before. Defaults to the "
             "container's own temp directory, which is never the shared EFS "
             "mount and is gone on pod restart."
-        ),
-    )
-    hub_workspaces_force_on: bool = Field(
-        default=False,
-        validation_alias=AliasChoices("COWORK_HUB_WORKSPACES_FORCE_ON"),
-        description=(
-            "Development override that turns the MindsHub workspace surfaces on "
-            "where no Statsig rule targets you. ON only: it cannot switch the "
-            "surfaces off, so it can never be used to escape the kill switch. "
-            "The switch itself is auth's `authorization_ui` gate, declared in "
-            "that repo's configs/statsig_gates.json and read through the "
-            "entitlements payload; this exists so the surface can be walked "
-            "before a rule exists for your environment. Never set in a deployed "
-            "environment."
         ),
     )
     ask_user_enabled: bool = Field(

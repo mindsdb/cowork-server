@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import time
 from collections.abc import AsyncGenerator
 from datetime import datetime, timezone
 from functools import partial
@@ -24,16 +25,19 @@ from cowork.common.settings.user_settings import (
 )
 from cowork.db.session import get_open_session
 from cowork.harnesses.base import available_harness_ids, get_harness
+from cowork.handlers import jev_shadow
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
     _MAX_HISTORY_MESSAGES,
+    _text_history,
     RouteDecision,
     RouterBinding,
     decide_route,
     ineligible_reason,
 )
 from cowork.harnesses.anton_harness.stream_formatter import SkillCreated, format_responses_stream
+from cowork.models.message import Message
 from cowork.streaming import TurnLifecycle, new_buffer, registry, sse_frame
 from cowork.streaming.answer_text import accumulate_answer_text
 from cowork.streaming.backend import get_backend
@@ -56,7 +60,7 @@ from cowork.handlers._turn_history import (
 )
 from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
-    CONTENT_RECOVERY_CODE,
+    CONTENT_REPAIR_CODES,
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
     MODEL_UNAVAILABLE_CODES,
@@ -91,6 +95,38 @@ from cowork.services.task_objects import remote_skill_draft_result
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Strong references for fire-and-forget probe tasks: asyncio holds only a weak
+# reference to a task once nothing else does, so a bare `create_task` result
+# that's dropped can be garbage-collected mid-flight. Discarded on completion
+# via the done-callback below.
+_jev_shadow_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_jev_shadow_probe(
+    *, conversation_id: UUID, correlation_id: str | None, messages: list[dict],
+    llm_block: dict | None, settings: TurnQueueSettings,
+) -> None:
+    """Runs `jev_shadow.probe` detached from the request path and logs its
+    own result. Never awaited by the caller, so a slow or hung probe cannot
+    delay the turn it's shadowing.
+
+    `create_task` copies the caller's context, so the probe runs under the
+    gate's anton TraceContext and `jev_shadow` attributes its Langfuse trace to
+    the same conversation and correlation_id."""
+
+    async def _run() -> None:
+        jev_result = await jev_shadow.probe(messages=messages, llm_block=llm_block, settings=settings)
+        if jev_result is None:
+            return
+        fields = " ".join(f"{k}={v}" for k, v in jev_result.items())
+        logger.warning(
+            "[jev-shadow] conversation=%s correlation_id=%s %s", conversation_id, correlation_id, fields,
+        )
+
+    task = asyncio.create_task(_run())
+    _jev_shadow_tasks.add(task)
+    task.add_done_callback(_jev_shadow_tasks.discard)
 
 
 class _RemoteTurnFailed(Exception):
@@ -259,6 +295,28 @@ def _auth_failure_provider(settings, role: str | None) -> Provider | None:
         return settings.resolved_planning_provider
     planning = settings.resolved_planning_provider
     return planning if planning == settings.resolved_coding_provider else None
+
+def _turn_anchor_id(user_message: Message, assistant_message: Message | None) -> UUID:
+    """The id a non-streaming caller can hand back to DELETE .../turns/{id}.
+
+    The output item carries the assistant's text, so its id is the assistant
+    row's — which is also the anchor delete_turn expects for an answered turn.
+    When nothing was persisted for the assistant (an empty turn), the user row
+    is the whole turn and is itself a valid orphan anchor, so it stands in.
+    Previously this was always the user row's id, which named the wrong message
+    for the content and 404s as an anchor once the turn has a reply.
+    """
+    return assistant_message.id if assistant_message is not None else user_message.id
+
+
+def _message_id_str(message: Message | None) -> str | None:
+    """The row's id as a string, or None when the producer persisted nothing.
+
+    Shapes a Message for the optional `assistant_message_id` field the
+    failure frames carry.
+    """
+    return str(message.id) if message is not None else None
+
 
 class ResponsesHandler:
     def __init__(self, session: Session, principal: Principal | None = None) -> None:
@@ -531,16 +589,31 @@ class ResponsesHandler:
                 set_trace_context,
             )
 
-            trace_token = set_trace_context(TraceContext(
-                session_id=str(conversation_id),
-                harness=self.harness_name,
-                tags=("cowork-gate",),
-                metadata=dict(trace_metadata or {}),
-            ))
+            trace_token = None
             try:
                 # The gate resolves the router role + key ambiently; bind the org scope.
                 with use_settings_scope(self.scope):
+                    # Minted before the context goes in (it is an auth call, not
+                    # an LLM call), so the context can carry the turn's
+                    # correlation_id: the gate's trace and the Jev shadow probe's
+                    # (which inherits this context) share it, making gate
+                    # decision <-> Jev answer an exact join. Never
+                    # turn_id: the gateway renames harness+turn_id traces to
+                    # "{harness}:turn-N", which would count these as user turns.
                     binding, turn_llm = await self._router_binding()
+                    correlation_id = (turn_llm or {}).get("correlation_id")
+                    trace_token = set_trace_context(TraceContext(
+                        session_id=str(conversation_id),
+                        harness=self.harness_name,
+                        tags=("cowork-gate",),
+                        metadata={
+                            **(trace_metadata or {}),
+                            **({"correlation_id": correlation_id} if correlation_id else {}),
+                        },
+                    ))
+                    turn_queue_settings = TurnQueueSettings()
+
+                    gate_started = time.monotonic()
                     decision = await decide_route(
                         history=history,
                         has_non_text_input=has_non_text_input,
@@ -548,8 +621,32 @@ class ResponsesHandler:
                         has_disabled_connections=has_disabled_connections,
                         binding=binding,
                     )
+                    gate_ms = round((time.monotonic() - gate_started) * 1000)
+                    # warning, not info: this deployment's LOG_LEVEL defaults to
+                    # WARNING (app_settings.py's own default too), so an info-level
+                    # line here is silently dropped everywhere it would actually
+                    # be read from — found live on staging, zero [gate] lines
+                    # across 8 real requests until this was bumped.
+                    logger.warning(
+                        "[gate] conversation=%s correlation_id=%s route=%s reason=%s "
+                        "provider=%s model=%s gate_ms=%d",
+                        conversation_id, correlation_id, decision.route, decision.reason,
+                        decision.provider, decision.model, gate_ms,
+                    )
+                    # Detached on purpose: awaiting this (even via asyncio.gather)
+                    # would make a ready gate decision wait for Jev, exactly the
+                    # thing a *shadow* probe must never do. Logs on its own once
+                    # it finishes; never read by anything on the request path.
+                    _spawn_jev_shadow_probe(
+                        conversation_id=conversation_id,
+                        correlation_id=correlation_id,
+                        messages=_text_history(history),
+                        llm_block=(turn_llm or {}).get("llm"),
+                        settings=turn_queue_settings,
+                    )
             finally:
-                reset_trace_context(trace_token)
+                if trace_token is not None:
+                    reset_trace_context(trace_token)
             return decision, turn_llm
         except (ProductPermissionDenied, ProductPermissionUnavailable):
             raise
@@ -579,6 +676,7 @@ class ResponsesHandler:
             user_id=self.scoped.scope.user_id,
             correlation_id=corr,
             settings=TurnQueueSettings(),
+            workspace_id=getattr(settings, "hub_workspace_id", "") or None,
         )
         provider = OpenAIProvider(
             api_key=block["api_key"],
@@ -613,13 +711,13 @@ class ResponsesHandler:
                 "response_route": route.route,
                 "response_route_reason": route.reason,
             }, {"type": "response.completed"}]
-            ConversationService(self.scoped).save_assistant_turn(
+            assistant_message = ConversationService(self.scoped).save_assistant_turn(
                 conversation_id, text, events, harness="cowork-direct",
             )
             return Response(
                 status=ResponseStatus.completed,
                 model=route.model,
-                output=[self._build_output(str(user_message.id), text)],
+                output=[self._build_output(str(_turn_anchor_id(user_message, assistant_message)), text)],
             )
 
         # turn_id comes from handle(): same numbering as the delegated path.
@@ -683,8 +781,8 @@ class ResponsesHandler:
                 "response_route_reason": route.reason,
             }
             svc = ConversationService(producer_session)
-            svc.save_user_message(conv_id, original_content)
-            svc.save_assistant_turn(
+            user_msg = svc.save_user_message(conv_id, original_content)
+            assistant_msg = svc.save_assistant_turn(
                 conv_id, route.text, [delta, {"type": "response.completed"}],
                 harness="cowork-direct",
             )
@@ -697,6 +795,7 @@ class ResponsesHandler:
                 "sequence_number": 1,
                 "conversation_id": str(conv_id),
                 "harness": "cowork-direct",
+                "user_message_id": str(user_msg.id),
                 "response": response.model_dump(),
             })})
             await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", delta)})
@@ -707,9 +806,21 @@ class ResponsesHandler:
                 model=route.model,
                 output=[self._build_output(item_id, route.text)],
             ).model_dump()
-            await buffer.append("sse", {"sse": sse_frame("response.completed", {
-                "type": "response.completed", "sequence_number": 3, "response": completed_response,
-            })})
+            completed_frame = {
+                "type": "response.completed",
+                "sequence_number": 3,
+                "response": completed_response,
+            }
+            # The persisted row's real id, at the frame root (not
+            # inside `response`) — lets the client delete/rekey this turn
+            # without ever having only a positional index for it. Both rows
+            # are already persisted above, before this frame is built, so no
+            # reordering is needed on this path. Omitted, not null, when
+            # nothing was persisted — same convention every other producer
+            # uses for this field.
+            if assistant_msg is not None:
+                completed_frame["assistant_message_id"] = str(assistant_msg.id)
+            await buffer.append("sse", {"sse": sse_frame("response.completed", completed_frame)})
             await buffer.close("completed")
         except asyncio.CancelledError:
             if lifecycle.discarded:
@@ -1229,6 +1340,10 @@ class ResponsesHandler:
             touched_slugs: set[str] = set()
             turn_scope = None
             artifact_writes_allowed = False
+            # Set only on turn_completed: any other exit (Stop, cancel, failure)
+            # may have cut anton off between writing an artifact's metadata and
+            # appending its provenance, see `turn_created_slugs`.
+            completed_cleanly = False
             # Off the loop: this reads the project's memory slots off the shared
             # mount, and one worker serves every other request on this process
             # while a blocking EFS round trip is in flight.
@@ -1309,6 +1424,7 @@ class ResponsesHandler:
                     elif kind == "turn_completed":
                         # `break`, not `return`: the publish/card block below the
                         # try must still run on a clean finish.
+                        completed_cleanly = True
                         break
                     elif kind == "turn_failed":
                         if await _remote_cancel_confirmed(data.get("error"), corr):
@@ -1334,6 +1450,10 @@ class ResponsesHandler:
                     new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
                         artifacts[0], conv_id, artifacts[2], artifacts[1],
                         before_slugs, before_mtimes,
+                        # ENG-2961: the project base is shared, so only folders
+                        # whose provenance names this conversation are its own.
+                        attribute_by_provenance=True,
+                        completed_cleanly=completed_cleanly,
                     )
 
             # Clean completion only — a raise inside the try skips this, matching
@@ -1350,17 +1470,17 @@ class ResponsesHandler:
                 ):
                     yield ArtifactCreated(card)
 
-        def persist(*, clean: bool = False) -> None:
+        def persist(*, clean: bool = False) -> Message | None:
             nonlocal persisted
             if persisted:
-                return
+                return None  # already persisted this turn — the caller has no new row to report
             persisted = True
             if producer_session is None:
                 logger.error(
                     "[responses] cannot persist remote turn without a session for conversation %s",
                     conv_id,
                 )
-                return
+                return None
             try:
                 # Re-anchor first: the conversation may be gone or out of scope.
                 svc = ConversationService(producer_session)
@@ -1375,7 +1495,7 @@ class ResponsesHandler:
                 # finalize rather than fall back to clearing every pending row.
                 if pending_message_id is not None:
                     svc.finalize_pending(conv_id, pending_message_id)
-                svc.save_assistant_turn(
+                return svc.save_assistant_turn(
                     conv_id, "".join(collected_text), collected_events, harness=harness_id,
                     # Tool rows only on a clean finish. They arrive before the
                     # terminal event, so a turn can carry rows and then fail or
@@ -1386,6 +1506,7 @@ class ResponsesHandler:
                 )
             except Exception:
                 logger.exception("[responses] failed to persist remote turn for conversation %s", conv_id)
+                return None
 
         try:
             # Stage attachments + project instructions before the pod runs. The
@@ -1416,8 +1537,21 @@ class ResponsesHandler:
                 if first:
                     # The formatter's created frame lacks conversation_id +
                     # harness; inject them like the in-process path does.
-                    sse = self._inject_created(sse, conv_id, harness_id)
+                    sse = self._inject_created(sse, conv_id, harness_id, pending_message_id)
                     first = False
+                if self._sse_event_type(sse) == "response.completed":
+                    # Persist now — event_sink has already seen
+                    # every delta/event this turn produced, since the
+                    # formatter only yields its terminal frame after its
+                    # source is exhausted — so this turn's real id can ride
+                    # the frame the client's SSE reader actually stops at.
+                    # The unconditional persist(clean=True) below stays as a
+                    # fallback for a formatter that (today, never) returns
+                    # without yielding a terminal frame; it's a no-op here.
+                    assistant_msg = persist(clean=True)
+                    sse = self._inject_completion_id(
+                        sse, assistant_msg.id if assistant_msg else None
+                    )
                 await buffer.append("sse", {"sse": sse})
             persist(clean=True)
             await buffer.close("completed")
@@ -1434,8 +1568,15 @@ class ResponsesHandler:
                 extra={"request_id": corr},
             )
             collected_events.append(response_failed_payload(message, code, request_id=corr))
-            await buffer.append("sse", {"sse": response_failed_sse(message, code, request_id=corr)})
-            if code == CONTENT_RECOVERY_CODE:
+            # Persist before building the frame — a client's SSE
+            # reader stops at response.failed, so any id has to ride this
+            # frame, not one after it.
+            assistant_msg = persist()
+            await buffer.append("sse", {"sse": response_failed_sse(
+                message, code, request_id=corr,
+                assistant_message_id=_message_id_str(assistant_msg),
+            )})
+            if code in CONTENT_REPAIR_CODES:
                 # ENG-1992: the remote/org path's twin of the streaming
                 # handler's repair — producer.py already classified this via
                 # remote_turn_error from the pod's scrubbed error string, so
@@ -1452,7 +1593,6 @@ class ResponsesHandler:
                         "[responses] failed to repair conversation %s after remote content validation error",
                         conv_id,
                     )
-            persist()
             await buffer.close("error")
         except asyncio.CancelledError:
             if lifecycle.discarded:
@@ -1469,9 +1609,13 @@ class ResponsesHandler:
             )
             collected_events.append(response_failed_payload(
                 GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr))
+            # Persist before building the frame — see the
+            # _RemoteTurnFailed branch above for why.
+            assistant_msg = persist()
             await buffer.append("sse", {"sse": response_failed_sse(
-                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr)})
-            persist()
+                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
+                assistant_message_id=_message_id_str(assistant_msg),
+            )})
             await buffer.close("error")
         finally:
             await _seal_unterminated_buffer(
@@ -1545,10 +1689,10 @@ class ResponsesHandler:
             collected_events.append(data)
             accumulate_answer_text(collected_text, event_type, data)
 
-        def persist() -> None:
+        def persist() -> Message | None:
             nonlocal persisted
             if persisted:
-                return
+                return None  # already persisted this turn — no new row to report
             persisted = True
             try:
                 # Re-anchor before ANY write: the conversation may be gone
@@ -1565,7 +1709,7 @@ class ResponsesHandler:
                 # finalize rather than fall back to clearing every pending row.
                 if pending_message_id is not None:
                     svc.finalize_pending(conv_id, pending_message_id)
-                svc.save_assistant_turn(
+                return svc.save_assistant_turn(
                     conv_id, "".join(collected_text), collected_events, harness=harness_id,
                     tool_rows=turn_rows,
                 )
@@ -1574,6 +1718,7 @@ class ResponsesHandler:
                     "[responses] failed to persist turn for conversation %s", conv_id,
                     extra={"request_id": corr},
                 )
+                return None
 
         try:
             conv = ConversationService(producer_session).get_conversation(conv_id)
@@ -1593,7 +1738,17 @@ class ResponsesHandler:
             event_count = 0
             async for sse_string in harness.formatter(stream, model, event_sink):
                 event_count += 1
-                sse_string = self._inject_created(sse_string, conv_id, harness_id)
+                sse_string = self._inject_created(sse_string, conv_id, harness_id, pending_message_id)
+                if self._sse_event_type(sse_string) == "response.completed":
+                    # Persist now, same reasoning as _produce_remote:
+                    # the formatter only yields its terminal frame once its
+                    # source is exhausted, so event_sink has already seen
+                    # everything this turn produced. The unconditional
+                    # persist() below stays as a fallback and is a no-op here.
+                    assistant_msg = persist()
+                    sse_string = self._inject_completion_id(
+                        sse_string, assistant_msg.id if assistant_msg else None
+                    )
                 await buffer.append("sse", {"sse": sse_string})
             logger.info("[responses] turn %s finished — %d events", conv_id, event_count)
             persist()
@@ -1640,7 +1795,7 @@ class ResponsesHandler:
                     "[responses] turn failed for conversation %s correlation_id=%s",
                     conv_id, corr, extra={"request_id": corr},
                 )
-            if code == CONTENT_RECOVERY_CODE:
+            if code in CONTENT_REPAIR_CODES:
                 # ENG-1992: the provider permanently rejected an image block in
                 # this conversation's stored history — repair the DATA once,
                 # here, rather than special-case every future replay. Never
@@ -1771,30 +1926,98 @@ class ResponsesHandler:
             # the generic card alone, so there is nothing to quote for one.
             extra["request_id"] = corr
             failed = response_failed_payload(message, code, **extra)
-            await buffer.append("sse", {"sse": response_failed_sse(message, code, **extra)})
+            # Append to collected_events BEFORE persisting — persist()
+            # reads collected_events to build the assistant row, and this failure
+            # event must land in it exactly as it did before this frame carried
+            # an id; only the append/persist order relative to the SSE frame
+            # below actually changed.
             collected_events.append(failed)
-            persist()
+            assistant_msg = persist()
+            await buffer.append("sse", {"sse": response_failed_sse(
+                message, code, **extra,
+                assistant_message_id=_message_id_str(assistant_msg),
+            )})
             await buffer.close("error")
         finally:
             await _seal_unterminated_buffer(buffer, lifecycle, conv_id, request_id=corr)
             producer_session.close()
 
     @staticmethod
-    def _inject_created(sse_string: str, conversation_id: UUID, harness_id: str | None) -> str:
+    def _sse_event_type(sse_string: str) -> str | None:
+        """The frame's own `event:` line, e.g. "response.completed" — every
+        frame in this codebase is built by `sse_frame`/this same f-string
+        shape, always `event: {type}\\n` as the first line (streaming/sse.py).
+
+        Never substring-search the full SSE text for a frame type: the JSON
+        payload can carry untrusted model output (a delta chunk, an error
+        message) that happens to contain a frame-type-looking string, which
+        would otherwise make a plain delta frame match "response.completed"
+        and get rewritten into one — persisting a partial turn early and
+        mislabeling the real event to the client."""
+        first_line = sse_string.strip().split("\n", 1)[0]
+        prefix = "event: "
+        return first_line[len(prefix):].strip() if first_line.startswith(prefix) else None
+
+    @classmethod
+    def _inject_created(
+        cls,
+        sse_string: str,
+        conversation_id: UUID,
+        harness_id: str | None,
+        user_message_id: UUID | None = None,
+    ) -> str:
         """Inject conversation_id + harness into the response.created event so
-        the client learns the canonical id and which agent generated this."""
-        if "response.created" in sse_string and "conversation_id" not in sse_string:
-            try:
-                lines = sse_string.strip().split("\n")
-                data_line = next(line for line in lines if line.startswith("data:"))
-                payload = json.loads(data_line[5:])
-                payload["conversation_id"] = str(conversation_id)
-                if harness_id:
-                    payload["harness"] = harness_id
-                return f"event: response.created\ndata: {json.dumps(payload)}\n\n"
-            except Exception:
-                pass
-        return sse_string
+        the client learns the canonical id and which agent generated this.
+
+        `user_message_id` is the persisted user Message's id, carried on the
+        same frame. The client appends the user's row optimistically on send,
+        so without this it holds a row with no id until a later refetch — and
+        every consumer keyed on message id (turn delete, the step sidecar, the
+        usage-notice anchor) silently degrades for the live turn. Omitted, not
+        null, on a producer that persists no user row (the probe path).
+        """
+        if cls._sse_event_type(sse_string) != "response.created":
+            return sse_string
+        try:
+            lines = sse_string.strip().split("\n")
+            data_line = next(line for line in lines if line.startswith("data:"))
+            payload = json.loads(data_line[5:])
+            if "conversation_id" in payload:
+                return sse_string
+            payload["conversation_id"] = str(conversation_id)
+            if harness_id:
+                payload["harness"] = harness_id
+            if user_message_id is not None:
+                payload["user_message_id"] = str(user_message_id)
+            return f"event: response.created\ndata: {json.dumps(payload)}\n\n"
+        except Exception:
+            return sse_string
+
+    @classmethod
+    def _inject_completion_id(cls, sse_string: str, assistant_message_id: UUID | None) -> str:
+        """Inject the persisted assistant message's id into a formatter-built
+        response.completed frame, at the frame root (sibling to
+        `type`/`response`, not nested inside `response.output`) — the client
+        reads it from there the same way `_inject_created` places
+        conversation_id/harness. Persistence for this turn must already have
+        happened by the time this is called; a formatter never yields
+        response.completed before its source is exhausted, so `event_sink`
+        has already seen every delta and event this turn produced.
+
+        A turn that persisted nothing (an early-return in save_assistant_turn)
+        passes assistant_message_id=None and the field is simply omitted,
+        same convention as response_failed_payload's optional fields."""
+        if cls._sse_event_type(sse_string) != "response.completed":
+            return sse_string
+        try:
+            lines = sse_string.strip().split("\n")
+            data_line = next(line for line in lines if line.startswith("data:"))
+            payload = json.loads(data_line[5:])
+            if assistant_message_id is not None:
+                payload["assistant_message_id"] = str(assistant_message_id)
+            return f"event: response.completed\ndata: {json.dumps(payload)}\n\n"
+        except Exception:
+            return sse_string
 
     async def _collect(
         self,
@@ -1837,7 +2060,7 @@ class ResponsesHandler:
                     "[responses] user-facing turn error: %s", exc,
                     extra={"request_id": corr},
                 )
-                if code == CONTENT_RECOVERY_CODE:
+                if code in CONTENT_REPAIR_CODES:
                     # ENG-1992: see the streaming path's twin for the full
                     # rationale — repair the conversation's stored history
                     # once here rather than special-case every future replay.
@@ -1879,12 +2102,14 @@ class ResponsesHandler:
         user_message = ConversationService(self.scoped).save_user_message(
             conversation_id, original_content, created_at=sent_at,
         )
-        self._save_assistant_turn(conversation_id, assistant_text, collected_events, turn_rows)
+        assistant_message = self._save_assistant_turn(
+            conversation_id, assistant_text, collected_events, turn_rows
+        )
 
         return Response(
             status=ResponseStatus.completed,
             model=model,
-            output=[self._build_output(str(user_message.id), assistant_text)],
+            output=[self._build_output(str(_turn_anchor_id(user_message, assistant_message)), assistant_text)],
         )
 
     def _save_assistant_turn(
@@ -1893,9 +2118,9 @@ class ResponsesHandler:
         text: str,
         events: list[dict],
         tool_rows: list[dict] | None = None,
-    ) -> None:
+    ) -> Message | None:
         harness_id = getattr(self._get_harness(), 'id', None)
-        ConversationService(self.scoped).save_assistant_turn(
+        return ConversationService(self.scoped).save_assistant_turn(
             conversation_id, text, events, harness=harness_id, tool_rows=tool_rows,
         )
 

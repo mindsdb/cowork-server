@@ -37,7 +37,7 @@
         "label": "In-Browser Connect",
         "description": "Enter your Google Ads developer token, then click Connect to authorize via Google sign-in.",
         "recommended": true,
-        "hidden": true,
+        "hidden": false,
         "fields": [
           {
             "name": "developer_token",
@@ -141,5 +141,6 @@
     ],
     "logo_url": "logos/google_ads.svg"
   },
-  "logo_url": "logos/google_ads.svg"
+  "logo_url": "logos/google_ads.svg",
+  "featured": true
 }
