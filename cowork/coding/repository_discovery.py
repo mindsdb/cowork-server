@@ -42,7 +42,8 @@ def github_repositories(
         raise WorkspaceError("GitHub could not list repositories. Try again.")
     items = []
     port = urlsplit(api).port
-    origin = f"https://{host}" + (f":{port}" if port else "")
+    authority = f"[{host}]" if ":" in host else host
+    origin = f"https://{authority}" + (f":{port}" if port else "")
     for item in payload:
         if not isinstance(item, dict):
             continue

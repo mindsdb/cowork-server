@@ -41,16 +41,19 @@ def test_lists_personal_collaborator_and_organisation_repositories_without_expos
         integration.close()
 
 
+@pytest.mark.parametrize("host", ["ghe.example.com", "[2606:4700::6810:1]"])
 @pytest.mark.parametrize("port", ["", ":8443"])
-def test_enterprise_discovery_uses_the_validated_host_and_not_supplied_clone_urls(port):
+def test_enterprise_discovery_uses_the_validated_host_and_not_supplied_clone_urls(host, port):
     def handler(request):
         assert request.url.path == "/api/v3/user/repos"
-        assert request.headers["Host"] == f"ghe.example.com{port}"
+        assert request.headers["Host"] == f"{host}{port}"
         return httpx.Response(200, json=[{**REPOSITORY, "clone_url": "https://attacker.example/steal", "archived": True}])
-    integration = service(handler, {("github", "work"): {"access_token": "secret", "base_url": f"https://ghe.example.com{port}"}}, resolver=public_resolver)
+    integration = service(handler, {("github", "work"): {"access_token": "secret", "base_url": f"https://{host}{port}"}}, resolver=public_resolver)
     try:
         page = integration.repositories("work")
-        assert page.items[0].clone_url == f"https://ghe.example.com{port}/acme/private.git"
+        assert page.items[0].clone_url == f"https://{host}{port}/acme/private.git"
+        resource = RepositoryResource(id="repo", name="Private", source_url=page.items[0].clone_url)
+        assert resource.source_url == page.items[0].clone_url
         assert page.items[0].archived
         assert page.next_page is None
     finally:
