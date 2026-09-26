@@ -1175,6 +1175,39 @@ def _fuse_via_header():
     return exc
 
 
+# anton's REAL parent type, as for ContentTooLargeError above. The pinned anton
+# predates MindsHubBillingStop, but production's stop IS a TokenLimitExceeded,
+# and that is what sends it to the out-of-credits rung when the body code goes
+# unread. A stand-in without the parent would pass for the wrong reason.
+from anton.core.llm.provider import TokenLimitExceeded as _AntonTokenLimitExceeded
+
+
+class MindsHubBillingStop(_AntonTokenLimitExceeded):
+    """Named to match anton's base of WalletEmptyError, AllowanceExhaustedError
+    and FreeServingPausedError. Like them it carries the gate's status and no
+    ``.response``: the response stays on the SDK error it is raised from."""
+
+    def __init__(self, message, *, reason, status_code=429):
+        super().__init__(message)
+        self.reason = reason
+        self.status_code = status_code
+
+
+def _typed_stop_via_body_code(reason, *, url=None):
+    """The billing stop anton raises today, on a lane that lost X-MindsHub-Reason.
+
+    The SDK error it is raised from still holds the response, the body `code`
+    and the reset header. ``url`` defaults to the configured gateway.
+    """
+    inner = _FakeAPIStatusError(
+        429, {"X-MindsHub-Reset-At": _FUSE_RESET_AT}, url=url or _minds_gateway_url()
+    )
+    inner.body = {"error": {"code": reason, "message": "Denied"}}
+    stop = MindsHubBillingStop(f"Server returned 429: {reason}", reason=reason)
+    stop.__cause__ = inner
+    return stop
+
+
 def test_fuse_header_maps_to_free_serving_paused_not_out_of_credits():
     code, message = te.friendly_turn_error(_fuse_via_header())
     assert code == te.FREE_SERVING_PAUSED_CODE
@@ -1188,6 +1221,89 @@ def test_fuse_body_code_maps_when_the_header_is_lost():
     code, message = te.friendly_turn_error(_fuse_via_body_code())
     assert code == te.FREE_SERVING_PAUSED_CODE
     assert message == te.FREE_SERVING_PAUSED_USER_MESSAGE
+
+
+def test_the_typed_stop_fixture_is_the_shape_that_cards_as_out_of_credits():
+    """Guards the typed-stop tests below from passing for the wrong reason. If
+    this fails, the fixture stopped being a TokenLimitExceeded with a status
+    and no response, and those tests no longer exercise the lost host."""
+    exc = _typed_stop_via_body_code(_FUSE_REASON)
+    assert te.is_token_limit_error(exc)
+    assert exc.status_code == 429
+    assert not hasattr(exc, "response")
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_code", "expected_message"),
+    [
+        (_FUSE_REASON, te.FREE_SERVING_PAUSED_CODE, te.FREE_SERVING_PAUSED_USER_MESSAGE),
+        (
+            "included_allowance_exhausted",
+            te.ALLOWANCE_EXHAUSTED_CODE, te.ALLOWANCE_EXHAUSTED_USER_MESSAGE,
+        ),
+    ],
+)
+def test_antons_typed_stop_maps_from_the_body_code_when_the_header_is_lost(
+    reason, expected_code, expected_message
+):
+    # The stop carries the gate's status but no response, so the gateway host
+    # sits one link down the chain. Read off the stop, the host was None, the
+    # body code never counted, and both stops carded as "You're out of
+    # credits", naming the wrong limit.
+    exc = _typed_stop_via_body_code(reason)
+    assert te.friendly_turn_error(exc) == (expected_code, expected_message)
+
+
+@pytest.mark.parametrize("reason", [_FUSE_REASON, "included_allowance_exhausted"])
+def test_the_probe_classifier_reads_a_typed_stops_body_code(reason):
+    # gateway_denial reads the body code by the same rule, so it names the
+    # limit for the typed stop too.
+    assert te.gateway_denial(exc=_typed_stop_via_body_code(reason)) == te.GatewayDenial(
+        reason=reason, reset_at=_FUSE_RESET_AT,
+    )
+
+
+@pytest.mark.parametrize("reason", [_FUSE_REASON, "included_allowance_exhausted"])
+def test_a_third_party_body_under_a_typed_stop_still_selects_nothing(reason):
+    # The body counts only when the response that carried it came from the
+    # configured gateway, however deep in the chain that response sits.
+    exc = _typed_stop_via_body_code(reason, url="https://openrouter.ai/api/v1/x")
+    code, _ = te.friendly_turn_error(exc)
+    assert code not in (te.FREE_SERVING_PAUSED_CODE, te.ALLOWANCE_EXHAUSTED_CODE)
+    assert te.gateway_denial(exc=exc) is None
+
+
+def test_a_relayed_upstream_503_under_antons_retry_wrappers_stays_provider_overloaded():
+    """The bare-status rule keeps the host of the entry that gave the status.
+
+    The gateway relays an upstream provider's 503 with no X-MindsHub-Reason.
+    anton classifies it as a TransientProviderError carrying the status and no
+    response, and raises ProviderOverloadedError from that once its retry
+    budget runs out. A fix that paired the wrapper's status with the host of
+    any later response would read this as the gateway's own 503 and card a
+    provider incident as "Billing is temporarily unavailable".
+    """
+    from anton.core.llm.provider import TransientProviderError
+
+    transient = TransientProviderError("The model provider returned 503.", code="http_503")
+    transient.status_code = 503
+    transient.__cause__ = _FakeAPIStatusError(503, {}, url=_minds_gateway_url())
+    exc = _FakeOverloadedErr(_OVERLOAD_MSG, model="sonnet")
+    exc.__cause__ = transient
+    assert te.friendly_turn_error(exc) == (te.PROVIDER_OVERLOADED_CODE, _OVERLOAD_MSG)
+
+
+def test_the_cause_chain_walk_survives_a_cycle():
+    # Every chain reader iterates _cause_chain, so its cycle guard is the only
+    # thing standing between a self-referencing chain and a hung error handler.
+    first = ConnectionError("first")
+    second = _FakeAPIStatusError(429, {}, url=_minds_gateway_url())
+    first.__cause__ = second
+    second.__cause__ = first
+    assert list(te._cause_chain(exc=first)) == [first, second]
+    assert te._http_error_context(first) == (429, None, te._configured_minds_host())
+    assert te.gate_reset_at(first) is None
+    assert te.retry_after_seconds(first) is None
 
 
 def test_the_fuse_is_no_longer_a_header_present_but_unmapped_reason():
@@ -1257,7 +1373,7 @@ _ALLOWANCE_WINDOW_CLAIMS = (
         ),
         pytest.param(
             # The hosted path: channels/runtime.py posts this verbatim to Slack
-            # and Discord, and the remote wire never carries a reset instant.
+            # and Discord, and reads no reset instant beside it.
             lambda: te.remote_turn_error(
                 "AllowanceExhaustedError: Your included allowance for 'x' is exhausted."
             )[1],
@@ -1288,6 +1404,15 @@ def test_the_allowance_stop_copy_claims_no_refill_or_window(make_message):
             lambda: _with_reset_at(_gateway_failure(429, reason="included_allowance_exhausted")),
             te.ALLOWANCE_EXHAUSTED_CODE, te.ALLOWANCE_EXHAUSTED_USER_MESSAGE,
             id="allowance-header",
+        ),
+        pytest.param(
+            lambda: _typed_stop_via_body_code(_FUSE_REASON), te.FREE_SERVING_PAUSED_CODE,
+            te.FREE_SERVING_PAUSED_USER_MESSAGE, id="typed-fuse-body-code",
+        ),
+        pytest.param(
+            lambda: _typed_stop_via_body_code("included_allowance_exhausted"),
+            te.ALLOWANCE_EXHAUSTED_CODE, te.ALLOWANCE_EXHAUSTED_USER_MESSAGE,
+            id="typed-allowance-body-code",
         ),
     ],
 )

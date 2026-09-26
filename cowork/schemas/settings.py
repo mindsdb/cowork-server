@@ -2,7 +2,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from cowork.schemas.base import CamelResponse
+from cowork.schemas.base import CamelRequest, CamelResponse
 
 
 class SettingUpsertRequest(BaseModel):
@@ -23,6 +23,29 @@ class SettingResponse(BaseModel):
     is_set: bool
     value: str | None
     options: list[str] | None = None
+
+
+class ProviderProbeCard(CamelRequest):
+    """One provider card ``POST /settings/test-providers`` is asked to ping.
+
+    The Settings UI sends its provider cards as it holds them (cowork
+    ``settingsTransform.js``): ``type``, ``apiKey``, the ``baseUrl`` or
+    ``mindsUrl`` the ping goes to, and display fields such as ``isDefault`` and
+    ``name``. Only the four the ping reads are declared. Anything else is
+    ignored rather than refused, so a renderer that adds a card field keeps
+    getting its status dots.
+    """
+
+    model_config = {**CamelRequest.model_config, "extra": "ignore"}
+
+    # The UI provider type ("minds-cloud", "openai-compatible", ...). A type
+    # ``ping_provider`` does not know answers "unknown provider type".
+    type: str
+    # ``""`` or ``"***"`` asks for the stored key (see ``test_providers``).
+    # Absent stays None, which pings as "missing API key".
+    api_key: str | None = None
+    base_url: str | None = None
+    minds_url: str | None = None
 
 
 # The gateway reasons a failed MindsHub health probe can report, verbatim. The

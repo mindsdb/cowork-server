@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 from urllib.parse import urlparse
@@ -128,15 +129,16 @@ TOKEN_LIMIT_CODE = "token_limit"
 # non-free models need a wallet they do not have.
 # The same reason also fires for an org with NO free grant at all: auth zeroes
 # the allowance of an org that is not `free_grant_eligible`, so its first
-# free-bucket request lands here and nothing ever refills. Only the gate knows
-# which case it is. It sends `X-MindsHub-Reset-At` when the allowance refills
-# and omits it when there is none, and the desktop card reads that `reset_at`
-# to offer waiting or to say there is no grant. This string is the fallback for
-# consumers that don't render the card, including the channel replies
-# `cowork/channels/runtime.py` posts to Slack and Discord, and the remote wire
-# never carries a reset instant. So it makes no refill claim and never states
-# how large the allowance or its window is: either would be false for one of
-# the two cases, and the window is plan config.
+# free-bucket request lands here and nothing ever refills. The denial does not
+# say which case it is. The card learns that from the hub usage read instead:
+# `cowork/services/hub_usage.py` relays auth's `free_grant_eligible: false` as
+# `freeTokens.limit` 0, and the card says there is no grant when it reads that.
+# The failure frame's `reset_at` only supplies the refill time. This string is
+# the fallback for consumers that don't render the card, including the channel
+# replies `cowork/channels/runtime.py` posts to Slack and Discord, which read
+# no `reset_at`. So it makes no refill claim and never states how large the
+# allowance or its window is: either would be false for one of the two cases,
+# and the window is plan config.
 ALLOWANCE_EXHAUSTED_CODE = "included_allowance_exhausted"
 ALLOWANCE_EXHAUSTED_USER_MESSAGE = (
     "You have no free MindsHub Air allowance left. "
@@ -159,8 +161,10 @@ FREE_SERVING_PAUSED_USER_MESSAGE = (
 
 # Codes whose failure frame carries the gate's `X-MindsHub-Reset-At` instant as
 # `reset_at`, so the card can say when the free way forward comes back.
-# responses.py branches on this set. Not named `*_CODE` on purpose: the
-# wire-vocabulary inventory test collects those, and this is not a wire code.
+# responses.py branches on this set for an in-process turn, and
+# `turnqueue/producer.py` keeps the hosted worker's `reset_at` only for it. Not
+# named `*_CODE` on purpose: the wire-vocabulary inventory test collects those,
+# and this is not a wire code.
 RESET_AT_CODES: frozenset[str] = frozenset(
     {ALLOWANCE_EXHAUSTED_CODE, FREE_SERVING_PAUSED_CODE}
 )
@@ -727,6 +731,23 @@ def auth_error_detail(provider_label: str, reconnectable: bool) -> str:
 _UNSET: object = object()
 
 
+def _cause_chain(*, exc: BaseException) -> Iterator[BaseException]:
+    """``exc`` and every exception it was chained from, outermost first.
+
+    anton wraps the provider SDK's error (``raise ... from exc``), so the
+    response a reader needs usually sits on a cause rather than on the
+    exception handed in. Follows ``__cause__``, falling back to
+    ``__context__``, and stops at an exception it has already yielded, so a
+    cyclic chain cannot loop.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        yield cur
+        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+
+
 def _response_url_host(resp: object) -> str | None:
     """Hostname the request that produced ``resp`` was sent to, lowercased.
 
@@ -774,13 +795,17 @@ def _http_error_context(
     lets callers tell a gateway billing status from a BYOK provider's own
     402/429/503. Returns ``(None, None, None)`` for a plain exception with no
     HTTP context.
+
+    anton's typed billing stops and its ``TransientProviderError`` carry a
+    ``status_code`` but no response, so for them the host is None. The
+    bare-status rule depends on that: pairing a wrapper's status with a later
+    entry's host would read an upstream 503 the gateway relayed as the
+    gateway's own. The body-code rung reads its host off the response that
+    carried the body instead (``_gateway_body_denial``).
     """
     status: int | None = None
     host: str | None = None
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
+    for cur in _cause_chain(exc=exc):
         code = getattr(cur, "status_code", None)
         # httpx.Headers (case-insensitive) on the SDK error's `.response`,
         # or a headers mapping some clients attach directly to the error.
@@ -810,7 +835,6 @@ def _http_error_context(
         if status is None and isinstance(code, int):
             status = code
             host = _response_url_host(resp)
-        cur = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
     return status, None, host
 
 
@@ -854,7 +878,19 @@ def _from_minds_gateway(host: str | None) -> bool:
     return expected is not None and host == expected
 
 
-def _gateway_denial_code(exc: BaseException) -> str | None:
+class _BodyDenial(NamedTuple):
+    """The gateway's body ``code``, read off one exception in a failure's cause chain."""
+
+    code: str
+    # Host of the response on the same exception that carries the body, never
+    # another chain entry's, as in `_DenyDetail`. anton's typed billing stops
+    # carry no response of their own, so the host `_http_error_context`
+    # reports for them is None; the SDK error they are raised from holds both
+    # the body and the response.
+    host: str | None
+
+
+def _gateway_body_denial(*, exc: BaseException) -> _BodyDenial | None:
     """The gateway's body ``code`` from anywhere in the cause chain, if any.
 
     Fallback discriminator for a lane that delivers the body but loses the
@@ -867,10 +903,10 @@ def _gateway_denial_code(exc: BaseException) -> str | None:
     this module knows, so an unrelated provider ``code`` can never be mistaken
     for a gateway denial (ENG-1537).
 
-    **The caller must host-gate this**, exactly like the bare-status rule below.
-    A response body is third-party-controlled on a BYOK
-    ``OPENAI_COMPATIBLE`` provider, so without the gate any endpoint could send
-    ``{"code": "wallet_empty"}`` and put our billing CTA — and the MindsHub
+    **The caller must host-gate this** on the returned ``host``, exactly like
+    the bare-status rule below. A response body is third-party-controlled on a
+    BYOK ``OPENAI_COMPATIBLE`` provider, so without the gate any endpoint could
+    send ``{"code": "wallet_empty"}`` and put our billing CTA — and the MindsHub
     top-up link — in front of a user who has no MindsHub balance at all. The
     allowlist alone does not prevent that: it constrains WHICH verdict can be
     selected, not WHO can select one.
@@ -883,10 +919,7 @@ def _gateway_denial_code(exc: BaseException) -> str | None:
         _REASON_UNKNOWN_MODEL,
         _REASON_RATE_LIMITED,
     )
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
+    for cur in _cause_chain(exc=exc):
         body = getattr(cur, "body", None)
         if isinstance(body, list) and body and isinstance(body[0], dict):
             body = body[0]  # Gemini's single-element-array dialect
@@ -894,8 +927,9 @@ def _gateway_denial_code(exc: BaseException) -> str | None:
             env = body.get("error") if isinstance(body.get("error"), dict) else {}
             code = body.get("code") or env.get("code")
             if isinstance(code, str) and code in known:
-                return code
-        cur = cur.__cause__ or cur.__context__
+                return _BodyDenial(
+                    code=code, host=_response_url_host(getattr(cur, "response", None))
+                )
     return None
 
 
@@ -912,10 +946,7 @@ def retry_after_seconds(exc: BaseException) -> float | None:
     centuries; unparseable, negative and non-finite values are dropped so the
     caller falls back to an ungated (but honest) card.
     """
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
+    for cur in _cause_chain(exc=exc):
         resp = getattr(cur, "response", None)
         headers = getattr(resp, "headers", None) or getattr(cur, "headers", None)
         if headers is not None:
@@ -944,7 +975,6 @@ def retry_after_seconds(exc: BaseException) -> float | None:
                     # consumers and is reachable through the reason header,
                     # which is not host-gated.
                     return min(secs, _MAX_RETRY_AFTER_S)
-        cur = cur.__cause__ or cur.__context__
     return None
 
 
@@ -1001,10 +1031,7 @@ def gate_reset_at(exc: BaseException) -> str | None:
     server-side parse would have to pick a timezone, and picking the wrong one
     shifts the time the user reads (ENG-1537).
     """
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
+    for cur in _cause_chain(exc=exc):
         resp = getattr(cur, "response", None)
         headers = getattr(resp, "headers", None) or getattr(cur, "headers", None)
         if headers is not None:
@@ -1014,7 +1041,6 @@ def gate_reset_at(exc: BaseException) -> str | None:
                 raw = None
             if raw:
                 return str(raw)
-        cur = cur.__cause__ or cur.__context__
     return None
 
 
@@ -1083,10 +1109,7 @@ def _deny_detail(*, exc: BaseException) -> _DenyDetail | None:
     Walks the chain the same way `_http_error_context` does, because anton
     wraps the SDK error that carries the response (``raise ... from exc``).
     """
-    seen: set[int] = set()
-    cur: BaseException | None = exc
-    while cur is not None and id(cur) not in seen:
-        seen.add(id(cur))
+    for cur in _cause_chain(exc=exc):
         resp = getattr(cur, "response", None)
         code = getattr(cur, "status_code", None)
         if not isinstance(code, int):
@@ -1118,7 +1141,6 @@ def _deny_detail(*, exc: BaseException) -> _DenyDetail | None:
                 host=_response_url_host(resp),
                 from_header=False,
             )
-        cur = cur.__cause__ or cur.__context__
     return None
 
 
@@ -1211,9 +1233,13 @@ def gateway_denial(*, exc: BaseException) -> GatewayDenial | None:
     _status, reason, host = _http_error_context(exc)
     if reason in PROBE_DENIAL_REASONS and not _origin_is_known_third_party(host):
         return GatewayDenial(reason=reason, reset_at=gate_reset_at(exc))
-    code = _gateway_denial_code(exc)
-    if code in PROBE_DENIAL_REASONS and _from_minds_gateway(host):
-        return GatewayDenial(reason=code, reset_at=gate_reset_at(exc))
+    body_denial = _gateway_body_denial(exc=exc)
+    if (
+        body_denial is not None
+        and body_denial.code in PROBE_DENIAL_REASONS
+        and _from_minds_gateway(body_denial.host)
+    ):
+        return GatewayDenial(reason=body_denial.code, reset_at=gate_reset_at(exc))
     return None
 
 
@@ -1269,14 +1295,18 @@ def friendly_turn_error(
     # carrier — NOT a heuristic. It must stay above the bare-status rule below:
     # that rule cannot tell the velocity 429 from the allowance 429, and
     # guessing "out of credits" for a rate limit is the ENG-1537 defect.
-    denial_code = _gateway_denial_code(exc)
+    body_denial = _gateway_body_denial(exc=exc)
     # NOTE: strict here (provably-gateway), unlike the header above. The header
     # needs the looser three-valued check because an existing test requires an
     # unknown origin to still map; the body carrier has no such constraint, so
     # it stays as tight as it can be. Don't "unify" these without re-reading
     # test_reason_header_maps_even_without_request_url.
-    if denial_code is not None and _from_minds_gateway(host):
-        mapped = _map_gateway_reason(denial_code)
+    #
+    # The host is the one on the response that carried the body, not `host`
+    # above: anton's typed billing stops carry the status but no response, so
+    # `host` is None for them and this rung would never see the gateway.
+    if body_denial is not None and _from_minds_gateway(body_denial.host):
+        mapped = _map_gateway_reason(body_denial.code)
         if mapped is not None:
             return mapped
 
@@ -1398,8 +1428,9 @@ _REMOTE_TYPE_MAPPINGS: dict[str, _RemoteTypeMapping] = {
         WORKER_UNRESPONSIVE_CODE, WORKER_UNRESPONSIVE_MESSAGE
     ),
     # The three MindsHub billing stops, each named by its own anton type so the
-    # hosted card matches the desktop one. The remote wire carries no
-    # X-MindsHub-Reset-At, so these codes reach the client without reset_at.
+    # hosted card matches the desktop one. The reset instant does not ride the
+    # error string: the worker sends it as `reset_at` beside `error`, and
+    # `turnqueue/producer.py` keeps it for the RESET_AT_CODES only.
     "WalletEmptyError": _RemoteTypeMapping(TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE),
     "AllowanceExhaustedError": _RemoteTypeMapping(
         ALLOWANCE_EXHAUSTED_CODE, ALLOWANCE_EXHAUSTED_USER_MESSAGE

@@ -256,24 +256,49 @@ def test_a_url_naming_no_host_is_refused(stored, pinged):
     assert pinged == []
 
 
-def test_a_non_string_url_is_refused_rather_than_raising(stored, pinged):
-    # The body is `list[dict[str, Any]]`, so pydantic passes a list straight
-    # through. Raising here would 500 the whole request.
-    result = _test_providers([{"type": "minds-cloud", "apiKey": "***", "mindsUrl": [ATTACKER_URL]}])
+@pytest.mark.parametrize(
+    "card",
+    [
+        pytest.param({"type": "minds-cloud", "apiKey": "***", "mindsUrl": [ATTACKER_URL]}, id="list-url"),
+        pytest.param({"type": 123, "apiKey": ""}, id="numeric-type"),
+    ],
+)
+def test_a_card_the_settings_ui_cannot_send_is_a_422_and_nothing_is_pinged(monkeypatch, pinged, card):
+    """The body is typed per card (ProviderProbeCard), so a non-string type or URL
+    fails validation before any key is resolved or sent, and answers 422 rather
+    than a 500 or a status keyed by whatever the caller put in ``type``."""
+    from fastapi.testclient import TestClient
 
-    assert result["providerStatus"]["minds-cloud"] == "fail"
+    from cowork.server import create_app
+
+    _deployment(monkeypatch, minds_api_key=STORED_KEY, minds_url=STORED_MINDS_URL)
+    client = TestClient(create_app(), client=("127.0.0.1", 50000))
+
+    resp = client.post("/api/v1/settings/test-providers", json={"providers": [card]})
+
+    assert resp.status_code == 422
     assert pinged == []
 
 
-def test_a_non_string_provider_type_still_answers(stored, pinged):
-    # Unknown types already came back as "unknown provider type" from
-    # ping_provider; the guard must not turn that into a 500.
-    result = _test_providers([{"type": 123, "apiKey": ""}])
+def test_the_settings_uis_card_fields_ride_along_and_only_the_ping_fields_are_sent(stored, pinged):
+    # What cowork's settingsTransform.js holds for a card, display fields and
+    # all. A card field the server does not know must not fail the request.
+    _test_providers(
+        [
+            {
+                "type": "openai-compatible",
+                "apiKey": "***",
+                "baseUrl": "https://oc.internal",
+                "name": "Local model",
+                "isDefault": True,
+                "addedInANewerRenderer": {"any": "shape"},
+            }
+        ]
+    )
 
-    # Keyed by the type's string form. The response is a typed model with
-    # string keys, and "123" is the key the JSON wire already carried for this
-    # type, so what a client reads is unchanged.
-    assert result["providerStatus"] == {"123": "ok"}
+    assert pinged == [
+        {"type": "openai-compatible", "apiKey": STORED_KEY, "baseUrl": "https://oc.internal", "mindsUrl": None}
+    ]
 
 
 def test_a_card_with_a_null_type_does_not_crash(monkeypatch, pinged):
@@ -469,7 +494,7 @@ def test_the_reasons_reach_the_wire_in_camel_case(monkeypatch, pinged_with_a_fus
     """Through the real route, so the declared response model is what serializes.
 
     The direct calls above read the handler's own return value; this reads the
-    body a renderer gets, including a non-string type the loose body lets in.
+    body a renderer gets.
     """
     from fastapi.testclient import TestClient
 
@@ -483,7 +508,7 @@ def test_the_reasons_reach_the_wire_in_camel_case(monkeypatch, pinged_with_a_fus
         json={
             "providers": [
                 {"type": "minds-cloud", "apiKey": "sk-callers-own", "mindsUrl": STORED_MINDS_URL},
-                {"type": 123, "apiKey": "sk-callers-own"},
+                {"type": "anthropic", "apiKey": "sk-callers-own"},
             ]
         },
     )
@@ -493,4 +518,4 @@ def test_the_reasons_reach_the_wire_in_camel_case(monkeypatch, pinged_with_a_fus
     assert body["providerStatusReasons"] == {
         "minds-cloud": {"code": "free_air_daily_spend_fuse_exceeded", "resetAt": _FUSE_RESET_AT},
     }
-    assert body["providerStatus"] == {"minds-cloud": "fail", "123": "ok"}
+    assert body["providerStatus"] == {"minds-cloud": "fail", "anthropic": "ok"}

@@ -923,7 +923,26 @@ class UserSettings(Settings):
             "JSON-encoded map of MindsHub model id → enabled flag, cached from "
             "/v1/models whenever recommended-models fetches it live. Lets model "
             "defaults avoid locked models (wallet can't pay / free allowance "
-            "spent) without a network call in the turn path."
+            "spent) without a network call in the turn path. In org mode it "
+            "holds only what is the same for every member; the models a "
+            "member's model rules restrict are in minds_model_restricted."
+        ),
+    )
+    # Untagged, so it writes per person: `SettingService._new_row` files it at
+    # (org, user) scope in org mode. Auth resolves the org, workspace and team
+    # model rules for each caller, so one member's restricted models are not
+    # another's, and the org-wide `minds_model_enabled` above leaves them out.
+    # Only the org-mode listing writes it (`persist_org_model_availability`); a
+    # desktop install has one member and keeps its restrictions in
+    # `minds_model_enabled`.
+    minds_model_restricted: str = Field(
+        default="[]",
+        title="MindsHub Models Restricted For You",
+        description=(
+            "JSON-encoded list of the MindsHub model ids your organization's "
+            "model rules restrict for you, cached from /v1/models whenever "
+            "recommended-models fetches it live. Model resolution treats them "
+            "as unavailable for you alone."
         ),
     )
 
@@ -984,7 +1003,9 @@ class UserSettings(Settings):
         recommended-models endpoint refreshes from ``/v1/models`` on every
         settings load — so it tracks availability changes (e.g. adding credits
         re-enables a locked model on the next fetch) without any network call
-        here.
+        here. The models this member's model rules restrict
+        (``_minds_restricted_ids``) read as ``False`` on top of it, which is how
+        an org-wide map that leaves them out still locks them for this member.
 
         Parsed once per instance and memoized: this is called from
         ``apply_model_defaults`` and both ``resolved_*_model`` properties.
@@ -1004,8 +1025,30 @@ class UserSettings(Settings):
             if isinstance(raw, dict)
             else {}
         )
+        # Only ids the map lists are overridden, in place, so map order is kept
+        # and a restriction on an id the catalogue no longer serves cannot make
+        # it read as served.
+        restricted = self._minds_restricted_ids()
+        if restricted:
+            result = {k: (False if k in restricted else v) for k, v in result.items()}
         self._enabled_map_cache = result
         return result
+
+    def _minds_restricted_ids(self) -> frozenset[str]:
+        """The model ids this member's model rules restrict, or an empty set.
+
+        Sourced from ``minds_model_restricted``, which only the org-mode listing
+        writes. A value that is not a JSON list of non-empty strings reads as
+        empty: an unreadable restriction list must not lock models it never
+        named.
+        """
+        try:
+            raw = json.loads(self.minds_model_restricted or "[]")
+        except (ValueError, TypeError):
+            return frozenset()
+        if not isinstance(raw, list):
+            return frozenset()
+        return frozenset(v for v in raw if isinstance(v, str) and v)
 
     def _minds_role_default_map(self) -> dict[str, str]:
         """The cached agent-role -> model-id map MindsHub's catalog declares, or {}.

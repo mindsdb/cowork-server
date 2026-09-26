@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
 import re
 import time
+from collections import OrderedDict
+from collections.abc import Collection
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 from urllib.parse import urlparse
 
@@ -15,6 +18,7 @@ import httpx
 from cowork.common.settings import runtime_credential
 from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
 from cowork.handlers.turn_errors import GatewayDenial, gateway_denial
+from cowork.services.hub_workspaces import sweep_cache
 
 if TYPE_CHECKING:
     from cowork.common.settings.user_settings import UserSettings
@@ -203,6 +207,15 @@ def provider_base_url(
 # that isn't deployed yet doesn't add a round-trip to every load.
 _MINDS_MODELS_TTL = 300.0       # successful fetch
 _MINDS_MODELS_FAIL_TTL = 30.0   # negative result (down / not deployed)
+# Expired entries are dropped on every write, and past this many the least
+# recently used goes too. Org mode holds one listing per org member, so without
+# a bound the cache grows with every member a pod has ever served. Meant to sit
+# well above the members one pod serves within one TTL, since only their entries
+# are still fresh, so eviction normally takes an entry nobody is about to read.
+_MINDS_MODELS_CACHE_MAX = 512
+# Derived from the TTLs rather than restated, so raising one cannot start
+# dropping entries that are still fresh.
+_MINDS_MODELS_MAX_TTL_S = max(_MINDS_MODELS_TTL, _MINDS_MODELS_FAIL_TTL)
 # Hard TOTAL budget for one /v1/models fetch. httpx.Timeout is per-operation, so
 # `follow_redirects` chains and trickled responses (each chunk under the per-op
 # read timeout) can otherwise run far past it — minutes, unbounded. This fetch
@@ -274,6 +287,12 @@ def _empty_listing() -> MindsModelListing:
     return MindsModelListing(None, {}, {}, {}, {}, {}, {}, {})
 
 
+# The listing's ``disabled_reason`` for a model an admin's model rule restricts
+# for the caller. Unlike the billing reasons, it is true for the caller alone
+# (see ``persist_org_model_availability``).
+_MODEL_RESTRICTED_REASON = "model_restricted"
+
+
 class _ListingCacheKey(NamedTuple):
     """Whose ``/v1/models`` answer one ``_minds_models_cache`` entry holds."""
 
@@ -288,9 +307,41 @@ class _ListingCacheKey(NamedTuple):
     # can get different rows. The user id rather than the bearer, because the
     # bearer rotates and every rotation would add an entry.
     user_id: str | None
+    # A digest of the credential the listing was fetched with, when no tenant
+    # scopes the entry, else None. A desktop install has no tenant and no user
+    # id, so without it an account switch in the running process is served the
+    # previous account's rows (its Restricted and Needs-credits locks) for the
+    # TTL, and recommended_models persists them. A digest rather than the key,
+    # because cache keys turn up in a repr or a heap dump.
+    credential: str | None
 
 
-_minds_models_cache: dict[_ListingCacheKey, tuple[float, MindsModelListing]] = {}
+def _listing_cache_key(
+    *, base_url: str, api_key: str, tenant_key: str | None, user_id: str | None
+) -> _ListingCacheKey:
+    """The entry a fetch writes and a cached read looks up, built in one place."""
+    credential = None
+    if tenant_key is None:
+        credential = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+    return _ListingCacheKey(base_url, tenant_key, user_id, credential)
+
+
+# Least recently used first, so the cap in `_store_listing` evicts from the front.
+_minds_models_cache: OrderedDict[_ListingCacheKey, tuple[float, MindsModelListing]] = OrderedDict()
+
+
+def _store_listing(key: _ListingCacheKey, listing: MindsModelListing) -> None:
+    """Cache ``listing`` under ``key``: expired entries go first, then any past the cap.
+
+    Swept on write, the one place the cache grows, with the hub workspace
+    caches' ``sweep_cache``. A departed caller's entry is never read or
+    overwritten again, so nothing else would drop it.
+    """
+    sweep_cache(_minds_models_cache, max_ttl_s=_MINDS_MODELS_MAX_TTL_S)
+    _minds_models_cache[key] = (time.monotonic(), listing)
+    _minds_models_cache.move_to_end(key)
+    while len(_minds_models_cache) > _MINDS_MODELS_CACHE_MAX:
+        _minds_models_cache.popitem(last=False)
 
 
 # Substrings that identify an embeddings model by id, used only for endpoints
@@ -317,21 +368,36 @@ def _is_embedding_row(row: dict, model_id: str) -> bool:
 
 
 def cached_minds_models(
-    minds_url: str, tenant_key: str | None = None, *, user_id: str | None = None
+    minds_url: str,
+    tenant_key: str | None = None,
+    *,
+    user_id: str | None = None,
+    api_key: str = "",
 ) -> MindsModelListing | None:
-    """The last successful ``/v1/models`` listing for this gateway, however old.
+    """The last successful ``/v1/models`` listing for this gateway, even past its TTL.
 
     A synchronous read for callers that cannot await the fetch (the coding
     endpoints run in a threadpool) and need only what the gateway advertises per
     model, which changes on the gateway's release cadence rather than the cache
     TTL's. None until something has fetched the listing since the process
-    started, and None for a negatively cached failure. ``tenant_key`` and
-    ``user_id`` pick the entry the same way they do in ``fetch_minds_models``.
+    started, and None for a negatively cached failure. An expired entry is read
+    until the next write drops it (``_store_listing``). ``tenant_key``,
+    ``user_id`` and ``api_key`` pick the entry the same way they do in
+    ``fetch_minds_models``: with no ``tenant_key``, the entry is the one fetched
+    with this ``api_key``.
+
+    Not a use for the least-recently-used order: this runs in a threadpool, and
+    reordering the cache from there would race the event loop's writes.
     """
     if not minds_url:
         return None
     cached = _minds_models_cache.get(
-        _ListingCacheKey(minds_chat_base_url(minds_url), tenant_key, user_id)
+        _listing_cache_key(
+            base_url=minds_chat_base_url(minds_url),
+            api_key=api_key,
+            tenant_key=tenant_key,
+            user_id=user_id,
+        )
     )
     if not cached or not cached[1].ids:
         return None
@@ -379,7 +445,8 @@ async def fetch_minds_models(
 
     ``tenant_key`` and ``user_id`` scope the cache entry (see
     ``_ListingCacheKey``): pass the org id for an org-scoped catalog, and the
-    caller's user id too when the gateway answers per caller.
+    caller's user id too when the gateway answers per caller. With no
+    ``tenant_key`` the entry is scoped by a digest of ``api_key`` instead.
 
     Never raises and never runs longer than ``_MINDS_MODELS_TIMEOUT_S`` — a
     slow/degraded gateway (hang, redirect loop, trickled body) returns an empty
@@ -388,7 +455,9 @@ async def fetch_minds_models(
     if not minds_url or not api_key:
         return _empty_listing()
     base = minds_chat_base_url(minds_url)
-    cache_key = _ListingCacheKey(base, tenant_key, user_id)
+    cache_key = _listing_cache_key(
+        base_url=base, api_key=api_key, tenant_key=tenant_key, user_id=user_id
+    )
 
     now = time.monotonic()
     cached = _minds_models_cache.get(cache_key)
@@ -398,10 +467,11 @@ async def fetch_minds_models(
         # force_refresh only overrides the success TTL — see the negative-cache
         # note above.
         if (now - ts) < ttl and not (force_refresh and val.ids):
+            _minds_models_cache.move_to_end(cache_key)
             return val
 
     def _remember(val: MindsModelListing) -> MindsModelListing:
-        _minds_models_cache[cache_key] = (time.monotonic(), val)
+        _store_listing(cache_key, val)
         return val
 
     async def _fetch() -> httpx.Response:
@@ -612,8 +682,9 @@ async def fetch_org_model_catalog(
 #     3. POST /api/v1/settings/raw    → SettingService.bulk_upsert
 #     4. cowork/migrations.py (first-boot .env→DB seed)
 #     5. cowork/main/minds-auth.ts (login / token refresh) — excludes models
-#   Two more write settings but only their own fixed key: channels.py
-#   (`channels_harness`) and the `minds_model_enabled` refresh in settings.py.
+#   Two more write settings but only their own fixed keys: channels.py
+#   (`channels_harness`) and the `minds_model_enabled` / `minds_model_restricted`
+#   refresh in settings.py.
 #
 #   OUT OF REACH of this gate: the standalone `anton` CLI reads models from
 #   ~/.anton/.env directly and never touches this DB (ENG-1140 covers its
@@ -738,7 +809,13 @@ async def model_value_rejection(
 
 
 def persist_enabled_model_map(
-    session, scope, prior_json: str | None, live_enabled: dict, live_ids: list[str] | None = None
+    session,
+    scope,
+    prior_json: str | None,
+    live_enabled: dict,
+    live_ids: list[str] | None = None,
+    *,
+    member_restricted: Collection[str] = (),
 ) -> bool:
     """Guarded write of the `minds_model_enabled` availability map.
 
@@ -782,6 +859,10 @@ def persist_enabled_model_map(
       gateway re-ranking also refreshes): ``upsert_setting`` commits a row and
       invalidates the settings cache, so an unconditional write churns every
       ``UserSettings`` reader.
+    - Never record ``member_restricted`` as a lock. Those are the ids the
+      caller's own model rules restrict (``persist_org_model_availability``),
+      and the org-mode map is read by every member, so each keeps the flag the
+      map already held for it, or ``True`` when it held none.
 
     Returns True iff the stored map was updated.
     """
@@ -800,6 +881,9 @@ def persist_enabled_model_map(
         # with the flag it published, unflagged rows defaulting to available
         # (missing = available), in the gateway's own /v1/models order.
         live_enabled = {mid: live_enabled.get(mid, True) for mid in (live_ids or live_enabled)}
+        for mid in member_restricted:
+            if mid in live_enabled:
+                live_enabled[mid] = prior.get(mid, True)
     elif live_ids:
         # A real catalogue that published NO enabled flags (gateway version
         # skew / a plain OpenAI-compatible endpoint). We can't re-derive which
@@ -819,6 +903,50 @@ def persist_enabled_model_map(
         return False
     SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
     return True
+
+
+def persist_org_model_availability(
+    session, scope, *, prior: UserSettings, listing: MindsModelListing
+) -> bool:
+    """Write one org member's listing: shared facts to the org, rule locks to the member.
+
+    Auth resolves each row's ``enabled`` and ``disabled_reason`` from the model
+    rules for the caller's org, workspace and team, so a ``model_restricted`` row
+    is true for this member and may be false for the next one. The availability
+    map is an org row that every member's model resolution reads, so a
+    restriction written there swaps every member off the model, and the next
+    unrestricted member's load lifts it for the member it applies to. So the
+    restricted ids go to the map with the flag it already held for them
+    (``persist_enabled_model_map``'s ``member_restricted``), and to this member's
+    own ``minds_model_restricted`` row, which ``UserSettings._minds_enabled_map``
+    lays over the map as ``False``.
+
+    ``scope`` must name the caller: ``minds_model_restricted`` is a personal
+    setting. ``prior`` is the caller's loaded settings. The restriction list
+    follows the map's evidence rule: a listing that publishes no ``enabled``
+    flags says nothing about locks, so it leaves the stored list alone. One that
+    does is the whole answer, and an empty restriction set clears the list.
+    Stored sorted and written only on a change, like ``persist_role_defaults_map``.
+
+    Returns True iff either row was updated.
+    """
+    from cowork.services.settings import SettingService
+
+    restricted = sorted(
+        mid for mid, reason in listing.disabled_reasons.items() if reason == _MODEL_RESTRICTED_REASON
+    )
+    changed = persist_enabled_model_map(
+        session, scope, prior.minds_model_enabled, listing.enabled, listing.ids,
+        member_restricted=restricted,
+    )
+    if not listing.enabled:
+        return changed
+    if restricted == sorted(prior._minds_restricted_ids()):
+        return changed
+    SettingService(session, scope).upsert_setting("minds_model_restricted", json.dumps(restricted))
+    return True
+
+
 def persist_role_defaults_map(session, scope, prior_json: str | None, live_role_defaults: dict) -> bool:
     """Guarded write of the `minds_role_defaults` map the catalogue declares.
 
@@ -992,9 +1120,10 @@ class _ProbeStatusError(httpx.HTTPStatusError):
 
     The OpenAI and Anthropic SDK errors hold ``status_code`` and the parsed JSON
     ``body`` beside ``response``, and turn_errors reads all three. httpx's own
-    error holds only ``response``. Without ``status_code`` turn_errors finds no
-    host for a response that lacks the reason header, and without ``body`` it
-    finds no body ``code``, so the body rung of ``gateway_denial`` never fires.
+    error holds only ``response``. The body rung of ``gateway_denial`` reads the
+    ``code`` from ``body`` and its host from the ``response`` beside it, so
+    without ``body`` that rung never fires. The status-keyed rules read
+    ``status_code``.
     """
 
     def __init__(self, *, response: httpx.Response) -> None:

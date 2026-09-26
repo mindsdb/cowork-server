@@ -1517,8 +1517,14 @@ class ResponsesHandler:
                 "correlation_id=%s code=%s", conv_id, corr, code,
                 extra={"request_id": corr},
             )
-            collected_events.append(response_failed_payload(message, code, request_id=corr))
-            await buffer.append("sse", {"sse": response_failed_sse(message, code, request_id=corr)})
+            # The producer keeps `reset_at` only for RESET_AT_CODES and only as
+            # an offset-aware instant (`_remote_reset_at` in producer.py), so
+            # it rides both the frame and the persisted event as sent.
+            reset_at = failure.get("reset_at")
+            collected_events.append(response_failed_payload(
+                message, code, reset_at=reset_at, request_id=corr))
+            await buffer.append("sse", {"sse": response_failed_sse(
+                message, code, reset_at=reset_at, request_id=corr)})
             if code in CONTENT_REPAIR_CODES:
                 # ENG-1992: the remote/org path's twin of the streaming
                 # handler's repair — producer.py already classified this via
