@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -11,7 +13,7 @@ if TYPE_CHECKING:
 def copy_source_changes(
     manager: WorkspaceManager, source: Path, target: Path, revision: str
 ) -> None:
-    """Copy the working tree through a private index; never stage the user's files."""
+    """Copy through a private index and object store; never stage the user's files."""
     from cowork.coding.workspace import MAX_TOTAL_DIFF_BYTES, WorkspaceError
 
     if manager.git.run(source, "ls-files", "--unmerged").stdout:
@@ -30,7 +32,21 @@ def copy_source_changes(
         )
     with tempfile.TemporaryDirectory(prefix="cowork-source-changes-") as temporary:
         root = Path(temporary)
-        environment = {"GIT_INDEX_FILE": str(root / "index"), "GIT_OPTIONAL_LOCKS": "0"}
+        objects = root / "objects"
+        objects.mkdir()
+        source_objects = (source / manager.git.run(source, "rev-parse", "--git-path", "objects").stdout.strip()).resolve()
+        # Git reads existing objects through alternates but writes new blobs
+        # only to this temporary store, even if we later reject an oversized patch.
+        alternates = json.dumps(str(source_objects), ensure_ascii=False)
+        inherited = os.environ.get("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        if inherited:
+            alternates += os.pathsep + inherited
+        environment = {
+            "GIT_INDEX_FILE": str(root / "index"),
+            "GIT_OBJECT_DIRECTORY": str(objects),
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES": alternates,
+            "GIT_OPTIONAL_LOCKS": "0",
+        }
         manager.git.run(source, "read-tree", revision, environment=environment)
         manager.git.run(source, "add", "--all", "--", ".", environment=environment)
         patch = root / "changes.patch"

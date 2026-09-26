@@ -234,6 +234,53 @@ def test_include_local_changes_never_copies_untracked_repository_cache_files(tmp
     assert not Path(second.primary.workspace_path, "cache-only.txt").exists()
 
 
+@pytest.mark.parametrize("include", [False, True])
+def test_missing_selected_checkout_cannot_silently_exclude_requested_local_changes(tmp_path, include):
+    repo = repository(tmp_path, "app")
+    remote = repository(tmp_path, "remote")
+    project = project_for(repo)
+    project.resources[0].source_url = str(remote)
+    (repo / "uncommitted.txt").write_text("keep my work")
+    moved = tmp_path / "moved"
+    repo.rename(moved)
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "runtime"))
+    options = TaskRepositorySetup(include_local_changes=include)
+    if include:
+        with pytest.raises(WorkspaceError, match="local checkout.*unavailable"):
+            manager.prepare("task", project, options)
+        assert not (manager.workspaces.root / "repositories").exists()
+        assert not (manager.workspaces.worktrees_root / "task").exists()
+    else:
+        prepared = manager.prepare("task", project, options)
+        assert Path(prepared.primary.workspace_path, "README.md").read_text() == "remote\n"
+    assert (moved / "uncommitted.txt").read_text() == "keep my work"
+
+
+@pytest.mark.parametrize("reject_patch", [False, True])
+@pytest.mark.parametrize("linked_worktree", [False, True])
+def test_copy_keeps_temporary_blobs_out_of_source_objects(tmp_path, monkeypatch, reject_patch, linked_worktree):
+    repo = repository(tmp_path, "app with spaces")
+    source = repo
+    if linked_worktree:
+        source = tmp_path / "linked"
+        git(repo, "worktree", "add", "--detach", str(source), "HEAD")
+    (source / "README.md").write_text("modified working file\n")
+    (source / "new.bin").write_bytes(b"\x00\xff\x80" * 1024)
+    objects = repo / ".git" / "objects"
+    before = {str(path.relative_to(objects)): path.read_bytes() for path in objects.rglob("*") if path.is_file()}
+    manager = WorkspaceManager(tmp_path / "runtime")
+    if reject_patch:
+        monkeypatch.setattr("cowork.coding.workspace.MAX_TOTAL_DIFF_BYTES", 8)
+        with pytest.raises(WorkspaceError, match="too large"):
+            manager.prepare("task", str(source), True, include_local_changes=True)
+    else:
+        prepared = manager.prepare("task", str(source), True, include_local_changes=True)
+        assert (prepared.workspace_path / "new.bin").read_bytes() == (source / "new.bin").read_bytes()
+        assert (prepared.workspace_path / "README.md").read_text() == "modified working file\n"
+    after = {str(path.relative_to(objects)): path.read_bytes() for path in objects.rglob("*") if path.is_file()}
+    assert after == before
+
+
 def test_local_folders_are_copied_and_cannot_receive_branch_overrides(tmp_path):
     folder = tmp_path / "notes"
     folder.mkdir()

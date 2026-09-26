@@ -169,7 +169,11 @@ class ProjectWorkspaceManager:
             prepared: list[TaskWorkspace] = []
             try:
                 for resource in project.resources:
-                    folder = self._runtime_folder(resource)
+                    include_local_changes = bool(
+                        setup and setup.include_local_changes and isinstance(resource, RepositoryResource)
+                        and resource.local_path
+                    )
+                    folder = self._runtime_folder(resource, require_local=include_local_changes)
                     key = self._key(session_id, folder.id)
                     if setup is not None and isinstance(resource, RepositoryResource):
                         inspection = self.workspaces.inspect(folder.path)
@@ -177,10 +181,7 @@ class ProjectWorkspaceManager:
                             raise WorkspaceError(f"{resource.name} has no commits. Make an initial commit, or leave the task branch blank and include local changes")
                     item = self.workspaces.prepare(
                         key, folder.path, True, folder.base_branch,
-                        include_local_changes=bool(
-                            setup and setup.include_local_changes and isinstance(resource, RepositoryResource)
-                            and resource.local_path and Path(resource.local_path).expanduser().is_dir()
-                        ),
+                        include_local_changes=include_local_changes,
                     )
                     prepared.append(self._task_workspace(
                         session_id, project.name, folder, item, task_branch=setup.branch if setup else None,
@@ -248,11 +249,15 @@ class ProjectWorkspaceManager:
             ports = self.ports.allocate(session_id, project.environment.port_names)
             return PreparedProjectWorkspace(primary=restored[0], workspaces=tuple(restored), ports=ports)
 
-    def _runtime_folder(self, resource: ProjectResource) -> ProjectFolder:
+    def _runtime_folder(self, resource: ProjectResource, *, require_local: bool = False) -> ProjectFolder:
         if isinstance(resource, LocalFolderResource):
             return resource_folder(resource)
         path = Path(resource.local_path).expanduser() if resource.local_path else None
         if path is None or not path.is_dir():
+            if require_local:
+                raise WorkspaceError(
+                    f"The local checkout for {resource.name} is unavailable. Reconnect it or choose Start from committed code"
+                )
             if not resource.source_url:
                 raise WorkspaceError(f"Repository is unavailable on this computer: {resource.name}")
             path = self._repository_cache(resource)
