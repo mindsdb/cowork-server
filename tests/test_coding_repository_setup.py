@@ -431,6 +431,33 @@ def test_task_setup_never_rebinds_a_checkout_owned_by_another_computer(tmp_path)
     assert project.resources[0].local_path is not None
 
 
+@pytest.mark.parametrize("inside_other_repository", [False, True])
+def test_task_setup_rejects_a_saved_checkout_replaced_by_a_directory(tmp_path, inside_other_repository):
+    parent = repository(tmp_path, "parent") if inside_other_repository else tmp_path
+    repo = repository(parent, "app")
+    remote = repository(tmp_path, "remote")
+    git(repo, "remote", "add", "origin", str(remote))
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(ProjectCreateRequest(
+        name="Example", folders=[ProjectFolder(id="app", name="App", path=str(repo))],
+    ))
+    assert project.resources[0].computer_id is None
+    moved = tmp_path / "original-checkout"
+    repo.rename(moved)
+    repo.mkdir()
+    (repo / "unrelated.txt").write_text("not the selected repository")
+    original_index = (moved / ".git/index").read_bytes()
+    with pytest.raises(WorkspaceError, match="no longer.*Git checkout"):
+        service.create_session(
+            SessionCreateRequest(project_id=project.id, prompt="Read files", engine_id="fake",
+                                 repository_setup=TaskRepositorySetup(include_local_changes=True)),
+            CREDS, "fake", "fake-model",
+        )
+    assert (repo / "unrelated.txt").read_text() == "not the selected repository"
+    assert (moved / ".git/index").read_bytes() == original_index
+    assert not list(service.project_workspaces.workspaces.worktrees_root.rglob("unrelated.txt"))
+
+
 def test_remote_target_rejected_before_any_task_is_created(tmp_path):
     repo = repository(tmp_path, "app")
     service = service_with(tmp_path, FakeEngine())

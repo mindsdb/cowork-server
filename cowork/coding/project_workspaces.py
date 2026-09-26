@@ -177,6 +177,14 @@ class ProjectWorkspaceManager:
                     key = self._key(session_id, folder.id)
                     if setup is not None and isinstance(resource, RepositoryResource):
                         inspection = self.workspaces.inspect(folder.path)
+                        if (
+                            not inspection.is_git
+                            or Path(inspection.repository_root or folder.path).resolve()
+                            != Path(folder.path).resolve()
+                        ):
+                            raise WorkspaceError(
+                                f"{resource.name} is no longer the selected Git checkout. Re-add the repository in Project settings"
+                            )
                         if not inspection.revision and (setup.branch or not setup.include_local_changes):
                             raise WorkspaceError(f"{resource.name} has no commits. Make an initial commit, or leave the task branch blank and include local changes")
                     item = self.workspaces.prepare(
