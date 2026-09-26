@@ -458,6 +458,28 @@ def test_task_setup_rejects_a_saved_checkout_replaced_by_a_directory(tmp_path, i
     assert not list(service.project_workspaces.workspaces.worktrees_root.rglob("unrelated.txt"))
 
 
+@pytest.mark.parametrize("endpoint", ["status", "diff", "branches"])
+def test_repository_inspection_never_exposes_a_replacement_parent_checkout(tmp_path, endpoint):
+    parent = repository(tmp_path, "parent")
+    git(parent, "branch", "parent-only")
+    (parent / "unrelated.txt").write_text("not part of the selected repository")
+    repo = repository(parent, "app")
+    project = project_for(repo)
+    repo.rename(tmp_path / "original-checkout")
+    repo.mkdir()
+    service = RepositorySetupService(WorkspaceManager(tmp_path / "runtime"), "local")
+    if endpoint == "status":
+        status = service.status(project)[0]
+        assert not status.available
+        assert not status.local
+        assert status.branches == []
+        assert status.changes == []
+        assert status.change_count == 0
+    else:
+        with pytest.raises(WorkspaceError, match="selected Git checkout"):
+            getattr(service, endpoint)(project, "app")
+
+
 def test_remote_target_rejected_before_any_task_is_created(tmp_path):
     repo = repository(tmp_path, "app")
     service = service_with(tmp_path, FakeEngine())

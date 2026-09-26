@@ -30,6 +30,7 @@ from cowork.coding.workspace import (
 )
 from cowork.coding.workspace_key import managed_key
 from cowork.coding.repository_setup_models import TaskRepositorySetup
+from cowork.coding.repository_setup import inspect_repository_checkout
 
 
 @dataclass(frozen=True)
@@ -176,15 +177,7 @@ class ProjectWorkspaceManager:
                     folder = self._runtime_folder(resource, require_local=include_local_changes)
                     key = self._key(session_id, folder.id)
                     if setup is not None and isinstance(resource, RepositoryResource):
-                        inspection = self.workspaces.inspect(folder.path)
-                        if (
-                            not inspection.is_git
-                            or Path(inspection.repository_root or folder.path).resolve()
-                            != Path(folder.path).resolve()
-                        ):
-                            raise WorkspaceError(
-                                f"{resource.name} is no longer the selected Git checkout. Re-add the repository in Project settings"
-                            )
+                        inspection = inspect_repository_checkout(self.workspaces, Path(folder.path))
                         if not inspection.revision and (setup.branch or not setup.include_local_changes):
                             raise WorkspaceError(f"{resource.name} has no commits. Make an initial commit, or leave the task branch blank and include local changes")
                     item = self.workspaces.prepare(

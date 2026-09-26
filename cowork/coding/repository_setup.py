@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from cowork.coding.contracts import DiffFile
+from cowork.coding.contracts import DiffFile, WorkspaceInspection
 from cowork.coding.git_transport import validate_git_source
 from cowork.coding.project_models import CodeProject, RepositoryResource
 from cowork.coding.repository_setup_models import RepositoryStatus, TaskRepositorySetup
@@ -57,6 +57,18 @@ def task_project(
     )
 
 
+def inspect_repository_checkout(workspaces: WorkspaceManager, path: Path) -> WorkspaceInspection:
+    inspection = workspaces.inspect(str(path))
+    if (
+        not inspection.is_git
+        or Path(inspection.repository_root or path).resolve() != path.resolve()
+    ):
+        raise WorkspaceError(
+            "This is no longer the selected Git checkout. Re-add the repository in Project settings"
+        )
+    return inspection
+
+
 class RepositorySetupService:
     """Read local checkout state without fetching, switching branches or touching its index."""
 
@@ -90,11 +102,7 @@ class RepositorySetupService:
                 )
             else:
                 try:
-                    inspection = self.workspaces.inspect(str(path))
-                    if not inspection.is_git:
-                        raise WorkspaceError(
-                            "This checkout is unavailable or has no Git repository"
-                        )
+                    inspection = inspect_repository_checkout(self.workspaces, path)
                     item.local = True
                     item.branch = inspection.branch
                     root = Path(inspection.repository_root or path)
@@ -130,9 +138,7 @@ class RepositorySetupService:
             raise WorkspaceError(
                 "Local changes can only be reviewed on their original computer"
             )
-        inspection = self.workspaces.inspect(str(path))
-        if not inspection.is_git:
-            raise WorkspaceError("This checkout is unavailable")
+        inspection = inspect_repository_checkout(self.workspaces, path)
         if not inspection.revision:
             raise WorkspaceError(
                 "This repository has no commits yet. Review its files in the original folder"
@@ -147,6 +153,7 @@ class RepositorySetupService:
             raise WorkspaceError("Choose a repository in this project")
         path = self._path(resource)
         if path is not None and path.is_dir():
+            inspect_repository_checkout(self.workspaces, path)
             return self.workspaces.git.run(
                 path,
                 "for-each-ref",
