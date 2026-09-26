@@ -259,6 +259,37 @@ def test_an_ineligible_org_stays_no_grant(calls):
     assert tokens.remaining == 0
 
 
+def test_an_ineligible_org_reports_no_refill(calls):
+    """No grant means nothing refills, so no refill time either.
+
+    Auth still sends ``next_refresh_at`` for this organization, a real instant
+    a few hours away. Relayed, the desktop would promise free tokens at a time
+    when none arrive.
+    """
+    calls.answers[svc.ENTITLEMENTS_PATH] = {
+        "included_percent_remaining": 0.0,
+        "free_grant_eligible": False,
+        "next_refresh_at": "2026-09-11T00:00:00Z",
+    }
+
+    tokens = _fetch().free_tokens
+
+    assert tokens.resets_at is None
+    assert tokens.limit == 0
+
+
+def test_an_exhausted_eligible_org_keeps_its_refill_time(calls):
+    # The negative case: a spent allowance does refill, and the time is the
+    # free way forward the desktop offers.
+    calls.answers[svc.ENTITLEMENTS_PATH] = {
+        "included_percent_remaining": 0.0,
+        "free_grant_eligible": True,
+        "next_refresh_at": "2026-09-11T00:00:00Z",
+    }
+
+    assert _fetch().free_tokens.resets_at == "2026-09-11T00:00:00Z"
+
+
 def test_an_exhausted_but_eligible_org_is_not_the_same_as_an_ineligible_one(calls):
     """Both read 0%, and only ``limit`` tells them apart.
 
@@ -491,3 +522,26 @@ def test_route_is_unchanged_in_local_mode_with_no_principal(monkeypatch):
 
     assert resp.status_code == 200
     assert resp.json()["balance"]["usd"] == 8.42
+
+
+def test_the_wire_sends_a_null_refill_time_for_an_ineligible_org(monkeypatch):
+    """The body the desktop reads: ``freeTokens.resetsAt`` null, ``limit`` 0."""
+
+    async def _fake(path, bearer_token):
+        return {
+            svc.ENTITLEMENTS_PATH: {
+                "included_percent_remaining": 0.0,
+                "free_grant_eligible": False,
+                "next_refresh_at": "2026-09-11T00:00:00Z",
+            },
+            svc.WALLET_PATH: WALLET,
+        }.get(path)
+
+    monkeypatch.setattr(svc, "get_auth_json", _fake)
+
+    body = _client(principal=None).get(
+        PATH, headers={HEADER_HUB_CREDENTIAL: "Bearer jwt-abc"}
+    ).json()
+
+    assert body["freeTokens"]["resetsAt"] is None
+    assert body["freeTokens"]["limit"] == 0

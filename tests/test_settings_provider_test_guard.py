@@ -35,6 +35,8 @@ from cowork.api.v1.endpoints import settings as settings_endpoint
 from cowork.common.settings.app_settings import default_minds_api_host
 from cowork.common.settings.user_settings import UserSettings
 from cowork.db.scoped import LOCAL_SCOPE
+from cowork.handlers.turn_errors import GatewayDenial
+from cowork.services.providers import ProviderPingResults
 
 STORED_KEY = "sk-stored-do-not-leak"
 STORED_MINDS_URL = "https://mdb.ai"
@@ -49,7 +51,11 @@ def pinged(monkeypatch):
 
     async def _fake_ping(providers):
         seen.extend(providers)
-        return ({p.get("type"): "ok" for p in providers}, {p.get("type"): "connected" for p in providers})
+        return ProviderPingResults(
+            statuses={p.get("type"): "ok" for p in providers},
+            details={p.get("type"): "connected" for p in providers},
+            denials={},
+        )
 
     monkeypatch.setattr(settings_endpoint, "ping_providers", _fake_ping)
     return seen
@@ -250,21 +256,49 @@ def test_a_url_naming_no_host_is_refused(stored, pinged):
     assert pinged == []
 
 
-def test_a_non_string_url_is_refused_rather_than_raising(stored, pinged):
-    # The body is `list[dict[str, Any]]`, so pydantic passes a list straight
-    # through. Raising here would 500 the whole request.
-    result = _test_providers([{"type": "minds-cloud", "apiKey": "***", "mindsUrl": [ATTACKER_URL]}])
+@pytest.mark.parametrize(
+    "card",
+    [
+        pytest.param({"type": "minds-cloud", "apiKey": "***", "mindsUrl": [ATTACKER_URL]}, id="list-url"),
+        pytest.param({"type": 123, "apiKey": ""}, id="numeric-type"),
+    ],
+)
+def test_a_card_the_settings_ui_cannot_send_is_a_422_and_nothing_is_pinged(monkeypatch, pinged, card):
+    """The body is typed per card (ProviderProbeCard), so a non-string type or URL
+    fails validation before any key is resolved or sent, and answers 422 rather
+    than a 500 or a status keyed by whatever the caller put in ``type``."""
+    from fastapi.testclient import TestClient
 
-    assert result["providerStatus"]["minds-cloud"] == "fail"
+    from cowork.server import create_app
+
+    _deployment(monkeypatch, minds_api_key=STORED_KEY, minds_url=STORED_MINDS_URL)
+    client = TestClient(create_app(), client=("127.0.0.1", 50000))
+
+    resp = client.post("/api/v1/settings/test-providers", json={"providers": [card]})
+
+    assert resp.status_code == 422
     assert pinged == []
 
 
-def test_a_non_string_provider_type_still_answers(stored, pinged):
-    # Unknown types already came back as "unknown provider type" from
-    # ping_provider; the guard must not turn that into a 500.
-    result = _test_providers([{"type": 123, "apiKey": ""}])
+def test_the_settings_uis_card_fields_ride_along_and_only_the_ping_fields_are_sent(stored, pinged):
+    # What cowork's settingsTransform.js holds for a card, display fields and
+    # all. A card field the server does not know must not fail the request.
+    _test_providers(
+        [
+            {
+                "type": "openai-compatible",
+                "apiKey": "***",
+                "baseUrl": "https://oc.internal",
+                "name": "Local model",
+                "isDefault": True,
+                "addedInANewerRenderer": {"any": "shape"},
+            }
+        ]
+    )
 
-    assert result["providerStatus"] == {123: "ok"}
+    assert pinged == [
+        {"type": "openai-compatible", "apiKey": STORED_KEY, "baseUrl": "https://oc.internal", "mindsUrl": None}
+    ]
 
 
 def test_a_card_with_a_null_type_does_not_crash(monkeypatch, pinged):
@@ -392,3 +426,96 @@ def test_a_refusal_does_not_overwrite_a_sibling_of_the_same_type(monkeypatch, pi
 
     assert result["providerStatus"]["minds-cloud"] == "ok"
     assert [p["apiKey"] for p in pinged] == [STORED_KEY], "only the allowed card was pinged"
+
+
+# ── The gateway's reason rides beside the status ────────────────────────────
+#
+# The Settings notice used to read "HTTP 429" out of the detail string and call
+# every MindsHub 429 "No credits available". The response now names the reason
+# the gateway sent, keyed by provider type, and a provider that was refused
+# (never pinged) has none.
+
+_FUSE_RESET_AT = "2026-09-25T00:00:00Z"
+
+
+@pytest.fixture()
+def pinged_with_a_fuse_denial(monkeypatch):
+    """ping_providers answers minds-cloud with the free-Air fuse, others ok."""
+    seen: list[dict] = []
+
+    async def _fake_ping(providers):
+        seen.extend(providers)
+        denials = {
+            p.get("type"): GatewayDenial(
+                reason="free_air_daily_spend_fuse_exceeded", reset_at=_FUSE_RESET_AT
+            )
+            for p in providers
+            if p.get("type") == "minds-cloud"
+        }
+        return ProviderPingResults(
+            statuses={p.get("type"): "fail" if p.get("type") in denials else "ok" for p in providers},
+            details={p.get("type"): "HTTP 429" if p.get("type") in denials else "connected" for p in providers},
+            denials=denials,
+        )
+
+    monkeypatch.setattr(settings_endpoint, "ping_providers", _fake_ping)
+    return seen
+
+
+def test_a_named_denial_rides_the_response_and_a_refused_type_has_none(
+    stored, pinged_with_a_fuse_denial
+):
+    result = _test_providers(
+        [
+            {"type": "minds-cloud", "apiKey": "***", "mindsUrl": STORED_MINDS_URL},
+            {"type": "anthropic", "apiKey": "***"},
+            {"type": "openai-compatible", "apiKey": "***", "baseUrl": ATTACKER_URL},
+        ]
+    )
+
+    assert result["providerStatusReasons"] == {
+        "minds-cloud": {"code": "free_air_daily_spend_fuse_exceeded", "resetAt": _FUSE_RESET_AT},
+    }
+    # The two maps a renderer that predates the reasons reads are unchanged.
+    assert result["providerStatus"] == {
+        "minds-cloud": "fail", "anthropic": "ok", "openai-compatible": "fail",
+    }
+    assert result["providerStatusDetails"]["minds-cloud"] == "HTTP 429"
+    assert REFUSAL in result["providerStatusDetails"]["openai-compatible"]
+
+
+def test_no_denial_means_an_empty_reasons_map(stored, pinged):
+    result = _test_providers([{"type": "anthropic", "apiKey": "***"}])
+
+    assert result["providerStatusReasons"] == {}
+
+
+def test_the_reasons_reach_the_wire_in_camel_case(monkeypatch, pinged_with_a_fuse_denial):
+    """Through the real route, so the declared response model is what serializes.
+
+    The direct calls above read the handler's own return value; this reads the
+    body a renderer gets.
+    """
+    from fastapi.testclient import TestClient
+
+    from cowork.server import create_app
+
+    _deployment(monkeypatch, minds_api_key=STORED_KEY, minds_url=STORED_MINDS_URL)
+    client = TestClient(create_app(), client=("127.0.0.1", 50000))
+
+    resp = client.post(
+        "/api/v1/settings/test-providers",
+        json={
+            "providers": [
+                {"type": "minds-cloud", "apiKey": "sk-callers-own", "mindsUrl": STORED_MINDS_URL},
+                {"type": "anthropic", "apiKey": "sk-callers-own"},
+            ]
+        },
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["providerStatusReasons"] == {
+        "minds-cloud": {"code": "free_air_daily_spend_fuse_exceeded", "resetAt": _FUSE_RESET_AT},
+    }
+    assert body["providerStatus"] == {"minds-cloud": "fail", "anthropic": "ok"}
