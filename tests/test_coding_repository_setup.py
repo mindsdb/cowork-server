@@ -1,4 +1,6 @@
 from pathlib import Path
+import shlex
+import sys
 
 import pytest
 from pydantic import ValidationError
@@ -303,6 +305,50 @@ def test_local_folders_are_copied_and_cannot_receive_branch_overrides(tmp_path):
     )
     (Path(prepared.primary.workspace_path) / "note.md").write_text("task")
     assert (folder / "note.md").read_text() == "original"
+
+
+@pytest.mark.parametrize("tracked", [False, True])
+def test_copy_preserves_worktree_representation_of_filtered_files(tmp_path, tracked):
+    repo = repository(tmp_path, "filtered")
+    (repo / ".gitattributes").write_text("*.filtered filter=qa\n")
+    for name, before, after in (
+        ("clean", "WORKTREE:", "CANONICAL:"),
+        ("smudge", "CANONICAL:", "WORKTREE:"),
+    ):
+        command = shlex.join([
+            Path(sys.executable).as_posix(), "-c",
+            f"import sys; sys.stdout.buffer.write(sys.stdin.buffer.read().replace(b'{before}', b'{after}'))",
+        ])
+        git(repo, "config", f"filter.qa.{name}", command)
+    git(repo, "config", "filter.qa.required", "true")
+    path = repo / "sample.filtered"
+    if tracked:
+        path.write_text("WORKTREE:old\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "filter attributes")
+    if tracked:
+        assert git(repo, "show", "HEAD:sample.filtered").strip() == "CANONICAL:old"
+    path.write_text("WORKTREE:new\n")
+    index = (repo / ".git/index").read_bytes()
+    prepared = WorkspaceManager(tmp_path / "runtime").prepare(
+        "task", str(repo), True, include_local_changes=True,
+    )
+    assert (prepared.workspace_path / path.name).read_bytes() == path.read_bytes()
+    assert (repo / ".git/index").read_bytes() == index
+
+
+def test_copy_rejects_untracked_embedded_repositories_without_losing_files(tmp_path):
+    repo = repository(tmp_path, "outer")
+    nested = repository(repo, "nested")
+    (nested / "untracked.txt").write_text("keep this too")
+    index = (repo / ".git/index").read_bytes()
+    manager = WorkspaceManager(tmp_path / "runtime")
+    with pytest.raises(WorkspaceError, match="embedded repositor"):
+        manager.prepare("task", str(repo), True, include_local_changes=True)
+    assert (repo / ".git/index").read_bytes() == index
+    assert (nested / "README.md").read_text() == "nested\n"
+    assert (nested / "untracked.txt").read_text() == "keep this too"
+    assert not (manager.worktrees_root / "task").exists()
 
 
 @pytest.mark.parametrize("origin", [None, "local-only-base", "shared-base"])

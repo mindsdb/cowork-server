@@ -49,6 +49,18 @@ def copy_source_changes(
         }
         manager.git.run(source, "read-tree", revision, environment=environment)
         manager.git.run(source, "add", "--all", "--", ".", environment=environment)
+        # An untracked nested repository becomes a new gitlink in this private
+        # index. A patch would copy only the link, silently dropping its files.
+        staged = manager.git.run(
+            source, "ls-files", "--stage", "-z", environment=environment
+        ).stdout
+        if any(
+            line.startswith("160000 ") and line.split("\t", 1)[1] not in gitlinks
+            for line in staged.split("\0") if "\t" in line
+        ):
+            raise WorkspaceError(
+                "Local changes contain embedded repositories. Add them as project resources or start from committed code"
+            )
         patch = root / "changes.patch"
         manager.git.run(
             source,
