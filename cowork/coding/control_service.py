@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from cowork.coding.connector_delegation import ConnectorDelegationService
+from cowork.coding.repository_setup_models import TaskRepositorySetup
 from cowork.coding.contracts import CodingSession, SessionStatus, TaskCapability, utc_now
 from cowork.coding.control_errors import RuntimeAuthenticationError, StaleRuntimeEvent, StateConflict
 from cowork.coding.control_models import (
@@ -309,6 +310,7 @@ class ControlPlaneService:
         computer_id: str | None,
         engine_id: str,
         standalone_computer_id: str | None = None,
+        repository_setup: TaskRepositorySetup | None = None,
     ) -> TaskControlSnapshot:
         with self._lock:
             return self._create_task_run(
@@ -320,6 +322,7 @@ class ControlPlaneService:
                 computer_id=computer_id,
                 engine_id=engine_id,
                 standalone_computer_id=standalone_computer_id,
+                repository_setup=repository_setup,
             )
 
     def _create_task_run(
@@ -332,6 +335,7 @@ class ControlPlaneService:
         computer_id: str | None,
         engine_id: str,
         standalone_computer_id: str | None,
+        repository_setup: TaskRepositorySetup | None = None,
     ) -> TaskControlSnapshot:
         scope = TaskResourceScope(
             all_project_resources=requested_resource_ids is None,
@@ -356,6 +360,7 @@ class ControlPlaneService:
             project_id=project.id if project else None,
             resource_scope=scope,
             execution_project=self.execution_project_snapshot(project, resources),
+            repository_setup=repository_setup,
         )
         run = TaskRun(
             id=f"run-{uuid.uuid4().hex}",
@@ -757,6 +762,8 @@ class ControlPlaneService:
             if project is not None
             else []
         )
+        if task.repository_setup is not None:
+            eligible = [computer for computer in eligible if computer.id == run.computer_id]
         return build_recovery_plan(self.store, run, eligible)
 
     def recover_run(
@@ -769,6 +776,10 @@ class ControlPlaneService:
         with self._lock:
             run = self.store.get_run(run_id)
             computer = self.store.get_computer(computer_id or run.computer_id)
+            task = self.store.get_task(run.task_id)
+            if task.repository_setup is not None:
+                if computer.id != run.computer_id:
+                    raise StateConflict("This task uses repository choices from its original computer. Resume it there")
             return apply_recovery(
                 self.store,
                 run.id,
@@ -784,6 +795,8 @@ class ControlPlaneService:
             if run.status != RunStatus.queued:
                 raise StateConflict("Only queued Task Runs can be reassigned; recover a leased run instead")
             task = self.store.get_task(run.task_id)
+            if task.repository_setup is not None and computer_id != run.computer_id:
+                raise StateConflict("This task uses repository choices from its original computer. Run it there")
             if task.execution_project is None:
                 raise NoEligibleComputer("This task includes resources that only exist on its original computer")
             eligible = self.eligible_computers(
