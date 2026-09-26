@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from coding_service_fakes import CREDS, FakeEngine, service_with
 from test_coding_projects import git, repository
 from cowork.coding.contracts import SessionCreateRequest
+from cowork.coding.control_models import TaskResourceScope
 from cowork.coding.project_models import (
     CodeProject,
     LocalFolderResource,
@@ -257,10 +258,21 @@ def test_local_folders_are_copied_and_cannot_receive_branch_overrides(tmp_path):
     assert (folder / "note.md").read_text() == "original"
 
 
-def test_real_session_factory_persists_choices_and_restores_named_workspace(tmp_path):
+@pytest.mark.parametrize("origin", [None, "local-only-base", "shared-base"])
+def test_real_session_factory_persists_choices_and_restores_named_workspace(tmp_path, origin):
     repo = repository(tmp_path, "app")
+    if origin:
+        remote = repository(tmp_path, "remote")
+        git(repo, "remote", "add", "origin", str(remote))
+        if origin == "shared-base":
+            git(remote, "branch", "staging")
     git(repo, "branch", "staging")
+    (repo / "README.md").write_text("staged work\n")
+    git(repo, "add", ".")
+    (repo / "README.md").write_text("unstaged work\n")
     (repo / "new.txt").write_text("user work")
+    index = (repo / ".git/index").read_bytes()
+    head = git(repo, "rev-parse", "HEAD")
     service = service_with(tmp_path, FakeEngine())
     project = service.projects.create(
         ProjectCreateRequest(
@@ -287,7 +299,16 @@ def test_real_session_factory_persists_choices_and_restores_named_workspace(tmp_
     stored = service.control.store.get_task(session.id)
     assert stored.repository_setup == options
     assert stored.execution_project.resources[0].default_branch == "staging"
+    assert stored.execution_project.resources[0].local_path == str(repo.resolve())
+    assert stored.execution_project.resources[0].computer_id == service.control.local_computer.id
     assert service.projects.get(project.id).resources[0].default_branch is None
+    assert service.projects.get(project.id).resources[0].computer_id == project.resources[0].computer_id
+    if origin:
+        assert project.resources[0].computer_id is None
+    assert Path(session.workspace_path, "README.md").read_text() == "unstaged work\n"
+    assert (repo / ".git/index").read_bytes() == index
+    assert git(repo, "rev-parse", "HEAD") == head
+    assert git(repo, "branch", "--show-current") != "feat/session"
     assert Path(session.workspace_path, "new.txt").read_text() == "user work"
     assert session.workspaces[0].task_branch == "feat/session"
     records = service.control.store.list_workspaces(session.run_id)
@@ -300,6 +321,21 @@ def test_real_session_factory_persists_choices_and_restores_named_workspace(tmp_
         option.computer.id == session.computer_id
         for option in service.control.recovery_plan(session.run_id).options
     )
+
+
+def test_task_setup_never_rebinds_a_checkout_owned_by_another_computer(tmp_path):
+    project = project_for(repository(tmp_path, "app"))
+    project.resources[0].computer_id = "other"
+    project.resources[0].source_url = "https://github.com/example/app.git"
+    service = service_with(tmp_path, FakeEngine())
+    selected = task_project(
+        project, TaskRepositorySetup(), None,
+        local_computer_id=service.control.local_computer.id,
+    )
+    assert selected.resources[0].computer_id == "other"
+    runtime = service.control.runtime_project(selected, TaskResourceScope(), service.control.local_computer.id)
+    assert runtime.resources[0].local_path is None
+    assert project.resources[0].local_path is not None
 
 
 def test_remote_target_rejected_before_any_task_is_created(tmp_path):

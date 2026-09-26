@@ -151,7 +151,10 @@ class CodingSessionFactory:
         if request.repository_setup is not None and project is not None:
             if request.computer_id not in {None, self.control.local_computer.id}:
                 raise ValueError("Repository choices are available on this computer. Switch to this computer first")
-            project = task_project(project, request.repository_setup, request.resource_ids)
+            project = task_project(
+                project, request.repository_setup, request.resource_ids,
+                local_computer_id=self.control.local_computer.id,
+            )
             project = self.control.runtime_project(project, TaskResourceScope(), self.control.local_computer.id)
         engine_id = request.engine_id or (project.default_engine_id if project else default_engine)
         model = canonical_model_id(request.model or (project.default_model if project else default_model))

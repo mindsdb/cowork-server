@@ -10,7 +10,8 @@ from cowork.coding.workspace import WorkspaceError, WorkspaceManager
 
 
 def task_project(
-    project: CodeProject, setup: TaskRepositorySetup, resource_ids: list[str] | None
+    project: CodeProject, setup: TaskRepositorySetup, resource_ids: list[str] | None,
+    *, local_computer_id: str | None = None,
 ) -> CodeProject:
     """Validate scope before any task records or worktrees are created."""
     selected = (
@@ -31,15 +32,27 @@ def task_project(
         raise WorkspaceError(
             "Include a repository to choose a task branch or local changes"
         )
+    resources = []
+    for item in project.resources:
+        updates = {}
+        if item.id in setup.base_branches:
+            updates["default_branch"] = setup.base_branches[item.id]
+        if (
+            local_computer_id is not None
+            and item.id in selected
+            and isinstance(item, RepositoryResource)
+            and item.local_path
+            and item.computer_id is None
+        ):
+            # A locally added Git repo with an origin remains portable in the
+            # project. Bind only this local task's snapshot so runtime routing
+            # preserves the checkout whose branches/changes the user inspected.
+            updates["computer_id"] = local_computer_id
+        resources.append(item.model_copy(update=updates))
     return CodeProject.model_validate(
         {
             **project.model_dump(),
-            "resources": [
-                item.model_copy(update={"default_branch": setup.base_branches[item.id]})
-                if item.id in setup.base_branches
-                else item
-                for item in project.resources
-            ],
+            "resources": resources,
         }
     )
 
