@@ -1980,3 +1980,140 @@ async def test_a_forced_continuation_persists_only_the_replacement(monkeypatch):
     )
 
     assert saved["assistant"] == "REPLACEMENT"
+
+
+# ── The persisted assistant message id rides the completion frame ──
+
+def _remote_handler_with_message_id(monkeypatch, saved, *, assistant_message_id):
+    """Same DB-layer fake as _remote_handler, but save_assistant_turn returns
+    a real (fake) Message so the completion-frame wiring can be asserted —
+    _remote_handler's own fake returns None, which every other test in this
+    file relies on NOT mattering."""
+    handler = _handler()
+    handler.principal = object()
+    handler._remote_seed_history = lambda session, conv_id: ([], None)
+
+    class FakeConversationService:
+        def __init__(self, session):
+            pass
+
+        def get_conversation(self, conv_id):
+            return object()
+
+        def save_user_message(self, conv_id, content, *, pending=False):
+            saved["user"] = content
+            return SimpleNamespace(id=uuid4())
+
+        def finalize_pending(self, conv_id, message_id=None):
+            pass
+
+        def save_assistant_turn(self, conv_id, text, events, harness=None, tool_rows=None):
+            saved["assistant"] = text
+            saved["events"] = events
+            if assistant_message_id is None:
+                return None
+            return SimpleNamespace(id=assistant_message_id)
+
+    class FakeSession:
+        def commit(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
+    monkeypatch.setattr(responses_mod, "ScopedSession", lambda s, scope: FakeSession())
+    monkeypatch.setattr(responses_mod, "get_open_session", lambda: None)
+    monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: _FakeScope())
+    return handler
+
+
+def _payload(frame):
+    return json.loads(frame.split("data: ", 1)[1])
+
+
+class _RecordingBuffer:
+    def __init__(self):
+        self.frames: list[str] = []
+
+    async def append(self, kind, record):
+        self.frames.append(record["sse"])
+
+    async def close(self, reason):
+        self.frames.append(f"CLOSE:{reason}")
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_completed_frame_carries_the_assistant_message_id(monkeypatch):
+    saved = {}
+    real_id = uuid4()
+    handler = _remote_handler_with_message_id(monkeypatch, saved, assistant_message_id=real_id)
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "hello"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    completed = [f for f in buffer.frames if f.startswith("event: response.completed")]
+    assert len(completed) == 1
+    assert _payload(completed[0])["assistant_message_id"] == str(real_id)
+    # persist() only ran once despite the early + fallback call sites.
+    assert saved["assistant"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_failed_frame_carries_the_id_when_something_persisted(monkeypatch):
+    saved = {}
+    real_id = uuid4()
+    handler = _remote_handler_with_message_id(monkeypatch, saved, assistant_message_id=real_id)
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "partial"}
+        yield "turn_failed", {"error": "boom", "code": "anton_error", "message": "An unexpected error occurred."}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+        turn_llm={"correlation_id": "corr-1"},
+    )
+
+    failed = [f for f in buffer.frames if f.startswith("event: response.failed")]
+    assert len(failed) == 1
+    payload = _payload(failed[0])
+    assert payload["assistant_message_id"] == str(real_id)
+    # The failure event persisted alongside it does NOT carry the id (same
+    # convention as request_id/code) — only the live wire frame does.
+    assert "assistant_message_id" not in saved["events"][-1]
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_completed_frame_omits_the_id_when_nothing_persisted(monkeypatch):
+    """An empty turn (save_assistant_turn's own early-return) must not crash
+    the frame-injection path, and must OMIT the field, not send it as null."""
+    saved = {}
+    handler = _remote_handler_with_message_id(monkeypatch, saved, assistant_message_id=None)
+
+    async def fake_replies(**kwargs):
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    completed = [f for f in buffer.frames if f.startswith("event: response.completed")]
+    assert len(completed) == 1
+    assert "assistant_message_id" not in _payload(completed[0])
