@@ -85,6 +85,7 @@ from cowork.coding.project_models import (
     canonical_model_id,
 )
 from cowork.coding.reasoning import check_reasoning_effort
+from cowork.coding.repository_setup import RepositorySetupService
 from cowork.coding.redaction import redact_text
 from cowork.coding.runtime_protocol import (
     ComputerUpdateRequest,
@@ -373,6 +374,27 @@ def inspect_code_project_folders(project_id: str):
 @router.post("/project-resources/inspect")
 def inspect_local_project_resource(body: ProjectFolder):
     return _call(_service().projects.resolve_local_resource, body)
+
+
+@router.get("/projects/{project_id}/repository-status")
+def code_project_repository_status(project_id: str):
+    service = _service()
+    project = _call(service.projects.get, project_id)
+    return {"items": _call(RepositorySetupService(service.workspaces, service.control.local_computer.id).status, project)}
+
+
+@router.get("/projects/{project_id}/repositories/{resource_id}/diff")
+def code_project_repository_diff(project_id: str, resource_id: str):
+    service = _service()
+    project = _call(service.projects.get, project_id)
+    return {"files": _call(RepositorySetupService(service.workspaces, service.control.local_computer.id).diff, project, resource_id)}
+
+
+@router.get("/projects/{project_id}/repositories/{resource_id}/branches")
+def code_project_repository_branches(project_id: str, resource_id: str):
+    service = _service()
+    project = _call(service.projects.get, project_id)
+    return {"items": _call(RepositorySetupService(service.workspaces, service.control.local_computer.id).branches, project, resource_id)}
 
 
 @router.get("/projects/{project_id}/resources")

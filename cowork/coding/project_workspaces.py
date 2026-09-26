@@ -29,6 +29,7 @@ from cowork.coding.workspace import (
     _org_mode,
 )
 from cowork.coding.workspace_key import managed_key
+from cowork.coding.repository_setup_models import TaskRepositorySetup
 
 
 @dataclass(frozen=True)
@@ -163,22 +164,45 @@ class ProjectWorkspaceManager:
         self.commands = commands or ProjectCommandRunner()
         self._lock = threading.RLock()
 
-    def prepare(self, session_id: str, project: CodeProject) -> PreparedProjectWorkspace:
+    def prepare(self, session_id: str, project: CodeProject, setup: TaskRepositorySetup | None = None) -> PreparedProjectWorkspace:
         with self._lock:
             prepared: list[TaskWorkspace] = []
             try:
                 for resource in project.resources:
                     folder = self._runtime_folder(resource)
                     key = self._key(session_id, folder.id)
-                    item = self.workspaces.prepare(key, folder.path, True, folder.base_branch)
-                    prepared.append(self._task_workspace(session_id, project.name, folder, item))
+                    if setup is not None and isinstance(resource, RepositoryResource):
+                        inspection = self.workspaces.inspect(folder.path)
+                        if not inspection.revision and (setup.branch or not setup.include_local_changes):
+                            raise WorkspaceError(f"{resource.name} has no commits. Make an initial commit, or leave the task branch blank and include local changes")
+                    item = self.workspaces.prepare(
+                        key, folder.path, True, folder.base_branch,
+                        include_local_changes=bool(
+                            setup and setup.include_local_changes and isinstance(resource, RepositoryResource)
+                            and resource.local_path and Path(resource.local_path).expanduser().is_dir()
+                        ),
+                    )
+                    prepared.append(self._task_workspace(
+                        session_id, project.name, folder, item, task_branch=setup.branch if setup else None,
+                    ))
                 ports = self.ports.allocate(session_id, project.environment.port_names)
                 return PreparedProjectWorkspace(primary=prepared[0], workspaces=tuple(prepared), ports=ports)
             except Exception:
                 for workspace in reversed(prepared):
                     self._cleanup_one(session_id, workspace)
+                    if setup and setup.branch and workspace.task_branch == setup.branch:
+                        # Only branches successfully created by this preparation.
+                        self.rollback_task_branch(workspace)
                 self.ports.release(session_id)
                 raise
+
+    def rollback_task_branch(self, workspace: TaskWorkspace) -> None:
+        """Delete only our still-unmodified branch after failed preparation."""
+        if workspace.task_branch and workspace.base_revision:
+            self.workspaces.git.run(
+                Path(workspace.source_path), "update-ref", "-d", f"refs/heads/{workspace.task_branch}",
+                workspace.base_revision, check=False,
+            )
 
     def restore(
         self,
@@ -522,12 +546,15 @@ class ProjectWorkspaceManager:
         folder: ProjectFolder,
         prepared: PreparedWorkspace,
         base_branch: str | None = None,
+        task_branch: str | None = None,
     ) -> TaskWorkspace:
         branch = None
+        branch_created = False
         try:
             if prepared.kind == WorkspaceKind.git_worktree:
-                branch = self._task_branch(project_name, session_id)
+                branch = task_branch or self._task_branch(project_name, session_id)
                 self.workspaces.create_branch(str(prepared.workspace_path), branch)
+                branch_created = True
             resolved_base_branch = base_branch or folder.base_branch
             if prepared.kind == WorkspaceKind.git_worktree and not resolved_base_branch:
                 resolved_base_branch = self.workspaces.inspect(str(prepared.source_path)).branch
@@ -551,6 +578,11 @@ class ProjectWorkspaceManager:
                 prepared.kind,
                 prepared.base_revision,
             )
+            if task_branch and branch_created and prepared.base_revision:
+                self.workspaces.git.run(
+                    prepared.source_path, "update-ref", "-d", f"refs/heads/{task_branch}",
+                    prepared.base_revision, check=False,
+                )
             raise
 
     @staticmethod
