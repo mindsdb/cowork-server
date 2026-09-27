@@ -281,6 +281,14 @@ def test_turn_queue_settings_is_remote(monkeypatch):
     assert TurnQueueSettings().is_remote is False  # default is "inprocess"
 
 
+def test_turn_queue_settings_jev_shadow_is_off_unless_the_env_turns_it_on(monkeypatch):
+    monkeypatch.delenv("COWORK_TURN_JEV_SHADOW_ENABLED", raising=False)
+    assert TurnQueueSettings().jev_shadow_enabled is False
+
+    monkeypatch.setenv("COWORK_TURN_JEV_SHADOW_ENABLED", "true")
+    assert TurnQueueSettings().jev_shadow_enabled is True
+
+
 def test_stale_organization_boundary_mode_env_var_is_inert(monkeypatch):
     """A leftover overlay entry loads and changes nothing.
 
