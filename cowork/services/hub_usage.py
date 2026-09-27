@@ -100,9 +100,11 @@ def _parse_free_tokens(payload: Any) -> Optional[HubFreeTokens]:
         return None
 
     # An explicit denial is the only thing that means "no grant"; a server that
-    # does not send the flag has not said so.
+    # does not send the flag has not said so. No refill time either: auth still
+    # sends `next_refresh_at` for this organization, but it has no allowance to
+    # refill, so relaying the instant would promise tokens that never arrive.
     if payload.get("free_grant_eligible") is False:
-        return HubFreeTokens(percent_remaining=0.0, limit=0, used=0, remaining=0, resets_at=resets_at)
+        return HubFreeTokens(percent_remaining=0.0, limit=0, used=0, remaining=0, resets_at=None)
 
     percent = payload.get("included_percent_remaining")
     if percent is None:

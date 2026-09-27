@@ -47,7 +47,7 @@ RECOMMENDED_MODELS: dict[str, list[str]] = {
 # it the lookup misses → None (not the prior provider's model), which trips
 # config_status's model gate ("select a model") rather than misrouting.
 #
-# The one model MindsHub's free monthly allowance covers; every other alias
+# The one model MindsHub's free included allowance covers; every other alias
 # bills the wallet. It is also every minds-cloud role default below, so the
 # name is declared here rather than beside the org-mode fallback that used to
 # be its only reader.

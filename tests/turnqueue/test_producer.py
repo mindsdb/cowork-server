@@ -140,6 +140,95 @@ async def test_turn_failed_yields_classified_code_and_message(monkeypatch):
     assert items == [items[-1]]  # terminal is the only yield, then the generator ends
 
 
+# What anton's worker sends, via scratchpad-controller, for a billing stop the
+# gate timed: `reset_at` beside `error` on the turn_failed reply.
+_FUSE_STOP = "FreeServingPausedError: Free serving for 'x' is paused until the daily budget resets."
+_ALLOWANCE_STOP = "AllowanceExhaustedError: Your included allowance for 'x' is exhausted."
+_WALLET_STOP = "WalletEmptyError: Your wallet has no balance to cover the model 'x'."
+_RESET_AT = "2026-09-26T00:00:00+00:00"
+
+
+async def _failed_turn(monkeypatch, data):
+    """The turn_failed data the producer yields for one worker reply."""
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_failed", data))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+    kind, failed = items[-1]
+    assert kind == "turn_failed"
+    return failed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [(_FUSE_STOP, te.FREE_SERVING_PAUSED_CODE), (_ALLOWANCE_STOP, te.ALLOWANCE_EXHAUSTED_CODE)],
+)
+async def test_turn_failed_keeps_the_workers_reset_at_for_a_timed_stop(
+    monkeypatch, error, expected_code
+):
+    # The hosted card needs the instant to say when the free way forward comes
+    # back, as the desktop card does from the gate's header.
+    data = await _failed_turn(monkeypatch, {"error": error, "reset_at": _RESET_AT})
+    assert data["code"] == expected_code
+    assert data["reset_at"] == _RESET_AT
+
+
+@pytest.mark.asyncio
+async def test_turn_failed_sends_reset_at_in_the_extended_iso_form(monkeypatch):
+    # Python parses compact and `Z` forms that a browser's Date may not, so the
+    # instant leaves in isoformat()'s extended form, offset unchanged.
+    data = await _failed_turn(
+        monkeypatch, {"error": _FUSE_STOP, "reset_at": "20260926T020000+0200"}
+    )
+    assert data["reset_at"] == "2026-09-26T02:00:00+02:00"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reset_at",
+    [
+        pytest.param("2026-09-26T00:00:00", id="naive"),
+        pytest.param("tomorrow", id="junk"),
+        pytest.param("", id="empty"),
+        pytest.param(1790380800, id="epoch-number"),
+        pytest.param({"at": _RESET_AT}, id="object"),
+        pytest.param(None, id="null"),
+    ],
+)
+async def test_turn_failed_drops_a_reset_at_that_is_not_an_offset_aware_instant(
+    monkeypatch, reset_at
+):
+    # A naive time names a different moment in every timezone, and anything
+    # that is not an ISO instant would make every consumer re-validate it.
+    data = await _failed_turn(monkeypatch, {"error": _FUSE_STOP, "reset_at": reset_at})
+    assert data["code"] == te.FREE_SERVING_PAUSED_CODE
+    assert "reset_at" not in data
+
+
+@pytest.mark.asyncio
+async def test_turn_failed_never_carries_reset_at_outside_the_reset_codes(monkeypatch):
+    # The out-of-credits card offers no wait, so a reset instant on an empty
+    # wallet stop must not reach it.
+    assert te.TOKEN_LIMIT_CODE not in te.RESET_AT_CODES
+    data = await _failed_turn(monkeypatch, {"error": _WALLET_STOP, "reset_at": _RESET_AT})
+    assert data["code"] == te.TOKEN_LIMIT_CODE
+    assert "reset_at" not in data
+
+
+@pytest.mark.asyncio
+async def test_turn_failed_from_an_older_worker_is_unchanged(monkeypatch):
+    # An older worker sends no reset_at, and the reply keeps exactly the shape
+    # it had before the worker could send one.
+    data = await _failed_turn(monkeypatch, {"error": _FUSE_STOP})
+    assert data == {
+        "error": _FUSE_STOP,
+        "code": te.FREE_SERVING_PAUSED_CODE,
+        "message": te.FREE_SERVING_PAUSED_USER_MESSAGE,
+    }
+
+
 @pytest.mark.asyncio
 async def test_unmapped_turn_failure_is_redacted(monkeypatch):
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply(
