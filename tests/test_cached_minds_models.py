@@ -4,6 +4,7 @@ import asyncio
 import time
 
 import pytest
+from pydantic import SecretStr
 
 from cowork.services import providers
 
@@ -129,7 +130,8 @@ def test_two_desktop_credentials_do_not_share_a_listing(monkeypatch) -> None:
     assert providers.cached_minds_models(_URL, api_key=account_b) == second
     for key in providers._minds_models_cache:
         assert account_a not in repr(key) and account_b not in repr(key)
-        assert len(key.credential) == 16
+        assert isinstance(key.credential, SecretStr)
+        assert "**********" in repr(key)
 
 
 def test_an_org_entry_is_keyed_without_the_credential() -> None:
