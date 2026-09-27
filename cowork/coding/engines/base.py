@@ -12,9 +12,11 @@ from cowork.coding.contracts import (
     PermissionMode,
     RuntimePlatformStatus,
     TerminalShellPreference,
+    TaskMode,
 )
 
-ApprovalHandler = Callable[[str, dict[str, Any] | None], dict[str, str]]
+# The SDK routes all server requests through this callback, including user input.
+ApprovalHandler = Callable[[str, dict[str, Any] | None], dict[str, Any]]
 TerminalOutputHandler = Callable[[str, str, bool], None]
 TerminalExitHandler = Callable[[int | None, str | None], None]
 
@@ -38,6 +40,7 @@ class EngineMcpServer:
 class EngineSessionConfig:
     model: str
     permission_mode: PermissionMode
+    task_mode: TaskMode = "build"
     reasoning_effort: str | None = None
     service_tier: str | None = None
     personality: str | None = None

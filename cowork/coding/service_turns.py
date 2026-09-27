@@ -121,6 +121,7 @@ class CodingTurnOperations:
         attachments: list[InputReference] | tuple[InputReference, ...],
         *,
         maintenance_reserved: bool = False,
+        continue_completed: bool = False,
     ) -> CodingSession:
         """Validate and launch one turn, optionally inside a service reservation."""
         intent = self._validated_command_intent(self.get_session(session_id), prompt, attachments)
@@ -142,6 +143,9 @@ class CodingTurnOperations:
             }:
                 raise RuntimeError("This coding task already has a running turn")
             engine_attachments = validate_references(session, attachments)
+            # Mode changes must finish preflight before allocating a new run.
+            if continue_completed:
+                self._continue_completed_task(session)
             self._emit(
                 session_id,
                 CodingEvent(type=EventType.user_message, title="You", text=prompt, phase="completed"),
@@ -183,6 +187,8 @@ class CodingTurnOperations:
         attachments: list[InputReference] | tuple[InputReference, ...],
     ) -> CommandIntent:
         intent = CommandIntent.parse(prompt)
+        if session.task_mode == "plan" and intent.name in {"goal", "review"}:
+            raise ValueError("Finish planning before starting a goal or review")
         self.commands.validate(session, intent.name)
         intent.validate_arguments()
         intent.validate_attachments(bool(attachments))
@@ -197,6 +203,8 @@ class CodingTurnOperations:
         attachments: list[InputReference] | tuple[InputReference, ...] = (),
     ) -> CodingSession:
         session = self.get_session(session_id)
+        if session.pending_question is not None:
+            raise StateConflict("Answer the pending question first; the instruction can be queued meanwhile")
         if session.pending_approval is not None:
             # Codex does not accept turn/steer while the turn waits on an
             # approval, so the request would hang until the decision arrives.
@@ -502,7 +510,10 @@ class CodingTurnOperations:
             ),
         )
         try:
-            self.approvals.cancel_session(session_id)
+            try:
+                self.questions.cancel_session(session_id)
+            finally:
+                self.approvals.cancel_session(session_id)
         finally:
             if engine is not None:
                 engine.cancel(turn_id)

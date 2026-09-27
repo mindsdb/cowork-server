@@ -48,6 +48,10 @@ class TaskObjectService:
     def __init__(self, session: ScopedSession) -> None:
         self.session = session
 
+    @property
+    def _org_mode(self) -> bool:
+        return bool(getattr(self.session.scope, "org_mode", False))
+
     # ── indexing ──────────────────────────────────────────────────────
 
     def index_artifact(self, conversation_id: UUID, project_id: UUID, slug: str) -> None:
@@ -92,7 +96,10 @@ class TaskObjectService:
         harness, or before this index existed. Returns the conversation's
         artifact rows."""
         base = _artifacts_base(project)
-        if base.is_dir():
+        # Org mode (ENG-2961, D8): provenance is agent-writable on the shared
+        # project root, so it must not create index rows that a relocation would
+        # then act on. Rows there come only from the end of the creating turn.
+        if not self._org_mode and base.is_dir():
             for folder in base.iterdir():
                 if not folder.is_dir():
                     continue
@@ -148,12 +155,37 @@ class TaskObjectService:
         return self._relocate_artifacts(conversation, source, dest)
 
     def _relocate_artifacts(self, conversation: Conversation, source: Project, dest: Project) -> int:
+        """Move the task's artifact folders and retarget its index rows.
+
+        Org mode (ENG-2961, D8): only folders owned by the task's creator move,
+        and their owner rows follow them. A row whose folder is already gone is
+        retargeted without an ownership check or a "not moved" log line — there
+        is nothing on disk to move or to protect.
+        """
         rows = self.reconcile_conversation(conversation, source)
         if not rows:
             return 0
         src_base = _artifacts_base(source)
         dest_base = _artifacts_base(dest)
         dest_base.mkdir(parents=True, exist_ok=True)
+        org_mode = self._org_mode
+        creator = str(conversation.created_by) if conversation.created_by else None
+        src_root = None
+        resolutions: dict = {}
+        if org_mode:
+            # Lazy: artifact_ownership imports this module back (lazily too).
+            from cowork.services.artifact_ownership import (
+                project_root_source,
+                rekey_artifact_owner,
+                resolve_artifact_owners,
+            )
+
+            src_root = project_root_source(source)
+            # One query for every row, before the loop.
+            resolutions = resolve_artifact_owners(
+                self.session, src_root, [row.ref for row in rows]
+            )
+        rekeys: list[tuple[str, str]] = []
         moved = 0
         for row in rows:
             src_folder = src_base / row.ref
@@ -162,17 +194,44 @@ class TaskObjectService:
                 row.project_id = dest.id
                 self.session.add(row)
                 continue
+            if org_mode:
+                # D8: a task carries only what its creator owns. Anything else
+                # indexed to it (someone else's, or ownerless) stays put, and its
+                # row keeps pointing at the source project.
+                resolution = resolutions[row.ref]
+                if not creator or resolution.owner_user_id != creator:
+                    logger.warning(
+                        "artifact not moved with task: project=%s slug=%s owner_state=%s",
+                        source.id, row.ref, resolution.state,
+                    )
+                    continue
             dest_slug = self._unique_slug(dest_base, row.ref, conversation.id)
             try:
                 shutil.move(str(src_folder), str(dest_base / dest_slug))
             except OSError:
                 logger.warning("Could not move artifact %r to project %r", row.ref, dest.name, exc_info=True)
                 continue
+            if org_mode:
+                rekeys.append((row.ref, dest_slug))
             row.project_id = dest.id
             row.ref = dest_slug
             self.session.add(row)
             moved += 1
         self.session.commit()
+        # After the index commit: each rekey commits on its own, and must not
+        # commit a half-applied batch of index rows along with it.
+        if rekeys:
+            actor = str(self.session.scope.user_id or creator)
+            for old_slug, new_slug in rekeys:
+                try:
+                    rekey_artifact_owner(
+                        self.session, src_root, old_slug, dest.id, new_slug, actor_id=actor
+                    )
+                except Exception:
+                    logger.warning(
+                        "Could not move the owner of artifact %r to project %r",
+                        old_slug, dest.name, exc_info=True,
+                    )
         return moved
 
     @staticmethod
@@ -191,12 +250,13 @@ class TaskObjectService:
 
 
 # ── run-boundary attribution ──────────────────────────────────────────────
-# Anton runs with its own episodic session id and never tags artifacts with
-# the cowork conversation_id, so provenance can't tell us which task created
-# which artifact. Instead cowork-server (which DOES know the conversation it's
-# running) snapshots the project's artifact folders before a turn and records
-# any that appear afterward as owned by that conversation. Harness-agnostic
-# and needs no agent change.
+# cowork-server snapshots the project's artifact folders before a turn and
+# attributes the ones that appear afterward to the turn. Since anton #399 the
+# artifact tools also write the cowork conversation id first in each folder's
+# `provenance`; the remote producers use it to drop folders a concurrent
+# sibling turn created (`artifact_ownership.turn_created_slugs`). Provenance is
+# agent-writable, so it only ever narrows a claim; ownership itself is a
+# server-written attribution row (ENG-2961).
 
 def snapshot_artifact_slugs(artifacts_base) -> set[str]:
     """The set of artifact folder names under a project's artifacts dir."""
@@ -261,11 +321,20 @@ def _recover_turn_scope(conversation) -> TenantScope | None:
         return None
 
 
-def _index_new_slugs(conversation_id, project_id, slugs: list[str], scope: TenantScope | None) -> None:
-    """Attribute freshly appeared artifacts to this conversation. Best-effort."""
+def _index_new_slugs(
+    conversation, conversation_id, project_id, slugs: list[str], scope: TenantScope | None
+) -> None:
+    """Attribute freshly appeared artifacts to this conversation. Best-effort.
+
+    One session for both records: the `task_objects` row, and in org mode
+    (ENG-2961) the owner row naming the conversation's creator, since a
+    project-level root is shared by every member and the owner has to be
+    written down when the turn ends rather than read from the path later. A
+    missed owner write leaves the artifact `unknown`, never fails the turn.
+    """
     try:
         from cowork.common.settings.app_settings import get_app_settings
-        from cowork.db.session import get_engine, get_session_factory
+        from cowork.db.session import get_open_session
 
         if scope is None:
             # Never invent a scope: local mode passes through; org mode without
@@ -277,11 +346,32 @@ def _index_new_slugs(conversation_id, project_id, slugs: list[str], scope: Tenan
                 )
                 return
             scope = LOCAL_SCOPE
-        factory = get_session_factory(get_engine(get_app_settings().database.uri))
-        with factory() as session:
-            svc = TaskObjectService(ScopedSession(session, scope))
-            for slug in slugs:
-                svc.index_artifact(conversation_id, project_id, slug)
+        owner = getattr(conversation, "created_by", None) if scope.org_mode else None
+        if scope.org_mode and not owner:
+            logger.warning(
+                "artifact owner not recorded: conversation %s has no creator", conversation_id
+            )
+        with get_open_session(get_app_settings().database.uri) as session:
+            scoped = ScopedSession(session, scope)
+            svc = TaskObjectService(scoped)
+            # Independent of the owner writes below: a failed index row must
+            # not leave the artifact ownerless as well.
+            try:
+                for slug in slugs:
+                    svc.index_artifact(conversation_id, project_id, slug)
+            except Exception:
+                session.rollback()
+                logger.warning("Could not index artifacts created this turn", exc_info=True)
+            if owner and project_id:
+                from cowork.services.artifact_ownership import record_artifact_owner
+
+                for slug in slugs:
+                    try:
+                        record_artifact_owner(scoped, project_id, slug, owner, action="create")
+                    except Exception:
+                        logger.warning(
+                            "Could not record the owner of artifact %r", slug, exc_info=True
+                        )
     except Exception:
         logger.warning("Could not index artifacts created this turn", exc_info=True)
 
@@ -295,6 +385,8 @@ def index_turn_artifacts(
     before_mtimes: dict[str, int],
     tracked_new: set[str] | None = None,
     tracked_edits: set[str] | None = None,
+    attribute_by_provenance: bool = False,
+    completed_cleanly: bool = True,
 ) -> tuple[list[str], set[str], TenantScope | None]:
     """End-of-turn artifact bookkeeping.
 
@@ -329,9 +421,17 @@ def index_turn_artifacts(
     remote producer's pure diff carries the same concurrent-sibling caveat as
     the desktop; the pod reports no tracked sets yet.
 
+    `attribute_by_provenance` is the remote producers' substitute for
+    `tracked_new` (ENG-2961): the pod reports no tracked sets, so a folder that
+    appeared is claimed only if its `metadata.json` provenance names this
+    conversation (`artifact_ownership.turn_created_slugs`), and, when the turn
+    did not complete cleanly, also if it has no provenance yet. Ignored when
+    `tracked_new` is given.
+
     conversation_id/project_id are captured by the caller while the row is
-    unambiguously attached (not read here, to avoid depending on the session
-    still being live/unexpired in this end-of-turn path).
+    unambiguously attached, so the ids never depend on the session still being
+    live/unexpired in this end-of-turn path. `conversation` itself is read only
+    for the tenant scope and, when owners are recorded, `created_by`.
 
     Never raises. This runs in a turn's `finally`, so an exception here would
     replace the turn's real outcome; on any internal failure it degrades to
@@ -346,6 +446,13 @@ def index_turn_artifacts(
 
         base = Path(artifacts_base)
         after = snapshot_artifact_slugs(base)
+        if tracked_new is None and attribute_by_provenance:
+            from cowork.services.artifact_ownership import turn_created_slugs
+
+            tracked_new = turn_created_slugs(
+                base, before, conversation_id,
+                after=after, accept_unattributed=not completed_cleanly,
+            )
         appeared = after - set(before or ())
         # Intersected with `after` throughout, so a slug the agent opened and
         # then deleted can't produce a card for a folder that is gone.
@@ -372,7 +479,7 @@ def index_turn_artifacts(
                 capture_agent_revision(base / slug, conversation_id=conversation_key)
         scope = _recover_turn_scope(conversation)
         if new:
-            _index_new_slugs(conversation_id, project_id, new, scope)
+            _index_new_slugs(conversation, conversation_id, project_id, new, scope)
         return new, touched, scope
     except Exception:
         logger.warning("index_turn_artifacts failed", exc_info=True)
@@ -461,7 +568,7 @@ async def publish_and_card_turn_artifacts(
     from cowork.services.artifact_autopublish import autopublish_project_artifacts
 
     republished = await autopublish_project_artifacts(
-        artifacts_base, scope, touched=set(touched_slugs),
+        artifacts_base, scope, touched=set(touched_slugs), project_id=project_id,
     )
     if getattr(scope, "org_mode", False):
         carded = set(new_slugs) | (republished & set(touched_slugs))

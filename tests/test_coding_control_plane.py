@@ -896,6 +896,8 @@ def test_run_status_is_only_assigned_by_the_transition_table() -> None:
         "run_recovery.py": {"workspace"},
         "service.py": {"session"},
         "service_turns.py": {"current"},
+        "service_questions.py": {"current"},  # CodingSession waiting state; never TaskRun.
+        "service_planning.py": {"current"},  # CodingSession rollback; sync uses transition_run.
         "store.py": {"session"},
         "turns.py": {"session"},
     }

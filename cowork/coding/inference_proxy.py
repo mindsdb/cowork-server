@@ -8,6 +8,7 @@ from starlette.background import BackgroundTask
 from starlette.responses import Response, StreamingResponse
 
 from cowork.coding.engines.base import EngineCredentials
+from cowork.coding.inference_trace import trace_headers
 
 INFERENCE_PATHS = {"models", "responses", "responses/compact"}
 MAX_INFERENCE_BODY_BYTES = 16 * 1024 * 1024
@@ -112,7 +113,7 @@ async def proxy_inference(request: Request, path: str, credentials: EngineCreden
         raise HTTPException(status_code=409, detail="MindsHub is not connected")
 
     body = inference_body(await read_inference_body(request))
-    headers = inference_headers(request, credentials.minds_api_key)
+    headers = {**inference_headers(request, credentials.minds_api_key), **trace_headers(request)}
     client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=None))
     try:
         upstream = await client.send(

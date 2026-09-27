@@ -525,7 +525,11 @@ class CodeOnlyRuntime:
         result, error = operations.execute(command)
         self.client.acknowledge(lease, command, result, error)
 
-    def _approval(self, lease: RuntimeLease, method: str, params: dict[str, Any] | None) -> dict[str, str]:
+    def _approval(self, lease: RuntimeLease, method: str, params: dict[str, Any] | None) -> dict[str, Any]:
+        # Structured questions currently belong to local task control. Never
+        # misrepresent an unsupported question as a remote security approval.
+        if method == "item/tool/requestUserInput":
+            return {"answers": {}}
         approval_id = f"approval-{lease.run.id}-{uuid.uuid4()}"
         resolved = threading.Event()
         decision: dict[str, str] = {}

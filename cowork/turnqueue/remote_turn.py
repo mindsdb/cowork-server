@@ -53,6 +53,8 @@ async def remote_turn_events(
     touched_slugs: set[str] = set()
     turn_scope = None
     artifact_writes_allowed = False
+    # Set only on turn_completed; see `turn_created_slugs(accept_unattributed=)`.
+    completed_cleanly = False
 
     try:
         async for kind, data in stream_remote_replies(
@@ -91,6 +93,7 @@ async def remote_turn_events(
                     for reason in reasons:
                         yield StreamTaskProgress(phase="skill_draft_dropped", message=reason)
             elif kind == "turn_completed":
+                completed_cleanly = True
                 break
             elif kind == "turn_failed":
                 message = data.get("message") or GENERIC_TURN_ERROR_MESSAGE
@@ -101,6 +104,8 @@ async def remote_turn_events(
             new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
                 artifacts[0], conv_id, artifacts[2], artifacts[1],
                 before_slugs, before_mtimes,
+                attribute_by_provenance=True,
+                completed_cleanly=completed_cleanly,
             )
 
     if artifacts is not None and artifact_writes_allowed:

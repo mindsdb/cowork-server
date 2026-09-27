@@ -382,6 +382,7 @@ def publish_artifact(
     password: str | None = None,
     access: dict | None = None,
     scope: TenantScope | None = None,
+    project_id: str | None = None,
 ) -> dict:
     """Zip an artifact and upload it, returning its public URL.
 
@@ -402,7 +403,12 @@ def publish_artifact(
     datasources at all, and because `vault_for_scope` fail-closes on an org
     deployment when it is missing - a caller that forgets it gets an error, not
     another org's secrets.
+
+    `project_id` is the artifact's project; required in organization mode,
+    where the owner lookup is keyed by it.
     """
+    if scope is not None and scope.org_mode and project_id is None:
+        raise ValueError("publish_artifact requires project_id in organization mode")
     if not api_key:
         raise ValueError("Publishing requires an API key")
 
@@ -442,7 +448,9 @@ def publish_artifact(
         if scope is not None and scope.org_mode:
             from cowork.services.artifact_authorization_identity import publish_authorization_key
 
-            canonical_artifact_key = publish_authorization_key(artifact_id, artifacts_base, scope)
+            canonical_artifact_key = publish_authorization_key(
+                artifact_id, artifacts_base, published_dir.name, project_id, scope
+            )
         else:
             canonical_artifact_key = artifact_key(artifact_id)
 
