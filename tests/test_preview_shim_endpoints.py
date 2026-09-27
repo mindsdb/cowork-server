@@ -6,6 +6,8 @@ activation flag needs its storage substitutes just as much.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from cowork.services.preview_html import prepare_preview_html
@@ -23,6 +25,22 @@ def test_comments_layer_rides_on_top_of_the_shim():
     out = prepare_preview_html(_HTML, comments=True)
     assert out.index("anton-preview") < out.index("anton-comments")
     assert out.index("anton-comments") < out.index("</body>")
+
+
+# Absolute and protocol-relative URLs, up to the first quote, space, bracket or paren.
+_REMOTE_REF_RE = re.compile(r"(?:https?:)?//[a-z0-9-]+(?:\.[a-z0-9-]+)+[^\s'\"<>)]*", re.IGNORECASE)
+# An XML namespace names a vocabulary; nothing fetches it.
+_NOT_FETCHED = {"http://www.w3.org/2000/svg"}
+
+
+@pytest.mark.parametrize("comments", [False, True])
+def test_injection_references_no_remote_host(comments):
+    # On web the preview is a srcdoc that inherits the app shell's CSP, so a
+    # remote file the platform injects is blocked and the shim reports the
+    # block as the artifact's own error (the comment layer's Google Fonts
+    # link did exactly that on every web HTML preview).
+    out = prepare_preview_html(_HTML, comments=comments)
+    assert [ref for ref in _REMOTE_REF_RE.findall(out) if ref not in _NOT_FETCHED] == []
 
 
 @pytest.mark.asyncio
