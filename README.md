@@ -273,6 +273,8 @@ A **harness** adapts an external agent library (Anton today) to the cowork-serve
 
 Agent responses stream to clients via **Server-Sent Events** (SSE) on `POST /responses/`. The server tracks in-flight streams and supports cancellation (`/responses/cancel`) and late-join tailing (`/responses/tail`).
 
+A turn that fails ends with one `response.failed` frame carrying a stable `code` and the user-facing `error` (`cowork/handlers/turn_errors.py`), and the conversation's saved events keep the same payload, so a reload shows the same card. For `included_allowance_exhausted` and `free_serving_paused` the frame also carries `reset_at`, the instant the free way forward comes back. An in-process turn passes the gate's `X-MindsHub-Reset-At` header through as sent. A hosted turn takes it from the anton worker's `turn_failed` reply, which scratchpad-controller forwards beside `error`. The producer keeps it only for those two codes and only when it parses as an ISO-8601 instant with a UTC offset. An older worker sends none, and its frame has no `reset_at`.
+
 A background **scheduler** loop polls the database every 30 seconds for due schedules, supporting `once`, `hourly`, `daily`, and `weekly` cadences. Each run creates a conversation and is tracked in `schedule_runs`. Deleting that conversation does not delete the run: the run keeps its status, timings, and error as audit history, and only its link to the conversation is released. A channel binding pinned to the conversation is released the same way, so the external chat stays bound to its project and the next inbound message starts a fresh conversation.
 
 ## Data Layer
@@ -392,7 +394,7 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/settings` | User preferences and API keys |
 | `/runtime-credential` | Desktop hand-over of the MindsHub credential (write-only, loopback, local mode) |
 | `/hub/workspaces` | Which MindsHub workspace this person is working in |
-| `/hub/usage` | The caller's free Air allowance (as a proportion), balance, auto top up and credit spend, for the desktop's usage warnings |
+| `/hub/usage` | The caller's free Air allowance (as a proportion), balance, auto top up and credit spend, for the desktop's usage warnings. An organization with no free grant reads `freeTokens.limit` 0 and `freeTokens.resetsAt` null, since nothing refills |
 
 ### Declaring who may call a route
 
@@ -689,7 +691,7 @@ Every minds-cloud role defaults to `mindshub_air`, for all three roles: planning
 coding and router. **MindsHub's catalog declares it**, in the
 `mindshub_model_policy_v1` config that already owns the alias registry, and the
 declaration arrives as a `default_for` list on each `/v1/models` row. So moving a
-default is a config edit plus an apply, not a release. MindsHub Air's usage draws the monthly included allowance, so a user who has
+default is a config edit plus an apply, not a release. MindsHub Air's usage draws the included allowance, so a user who has
 picked no model can finish a whole turn without the wallet being charged for any
 part of it.
 
@@ -721,6 +723,12 @@ Two cases share that path and should not be confused. A pin the map flags
 `false` is a real MindsHub model that is merely unaffordable right now. A pin
 **absent** from a non-empty map is foreign or retired, so it would 404 on every
 turn rather than 402, and it is healed the same way with no route back.
+
+`enabled: false` has one more cause: an admin in the organization restricted the model. `/v1/models` names the lock on each disabled row in `disabled_reason` (`model_restricted`, `wallet_empty` or `included_allowance_exhausted`), and `GET /settings/recommended-models` relays it as `modelDisabledReasons`, so the picker shows a restricted model as restricted and offers no credits for it. The map comes from the MindsHub listing only. A custom openai-compatible endpoint's `disabled_reason` is dropped, because a BYO endpoint must not be able to claim an admin restricted a model. Resolution treats a restricted pin like any other `false` one and swaps it, for the members the rule restricts and no one else. A turn that still reaches the gateway on a restricted model fails with the `model_restricted` code: the gateway keeps the 403's `permission_denied` reason and names the rule on its `X-MindsHub-Deny-Detail` header and in the body's `error.deny_detail`, trusted by the same origin rules as the reason.
+
+A restriction belongs to one member, so it is stored per member. Auth applies the model rules for each caller's org, workspace and team, so two members of one org get different listings, and `fetch_org_model_catalog` caches one listing per org and member. `minds_model_enabled` is an org row that every member's resolution reads. So in org mode `recommended_models` leaves the caller's `model_restricted` models out of it: each keeps the flag the org map already held for it, or `true` when it held none. The caller's restricted ids go to their own `minds_model_restricted` row instead, an untagged setting that `SettingService` files at the caller's user scope, and `UserSettings._minds_enabled_map` reads them as `false` over the org map. One member's restriction therefore never swaps another member off a model, and another member's load never lifts it. A member's restrictions reach resolution when that member's own settings load writes them. A listing that publishes no `enabled` flags leaves the stored list alone, the same evidence rule the org map follows. A desktop install has one member, so it keeps restrictions in `minds_model_enabled`.
+
+The listing cache (`_minds_models_cache` in `cowork/services/providers.py`) drops expired entries on every write and holds at most `_MINDS_MODELS_CACHE_MAX` listings, evicting the least recently used, so keeping one entry per member does not grow it for the life of the pod. An entry with no organization in its key, which includes every desktop fetch, is keyed by a digest of the credential it was fetched with, so an account switch in the running app is never served the previous account's restricted or locked rows.
 
 The desktop closes the loop at the other end: a model the map locks is not
 offered in either picker, so a swap only ever applies to a pin that was
@@ -760,7 +768,7 @@ when the gateway published defaults, the cached one when it did not.
 Why a probe sends a model at all: MindsHub bills per model, so a model the wallet
 cannot pay for is denied, and that denial is indistinguishable from a bad key.
 Probing a paid model tells an account with an empty wallet that its working key is
-invalid. `MINDS_PROBE_MODEL` (`mindshub_air`) draws the monthly included allowance
+invalid. `MINDS_PROBE_MODEL` (`mindshub_air`) draws the included allowance
 instead of the wallet, so the result reports reachability and key validity, which
 is what these endpoints are for.
 
@@ -799,6 +807,10 @@ guard. A key the caller supplied may go anywhere, since nothing stored is at ris
 A refused provider comes back `fail` with its reason and is never pinged, rather
 than failing the whole request. Callers send every configured provider in one call,
 so refusing the request would blank the other providers' dots over one bad URL.
+
+Each card in the body is a `ProviderProbeCard` (`cowork/schemas/settings.py`), which declares the four fields the ping reads, `type`, `apiKey`, `baseUrl` and `mindsUrl`, as strings. A card whose `type` or URL is not a string fails the whole request with a 422 before any key is resolved. The Settings UI does not hit this: it sends the cards it saved itself, with `type` normalized to a string by `backfillProviders` in cowork's `settingsTransform.js`. Every other field the UI holds on a card, such as `isDefault` or `name`, is ignored, so a renderer that adds one keeps getting its status dots.
+
+When the MindsHub gateway refuses a `minds-cloud` probe with a named reason, the response carries it in `providerStatusReasons`, keyed by provider type: `{"minds-cloud": {"code": "free_air_daily_spend_fuse_exceeded", "resetAt": "<ISO instant or null>"}}`. The code is the gateway's own `X-MindsHub-Reason` word, one of `wallet_empty`, `included_allowance_exhausted`, `free_air_daily_spend_fuse_exceeded`, `rate_limited` and `policy_unavailable`, so the Settings notice can tell a velocity limit or the free-Air fuse from an empty wallet instead of matching on `HTTP 429` in the detail string. When a proxy strips that header, the probe reads the same word from the body `code`, which the gateway sets to match. `resetAt` carries the gate's `X-MindsHub-Reset-At`, which it sends on the allowance and fuse denials. The body `code` counts only when the probe's response came from the configured `minds_url` host. The header counts unless the response provably came from another host. These are the origin rules the turn-failure mapping applies (`gateway_denial` in `cowork/handlers/turn_errors.py`), so a probe aimed at any other host names no reason. A refused provider was never pinged, so it has no entry. `providerStatus` and `providerStatusDetails` keep their shape.
 
 Every MindsHub-bound chat probe caps the completion at `max_tokens: 20`, not 1:
 some models refuse a 1-token budget and fail the probe for a perfectly good key

@@ -147,6 +147,13 @@ def _credentials(settings) -> EngineCredentials:
     )
 
 
+def _model_levels(settings):
+    """The cached MindsHub listing fetched with this install's own credential."""
+    return cached_minds_models(
+        settings.minds_url, api_key=provider_api_key_str(settings, Provider.MINDS_CLOUD)
+    )
+
+
 def _integration_service(scope: ScopeDep):
     integrations = DeveloperIntegrationService(scope)
     try:
@@ -342,7 +349,7 @@ def create_code_project(body: ProjectCreateRequest, session: SessionDep, scope: 
     if body.default_reasoning_effort is not None:
         settings = _settings(session, scope)
         model = canonical_model_id(body.default_model or settings.coding_agent_model)
-        _call(check_reasoning_effort, model, body.default_reasoning_effort, cached_minds_models(settings.minds_url))
+        _call(check_reasoning_effort, model, body.default_reasoning_effort, _model_levels(settings))
     return _call(_service().projects.create, body)
 
 
@@ -356,7 +363,7 @@ def update_code_project(project_id: str, body: ProjectUpdateRequest, session: Se
     if body.default_reasoning_effort is not None:
         current = _call(_service().projects.get, project_id)
         model = canonical_model_id(body.default_model) if body.default_model else current.default_model
-        _call(check_reasoning_effort, model, body.default_reasoning_effort, cached_minds_models(_settings(session, scope).minds_url))
+        _call(check_reasoning_effort, model, body.default_reasoning_effort, _model_levels(_settings(session, scope)))
     return _call(_service().projects.update, project_id, body)
 
 
@@ -475,7 +482,7 @@ def create_session(body: SessionCreateRequest, session: SessionDep, scope: Scope
         default_engine=settings.coding_agent_engine,
         default_model=settings.coding_agent_model,
         code_skills=CodeSkillService(scope),
-        model_levels=cached_minds_models(settings.minds_url),
+        model_levels=_model_levels(settings),
     )
 
 
@@ -579,7 +586,7 @@ def update_session(session_id: str, body: SessionUpdateRequest, session: Session
     if body.reasoning_effort is not None:
         current = _call(_service().get_session, session_id)
         model = canonical_model_id(body.model) if body.model else current.model
-        _call(check_reasoning_effort, model, body.reasoning_effort, cached_minds_models(_settings(session, scope).minds_url))
+        _call(check_reasoning_effort, model, body.reasoning_effort, _model_levels(_settings(session, scope)))
     return _call(_service().update_session_config, session_id, body)
 
 
