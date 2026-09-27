@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import inspect
 import json
 import logging
@@ -14,6 +13,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 from urllib.parse import urlparse
 
 import httpx
+from pydantic import SecretStr
 
 from cowork.common.settings import runtime_credential
 from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
@@ -307,22 +307,22 @@ class _ListingCacheKey(NamedTuple):
     # can get different rows. The user id rather than the bearer, because the
     # bearer rotates and every rotation would add an entry.
     user_id: str | None
-    # A digest of the credential the listing was fetched with, when no tenant
-    # scopes the entry, else None. A desktop install has no tenant and no user
-    # id, so without it an account switch in the running process is served the
+    # The credential the listing was fetched with, when no tenant scopes the
+    # entry, else None. A desktop install has no tenant and no user id, so
+    # without it an account switch in the running process is served the
     # previous account's rows (its Restricted and Needs-credits locks) for the
-    # TTL, and recommended_models persists them. A digest rather than the key,
-    # because cache keys turn up in a repr or a heap dump.
-    credential: str | None
+    # TTL, and recommended_models persists them. Held as a SecretStr, which
+    # compares and hashes by value but prints as asterisks, so a repr or log of
+    # the key never shows it. Nothing is derived from it: the key is the same
+    # value the settings object already holds in memory.
+    credential: SecretStr | None
 
 
 def _listing_cache_key(
     *, base_url: str, api_key: str, tenant_key: str | None, user_id: str | None
 ) -> _ListingCacheKey:
     """The entry a fetch writes and a cached read looks up, built in one place."""
-    credential = None
-    if tenant_key is None:
-        credential = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+    credential = SecretStr(api_key) if tenant_key is None else None
     return _ListingCacheKey(base_url, tenant_key, user_id, credential)
 
 
@@ -446,7 +446,7 @@ async def fetch_minds_models(
     ``tenant_key`` and ``user_id`` scope the cache entry (see
     ``_ListingCacheKey``): pass the org id for an org-scoped catalog, and the
     caller's user id too when the gateway answers per caller. With no
-    ``tenant_key`` the entry is scoped by a digest of ``api_key`` instead.
+    ``tenant_key`` the entry is scoped by ``api_key`` itself, held as a ``SecretStr``.
 
     Never raises and never runs longer than ``_MINDS_MODELS_TIMEOUT_S`` — a
     slow/degraded gateway (hang, redirect loop, trickled body) returns an empty
