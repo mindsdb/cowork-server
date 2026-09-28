@@ -18,6 +18,7 @@ from starlette.responses import JSONResponse
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.common.logger import setup_logging
+from cowork.common.settings.app_settings import TurnQueueSettings
 from cowork.db.scoped import (
     MissingTenantScopeError,
     TenantScope,
@@ -32,6 +33,7 @@ from cowork.streaming.answers import SubmitResult, broker
 from cowork.streaming.backend import get_backend
 from cowork.streaming.buffer import RedisStreamBuffer
 from cowork.streaming.turn_index import get_turn, list_turns
+from cowork.turnqueue.answers import RemoteAnswerResult, submit_remote_answer
 from cowork.turnqueue.redis_client import cancel_flag_key, get_redis
 
 
@@ -336,11 +338,23 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
     question. 409 means somebody already answered — a second tab, or a
     double click. The client's source of truth for what was chosen is the
     response.ask_user_answered event, not its own click.
+
+    On the remote backend the question lives in a pod: the answer is queued
+    in Redis for the turn's controller and the status is the pod's own
+    verdict (turnqueue/answers.py).
     """
     _require_streaming_scope(scope)
-    handle = _authorized_handle(registry.get(req.conversation_id), scope)
-    if handle is None:
-        return JSONResponse(status_code=404, content={"status": "not_found"})
+    remote = TurnQueueSettings().is_remote
+    correlation_id = None
+    if remote:
+        found = await _shared_turn(req.conversation_id, scope)
+        if found is None or not found.in_flight:
+            return JSONResponse(status_code=404, content={"status": "not_found"})
+        correlation_id = found.index["correlation_id"]
+    else:
+        handle = _authorized_handle(registry.get(req.conversation_id), scope)
+        if handle is None:
+            return JSONResponse(status_code=404, content={"status": "not_found"})
 
     values = [v for v in (req.values or []) if v]
     text = (req.text or "").strip()
@@ -357,6 +371,27 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
         payload["text"] = text
     if skipped:
         payload["skipped"] = True
+
+    if remote:
+        remote_result = await submit_remote_answer(
+            conversation_id=req.conversation_id,
+            correlation_id=correlation_id,
+            question_id=req.question_id,
+            payload=payload,
+        )
+        match remote_result:
+            case RemoteAnswerResult.ACCEPTED:
+                return {"accepted": True}
+            case RemoteAnswerResult.NOT_FOUND:
+                return JSONResponse(status_code=404, content={"status": "not_found"})
+            case RemoteAnswerResult.ALREADY_ANSWERED:
+                return JSONResponse(
+                    status_code=409, content={"accepted": False, "status": "already_answered"}
+                )
+            case RemoteAnswerResult.INVALID_OPTION:
+                return JSONResponse(status_code=400, content={"status": "invalid_option"})
+            case _:
+                raise AssertionError(f"unhandled RemoteAnswerResult: {remote_result}")
 
     # Exhaustive on purpose, with a raising default: authorization is already
     # settled by here (:_authorized_handle above), so the cost of a fall-through
