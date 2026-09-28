@@ -747,6 +747,56 @@ def test_step_stream_events_unknown_step_yields_nothing():
     assert prod.step_stream_events({"step": "mystery"}) == []
 
 
+def test_step_stream_events_ask_user_becomes_a_question():
+    from anton.core.llm.provider import StreamAskUser
+
+    [event] = prod.step_stream_events({
+        "step": "ask_user", "id": "ask:1", "prompt": "Which database?",
+        "options": [{"value": "pg", "label": "postgres", "detail": "local"},
+                    {"value": "my"}],
+        "select": "many", "allow_custom": False, "timeout_s": 300,
+    })
+    assert isinstance(event, StreamAskUser)
+    assert event.id == "ask:1"
+    request = event.request
+    assert request.prompt == "Which database?"
+    assert request.kind == "choice"
+    assert [(o.value, o.label, o.detail) for o in request.options] == [
+        ("pg", "postgres", "local"), ("my", "my", "")]
+    assert (request.select, request.allow_custom, request.timeout_s) == ("many", False, 300)
+
+
+def test_step_stream_events_ask_user_defaults():
+    [event] = prod.step_stream_events({"step": "ask_user", "id": "ask:1", "prompt": "Q",
+                                       "options": [{"value": "a"}, {"value": "b"}],
+                                       "timeout_s": "soon"})
+    assert event.request.select == "one"
+    assert event.request.allow_custom is True
+    assert event.request.timeout_s is None
+
+
+def test_step_stream_events_ask_user_answered_retires_the_question():
+    from anton.core.llm.provider import StreamAskUserAnswered
+
+    [event] = prod.step_stream_events({
+        "step": "ask_user_answered", "id": "ask:1", "status": "answered",
+        "values": ["pg"], "text": "", "answer_id": "a1",
+    })
+    assert isinstance(event, StreamAskUserAnswered)
+    assert event.id == "ask:1"
+    assert (event.answer.status, event.answer.values, event.answer.text) == ("answered", ("pg",), "")
+
+
+def test_step_stream_events_rejection_is_not_rendered():
+    assert prod.step_stream_events({"step": "ask_user_answer_rejected", "id": "ask:1",
+                                    "answer_id": "a1", "reason": "invalid_option"}) == []
+
+
+def test_step_stream_events_question_without_an_id_is_dropped():
+    assert prod.step_stream_events({"step": "ask_user", "prompt": "Q", "options": []}) == []
+    assert prod.step_stream_events({"step": "ask_user_answered", "status": "answered"}) == []
+
+
 @pytest.mark.asyncio
 async def test_turn_skill_reaches_the_caller(monkeypatch):
     """The kind filter is a whitelist: a kind missing from it is dropped
