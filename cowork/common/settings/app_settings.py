@@ -565,8 +565,9 @@ class TurnQueueSettings(Settings):
             "purely for latency/agreement comparison. Never used to route; logged only. "
             "Requires a minted minds-cloud credential, so it's a no-op unless backend is "
             "'remote'. Off by default: the call runs on the turn's own minted key and "
-            "sends the turn's text history as state, so every turn spends that org's Jev "
-            "allowance in the background, and a refused call shows up only as the "
+            "sends the turn's text history as state. Jev is zero-priced, so it charges no "
+            "wallet, but on an unfunded org every turn draws that org's free Jev allowance "
+            "in the background, and a refused call shows up only as the "
             "'jev_error=http_<status>' field of the '[jev-shadow]' warning that "
             "responses._spawn_jev_shadow_probe logs."
         ),

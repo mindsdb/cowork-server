@@ -3,11 +3,12 @@
 
 Asks Jev the same question the LLM gate answers, on the same turn, purely for
 comparison. Off unless ``COWORK_TURN_JEV_SHADOW_ENABLED`` is set to true,
-because the call bills the user's own minted key. Never used to route:
-`probe`'s result is not read by `decide_route` and must never affect it. Any
-failure here, a bad response, a timeout, a network error, is swallowed and
-logged; a broken shadow probe must never break or slow down a real turn beyond
-its own timeout.
+because the call runs on the turn's own minted key. Jev is zero-priced, so the
+call charges no wallet, but on an unfunded org each call draws from that org's
+free Jev allowance. Never used to route: `probe`'s result is not read by
+`decide_route` and must never affect it. Any failure here, a bad response, a
+timeout, a network error, is swallowed and logged; a broken shadow probe must
+never break or slow down a real turn beyond its own timeout.
 """
 from __future__ import annotations
 
