@@ -19,6 +19,7 @@ from cowork.common.paths import (
     dir_scandir,
     dir_stat,
     dir_unlink,
+    open_fd,
     open_pinned_child,
     pinned_dir,
     safe_join,
@@ -141,7 +142,7 @@ def stage_project_instructions(
         # file that vanished in between must not be recreated here.
         try:
             if dest.is_file() and dest.stat().st_size > 0:
-                fd = os.open(dest, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+                fd = open_fd(dest, os.O_WRONLY | os.O_TRUNC | O_NOFOLLOW)
                 os.close(fd)
         except OSError:
             pass
