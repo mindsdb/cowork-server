@@ -40,6 +40,15 @@ def answer_queue_key(correlation_id: str) -> str:
     return f"cowork:answer:{correlation_id}"
 
 
+def reply_stream_key(conversation_id: str) -> str:
+    """The stream scratchpad-controller relays a turn's replies onto.
+
+    Both the producer (writing the job) and ``turnqueue/answers.py`` (reading
+    the pod's verdict) need this name; kept here so the two cannot drift.
+    """
+    return f"scratchpad:reply:{conversation_id}"
+
+
 def get_redis() -> aioredis.Redis:
     global _client
     if _client is None:

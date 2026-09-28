@@ -16,9 +16,10 @@ import uuid
 from enum import StrEnum
 
 import redis.asyncio as aioredis
+from redis.exceptions import RedisError
 
 from cowork.turnqueue.models import TurnReply
-from cowork.turnqueue.redis_client import answer_queue_key, get_redis
+from cowork.turnqueue.redis_client import answer_queue_key, get_redis, reply_stream_key
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +29,10 @@ logger = logging.getLogger(__name__)
 ACK_TIMEOUT_S = 15.0
 #: A queued answer nobody pops (the turn ended) must not linger.
 ANSWER_TTL_S = 60
+#: scratchpad-controller drops any stdin line over this many raw UTF-8 bytes
+#: (its own MAX_ANSWER_BYTES); past that /answer would wait the full ack
+#: timeout for a verdict that never comes. Reject it here instead.
+MAX_ANSWER_BYTES = 64 * 1024
 _TERMINAL = frozenset({"turn_completed", "turn_failed"})
 #: The scan stops at this turn's latest reply and skips other turns'. Turns on
 #: one conversation are serialised by the controller, so at most one later turn
@@ -41,6 +46,7 @@ class RemoteAnswerResult(StrEnum):
     INVALID_OPTION = "invalid_option"
     NOT_FOUND = "not_found"
     ALREADY_ANSWERED = "already_answered"
+    TOO_LARGE = "too_large"
 
 
 _REJECTIONS = {
@@ -70,7 +76,7 @@ async def submit_remote_answer(
     ack_timeout_s: float = ACK_TIMEOUT_S,
 ) -> RemoteAnswerResult:
     r = r or get_redis()
-    stream = f"scratchpad:reply:{conversation_id}"
+    stream = reply_stream_key(conversation_id)
 
     # Before pushing: the read position must precede the pod's verdict, and a
     # turn whose terminal reply is already on the stream (buffer not yet
@@ -87,30 +93,57 @@ async def submit_remote_answer(
 
     answer_id = uuid.uuid4().hex
     key = answer_queue_key(correlation_id)
-    entry = json.dumps({"question_id": question_id, "answer_id": answer_id, **payload})
+    # ensure_ascii=False: the default escapes every non-ASCII character to
+    # \uXXXX, which can inflate a short non-Latin answer well past the raw
+    # UTF-8 size the controller actually measures against MAX_ANSWER_BYTES.
+    entry = json.dumps({"question_id": question_id, "answer_id": answer_id, **payload}, ensure_ascii=False)
+    if len(entry.encode("utf-8")) > MAX_ANSWER_BYTES:
+        return RemoteAnswerResult.TOO_LARGE
     async with r.pipeline(transaction=True) as pipe:
         pipe.rpush(key, entry)
         pipe.expire(key, ANSWER_TTL_S)
         await pipe.execute()
 
-    deadline = time.monotonic() + ack_timeout_s
-    while (left := deadline - time.monotonic()) > 0:
-        resp = await r.xread({stream: last_id}, count=50, block=max(1, int(left * 1000)))
-        for _stream, entries in resp or []:
-            for entry_id, fields in entries:
-                last_id = entry_id
-                reply = _own_reply(fields, correlation_id)
-                if reply is None:
-                    continue
-                if reply.kind in _TERMINAL:
-                    return RemoteAnswerResult.NOT_FOUND
-                data = reply.data or {}
-                if reply.kind != "turn_step" or data.get("answer_id") != answer_id:
-                    continue
-                if data.get("step") == "ask_user_answered":
-                    return RemoteAnswerResult.ACCEPTED
-                if data.get("step") == "ask_user_answer_rejected":
-                    return _REJECTIONS.get(data.get("reason"), RemoteAnswerResult.INVALID_OPTION)
+    try:
+        deadline = time.monotonic() + ack_timeout_s
+        while (left := deadline - time.monotonic()) > 0:
+            resp = await r.xread({stream: last_id}, count=50, block=max(1, int(left * 1000)))
+            for _stream, entries in resp or []:
+                for entry_id, fields in entries:
+                    last_id = entry_id
+                    reply = _own_reply(fields, correlation_id)
+                    if reply is None:
+                        continue
+                    if reply.kind in _TERMINAL:
+                        return RemoteAnswerResult.NOT_FOUND
+                    data = reply.data or {}
+                    if reply.kind != "turn_step" or data.get("answer_id") != answer_id:
+                        continue
+                    if data.get("step") == "ask_user_answered":
+                        return RemoteAnswerResult.ACCEPTED
+                    if data.get("step") == "ask_user_answer_rejected":
+                        reason = data.get("reason")
+                        if reason not in _REJECTIONS:
+                            logger.warning(
+                                "ask_user answer rejected with an unrecognised reason, treating as "
+                                "invalid_option conversation=%s correlation_id=%s question_id=%s "
+                                "answer_id=%s reason=%r",
+                                conversation_id, correlation_id, question_id, answer_id, reason,
+                            )
+                        return _REJECTIONS.get(reason, RemoteAnswerResult.INVALID_OPTION)
+    except RedisError:
+        # The answer is already queued (RPUSH above succeeded): propagating
+        # here would 500 the request, the client would retry, get 409 (a
+        # second RPUSH the pod never asked for) and resend the typed text as
+        # a new message — a visible duplicate of an answer that may well have
+        # been delivered. Report it accepted instead, same as a plain ack
+        # timeout; the card settles from SSE once the pod's verdict lands.
+        logger.warning(
+            "ask_user ack wait hit a Redis error, reporting accepted conversation=%s "
+            "correlation_id=%s question_id=%s answer_id=%s",
+            conversation_id, correlation_id, question_id, answer_id, exc_info=True,
+        )
+        return RemoteAnswerResult.ACCEPTED
     logger.warning(
         "ask_user answer not confirmed within %.0fs conversation=%s correlation_id=%s "
         "question_id=%s answer_id=%s",

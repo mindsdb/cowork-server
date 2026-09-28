@@ -28,7 +28,7 @@ from cowork.services.product_permissions import require_product_permission
 from cowork.turnqueue.auth_keys import list_active_connections, mint_turn_key
 from cowork.turnqueue.models import TurnJob, TurnReply
 from cowork.streaming.turn_index import record_turn
-from cowork.turnqueue.redis_client import cancel_flag_key, get_redis
+from cowork.turnqueue.redis_client import cancel_flag_key, get_redis, reply_stream_key
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host, get_app_settings
 
 logger = logging.getLogger(__name__)
@@ -358,7 +358,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     corr = correlation_id or _new_correlation_id()
     # A flag left by an earlier turn would cancel this one on its first line.
     await r.delete(cancel_flag_key(corr))
-    reply_stream = f"scratchpad:reply:{conversation_id}"
+    reply_stream = reply_stream_key(conversation_id)
 
     # No client-picked model → the deployment's resolved default (org mode: the
     # free-bucket model). Resolved here so the model reaching the pod is always

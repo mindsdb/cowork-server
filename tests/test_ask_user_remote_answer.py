@@ -75,6 +75,7 @@ def test_skip_is_queued(client, turn, pod):
     (RemoteAnswerResult.INVALID_OPTION, 400, {"status": "invalid_option"}),
     (RemoteAnswerResult.NOT_FOUND, 404, {"status": "not_found"}),
     (RemoteAnswerResult.ALREADY_ANSWERED, 409, {"accepted": False, "status": "already_answered"}),
+    (RemoteAnswerResult.TOO_LARGE, 400, {"status": "answer_too_large"}),
 ])
 def test_pod_verdicts_map_to_statuses(client, turn, pod, result, status, body):
     pod["result"] = result
