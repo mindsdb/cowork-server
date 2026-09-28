@@ -45,7 +45,7 @@ from cowork.coding.contracts import (
     GitIdentity,
     GitIdentityRequest,
 )
-from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, StateConflict
+from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, ModelDiscoveryUnavailableError, StateConflict
 from cowork.coding.contracts import ModeTurnRequest
 from cowork.coding.questions import QuestionResponse
 from cowork.coding.control_models import TaskResourceScope
@@ -172,6 +172,12 @@ def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, ModelDiscoveryAuthenticationError):
         return HTTPException(
             status_code=401,
+            detail=str(exc),
+            headers={"X-MindsHub-Error-Code": exc.code},
+        )
+    if isinstance(exc, ModelDiscoveryUnavailableError):
+        return HTTPException(
+            status_code=502,
             detail=str(exc),
             headers={"X-MindsHub-Error-Code": exc.code},
         )
