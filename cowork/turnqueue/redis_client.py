@@ -30,6 +30,16 @@ def cancel_flag_key(correlation_id: str) -> str:
     return f"cowork:cancel:{correlation_id}"
 
 
+def answer_queue_key(correlation_id: str) -> str:
+    """The list /answer pushes a remote turn's ask_user answers onto.
+
+    scratchpad-controller's ``answers.answer_key`` rebuilds the same name and
+    pops it on the replica running the turn; kept here for the same reason as
+    ``cancel_flag_key``.
+    """
+    return f"cowork:answer:{correlation_id}"
+
+
 def get_redis() -> aioredis.Redis:
     global _client
     if _client is None:
