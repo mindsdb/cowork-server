@@ -437,16 +437,24 @@ async def test_gate_and_jev_probe_share_the_turns_correlation_id(monkeypatch):
 @pytest.mark.asyncio
 async def test_gate_sends_no_jev_probe_unless_shadow_mode_is_turned_on(monkeypatch):
     """A remote turn with a minted minds-cloud key and no shadow override sends
-    nothing to '/v1/decisions'. The probe bills the user's own key, so with the
-    default on every turn would spend the org's Jev allowance in the background.
-    Only the HTTP client is faked, and the detached probe task is awaited to the
-    end, so a default flipped back on makes the POST this test forbids."""
+    nothing to '/v1/decisions'. The probe runs on the turn's own key: Jev is
+    zero-priced, so it charges no wallet, but with the default on every turn on
+    an unfunded org would draw that org's free Jev allowance in the background.
+    Only the HTTP client is faked, the gate's own decision (not the
+    router_unavailable fallback) proves the gate block ran through the probe
+    spawn, and the detached probe task is awaited to the end, so a default
+    flipped back on makes the POST this test forbids."""
     import asyncio
+    import functools
 
     import cowork.handlers.responses as responses
+    from cowork.common.settings.app_settings import TurnQueueSettings
     from cowork.handlers import jev_shadow
 
     monkeypatch.delenv("COWORK_TURN_JEV_SHADOW_ENABLED", raising=False)
+    # The handler's settings skip the .env chain, so a repo-root .env cannot
+    # turn the probe on or off here and only the field default decides.
+    monkeypatch.setattr(responses, "TurnQueueSettings", functools.partial(TurnQueueSettings, _env_file=None))
     handler = _routing_handler(monkeypatch)
     monkeypatch.setattr(
         responses,
@@ -482,7 +490,7 @@ async def test_gate_sends_no_jev_probe_unless_shadow_mode_is_turned_on(monkeypat
 
     monkeypatch.setattr(jev_shadow.httpx, "AsyncClient", _Client)
 
-    await handler._route_request(
+    decision, _turn_llm = await handler._route_request(
         conversation_id="conv-1",
         harness_input=[{"type": "text", "text": "Hello"}],
         has_attachments=False,
@@ -490,6 +498,8 @@ async def test_gate_sends_no_jev_probe_unless_shadow_mode_is_turned_on(monkeypat
     )
     await asyncio.gather(*list(responses._jev_shadow_tasks))
 
+    assert decision.fallback is False
+    assert decision.reason == "test"
     assert posted_urls == []
 
 
