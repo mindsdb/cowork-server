@@ -239,6 +239,8 @@ def step_stream_events(data: dict) -> list:
     uses, so remote turns render steps/thinking identically to desktop."""
     from anton.core.llm.provider import (
         LLMResponse,
+        StreamAskUser,
+        StreamAskUserAnswered,
         StreamComplete,
         StreamContextCompacted,
         StreamTaskProgress,
@@ -248,6 +250,7 @@ def step_stream_events(data: dict) -> list:
         StreamToolUseStart,
         ToolCall,
     )
+    from anton.core.interaction.elicit import AskAnswer, AskOption, AskRequest
 
     step = data.get("step")
     if step == "tool_start":
@@ -286,6 +289,40 @@ def step_stream_events(data: dict) -> list:
         return [StreamComplete(response=LLMResponse(
             content="", tool_calls=calls, stop_reason=data.get("stop_reason"),
         ))]
+    if step in ("ask_user", "ask_user_answered"):
+        question_id = data.get("id")
+        if not isinstance(question_id, str) or not question_id:
+            return []
+        if step == "ask_user":
+            timeout_s = data.get("timeout_s")
+            options = tuple(
+                AskOption(
+                    value=str(option.get("value") or ""),
+                    label=str(option.get("label") or option.get("value") or ""),
+                    detail=str(option.get("detail") or ""),
+                )
+                for option in data.get("options") or []
+                if isinstance(option, dict)
+            )
+            return [StreamAskUser(id=question_id, request=AskRequest(
+                prompt=str(data.get("prompt") or ""),
+                kind="choice",
+                timeout_s=(
+                    timeout_s
+                    if isinstance(timeout_s, int) and not isinstance(timeout_s, bool)
+                    else None
+                ),
+                options=options,
+                select="many" if data.get("select") == "many" else "one",
+                allow_custom=data.get("allow_custom") is not False,
+            ))]
+        return [StreamAskUserAnswered(id=question_id, answer=AskAnswer(
+            status=str(data.get("status") or "error"),
+            values=tuple(v for v in data.get("values") or [] if isinstance(v, str)),
+            text=str(data.get("text") or ""),
+        ))]
+    # `ask_user_answer_rejected` is the pod's verdict on one answer; only
+    # /answer reads it (turnqueue/answers.py), nothing renders it.
     return []
 
 
