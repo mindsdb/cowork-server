@@ -619,6 +619,6 @@ def test_aiohttp_is_a_core_dependency_not_only_an_extra():
     server image installs no extras, so it has to be an unconditional requirement."""
     core = [
         req for req in requires("cowork-server") or []
-        if re.match(r"aiohttp\b", req) and ";" not in req
+        if re.match(r"aiohttp\s*(?:[<>=!~\[]|$)", req) and ";" not in req
     ]
     assert core, "aiohttp is only reachable through an extra"
