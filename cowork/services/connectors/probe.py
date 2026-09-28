@@ -20,7 +20,7 @@ from typing import Any, AsyncIterator
 
 from anton.core.datasources.data_vault import LocalDataVault
 from cowork.build_info import surface_kwarg
-from cowork.common.chat_session import build_chat_session
+from cowork.common.chat_session import build_chat_session, close_session_scratchpads
 from cowork.common.paths import cowork_home, pod_local_only
 
 logger = logging.getLogger(__name__)
@@ -593,6 +593,9 @@ class CredentialProbe:
                 # plaintext credentials file is worth an operator's attention,
                 # not a debug line nobody has turned on.
                 logger.warning("Could not delete probe env file %s", env_path, exc_info=True)
+            # The cells the prompt asks for each start a scratchpad process,
+            # and no later turn reuses it.
+            close_session_scratchpads(probe_session, owner="connector probe")
 
         if self._outcome.status == "unresolved":
             self._outcome.status = "failure"
