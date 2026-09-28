@@ -269,6 +269,8 @@ The server is designed to be **agent-agnostic** — core features (projects, con
 
 A **harness** adapts an external agent library (Anton today) to the cowork-server interface. All harnesses implement the `HarnessProvider` protocol (`harnesses/base.py`), which exposes streaming responses, skill sync, and memory operations. The active harness is selected via the `harness` user setting. To add a new agent, implement the protocol and register it with the `@register` decorator.
 
+**Each turn's scratchpads exit when the turn ends.** The Anton harness builds a fresh `ChatSession` for every turn, and each scratchpad that session starts is a child process of the server. When the turn completes, fails or is stopped, `close_session_scratchpads` (`cowork/common/chat_session.py`) kills those processes. A Stop pressed while a cell is running does not end the turn yet: anton kills that cell's scratchpad and the turn carries on until it ends by itself, which ENG-3078 tracks. The next turn starts a new process, which reloads the variables the old one saved to the conversation's namespace snapshot after every cell. Only the scratchpads close: full-stack backends the agent launched keep running. Anything a cell starts in the scratchpad's process group, such as a default `subprocess.Popen` child or a thread, dies with it, so a long-lived service belongs in `launch_backend`. A child started with `start_new_session=True` or `setsid` escapes: it keeps running and holds two of the server's pipe descriptors until it exits. The connector probe closes its scratchpads the same way, and shutdown waits up to 5 seconds for closes still running. A scratchpad runs as `python <tmp>/anton_scratchpad_<random>.py`, so `pgrep -f anton_scratchpad_` counts the live ones; it should drop to 0 once no turn is running.
+
 ### Streaming & scheduling
 
 Agent responses stream to clients via **Server-Sent Events** (SSE) on `POST /responses/`. The server tracks in-flight streams and supports cancellation (`/responses/cancel`) and late-join tailing (`/responses/tail`).
@@ -366,9 +368,9 @@ gateway 401 that looked like a dead account. `build_llm_client` now passes an
 reads the current in-memory value. Two limits are deliberate. Static
 organization-mode and user-supplied keys keep their construction-time value,
 because nothing rotates them. And the **scratchpad subprocess keeps the token it
-was started with** — `export_connection_info()` hands it a string once and it
-has no supplier, so a pad-side model call still runs on that value. Refreshing
-it needs a pad IPC contract, which ENG-2116 scoped out.
+was started with** for the rest of its turn: `export_connection_info()` hands it
+a string once and it has no supplier, so a pad-side model call still runs on
+that value. Refreshing it needs a pad IPC contract, which ENG-2116 scoped out.
 
 `build_llm_client` capability-gates the kwarg on `inspect.signature`, so an
 older Anton keeps the static key and logs the degradation rather than failing
