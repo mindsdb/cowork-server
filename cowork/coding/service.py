@@ -31,7 +31,7 @@ from cowork.coding.contracts import (
     WorkspaceInspection,
 )
 from cowork.coding.control_errors import StateConflict
-from cowork.coding.control_models import RunStatus
+from cowork.coding.control_models import CodeTask, RunStatus
 from cowork.coding.control_service import ControlPlaneService
 from cowork.coding.control_store import ControlPlaneStore
 from cowork.coding.delivery import ProjectDeliveryService
@@ -486,11 +486,12 @@ class CodingService(
             raise WorkspaceError("This task is not linked to a Code Project")
         project = self.projects.get(session.project_id)
         task = self.control.refresh_task_commands(session.task_id, project)
-        scoped = {workspace.folder_id for workspace in session.workspaces}
+        self._push_commands_to_active_lease(session, task)
+        # The snapshot holds only the resources in the task's scope, so its
+        # commands are exactly the ones this task can be offered.
         commands = [
             command
             for resource in (task.execution_project.resources if task.execution_project else [])
-            if resource.id in scoped
             for command in resource.commands
         ]
         summary = ProjectCommandRefresh(
@@ -510,6 +511,33 @@ class CodingService(
             ),
         )
         return summary
+
+    def _push_commands_to_active_lease(self, session: CodingSession, task: CodeTask) -> None:
+        """A leased remote worker holds its own copy of the project, so hand it the new commands.
+
+        A run that has not been leased yet reads the refreshed snapshot when
+        it is, and a finished run cannot run checks at all, so only an active
+        lease needs the push. If the worker does not take it, the saved
+        commands stay saved and the caller hears that the computer lagged,
+        rather than a success it would contradict on the next Run checks.
+        """
+
+        if not self._is_remote(session) or not session.run_id or task.execution_project is None:
+            return
+        run = self.control.store.get_run(session.run_id)
+        if not run.lease_id or run.status in {RunStatus.completed, RunStatus.cancelled, RunStatus.failed}:
+            return
+        commands = {
+            resource.id: [command.model_dump(mode="json") for command in resource.commands]
+            for resource in task.execution_project.resources
+        }
+        try:
+            self.remote.operation(session, "refresh_project", {"commands": commands})
+        except RuntimeError as exc:
+            raise WorkspaceError(
+                "The commands were saved, but the selected computer has not picked them up yet "
+                f"({exc}). Retry once it is online."
+            ) from exc
 
     def _execution_project(self, session: CodingSession) -> CodeProject | None:
         if not session.task_id:
