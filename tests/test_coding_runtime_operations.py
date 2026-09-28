@@ -8,8 +8,15 @@ import pytest
 
 from cowork.coding.contracts import PermissionMode, TaskWorkspace, WorkspaceKind
 from cowork.coding.control_models import CodeTask, RunStatus, RuntimeCommand, TaskRun
-from cowork.coding.project_models import CodeProject, LocalFolderResource, RepositoryResource
-from cowork.coding.project_workspaces import PreparedProjectWorkspace, ProjectWorkspaceManager
+from cowork.coding.project_models import (
+    CodeProject,
+    LocalFolderResource,
+    RepositoryResource,
+)
+from cowork.coding.project_workspaces import (
+    PreparedProjectWorkspace,
+    ProjectWorkspaceManager,
+)
 from cowork.coding.runtime_operations import RuntimeWorkspaceOperations
 from cowork.coding.runtime_protocol import RuntimeExecutionConfig, RuntimeLease
 from cowork.coding.workspace import WorkspaceManager
