@@ -22,8 +22,9 @@ without either routing through this function or being reviewed as an exception.
 Guarding `turn_stream` instead would be invisible to that test, since it is a
 method call on whatever the caller named its session object.
 
-Both callers also end their session here: `close_session_scratchpads` stops
-the scratchpad processes a session started, which nothing else does.
+Both callers also stop their session's scratchpad processes through
+`close_session_scratchpads`. It closes pads only, never `ChatSession.close()`,
+and nothing else in cowork-server stops them.
 """
 
 from __future__ import annotations
@@ -93,6 +94,10 @@ def close_session_scratchpads(session, *, owner: str) -> None:
     """
     manager = getattr(session, "_scratchpads", None)
     if manager is None:
+        # anton's ChatSession.__init__ always sets it, so None means an anton
+        # release renamed it. The desktop wheel installs anton outside uv.lock,
+        # where no test pins the name, so say so instead of leaking quietly.
+        logger.warning("Cannot close the scratchpads of %s: the session has no _scratchpads", owner)
         return
     try:
         task = asyncio.get_running_loop().create_task(manager.close_all())
@@ -116,14 +121,20 @@ def _log_scratchpad_close(task: asyncio.Task[None], *, owner: str) -> None:
 async def drain_scratchpad_closes(*, timeout: float = 5.0) -> None:
     """Wait for scheduled scratchpad closes, for shutdown.
 
-    Each turn that shutdown cancels schedules its close while it unwinds,
-    and a close still pending when the event loop stops is destroyed with
-    its pads alive. `asyncio.wait` does not cancel on timeout, so a slow close keeps
-    running for as long as the loop does.
+    A close still pending when the event loop stops is destroyed with its
+    pads alive. Turns that finished unwinding inside `registry.shutdown()`'s
+    grace have queued their close by now, and closes queued while this waits
+    are picked up too. A turn that shutdown cancels mid-cell is the exception:
+    anton kills that pad itself, swallows the cancel and carries on, so its
+    close can come after this returns. Any pad still alive when the server
+    exits reads EOF on stdin and exits. `asyncio.wait` does not cancel on
+    timeout, so a slow close keeps running for as long as the loop does.
     """
-    tasks = list(_scratchpad_closes)
-    if not tasks:
-        return
-    _done, pending = await asyncio.wait(tasks, timeout=timeout)
-    if pending:
-        logger.warning("%d scratchpad close(s) did not finish within %.1fs", len(pending), timeout)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while pending := [task for task in _scratchpad_closes if not task.done()]:
+        left = deadline - loop.time()
+        if left <= 0:
+            logger.warning("%d scratchpad close(s) did not finish within %.1fs", len(pending), timeout)
+            return
+        await asyncio.wait(pending, timeout=left)
