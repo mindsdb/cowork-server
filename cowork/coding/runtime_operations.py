@@ -15,7 +15,7 @@ from cowork.coding.contracts import (
 from cowork.coding.control_models import RuntimeCommand
 from cowork.coding.delivery import ProjectDeliveryService
 from cowork.coding.engines.base import EngineSession
-from cowork.coding.project_models import ProjectCommand
+from cowork.coding.project_models import CodeProject, ProjectCommand
 from cowork.coding.project_workspaces import (
     PreparedProjectWorkspace,
     ProjectWorkspaceManager,
@@ -175,7 +175,12 @@ class RuntimeWorkspaceOperations:
                 })
                 updated += 1
             resources.append(resource)
-        self.project = self.project.model_copy(update={"resources": resources})
+        # Re-validate rather than model_copy: ``ProjectCommandRunner`` reads the
+        # ``folders`` projection, which only the model validator rebuilds.
+        self.project = CodeProject.model_validate({
+            **self.project.model_dump(mode="python"),
+            "resources": resources,
+        })
         return {"resources": updated}
 
     def _delivery_plan(self, payload: dict[str, object]) -> dict[str, object]:

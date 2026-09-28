@@ -1,23 +1,27 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from cowork.coding.contracts import PermissionMode
+from cowork.coding.contracts import PermissionMode, TaskWorkspace, WorkspaceKind
 from cowork.coding.control_models import CodeTask, RunStatus, RuntimeCommand, TaskRun
-from cowork.coding.project_models import CodeProject, RepositoryResource
+from cowork.coding.project_models import CodeProject, LocalFolderResource, RepositoryResource
+from cowork.coding.project_workspaces import PreparedProjectWorkspace, ProjectWorkspaceManager
 from cowork.coding.runtime_operations import RuntimeWorkspaceOperations
 from cowork.coding.runtime_protocol import RuntimeExecutionConfig, RuntimeLease
+from cowork.coding.workspace import WorkspaceManager
 
 
-def lease() -> RuntimeLease:
+def lease(project: CodeProject | None = None) -> RuntimeLease:
     return RuntimeLease(
         task=CodeTask(id="task-ops", title="Ops task", prompt="Build"),
         run=TaskRun(id="run-ops", task_id="task-ops", computer_id="remote", status=RunStatus.running, lease_id="lease-ops"),
         lease_id="lease-ops",
         agent_token="agent-token-that-is-long-enough-for-runtime",
-        project=CodeProject(
+        project=project or CodeProject(
             id="ops-project",
             name="Ops project",
             resources=[
@@ -51,6 +55,36 @@ def test_refresh_project_hands_validate_the_new_commands_without_touching_worksp
     assert seen[1].resources[1].commands == []
     assert [resource.id for resource in seen[1].resources] == ["repo", "docs"]
     assert operations.prepared is prepared
+
+
+def test_refresh_project_then_validate_runs_the_new_commands_through_the_real_runner(tmp_path: Path) -> None:
+    folder = tmp_path / "app"
+    folder.mkdir()
+    project = CodeProject(
+        id="ops-project",
+        name="Ops project",
+        resources=[LocalFolderResource(id="app", name="App", path=str(folder), computer_id="remote")],
+    )
+    workspace = TaskWorkspace(
+        folder_id="app",
+        folder_name="App",
+        source_path=str(folder),
+        workspace_path=str(folder),
+        workspace_kind=WorkspaceKind.local_copy,
+        source_dirty=False,
+    )
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"))
+    prepared = PreparedProjectWorkspace(primary=workspace, workspaces=(workspace,), ports={})
+    operations = RuntimeWorkspaceOperations(lease(project), manager, prepared, object())
+    check = {"id": "check", "label": "Check", "argv": [sys.executable, "-c", "print('late')"], "phase": "validate"}
+
+    assert operations.execute(operation(0, {"operation": "validate"})) == ({"items": []}, None)
+    assert operations.execute(operation(1, {"operation": "refresh_project", "commands": {"app": [check]}})) == ({"resources": 1}, None)
+
+    result, error = operations.execute(operation(2, {"operation": "validate"}))
+
+    assert error is None
+    assert [(item["label"], item["return_code"], item["output"]) for item in result["items"]] == [("Check", 0, "late")]
 
 
 @pytest.mark.parametrize("payload", [{}, {"commands": ["not", "a", "map"]}])
