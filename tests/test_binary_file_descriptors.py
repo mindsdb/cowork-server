@@ -7,7 +7,9 @@ bit and check that the bit reaches ``os.open``.
 """
 from __future__ import annotations
 
+import ast
 import os
+from pathlib import Path
 
 import pytest
 
@@ -96,3 +98,50 @@ def test_project_file_open_is_binary(tmp_path, recorded_flags):
     cm.__exit__(None, None, None)
 
     assert _flags_for(recorded_flags, "data.csv") & SENTINEL
+
+
+COWORK_ROOT = Path(paths.__file__).resolve().parents[1]
+
+# Raw ``os.open`` calls that are allowed, by module, with their exact count.
+# ``common/paths.py``: ``open_fd`` itself plus four directory opens. The
+# revision journal opens a directory to fsync it. Text mode does not apply to
+# directories. A changed count means a new raw open: check whether it is a
+# regular file and belongs in ``open_fd``.
+# Limitation: only the ``os.open(...)`` form is detected, not
+# ``from os import open`` or ``posix.open``; the codebase uses neither.
+RAW_OS_OPEN_ALLOWED = {
+    "common/paths.py": 5,
+    "services/artifact_revisions.py": 1,
+}
+
+
+def _raw_os_open_calls() -> dict[str, list[int]]:
+    found: dict[str, list[int]] = {}
+    for source in sorted(COWORK_ROOT.rglob("*.py")):
+        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "open"
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "os"
+            ):
+                rel = source.relative_to(COWORK_ROOT).as_posix()
+                found.setdefault(rel, []).append(node.lineno)
+    return found
+
+
+def test_regular_files_are_opened_through_open_fd():
+    offenders = []
+    for rel, lines in _raw_os_open_calls().items():
+        if rel not in RAW_OS_OPEN_ALLOWED:
+            offenders.extend(f"{rel}:{line}" for line in lines)
+            continue
+        allowed = RAW_OS_OPEN_ALLOWED[rel]
+        if len(lines) != allowed:
+            offenders.append(f"{rel}: expected {allowed} os.open, found {lines}")
+    assert offenders == [], (
+        "Use cowork.common.paths.open_fd for regular files (ENG-2950): "
+        + ", ".join(offenders)
+    )
