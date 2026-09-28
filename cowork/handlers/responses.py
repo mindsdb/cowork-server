@@ -16,7 +16,7 @@ from sqlmodel import Session
 from cowork.build_info import build_trace_metadata
 from cowork.common.chat_session import in_process_agent_allowed
 from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
-from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings
+from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings, get_app_settings
 from cowork.common.settings.user_settings import (
     Provider,
     get_user_settings,
@@ -1372,6 +1372,9 @@ class ResponsesHandler:
                     correlation_id=corr,
                     llm=(turn_llm or {}).get("llm"),
                     disabled=disabled,
+                    # Questions need someone to answer them: this path serves
+                    # the web UI, which renders the card and posts /answer.
+                    interactive=get_app_settings().ask_user_enabled,
                 ):
                     if kind == "progress" and data.get("phase") == "workspace_authorized":
                         artifact_writes_allowed = data.get("workspace_mode") == "persistent"

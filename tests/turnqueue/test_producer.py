@@ -955,3 +955,25 @@ async def test_artifact_authority_outage_stops_before_queue_side_effects(monkeyp
         ))
     assert permissions == ["product.execute", "artifact.manage"]
     redis.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interactive", [True, False])
+async def test_interactive_reaches_the_job_params(monkeypatch, interactive):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m", interactive=interactive))
+    job = json.loads(fake.added[0][1]["payload"])
+    assert job["params"]["interactive"] is interactive
+
+
+@pytest.mark.asyncio
+async def test_interactive_defaults_to_false(monkeypatch):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m"))
+    assert json.loads(fake.added[0][1]["payload"])["params"]["interactive"] is False
