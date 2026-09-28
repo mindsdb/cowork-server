@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import os
 import stat
@@ -9,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
-from sqlalchemy import case, func
+from sqlalchemy import case, func, tuple_
 from sqlalchemy import select as sa_select
 
 from cowork.common.paths import (
@@ -23,23 +25,97 @@ from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
+from cowork.schemas.conversations import ConversationItemsPage
 from cowork.schemas.responses import Role
 from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.schedules import ScheduleService
 from cowork.services.scratchpad_sessions import remove_conversation_sessions
 from cowork.services.task_objects import TaskObjectService
 
-# created_at is only second-precision, so rows of turns in the same second
-# would otherwise interleave. `seq` is a per-conversation monotonic ordinal
-# (see _next_seq) that resolves those ties deterministically. The role tiebreak
-# only matters for legacy rows (all seq 0), keeping user before assistant; id is
-# the final tiebreak.
+# Defaults/bounds for GET /conversations/{id}/items's opt-in pagination
+# (see get_messages_page). Omitting both limit and before keeps the route's
+# original bare-list, unbounded response — these only apply once a caller
+# opts in.
+_DEFAULT_PAGE_LIMIT = 50
+_MAX_PAGE_LIMIT = 200
+# How many raw rows (visible + hidden tool rows) get_messages_page will scan
+# past `limit` before giving up on filling a full page of visible items.
+# Bounded so a pathological run of consecutive tool rows can't reintroduce
+# an unbounded query; a page that hits this cap is simply reported as
+# `has_more=True` so the client just asks again.
+_SCAN_CAP_MULTIPLIER = 10
+# Batch size for _hydrate_message_items's MessageEvent `IN (...)` query —
+# comfortably under every SQLite build's bound-parameter ceiling (including
+# pre-3.32 defaults of 999) while still batching hundreds of ids per round
+# trip on the unbounded get_messages branch a 1,000+ message conversation
+# can reach.
+_EVENTS_IN_CHUNK_SIZE = 500
+# Upper bound for a decoded cursor's `seq`. Not the column's limit (`seq` is
+# INTEGER, so 2**31-1 on Postgres) — this is what the drivers tolerate. sqlite3
+# raises OverflowError rather than bind an int wider than 64 bits, and that
+# raise escapes past this module's error mapping as a 500. psycopg does not
+# raise (it promotes the value to numeric, which Postgres compares against
+# int4 happily), so this guard is what makes the two backends agree.
+_MAX_CURSOR_SEQ = 2**63 - 1
+
+# The one order every read path uses: the UI list, the paginated page, the
+# replayed LLM history, and delete_turn's anchor resolution.
+#
+# `seq` leads, and created_at is deliberately absent. created_at is written two
+# different ways depending on the path — an explicit Python datetime (bound
+# with microsecond precision) by save_user_message, vs `server_default=now()`
+# by save_assistant_turn, which SQLite stores as a bare second-precision
+# string. SQLite compares those lexicographically, not temporally, so an
+# answer persisted in the same second as its question sorts BEFORE it. Leading
+# on created_at therefore returns a turn back to front, and a cursor built
+# from one format never satisfies `<` against rows stored in the other.
+#
+# `seq` is a per-conversation monotonic ordinal assigned at insert
+# (max(seq)+1, see _next_seq) that records the real insert order created_at
+# was only approximating. It is a TOTAL order per conversation only because
+# migration 3e4b5f7586d3 backfills the pre-seq rows that all shared 0; without
+# that backfill every legacy row ties here. role/id stay as a defensive
+# tiebreak, not a load-bearing one.
 _MESSAGE_ORDER = (
-    Message.created_at,
     Message.seq,
     case((Message.role == Role.user, 0), else_=1),
     Message.id,
 )
+
+
+def _message_cursor_key(message: Message) -> tuple[int, int, UUID]:
+    """The runtime value of each _MESSAGE_ORDER column for one row, in the
+    same order — used to build a keyset pagination cursor from it."""
+    role_rank = 0 if message.role == Role.user else 1
+    return (message.seq, role_rank, message.id)
+
+
+def _encode_message_cursor(message: Message) -> str:
+    seq, role_rank, message_id = _message_cursor_key(message)
+    payload = [seq, role_rank, str(message_id)]
+    return base64.urlsafe_b64encode(json.dumps(payload).encode()).decode()
+
+
+class InvalidPaginationParams(ValueError):
+    """A malformed `before` cursor or an out-of-range `limit` on
+    GET .../items — the route maps this to 400, distinct from the plain
+    ValueError get_conversation raises for a missing/foreign conversation
+    (mapped to 404)."""
+
+
+def _decode_message_cursor(cursor: str) -> tuple[int, int, UUID]:
+    try:
+        raw = base64.urlsafe_b64decode(cursor.encode())
+        seq, role_rank, message_id = json.loads(raw)
+        seq, role_rank, message_id = int(seq), int(role_rank), UUID(message_id)
+    except Exception as e:
+        raise InvalidPaginationParams("Malformed pagination cursor") from e
+    # Range-checked, not just shape-checked: `before` is unsigned client
+    # input, and a decodable seq wider than the column overflows inside the
+    # driver, past this function's own error mapping and out as a 500.
+    if not 0 <= seq <= _MAX_CURSOR_SEQ or role_rank not in (0, 1):
+        raise InvalidPaginationParams("Malformed pagination cursor")
+    return (seq, role_rank, message_id)
 
 
 @dataclass(frozen=True)
@@ -666,14 +742,29 @@ class ConversationService:
         self.finalize_staged_conversation_delete(stage)
         return True
 
-    def delete_turn(self, conversation_id: UUID, turn_index: int) -> int:
-        """Delete a turn and everything after it.
+    def delete_turn(self, conversation_id: UUID, message_id: UUID) -> int:
+        """Delete a turn and everything after it, anchored at `message_id`
+        instead of a positional index — a client that has only lazily
+        loaded the most recent page of a long conversation cannot compute a
+        correct absolute position, and getting that wrong here would delete
+        the wrong range of history.
 
-        turn_index is 0-based counting only VISIBLE assistant messages —
-        hidden tool rows (tool_use / tool_result) are skipped so the index
-        matches the UI's, which never shows them. The turn's opening user
-        message and all subsequent messages (including this turn's tool rows)
-        are removed. Returns the number of messages deleted.
+        `message_id` must be one of:
+        - a visible assistant message (role=assistant, not a hidden
+          tool_use/tool_result row) — the normal case. Walks backward over
+          that turn's hidden tool rows and includes the user message that
+          opened it, exactly as the old index-based walk did.
+        - a visible user message with no visible assistant reply before
+          the next visible user message or the end of history (an orphan
+          turn — stopped or failed before any answer). Cuts from that user
+          message directly; there is nothing to walk back over.
+
+        Anything else (a hidden tool row's id, an answered user message, an
+        id from another conversation, or an id that doesn't exist at all)
+        raises the same ValueError, mapped to the same 404 either way — a
+        foreign id must not be distinguishable from a nonexistent one.
+
+        Returns the number of messages deleted.
         """
         conversation = self.get_conversation(conversation_id)  # raises if not found
         messages = list(
@@ -683,27 +774,47 @@ class ConversationService:
                 .order_by(*_MESSAGE_ORDER)
             ).all()
         )
-        # Find the Nth visible assistant message (0-based).
-        assistant_count = -1
-        cut_from = None
-        for i, m in enumerate(messages):
-            if m.role.value == "assistant" and not _is_tool_row(m.content):
-                assistant_count += 1
-                if assistant_count == turn_index:
-                    # Walk back over this turn's hidden tool rows (the
-                    # tool_result row is role=user, so a plain i-1 check would
-                    # stop on it and orphan the real user input + tool_use).
-                    cut_from = i
-                    j = i - 1
-                    while j >= 0 and _is_tool_row(messages[j].content):
-                        cut_from = j
-                        j -= 1
-                    # Include the user message that opened the turn.
-                    if j >= 0 and messages[j].role.value == "user":
-                        cut_from = j
-                    break
-        if cut_from is None:
-            raise ValueError(f"Turn {turn_index} not found")
+        anchor_index = next((i for i, m in enumerate(messages) if m.id == message_id), None)
+        if anchor_index is None:
+            raise ValueError(f"Turn anchor {message_id} not found")
+        anchor = messages[anchor_index]
+
+        cut_from: int | None = None
+        if anchor.role.value == "assistant" and not _is_tool_row(anchor.content):
+            # Walk back over this turn's hidden tool rows (the
+            # tool_result row is role=user, so a plain i-1 check would
+            # stop on it and orphan the real user input + tool_use).
+            cut_from = anchor_index
+            j = anchor_index - 1
+            while j >= 0 and _is_tool_row(messages[j].content):
+                cut_from = j
+                j -= 1
+            # Include the user message that opened the turn.
+            if j >= 0 and messages[j].role.value == "user":
+                cut_from = j
+        elif anchor.role.value == "user" and not _is_tool_row(anchor.content):
+            # Orphan anchor: valid only if nothing visible answers it yet. A
+            # visible assistant row with empty content is a turn that failed
+            # or was stopped before producing anything — save_assistant_turn
+            # still persists it when it carries events (e.g. the
+            # response.failed record), but the client renders no bubble for
+            # it and treats the user row as the orphan instead
+            # (isSkippedFailedAssistant / isOrphanUser,
+            # lib/turnVisibility.js) — the two must agree, or deleting
+            # exactly the "stopped/failed before any answer" turn the ticket
+            # calls out 404s here.
+            answered = False
+            for m in messages[anchor_index + 1 :]:
+                if _is_tool_row(m.content):
+                    continue
+                answered = m.role.value == "assistant" and bool(m.content)
+                break  # first visible row after the anchor decides it either way
+            if answered:
+                raise ValueError(f"Turn anchor {message_id} already has a reply")
+            cut_from = anchor_index
+        else:
+            raise ValueError(f"Turn anchor {message_id} is not a valid turn boundary")
+
         to_delete = messages[cut_from:]
         swept_slugs: set[str] = set()
         for msg in to_delete:
@@ -750,8 +861,11 @@ class ConversationService:
         events: list[dict],
         harness: str | None = None,
         tool_rows: list[dict] | None = None,
-    ) -> None:
-        """Persist an assistant turn.
+    ) -> Message | None:
+        """Persist an assistant turn. Returns the created assistant Message
+        (its id is what the completion SSE frames hand back to the browser),
+        or None on the early-return below when nothing was
+        actually persisted.
 
         `tool_rows` are the turn's tool block-messages ({role, content} with
         `tool_use` / `tool_result` blocks). They are written as their own rows
@@ -766,7 +880,7 @@ class ConversationService:
         # emits a `response.artifact_created` event, and that event must survive
         # reload so the inline card replays identically.
         if not text and not events and not tool_rows:
-            return
+            return None
         # Anchor the write to a parent loaded through THIS session's scope —
         # detached writers (producer) call this on a fresh session, and the
         # conversation may be gone or out-of-scope by now.
@@ -814,6 +928,7 @@ class ConversationService:
                 self._supersede_skill_cards(
                     conversation_id, assistant_msg.id, new_slugs
                 )
+        return assistant_msg
 
     def _supersede_skill_cards(
         self, conversation_id: UUID, keep_message_id: UUID, slugs: set[str]
@@ -872,6 +987,43 @@ class ConversationService:
             stmt = stmt.where(Message.pending == False)  # noqa: E712 — SQL boolean column, not Python identity
         return list(self.session.exec(stmt.order_by(*_MESSAGE_ORDER)).all())
 
+    def _hydrate_message_items(self, messages: Iterable[Message]) -> list[dict]:
+        """Turn ordered Message rows into the UI-facing item-dict shape,
+        skipping hidden tool rows. Fetches every included message's events in
+        one batched query per _EVENTS_IN_CHUNK_SIZE ids instead of one per
+        message (the events relationship is intentionally not used here —
+        this keeps the query shape explicit and ordered). Chunked rather than
+        a single `IN (...)` over every id: a 1,000-message conversation (the
+        ticket's own largest verification size) would otherwise bind one
+        parameter per visible message, which is fine on Postgres and modern
+        SQLite but exceeds older SQLite builds' bound-parameter limit."""
+        visible = [m for m in messages if not _is_tool_row(m.content)]
+        if not visible:
+            return []
+        events_by_message: dict[UUID, list] = {}
+        visible_ids = [m.id for m in visible]
+        for start in range(0, len(visible_ids), _EVENTS_IN_CHUNK_SIZE):
+            chunk = visible_ids[start : start + _EVENTS_IN_CHUNK_SIZE]
+            for event in self.session.exec(
+                self.session.select(MessageEvent)
+                .where(MessageEvent.message_id.in_(chunk))
+                .order_by(MessageEvent.message_id, MessageEvent.sequence_number)
+            ).all():
+                events_by_message.setdefault(event.message_id, []).append(event.event_data)
+        result = []
+        for message in visible:
+            item = {
+                "id": message.id,
+                "role": message.role,
+                "content": message.content,
+                "created_at": message.created_at,
+                "events": events_by_message.get(message.id, []),
+            }
+            if message.harness:
+                item["harness"] = message.harness
+            result.append(item)
+        return result
+
     def get_messages(self, conversation_id: UUID) -> list[dict]:
         self.get_conversation(conversation_id)  # raises if not found
         messages = self.session.exec(
@@ -879,23 +1031,74 @@ class ConversationService:
             .where(Message.conversation_id == conversation_id)
             .order_by(*_MESSAGE_ORDER)
         ).all()
-        result = []
-        for message in messages:
-            if _is_tool_row(message.content):
-                continue  # history-only tool row — not shown in the chat
-            events = self.session.exec(
-                self.session.select(MessageEvent)
-                .where(MessageEvent.message_id == message.id)
-                .order_by(MessageEvent.sequence_number)
-            ).all()
-            item = {
-                "id": message.id,
-                "role": message.role,
-                "content": message.content,
-                "created_at": message.created_at,
-                "events": [e.event_data for e in events],
-            }
-            if message.harness:
-                item["harness"] = message.harness
-            result.append(item)
-        return result
+        return self._hydrate_message_items(messages)
+
+    def get_messages_page(
+        self,
+        conversation_id: UUID,
+        *,
+        limit: int = _DEFAULT_PAGE_LIMIT,
+        before: str | None = None,
+    ) -> ConversationItemsPage:
+        """Cursor-paginated sibling of get_messages, for GET .../items when
+        the caller opts in via limit/before. get_messages itself is left
+        alone (still used by the route's no-params branch and by callers
+        that want the whole history at once).
+
+        Walks newest-to-oldest from `before` (or from the most recent
+        message when absent), collecting up to `limit` VISIBLE (non-tool-row)
+        items — `pending` rows are included, same as get_messages, since
+        this is the same UI-facing view. Over-fetches raw rows (bounded by
+        _SCAN_CAP_MULTIPLIER) so a run of consecutive tool rows can't come
+        back as an empty page while still claiming more is available.
+        """
+        self.get_conversation(conversation_id)  # raises if not found
+        if not (1 <= limit <= _MAX_PAGE_LIMIT):
+            raise InvalidPaginationParams(f"limit must be between 1 and {_MAX_PAGE_LIMIT}")
+        cursor = _decode_message_cursor(before) if before else None
+
+        stmt = self.session.select(Message).where(Message.conversation_id == conversation_id)
+        if cursor is not None:
+            # Two predicates on purpose. The row-value comparison is the
+            # exact one, but its middle element is a CASE expression, which
+            # no index can serve as a range start-point. The plain `seq <=`
+            # alongside it is sargable, so the index seeks straight to the
+            # cursor instead of scanning and discarding every newer row.
+            stmt = stmt.where(Message.seq <= cursor[0])
+            stmt = stmt.where(tuple_(*_MESSAGE_ORDER) < tuple_(*cursor))
+        # Derived, not restated: the cursor tuple and this ORDER BY have to stay
+        # the same columns in the same sequence, and a hand-written copy drifts
+        # silently — a fourth column added to _MESSAGE_ORDER would widen the
+        # cursor while this stayed at three, and the walk would start skipping
+        # rows while the unbounded read looked fine.
+        stmt = stmt.order_by(*[column.desc() for column in _MESSAGE_ORDER])
+
+        scan_cap = limit * _SCAN_CAP_MULTIPLIER
+        raw_rows = list(self.session.exec(stmt.limit(scan_cap + 1)).all())
+
+        visible: list[Message] = []
+        consumed = 0
+        for message in raw_rows:
+            if consumed >= scan_cap:
+                break
+            consumed += 1
+            if not _is_tool_row(message.content):
+                visible.append(message)
+                if len(visible) == limit:
+                    break
+
+        if len(visible) == limit:
+            has_more = len(raw_rows) > consumed
+        else:
+            has_more = len(raw_rows) > scan_cap
+
+        # Anchor the next page off the last row actually scanned, not the
+        # last VISIBLE one — otherwise a page that's all tool rows (has_more
+        # true, nothing visible to show) would have no cursor to continue
+        # from, and the client's "load earlier" would dead-end.
+        next_before = (
+            _encode_message_cursor(raw_rows[consumed - 1]) if has_more and consumed else None
+        )
+
+        items = self._hydrate_message_items(list(reversed(visible)))
+        return ConversationItemsPage(items=items, has_more=has_more, next_before=next_before)

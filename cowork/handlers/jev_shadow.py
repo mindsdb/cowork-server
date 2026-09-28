@@ -10,6 +10,7 @@ must never break or slow down a real turn beyond its own timeout.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import time
@@ -18,6 +19,7 @@ from typing import Any
 import httpx
 
 from cowork.common.settings.app_settings import TurnQueueSettings
+from cowork.services.providers import MINDS_REQUEST_KIND_HEADER, MINDS_REQUEST_KIND_PROBE
 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +63,56 @@ _ROUTE_QUESTION: dict[str, Any] = {
 }
 
 
+# Separates the probe's Jev traces from the gate's own ("cowork-gate") and from
+# user turns in Langfuse.
+JEV_SHADOW_TAG = "jev-shadow"
+
+
 def _elapsed_ms(started: float) -> int:
     return round((time.monotonic() - started) * 1000)
+
+
+def _trace_headers() -> dict[str, str]:
+    """Langfuse headers attributing the probe to the turn whose gate it shadows.
+
+    Without them the gateway stamps the call ``origin:direct-api``: from its
+    side a probe on the user's minted key is indistinguishable from that user
+    calling Jev directly. The probe runs under the gate's anton
+    TraceContext (``_spawn_jev_shadow_probe``), so this reads it rather than
+    re-deriving the turn's identity.
+
+    Deliberately narrower than anton's own header builder, which serves LLM
+    calls: the gate's ``cowork-gate`` tag is not forwarded (the probe is not the
+    gate call), and ``turn_id`` is never sent — the gateway renames any trace
+    carrying harness + turn_id to ``{harness}:turn-N``, which would count every
+    probe as a user turn.
+
+    No ``Langfuse-Session-Id`` either: the gateway stores it as the row's
+    ``session_id``, and the customer's Traces *Sessions* view counts every row
+    in a session regardless of ``request_kind`` — so the probe would appear in
+    the user's own conversation, and a failed probe would mark it failed. The
+    conversation rides in the metadata instead, and ``correlation_id`` joins
+    the probe to the gate trace, which does carry the session.
+    """
+    from anton.core.llm.tracing import get_trace_context, surface_tag
+
+    ctx = get_trace_context()
+    if ctx is None:
+        return {}
+    headers: dict[str, str] = {}
+    tags = [ctx.harness, surface_tag(ctx.surface) if ctx.surface else None, JEV_SHADOW_TAG]
+    headers["Langfuse-Tags"] = ",".join(t for t in tags if t)
+    metadata: dict[str, object] = dict(ctx.metadata or {})
+    metadata.pop("turn_id", None)
+    if ctx.harness:
+        # What makes the gateway stamp origin:harness rather than direct-api.
+        metadata["harness"] = ctx.harness
+    if ctx.surface:
+        metadata["surface"] = ctx.surface
+    if ctx.session_id:
+        metadata["conversation_id"] = ctx.session_id
+    headers["Langfuse-Metadata"] = json.dumps(metadata)
+    return headers
 
 
 async def probe(
@@ -79,9 +129,9 @@ async def probe(
     Wrapped in `asyncio.timeout`, not just httpx's own timeout kwarg: httpx's
     applies per phase (connect/write/read/pool) and measures inactivity, not
     total elapsed time, so a trickling response could run past the budget
-    without tripping it — and since `_route_request` awaits this via
-    `asyncio.gather` alongside the gate, an unbounded probe would hold up the
-    real turn, not just log a slow number.
+    without tripping it. The probe runs detached from the turn it shadows
+    (`_spawn_jev_shadow_probe`), so a slow probe never delays the turn, but an
+    unbounded one would still hold its task and connection open indefinitely.
     """
     if not settings.jev_shadow_enabled or not llm_block:
         return None
@@ -101,7 +151,15 @@ async def probe(
             async with httpx.AsyncClient(timeout=settings.jev_shadow_timeout_seconds) as client:
                 response = await client.post(
                     f"{base_url}/decisions",
-                    headers={"Authorization": f"Bearer {api_key}"},
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        # Our experiment, not the user's request: hides the row
+                        # from their Traces list by default, like the key-test
+                        # pings. It only reaches Postgres, never Langfuse, so
+                        # our own attribution below is unaffected.
+                        MINDS_REQUEST_KIND_HEADER: MINDS_REQUEST_KIND_PROBE,
+                        **_trace_headers(),
+                    },
                     json=payload,
                 )
     except TimeoutError:

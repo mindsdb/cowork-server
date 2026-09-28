@@ -117,6 +117,55 @@ def trust_test_client_host():
 
 
 @pytest.fixture
+def cleanup_tmp_projects(tmp_path):
+    """Delete Project rows created under this test's `tmp_path`, plus their
+    dependent TaskObject, Conversation, and SharedResourceAttribution rows.
+
+    Several artifact-ownership test modules create real Project rows against
+    the session-scoped test DB; a leaked row (especially one with a real
+    `.anton/artifacts` dir) pollutes other modules that scan or query all
+    projects. Not autouse: opt in per module with
+    `pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")`.
+    """
+    from sqlalchemy import delete, or_
+    from sqlmodel import select
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.session import get_engine
+    from cowork.models.conversation import Conversation
+    from cowork.models.project import Project
+    from cowork.models.shared_resource import SharedResourceAttribution
+    from cowork.models.task_object import TaskObject
+
+    yield
+
+    engine = get_engine(get_app_settings().database.uri)
+    with Session(engine) as session:
+        leaked_ids = list(
+            session.exec(
+                select(Project.id).where(Project.path.startswith(tmp_path.as_posix()))
+            ).all()
+        )
+        if not leaked_ids:
+            return
+        session.exec(delete(TaskObject).where(TaskObject.project_id.in_(leaked_ids)))
+        session.exec(delete(Conversation).where(Conversation.project_id.in_(leaked_ids)))
+        # `artifact_resource_key` always starts with "<project_id>/".
+        session.exec(
+            delete(SharedResourceAttribution).where(
+                or_(
+                    *(
+                        SharedResourceAttribution.resource_key.startswith(f"{pid}/")
+                        for pid in leaked_ids
+                    )
+                )
+            )
+        )
+        session.exec(delete(Project).where(Project.id.in_(leaked_ids)))
+        session.commit()
+
+
+@pytest.fixture
 def granted_product_permissions(monkeypatch):
     """Model built-in Member grants only for suites testing resource ownership.
 

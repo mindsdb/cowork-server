@@ -27,6 +27,8 @@ class HubFreeTokens(CamelResponse):
     remaining: float = 0
     # When the allowance refreshes, as auth's opaque ISO string. Formatted on
     # the client, which is the only side that knows the viewer's timezone.
+    # None when auth sent none, and when there is no allowance to refresh
+    # (``limit`` 0, the organization has no free grant).
     resets_at: Optional[str] = None
 
 

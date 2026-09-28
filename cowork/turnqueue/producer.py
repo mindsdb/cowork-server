@@ -13,9 +13,14 @@ import json
 import logging
 import time
 import uuid
+from datetime import datetime
 
 from cowork.build_info import KEY_ANTON_VERSION, account_ids, build_trace_metadata, surface
-from cowork.handlers.turn_errors import WORKER_UNRESPONSIVE_TYPE_NAME, remote_turn_error
+from cowork.handlers.turn_errors import (
+    RESET_AT_CODES,
+    WORKER_UNRESPONSIVE_TYPE_NAME,
+    remote_turn_error,
+)
 from cowork.services.providers import minds_chat_base_url
 from cowork.db.scoped import TenantScope
 from cowork.services import product_permissions
@@ -112,18 +117,23 @@ def _new_correlation_id() -> str:
 
 
 async def _mint_llm_block(*, org_id: str | None, user_id: str | None,
-                          correlation_id: str, settings: TurnQueueSettings) -> dict:
+                          correlation_id: str, settings: TurnQueueSettings,
+                          workspace_id: str | None = None) -> dict:
     """Mint a short-TTL MindsHub turn key and build the job's `llm` block.
 
     The mint call is authenticated with the internal shared secret
     (`X-Internal-Auth`) only - there is no per-tenant credential to look up or
     send. `org_id`/`user_id` (the request principal's identity) tell auth
     which tenant the key is scoped to; auth resolves them itself, so no
-    per-user provider key is needed or read here.
+    per-user provider key is needed or read here. `workspace_id` is the
+    caller's active MindsHub workspace (`UserSettings.hub_workspace_id`), if
+    they have picked one; omitted otherwise, so the key binds to the
+    organization's Default the way it always has.
     """
     api_key = await mint_turn_key(
         user_id=user_id, org_id=org_id, correlation_id=correlation_id,
         ttl_seconds=settings.turn_key_ttl_seconds, settings=settings,
+        workspace_id=workspace_id,
     )
     base_url = settings.minds_base_url or minds_chat_base_url(default_turn_minds_api_host())
     block = {"provider": "minds-cloud", "api_key": api_key, "base_url": base_url}
@@ -198,6 +208,28 @@ async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
 UNRESPONSIVE_WORKER_ERROR = (
     f"{WORKER_UNRESPONSIVE_TYPE_NAME}: the turn worker stopped responding"
 )
+
+
+def _remote_reset_at(*, code: str, value: object) -> str | None:
+    """The worker's ``reset_at`` for a failed turn, or None to leave it off.
+
+    anton's worker sends the gate's reset instant on a billing stop the gate
+    timed, and scratchpad-controller forwards it beside ``error``. It is kept
+    only for the codes whose card offers waiting (``RESET_AT_CODES``) and only
+    as an instant with a UTC offset: a naive time names a different moment in
+    every timezone, so the card would count down to the wrong one. Returned in
+    ``datetime.isoformat()``'s extended form, which a browser's ``Date``
+    parses; Python also accepts compact forms that it does not.
+    """
+    if code not in RESET_AT_CODES or not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.utcoffset() is None:
+        return None
+    return parsed.isoformat()
 
 
 def step_stream_events(data: dict) -> list:
@@ -308,8 +340,13 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         llm_block = llm
         oauth_connections = await oauth_connections_coro
     else:
+        from cowork.common.settings.user_settings import get_user_settings
+        workspace_id = getattr(get_user_settings(scope), "hub_workspace_id", "") or None
         llm_block, oauth_connections = await asyncio.gather(
-            _mint_llm_block(org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings),
+            _mint_llm_block(
+                org_id=org_id, user_id=user_id, correlation_id=corr, settings=settings,
+                workspace_id=workspace_id,
+            ),
             oauth_connections_coro,
         )
     # Reuses the turn key already minted for llm_block — never mints a
@@ -435,9 +472,14 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                         yield "turn_failed", _workspace_permission_failure()
                         return
                     # Classify once; the SSE frame and the persisted events
-                    # log must carry the same (code, message).
+                    # log must carry the same (code, message), and the same
+                    # reset_at. An older worker sends no reset_at, and its
+                    # frame stays as it was.
                     code, message = remote_turn_error(data.get("error"))
                     data = {**data, "code": code, "message": message}
+                    reset_at = _remote_reset_at(code=code, value=data.pop("reset_at", None))
+                    if reset_at is not None:
+                        data["reset_at"] = reset_at
                     logger.warning(
                         "Remote turn failed conversation=%s correlation_id=%s error=%s",
                         conversation_id, corr, data.get("error"),

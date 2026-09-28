@@ -8,6 +8,9 @@ from functools import lru_cache
 from pathlib import Path
 
 from cowork.coding.approvals import ApprovalBroker
+from cowork.coding.questions import QuestionBroker
+from cowork.coding.service_questions import CodingQuestionOperations
+from cowork.coding.service_planning import CodingPlanningOperations
 from cowork.coding.commands import CodingCommandHandler
 from cowork.coding.context import (
     validate_directories,
@@ -69,6 +72,8 @@ logger = logging.getLogger(__name__)
 
 
 class CodingService(
+    CodingPlanningOperations,
+    CodingQuestionOperations,
     CodingWorkspaceFilesOperations,
     CodingDeliveryOperations,
     CodingTerminalOperations,
@@ -117,7 +122,8 @@ class CodingService(
             self._approval_opened, self._approval_closed,
             lambda session_id: self.store.load_session(session_id).command_approval_grants,
         )
-        self.runtimes = RuntimeManager(root, self.registry, self.approvals.request)
+        self.questions = QuestionBroker(self._question_opened, self._question_closed)
+        self.runtimes = RuntimeManager(root, self.registry, self._engine_request)
         self.lifecycle = SessionLifecycleOperations(
             maintenance_session=self._maintenance_session,
             emit=self._emit,
@@ -492,13 +498,18 @@ class CodingService(
         """Checkpoint active turns before the desktop terminates the sidecar tree."""
         with self._lock:
             active_sessions = list(self._running)
+            for running in self._running.values():
+                running.cancel_requested = True
         for session_id in active_sessions:
             try:
-                self.approvals.cancel_session(session_id)
+                try:
+                    self.questions.cancel_session(session_id)
+                finally:
+                    self.approvals.cancel_session(session_id)
             except Exception:
                 # Shutdown must continue releasing the remaining tasks and
                 # runtimes even if one persisted approval cannot be updated.
-                logger.exception("Could not cancel approval while shutting down task %s", session_id)
+                logger.exception("Could not cancel pending input while shutting down task %s", session_id)
         return self.turns.interrupt(active_sessions)
 
     def _approval_opened(self, session_id: str, pending: PendingApproval) -> None:
