@@ -116,9 +116,9 @@ def _log_scratchpad_close(task: asyncio.Task[None], *, owner: str) -> None:
 async def drain_scratchpad_closes(*, timeout: float = 5.0) -> None:
     """Wait for scheduled scratchpad closes, for shutdown.
 
-    The turns shutdown cancels schedule their closes as they unwind, and a
-    task still pending when the event loop stops is destroyed with its pads
-    alive. `asyncio.wait` does not cancel on timeout, so a slow close keeps
+    Each turn that shutdown cancels schedules its close while it unwinds,
+    and a close still pending when the event loop stops is destroyed with
+    its pads alive. `asyncio.wait` does not cancel on timeout, so a slow close keeps
     running for as long as the loop does.
     """
     tasks = list(_scratchpad_closes)
