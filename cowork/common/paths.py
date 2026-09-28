@@ -129,10 +129,21 @@ def open_fd(
     Every raw ``os.open`` of a regular file in cowork-server goes through
     here, so bytes read and written through the descriptor match the bytes on
     disk on every platform.
-    ``tests/test_binary_file_descriptors.py`` fails on a raw ``os.open``
-    outside the allowlisted directory opens.
     """
     return os.open(path, flags | O_BINARY, mode, dir_fd=dir_fd)
+
+
+def read_bounded(fd: int, size: int, chunk_size: int = 1 << 16) -> Iterator[bytes]:
+    """Yield at most *size* bytes from *fd*, stopping early at EOF.
+
+    *size* is the ``fstat`` size taken when the descriptor was authorized: a
+    file that grows afterwards is served as it was, one that shrinks ends
+    early, and neither can make the read run on (ENG-2950).
+    """
+    remaining = size
+    while remaining > 0 and (chunk := os.read(fd, min(remaining, chunk_size))):
+        remaining -= len(chunk)
+        yield chunk
 
 
 def dir_open(d: PinnedDir, name: str, flags: int, mode: int = 0o777) -> int:

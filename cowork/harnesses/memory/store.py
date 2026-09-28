@@ -3,6 +3,7 @@ This module defines the memory stores for canonical slot files on disk.
 """
 
 import os
+import re
 import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -42,6 +43,9 @@ def _undo_text_mode_double_cr(text: str) -> str:
     back as CRLF restores what the old read returned.
     """
     return text.replace("\r\r\n", "\r\n")
+
+
+_LINE_BREAK = re.compile(r"\r\r\n|\r\n|\r")
 
 
 @dataclass(frozen=True)
@@ -123,9 +127,10 @@ class MemoryStore:
             with self._root_fd(create=False) as root:
                 sfd = dir_open(root, name, os.O_RDONLY | O_NOFOLLOW)
                 with open(sfd, encoding="utf-8", newline="") as f:
-                    raw = _undo_text_mode_double_cr(f.read())
-            # Universal newlines, as ``newline=None`` would have applied.
-            return raw.replace("\r\n", "\n").replace("\r", "\n")
+                    raw = f.read()
+            # Universal newlines, as ``newline=None`` would have applied, with
+            # the legacy \r\r\n read as one break (see _undo_text_mode_double_cr).
+            return _LINE_BREAK.sub("\n", raw)
         except OSError:
             # Missing dir/file, or a symlink squatting the slot (O_NOFOLLOW ->
             # ELOOP): no readable slot content.

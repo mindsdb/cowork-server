@@ -40,6 +40,7 @@ from cowork.common.paths import (
     open_pinned_child,
     opened_subdir_nofollow,
     pinned_dir,
+    read_bounded,
     safe_join,
 )
 from cowork.db.scoped import (
@@ -948,15 +949,7 @@ def _read_project_bytes(
     try:
         if st.st_size > TEXT_MAX_BYTES:
             raise HTTPException(status_code=413, detail="File too large to edit")
-        chunks: list[bytes] = []
-        remaining = st.st_size
-        while remaining:
-            chunk = os.read(fd, min(remaining, 1 << 16))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
+        return b"".join(read_bounded(fd, st.st_size))
     finally:
         cm.__exit__(None, None, None)
 
@@ -1035,10 +1028,7 @@ def _pinned_stream(
 
     def _chunks():
         try:
-            remaining = st.st_size
-            while remaining > 0 and (chunk := os.read(fd, min(remaining, 1 << 16))):
-                remaining -= len(chunk)
-                yield chunk
+            yield from read_bounded(fd, st.st_size)
         finally:
             cm.__exit__(None, None, None)
 

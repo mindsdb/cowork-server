@@ -130,7 +130,10 @@ RAW_OS_OPEN_ALLOWED = {
 def _raw_os_open_calls() -> dict[str, list[int]]:
     found: dict[str, list[int]] = {}
     for source in sorted(COWORK_ROOT.rglob("*.py")):
-        tree = ast.parse(source.read_text(encoding="utf-8"), filename=str(source))
+        text = source.read_text(encoding="utf-8")
+        if "os.open" not in text:
+            continue
+        tree = ast.parse(text, filename=str(source))
         for node in ast.walk(tree):
             if (
                 isinstance(node, ast.Call)
