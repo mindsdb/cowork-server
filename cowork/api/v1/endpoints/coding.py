@@ -72,6 +72,7 @@ from cowork.coding.project_models import (
     ProjectActionPage,
     ProjectActionRunRequest,
     ProjectActionRunResponse,
+    ProjectCommandRefresh,
     ProjectCreateRequest,
     ProjectFolder,
     ProjectPage,
@@ -792,6 +793,11 @@ def run_project_action(
 @router.get("/sessions/{session_id}/project-actions", response_model=ProjectActionPage)
 def project_actions(session_id: str):
     return _call(_service().project_action_page, session_id)
+
+
+@router.post("/sessions/{session_id}/project-commands/refresh", response_model=ProjectCommandRefresh)
+def refresh_project_commands(session_id: str):
+    return _call(_service().refresh_project_commands, session_id)
 
 
 @router.post("/sessions/{session_id}/terminals", response_model=TerminalTabState)
