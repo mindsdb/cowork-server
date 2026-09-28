@@ -1024,11 +1024,13 @@ def _pinned_stream(
 
     A `FileResponse` takes a path and opens it after the handler returns, which
     is the one thing the pinning exists to avoid, so the bytes come off the
-    descriptor instead. Content-Length comes from `fstat` on that same
-    descriptor, so it describes the file being sent rather than whatever the name
-    resolves to next.
+    descriptor instead. No Content-Length is declared: the file can change
+    while it is read (an agent still writing it), and a length taken from
+    `fstat` would then disagree with the bytes sent, which browsers report as
+    `ERR_CONTENT_LENGTH_MISMATCH` (ENG-2950). Chunked transfer sends exactly
+    what the descriptor yields.
     """
-    cm, fd, st = _pinned_regular_file(target, base)
+    cm, fd, _st = _pinned_regular_file(target, base)
 
     def _chunks():
         try:
@@ -1037,11 +1039,7 @@ def _pinned_stream(
         finally:
             cm.__exit__(None, None, None)
 
-    return StreamingResponse(
-        _chunks(),
-        media_type=media_type,
-        headers={**headers, "Content-Length": str(st.st_size)},
-    )
+    return StreamingResponse(_chunks(), media_type=media_type, headers=headers)
 
 
 @router.get(
