@@ -32,6 +32,18 @@ PROJECT_SLOTS = (MemorySlot.RULES, MemorySlot.LESSONS)
 _KNOWN_SLOT_FILENAMES = frozenset(spec.filename for spec in SLOT_REGISTRY.values())
 
 
+def _undo_text_mode_double_cr(text: str) -> str:
+    """Collapse the ``\\r\\r\\n`` that Windows slots got before ENG-2950.
+
+    Slot descriptors were opened in CRT text mode then: the text layer wrote
+    CRLF and the CRT added another CR. The old text-mode read hid the extra
+    CR; binary descriptors expose it, and universal newlines would read every
+    line break as two. The sequence is never written on purpose, so reading it
+    back as CRLF restores what the old read returned.
+    """
+    return text.replace("\r\r\n", "\r\n")
+
+
 @dataclass(frozen=True)
 class SlotRead:
     """One slot as a caller found it on disk.
@@ -110,8 +122,10 @@ class MemoryStore:
         try:
             with self._root_fd(create=False) as root:
                 sfd = dir_open(root, name, os.O_RDONLY | O_NOFOLLOW)
-                with open(sfd, encoding="utf-8") as f:
-                    return f.read()
+                with open(sfd, encoding="utf-8", newline="") as f:
+                    raw = _undo_text_mode_double_cr(f.read())
+            # Universal newlines, as ``newline=None`` would have applied.
+            return raw.replace("\r\n", "\n").replace("\r", "\n")
         except OSError:
             # Missing dir/file, or a symlink squatting the slot (O_NOFOLLOW ->
             # ELOOP): no readable slot content.
@@ -132,7 +146,7 @@ class MemoryStore:
                 # compensation snapshot. ``newline=None`` would translate
                 # CRLF to LF before ``restore_exact`` can put it back.
                 with open(sfd, encoding="utf-8", newline="") as f:
-                    return True, f.read()
+                    return True, _undo_text_mode_double_cr(f.read())
         except FileNotFoundError:
             return False, ""
 

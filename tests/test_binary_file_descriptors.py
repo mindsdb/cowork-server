@@ -16,6 +16,8 @@ import pytest
 from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
 from cowork.api.v1.endpoints import project_files as project_files_ep
 from cowork.common import paths
+from cowork.harnesses.memory.registry import MemorySlot
+from cowork.harnesses.memory.store import GlobalMemoryStore
 from cowork.services import files as files_service
 from cowork.services.artifacts import ProjectArtifacts
 
@@ -173,3 +175,29 @@ def test_stage_attachment_replaces_a_text_mode_copy(tmp_path):
         files_service._stage_attachment(attach, "file-1", "upload.png", src, len(payload))
 
     assert stale.read_bytes() == payload
+
+
+def _memory_slot_with_bytes(root: Path, payload: bytes) -> GlobalMemoryStore:
+    store = GlobalMemoryStore(root=root)
+    store.write(MemorySlot.RULES, "placeholder")
+    (slot_file,) = [entry for entry in root.iterdir() if entry.is_file()]
+    slot_file.write_bytes(payload)
+    return store
+
+
+def test_memory_read_undoes_the_legacy_text_mode_double_cr(tmp_path):
+    """Before ENG-2950, a Windows slot was written through a text-mode
+    descriptor: the text layer wrote CRLF and the CRT added another CR. The
+    old text-mode read hid that; a binary read must too, or every line would
+    come back followed by a blank one."""
+    store = _memory_slot_with_bytes(tmp_path, b"first rule\r\r\nsecond rule\r\r\n")
+
+    assert store.read(MemorySlot.RULES) == "first rule\nsecond rule\n"
+    assert store.read_checked(MemorySlot.RULES) == (True, "first rule\r\nsecond rule\r\n")
+
+
+def test_memory_read_keeps_ordinary_line_endings(tmp_path):
+    store = _memory_slot_with_bytes(tmp_path, b"crlf\r\nlf\nlone cr\rend")
+
+    assert store.read(MemorySlot.RULES) == "crlf\nlf\nlone cr\nend"
+    assert store.read_checked(MemorySlot.RULES) == (True, "crlf\r\nlf\nlone cr\rend")
