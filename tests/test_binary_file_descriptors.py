@@ -16,6 +16,7 @@ import pytest
 from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
 from cowork.api.v1.endpoints import project_files as project_files_ep
 from cowork.common import paths
+from cowork.services import files as files_service
 from cowork.services.artifacts import ProjectArtifacts
 
 SENTINEL = 1 << 30
@@ -145,3 +146,21 @@ def test_regular_files_are_opened_through_open_fd():
         "Use cowork.common.paths.open_fd for regular files (ENG-2950): "
         + ", ".join(offenders)
     )
+
+
+def test_stage_attachment_replaces_a_text_mode_copy(tmp_path):
+    """A copy written through a text-mode descriptor is larger than its source
+    (every LF became CRLF), so the size check must not treat it as done."""
+    payload = b"\x89PNG\r\n\x1a\n" + bytes(range(256))
+    src = tmp_path / "upload.png"
+    src.write_bytes(payload)
+    attachments = tmp_path / "attachments"
+    stale = attachments / "file-1" / "upload.png"
+    stale.parent.mkdir(parents=True)
+    stale.write_bytes(payload.replace(b"\n", b"\r\n"))
+    assert stale.stat().st_size > len(payload)
+
+    with paths.pinned_dir(attachments) as attach:
+        files_service._stage_attachment(attach, "file-1", "upload.png", src, len(payload))
+
+    assert stale.read_bytes() == payload
