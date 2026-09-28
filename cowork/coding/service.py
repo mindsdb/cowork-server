@@ -45,6 +45,7 @@ from cowork.coding.project_models import (
     ProjectActionPage,
     ProjectActionRunRequest,
     ProjectActionRunResponse,
+    ProjectCommandRefresh,
 )
 from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.project_tasks import ProjectTaskOperations
@@ -65,7 +66,7 @@ from cowork.coding.store import CodingStore
 from cowork.coding.task_delivery import TaskDeliveryService
 from cowork.coding.terminal_service import TaskTerminalService
 from cowork.coding.turns import RunningTurn, TurnExecutor
-from cowork.coding.workspace import WorkspaceManager
+from cowork.coding.workspace import WorkspaceError, WorkspaceManager
 from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
@@ -471,6 +472,44 @@ class CodingService(
 
     def project_action_page(self, session_id: str) -> ProjectActionPage:
         return self.project_actions.list(session_id)
+
+    def refresh_project_commands(self, session_id: str) -> ProjectCommandRefresh:
+        """Let an existing task adopt the commands now saved in Project settings.
+
+        A task freezes its project at creation, so commands added later reach
+        only new tasks. This is the explicit opt-in for an older task; it
+        touches commands alone and leaves the task's resource scope frozen.
+        """
+
+        session = self.get_session(session_id)
+        if not session.project_id or not session.task_id:
+            raise WorkspaceError("This task is not linked to a Code Project")
+        project = self.projects.get(session.project_id)
+        task = self.control.refresh_task_commands(session.task_id, project)
+        scoped = {workspace.folder_id for workspace in session.workspaces}
+        commands = [
+            command
+            for resource in (task.execution_project.resources if task.execution_project else [])
+            if resource.id in scoped
+            for command in resource.commands
+        ]
+        summary = ProjectCommandRefresh(
+            validate_count=sum(command.phase == "validate" for command in commands),
+            run_count=sum(command.phase == "run" for command in commands),
+        )
+        self._emit(
+            session.id,
+            CodingEvent(
+                type=EventType.session,
+                title="Project commands updated",
+                text=(
+                    f"This task now uses the commands saved in Project settings: "
+                    f"{summary.validate_count} validation, {summary.run_count} run."
+                ),
+                phase="completed",
+            ),
+        )
+        return summary
 
     def _execution_project(self, session: CodingSession) -> CodeProject | None:
         if not session.task_id:

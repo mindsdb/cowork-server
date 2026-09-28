@@ -365,6 +365,51 @@ def test_task_resource_snapshot_is_immutable_when_project_changes(tmp_path: Path
     assert [item.id for item in service.runtime_project_for_task(task, remote.id).resources] == ["api"]
 
 
+def test_refreshing_task_commands_keeps_the_frozen_resource_scope(tmp_path: Path) -> None:
+    from cowork.coding.project_models import ProjectCommand
+
+    service = ControlPlaneService(tmp_path, capabilities())
+    remote, _ = register(service)
+    code_project = project(service.local_computer.id)
+    snapshot = service.create_task_run(
+        task_id="scoped-task",
+        title="Scoped task",
+        prompt="Only change the API",
+        project=code_project,
+        requested_resource_ids=["api"],
+        computer_id=remote.id,
+        engine_id="codex",
+    )
+
+    check = ProjectCommand(id="api-check", label="API check", argv=["npm", "test"], phase="validate")
+    serve = ProjectCommand(id="api-serve", label="API server", argv=["npm", "start"], phase="run")
+    code_project.resources[0].commands = [check, serve]
+    code_project.resources[0].name = "Renamed after task creation"
+    code_project.resources[0].source_url = "https://github.com/example/moved.git"
+    code_project.resources[1].commands = [ProjectCommand(id="notes-check", label="Notes", argv=["true"], phase="validate")]
+    code_project.resources.append(RepositoryResource(
+        id="web",
+        name="Web",
+        source_url="https://github.com/example/web.git",
+        commands=[ProjectCommand(id="web-check", label="Web", argv=["true"], phase="validate")],
+    ))
+
+    task = service.refresh_task_commands(snapshot.task.id, code_project)
+
+    assert task.execution_project is not None
+    # Commands arrive; every other frozen fact about the scope is untouched.
+    assert [(item.id, item.name) for item in task.execution_project.resources] == [("api", "API")]
+    assert task.execution_project.resources[0].source_url == "https://github.com/example/api.git"
+    assert [item.id for item in task.execution_project.resources[0].commands] == ["api-check", "api-serve"]
+    assert task.resource_scope.resource_ids == ["api"]
+    stored = service.store.get_task(snapshot.task.id).execution_project
+    assert stored is not None
+    assert [[c.id for c in r.commands] for r in stored.resources] == [["api-check", "api-serve"]]
+
+    with pytest.raises(ValueError):
+        service.refresh_task_commands(snapshot.task.id, CodeProject(id="other", name="Other", resources=[]))
+
+
 def test_no_project_folder_task_is_kept_on_its_owning_computer(tmp_path: Path) -> None:
     service = ControlPlaneService(tmp_path, capabilities())
     remote, _ = register(service)

@@ -2351,6 +2351,66 @@ def test_project_fork_keeps_every_folder_change_isolated_and_reviewable(tmp_path
     assert engine.forked_additional_dirs[-1] == tuple(child.additional_dirs)
 
 
+def test_existing_task_can_adopt_commands_added_to_the_project_later(tmp_path: Path) -> None:
+    app = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(
+        ProjectCreateRequest(
+            name="Late checks",
+            folders=[ProjectFolder(id="app", name="App", path=str(app))],
+            default_engine_id="fake",
+            default_model="fake-model",
+        )
+    )
+    early = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Started before any checks existed"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, early.id, SessionStatus.completed)
+    assert service.validate_project(early.id) == []
+
+    live = service.projects.get(project.id)
+    service.projects.update(project.id, ProjectUpdateRequest(resources=[
+        resource.model_copy(update={
+            "commands": [
+                ProjectCommand(
+                    id="late-check",
+                    label="Late check",
+                    argv=[sys.executable, "-c", "print('late')"],
+                    phase="validate",
+                ),
+                ProjectCommand(id="serve", label="Serve", argv=[sys.executable, "-m", "http.server"], phase="run"),
+            ],
+        })
+        for resource in live.resources
+    ]))
+
+    # The snapshot still rules until the user asks for the new commands.
+    assert service.validate_project(early.id) == []
+    assert service.project_action_page(early.id).items == []
+
+    summary = service.refresh_project_commands(early.id)
+
+    assert (summary.validate_count, summary.run_count) == (1, 1)
+    results = service.validate_project(early.id)
+    assert [(result["label"], result["return_code"]) for result in results] == [("Late check", 0)]
+    assert [item.id for item in service.project_action_page(early.id).items] == ["serve"]
+    assert service.get_session(early.id).resource_ids == early.resource_ids
+    assert any(event.title == "Project commands updated" for event in service.events(early.id).items)
+
+    # New tasks keep receiving the saved commands without any extra step.
+    late = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Started after"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, late.id, SessionStatus.completed)
+    assert [result["label"] for result in service.validate_project(late.id)] == ["Late check"]
+
+
 def test_scoped_task_validation_and_fork_use_immutable_project_snapshot(tmp_path: Path) -> None:
     app = repository(tmp_path)
     docs = tmp_path / "docs"
