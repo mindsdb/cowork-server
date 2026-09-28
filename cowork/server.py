@@ -119,9 +119,7 @@ async def _run_artifact_owner_backfill() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_dev_setup()
-    # Write the orphaned turn into history FIRST, while its buffer file still
-    # has no terminal record — seal_orphan_buffers below uses that same "no
-    # terminal record" check, so running this after it would skip everything.
+    # History recovery also retries buffers sealed by an earlier failed sweep.
     try:
         from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
         from cowork.db.session import get_open_session
@@ -207,12 +205,11 @@ async def lifespan(app: FastAPI):
         from cowork.coding.service import get_coding_service
         from cowork.streaming.registry import registry
 
-        # Cancel any in-flight turn and wait (bounded) for it to persist its
-        # partial answer as interrupted, before the resources below it
-        # depends on go away.
+        # Uvicorn's request drain is bounded by the image command. Persist
+        # interrupted turns before their database and runtime resources close.
         cancelled = await registry.shutdown()
         if cancelled:
-            logger.warning(f"Cancelled {cancelled} in-flight turn(s) for shutdown")
+            logger.warning("Cancelled %d in-flight turn(s) for shutdown", cancelled)
 
         await _cancel_and_wait(getattr(app.state, "channel_ingress_reconciler", None))
         await _cancel_and_wait(getattr(app.state, "artifact_owner_backfill", None))

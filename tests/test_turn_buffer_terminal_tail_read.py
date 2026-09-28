@@ -72,3 +72,15 @@ def test_a_short_completed_file_still_resolves(tmp_path):
     _write(path, 3, close_reason="cancelled")
 
     assert latest_terminal_reason(path) == "cancelled"
+
+
+def test_tail_may_start_inside_a_large_sse_records_utf8_character(tmp_path):
+    path = tmp_path / "large-unicode.jsonl"
+    raw = (
+        b'{"seq":0,"ts":"now","type":"sse","data":{"sse":"'
+        + "😀".encode() * 3000 + b'x"}}\n'
+    )
+    assert raw[-8192] & 0xC0 == 0x80  # a UTF-8 continuation byte
+    path.write_bytes(raw)
+
+    assert latest_terminal_reason(path) is None

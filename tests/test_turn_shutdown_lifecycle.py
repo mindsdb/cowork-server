@@ -152,3 +152,57 @@ async def test_shutdown_reports_a_turn_still_unwinding_past_its_budget():
     assert lifecycle.shutting_down is True
     assert not task.done()
     await asyncio.wait_for(task, timeout=2)  # let it finish so nothing leaks past the test
+
+
+@pytest.mark.parametrize("backend", ["local", "remote"])
+@pytest.mark.parametrize("cause", ["watchdog", "shutdown", "user_stop"])
+async def test_only_user_stop_emits_cancelled(monkeypatch, tmp_path, backend, cause):
+    import sys
+
+    from cowork.handlers.responses import sse_from_buffer
+    from cowork.streaming.buffer import FileStreamBuffer, turn_buffer_path
+    from test_responses_remote_backend import _remote_handler_with_message_id
+
+    registry_module = sys.modules["cowork.streaming.registry"]
+    monkeypatch.setattr(registry_module, "_IDLE_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(registry_module, "_MAX_TURN_IDLE_SECONDS", 0.05 if cause == "watchdog" else 600)
+    saved = {}
+    buffer = FileStreamBuffer(turn_buffer_path(tmp_path, CID, 0))
+    if backend == "local":
+        handle = await _start_streaming_turn(monkeypatch, saved, buffer)
+    else:
+        started = asyncio.Event()
+        handler = _remote_handler_with_message_id(monkeypatch, saved, assistant_message_id=uuid4())
+
+        async def replies(**kwargs):
+            yield "turn_delta", {"text": "partial"}
+            started.set()
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(responses_mod, "stream_remote_replies", replies)
+        lifecycle = TurnLifecycle()
+        handle = await registry.start(
+            conversation_id=CID, turn_id=0, buffer=buffer, lifecycle=lifecycle,
+            producer_coro=handler._produce_remote(
+                conv_id=uuid4(), input_text="hi", original_content="hi", model="anton",
+                harness_id="anton", buffer=buffer, lifecycle=lifecycle,
+            ),
+        )
+        await asyncio.wait_for(started.wait(), timeout=5)
+    if cause == "shutdown":
+        await registry.shutdown()
+    elif cause == "user_stop":
+        await handle.cancel()
+    await asyncio.wait_for(handle.task, timeout=5)
+
+    frames = [frame async for frame in sse_from_buffer(buffer)]
+    assert saved["assistant"] == "partial"
+    assert handle.lifecycle.timed_out is (cause == "watchdog")
+    assert handle.lifecycle.shutting_down is (cause == "shutdown")
+    if cause == "user_stop":
+        assert frames[-1].startswith("event: response.cancelled\n")
+        assert not any(e.get("type") == "response.failed" for e in saved["events"])
+    else:
+        assert frames[-1].startswith("event: response.failed\n")
+        assert not any("response.cancelled" in frame for frame in frames)
+        assert saved["events"][-1]["error"] == INTERRUPTED_TURN_MESSAGE
