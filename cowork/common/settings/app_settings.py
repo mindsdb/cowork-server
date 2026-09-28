@@ -559,12 +559,17 @@ class TurnQueueSettings(Settings):
         ),
     )  # COWORK_TURN_MINDS_BASE_URL
     jev_shadow_enabled: bool = Field(
-        default=True,
+        default=False,
         description=(
             "Fire a Jev '/v1/decisions' call alongside the LLM gate on every remote turn, "
             "purely for latency/agreement comparison. Never used to route; logged only. "
             "Requires a minted minds-cloud credential, so it's a no-op unless backend is "
-            "'remote'."
+            "'remote'. Off by default: the call runs on the turn's own minted key and "
+            "sends the turn's text history as state. Jev is zero-priced, so it charges no "
+            "wallet, but on an unfunded org every turn draws that org's free Jev allowance "
+            "in the background, and a refused call shows up only as the "
+            "'jev_error=http_<status>' field of the '[jev-shadow]' warning that "
+            "responses._spawn_jev_shadow_probe logs."
         ),
     )  # COWORK_TURN_JEV_SHADOW_ENABLED
     jev_shadow_model: str = Field(
