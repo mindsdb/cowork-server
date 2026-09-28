@@ -173,6 +173,7 @@ packages = ["cowork"]
 # `services/providers.py` capability-gates the live supplier and logs when it
 # must retain the static construction-time key, and `handlers/turn_errors.py`
 # keeps the legacy 401 classifier available under that skew.
+#
 anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
 
 [dependency-groups]
