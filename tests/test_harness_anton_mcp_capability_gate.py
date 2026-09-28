@@ -21,11 +21,12 @@ from cowork.harnesses.anton_harness.harness import _anton_mcp_wiring
 
 
 def test_returns_none_when_the_installed_anton_has_no_mcp_client(monkeypatch):
-    # A `None` entry in sys.modules makes `import anton.core.mcp.wiring` raise
-    # ImportError — exactly what an older anton does. Runs on every build,
-    # including ones that do ship the module, so the skew path is never left
-    # untested just because CI happens to be on a newer anton.
-    monkeypatch.setitem(sys.modules, "anton.core.mcp.wiring", None)
+    # A `None` entry in sys.modules makes the import raise ImportError, as on
+    # an older anton. Stub the package, not just `wiring`: once another test
+    # has imported the real module, `from anton.core.mcp import wiring` finds
+    # it as a package attribute and never consults the submodule entry.
+    # Runs on every build, so the skew path stays tested on a newer anton too.
+    monkeypatch.setitem(sys.modules, "anton.core.mcp", None)
 
     assert _anton_mcp_wiring() is None
 
