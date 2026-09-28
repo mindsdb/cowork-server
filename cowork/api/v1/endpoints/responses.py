@@ -344,6 +344,15 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
     verdict (turnqueue/answers.py).
     """
     _require_streaming_scope(scope)
+    # Keyed off the backend setting rather than local-registry presence (the
+    # way /cancel and /tail check first): on the replica that owns this turn a
+    # registry handle exists, but the broker it would submit to never holds a
+    # pod's question — the pod is the source of truth on the remote backend —
+    # so a registry-first check here would 404 on the very replica that could
+    # otherwise serve the request. Remote mode also requires
+    # COWORK_STREAM_BACKEND=redis: _shared_turn (used below) returns None on
+    # any other stream backend, so a misconfigured deployment 404s instead of
+    # silently falling through to the in-process broker.
     remote = TurnQueueSettings().is_remote
     correlation_id = None
     if remote:
@@ -390,6 +399,8 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
                 )
             case RemoteAnswerResult.INVALID_OPTION:
                 return JSONResponse(status_code=400, content={"status": "invalid_option"})
+            case RemoteAnswerResult.TOO_LARGE:
+                return JSONResponse(status_code=400, content={"status": "answer_too_large"})
             case _:
                 raise AssertionError(f"unhandled RemoteAnswerResult: {remote_result}")
 
