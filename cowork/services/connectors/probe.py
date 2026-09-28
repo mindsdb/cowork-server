@@ -593,8 +593,8 @@ class CredentialProbe:
                 # plaintext credentials file is worth an operator's attention,
                 # not a debug line nobody has turned on.
                 logger.warning("Could not delete probe env file %s", env_path, exc_info=True)
-            # The cells the prompt asks for each start a scratchpad process,
-            # and no later turn reuses it.
+            # The cells the prompt asks for run in a scratchpad process, and
+            # no later turn reuses it.
             close_session_scratchpads(probe_session, owner="connector probe")
 
         if self._outcome.status == "unresolved":
