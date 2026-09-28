@@ -1575,6 +1575,8 @@ class ResponsesHandler:
             # an offset-aware instant (`_remote_reset_at` in producer.py), so
             # it rides both the frame and the persisted event as sent.
             reset_at = failure.get("reset_at")
+            # The pod never got to retire a question it was blocked on.
+            collected_events.extend(cancelled_ask_user_retirements(collected_events))
             collected_events.append(response_failed_payload(
                 message, code, reset_at=reset_at, request_id=corr))
             # Persist before building the frame — a client's SSE
@@ -1620,7 +1622,9 @@ class ResponsesHandler:
                 )})
                 await buffer.close("interrupted")
                 return
-            # Partial text generated before cancellation is persisted.
+            # Partial text generated before cancellation is persisted, with
+            # every question the Stop left open retired.
+            collected_events.extend(cancelled_ask_user_retirements(collected_events))
             persist()
             await buffer.close("cancelled")
         except Exception:
@@ -1628,6 +1632,7 @@ class ResponsesHandler:
                 "[responses] remote turn failed for conversation %s correlation_id=%s",
                 conv_id, corr, extra={"request_id": corr},
             )
+            collected_events.extend(cancelled_ask_user_retirements(collected_events))
             collected_events.append(response_failed_payload(
                 GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr))
             # Persist before building the frame — see the

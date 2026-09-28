@@ -2146,3 +2146,66 @@ async def test_produce_remote_marks_the_turn_interactive_per_setting(monkeypatch
     finally:
         get_app_settings.cache_clear()
     assert captured["interactive"] is expected
+
+
+_ASK_STEP = {"step": "ask_user", "id": "ask:1", "prompt": "Which database?",
+             "options": [{"value": "pg"}, {"value": "my"}], "select": "one",
+             "allow_custom": True, "timeout_s": 300}
+
+
+def _retirements(events):
+    return [e for e in events if e.get("type") == "response.ask_user_answered"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["failed", "cancelled", "exception"])
+async def test_produce_remote_retires_an_open_question(monkeypatch, ending):
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    _fake_redis(monkeypatch, flag_set=False)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_step", _ASK_STEP
+        if ending == "failed":
+            yield "turn_failed", {"error": "RuntimeError: boom",
+                                  "code": "anton_error", "message": "An unexpected error occurred."}
+        elif ending == "cancelled":
+            yield "turn_failed", {"error": "cancelled"}   # the controller's own cancel literal
+        else:
+            raise RuntimeError("reply loop broke")
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_RecBuffer(),
+    )
+
+    events = saved["events"]
+    assert any(e.get("type") == "response.ask_user" for e in events)
+    assert _retirements(events) == [{
+        "type": "response.ask_user_answered", "question_id": "ask:1",
+        "status": "cancelled", "values": [], "text": "",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_does_not_retire_an_answered_question(monkeypatch):
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    _fake_redis(monkeypatch, flag_set=False)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_step", _ASK_STEP
+        yield "turn_step", {"step": "ask_user_answered", "id": "ask:1", "status": "answered",
+                            "values": ["pg"], "text": "", "answer_id": "a1"}
+        yield "turn_failed", {"error": "RuntimeError: boom",
+                              "code": "anton_error", "message": "An unexpected error occurred."}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_RecBuffer(),
+    )
+    assert [e["status"] for e in _retirements(saved["events"])] == ["answered"]
