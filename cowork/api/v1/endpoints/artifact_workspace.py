@@ -25,6 +25,7 @@ from cowork.common.paths import (
     dir_open,
     dir_scandir,
     open_pinned_child,
+    read_bounded,
 )
 from cowork.api.v1.artifact_scope import review_artifact_for_request
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
@@ -363,10 +364,7 @@ def _draft_stream(
     """
     def chunks():
         try:
-            remaining = size
-            while remaining > 0 and (chunk := os.read(fd, min(remaining, 1 << 16))):
-                remaining -= len(chunk)
-                yield chunk
+            yield from read_bounded(fd, size)
         finally:
             resources.close()
 
