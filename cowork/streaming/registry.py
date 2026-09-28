@@ -63,8 +63,8 @@ _MAX_TURN_IDLE_SECONDS = _idle_bound_seconds()
 _IDLE_POLL_SECONDS = 15
 
 # Bound on RunRegistry.shutdown()'s wait for in-flight turns to persist their
-# partial answer before the process exits. The host's own graceful-shutdown
-# timeout (uvicorn, Kubernetes) should stay above this to give it room to run.
+# partial answer before the process exits. The container's stop deadline must
+# cover Uvicorn's earlier request-drain budget (2s), this wait, and teardown.
 TURN_SHUTDOWN_GRACE_SECONDS = 5
 
 
@@ -92,6 +92,8 @@ class TurnLifecycle:
 
     discarded: bool = False
     shutting_down: bool = False
+    # Watchdog expiry is an interruption, separate from deliberate user Stop.
+    timed_out: bool = False
 
 
 @dataclass
@@ -192,8 +194,9 @@ class RunRegistry:
                     conversation_id, existing.turn_id,
                 )
                 return existing
+            lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
             task = asyncio.create_task(
-                self._run_bounded(producer_coro, buffer, conversation_id, turn_id),
+                self._run_bounded(producer_coro, buffer, conversation_id, turn_id, lifecycle),
                 name=f"turn[{conversation_id}/{turn_id}]",
             )
             handle = RunHandle(
@@ -206,20 +209,22 @@ class RunRegistry:
                 user_id=user_id,
                 # The SAME object the producer coroutine closed over, so
                 # discard() can tell it to drop the turn on the floor.
-                lifecycle=lifecycle if lifecycle is not None else TurnLifecycle(),
+                lifecycle=lifecycle,
             )
             self._by_cid[conversation_id] = handle
             return handle
 
     async def _run_bounded(
         self, producer_coro, buffer: StreamBuffer, conversation_id: str, turn_id: int,
+        lifecycle: TurnLifecycle,
     ) -> None:
         """Run a producer under the idle bound (see module comment).
 
-        On reap the producer is cancelled; its CancelledError handler seals the
-        buffer with a terminal record (the user-Stop path), so the tail ends and
-        the client releases its slot. An external cancel/discard cancels this
-        wrapper and ``await task`` forwards it into the producer, so
+        On reap the producer is marked interrupted before cancellation. Its
+        CancelledError handler persists a failure and seals the buffer, so a
+        stalled answer never looks like a deliberate user Stop. An external
+        cancel/discard cancels this wrapper and ``await task`` forwards it into
+        the producer, so
         ``RunHandle.cancel``/``discard`` still work; a producer that raises on
         its own propagates unchanged.
         """
@@ -242,6 +247,7 @@ class RunRegistry:
                         last_seq, last_progress = seq, loop.time()
                     elif loop.time() - last_progress >= _MAX_TURN_IDLE_SECONDS:
                         reaped = True
+                        lifecycle.timed_out = True
                         logger.warning(
                             "Turn for conversation %s (turn %d) made no progress for %ss; "
                             "producer cancelled and its buffer sealed.",
