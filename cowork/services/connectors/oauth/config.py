@@ -29,13 +29,10 @@ OAUTH_SERVICES: dict[str, OAuthServiceConfig] = {
     "github": OAuthServiceConfig(engine="github"),
     "supabase": OAuthServiceConfig(engine="supabase"),
     "posthog": OAuthServiceConfig(engine="posthog"),
-    # No `browser_oauth_builtin` method exists for hubspot (its method id is
-    # "mcp" — see hubspot.json), so `_oauth_config_for()` will find nothing
-    # and `start()`/`callback()` cleanly 500 if ever called for this service.
-    # Registered here anyway because `/credentials` is engine-keyed and
-    # shared by every connector, including HubSpot's Electron-native PKCE
-    # flow (see cowork's oauth-identity.ts / DataVaultFormPanel.jsx) — it
-    # still needs this app's client_id/secret even though it never goes
-    # through OAuthService.start()/.callback() to get them.
+    # HubSpot's method id is "mcp", not `browser_oauth_builtin`, so the local
+    # `_oauth_config_for()` finds nothing and `start()`/`callback()` 500 here.
+    # That path is unused: desktop runs PKCE in Electron and only needs
+    # `/credentials` (engine-keyed, hence this entry), while web forwards
+    # start/callback to auth in org mode, keyed by the spec's `service_id`.
     "hubspot": OAuthServiceConfig(engine="hubspot"),
 }

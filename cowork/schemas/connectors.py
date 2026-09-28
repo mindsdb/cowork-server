@@ -52,7 +52,8 @@ class OAuthConfig(BaseModel):
             raise ValueError("redirect_host must be a loopback hostname")
         return v
 
-    # Only set on the `browser_oauth_builtin` method — the service-id slug
+    # Set on the zero-field OAuth method (`browser_oauth_builtin`, or `mcp`
+    # for HubSpot) — the service-id slug
     # (e.g. "google-drive") used in the /connectors/oauth/{service}/... web
     # fallback routes. The engine name and this slug have already diverged
     # historically (e.g. engine google_analytics_4 -> service
