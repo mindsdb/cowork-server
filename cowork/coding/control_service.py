@@ -403,6 +403,40 @@ class ControlPlaneService:
             computer_id,
         )
 
+    def refresh_task_commands(self, task_id: str, project: CodeProject) -> CodeTask:
+        """Copy the project's current commands onto a task's frozen resource snapshot.
+
+        Only ``commands`` move. The resources a task may touch, and the paths,
+        branches and computers behind them, stay exactly as frozen at creation,
+        so adopting newer project settings can never widen a task's reach or
+        change the checkouts a recovered run resumes on. A resource the project
+        has since removed keeps the commands it was frozen with.
+        """
+
+        with self._lock:
+            task = self.store.get_task(task_id)
+            if task.execution_project is None:
+                raise ValueError("This task has no saved Code Project to update")
+            if task.project_id != project.id:
+                raise ValueError("That project does not belong to this task")
+            live = {resource.id: resource for resource in project.resources}
+            resources = [
+                resource.model_copy(update={
+                    "commands": [command.model_copy(deep=True) for command in live[resource.id].commands],
+                })
+                if resource.id in live
+                else resource
+                for resource in task.execution_project.resources
+            ]
+            # Re-validate rather than model_copy: the ``folders`` projection that
+            # command execution reads is rebuilt by the model validator only.
+            task.execution_project = CodeProject.model_validate({
+                **task.execution_project.model_dump(mode="python"),
+                "resources": resources,
+            })
+            task.updated_at = utc_now()
+            return self.store.save_task(task)
+
     def set_run_status(self, run_id: str, status: RunStatus, *, error: str | None = None) -> TaskRun:
         return self.store.update_run(run_id, lambda run: transition_run(run, status, error=error))
 
