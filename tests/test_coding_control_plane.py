@@ -401,6 +401,8 @@ def test_refreshing_task_commands_keeps_the_frozen_resource_scope(tmp_path: Path
     assert [(item.id, item.name) for item in task.execution_project.resources] == [("api", "API")]
     assert task.execution_project.resources[0].source_url == "https://github.com/example/api.git"
     assert [item.id for item in task.execution_project.resources[0].commands] == ["api-check", "api-serve"]
+    # Command execution reads the folders projection, so it must follow.
+    assert [item.id for item in task.execution_project.folders[0].commands] == ["api-check", "api-serve"]
     assert task.resource_scope.resource_ids == ["api"]
     stored = service.store.get_task(snapshot.task.id).execution_project
     assert stored is not None

@@ -428,7 +428,12 @@ class ControlPlaneService:
                 else resource
                 for resource in task.execution_project.resources
             ]
-            task.execution_project = task.execution_project.model_copy(update={"resources": resources})
+            # Re-validate rather than model_copy: the ``folders`` projection that
+            # command execution reads is rebuilt by the model validator only.
+            task.execution_project = CodeProject.model_validate({
+                **task.execution_project.model_dump(mode="python"),
+                "resources": resources,
+            })
             task.updated_at = utc_now()
             return self.store.save_task(task)
 
