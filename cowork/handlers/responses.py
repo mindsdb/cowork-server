@@ -1605,14 +1605,16 @@ class ResponsesHandler:
                 # Same reasoning as _run_turn's discarded branch — see there.
                 logger.info("[responses] discarded remote turn %s — not persisting", conv_id)
                 return
-            if lifecycle.shutting_down:
-                # Same reasoning as _run_turn's shutting_down branch — see there.
-                collected_events.append(
-                    response_failed_payload(INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE)
-                )
+            if lifecycle.shutting_down or lifecycle.timed_out:
+                collected_events.extend(cancelled_ask_user_retirements(collected_events))
+                collected_events.append(response_failed_payload(
+                    INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
+                ))
+                assistant_msg = persist()
                 await buffer.append("sse", {"sse": response_failed_sse(
-                    INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE)})
-                persist()
+                    INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
+                    assistant_message_id=_message_id_str(assistant_msg),
+                )})
                 await buffer.close("interrupted")
                 return
             # Partial text generated before cancellation is persisted.
@@ -1780,16 +1782,16 @@ class ResponsesHandler:
                 # truncation. So drop the turn entirely.
                 logger.info("[responses] discarded turn %s — not persisting", conv_id)
                 return
-            if lifecycle.shutting_down:
-                # The server is exiting, not the user's own Stop: unlike the
-                # plain cancel below, this must read as an interruption, same
-                # marker seal_orphan_turns_in_history writes after a hard crash.
-                collected_events.append(
-                    response_failed_payload(INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE)
-                )
+            if lifecycle.shutting_down or lifecycle.timed_out:
+                collected_events.extend(cancelled_ask_user_retirements(collected_events))
+                collected_events.append(response_failed_payload(
+                    INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
+                ))
+                assistant_msg = persist()
                 await buffer.append("sse", {"sse": response_failed_sse(
-                    INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE)})
-                persist()
+                    INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
+                    assistant_message_id=_message_id_str(assistant_msg),
+                )})
                 await buffer.close("interrupted")
                 return
             # Nothing special is emitted on cancellation.
@@ -2290,8 +2292,8 @@ async def sse_from_buffer(buffer, from_seq: int = 0) -> AsyncGenerator[str, None
     then live-tailing. Used by both the initial POST /responses stream
     (from_seq=0) and reconnects via GET /responses/tail. The terminal record
     ends the stream — the harness's own response.completed/failed frame was
-    already written as a normal record. A cancelled turn has no such frame, so
-    its terminal is turned into ``response.cancelled`` here.
+    already written as a normal record. User Stop has no such frame, so its
+    terminal is turned into ``response.cancelled`` here.
 
     Emits a comment heartbeat whenever the buffer has been quiet for
     ``SSE_KEEPALIVE_SECONDS``, so an intermediary cannot mistake a pending
@@ -2321,8 +2323,6 @@ async def sse_from_buffer(buffer, from_seq: int = 0) -> AsyncGenerator[str, None
             # Checked BEFORE prefetching: the terminal record ends the stream,
             # so scheduling another __anext__() here would only be cancelled.
             if rec.is_terminal:
-                # A cancel writes no frame of its own, and a bare close is what
-                # the client reads as a dropped connection.
                 if rec.data.get("reason") == "cancelled":
                     yield sse_frame("response.cancelled", {"type": "response.cancelled"})
                 return

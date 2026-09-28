@@ -98,7 +98,7 @@ def test_skips_a_turn_whose_reply_already_landed(svc, conv, session, tmp_path):
     # already correct, only the buffer file's terminal is missing.
     svc.save_user_message(conv.id, "hello", pending=True)
     svc.finalize_pending(conv.id)
-    svc.save_assistant_turn(conv.id, "already answered", [])
+    svc.save_assistant_turn(conv.id, "already answered", [{"type": "response.completed"}])
     _write_orphan_buffer(tmp_path, conv.id, 0, [DELTA.format("stale replay")])
 
     sealed = seal_orphan_turns_in_history(ScopedSession(session, SYSTEM_SCOPE), tmp_path)
@@ -153,19 +153,99 @@ def test_ignores_a_directory_that_is_not_a_conversation_id(session, tmp_path):
     assert seal_orphan_turns_in_history(ScopedSession(session, SYSTEM_SCOPE), tmp_path) == 0
 
 
-def test_must_run_before_seal_orphan_buffers_or_it_finds_nothing_to_seal(svc, conv, session, tmp_path):
-    # seal_orphan_buffers uses the same "no terminal record yet" signal.
-    # Running this after it means every buffer already looks cleanly closed
-    # and every turn is silently skipped — server.py must call this first.
+def test_retries_history_after_buffer_was_sealed(svc, conv, session, tmp_path):
     svc.save_user_message(conv.id, "hello", pending=True)
-    path = _write_orphan_buffer(tmp_path, conv.id, 0, [DELTA.format("Hi")])
-    seal_orphan_buffers(tmp_path)  # simulate the wrong order
+    _write_orphan_buffer(tmp_path, conv.id, 0, [DELTA.format("Hi")])
+    seal_orphan_buffers(tmp_path)
 
-    sealed = seal_orphan_turns_in_history(ScopedSession(session, SYSTEM_SCOPE), tmp_path)
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    assert seal_orphan_turns_in_history(scoped, tmp_path) == 1
+    assert seal_orphan_turns_in_history(scoped, tmp_path) == 0
+    assert svc.get_ordered_messages(conv.id)[1].content == "Hi"
 
-    assert sealed == 0
-    assert svc.get_ordered_messages(conv.id, include_pending=True)[0].pending is True
-    # Sanity: a fresh turn DOES seal when this runs first (the right order).
-    svc.save_user_message(conv.id, "second", pending=True)
-    _write_orphan_buffer(tmp_path, conv.id, 1, [DELTA.format("Hi")])
+
+@pytest.mark.parametrize("failure_at", ["read", "event_write"])
+def test_failed_history_recovery_retries_on_next_boot(
+    svc, conv, session, tmp_path, monkeypatch, failure_at,
+):
+    svc.save_user_message(conv.id, "hello", pending=True)
+    _write_orphan_buffer(tmp_path, conv.id, 0, [DELTA.format("survives")])
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    with monkeypatch.context() as patch:
+        if failure_at == "read":
+            def fail_read(*args, **kwargs):
+                raise RuntimeError("database unavailable")
+            patch.setattr(ConversationService, "get_ordered_messages", fail_read)
+        else:
+            original_add = scoped.add
+            def fail_event_write(row):
+                if isinstance(row, MessageEvent):
+                    raise RuntimeError("database write failed")
+                return original_add(row)
+            patch.setattr(scoped, "add", fail_event_write)
+        assert seal_orphan_turns_in_history(scoped, tmp_path) == 0
+        seal_orphan_buffers(tmp_path)
+
+    assert seal_orphan_turns_in_history(scoped, tmp_path) == 1
+    assert seal_orphan_turns_in_history(scoped, tmp_path) == 0
+    messages = svc.get_ordered_messages(conv.id)
+    assert [m.role for m in messages] == ["user", "assistant"]
+    assert messages[1].content == "survives"
+    assert _events_for(session, messages[1].id)[0].event_data["type"] == "response.failed"
+
+
+def test_assistant_and_terminal_event_commit_together(svc, conv, session, monkeypatch):
+    svc.save_user_message(conv.id, "hello", pending=True)
+    original_add = svc.session.add
+
+    def fail_event_write(row):
+        if isinstance(row, MessageEvent):
+            raise RuntimeError("killed between assistant and event writes")
+        return original_add(row)
+
+    monkeypatch.setattr(svc.session, "add", fail_event_write)
+    with pytest.raises(RuntimeError, match="killed between"):
+        svc.save_assistant_turn(conv.id, "partial", [{"type": "response.failed"}])
+    session.rollback()
+    # A fresh session sees committed state, not the failed transaction's objects.
+    with Session(session.get_bind()) as fresh:
+        messages = ConversationService(ScopedSession(fresh, SYSTEM_SCOPE)).get_ordered_messages(
+            conv.id, include_pending=True,
+        )
+        assert [m.role for m in messages] == ["user"]
+
+
+@pytest.mark.parametrize("completed_in_buffer", [False, True])
+def test_repairs_an_older_assistant_commit_missing_its_events(
+    svc, conv, session, tmp_path, completed_in_buffer,
+):
+    svc.save_user_message(conv.id, "hello", pending=True)
+    svc.save_assistant_turn(conv.id, "partial", [])
+    frames = [DELTA.format("partial")]
+    if completed_in_buffer:
+        frames.append('event: response.completed\ndata: {"type":"response.completed"}\n\n')
+    _write_orphan_buffer(tmp_path, conv.id, 0, frames)
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+
+    assert seal_orphan_turns_in_history(scoped, tmp_path) == 1
+    assert seal_orphan_turns_in_history(scoped, tmp_path) == 0
+    messages = svc.get_ordered_messages(conv.id)
+    assert [m.role for m in messages] == ["user", "assistant"]
+    events = _events_for(session, messages[1].id)
+    assert len(events) == 1
+    assert events[0].event_data["type"] == (
+        "response.completed" if completed_in_buffer else "response.failed"
+    )
+
+
+def test_does_not_attach_orphan_to_a_later_question(svc, conv, session, tmp_path):
+    first = svc.save_user_message(conv.id, "first", pending=True)
+    second = svc.save_user_message(conv.id, "second", pending=True)
+    _write_orphan_buffer(tmp_path, conv.id, 0, [DELTA.format("belongs to first")])
+    _write_orphan_buffer(tmp_path, conv.id, 1, [DELTA.format("belongs to second")])
+
     assert seal_orphan_turns_in_history(ScopedSession(session, SYSTEM_SCOPE), tmp_path) == 1
+    messages = svc.get_ordered_messages(conv.id, include_pending=True)
+    assert messages[0].id == first.id and messages[0].pending
+    assert messages[1].id == second.id and not messages[1].pending
+    assert messages[2].content == "belongs to second"

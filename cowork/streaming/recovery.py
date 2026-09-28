@@ -19,8 +19,8 @@ from cowork.streaming.records import TerminalReason, TurnRecord, now_iso
 logger = logging.getLogger(__name__)
 
 # Read only the last _TAIL_READ_BYTES of a buffer file to find its terminal
-# record, rather than replaying the whole thing — comfortably larger than any
-# single JSONL record here, so the true last line is always inside it.
+# record, rather than replaying the whole thing. Terminal records fit inside
+# this window; a normal SSE record may be larger and start outside it.
 _TAIL_READ_BYTES = 8192
 
 
@@ -46,8 +46,8 @@ def latest_terminal_reason(path: Path) -> TerminalReason | None:
         return None
     try:
         obj = json.loads(lines[-1])
-    except json.JSONDecodeError:
-        return None  # a half-written last line from a crash mid-write
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None  # partial JSON or a tail starting inside a UTF-8 character
     rec = TurnRecord(
         seq=int(obj.get("seq", -1)), ts=str(obj.get("ts", "")),
         type=str(obj.get("type", "")), data=dict(obj.get("data") or {}),
@@ -118,8 +118,9 @@ def seal_orphan_turns_in_history(session, streams_root: Path) -> int:
     """Write each crash-orphaned turn's streamed text into its conversation's
     history as an interrupted turn, so a reload shows it instead of nothing.
 
-    Idempotent: skipped once the assistant reply already landed. Independent
-    of `seal_orphan_buffers`, which seals the buffer file with the same check.
+    Idempotent: an existing reply must have a durable terminal event. Retry
+    restart/interrupted buffers too, so a failed DB write can recover on the
+    next boot even after the separate buffer sweep closes the replay stream.
     """
     from cowork.handlers.turn_errors import (
         GENERIC_TURN_ERROR_CODE,
@@ -143,49 +144,33 @@ def seal_orphan_turns_in_history(session, streams_root: Path) -> int:
             continue
         for path in conv_dir.glob("turn_*.jsonl"):
             try:
-                if latest_terminal_reason(path) is not None:
-                    continue  # already cleanly closed
+                if latest_terminal_reason(path) not in {None, "restart", "interrupted"}:
+                    continue  # completed, failed, or deliberately stopped
                 turn_id = int(path.stem.removeprefix("turn_"))
             except Exception:
                 logger.debug("Could not inspect %s for terminal", path, exc_info=True)
                 continue
             try:
-                # include_pending: this turn's own question row (if it made it
-                # to disk) is still pending at this point — it must count
-                # toward the idempotency check below, not be invisible to it.
-                messages = svc.get_ordered_messages(conversation_id, include_pending=True)
-            except ValueError:
-                continue  # conversation gone — nothing to seal
-            except Exception:
-                logger.exception("Could not load messages for conversation %s", conversation_id)
-                continue
-            if len(messages) > turn_id + 1:
-                continue  # the turn's assistant reply already landed
-            if len(messages) <= turn_id:
-                # The crash landed before even the pending question was
-                # committed — there's no row to attach an answer to.
-                logger.warning(
-                    "Turn %d for conversation %s has no question row; skipping history seal",
-                    turn_id, conversation_id,
-                )
-                continue
-            try:
                 collected: list[str] = []
+                terminal_event = None
                 for event_type, data in _read_buffer_events(path):
                     accumulate_answer_text(collected, event_type, data)
-                # Scoped to this turn's own row — an unscoped finalize_pending
-                # would also clear an unrelated pending row stranded by a
-                # different, unprocessed turn in the same conversation.
-                svc.finalize_pending(conversation_id, messages[turn_id].id)
-                conversation = svc.get_conversation(conversation_id)
-                svc.save_assistant_turn(
-                    conversation_id,
-                    "".join(collected),
-                    [response_failed_payload(INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE)],
-                    harness=conversation.harness,
+                    if event_type in {"response.completed", "response.failed"}:
+                        terminal_event = data
+                # A completed frame is evidence the entire answer was produced;
+                # otherwise an orphan must retain a visible interruption marker.
+                terminal_event = terminal_event or response_failed_payload(
+                    INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE,
                 )
-                sealed += 1
+                if svc.recover_interrupted_turn(
+                    conversation_id, turn_id, "".join(collected), terminal_event,
+                ):
+                    sealed += 1
+            except ValueError:
+                session.rollback()
+                continue  # conversation gone — nothing to seal
             except Exception:
+                session.rollback()
                 logger.exception(
                     "Could not seal orphan turn %d for conversation %s into history",
                     turn_id, conversation_id,
