@@ -122,6 +122,27 @@ def publish_url_for_endpoint(endpoint_url: str | None) -> str:
     if host.startswith("api.") and host.endswith(".mindshub.ai") and host != "api.mindshub.ai":
         return f"https://{host}"
     return PUBLISH_FAILSAFE_URL
+
+
+def is_mindshub_publish_url(publish_url: str | None) -> bool:
+    """True when `publish_url` is MindsHub's own publishing service.
+
+    Only MindsHub's service can run a full-stack artifact. A service an operator
+    points `ANTON_PUBLISH_URL` or the `publish_url` setting at, such as one a
+    customer built from the publishing specification, stores static bundles
+    only. Matches the hosts `publish_url_for_endpoint` can return: the MindsHub
+    api hosts (via `is_minds_host`) and the legacy `4nton.ai` host.
+    """
+    if is_minds_host(publish_url):
+        return True
+    try:
+        host = (urlparse(publish_url or "").hostname or "").lower()
+    except ValueError:
+        # `.hostname` raises on an unbalanced bracket; see `is_minds_host`.
+        return False
+    return host == urlparse(PUBLISH_FAILSAFE_URL).hostname
+
+
 # Gemini speaks OpenAI-compatible at Google's endpoint — NOT api.openai.com.
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
