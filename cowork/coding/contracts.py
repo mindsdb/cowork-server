@@ -8,6 +8,7 @@ from pydantic import BaseModel, Field, StringConstraints, field_validator, model
 
 from cowork.coding.redaction import redact_text, sanitize
 from cowork.coding.questions import PendingQuestion
+from cowork.coding.repository_setup_models import TaskRepositorySetup
 
 SCHEMA_VERSION = 1
 
@@ -514,6 +515,7 @@ class SessionCreateRequest(BaseModel):
     path: str | None = Field(default=None, min_length=1, max_length=32_768)
     project_id: str | None = Field(default=None, min_length=1, max_length=128)
     resource_ids: list[str] | None = Field(default=None, min_length=1, max_length=64)
+    repository_setup: TaskRepositorySetup | None = None
     computer_id: str | None = Field(default=None, min_length=1, max_length=128)
     prompt: str = Field(min_length=1, max_length=200_000)
     engine_id: str | None = Field(default=None, min_length=1, max_length=128)
@@ -534,6 +536,8 @@ class SessionCreateRequest(BaseModel):
     def require_workspace_source(self) -> SessionCreateRequest:
         if bool(self.path) == bool(self.project_id):
             raise ValueError("Choose exactly one Code Project or folder")
+        if self.repository_setup is not None and not self.project_id:
+            raise ValueError("Repository choices require a Code Project")
         return self
 
     @field_validator("resource_ids")

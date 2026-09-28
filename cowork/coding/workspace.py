@@ -131,6 +131,7 @@ class GitRunner:
         input_text: str | None = None,
         stdin: IO[bytes] | None = None,
         environment: dict[str, str] | None = None,
+        timeout: int = 120,
     ) -> subprocess.CompletedProcess[str]:
         if _org_mode():
             raise WorkspaceError("Local coding workspaces are not available on this deployment")
@@ -157,7 +158,7 @@ class GitRunner:
                 errors="replace",
                 capture_output=True,
                 check=False,
-                timeout=120,
+                timeout=timeout,
                 shell=False,
             )
         except FileNotFoundError as exc:
@@ -225,6 +226,8 @@ class WorkspaceManager:
         raw_path: str,
         allow_direct_folder: bool,
         base_branch: str | None = None,
+        *,
+        include_local_changes: bool = False,
     ) -> PreparedWorkspace:
         with self._mutation_lock:
             inspection = self.inspect(raw_path)
@@ -254,6 +257,14 @@ class WorkspaceManager:
                 raise WorkspaceError("A managed worktree already exists for this task")
             worktree.parent.mkdir(parents=True, exist_ok=True)
             self.git.run(repo, "worktree", "add", "--detach", str(worktree), revision)
+            if include_local_changes and inspection.dirty:
+                from cowork.coding.source_changes import copy_source_changes
+
+                try:
+                    copy_source_changes(self, repo, worktree, inspection.revision)
+                except Exception:
+                    self.git.run(repo, "worktree", "remove", "--force", str(worktree))
+                    raise
             return PreparedWorkspace(
                 source_path=repo,
                 workspace_path=worktree,
@@ -261,7 +272,7 @@ class WorkspaceManager:
                 repository_root=repo,
                 base_revision=revision,
                 source_dirty=inspection.dirty,
-                warning=inspection.warning,
+                warning=None if include_local_changes else inspection.warning,
             )
 
     def git_state(self, source_path: str, workspace_path: str) -> GitState:
@@ -512,7 +523,7 @@ class WorkspaceManager:
         with self._mutation_lock:
             root = Path(workspace_path)
             valid = self.git.run(root, "check-ref-format", "--branch", name, check=False)
-            if valid.returncode != 0:
+            if valid.returncode != 0 or valid.stdout.strip() != name:
                 raise WorkspaceError("Enter a valid Git branch name")
             self.git.run(root, "switch", "-c", name)
             return self.git_state(str(root), str(root))
@@ -521,10 +532,13 @@ class WorkspaceManager:
         """Resolve a validated branch name without allowing ref option injection."""
         root = Path(repository_root)
         valid = self.git.run(root, "check-ref-format", "--branch", name, check=False)
-        if valid.returncode != 0:
+        if valid.returncode != 0 or valid.stdout.strip() != name:
             return None
-        resolved = self.git.run(root, "rev-parse", "--verify", name, check=False)
-        return resolved.stdout.strip() if resolved.returncode == 0 else None
+        for prefix in ("refs/heads/", "refs/remotes/", "refs/remotes/origin/"):
+            resolved = self.git.run(root, "rev-parse", "--verify", f"{prefix}{name}^{{commit}}", check=False)
+            if resolved.returncode == 0:
+                return resolved.stdout.strip()
+        return None
 
     def commit(self, workspace_path: str, message: str) -> GitState:
         with self._mutation_lock:
@@ -798,10 +812,13 @@ class WorkspaceManager:
             return self.git.run(cwd, "apply", *flags, "--whitespace=nowarn", "-", check=check, stdin=handle)
 
     def _status_lines(self, root: Path) -> list[str]:
-        return [line for line in self.git.run(root, "status", "--porcelain=v1", "--untracked-files=all").stdout.splitlines() if line]
+        return [line for line in self.git.run(root, "status", "--porcelain=v1", "--untracked-files=all", environment={"GIT_OPTIONAL_LOCKS": "0"}).stdout.splitlines() if line]
+
+    def source_change_paths(self, root: Path) -> list[str]:
+        return [path for _, path in self._status_entries(root)]
 
     def _status_entries(self, root: Path) -> list[tuple[str, str]]:
-        raw = self.git.run(root, "status", "--porcelain=v1", "-z", "--untracked-files=all").stdout
+        raw = self.git.run(root, "status", "--porcelain=v1", "-z", "--untracked-files=all", environment={"GIT_OPTIONAL_LOCKS": "0"}).stdout
         parts = raw.split("\0")
         entries: list[tuple[str, str]] = []
         index = 0
