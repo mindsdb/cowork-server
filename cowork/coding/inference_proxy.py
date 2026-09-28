@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
@@ -24,6 +25,18 @@ TERMINAL_UPSTREAM_CODES = {
     403: "model_authentication_failed",
     404: "model_unavailable",
 }
+
+# MindsHub answers 429 for three different denials. An exhausted allowance or a
+# tripped free-serving fuse holds until a reset hours away, so retrying cannot
+# succeed and they fail terminally like the codes above. A velocity limit clears
+# within seconds, so the proxy waits out Retry-After itself: Codex's one
+# immediate retry would land inside the same window and fail the turn.
+TERMINAL_RATE_LIMIT_CODES = frozenset({"included_allowance_exhausted", "free_air_daily_spend_fuse_exceeded"})
+RATE_LIMIT_RETRIES = 3
+RATE_LIMIT_DEFAULT_WAIT_SECONDS = 2.0
+# Codex holds the request open while the proxy waits, so the total wait stays
+# well under its stream idle timeout.
+RATE_LIMIT_MAX_TOTAL_WAIT_SECONDS = 45.0
 
 
 def inference_url(minds_url: str, path: str, query: str = "") -> str:
@@ -63,9 +76,20 @@ def upstream_error_message(body: bytes) -> str:
     return text
 
 
-def terminal_rejection(status_code: int, body: bytes) -> tuple[str, bytes] | None:
+def upstream_error_code(body: bytes) -> str:
+    """Extract the machine-readable ``error.code`` from an upstream error body."""
+    try:
+        payload = json.loads(body[:MAX_REJECTION_BODY_BYTES])
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return ""
+    error = payload.get("error") if isinstance(payload, dict) else None
+    code = error.get("code") if isinstance(error, dict) else None
+    return code if isinstance(code, str) else ""
+
+
+def terminal_rejection(status_code: int, body: bytes, code: str | None = None) -> tuple[str, bytes] | None:
     """Return the (code, body) of a non-retryable 400 for a deterministic upstream rejection."""
-    code = TERMINAL_UPSTREAM_CODES.get(status_code)
+    code = code or TERMINAL_UPSTREAM_CODES.get(status_code)
     if code is None:
         return None
     payload = {
@@ -77,6 +101,15 @@ def terminal_rejection(status_code: int, body: bytes) -> tuple[str, bytes] | Non
         }
     }
     return code, json.dumps(payload, ensure_ascii=False).encode()
+
+
+def retry_after_seconds(value: str | None) -> float:
+    """Parse a delta-seconds Retry-After, falling back to a short default."""
+    try:
+        seconds = float(value) if value else RATE_LIMIT_DEFAULT_WAIT_SECONDS
+    except ValueError:
+        return RATE_LIMIT_DEFAULT_WAIT_SECONDS
+    return seconds if seconds >= 0 else RATE_LIMIT_DEFAULT_WAIT_SECONDS
 
 
 def inference_headers(request: Request, api_key: str) -> dict[str, str]:
@@ -115,45 +148,80 @@ async def proxy_inference(request: Request, path: str, credentials: EngineCreden
     body = inference_body(await read_inference_body(request))
     headers = {**inference_headers(request, credentials.minds_api_key), **trace_headers(request)}
     client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=None))
+    url = inference_url(credentials.minds_url, path, request.url.query)
     try:
-        upstream = await client.send(
-            client.build_request(
-                request.method,
-                inference_url(credentials.minds_url, path, request.url.query),
-                headers=headers,
-                content=body,
-            ),
-            stream=True,
-        )
-    except httpx.HTTPError as exc:
+        upstream = await _send_through_rate_limits(client, request.method, url, headers, body)
+    except BaseException:
+        # Cancellation while waiting out Retry-After lands here too.
         await client.aclose()
-        raise HTTPException(status_code=502, detail="MindsHub inference is unavailable") from exc
+        raise
+    if isinstance(upstream, Response):
+        await client.aclose()
+        return upstream
 
     async def close_upstream() -> None:
         await upstream.aclose()
         await client.aclose()
 
-    response_headers = {
-        name: value
-        for name in ("content-type", "retry-after", "x-mindshub-dropped-params", "x-request-id")
-        if (value := upstream.headers.get(name))
-    }
     if upstream.status_code in TERMINAL_UPSTREAM_CODES:
         try:
             raw = await _read_bounded(upstream, MAX_REJECTION_BODY_BYTES)
         finally:
             await close_upstream()
-        code, body = terminal_rejection(upstream.status_code, raw)
-        response_headers.pop("content-type", None)
-        response_headers["x-mindshub-error-code"] = code
-        response_headers["x-mindshub-upstream-status"] = str(upstream.status_code)
-        return Response(content=body, status_code=400, media_type="application/json", headers=response_headers)
+        return _terminal_response(upstream, raw)
     return StreamingResponse(
         upstream.aiter_bytes(),
         status_code=upstream.status_code,
-        headers=response_headers,
+        headers=_response_headers(upstream),
         background=BackgroundTask(close_upstream),
     )
+
+
+async def _send_through_rate_limits(
+    client: httpx.AsyncClient, method: str, url: str, headers: dict[str, str], body: bytes
+) -> httpx.Response | Response:
+    """Send, waiting out velocity 429s; returns the streaming upstream or a terminal 400."""
+    waited = 0.0
+    attempt = 0
+    while True:
+        try:
+            upstream = await client.send(client.build_request(method, url, headers=headers, content=body), stream=True)
+        except httpx.HTTPError as exc:
+            raise HTTPException(status_code=502, detail="MindsHub inference is unavailable") from exc
+        if upstream.status_code != 429:
+            return upstream
+        try:
+            raw = await _read_bounded(upstream, MAX_REJECTION_BODY_BYTES)
+        finally:
+            await upstream.aclose()
+        code = upstream_error_code(raw)
+        if code in TERMINAL_RATE_LIMIT_CODES:
+            return _terminal_response(upstream, raw, code)
+        wait = retry_after_seconds(upstream.headers.get("retry-after"))
+        if attempt == RATE_LIMIT_RETRIES or waited + wait > RATE_LIMIT_MAX_TOTAL_WAIT_SECONDS:
+            return _terminal_response(upstream, raw, "rate_limited")
+        attempt += 1
+        waited += wait
+        await asyncio.sleep(wait)
+
+
+def _response_headers(upstream: httpx.Response) -> dict[str, str]:
+    return {
+        name: value
+        for name in ("content-type", "retry-after", "x-mindshub-dropped-params", "x-mindshub-reset-at", "x-request-id")
+        if (value := upstream.headers.get(name))
+    }
+
+
+def _terminal_response(upstream: httpx.Response, raw: bytes, code: str | None = None) -> Response:
+    rejection = terminal_rejection(upstream.status_code, raw, code)
+    assert rejection is not None
+    code, body = rejection
+    headers = _response_headers(upstream)
+    headers.pop("content-type", None)
+    headers["x-mindshub-error-code"] = code
+    headers["x-mindshub-upstream-status"] = str(upstream.status_code)
+    return Response(content=body, status_code=400, media_type="application/json", headers=headers)
 
 
 async def _read_bounded(upstream: httpx.Response, limit: int) -> bytes:

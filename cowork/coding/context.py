@@ -154,12 +154,18 @@ FAILURE_MESSAGES = {
     ),
     "model_unavailable": "This model is not available to your account. Choose another model.",
     "model_upstream_unavailable": "The model service is temporarily unavailable. Try again in a moment.",
+    "rate_limited": "MindsHub is receiving requests from your organization too quickly. Wait a moment, then continue.",
+    "included_allowance_exhausted": "Your included allowance is used up. Add credits to continue now, or wait for it to refill.",
+    "free_air_daily_spend_fuse_exceeded": (
+        "Free MindsHub Air is paused until the daily budget resets. Add credits to continue now."
+    ),
 }
 
 _FAILURE_MARKERS = (
     ("insufficient_credits", ("402 payment required", "wallet has no balance", "insufficient credits")),
     ("model_authentication_failed", ("401 unauthorized", "403 forbidden", "invalid api key")),
     ("model_unavailable", ("404 not found: the model",)),
+    ("rate_limited", ("429 too many requests",)),
     (
         "model_upstream_unavailable",
         (
