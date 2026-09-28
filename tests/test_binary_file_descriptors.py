@@ -67,6 +67,15 @@ def test_dir_open_adds_o_binary(tmp_path, recorded_flags):
     assert _flags_for(recorded_flags, "data.csv") & SENTINEL
 
 
+def test_dir_open_without_a_directory_descriptor_adds_o_binary(tmp_path, recorded_flags):
+    """The ``d.fd is None`` branch is the one Windows runs (no ``dir_fd``)."""
+    (tmp_path / "data.csv").write_bytes(CSV_CRLF)
+
+    os.close(paths.dir_open(paths.PinnedDir(None, tmp_path), "data.csv", os.O_RDONLY))
+
+    assert _flags_for(recorded_flags, "data.csv") == os.O_RDONLY | SENTINEL
+
+
 def test_draft_file_open_is_binary(tmp_path, recorded_flags):
     project = tmp_path / "project"
     base = project / ".anton" / "artifacts"
