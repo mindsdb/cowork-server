@@ -15,6 +15,7 @@ from cowork.coding.contracts import (
 from cowork.coding.control_models import RuntimeCommand
 from cowork.coding.delivery import ProjectDeliveryService
 from cowork.coding.engines.base import EngineSession
+from cowork.coding.project_models import ProjectCommand
 from cowork.coding.project_workspaces import (
     PreparedProjectWorkspace,
     ProjectWorkspaceManager,
@@ -54,6 +55,7 @@ class RuntimeWorkspaceOperations:
             "branch": self._branch,
             "commit": self._commit,
             "validate": self._validate,
+            "refresh_project": self._refresh_project,
             "delivery_plan": self._delivery_plan,
             "push_branch": self._push_branch,
             "terminal_page": self._terminal_page,
@@ -152,6 +154,29 @@ class RuntimeWorkspaceOperations:
             self.prepared.ports,
         )
         return {"items": [asdict(item) for item in results]}
+
+    def _refresh_project(self, payload: dict[str, object]) -> dict[str, object]:
+        """Adopt commands the control plane copied onto the task after this lease began.
+
+        Only ``commands`` change. The prepared workspaces, and every other
+        fact about the leased project, stay as they were at lease time.
+        """
+
+        raw = payload.get("commands")
+        if not isinstance(raw, dict):
+            raise WorkspaceError("A project command refresh needs a commands map")
+        resources = []
+        updated = 0
+        for resource in self.project.resources:
+            items = raw.get(resource.id)
+            if isinstance(items, list):
+                resource = resource.model_copy(update={
+                    "commands": [ProjectCommand.model_validate(item) for item in items],
+                })
+                updated += 1
+            resources.append(resource)
+        self.project = self.project.model_copy(update={"resources": resources})
+        return {"resources": updated}
 
     def _delivery_plan(self, payload: dict[str, object]) -> dict[str, object]:
         raw_deliveries = payload.get("deliveries")
