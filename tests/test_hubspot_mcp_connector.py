@@ -24,7 +24,9 @@ from cowork.api.v1.endpoints.connectors.connections import (
 from cowork.api.v1.endpoints.connectors.oauth import McpIdentityRequest, _parse_mcp_identity
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.schemas.connectors import DirectSaveRequest
+from cowork.services.connectors.oauth.config import OAUTH_SERVICES
 from cowork.services.connectors.persist import persist_connection
+from cowork.services.connectors.specs._registry import ConnectorSpecRegistry
 from tests._fakes import FakeRequest
 
 ORG_SCOPE = TenantScope(org_mode=True, org_id="org-1", user_id="user-1")
@@ -359,6 +361,17 @@ class TestOAuthIsTheOnlyOfferedMethod:
         offered = [m for m in self._methods() if not m.get("hidden")]
         assert [m["id"] for m in offered] == ["mcp"]
         assert offered[0]["oauth"]["auth_url"].startswith("https://mcp.hubspot.com/")
+
+    def test_the_served_oauth_method_names_its_web_service(self):
+        """The web SPA can't run Electron's loopback PKCE, so it starts OAuth
+        via /connectors/oauth/{service_id}/start. Without a service_id the
+        connect button dead-ends in "isn't available on the web yet"."""
+        spec = ConnectorSpecRegistry().get_connector("hubspot")
+        by_id = {m.id: m for m in spec.form.methods}
+
+        service_id = by_id["mcp"].oauth.service_id
+        assert service_id == "hubspot"
+        assert service_id in OAUTH_SERVICES
 
     def test_the_private_app_token_method_is_retired_but_still_defined(self):
         by_id = {m["id"]: m for m in self._methods()}
