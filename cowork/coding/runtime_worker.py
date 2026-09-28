@@ -133,7 +133,7 @@ class CodeOnlyRuntime:
         prepared = (
             self.workspaces.restore(lease.task.id, lease.project, lease.workspaces)
             if lease.run.workspace_resume_mode == "restore" and can_restore
-            else self.workspaces.prepare(lease.task.id, lease.project)
+            else self.workspaces.prepare(lease.task.id, lease.project, lease.task.repository_setup)
         )
         self.client.event(lease, "workspace", {
             "items": [item.model_dump(mode="json") for item in prepared.workspaces],

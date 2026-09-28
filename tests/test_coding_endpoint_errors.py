@@ -93,7 +93,7 @@ LEVELS = SimpleNamespace(ids=["gemini"], efforts={"gemini": {"efforts": ["low", 
 
 def _settings_with(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(coding, "_settings", lambda _session, _scope: SimpleNamespace(minds_url="https://api.mindshub.ai/v1", coding_agent_model="gpt"))
-    monkeypatch.setattr(coding, "cached_minds_models", lambda _url: LEVELS)
+    monkeypatch.setattr(coding, "cached_minds_models", lambda _url, **_kw: LEVELS)
 
 
 def test_a_project_default_effort_its_model_lacks_is_refused_before_saving(monkeypatch: pytest.MonkeyPatch) -> None:

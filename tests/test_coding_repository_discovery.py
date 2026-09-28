@@ -15,8 +15,10 @@ from cowork.api.v1.endpoints import coding
 from cowork.coding.integrations import GitPushCredentials, local_repository_credentials
 from cowork.coding.project_models import CodeProject, ProjectConnection, RepositoryResource
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
+from cowork.coding.repository_setup_models import TaskRepositorySetup
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager
 from test_coding_integrations import public_resolver, service
+from test_coding_projects import git, repository
 
 FIELDS = {("github", "work"): {"access_token": "test-secret"}}
 REPOSITORY = {"full_name": "acme/private", "private": True, "default_branch": "staging", "archived": False}
@@ -173,11 +175,81 @@ def test_clone_and_refresh_receive_ephemeral_credentials_but_local_git_operation
     assert [args[0] for args, _ in calls][:2] == ["clone", "fetch"]
 
 
-def test_existing_local_checkout_does_not_need_connector_credentials(tmp_path):
+@pytest.mark.parametrize("require_local", [False, True])
+def test_existing_local_checkout_does_not_need_connector_credentials(tmp_path, require_local):
     resource = RepositoryResource(id="repo", name="Local", local_path=str(tmp_path), source_url="https://github.com/acme/private.git", connector_name="work")
     project = CodeProject(id="project", name="Project", resources=[resource])
     manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"), repository_credentials=lambda *_: pytest.fail("local checkout should not contact GitHub"))
-    assert manager._runtime_folder(resource, project).path == str(tmp_path)
+    assert manager._runtime_folder(resource, project, require_local=require_local).path == str(tmp_path)
+
+
+@pytest.mark.parametrize("include", [False, True])
+def test_missing_local_checkout_checks_local_changes_before_resolving_credentials(tmp_path, include):
+    resource = RepositoryResource(
+        id="repo", name="Private", local_path=str(tmp_path / "missing"),
+        source_url="https://github.com/acme/private.git", connector_name="work",
+    )
+    project = CodeProject(id="project", name="Project", resources=[resource])
+    resolve_credentials = Mock(side_effect=WorkspaceError("Connection unavailable"))
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "runtime"), repository_credentials=resolve_credentials)
+    manager.workspaces.git.run = Mock()
+
+    message = "local checkout.*unavailable" if include else "Connection unavailable"
+    with pytest.raises(WorkspaceError, match=message):
+        manager.prepare("task", project, TaskRepositorySetup(include_local_changes=include))
+    if include:
+        resolve_credentials.assert_not_called()
+    else:
+        resolve_credentials.assert_called_once_with(project, resource)
+    manager.workspaces.git.run.assert_not_called()
+
+
+def test_connected_repository_clone_and_refresh_support_task_branch_choices(tmp_path):
+    remote = repository(tmp_path, "remote")
+    git(remote, "checkout", "-b", "staging")
+    resource = RepositoryResource(
+        id="repo", name="Private", source_url=str(remote),
+        connector_name="work", default_branch="staging",
+    )
+    project = CodeProject(id="project", name="Project", resources=[resource])
+    credentials = GitPushCredentials(str(remote), {
+        "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "http.https://github.com/.extraHeader",
+        "GIT_CONFIG_VALUE_0": "Authorization: Bearer test-secret",
+    })
+    resolve_credentials = Mock(return_value=credentials)
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "runtime"), repository_credentials=resolve_credentials)
+    manager.workspaces.git.run = Mock(wraps=manager.workspaces.git.run)
+
+    first = manager.prepare("first", project, TaskRepositorySetup(branch="feat/first"))
+    cache = Path(first.primary.source_path)
+    (cache / "cache-only.txt").write_text("must not copy")
+    (remote / "new.txt").write_text("new commit")
+    git(remote, "add", ".")
+    git(remote, "commit", "-m", "Update staging")
+    second = manager.prepare(
+        "second", project, TaskRepositorySetup(branch="feat/second", include_local_changes=True),
+    )
+
+    for prepared, branch in [(first, "feat/first"), (second, "feat/second")]:
+        target = Path(prepared.primary.workspace_path)
+        assert git(target, "branch", "--show-current") == branch
+        assert prepared.primary.base_branch == "staging"
+        assert not (target / "cache-only.txt").exists()
+    assert not Path(first.primary.workspace_path, "new.txt").exists()
+    assert Path(second.primary.workspace_path, "new.txt").read_text() == "new commit"
+    assert git(remote, "branch", "--show-current") == "staging"
+    assert "test-secret" not in (cache / ".git/config").read_text()
+    assert resolve_credentials.call_count == 2
+    network_operations = []
+    for call in manager.workspaces.git.run.call_args_list:
+        environment = call.kwargs.get("environment")
+        if call.args[1] in {"clone", "fetch"}:
+            network_operations.append(call.args[1])
+            assert environment["GIT_CONFIG_VALUE_0"] == "Authorization: Bearer test-secret"
+            assert environment["GIT_CONFIG_VALUE_1"] == "false"
+        else:
+            assert not credentials.environment.keys() & (environment or {}).keys()
+    assert network_operations == ["clone", "fetch"]
 
 
 def test_manual_public_repository_does_not_inherit_a_projects_github_connection(tmp_path):
