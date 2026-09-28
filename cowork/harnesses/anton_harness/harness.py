@@ -24,6 +24,32 @@ from cowork.services.projects import display_label
 logger = get_logger(__name__)
 
 
+def _anton_mcp_wiring():
+    """anton's MCP wiring module, or ``None`` when the installed anton predates it.
+
+    cowork-server pins anton from a git branch, but its *published* floor
+    (``anton-agent>=2.26.8.23.1``) still resolves builds with no
+    ``anton.core.mcp`` package — the MCP client (ENG-1816) reaches anton's
+    ``main`` on its own release cadence, so there is a real window where a
+    perfectly valid dependency lacks it.
+
+    Importing it unconditionally turns that window into an ImportError on the
+    session-construction path, i.e. every turn fails, not just the MCP ones.
+    Same reasoning and same shape as ``services/providers.py``'s
+    ``router_provider`` gate and ``handlers/turn_errors.py``'s deliberate
+    refusal to import a type this repo can be deployed ahead of.
+    """
+    try:
+        from anton.core.mcp import wiring
+    except ImportError:
+        logger.info(
+            "Installed anton has no anton.core.mcp — MCP-based connectors are "
+            "inactive for this build; every other connector is unaffected."
+        )
+        return None
+    return wiring
+
+
 def _vault_scratch_dir() -> Path:
     """Where the temporary filtered data-vault directory is staged when a
     turn disables one or more connections (see ``_build_chat_session``).
@@ -1023,169 +1049,215 @@ class AntonHarness:
 
             restore_namespaced_env(data_vault)
 
-        # TODO: Add guidance for integrations
-
-        # Google Drive's google_drive connector uses the drive.file OAuth
-        # scope, which only covers files the app created itself, plus files
-        # the user explicitly granted access to via the Google Picker
-        # (persisted as a `_picked_files` vault field — see
-        # cowork/services/connectors/connections.py). A plain
-        # files.list()/files.search() call does NOT return the latter, so
-        # without calling them out by name here the agent has no way to
-        # know they're reachable at all — the scratchpad's env carries only the
-        # raw JSON, which isn't enough for the agent to notice or act on.
+        # HubSpot's MCP connector (ENG-487) and any future MCP-based one:
+        # discover tools BEFORE ChatSessionConfig/ChatSession exist — see
+        # anton/core/mcp/wiring.py's module docstring for why this can't
+        # happen after construction. Uses whichever data_vault was resolved
+        # above (filtered or source), so a connection disabled for this turn
+        # via `disabled_connections` is excluded here the same way its env
+        # vars already are. discover_mcp_tools_async itself skips every
+        # connection whose `_method` isn't "mcp" — safe to pass the full,
+        # unfiltered connection list for every other connector.
         #
-        # Parsing `_picked_files` and applying the project-scoping rule is
-        # connector logic, not agent logic, so it lives in
-        # ConnectionsService.picked_files_by_project().
-        integration_guidance = ""
-        picked_by_connection: dict[str, list[dict]] = {}
-        if data_vault is not None:
-            picked_by_connection = service.picked_files_by_project(data_vault, conversation.project.name)
+        # Capability-gated on the installed anton, the same way
+        # services/providers.py gates ENG-648's router kwargs: this repo's
+        # published floor (anton-agent>=2.26.8.23.1) still resolves builds
+        # that predate the MCP client, and promoting it to anton's `main` is
+        # a separate release step (ENG-1816). An unguarded import would turn
+        # that window into a failure on EVERY turn, not just MCP ones.
+        mcp_tool_defs: list = []
+        mcp_sessions: list = []
+        mcp_wiring = _anton_mcp_wiring() if data_vault is not None else None
+        if mcp_wiring is not None:
+            mcp_tool_defs, mcp_sessions = await mcp_wiring.discover_mcp_tools_async(
+                data_vault, data_vault.list_connections()
+            )
 
-            if picked_by_connection:
-                def _describe(f: dict, conn_name: str) -> str:
-                    line = f"- {f.get('name', 'untitled')} (id: {f.get('id')}, connection: {conn_name}"
-                    resource_key = f.get("resourceKey") or f.get("resource_key")
-                    if resource_key:
-                        line += f", resourceKey: {resource_key}"
-                    return line + ")"
+        try:
+            # TODO: Add guidance for integrations
 
-                picked_lines = [
-                    _describe(f, conn_name)
-                    for conn_name, files in picked_by_connection.items()
-                    for f in files
-                ]
-                integration_guidance = (
-                    "\n\nIMPORTANT — additional Google Drive files the user has explicitly granted "
-                    "access to via the Google Picker, which a plain files.list()/files.search() call "
-                    "will NOT return (the google_drive connector's scope only covers files this app "
-                    "created itself, plus these specifically granted ones):\n"
-                    + "\n".join(picked_lines)
-                    + "\nWhenever you list, search, or enumerate Drive files for the user, you MUST "
-                    "include every file above IN ADDITION to whatever files.list()/files.search() "
-                    "returns — do not report only the API call's results. To read one of these "
-                    "files' content, call files.get(fileId=...) directly with its id above; do not "
-                    "expect it to appear in a files.list() response first. If a file above has a "
-                    "resourceKey listed, you MUST send it or the call will fail with a 404 notFound "
-                    "even though access was actually granted — either add header "
-                    "'X-Goog-Drive-Resource-Keys: <id>/<resourceKey>' to the request, or pass "
-                    "resourceKey=<resourceKey> as a query parameter. Some of these files may live in "
-                    "a Shared Drive rather than the user's My Drive — Drive API calls silently return "
-                    "404 notFound for Shared Drive items unless you pass supportsAllDrives=true (and, "
-                    "for files.list()/files.search(), also includeItemsFromAllDrives=true). Always "
-                    "include both params on any Drive API call touching these files; they're no-ops "
-                    "for regular files, so there's no downside to always sending them. CRITICAL: when "
-                    "calling files.list()/files.search(), do NOT pass corpora='allDrives' — unlike "
-                    "supportsAllDrives/includeItemsFromAllDrives, that parameter is NOT properly scoped "
-                    "by this connector's restricted OAuth grant and will return files across the user's "
-                    "entire Google account that this app was never actually given access to. Omit "
-                    "corpora entirely (or use corpora='user') — combined with "
-                    "includeItemsFromAllDrives=true and supportsAllDrives=true, that already correctly "
-                    "surfaces every file this app can legitimately see, Shared Drive items included."
+            # Google Drive's google_drive connector uses the drive.file OAuth
+            # scope, which only covers files the app created itself, plus files
+            # the user explicitly granted access to via the Google Picker
+            # (persisted as a `_picked_files` vault field — see
+            # cowork/services/connectors/connections.py). A plain
+            # files.list()/files.search() call does NOT return the latter, so
+            # without calling them out by name here the agent has no way to
+            # know they're reachable at all — the scratchpad's env carries only the
+            # raw JSON, which isn't enough for the agent to notice or act on.
+            #
+            # Parsing `_picked_files` and applying the project-scoping rule is
+            # connector logic, not agent logic, so it lives in
+            # ConnectionsService.picked_files_by_project().
+            integration_guidance = ""
+            picked_by_connection: dict[str, list[dict]] = {}
+            if data_vault is not None:
+                picked_by_connection = service.picked_files_by_project(data_vault, conversation.project.name)
+
+                if picked_by_connection:
+                    def _describe(f: dict, conn_name: str) -> str:
+                        line = f"- {f.get('name', 'untitled')} (id: {f.get('id')}, connection: {conn_name}"
+                        resource_key = f.get("resourceKey") or f.get("resource_key")
+                        if resource_key:
+                            line += f", resourceKey: {resource_key}"
+                        return line + ")"
+
+                    picked_lines = [
+                        _describe(f, conn_name)
+                        for conn_name, files in picked_by_connection.items()
+                        for f in files
+                    ]
+                    integration_guidance = (
+                        "\n\nIMPORTANT — additional Google Drive files the user has explicitly granted "
+                        "access to via the Google Picker, which a plain files.list()/files.search() call "
+                        "will NOT return (the google_drive connector's scope only covers files this app "
+                        "created itself, plus these specifically granted ones):\n"
+                        + "\n".join(picked_lines)
+                        + "\nWhenever you list, search, or enumerate Drive files for the user, you MUST "
+                        "include every file above IN ADDITION to whatever files.list()/files.search() "
+                        "returns — do not report only the API call's results. To read one of these "
+                        "files' content, call files.get(fileId=...) directly with its id above; do not "
+                        "expect it to appear in a files.list() response first. If a file above has a "
+                        "resourceKey listed, you MUST send it or the call will fail with a 404 notFound "
+                        "even though access was actually granted — either add header "
+                        "'X-Goog-Drive-Resource-Keys: <id>/<resourceKey>' to the request, or pass "
+                        "resourceKey=<resourceKey> as a query parameter. Some of these files may live in "
+                        "a Shared Drive rather than the user's My Drive — Drive API calls silently return "
+                        "404 notFound for Shared Drive items unless you pass supportsAllDrives=true (and, "
+                        "for files.list()/files.search(), also includeItemsFromAllDrives=true). Always "
+                        "include both params on any Drive API call touching these files; they're no-ops "
+                        "for regular files, so there's no downside to always sending them. CRITICAL: when "
+                        "calling files.list()/files.search(), do NOT pass corpora='allDrives' — unlike "
+                        "supportsAllDrives/includeItemsFromAllDrives, that parameter is NOT properly scoped "
+                        "by this connector's restricted OAuth grant and will return files across the user's "
+                        "entire Google account that this app was never actually given access to. Omit "
+                        "corpora entirely (or use corpora='user') — combined with "
+                        "includeItemsFromAllDrives=true and supportsAllDrives=true, that already correctly "
+                        "surfaces every file this app can legitimately see, Shared Drive items included."
+                    )
+
+            # Canonical order (ConversationService._MESSAGE_ORDER: seq, role, id);
+            # the bare `conversation.messages`
+            # relationship is unordered and would scramble a turn's tool_use/tool_result
+            # block-rows. Ordering needs the DB session, so the conversation must be
+            # attached — callers always pass an attached instance; fail fast rather
+            # than silently fall back to a scrambled, replay-breaking history.
+            from sqlalchemy.orm import object_session
+            from cowork.db.scoped import adopt_scoped_session
+            from cowork.services.conversations import ConversationService
+
+            db_session = object_session(conversation)
+            if db_session is None:
+                raise RuntimeError(
+                    f"Conversation {conversation.id} is detached from its Session; "
+                    "cannot resolve ordered history for replay."
                 )
+            ordered_messages = ConversationService(
+                adopt_scoped_session(db_session)
+            ).get_ordered_messages(conversation.id)
 
-        # Canonical order (ConversationService._MESSAGE_ORDER: seq, role, id);
-        # the bare `conversation.messages`
-        # relationship is unordered and would scramble a turn's tool_use/tool_result
-        # block-rows. Ordering needs the DB session, so the conversation must be
-        # attached — callers always pass an attached instance; fail fast rather
-        # than silently fall back to a scrambled, replay-breaking history.
-        from sqlalchemy.orm import object_session
-        from cowork.db.scoped import adopt_scoped_session
-        from cowork.services.conversations import ConversationService
+            cells = extract_scratchpad_cells_from_message_events(ordered_messages)
+            os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
 
-        db_session = object_session(conversation)
-        if db_session is None:
-            raise RuntimeError(
-                f"Conversation {conversation.id} is detached from its Session; "
-                "cannot resolve ordered history for replay."
-            )
-        ordered_messages = ConversationService(
-            adopt_scoped_session(db_session)
-        ).get_ordered_messages(conversation.id)
+            replayable = [m for m in ordered_messages if m.role in {"user", "assistant"}]
+            # Replay [summary] + [messages after cutoff] instead of full history
+            # when a saved compaction is still valid (ENG-664). Disabled → plain
+            # full history and `seed_info = None`, which skips persistence too.
+            if user.history_compaction_enabled:
+                initial_history, seed_info = self._seed_history(
+                    replayable,
+                    conversation.history_summary,
+                    conversation.history_summary_cutoff_id,
+                    self._stamp_message,
+                )
+            else:
+                initial_history = [self._stamp_message(m) for m in replayable]
+                seed_info = None
 
-        cells = extract_scratchpad_cells_from_message_events(ordered_messages)
-        os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
-
-        replayable = [m for m in ordered_messages if m.role in {"user", "assistant"}]
-        # Replay [summary] + [messages after cutoff] instead of full history
-        # when a saved compaction is still valid (ENG-664). Disabled → plain
-        # full history and `seed_info = None`, which skips persistence too.
-        if user.history_compaction_enabled:
-            initial_history, seed_info = self._seed_history(
-                replayable,
-                conversation.history_summary,
-                conversation.history_summary_cutoff_id,
-                self._stamp_message,
-            )
-        else:
-            initial_history = [self._stamp_message(m) for m in replayable]
-            seed_info = None
-
-        config = ChatSessionConfig(
-            llm_client=llm_client,
-            settings=anton_settings,
-            self_awareness=self_awareness,
-            cortex=cortex,
-            # episodic=episodic,
-            system_prompt_context=SystemPromptContext(
-                runtime_context=build_runtime_context(anton_settings),
-                suffix=(
-                    _turn_style_context(channel_context)
-                    + f"{project_context}"
-                    + f"{output_context}"
-                    + f"{skill_output_context}"
-                    + f"{integration_guidance}"
+            config = ChatSessionConfig(
+                llm_client=llm_client,
+                settings=anton_settings,
+                self_awareness=self_awareness,
+                cortex=cortex,
+                # episodic=episodic,
+                system_prompt_context=SystemPromptContext(
+                    runtime_context=build_runtime_context(anton_settings),
+                    suffix=(
+                        _turn_style_context(channel_context)
+                        + f"{project_context}"
+                        + f"{output_context}"
+                        + f"{skill_output_context}"
+                        + f"{integration_guidance}"
+                    ),
                 ),
-            ),
-            workspace=workspace,
-            data_vault=data_vault,
-            **overlay_kwargs,
-            initial_history=initial_history,
-            # history_store=history_store,
-            session_id=str(conversation.id),
-            elicitor=build_elicitor(str(conversation.id)),
-            # Surfaced on langfuse traces (Langfuse-Tags / metadata) so calls
-            # are attributed to the active harness. self.id == "anton".
-            harness=self.id,
-            # WHERE the user is, which `harness` cannot say: this one server
-            # serves both the desktop sidecar and the multi-tenant web build,
-            # and both report harness="anton" (ENG-1459). Only the deployment
-            # knows which, so it is resolved here rather than by anton.
-            **surface_kwarg(ChatSessionConfig),
-            # WHO the user is, so anton keys `turn_completed` on the account
-            # rather than the machine (ENG-2121). Opaque ids from the held
-            # MindsHub JWT only; {} when there is none or the pinned anton
-            # predates the fields.
-            **account_kwargs(ChatSessionConfig),
-            proactive_dashboards=anton_settings.proactive_dashboards,
-            act_first=anton_settings.act_first,
-            # "Conversation started" stamp for the cache-stable prompt prefix
-            # (anton 2a). The live current time is rendered separately in the
-            # volatile tail, so resuming days later still reports the real "now".
-            started_at=conversation.created_at,
-            tools=[
-                CONNECT_DATASOURCE_TOOL,
-                PUBLISH_TOOL,
-                LOOKUP_CONNECTOR_TOOL,
-                REQUEST_CREDENTIALS_TOOL,
-                LABEL_CONNECTION_TOOL,
-                CREATE_SKILL_DRAFT_TOOL,
-                # FETCH_SUBMISSION_TOOL,
-                # UPDATE_FORM_TOOL,
-                *([RECALL_HISTORY_TOOL] if RECALL_HISTORY_TOOL else []),
-            ],
-            cells=cells
-        )
-        # Not `ChatSession(config)` directly: every construction of anton's
-        # executor inside cowork-server goes through build_chat_session, which
-        # refuses in org mode. stream_response already refuses earlier on this
-        # path, so this is the second of two gates rather than the only one,
-        # but keeping the construction uniform is what lets the static test
-        # (tests/test_no_subprocess_static.py) treat any other ChatSession(...)
-        # call under cowork/ as a new, unreviewed execution site.
-        return build_chat_session(config), temp_vault_dir, seed_info
+                workspace=workspace,
+                data_vault=data_vault,
+                **overlay_kwargs,
+                initial_history=initial_history,
+                # history_store=history_store,
+                session_id=str(conversation.id),
+                elicitor=build_elicitor(str(conversation.id)),
+                # Surfaced on langfuse traces (Langfuse-Tags / metadata) so calls
+                # are attributed to the active harness. self.id == "anton".
+                harness=self.id,
+                # WHERE the user is, which `harness` cannot say: this one server
+                # serves both the desktop sidecar and the multi-tenant web build,
+                # and both report harness="anton" (ENG-1459). Only the deployment
+                # knows which, so it is resolved here rather than by anton.
+                **surface_kwarg(ChatSessionConfig),
+                # WHO the user is, so anton keys `turn_completed` on the account
+                # rather than the machine (ENG-2121). Opaque ids from the held
+                # MindsHub JWT only; {} when there is none or the pinned anton
+                # predates the fields.
+                **account_kwargs(ChatSessionConfig),
+                proactive_dashboards=anton_settings.proactive_dashboards,
+                act_first=anton_settings.act_first,
+                # "Conversation started" stamp for the cache-stable prompt prefix
+                # (anton 2a). The live current time is rendered separately in the
+                # volatile tail, so resuming days later still reports the real "now".
+                started_at=conversation.created_at,
+                tools=[
+                    CONNECT_DATASOURCE_TOOL,
+                    PUBLISH_TOOL,
+                    LOOKUP_CONNECTOR_TOOL,
+                    REQUEST_CREDENTIALS_TOOL,
+                    LABEL_CONNECTION_TOOL,
+                    CREATE_SKILL_DRAFT_TOOL,
+                    # FETCH_SUBMISSION_TOOL,
+                    # UPDATE_FORM_TOOL,
+                    *([RECALL_HISTORY_TOOL] if RECALL_HISTORY_TOOL else []),
+                    *mcp_tool_defs,
+                ],
+                # Same gate as the discovery call above, not a second one:
+                # `ChatSessionConfig.mcp_sessions` and `anton.core.mcp` ship
+                # together (anton#478), so an anton without the wiring module
+                # also rejects this kwarg — passing it there is a TypeError
+                # that takes down every turn.
+                **({"mcp_sessions": mcp_sessions} if mcp_wiring is not None else {}),
+                cells=cells
+            )
+            # Not `ChatSession(config)` directly: every construction of anton's
+            # executor inside cowork-server goes through build_chat_session, which
+            # refuses in org mode. stream_response already refuses earlier on this
+            # path, so this is the second of two gates rather than the only one,
+            # but keeping the construction uniform is what lets the static test
+            # (tests/test_no_subprocess_static.py) treat any other ChatSession(...)
+            # call under cowork/ as a new, unreviewed execution site.
+            session = build_chat_session(config)
+            return session, temp_vault_dir, seed_info
+        except Exception:
+            # Mirrors anton's own build_cloud_chat_session fix (ENG-1816
+            # code review): ChatSession.close() is what closes mcp_sessions,
+            # so a failure ANYWHERE below MCP discovery — not just
+            # build_chat_session's own construction — would otherwise leak
+            # every MCP transport this turn opened (found in review: the
+            # original narrower try/except here missed object_session()/
+            # _seed_history() raising before build_chat_session is ever called).
+            # A non-empty mcp_sessions implies mcp_wiring resolved above, so
+            # no second import and no second capability check is needed here.
+            if mcp_sessions:
+                await mcp_wiring.close_mcp_sessions(mcp_sessions)
+            raise
 
     @staticmethod
     def _build_llm_client(effort: str | None = None, *, model: str | None = None):
