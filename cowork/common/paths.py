@@ -130,7 +130,7 @@ def open_fd(
     here, so bytes read and written through the descriptor match the bytes on
     disk on every platform.
     ``tests/test_binary_file_descriptors.py`` fails on a raw ``os.open``
-    outside this module.
+    outside the allowlisted directory opens.
     """
     return os.open(path, flags | O_BINARY, mode, dir_fd=dir_fd)
 
