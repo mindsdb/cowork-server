@@ -6,7 +6,7 @@ import shutil
 import tempfile
 
 from cowork.build_info import account_kwargs, supported_kwargs, surface_kwarg
-from cowork.common.chat_session import build_chat_session
+from cowork.common.chat_session import build_chat_session, close_session_scratchpads
 from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.logger import get_logger
 from cowork.common.paths import cowork_home, pod_local_only
@@ -552,6 +552,10 @@ class AntonHarness:
         finally:
             if temp_vault_dir:
                 shutil.rmtree(temp_vault_dir, ignore_errors=True)
+            if session is not None:
+                # Before the steps below, so none of them raising can skip it.
+                # Scheduled rather than awaited; see close_session_scratchpads.
+                close_session_scratchpads(session, owner=f"conversation {conv_id}")
             if session is not None and seed_info is not None:
                 # Best-effort — must never mask the turn's real outcome.
                 try:
