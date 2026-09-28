@@ -212,12 +212,13 @@ _DENIES_PRODUCT_RE = re.compile(
 # teaches the agent that tool exists. Two shapes reach here as text: a call the
 # endpoint failed to parse (local servers stream it as content), and a small
 # model describing its one visible tool. Whole word, because the paraphrases
-# vary far more than the name does; a false positive costs one hop.
+# vary far more than the name does; a false positive costs one hop. Only letters
+# and digits bound the name, so `delegate-tool` and `delegate_tool` still match.
 _TEXT_TOOL_CALL_MARKERS = (
     r"<tool_call>", r"<\|tool_call\|>", r"\[TOOL_CALLS\]", r"<function=", r"tool▁call▁begin",
 )
 _GATE_TOOL_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])%s(?![A-Za-z0-9_-])|%s"
+    r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])|%s"
     % (re.escape(_DELEGATE_TOOL["name"]), "|".join(_TEXT_TOOL_CALL_MARKERS)),
     re.IGNORECASE,
 )

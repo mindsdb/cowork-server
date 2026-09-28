@@ -1582,6 +1582,8 @@ _GATE_TOOL_ANSWERS = [
     "I have one tool available:\n\n- **delegate**: forwards the task to the assistant's backend.",
     "The only tool I can use is the delegate tool.",
     "Tools:\n- delegate: Delegate when a request requires the full agent.",
+    "I have one delegate-tool for handing work to the backend.",
+    "My only capability is delegate_tool, which hands work to the backend.",
 ]
 
 
