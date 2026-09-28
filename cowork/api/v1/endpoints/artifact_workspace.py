@@ -346,20 +346,26 @@ def _preview_html_from_fd(fd: int, *, comments: bool) -> HTMLResponse | None:
 def _draft_stream(
     resources: ExitStack,
     fd: int,
+    size: int,
     media_type: str,
     *,
     extra_headers: dict[str, str] | None = None,
 ):
-    """Stream bytes from the pinned descriptor and close every held handle.
+    """Stream at most *size* bytes from the pinned descriptor and close every
+    held handle.
 
     No ``Content-Length``: the agent may still be writing the file, and a
     length taken from ``fstat`` would then disagree with the bytes read, which
     the browser reports as ``ERR_CONTENT_LENGTH_MISMATCH`` (ENG-2950). Chunked
-    transfer sends exactly what the descriptor yields.
+    transfer sends exactly what the descriptor yields. *size* (the ``fstat``
+    size at authorization) still bounds the body, so a file that keeps growing
+    cannot keep the response open.
     """
     def chunks():
         try:
-            while chunk := os.read(fd, 1 << 16):
+            remaining = size
+            while remaining > 0 and (chunk := os.read(fd, min(remaining, 1 << 16))):
+                remaining -= len(chunk)
                 yield chunk
         finally:
             resources.close()
@@ -1235,7 +1241,7 @@ async def serve_private_draft(
 
     download = download or wants_download(request)
     media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
-    resources, fd, _file_stat = _open_pinned_draft_file(source, folder, parts)
+    resources, fd, file_stat = _open_pinned_draft_file(source, folder, parts)
     try:
         if not download and media_type == "text/html":
             resp = await run_in_threadpool(
@@ -1250,7 +1256,9 @@ async def serve_private_draft(
             {"Content-Disposition": _attachment_disposition(parts[-1])}
             if download else None
         )
-        return _draft_stream(resources, fd, media_type, extra_headers=extra)
+        return _draft_stream(
+            resources, fd, file_stat.st_size, media_type, extra_headers=extra,
+        )
     except BaseException:
         resources.close()
         raise

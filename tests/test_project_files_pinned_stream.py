@@ -46,7 +46,9 @@ async def test_body_is_the_file_bytes(tmp_path, payload):
     assert response.headers["cache-control"] == "private, max-age=300"
 
 
-async def test_declares_no_length_when_the_file_grows(tmp_path):
+async def test_stops_at_the_authorized_size_when_the_file_grows(tmp_path):
+    """Bytes appended after fstat are not sent: a file that keeps growing
+    cannot keep the response open (ENG-2950)."""
     base = _project(tmp_path)
     target = base / "data.csv"
     target.write_bytes(b"a,b\n1,2\n")
@@ -56,7 +58,7 @@ async def test_declares_no_length_when_the_file_grows(tmp_path):
         handle.write(b"3,4\n")
 
     assert "content-length" not in response.headers
-    assert await _body(response) == b"a,b\n1,2\n3,4\n"
+    assert await _body(response) == b"a,b\n1,2\n"
 
 
 async def test_declares_no_length_when_the_file_is_rewritten_shorter(tmp_path):

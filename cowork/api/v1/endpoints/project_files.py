@@ -1028,13 +1028,16 @@ def _pinned_stream(
     while it is read (an agent still writing it), and a length taken from
     `fstat` would then disagree with the bytes sent, which browsers report as
     `ERR_CONTENT_LENGTH_MISMATCH` (ENG-2950). Chunked transfer sends exactly
-    what the descriptor yields.
+    what the descriptor yields. The `fstat` size still bounds the body, so a
+    file that keeps growing cannot keep the response open.
     """
-    cm, fd, _st = _pinned_regular_file(target, base)
+    cm, fd, st = _pinned_regular_file(target, base)
 
     def _chunks():
         try:
-            while chunk := os.read(fd, 1 << 16):
+            remaining = st.st_size
+            while remaining > 0 and (chunk := os.read(fd, min(remaining, 1 << 16))):
+                remaining -= len(chunk)
                 yield chunk
         finally:
             cm.__exit__(None, None, None)

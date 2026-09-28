@@ -198,7 +198,7 @@ async def test_send_failure_before_iteration_closes_the_pinned_file(tmp_path):
     fd = os.open(path, os.O_RDONLY)
     resources = ExitStack()
     resources.callback(os.close, fd)
-    response = workspace_ep._draft_stream(resources, fd, "text/plain")
+    response = workspace_ep._draft_stream(resources, fd, 5, "text/plain")
 
     async def receive():
         return {"type": "http.disconnect"}
@@ -439,9 +439,12 @@ async def test_draft_body_is_the_file_bytes(tmp_path, monkeypatch, name, payload
     assert await _stream_body(response) == payload
 
 
-async def test_draft_declares_no_length_when_the_file_grows(tmp_path, monkeypatch):
-    """ENG-2950: a file appended to after fstat must not end up with a body
-    longer than a declared length."""
+async def test_draft_stops_at_the_authorized_size_when_the_file_grows(
+    tmp_path, monkeypatch
+):
+    """ENG-2950: bytes appended after fstat are not sent, so a file that keeps
+    growing cannot keep the response open. The body is the file as it was
+    when the request was authorized."""
     source, folder, metadata = _artifact(tmp_path, metadata={"type": "file"})
     served = folder / "data.csv"
     served.write_bytes(b"a,b\n1,2\n")
@@ -451,7 +454,7 @@ async def test_draft_declares_no_length_when_the_file_grows(tmp_path, monkeypatc
         handle.write(b"3,4\n")
 
     assert "content-length" not in response.headers
-    assert await _stream_body(response) == b"a,b\n1,2\n3,4\n"
+    assert await _stream_body(response) == b"a,b\n1,2\n"
 
 
 async def test_draft_declares_no_length_when_the_file_is_rewritten_shorter(
