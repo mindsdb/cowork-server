@@ -258,6 +258,21 @@ async def test_pad_closes_even_when_artifact_indexing_raises(turns, monkeypatch)
     await _assert_exits(turns.pads[0].proc, "the turn's scratchpad")
 
 
+async def test_every_pad_the_turn_started_closes(turns):
+    """`launch_backend` starts a slug pad in the same manager as "main", so a
+    turn can own several pads. A close that stopped only one leaks the rest."""
+
+    async def _starts_a_slug_pad():
+        await turns.sessions[-1]._scratchpads.get_or_create("dash")
+        return
+        yield
+
+    await _drain(turns.run(_starts_a_slug_pad))
+    assert [pad.name for pad in turns.pads] == ["main", "dash"]
+    for pad in turns.pads:
+        await _assert_exits(pad.proc, f"the turn's {pad.name!r} scratchpad")
+
+
 async def test_shutdown_drain_waits_for_a_scheduled_close(tmp_path):
     pads: list[_ChildPad] = []
     session = _Session(pads, _completes, tmp_path)
@@ -268,6 +283,75 @@ async def test_shutdown_drain_waits_for_a_scheduled_close(tmp_path):
         assert pads[0].proc.returncode is not None, "drain returned before the close finished"
     finally:
         await _kill_survivors([p.proc for p in pads])
+
+
+async def test_shutdown_drain_also_waits_for_a_close_queued_while_it_waits():
+    """A turn that finishes unwinding during the drain queues its close then."""
+    first_may_finish = asyncio.Event()
+    closed: list[str] = []
+
+    class _Manager:
+        def __init__(self, name: str, *, gate: asyncio.Event | None = None, delay: float = 0.0):
+            self.name, self.gate, self.delay = name, gate, delay
+
+        async def close_all(self):
+            if self.gate is not None:
+                await self.gate.wait()
+            await asyncio.sleep(self.delay)
+            closed.append(self.name)
+
+    close_session_scratchpads(SimpleNamespace(_scratchpads=_Manager("first", gate=first_may_finish)), owner="first")
+    drain = asyncio.create_task(drain_scratchpad_closes())
+    await asyncio.sleep(0)
+    close_session_scratchpads(SimpleNamespace(_scratchpads=_Manager("late", delay=0.2)), owner="late")
+    first_may_finish.set()
+    await drain
+    assert closed == ["first", "late"], "drain returned before the late close finished"
+
+
+async def test_shutdown_drain_warns_and_leaves_a_slow_close_running(caplog):
+    """Shutdown goes on to reap backends after this, so a slow close must not
+    make the drain raise, and the drain must not cancel it either."""
+    may_finish = asyncio.Event()
+    cancelled: list[bool] = []
+
+    class _SlowManager:
+        async def close_all(self):
+            try:
+                await may_finish.wait()
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+
+    with caplog.at_level(logging.WARNING, logger="cowork.common.chat_session"):
+        close_session_scratchpads(SimpleNamespace(_scratchpads=_SlowManager()), owner="slow")
+        await drain_scratchpad_closes(timeout=0.1)
+        assert not cancelled, "the drain cancelled a close it timed out on"
+        may_finish.set()
+        await drain_scratchpad_closes()
+
+    records = [
+        r for r in caplog.records
+        if r.name == "cowork.common.chat_session" and r.levelno == logging.WARNING
+    ]
+    assert [r.getMessage() for r in records] == ["1 scratchpad close(s) did not finish within 0.1s"]
+
+
+def test_the_lifespan_drains_closes_after_turns_unwind_and_before_backends_are_reaped():
+    """The turn drains queue each turn's close as it unwinds, so the close
+    drain has to follow them; backend and pool teardown follow it."""
+    from cowork import server
+
+    source = inspect.getsource(server.lifespan)
+    calls = [
+        "await registry.shutdown()",
+        "await drain_background_tasks()",
+        "await drain_scratchpad_closes()",
+        "shutdown_launched_backends()",
+    ]
+    positions = [source.find(call) for call in calls]
+    assert -1 not in positions, dict(zip(calls, positions))
+    assert positions == sorted(positions), dict(zip(calls, positions))
 
 
 async def test_a_failed_close_is_logged_not_raised(caplog):
@@ -289,11 +373,29 @@ async def test_a_failed_close_is_logged_not_raised(caplog):
     assert isinstance(records[0].exc_info[1], RuntimeError)
 
 
+async def test_a_session_without_scratchpads_is_logged(caplog):
+    """anton's ChatSession always sets `_scratchpads`, so a session without it
+    means an anton release renamed it. The desktop wheel installs anton outside
+    uv.lock, where the pin below never runs, so the skipped close has to show."""
+    with caplog.at_level(logging.WARNING, logger="cowork.common.chat_session"):
+        close_session_scratchpads(SimpleNamespace(), owner="conversation c-2")
+
+    records = [
+        r for r in caplog.records
+        if r.name == "cowork.common.chat_session" and r.levelno == logging.WARNING
+    ]
+    assert [r.getMessage() for r in records] == [
+        "Cannot close the scratchpads of conversation c-2: the session has no _scratchpads"
+    ]
+
+
 def test_the_close_reaches_the_manager_anton_itself_closes():
     """anton has no public pads-only close, so close_session_scratchpads reads
     the private `_scratchpads`. Pin that anton's own close() still closes pads
-    through it, so an anton upgrade that renames it fails here instead of
-    silently bringing the leak back."""
+    through it, so a locked anton bump that renames it fails here. The desktop
+    wheel installs anton outside uv.lock, where this never runs; there the
+    missing attribute logs a warning instead
+    (test_a_session_without_scratchpads_is_logged)."""
     from anton.core.session import ChatSession
 
     assert "self._scratchpads.close_all()" in inspect.getsource(ChatSession.close)
@@ -349,6 +451,13 @@ async def test_probe_closes_its_pad_after_a_timeout(probe_turns):
     verdict = events[-1][1]
     assert verdict.status == "failure" and "timed out" in verdict.error
     await _assert_exits(probe_turns.pads[0].proc, "the timed-out probe's scratchpad")
+
+
+async def test_probe_closes_its_pad_after_a_crash(probe_turns):
+    events = await _drain(probe_turns.run(_raises))
+    verdict = events[-1][1]
+    assert verdict.status == "failure" and "crashed" in verdict.error
+    await _assert_exits(probe_turns.pads[0].proc, "the crashed probe's scratchpad")
 
 
 # --- Against anton's real scratchpad runtime --------------------------------

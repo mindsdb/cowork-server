@@ -967,6 +967,11 @@ class AntonHarness:
             "Access to any files not attached to the conversation or located outside the project is strictly forbidden."
             "ALWAYS use the scratchpad to interact with files."
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
+            # Each turn's scratchpad processes are killed when the turn ends
+            # (close_session_scratchpads), with their whole process group.
+            " Processes and threads a scratchpad cell starts are stopped when your reply ends: "
+            "variables carry over to the next turn, running servers do not. "
+            "For a service that must keep running, build a full-stack artifact and start it with `launch_backend`."
             + attachment_context
         )
         output_context = (
