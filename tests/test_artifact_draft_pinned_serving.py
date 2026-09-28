@@ -107,7 +107,7 @@ async def test_file_swap_after_authorization_cannot_change_streamed_bytes(
     served.symlink_to(outside)
 
     assert await _stream_body(response) == b"authorized bytes"
-    assert response.headers["content-length"] == str(len("authorized bytes"))
+    assert "content-length" not in response.headers
     assert response.headers["cache-control"] == "private, no-store"
 
 
@@ -198,7 +198,7 @@ async def test_send_failure_before_iteration_closes_the_pinned_file(tmp_path):
     fd = os.open(path, os.O_RDONLY)
     resources = ExitStack()
     resources.callback(os.close, fd)
-    response = workspace_ep._draft_stream(resources, fd, 5, "text/plain")
+    response = workspace_ep._draft_stream(resources, fd, "text/plain")
 
     async def receive():
         return {"type": "http.disconnect"}
@@ -326,7 +326,7 @@ async def test_download_serves_a_binary_as_an_attachment(tmp_path, monkeypatch):
     # The preview's hardening headers are kept, not replaced.
     assert response.headers["x-content-type-options"] == "nosniff"
     assert response.headers["cache-control"] == "private, no-store"
-    assert response.headers["content-length"] == str(len(payload))
+    assert "content-length" not in response.headers
     assert await _stream_body(response) == payload
 
 
@@ -417,3 +417,72 @@ async def test_download_does_not_bypass_authorization(tmp_path, monkeypatch):
             SimpleNamespace(query_params={}), SimpleNamespace(), download=True,
         )
     assert excinfo.value.status_code == 404
+
+
+CSV_CRLF = b"id,name\r\n1,alpha\r\n2,beta\r\n"
+BINARY_WITH_EOF_MARK = b"PK\x03\x04\x1a\r\n\x00\x1a\n\xff"
+
+
+@pytest.mark.parametrize(
+    ("name", "payload"),
+    (("data.csv", CSV_CRLF), ("blob.bin", BINARY_WITH_EOF_MARK)),
+)
+async def test_draft_body_is_the_file_bytes(tmp_path, monkeypatch, name, payload):
+    """ENG-2950: the body is the file byte for byte. On Linux this guards the
+    body against future transformations; the Windows text-mode regression is
+    covered by tests/test_binary_file_descriptors.py."""
+    source, folder, metadata = _artifact(tmp_path, metadata={"type": "file"})
+    (folder / name).write_bytes(payload)
+
+    response = await _serve(monkeypatch, source, folder, metadata, name)
+
+    assert await _stream_body(response) == payload
+
+
+async def test_draft_declares_no_length_when_the_file_grows(tmp_path, monkeypatch):
+    """ENG-2950: a file appended to after fstat must not end up with a body
+    longer than a declared length."""
+    source, folder, metadata = _artifact(tmp_path, metadata={"type": "file"})
+    served = folder / "data.csv"
+    served.write_bytes(b"a,b\n1,2\n")
+    response = await _serve(monkeypatch, source, folder, metadata, "data.csv")
+
+    with served.open("ab") as handle:
+        handle.write(b"3,4\n")
+
+    assert "content-length" not in response.headers
+    assert await _stream_body(response) == b"a,b\n1,2\n3,4\n"
+
+
+async def test_draft_declares_no_length_when_the_file_is_rewritten_shorter(
+    tmp_path, monkeypatch
+):
+    """ENG-2950: ``to_csv`` truncates the same inode and rewrites it."""
+    source, folder, metadata = _artifact(tmp_path, metadata={"type": "file"})
+    served = folder / "data.csv"
+    served.write_bytes(b"a,b\n1,2\n3,4\n")
+    response = await _serve(monkeypatch, source, folder, metadata, "data.csv")
+
+    with served.open("r+b") as handle:
+        handle.truncate(0)
+        handle.write(b"a,b\n")
+
+    assert "content-length" not in response.headers
+    assert await _stream_body(response) == b"a,b\n"
+
+
+async def test_draft_keeps_the_old_bytes_when_the_file_is_replaced(
+    tmp_path, monkeypatch
+):
+    """An atomic rename leaves the pinned descriptor on the old inode."""
+    source, folder, metadata = _artifact(tmp_path, metadata={"type": "file"})
+    served = folder / "data.csv"
+    served.write_bytes(b"a,b\n1,2\n")
+    response = await _serve(monkeypatch, source, folder, metadata, "data.csv")
+
+    replacement = folder / ".data.csv.tmp"
+    replacement.write_bytes(b"new\n")
+    os.replace(replacement, served)
+
+    assert "content-length" not in response.headers
+    assert await _stream_body(response) == b"a,b\n1,2\n"
