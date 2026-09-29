@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 import time
@@ -578,6 +579,7 @@ def _cancellable_session(client) -> codex_module.CodexEngineSession:
     engine_session = object.__new__(codex_module.CodexEngineSession)
     engine_session._client = client
     engine_session._session_id = "session-1"
+    engine_session._catalog_resources = contextlib.ExitStack()
     engine_session._cancel_watchdogs = {}
     engine_session._cancel_lock = codex_module.threading.Lock()
     engine_session._goal_states = {}

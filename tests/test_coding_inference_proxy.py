@@ -56,6 +56,8 @@ def test_inference_headers_strip_codex_transport_headers() -> None:
             (b"accept", b"text/event-stream"),
             (b"content-type", b"application/json"),
             (b"x-codex-turn-metadata", b'{"turn_id":"turn-1"}'),
+            (b"originator", b"codex_mindshub_cowork"),
+            (b"authorization", b"Bearer scoped-token"),
         ]
     )
 
@@ -64,6 +66,7 @@ def test_inference_headers_strip_codex_transport_headers() -> None:
     assert headers == {
         "Authorization": "Bearer secret-key",
         "content-type": "application/json",
+        "originator": "codex_mindshub_cowork",
     }
 
 
