@@ -44,7 +44,7 @@ The runtime persists its computer identity and private token in its own mode-`06
 
 Before starting or resuming an app-server session, the Codex adapter fetches the native model catalog through the configured inference proxy using its scoped token. The request carries the SDK's `client_version` and `originator: codex_mindshub_cowork`; the proxy forwards the originator so inference returns native metadata rather than the model picker's OpenAI-compatible list.
 
-The adapter supplies a private, per-session catalog file through Codex's `model_catalog_json` startup override. It retains the file until the app-server closes and removes it on startup failure. Fetch failures, invalid catalog shapes, and missing selected models stop startup rather than silently using fallback metadata.
+The adapter supplies a private, per-session catalog file through Codex's `model_catalog_json` startup override. It retains the file until the app-server closes and removes it on startup failure. The whole fetch has a 15-second deadline, since httpx timeouts apply per read. Fetch failures, invalid catalog shapes, and a selected model that is missing or hidden (`visibility` other than `list`) stop startup rather than silently using fallback metadata.
 
 Upstream instructions, context windows, and reasoning capabilities remain intact. The adapter defaults missing `supports_parallel_tool_calls` to `false` for the pinned 0.147.0 runtime, which requires that field. The separate preventive auto-compaction limit remains unchanged.
 
