@@ -6,14 +6,22 @@ import shutil
 import socket
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+from cowork.coding import local_copy as local_copy_module
 from cowork.coding import workspace as workspace_module
 from cowork.coding.contracts import WorkspaceKind
-from cowork.coding.local_copy import LocalCopyError
-from cowork.coding.workspace import GitIdentityMissingError, GitRunner, GitUnavailableError, WorkspaceError, WorkspaceManager
+from cowork.coding.local_copy import CloneUnavailable, LocalCopyError
+from cowork.coding.workspace import (
+    GitIdentityMissingError,
+    GitRunner,
+    GitUnavailableError,
+    WorkspaceError,
+    WorkspaceManager,
+)
 from cowork.coding.workspace_key import managed_key
 from cowork.common.settings.app_settings import get_app_settings
 
@@ -517,6 +525,89 @@ def test_fork_and_cleanup_survive_a_socket_made_inside_the_task(tmp_path: Path) 
     assert not (recovery / "dev.sock").exists()
 
 
+def disable_clone(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Path, Path]]:
+    """Make every clone attempt report the filesystem as unable to clone."""
+    attempts: list[tuple[Path, Path]] = []
+
+    def unavailable(source: Path, target: Path) -> None:
+        attempts.append((source, target))
+        raise CloneUnavailable(45, "Operation not supported", str(source))
+
+    monkeypatch.setattr(local_copy_module, "_clone_tree", unavailable)
+    return attempts
+
+
+@pytest.mark.skipif(os.name == "nt", reason="sockets and FIFOs are POSIX")
+def test_a_local_copy_falls_back_to_a_byte_copy_when_the_filesystem_cannot_clone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "plain"
+    (source / "nested").mkdir(parents=True)
+    (source / "nested" / "notes.txt").write_text("v1\n", encoding="utf-8")
+    (source / "link").symlink_to("nested/notes.txt")
+    bind_socket(source / "cli.sock")
+    attempts = disable_clone(monkeypatch)
+    manager = WorkspaceManager(tmp_path / "coding")
+
+    prepared = manager.prepare("fallback-1", str(source), allow_direct_folder=True)
+    workspace = prepared.workspace_path
+    baseline = manager.local_copies.baselines_root / managed_key("fallback-1")
+
+    assert len(attempts) == 2
+    for root in (workspace, baseline):
+        assert (root / "nested" / "notes.txt").read_text(encoding="utf-8") == "v1\n"
+        assert os.readlink(root / "link") == "nested/notes.txt"
+        assert not (root / "cli.sock").exists()
+    assert manager.local_copies.diff(workspace) == []
+
+
+def test_a_failed_clone_leaves_no_partial_tree_behind_the_byte_copy(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "plain"
+    source.mkdir()
+    (source / "notes.txt").write_text("v1\n", encoding="utf-8")
+
+    def partial_clone(_source: Path, target: Path) -> None:
+        target.mkdir()
+        (target / "stale.txt").write_text("half-cloned\n", encoding="utf-8")
+        raise CloneUnavailable(28, "No space left on device", str(_source))
+
+    monkeypatch.setattr(local_copy_module, "_clone_tree", partial_clone)
+    manager = WorkspaceManager(tmp_path / "coding")
+
+    prepared = manager.prepare("partial-1", str(source), allow_direct_folder=True)
+
+    assert sorted(path.name for path in prepared.workspace_path.iterdir()) == ["notes.txt"]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="clonefile is macOS only")
+def test_a_local_copy_on_apfs_is_a_copy_on_write_clone(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    source = tmp_path / "plain"
+    source.mkdir()
+    (source / "notes.txt").write_text("v1\n", encoding="utf-8")
+    real_clone = local_copy_module._clone_tree
+    cloned: list[Path] = []
+
+    def spy(clone_source: Path, target: Path) -> None:
+        real_clone(clone_source, target)
+        cloned.append(target)
+
+    monkeypatch.setattr(local_copy_module, "_clone_tree", spy)
+    monkeypatch.setattr(shutil, "copytree", lambda *_args, **_kwargs: pytest.fail("byte copy used on APFS"))
+    manager = WorkspaceManager(tmp_path / "coding")
+
+    prepared = manager.prepare("clone-1", str(source), allow_direct_folder=True)
+    baseline = manager.local_copies.baselines_root / managed_key("clone-1")
+    (prepared.workspace_path / "notes.txt").write_text("v2\n", encoding="utf-8")
+
+    assert cloned == [baseline, prepared.workspace_path]
+    # Copy-on-write: a task edit never reaches the source or the baseline.
+    assert (source / "notes.txt").read_text(encoding="utf-8") == "v1\n"
+    assert (baseline / "notes.txt").read_text(encoding="utf-8") == "v1\n"
+    assert [item.path for item in manager.local_copies.diff(prepared.workspace_path)] == ["notes.txt"]
+
+
 @pytest.mark.parametrize("failure", ["collected", "immediate"])
 def test_a_local_copy_that_fails_reports_the_path_it_failed_on(
     failure: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -534,6 +625,7 @@ def test_a_local_copy_that_fails_reports_the_path_it_failed_on(
             raise shutil.Error([(target, "managed-destination", "[Errno 28] No space left on device")])
         raise FileNotFoundError(2, "No such file or directory", target)
 
+    disable_clone(monkeypatch)
     monkeypatch.setattr(shutil, "copytree", failing_copytree)
 
     with pytest.raises(WorkspaceError, match="notes.txt") as raised:
@@ -605,6 +697,7 @@ def test_a_copy_error_with_shredded_arguments_still_becomes_a_task_error(
         # SameFileError shreds its message into a list of single characters.
         raise shutil.Error(list("'/a/notes.txt' and '/b/notes.txt' are the same file"))
 
+    disable_clone(monkeypatch)
     monkeypatch.setattr(shutil, "copytree", failing_copytree)
 
     with pytest.raises(WorkspaceError):
