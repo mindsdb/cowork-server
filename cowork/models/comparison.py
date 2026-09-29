@@ -68,6 +68,13 @@ class ComparisonSide(BaseSQLModel, table=True):
         sa_type=sa.JSON,  # type: ignore
         description="Files copied into the sandbox from the source project, by relative path and SHA-256",
     )
+    #: The side's cost as last read from the gateway, so the history list can
+    #: show it without a gateway read per row. Written by the usage route.
+    usage_snapshot: dict | None = Field(
+        default=None,
+        sa_type=sa.JSON,  # type: ignore
+        description="Last-read estimated cost and tokens: estimated_cost_usd, tokens, partial",
+    )
     org_id: str | None = Field(default=None, max_length=36, description="Owning organization; NULL on local/desktop rows")
     created_by: str | None = Field(default=None, max_length=36, description="User who created the row; NULL on local/desktop rows")
 

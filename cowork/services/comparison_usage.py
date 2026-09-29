@@ -19,7 +19,8 @@ from __future__ import annotations
 import asyncio
 import bisect
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any, Optional
 from urllib.parse import quote
 
@@ -41,8 +42,28 @@ def _usage_url(conversation_id: str) -> str:
     return f"{default_turn_minds_api_host().rstrip('/')}/v1/usage/sessions/{quote(conversation_id, safe='')}"
 
 
-async def _gateway_usage(conversation_id: str, bearer_token: str) -> Optional[dict]:
-    """The gateway's usage payload for one conversation, or None on any failure."""
+def _clock_offset(response: httpx.Response, received_at: datetime) -> Optional[timedelta]:
+    """How far the gateway's clock is ahead of this machine's, from its `Date` header.
+
+    `Date` has whole seconds and is truncated, so this can read up to a second
+    low. That errs the safe way: turn starts shift a little early, never late,
+    so a turn's first call still lands in its own turn.
+    """
+    header = response.headers.get("date")
+    if not header:
+        return None
+    try:
+        gateway_now = parsedate_to_datetime(header)
+    except (TypeError, ValueError):
+        return None
+    if gateway_now.tzinfo is None:
+        gateway_now = gateway_now.replace(tzinfo=timezone.utc)
+    return gateway_now - received_at
+
+
+async def _gateway_usage(conversation_id: str, bearer_token: str) -> tuple[Optional[dict], Optional[timedelta]]:
+    """The gateway's usage payload for one conversation, or None on any failure,
+    and how far the gateway's clock is from this one's."""
 
     async def _fetch() -> httpx.Response:
         # No redirects: the bearer must not follow a redirect to another host.
@@ -53,15 +74,16 @@ async def _gateway_usage(conversation_id: str, bearer_token: str) -> Optional[di
         response = await asyncio.wait_for(_fetch(), _TIMEOUT_S)
     except Exception as exc:
         logger.debug("comparison usage read failed: %s", exc)
-        return None
+        return None, None
+    offset = _clock_offset(response, datetime.now(timezone.utc))
     if response.status_code != 200:
         logger.debug("comparison usage read returned HTTP %s", response.status_code)
-        return None
+        return None, offset
     try:
         payload = response.json()
     except ValueError:
-        return None
-    return payload if isinstance(payload, dict) and isinstance(payload.get("requests"), list) else None
+        return None, offset
+    return (payload if isinstance(payload, dict) and isinstance(payload.get("requests"), list) else None), offset
 
 
 def _as_utc(value: Any) -> Optional[datetime]:
@@ -80,7 +102,13 @@ def _count(value: Any) -> int:
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
 
-def side_usage(turn_starts: list[datetime], payload: Optional[dict], *, turn_limit: Optional[int] = None) -> SideUsage:
+def side_usage(
+    turn_starts: list[datetime],
+    payload: Optional[dict],
+    *,
+    turn_limit: Optional[int] = None,
+    clock_offset: Optional[timedelta] = None,
+) -> SideUsage:
     """File the gateway's calls under the side's turns.
 
     ``turn_starts`` are the side's user messages in order; a call belongs to the
@@ -88,8 +116,11 @@ def side_usage(turn_starts: list[datetime], payload: Optional[dict], *, turn_lim
     "at" matters: a turn's first call usually lands in the same second.
     ``turn_limit`` is how many turns the comparison owns (a continued side keeps
     going as a normal task); calls from the turns after it are left out.
+    ``clock_offset`` moves the turn starts onto the gateway's clock: on desktop
+    they come from the user's machine, which can run fast or slow.
     """
-    starts = sorted(t for t in (_as_utc(s) for s in turn_starts) if t is not None)
+    shift = clock_offset or timedelta(0)
+    starts = sorted(t + shift for t in (_as_utc(s) for s in turn_starts) if t is not None)
     if payload is None or not starts:
         return SideUsage(available=False)
     owned = starts if turn_limit is None else starts[:turn_limit]
@@ -135,10 +166,10 @@ async def comparison_usage(
     """Usage for each side: ``(label, conversation_id, turn_starts, turn_limit)``."""
     if not bearer_token:
         return ComparisonUsageResponse(sides={label: SideUsage(available=False) for label, *_ in sides})
-    payloads = await asyncio.gather(*(_gateway_usage(conversation_id, bearer_token) for _, conversation_id, _, _ in sides))
+    reads = await asyncio.gather(*(_gateway_usage(conversation_id, bearer_token) for _, conversation_id, _, _ in sides))
     return ComparisonUsageResponse(
         sides={
-            label: side_usage(starts, payload, turn_limit=limit)
-            for (label, _, starts, limit), payload in zip(sides, payloads)
+            label: side_usage(starts, payload, turn_limit=limit, clock_offset=offset)
+            for (label, _, starts, limit), (payload, offset) in zip(sides, reads)
         }
     )

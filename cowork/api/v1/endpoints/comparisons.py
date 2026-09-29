@@ -51,6 +51,7 @@ def _response(service: ComparisonService, comparison: Comparison) -> dict:
                 "turn_count": service.turn_count(side),
                 "continued_at": side.continued_at,
                 "continued_turn_count": side.continued_turn_count,
+                "usage": side.usage_snapshot,
             }
             for side in sorted(comparison.sides, key=lambda s: s.label)
         ],
@@ -67,10 +68,16 @@ def _get(service: ComparisonService, comparison_id: UUID) -> Comparison:
 
 
 @router.get("/")
-def list_comparisons(scoped: ScopedSessionDep, limit: int = 50):
+def list_comparisons(scoped: ScopedSessionDep, limit: int = 50, offset: int = 0):
     service = ComparisonService(scoped)
     limit = max(1, min(limit, 200))
-    return {"comparisons": [_response(service, c) for c in service.list_comparisons(limit=limit)]}
+    offset = max(0, offset)
+    # One past the page says whether there is another, without a count.
+    page = service.list_comparisons(limit=limit + 1, offset=offset)
+    return {
+        "comparisons": [_response(service, c) for c in page[:limit]],
+        "hasMore": len(page) > limit,
+    }
 
 
 @router.post("/", status_code=status.HTTP_201_CREATED)
@@ -109,6 +116,7 @@ async def get_comparison_usage(comparison_id: UUID, request: Request, scoped: Sc
         for side in sorted(comparison.sides, key=lambda s: s.label)
     ]
     usage = await comparison_usage(sides, bearer_token=hub_credential(request))
+    service.record_usage(comparison, usage.sides)
     return usage.model_dump(by_alias=True)
 
 

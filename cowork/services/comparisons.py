@@ -121,12 +121,26 @@ class ComparisonService:
             stmt = stmt.where(Comparison.created_by == self.session.scope.user_id)
         return stmt
 
-    def list_comparisons(self, limit: int = 50) -> list[Comparison]:
+    def list_comparisons(self, limit: int = 50, offset: int = 0) -> list[Comparison]:
         return list(
             self.session.exec(
-                self._own().order_by(Comparison.created_at.desc(), Comparison.id).limit(limit)
+                self._own().order_by(Comparison.created_at.desc(), Comparison.id).offset(offset).limit(limit)
             ).all()
         )
+
+    def record_usage(self, comparison: Comparison, usage: dict) -> None:
+        """Keep each side's cost as just read, for the history list."""
+        for side in comparison.sides:
+            read = usage.get(side.label)
+            if read is None or not read.available:
+                continue
+            side.usage_snapshot = {
+                "estimated_cost_usd": read.estimated_cost_usd,
+                "tokens": read.input_tokens + read.output_tokens + read.cached_input_tokens + read.cache_write_tokens,
+                "partial": bool(read.truncated or read.unpriced_calls),
+            }
+            self.session.add(side)
+        self.session.commit()
 
     def get_comparison(self, comparison_id: UUID) -> Comparison:
         comparison = self.session.exec(self._own().where(Comparison.id == comparison_id)).first()

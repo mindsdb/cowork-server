@@ -40,6 +40,15 @@ class ComparisonSideResponse(CamelResponse):
     turn_count: int
     continued_at: datetime | None = None
     continued_turn_count: int | None = None
+    #: The side's cost as last read, for the history list; None until it has been.
+    usage: "SideUsageSnapshot | None" = None
+
+
+class SideUsageSnapshot(CamelResponse):
+    estimated_cost_usd: float | None = None
+    tokens: int = 0
+    #: The figure leaves something out (unpriced calls, the gateway's cap).
+    partial: bool = False
 
 
 class ComparisonVerdictResponse(CamelResponse):
@@ -88,3 +97,6 @@ class SideUsage(CamelResponse):
 
 class ComparisonUsageResponse(CamelResponse):
     sides: dict[str, SideUsage]
+
+
+ComparisonSideResponse.model_rebuild()

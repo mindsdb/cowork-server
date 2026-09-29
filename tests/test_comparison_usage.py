@@ -94,6 +94,30 @@ def test_the_gateway_cap_marks_the_totals_as_a_floor():
     assert side_usage(_starts(0), {"requests": [_call(1)], "truncated": True}).truncated is True
 
 
+def test_a_fast_local_clock_is_corrected_before_calls_are_filed():
+    # The laptop runs 30 s fast: its turn starts read 30 s late against the
+    # gateway's timestamps. Uncorrected, the second turn's first calls would be
+    # filed under the first turn.
+    local_starts = _starts(30, 90)
+    payload = {"requests": [_call(1, 0.1), _call(61, 0.2), _call(75, 0.3)]}
+
+    assert [t.estimated_cost_usd for t in side_usage(local_starts, payload).turns] == pytest.approx([0.6, None])
+    corrected = side_usage(local_starts, payload, clock_offset=timedelta(seconds=-30))
+    assert [t.estimated_cost_usd for t in corrected.turns] == pytest.approx([0.1, 0.5])
+
+
+def test_the_gateway_clock_is_read_from_its_date_header():
+    from email.utils import format_datetime
+
+    from cowork.services.comparison_usage import _clock_offset
+
+    received = datetime(2026, 9, 29, 12, 0, 30, tzinfo=timezone.utc)
+    gateway_now = format_datetime(datetime(2026, 9, 29, 12, 0, 0, tzinfo=timezone.utc), usegmt=True)
+    assert _clock_offset(httpx.Response(200, headers={"date": gateway_now}), received) == timedelta(seconds=-30)
+    assert _clock_offset(httpx.Response(200), received) is None
+    assert _clock_offset(httpx.Response(200, headers={"date": "not a date"}), received) is None
+
+
 # ── The route ──────────────────────────────────────────────────────────────
 
 
@@ -220,3 +244,69 @@ def test_without_a_hub_credential_nothing_is_sent(client, gateway):
 
 def test_an_unknown_comparison_is_not_found(client, gateway):
     assert client.get("/api/v1/comparisons/00000000-0000-0000-0000-000000000000/usage").status_code == 404
+
+
+def test_the_route_corrects_for_the_local_clock(client, gateway):
+    from email.utils import format_datetime
+
+    comparison = _comparison(client)
+    side_a = comparison["sides"][0]
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    # Messages carry this machine's clock, which runs 30 s ahead of the gateway.
+    _user_turn(side_a["conversationId"], 1, now - timedelta(seconds=90))
+    _user_turn(side_a["conversationId"], 2, now - timedelta(seconds=30))
+    gateway_clock = lambda seconds_ago: (now - timedelta(seconds=30 + seconds_ago)).isoformat()
+
+    def respond(request):
+        calls = [
+            {**_call(0, 0.1), "timestamp": gateway_clock(89)},
+            {**_call(0, 0.2), "timestamp": gateway_clock(29)},
+        ]
+        date = format_datetime(now - timedelta(seconds=30), usegmt=True)
+        return httpx.Response(200, json={"requests": calls}, headers={"date": date})
+
+    gateway["respond"] = respond
+    resp = client.get(
+        f"/api/v1/comparisons/{comparison['id']}/usage", headers={"X-MindsHub-Authorization": "Bearer caller-jwt"}
+    )
+
+    assert [t["estimatedCostUsd"] for t in resp.json()["sides"]["a"]["turns"]] == pytest.approx([0.1, 0.2])
+
+
+def test_the_history_shows_the_cost_last_read_and_keeps_it_when_a_read_fails(client, gateway):
+    comparison = _comparison(client)
+    for side in comparison["sides"]:
+        _user_turn(side["conversationId"], 1, T0)
+    headers = {"X-MindsHub-Authorization": "Bearer caller-jwt"}
+    gateway["respond"] = lambda r: httpx.Response(200, json={"requests": [_call(1, 0.25, input=1000, output=50)]})
+    client.get(f"/api/v1/comparisons/{comparison['id']}/usage", headers=headers)
+
+    gateway["respond"] = lambda r: httpx.Response(500)
+    client.get(f"/api/v1/comparisons/{comparison['id']}/usage", headers=headers)
+
+    listed = next(c for c in _all_comparisons(client) if c["id"] == comparison["id"])
+    assert [s["usage"] for s in listed["sides"]] == [{"estimatedCostUsd": 0.25, "tokens": 1050, "partial": False}] * 2
+
+
+def _all_comparisons(client, limit=2, max_pages=500):
+    seen, offset = [], 0
+    for _ in range(max_pages):
+        page = client.get("/api/v1/comparisons/", params={"limit": limit, "offset": offset}).json()
+        assert len(page["comparisons"]) <= limit
+        seen += page["comparisons"]
+        if not page["hasMore"]:
+            return seen
+        offset += limit
+    raise AssertionError("the history never ran out of pages")
+
+
+def test_the_history_pages_past_its_limit(client):
+    ids = {_comparison(client)["id"] for _ in range(3)}
+
+    first = client.get("/api/v1/comparisons/", params={"limit": 2}).json()
+    everything = _all_comparisons(client)
+
+    assert first["hasMore"] is True
+    listed = [c["id"] for c in everything]
+    # Every comparison once, however many pages it takes.
+    assert ids <= set(listed) and len(listed) == len(set(listed))
