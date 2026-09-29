@@ -330,6 +330,33 @@ class AnswerRequest(BaseModel):
     skipped: bool | None = None
 
 
+# Response per answer outcome, shared by the in-process broker (SubmitResult)
+# and the remote pod path (RemoteAnswerResult); both enums use these values.
+_ANSWER_RESPONSES: dict[str, tuple[int, dict]] = {
+    "not_found": (404, {"status": "not_found"}),
+    "already_answered": (409, {"accepted": False, "status": "already_answered"}),
+    "invalid_option": (400, {"status": "invalid_option"}),
+    "too_large": (400, {"status": "answer_too_large"}),
+}
+
+
+def _answer_response(result: SubmitResult | RemoteAnswerResult):
+    # Exhaustive on purpose, with a raising default: callers settle
+    # authorization before this runs, so the cost of a fall-through is not an
+    # access-control hole but a desynchronised UI — a new result member
+    # answered as 200 {"accepted": true} while the
+    # future stayed unresolved, so the card would render as delivered and the
+    # turn would hang to its 300 s timeout. A 500 is the right direction for
+    # "the server does not understand its own state".
+    value = getattr(result, "value", None)
+    if value == "accepted":
+        return {"accepted": True}
+    if value not in _ANSWER_RESPONSES:
+        raise AssertionError(f"unhandled answer result: {result}")
+    status_code, content = _ANSWER_RESPONSES[value]
+    return JSONResponse(status_code=status_code, content=content)
+
+
 @router.post("/answer", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
     """Deliver the user's answer to a question a turn is blocked on.
@@ -388,43 +415,9 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
             question_id=req.question_id,
             payload=payload,
         )
-        match remote_result:
-            case RemoteAnswerResult.ACCEPTED:
-                return {"accepted": True}
-            case RemoteAnswerResult.NOT_FOUND:
-                return JSONResponse(status_code=404, content={"status": "not_found"})
-            case RemoteAnswerResult.ALREADY_ANSWERED:
-                return JSONResponse(
-                    status_code=409, content={"accepted": False, "status": "already_answered"}
-                )
-            case RemoteAnswerResult.INVALID_OPTION:
-                return JSONResponse(status_code=400, content={"status": "invalid_option"})
-            case RemoteAnswerResult.TOO_LARGE:
-                return JSONResponse(status_code=400, content={"status": "answer_too_large"})
-            case _:
-                raise AssertionError(f"unhandled RemoteAnswerResult: {remote_result}")
+        return _answer_response(remote_result)
 
-    # Exhaustive on purpose, with a raising default: authorization is already
-    # settled by here (:_authorized_handle above), so the cost of a fall-through
-    # is not an access-control hole but a desynchronised UI — a new
-    # SubmitResult member would answer 200 {"accepted": true} while the
-    # future stayed unresolved, so the card would render as delivered and the
-    # turn would hang to its 300 s timeout. A 500 is the right direction for
-    # "the server does not understand its own state".
-    result = broker.submit(req.conversation_id, req.question_id, payload)
-    match result:
-        case SubmitResult.ACCEPTED:
-            return {"accepted": True}
-        case SubmitResult.NOT_FOUND:
-            return JSONResponse(status_code=404, content={"status": "not_found"})
-        case SubmitResult.ALREADY_ANSWERED:
-            return JSONResponse(
-                status_code=409, content={"accepted": False, "status": "already_answered"}
-            )
-        case SubmitResult.INVALID_OPTION:
-            return JSONResponse(status_code=400, content={"status": "invalid_option"})
-        case _:
-            raise AssertionError(f"unhandled SubmitResult: {result}")
+    return _answer_response(broker.submit(req.conversation_id, req.question_id, payload))
 
 
 @router.get("/tail", dependencies=[Depends(require(AuthenticatedInOrgMode))])

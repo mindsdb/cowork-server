@@ -33,6 +33,9 @@ ANSWER_TTL_S = 60
 #: (its own MAX_ANSWER_BYTES); past that /answer would wait the full ack
 #: timeout for a verdict that never comes. Reject it here instead.
 MAX_ANSWER_BYTES = 64 * 1024
+#: Upper bound on the bytes the controller's re-wrap adds to an entry
+#: ("kind":"answer", fields it defaults, the trailing newline).
+_WRAP_HEADROOM_BYTES = 256
 _TERMINAL = frozenset({"turn_completed", "turn_failed"})
 #: The scan stops at this turn's latest reply and skips other turns'. Turns on
 #: one conversation are serialised by the controller, so at most one later turn
@@ -93,30 +96,16 @@ async def submit_remote_answer(
 
     answer_id = uuid.uuid4().hex
     key = answer_queue_key(correlation_id)
-    # ensure_ascii=False: the default escapes every non-ASCII character to
-    # \uXXXX, which can inflate a short non-Latin answer well past the raw
-    # UTF-8 size the controller actually measures against MAX_ANSWER_BYTES.
-    entry = json.dumps({"question_id": question_id, "answer_id": answer_id, **payload}, ensure_ascii=False)
-    # The raw entry above is what we push, but scratchpad-controller checks its
-    # own re-wrapped stdin line against MAX_ANSWER_BYTES instead (answer_line in
-    # scratchpad_controller/answers.py): {"kind": "answer", question_id,
-    # answer_id, values, text, skipped} with compact separators and the same
-    # defaults it fills in for missing keys. An entry just under our limit but
-    # over the wrapped one would pass here and be silently dropped there, so we
-    # size-check that same wrapped line and still queue the original entry.
-    wrapped = json.dumps(
-        {
-            "kind": "answer",
-            "question_id": question_id,
-            "answer_id": answer_id,
-            "values": payload.get("values", []),
-            "text": payload.get("text", ""),
-            "skipped": payload.get("skipped", False),
-        },
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ) + "\n"
-    if len(wrapped.encode("utf-8")) > MAX_ANSWER_BYTES:
+    # Compact and ensure_ascii=False, so the size here tracks the raw UTF-8
+    # size the controller measures (the default \uXXXX escaping inflates
+    # non-Latin text). The headroom covers what the controller adds when it
+    # re-wraps the entry as the pod's stdin line, so an entry accepted here is
+    # never silently dropped there.
+    entry = json.dumps(
+        {"question_id": question_id, "answer_id": answer_id, **payload},
+        separators=(",", ":"), ensure_ascii=False,
+    )
+    if len(entry.encode("utf-8")) + _WRAP_HEADROOM_BYTES > MAX_ANSWER_BYTES:
         return RemoteAnswerResult.TOO_LARGE
     async with r.pipeline(transaction=True) as pipe:
         pipe.rpush(key, entry)
