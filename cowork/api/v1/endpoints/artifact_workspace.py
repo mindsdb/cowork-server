@@ -9,7 +9,7 @@ import os
 import stat
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import quote
 from uuid import UUID
 
@@ -18,13 +18,14 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
-from cowork.api.v1.artifact_preview import wants_comment_layer
+from cowork.api.v1.artifact_preview import wants_comment_layer, wants_download
 from cowork.common.paths import (
     O_NOFOLLOW,
     dir_lstat,
     dir_open,
     dir_scandir,
     open_pinned_child,
+    read_bounded,
 )
 from cowork.api.v1.artifact_scope import review_artifact_for_request
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
@@ -34,7 +35,7 @@ from cowork.services.artifact_permissions import (
     artifact_capabilities,
     require_artifact_owner,
 )
-from cowork.services.comments_layer import inject_layer
+from cowork.services.preview_html import prepare_preview_html
 from cowork.services.artifact_identity import opened_artifact_folder
 from cowork.services.artifact_revisions import (
     JOURNAL_DIRNAME,
@@ -321,8 +322,8 @@ def _recorded_source_selector(source, folder: Path, metadata: dict) -> str | Non
         return None
 
 
-def _comment_layer_from_fd(fd: int) -> HTMLResponse | None:
-    """Build the review HTML from the already-authorized file descriptor."""
+def _preview_html_from_fd(fd: int, *, comments: bool) -> HTMLResponse | None:
+    """Build the preview HTML from the already-authorized file descriptor."""
     payload = bytearray()
     try:
         while chunk := os.read(fd, 1 << 16):
@@ -338,7 +339,9 @@ def _comment_layer_from_fd(fd: int) -> HTMLResponse | None:
             os.lseek(fd, 0, os.SEEK_SET)
         except OSError:
             pass
-    return HTMLResponse(inject_layer(html), headers=_DRAFT_RESPONSE_HEADERS)
+    return HTMLResponse(
+        prepare_preview_html(html, comments=comments), headers=_DRAFT_RESPONSE_HEADERS
+    )
 
 
 def _draft_stream(
@@ -349,11 +352,19 @@ def _draft_stream(
     *,
     extra_headers: dict[str, str] | None = None,
 ):
-    """Stream bytes from the pinned descriptor and close every held handle."""
+    """Stream at most *size* bytes from the pinned descriptor and close every
+    held handle.
+
+    No ``Content-Length``: the agent may still be writing the file, and a
+    length taken from ``fstat`` would then disagree with the bytes read, which
+    the browser reports as ``ERR_CONTENT_LENGTH_MISMATCH`` (ENG-2950). Chunked
+    transfer sends exactly what the descriptor yields. *size* (the ``fstat``
+    size at authorization) still bounds the body, so a file that keeps growing
+    cannot keep the response open.
+    """
     def chunks():
         try:
-            while chunk := os.read(fd, 1 << 16):
-                yield chunk
+            yield from read_bounded(fd, size)
         finally:
             resources.close()
 
@@ -361,11 +372,7 @@ def _draft_stream(
         chunks(),
         resources=resources,
         media_type=media_type,
-        headers={
-            **_DRAFT_RESPONSE_HEADERS,
-            **(extra_headers or {}),
-            "Content-Length": str(size),
-        },
+        headers={**_DRAFT_RESPONSE_HEADERS, **(extra_headers or {})},
     )
 
 
@@ -437,6 +444,10 @@ class _AgentRepairBody(BaseModel):
     selector: str | None = Field(default=None, max_length=2000)
     thread: list[_AgentRepairThreadEntry] = Field(min_length=1, max_length=501)
     conversationId: UUID
+    # Deliberately untyped. A typed model would answer 422 on the first odd
+    # entry, which would fail the repair over a diagnostic — the opposite of
+    # what diagnostics are for. create_agent_repair drops anything malformed.
+    previewErrors: Any = None
 
 
 class _RepairDecisionBody(BaseModel):
@@ -1012,6 +1023,7 @@ async def request_agent_repair(
             selector=body.selector,
             thread=[entry.model_dump() for entry in body.thread],
             conversation_id=str(body.conversationId),
+            preview_errors=body.previewErrors,
         )
     except RevisionConflict as exc:
         raise HTTPException(
@@ -1164,6 +1176,11 @@ async def serve_private_draft(
     header changes how the response is labelled, not who may read it.
     ``Annotated[..., Query()] = False`` rather than ``= Query(False)`` so a
     direct call (the tests') gets a real ``False``, not the ``Query`` object.
+    The effective flag below also folds in ``wants_download(request)``, the
+    same predicate `/serve` and `/preview-asset` use, so all three routes
+    agree on what a raw query string like ``?download=0`` means; a direct
+    call still controls the outcome through the keyword argument, since its
+    bare ``request`` carries no query string of its own.
     """
     # Parse before taking basename so a path ending in a valid UUID is rejected,
     # never silently accepted. Keep the recognized sanitizer at this filesystem
@@ -1220,11 +1237,16 @@ async def serve_private_draft(
                 detail="Artifact file not found",
             )
 
+    download = download or wants_download(request)
     media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
     resources, fd, file_stat = _open_pinned_draft_file(source, folder, parts)
     try:
-        if not download and wants_comment_layer(media_type, request):
-            resp = await run_in_threadpool(_comment_layer_from_fd, fd)
+        if not download and media_type == "text/html":
+            resp = await run_in_threadpool(
+                _preview_html_from_fd,
+                fd,
+                comments=wants_comment_layer(request),
+            )
             if resp is not None:
                 resources.close()
                 return resp
