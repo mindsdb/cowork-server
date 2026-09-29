@@ -26,6 +26,9 @@ class ComparisonVerdictRequest(CamelRequest):
 
 class ComparisonContinueRequest(CamelRequest):
     project_id: UUID
+    #: The model's name as the screen shows it, for the folder the side's work
+    #: lands in. Only a name: it is cleaned before it touches a path.
+    model_label: str | None = Field(default=None, max_length=80)
 
 
 class ComparisonSideResponse(CamelResponse):

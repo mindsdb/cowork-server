@@ -385,22 +385,145 @@ def test_delete_removes_the_sandboxes_but_not_a_continued_task(client):
     body = _create(client).json()
     a, b = body["sides"]
     project = _real_project(client, "delete-target")
-    # Something the side wrote outside its artifacts, which Continue leaves behind.
-    a_work = Path(_project(a["projectId"]).path) / "analysis.csv"
-    a_work.write_text("region,total\n")
-    client.post(f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": project["id"]})
+    # Something the side wrote outside its artifacts.
+    (Path(_project(a["projectId"]).path) / "analysis.csv").write_text("region,total\n")
+    client.post(
+        f"/api/v1/comparisons/{body['id']}/sides/a/continue",
+        json={"projectId": project["id"], "modelLabel": "Kimi"},
+    )
     b_path = Path(_project(b["projectId"]).path)
 
     assert client.delete(f"/api/v1/comparisons/{body['id']}").status_code == 204
     assert client.get(f"/api/v1/comparisons/{body['id']}").status_code == 404
-    # The continued task's working files survive the delete.
-    assert _project(a["projectId"]) is not None
-    assert a_work.read_text() == "region,total\n"
     assert _project(b["projectId"]) is None
     assert not b_path.exists()
     assert _conversation(b["conversationId"]) is None
-    # The continued side lives on as a task.
+    # The continued side lives on as a task, with its work in its project.
     assert _conversation(a["conversationId"]) is not None
+    carried = Path(project["path"]) / "Build a sales dashboard (Kimi)" / "analysis.csv"
+    assert carried.read_text() == "region,total\n"
+
+
+def test_continue_brings_what_the_side_made_or_changed_into_the_project(client, tmp_path):
+    source = _real_project(client, "carry-source")
+    _seed_source(Path(source["path"]))
+    body = _create(client, source_project_id=source["id"]).json()
+    a = body["sides"][0]
+    sandbox = Path(_project(a["projectId"]).path)
+    (sandbox / "notes.md").write_text("# notes, edited by the side")
+    (sandbox / "scripts").mkdir()
+    (sandbox / "scripts" / "clean.py").write_text("print('clean')")
+    outside = tmp_path / "secret.txt"
+    outside.write_text("not the side's")
+    os.symlink(outside, sandbox / "linked.txt")
+    target = _real_project(client, "carry-target")
+    (Path(target["path"]) / "notes.md").write_text("# the project's own notes")
+
+    r = client.post(
+        f"/api/v1/comparisons/{body['id']}/sides/a/continue",
+        json={"projectId": target["id"], "modelLabel": "Claude Opus 5.5"},
+    )
+
+    assert r.status_code == 200, r.text
+    folder = Path(target["path"]) / "Build a sales dashboard (Claude Opus 5.5)"
+    assert (folder / "notes.md").read_text() == "# notes, edited by the side"
+    assert (folder / "scripts" / "clean.py").read_text() == "print('clean')"
+    # An unchanged copy of the source isn't brought back, and a link is never followed.
+    assert not (folder / "data").exists()
+    assert not (folder / "linked.txt").exists()
+    assert not (folder / ".anton").exists()
+    # The project's own files are untouched.
+    assert (Path(target["path"]) / "notes.md").read_text() == "# the project's own notes"
+    # Everything the task needs is in its project, so the sandbox goes.
+    assert _project(a["projectId"]) is None
+    assert not sandbox.exists()
+
+
+def test_continue_with_nothing_new_makes_no_folder(client):
+    source = _real_project(client, "untouched-source")
+    _seed_source(Path(source["path"]))
+    body = _create(client, source_project_id=source["id"]).json()
+    target = _real_project(client, "untouched-target")
+
+    client.post(f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": target["id"]})
+
+    assert sorted(p.name for p in Path(target["path"]).iterdir() if not p.name.startswith(".")) == []
+
+
+def test_continue_keeps_the_sandbox_when_the_work_cannot_all_be_carried(client, monkeypatch):
+    from cowork.services import comparisons
+
+    body = _create(client).json()
+    a = body["sides"][0]
+    sandbox = Path(_project(a["projectId"]).path)
+    for i in range(3):
+        (sandbox / f"out{i}.csv").write_text("x")
+    monkeypatch.setattr(comparisons, "_COPY_MAX_FILES", 1)
+    target = _real_project(client, "partial-target")
+
+    r = client.post(f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": target["id"]})
+
+    assert r.status_code == 200, r.text
+    assert (sandbox / "out2.csv").is_file()
+    assert _project(a["projectId"]) is not None
+    assert client.delete(f"/api/v1/comparisons/{body['id']}").status_code == 204
+    # Still kept after the comparison is deleted: it holds work the project doesn't have.
+    assert (sandbox / "out2.csv").is_file()
+
+
+def test_a_file_that_cannot_be_copied_keeps_the_sandbox(tmp_path):
+    from cowork.services.comparisons import copy_side_changes
+
+    sandbox, destination = tmp_path / "s", tmp_path / "d"
+    sandbox.mkdir()
+    destination.mkdir()
+    (sandbox / "ok.txt").write_text("ok")
+    unreadable = sandbox / "locked.txt"
+    unreadable.write_text("x")
+    unreadable.chmod(0)
+    try:
+        copied, complete = copy_side_changes(sandbox, destination, "Run (Kimi)", copied={})
+    finally:
+        unreadable.chmod(0o644)
+
+    assert (copied, complete) == (1, False)
+
+
+def test_a_hosted_side_takes_its_whole_workspace_along(tmp_path):
+    from cowork.services.comparisons import _carry_side_work
+
+    side = SimpleNamespace(conversation_id=uuid4(), copied_files={})
+    sandbox, destination = tmp_path / "sandbox", tmp_path / "project"
+    workspace = sandbox / "conversations" / str(side.conversation_id)
+    workspace.mkdir(parents=True)
+    (workspace / "session.pkl").write_bytes(b"state")
+    destination.mkdir()
+
+    assert _carry_side_work(side, sandbox=sandbox, destination=destination, folder_name="x", org_mode=True)
+    assert (destination / "conversations" / str(side.conversation_id) / "session.pkl").read_bytes() == b"state"
+    assert not workspace.exists()
+
+
+def test_the_carried_folder_is_named_for_the_comparison_and_side():
+    from cowork.services.comparisons import _carried_folder_name
+
+    assert _carried_folder_name("Build a dashboard\nfrom sales", "Claude Opus 5.5") == "Build a dashboard (Claude Opus 5.5)"
+    # Only ever one path component.
+    assert _carried_folder_name("../../etc/passwd", "a/b:c") == "etc passwd (a b c)"
+    assert _carried_folder_name("", "") == "Comparison"
+
+
+def test_a_second_carry_into_the_same_project_gets_its_own_folder(tmp_path):
+    from cowork.services.comparisons import copy_side_changes
+
+    sandbox, destination = tmp_path / "s", tmp_path / "d"
+    sandbox.mkdir()
+    destination.mkdir()
+    (sandbox / "a.txt").write_text("a")
+    (destination / "Run (Kimi)").mkdir()
+
+    assert copy_side_changes(sandbox, destination, "Run (Kimi)", copied={}) == (1, True)
+    assert (destination / "Run (Kimi) 2" / "a.txt").read_text() == "a"
 
 
 def test_delete_frees_the_sandboxes_scratchpad_slots_and_backends(client):

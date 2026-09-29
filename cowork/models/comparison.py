@@ -61,6 +61,13 @@ class ComparisonSide(BaseSQLModel, table=True):
     continued_turn_count: int | None = Field(
         default=None, description="Turns the conversation had when it was continued; the comparison shows those"
     )
+    #: Relative path -> SHA-256 of each file copied from the source project, so
+    #: Continue can tell what the side created or changed from what it was given.
+    copied_files: dict | None = Field(
+        default=None,
+        sa_type=sa.JSON,  # type: ignore
+        description="Files copied into the sandbox from the source project, by relative path and SHA-256",
+    )
     org_id: str | None = Field(default=None, max_length=36, description="Owning organization; NULL on local/desktop rows")
     created_by: str | None = Field(default=None, max_length=36, description="User who created the row; NULL on local/desktop rows")
 

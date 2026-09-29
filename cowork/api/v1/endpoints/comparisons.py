@@ -144,7 +144,7 @@ def continue_side(
 ):
     service = ComparisonService(scoped)
     try:
-        conversation = service.continue_side(comparison_id, label, body.project_id)
+        conversation = service.continue_side(comparison_id, label, body.project_id, model_label=body.model_label)
     except (ComparisonNotFoundError, ProjectNotFoundError) as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ComparisonConflictError as e:

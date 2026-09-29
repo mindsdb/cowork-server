@@ -18,8 +18,10 @@ conversation into a real project, and from then on it is an ordinary task.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 import stat as stat_module
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -225,9 +227,10 @@ class ComparisonService:
             for label, spec in zip(SIDE_LABELS, sides):
                 sandbox = projects.create_comparison_sandbox(sandbox_label)
                 created.append(sandbox)
+                copied: dict[str, str] = {}
                 if source is not None:
                     copy_project_files(
-                        Path(source.path), Path(sandbox.path), org_mode=self.session.scope.org_mode
+                        Path(source.path), Path(sandbox.path), org_mode=self.session.scope.org_mode, manifest=copied
                     )
                 conversation = Conversation(
                     topic=title,
@@ -245,6 +248,7 @@ class ComparisonService:
                         reasoning_effort=spec.reasoning_effort,
                         project_id=sandbox.id,
                         conversation_id=conversation.id,
+                        copied_files=copied,
                     )
                 )
             self.session.add(comparison)
@@ -278,12 +282,15 @@ class ComparisonService:
         self.session.refresh(verdict)
         return verdict
 
-    def continue_side(self, comparison_id: UUID, label: str, destination_project_id: UUID) -> Conversation:
+    def continue_side(
+        self, comparison_id: UUID, label: str, destination_project_id: UUID, *, model_label: str | None = None
+    ) -> Conversation:
         """Turn one side into an ordinary task in a real project.
 
         Reuses the task move: the conversation moves and its artifacts move
-        with it. The side row stays, with the message count at the moment of
-        continuing, so the comparison keeps showing what was compared.
+        with it. The side's other work comes too (see `_carry_side_work`). The
+        side row stays, with the message count at the moment of continuing, so
+        the comparison keeps showing what was compared.
         """
         from cowork.services.conversations import ConversationService
         from cowork.services.task_objects import TaskObjectService
@@ -309,8 +316,18 @@ class ComparisonService:
         # relocate) and only records the mark. Marking first would answer 409
         # to the retry while the conversation was still in its sandbox.
         source = conversation.project
+        emptied_sandbox = None
         if source is not None and source.id != destination.id:
             TaskObjectService(self.session).relocate_to_project(conversation, source, destination)
+            carried_all = _carry_side_work(
+                side,
+                sandbox=Path(source.path),
+                destination=Path(destination.path),
+                folder_name=_carried_folder_name(comparison.title, model_label or side.model),
+                org_mode=self.session.scope.org_mode,
+            )
+            if carried_all and is_comparison_sandbox(source.name):
+                emptied_sandbox = source
         conversation = conversations.update_conversation(conversation.id, project_id=destination.id)
 
         side.continued_turn_count = turn_count
@@ -318,14 +335,24 @@ class ComparisonService:
         self.session.add(side)
         self.session.commit()
         self.session.refresh(conversation)
+        # Everything the task needs now lives in its project, so the sandbox
+        # would only be an unreachable copy. Kept when anything couldn't be
+        # carried.
+        if emptied_sandbox is not None:
+            _release_project_runtime(emptied_sandbox.path)
+            try:
+                ProjectService(self.session).delete_project(emptied_sandbox.id)
+            except Exception:
+                logger.exception("Could not remove a continued side's sandbox %s", emptied_sandbox.id)
         return conversation
 
     def delete_comparison(self, comparison_id: UUID) -> None:
         """Remove the comparison and the sandboxes of the sides not continued.
 
-        A continued side's sandbox is kept. Continue moves only the side's
-        artifacts, so the files its turns wrote are still there, and deleting
-        the comparison must not delete a live task's work.
+        A continued side's sandbox is kept if it is still there: Continue removes
+        it once the side's work is in its project, and keeps it only when
+        something could not be carried, which deleting the comparison must not
+        destroy.
         """
         from cowork.streaming.registry import registry
 
@@ -352,6 +379,168 @@ class ComparisonService:
                 # The comparison is gone either way; a leftover sandbox is
                 # hidden from every list and is only disk.
                 logger.exception("Could not remove comparison sandbox %s", project_id)
+
+
+_FOLDER_UNSAFE = re.compile(r'[\x00-\x1f/\\:*?"<>|]+')
+
+
+def _folder_part(text: str, limit: int) -> str:
+    first_line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+    cleaned = " ".join(_FOLDER_UNSAFE.sub(" ", first_line).split()).strip(" .")
+    return cleaned[:limit].rstrip(" .")
+
+
+def _carried_folder_name(title: str, model_label: str) -> str:
+    """`Build a dashboard (Claude Opus 5.5)`: which comparison, and which side."""
+    name = _folder_part(title, 60) or "Comparison"
+    label = _folder_part(model_label, 40)
+    return f"{name} ({label})" if label else name
+
+
+def _carry_side_work(
+    side: ComparisonSide, *, sandbox: Path, destination: Path, folder_name: str, org_mode: bool
+) -> bool:
+    """Bring what a continued side worked on into the real project.
+
+    Hosted: a task works in its own `conversations/<id>` folder, workspace and
+    scratchpad session included, so that folder moves as a whole, to where a
+    task in the destination would have had it.
+
+    Desktop: a task works in the project's own folder, and the sandbox also
+    holds the copy of the source project the comparison started from. Only
+    what the side created or changed is copied, into one folder named for the
+    comparison and the side, so nothing in the real project is overwritten.
+
+    True when everything was carried, so the sandbox holds nothing the task
+    still needs.
+    """
+    if org_mode:
+        workspace = sandbox / "conversations" / str(side.conversation_id)
+        target = destination / "conversations" / str(side.conversation_id)
+        if not workspace.exists():
+            return True
+        if workspace.is_symlink() or not workspace.is_dir() or target.exists():
+            return False
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.rename(workspace, target)
+        except OSError:
+            logger.exception("Could not move a continued side's workspace into its project")
+            return False
+        return True
+    try:
+        _copied, complete = copy_side_changes(sandbox, destination, folder_name, copied=side.copied_files or {})
+    except ProjectTooLargeToCopyError:
+        logger.warning("A continued side's work was larger than the copy budget; the rest stays in its sandbox")
+        return False
+    except OSError:
+        logger.exception("Could not copy a continued side's work into its project")
+        return False
+    return complete
+
+
+def copy_side_changes(
+    sandbox_root: Path, destination_root: Path, folder_name: str, *, copied: dict[str, str]
+) -> tuple[int, bool]:
+    """Copy the sandbox files that are not an unchanged copy of the source into
+    `destination_root/folder_name`. Returns how many were copied, and whether
+    every one of them was; with none to copy, no folder is made.
+
+    Same rules as `copy_project_files`: regular files and directories only,
+    never through a link, and within the same budget. Left out: `.anton`
+    (artifacts move separately; scratchpad environments are rebuilt on use),
+    and on a hosted layout `conversations/`.
+    """
+    changed = _changed_files(sandbox_root, copied)
+    if not changed:
+        return 0, True
+    name, n = folder_name, 2
+    while (destination_root / name).exists():
+        name, n = f"{folder_name} {n}", n + 1
+    (destination_root / name).mkdir()
+    budget = _CopyBudget()
+    failed = 0
+    with pinned_dir(sandbox_root) as src_root, pinned_dir(destination_root / name) as dst_root:
+        for rel in changed:
+            parts = rel.split("/")
+            src_dirs, dst_dirs = [], []
+            try:
+                src, dst = src_root, dst_root
+                for part in parts[:-1]:
+                    src = open_pinned_child(src, part)
+                    src_dirs.append(src)
+                    try:
+                        dir_mkdir(dst, part)
+                    except FileExistsError:
+                        pass
+                    dst = open_pinned_child(dst, part)
+                    dst_dirs.append(dst)
+                before = budget.files
+                _copy_file(src, dst, parts[-1], budget)
+                if budget.files == before:
+                    failed += 1
+            except OSError:
+                failed += 1
+            finally:
+                for d in reversed(src_dirs + dst_dirs):
+                    d.close()
+    return budget.files, failed == 0
+
+
+def _changed_files(sandbox_root: Path, copied: dict[str, str]) -> list[str]:
+    """Relative paths of sandbox files whose content is not in `copied`."""
+    changed: list[str] = []
+
+    def walk(directory: PinnedDir, rel: str, depth: int) -> None:
+        if depth > _COPY_MAX_DEPTH:
+            return
+        with dir_scandir(directory) as scan:
+            names = sorted(entry.name for entry in scan)
+        for name in names:
+            if not rel and name in (".anton", "conversations"):
+                continue
+            try:
+                st = dir_lstat(directory, name)
+            except OSError:
+                continue
+            path = f"{rel}{name}"
+            if stat_module.S_ISDIR(st.st_mode):
+                try:
+                    child = open_pinned_child(directory, name)
+                except OSError:
+                    continue
+                try:
+                    walk(child, f"{path}/", depth + 1)
+                finally:
+                    child.close()
+            elif stat_module.S_ISREG(st.st_mode):
+                digest = _file_digest(directory, name)
+                # A file that can't be read can't be shown to be the original
+                # copy, so it counts as changed and its failed copy is noticed.
+                if digest is None or copied.get(path) != digest:
+                    changed.append(path)
+
+    with pinned_dir(sandbox_root) as root:
+        walk(root, "", 0)
+    return changed
+
+
+def _file_digest(directory: PinnedDir, name: str) -> str | None:
+    binary = getattr(os, "O_BINARY", 0)
+    nonblock = getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = dir_open(directory, name, os.O_RDONLY | O_NOFOLLOW | nonblock | binary)
+    except OSError:
+        return None
+    try:
+        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        digest = hashlib.sha256()
+        while chunk := os.read(fd, _COPY_CHUNK):
+            digest.update(chunk)
+        return digest.hexdigest()
+    finally:
+        os.close(fd)
 
 
 def _release_project_runtime(project_path: str | None) -> None:
@@ -411,6 +600,8 @@ async def blocked_connections(scope: TenantScope) -> list[dict]:
 class _CopyBudget:
     files: int = 0
     bytes: int = 0
+    #: Relative path -> SHA-256 of each file copied, when the caller wants them.
+    manifest: dict[str, str] | None = None
 
     def take_file(self) -> None:
         self.files += 1
@@ -427,7 +618,9 @@ class _CopyBudget:
             )
 
 
-def copy_project_files(source_root: Path, dest_root: Path, *, org_mode: bool) -> int:
+def copy_project_files(
+    source_root: Path, dest_root: Path, *, org_mode: bool, manifest: dict[str, str] | None = None
+) -> int:
     """Copy a project's files into a sandbox. Returns the number of files copied.
 
     Regular files and directories only, and never through a link: every
@@ -439,16 +632,22 @@ def copy_project_files(source_root: Path, dest_root: Path, *, org_mode: bool) ->
     Left out: the project's `.anton` state other than its instructions and
     memory, and on a hosted deployment the per-conversation workspaces under
     `conversations/`, which belong to other members.
+
+    `manifest`, when given, is filled with each copied file's relative path
+    and SHA-256 (the `.anton` files it keeps are not listed).
     """
-    budget = _CopyBudget()
+    budget = _CopyBudget(manifest=manifest)
     with pinned_dir(source_root) as src, pinned_dir(dest_root) as dst:
-        _copy_children(src, dst, budget, depth=0, top_level=True, org_mode=org_mode)
+        _copy_children(src, dst, budget, depth=0, top_level=True, org_mode=org_mode, rel="")
     return budget.files
 
 
 def _copy_children(
-    src: PinnedDir, dst: PinnedDir, budget: _CopyBudget, *, depth: int, top_level: bool, org_mode: bool
+    src: PinnedDir, dst: PinnedDir, budget: _CopyBudget, *, depth: int, top_level: bool, org_mode: bool,
+    rel: str | None,
 ) -> None:
+    """``rel`` is this directory's path within the copy, or None where files are
+    not recorded (the kept ``.anton`` state)."""
     if depth > _COPY_MAX_DEPTH:
         return
     with dir_scandir(src) as scan:
@@ -467,13 +666,15 @@ def _copy_children(
             if top_level and name == ".anton":
                 _copy_anton_dir(src, dst, budget, org_mode=org_mode)
                 continue
-            _copy_subdir(src, dst, name, budget, depth=depth, org_mode=org_mode)
+            _copy_subdir(
+                src, dst, name, budget, depth=depth, org_mode=org_mode, rel=None if rel is None else f"{rel}{name}/"
+            )
         elif stat_module.S_ISREG(st.st_mode):
-            _copy_file(src, dst, name, budget)
+            _copy_file(src, dst, name, budget, rel=None if rel is None else f"{rel}{name}")
 
 
 def _copy_subdir(
-    src: PinnedDir, dst: PinnedDir, name: str, budget: _CopyBudget, *, depth: int, org_mode: bool
+    src: PinnedDir, dst: PinnedDir, name: str, budget: _CopyBudget, *, depth: int, org_mode: bool, rel: str | None = None
 ) -> None:
     try:
         child_src = open_pinned_child(src, name)
@@ -486,7 +687,9 @@ def _copy_subdir(
             pass
         child_dst = open_pinned_child(dst, name)
         try:
-            _copy_children(child_src, child_dst, budget, depth=depth + 1, top_level=False, org_mode=org_mode)
+            _copy_children(
+                child_src, child_dst, budget, depth=depth + 1, top_level=False, org_mode=org_mode, rel=rel
+            )
         finally:
             child_dst.close()
     finally:
@@ -522,7 +725,7 @@ def _copy_anton_dir(src: PinnedDir, dst: PinnedDir, budget: _CopyBudget, *, org_
         anton_src.close()
 
 
-def _copy_file(src: PinnedDir, dst: PinnedDir, name: str, budget: _CopyBudget) -> None:
+def _copy_file(src: PinnedDir, dst: PinnedDir, name: str, budget: _CopyBudget, *, rel: str | None = None) -> None:
     binary = getattr(os, "O_BINARY", 0)
     # O_NONBLOCK so an entry swapped for a FIFO after the lstat cannot park
     # this thread in open() waiting for a writer; it has no effect on reading
@@ -539,11 +742,14 @@ def _copy_file(src: PinnedDir, dst: PinnedDir, name: str, budget: _CopyBudget) -
             return
         budget.take_file()
         fd_out = dir_open(dst, name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW | binary, 0o644)
+        digest = hashlib.sha256() if budget.manifest is not None and rel is not None else None
         try:
             while True:
                 chunk = os.read(fd_in, _COPY_CHUNK)
                 if not chunk:
                     break
+                if digest is not None:
+                    digest.update(chunk)
                 # Counted as read, not from the stat, so a file that grows
                 # mid-copy is still bounded.
                 budget.take_bytes(len(chunk))
@@ -553,5 +759,7 @@ def _copy_file(src: PinnedDir, dst: PinnedDir, name: str, budget: _CopyBudget) -
                     view = view[written:]
         finally:
             os.close(fd_out)
+        if digest is not None:
+            budget.manifest[rel] = digest.hexdigest()
     finally:
         os.close(fd_in)
