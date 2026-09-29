@@ -177,6 +177,20 @@ def remove(name: str, *, workspace_path: Optional[str] = None) -> None:
     _pads.pop(_key(name, workspace_path), None)
 
 
+def release_workspace(workspace_path: str) -> int:
+    """Forget every pad registered for one workspace, freeing their slots.
+
+    For a project that is going away. The pads a backend preview registers only
+    hold a venv path (see ``WorkspaceScopedPool``), so there is no process to
+    stop. Returns how many were released.
+    """
+    workspace = str(_resolve_workspace(workspace_path))
+    keys = [key for key in _pads if key[0] == workspace]
+    for key in keys:
+        _pads.pop(key, None)
+    return len(keys)
+
+
 def list_pads() -> list[str]:
     return [name for _workspace, name in _pads]
 

@@ -1933,6 +1933,19 @@ async def _launch_backend_locked(
     return True, "launched", new_port
 
 
+def stop_project_backends(project_root: str | Path) -> None:
+    """Stop the backends launched for one project, for a project going away."""
+    root = Path(project_root)
+    for key in {str(root), str(root.resolve())}:
+        for entry in list(_LAUNCHED_BACKENDS.pop(key, {}).values()):
+            proc = entry.get("proc")
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.terminate()
+                except (OSError, ProcessLookupError):
+                    pass
+
+
 def shutdown_launched_backends() -> None:
     """Terminate every backend cowork-server itself launched.
 

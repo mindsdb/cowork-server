@@ -58,14 +58,22 @@ SIDE_LABELS = ("a", "b")
 COMPARISON_HARNESS = "anton"
 VERDICT_WINNERS = frozenset({"a", "b", "tie", "neither"})
 
-#: Connector categories whose purpose is reaching people: chat, email,
-#: outreach sequences, campaigns, support replies, meeting invites, signature
-#: requests. Two agents running the same task would each send the message, so
-#: they are off in a comparison. Every other category stays on -- building a
-#: dashboard from the CRM or the warehouse is the comparison people run.
+#: Connector categories whose purpose is reaching people or acting in the
+#: world: chat, email, outreach sequences, campaigns, support replies, meeting
+#: invites, signature requests, rides and orders, shipping labels. Two agents
+#: running the same task would each do it, so they are off in a comparison.
+#: Other categories stay on -- building a dashboard from the CRM or the
+#: warehouse is the comparison people run.
 BLOCKED_CONNECTOR_CATEGORIES = frozenset(
-    {"communication", "sales-engagement", "marketing", "support", "scheduling", "documents"}
+    {
+        "communication", "sales-engagement", "marketing", "support", "scheduling", "documents",
+        "mobility", "logistics",
+    }
 )
+#: Connectors that reach people from a category that otherwise stays on: a
+#: calendar event invites its attendees, an incident pages whoever is on call,
+#: a status page posts publicly.
+BLOCKED_CONNECTOR_ENGINES = frozenset({"google_calendar", "pagerduty", "opsgenie", "statuspage"})
 
 # What a copied project may hold. Generous for documents and data files; it
 # exists so a comparison started from a project with a vendored dependency tree
@@ -337,6 +345,7 @@ class ComparisonService:
                 continue
             if not is_comparison_sandbox(project.name):
                 continue
+            _release_project_runtime(project.path)
             try:
                 projects.delete_project(project_id)
             except Exception:
@@ -345,11 +354,30 @@ class ComparisonService:
                 logger.exception("Could not remove comparison sandbox %s", project_id)
 
 
+def _release_project_runtime(project_path: str | None) -> None:
+    """Stop a sandbox's backend previews and free its scratchpad slots.
+
+    Each project holds its own, and the pool is capped: without this, a few
+    deleted comparisons would use up every slot until the server restarts.
+    """
+    if not project_path:
+        return
+    from cowork.services import scratchpad_runtime
+    from cowork.services.artifacts import stop_project_backends
+
+    stop_project_backends(project_path)
+    scratchpad_runtime.release_workspace(project_path)
+
+
 def _blocked(engine: str | None) -> bool:
     from cowork.services.connectors.specs._registry import registry
 
     spec = registry.get_connector(engine or "")
-    return spec is not None and spec.category in BLOCKED_CONNECTOR_CATEGORIES
+    # A connector the catalog doesn't describe (a custom one) could do anything,
+    # so it is off too.
+    if spec is None:
+        return True
+    return spec.category in BLOCKED_CONNECTOR_CATEGORIES or engine in BLOCKED_CONNECTOR_ENGINES
 
 
 async def blocked_connections(scope: TenantScope) -> list[dict]:

@@ -403,6 +403,34 @@ def test_delete_removes_the_sandboxes_but_not_a_continued_task(client):
     assert _conversation(a["conversationId"]) is not None
 
 
+def test_delete_frees_the_sandboxes_scratchpad_slots_and_backends(client):
+    from unittest.mock import MagicMock
+
+    from cowork.services import artifacts, scratchpad_runtime
+
+    body = _create(client).json()
+    a, b = body["sides"]
+    elsewhere = _real_project(client, "unrelated")
+    sandbox_paths = [_project(side["projectId"]).path for side in (a, b)]
+    procs = {}
+    for path in [*sandbox_paths, elsewhere["path"]]:
+        scratchpad_runtime._pads[scratchpad_runtime._key("dash", path)] = object()
+        procs[path] = MagicMock(returncode=None)
+        artifacts._LAUNCHED_BACKENDS[str(Path(path).resolve())] = {"dash": {"proc": procs[path]}}
+    try:
+        assert client.delete(f"/api/v1/comparisons/{body['id']}").status_code == 204
+
+        for path in sandbox_paths:
+            assert scratchpad_runtime.get("dash", workspace_path=path) is None
+            procs[path].terminate.assert_called_once()
+        # Another project's preview is untouched.
+        assert scratchpad_runtime.get("dash", workspace_path=elsewhere["path"]) is not None
+        procs[elsewhere["path"]].terminate.assert_not_called()
+    finally:
+        scratchpad_runtime._pads.clear()
+        artifacts._LAUNCHED_BACKENDS.clear()
+
+
 def test_delete_refuses_while_a_side_is_running(client):
     body = _create(client).json()
     running = _handle(running=True)
@@ -497,13 +525,19 @@ def test_blocked_connections_are_the_messaging_ones(monkeypatch):
         SimpleNamespace(engine="gmail", name="me"),
         SimpleNamespace(engine="postgres", name="warehouse"),
         SimpleNamespace(engine="hubspot", name="crm"),
+        SimpleNamespace(engine="google_calendar", name="work"),
+        SimpleNamespace(engine="pagerduty", name="oncall"),
+        SimpleNamespace(engine="doordash", name="lunch"),
+        SimpleNamespace(engine="shippo", name="labels"),
+        SimpleNamespace(engine="google_analytics_4", name="site"),
         SimpleNamespace(engine="my-custom-thing", name="x"),
     ]
     monkeypatch.setattr(connections.ConnectionsService, "list", lambda self: listed)
     import asyncio
 
-    blocked = asyncio.run(comparisons.blocked_connections(LOCAL_SCOPE))
-    assert blocked == [{"engine": "slack", "name": "team"}, {"engine": "gmail", "name": "me"}]
+    blocked = [item["engine"] for item in asyncio.run(comparisons.blocked_connections(LOCAL_SCOPE))]
+    # Reaching people, acting in the world, and anything the catalog can't vouch for.
+    assert blocked == ["slack", "gmail", "google_calendar", "pagerduty", "doordash", "shippo", "my-custom-thing"]
 
 
 def test_blocked_connections_read_auths_list_on_a_hosted_deployment(monkeypatch):
@@ -527,6 +561,14 @@ def test_every_blocked_category_exists_in_the_catalog():
 
     categories = {spec.category for spec in registry.list_connectors()}
     assert BLOCKED_CONNECTOR_CATEGORIES <= categories
+
+
+def test_every_blocked_engine_exists_in_the_catalog():
+    # A renamed engine would silently turn a connector that reaches people back on.
+    from cowork.services.comparisons import BLOCKED_CONNECTOR_ENGINES
+    from cowork.services.connectors.specs._registry import registry
+
+    assert all(registry.get_connector(engine) is not None for engine in BLOCKED_CONNECTOR_ENGINES)
 
 
 def test_a_side_never_writes_memory_in_process():
