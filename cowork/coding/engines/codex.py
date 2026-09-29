@@ -256,9 +256,10 @@ class CodexEngineSession:
                 client_config.client_version,
                 config.model,
             ))
-            client_config.config_overrides += (
-                f"model_catalog_json={codex_config.toml_string(str(catalog_path))}",
-            )
+            if catalog_path:
+                client_config.config_overrides += (
+                    f"model_catalog_json={codex_config.toml_string(str(catalog_path))}",
+                )
             self._client.start()
             self._client.initialize()
             self._register_skill_roots()

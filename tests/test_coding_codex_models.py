@@ -65,27 +65,25 @@ def test_catalog_preserves_explicit_parallel_tool_support(monkeypatch, catalog):
         assert json.loads(path.read_text()) == catalog
 
 
-@pytest.mark.parametrize("payload, message", [
-    ({"data": [{"id": "fable"}]}, "native Codex model catalog"),
-    ({"models": []}, "native Codex model catalog"),
-    ({"models": [None]}, "native Codex model catalog"),
-    ({"models": [{"slug": "other", "visibility": "list"}]}, "selected model is missing"),
-    ({"models": [{"slug": "fable", "visibility": "hide"}]}, "selected model is missing"),
-    ({"models": [{"slug": "fable"}]}, "selected model is missing"),
+@pytest.mark.parametrize("payload", [
+    {"data": [{"id": "fable"}]},
+    {"models": []},
+    {"models": [None]},
+    {"models": [{"slug": "other", "visibility": "list"}]},
+    {"models": [{"slug": "fable", "visibility": "hide"}]},
+    {"models": [{"slug": "fable"}]},
 ])
-def test_catalog_rejects_fallback_conditions(monkeypatch, payload, message):
+def test_catalog_falls_back_without_a_listed_row(monkeypatch, payload):
     mock_catalog(monkeypatch, payload)
-    with pytest.raises(RuntimeError, match=message):
-        with codex_models.model_catalog("http://proxy", "token", "0.147.0", "fable"):
-            pytest.fail("Invalid metadata must not start Codex")
+    with codex_models.model_catalog("http://proxy", "token", "0.147.0", "fable") as path:
+        assert path is None
 
 
 @pytest.mark.parametrize("status", [401, 403, 500])
-def test_catalog_reports_fetch_failure(monkeypatch, status):
+def test_catalog_falls_back_on_fetch_failure(monkeypatch, status):
     mock_catalog(monkeypatch, {"error": "upstream error"}, status)
-    with pytest.raises(RuntimeError, match="Unable to load Codex model metadata"):
-        with codex_models.model_catalog("http://proxy", "token", "0.147.0", "fable"):
-            pytest.fail("Failed discovery must not start Codex")
+    with codex_models.model_catalog("http://proxy", "token", "0.147.0", "fable") as path:
+        assert path is None
 
 
 def test_catalog_files_are_isolated_and_removed_on_failure(monkeypatch, catalog):
@@ -101,7 +99,7 @@ def test_catalog_files_are_isolated_and_removed_on_failure(monkeypatch, catalog)
 
 
 @pytest.mark.parametrize("failure", ["timeout", "invalid_json"])
-def test_catalog_reports_transport_and_json_errors(monkeypatch, failure):
+def test_catalog_falls_back_on_transport_and_json_errors(monkeypatch, failure):
     def respond(request):
         if failure == "timeout":
             raise httpx.ReadTimeout("Timed out", request=request)
@@ -109,9 +107,8 @@ def test_catalog_reports_transport_and_json_errors(monkeypatch, failure):
 
     client = httpx.Client(transport=httpx.MockTransport(respond))
     monkeypatch.setattr(codex_models.httpx, "Client", lambda **kwargs: client)
-    with pytest.raises(RuntimeError, match="Unable to load Codex model metadata"):
-        with codex_models.model_catalog("http://proxy", "token", "0.147.0", "fable"):
-            pytest.fail("Failed discovery must not start Codex")
+    with codex_models.model_catalog("http://proxy", "token", "0.147.0", "fable") as path:
+        assert path is None
 
 
 def test_catalog_deadline_bounds_a_trickled_response(monkeypatch, catalog):
@@ -127,9 +124,8 @@ def test_catalog_deadline_bounds_a_trickled_response(monkeypatch, catalog):
             yield bytes([byte])
 
     mock_catalog(monkeypatch, catalog, content=trickle())
-    with pytest.raises(RuntimeError, match="Unable to load Codex model metadata"):
-        with codex_models.model_catalog("http://proxy", "token", "0.147.0", "fable"):
-            pytest.fail("A fetch past its deadline must not start Codex")
+    with codex_models.model_catalog("http://proxy", "token", "0.147.0", "fable") as path:
+        assert path is None
     assert len(chunks) < len(body)
 
 
@@ -223,3 +219,51 @@ def test_session_loads_catalog_before_start_and_cleans_up(
     token = "scoped-token" if remote else codex_config.LOCAL_PROXY_TOKEN
     assert requests[0].headers["Authorization"] == f"Bearer {token}"
     assert requests[0].url.host == ("gateway" if remote else "127.0.0.1")
+
+
+def test_session_starts_on_fallback_metadata_for_unlisted_model(monkeypatch, tmp_path, catalog):
+    catalog["models"][0]["slug"] = "fable-alias"
+    mock_catalog(monkeypatch, catalog)
+    started = []
+
+    @dataclass
+    class FakeConfig:
+        cwd: str
+        env: dict
+        config_overrides: tuple
+        client_name: str
+        client_title: str
+        client_version: str = "0.147.0"
+
+    class FakeClient:
+        def __init__(self, config, approval_handler):
+            self.config = config
+
+        def start(self):
+            started.append(tomllib.loads("\n".join(self.config.config_overrides)))
+
+        def initialize(self):
+            pass
+
+        def thread_start(self, params):
+            return SimpleNamespace(thread=SimpleNamespace(id="thread"))
+
+        def close(self):
+            pass
+
+    sdk = ModuleType("openai_codex.client")
+    sdk.CodexConfig = FakeConfig
+    sdk.CodexClient = FakeClient
+    monkeypatch.setitem(sys.modules, "openai_codex.client", sdk)
+    monkeypatch.setattr(codex.CodexEngineSession, "_register_skill_roots", lambda self: None)
+    monkeypatch.setattr(codex.CodexEngineSession, "_route_global_notifications", lambda self: None)
+    monkeypatch.setattr(codex.CodexEngineSession, "_app_server_pid", lambda self: None)
+    monkeypatch.setattr(codex, "terminate_descendants", lambda pid: None)
+    session = codex.CodexEngineSession(
+        cowork_root=tmp_path, workspace=tmp_path,
+        config=EngineSessionConfig(model="fable", permission_mode=PermissionMode.workspace),
+        credentials=EngineCredentials(minds_url="https://upstream", minds_api_key="real-secret"),
+        existing_session_id=None, approval_handler=lambda *args: {},
+    )
+    assert "model_catalog_json" not in started[0]
+    session.close()
