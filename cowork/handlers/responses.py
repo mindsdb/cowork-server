@@ -320,7 +320,9 @@ def _message_id_str(message: Message | None) -> str | None:
 
 
 class ResponsesHandler:
-    def __init__(self, session: Session, principal: Principal | None = None) -> None:
+    def __init__(
+        self, session: Session, principal: Principal | None = None, interactive: bool = True
+    ) -> None:
         self.session = session
         self.principal = principal
         self.scope = scope_from_principal(principal)
@@ -331,6 +333,8 @@ class ResponsesHandler:
         self.harness_name = get_user_settings(self.scope).harness
         self.harness = None
         self.last_conversation_id: str | None = None
+        # Whether a person is watching this turn and can answer ask_user cards.
+        self.interactive = interactive
 
     def _get_harness(self):
         if self.harness is None:
@@ -1374,7 +1378,7 @@ class ResponsesHandler:
                     disabled=disabled,
                     # Questions need someone to answer them: this path serves
                     # the web UI, which renders the card and posts /answer.
-                    interactive=get_app_settings().ask_user_enabled,
+                    interactive=self.interactive and get_app_settings().ask_user_enabled,
                 ):
                     if kind == "progress" and data.get("phase") == "workspace_authorized":
                         artifact_writes_allowed = data.get("workspace_mode") == "persistent"

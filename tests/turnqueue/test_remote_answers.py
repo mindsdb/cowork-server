@@ -161,6 +161,31 @@ async def test_an_oversized_entry_is_rejected_and_nothing_is_queued(r):
     assert await r.llen(KEY) == 0
 
 
+async def test_an_entry_under_the_limit_but_over_it_once_rewrapped_is_rejected(r):
+    """scratchpad-controller doesn't check our raw queued entry — it checks the
+    stdin line it re-wraps from it (kind/question_id/answer_id/values/text/
+    skipped, compact separators, plus a trailing newline), which is a bit
+    bigger. An entry that clears MAX_ANSWER_BYTES raw but not once re-wrapped
+    would otherwise be accepted here and then silently dropped there."""
+    question_id, answer_id = "ask:1", "a" * 32
+    raw_overhead = len(
+        json.dumps({"question_id": question_id, "answer_id": answer_id, "text": ""},
+                   ensure_ascii=False).encode("utf-8")
+    )
+    big_text = "a" * (MAX_ANSWER_BYTES - raw_overhead)  # raw entry lands exactly at the limit
+    raw_entry = json.dumps(
+        {"question_id": question_id, "answer_id": answer_id, "text": big_text}, ensure_ascii=False
+    )
+    assert len(raw_entry.encode("utf-8")) <= MAX_ANSWER_BYTES  # confirms the raw size alone would pass
+
+    result = await submit_remote_answer(
+        conversation_id="conv-1", correlation_id="corr-1", question_id=question_id,
+        payload={"text": big_text}, r=r, ack_timeout_s=2.0,
+    )
+    assert result is RemoteAnswerResult.TOO_LARGE
+    assert await r.llen(KEY) == 0
+
+
 async def test_redis_error_during_ack_wait_is_reported_accepted(r, monkeypatch):
     async def boom(*args, **kwargs):
         raise RedisError("connection lost")

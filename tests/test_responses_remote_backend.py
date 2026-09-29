@@ -41,6 +41,7 @@ class _FakeBuffer:
 def _handler() -> ResponsesHandler:
     handler = object.__new__(ResponsesHandler)
     handler.scoped = _FakeScoped()
+    handler.interactive = True
     return handler
 
 
@@ -2146,6 +2147,34 @@ async def test_produce_remote_marks_the_turn_interactive_per_setting(monkeypatch
     finally:
         get_app_settings.cache_clear()
     assert captured["interactive"] is expected
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_stays_noninteractive_when_the_handler_is_built_that_way(monkeypatch):
+    """A scheduled/cron turn (cowork/scheduler.py) builds the handler with
+    interactive=False because nobody is watching to answer an ask_user card —
+    that must hold even when the account has ask_user_enabled on."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_ASK_USER_ENABLED", "true")
+    get_app_settings.cache_clear()
+    saved, captured = {}, {}
+    handler = _remote_handler(monkeypatch, saved)
+    handler.interactive = False
+
+    async def fake_replies(**kwargs):
+        captured.update(kwargs)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    try:
+        await handler._produce_remote(
+            conv_id=uuid4(), input_text="hi", original_content="hi",
+            model="anton", harness_id="anton", buffer=_RecBuffer(),
+        )
+    finally:
+        get_app_settings.cache_clear()
+    assert captured["interactive"] is False
 
 
 _ASK_STEP = {"step": "ask_user", "id": "ask:1", "prompt": "Which database?",
