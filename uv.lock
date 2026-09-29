@@ -405,6 +405,7 @@ wheels = [
 name = "cowork-server"
 source = { editable = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "alembic" },
     { name = "anton-agent" },
     { name = "anyio" },
@@ -450,6 +451,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.14" },
     { name = "aiohttp", marker = "extra == 'channels'", specifier = ">=3.9.0" },
     { name = "alembic", specifier = ">=1.17.0" },
     { name = "anton-agent", git = "https://github.com/mindsdb/anton.git?branch=main" },
