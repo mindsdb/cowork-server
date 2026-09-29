@@ -38,6 +38,7 @@ from cowork.coding.engines.base import (
     TerminalOutputHandler,
 )
 from cowork.coding.engines.codex_extensions import add_extension_response
+from cowork.coding.engines.codex_models import model_catalog
 from cowork.coding.processes import (
     TERMINAL_ENV_MARKER,
     executable_name,
@@ -247,8 +248,18 @@ class CodexEngineSession:
         # a turn-completion reap recognises terminal tabs by it.
         self._terminal_commands: set[tuple[str, ...]] = set()
         self._goal_states: dict[str, Any] = {}
-        self._client.start()
+        self._catalog_resources = contextlib.ExitStack()
         try:
+            catalog_path = self._catalog_resources.enter_context(model_catalog(
+                endpoint,
+                config.inference_api_key or codex_config.LOCAL_PROXY_TOKEN,
+                client_config.client_version,
+                config.model,
+            ))
+            client_config.config_overrides += (
+                f"model_catalog_json={codex_config.toml_string(str(catalog_path))}",
+            )
+            self._client.start()
             self._client.initialize()
             self._register_skill_roots()
             if existing_session_id:
@@ -256,7 +267,10 @@ class CodexEngineSession:
             else:
                 response = self._client.thread_start(launch.thread_params)
         except Exception:
-            self._client.close()
+            try:
+                self._client.close()
+            finally:
+                self._catalog_resources.close()
             raise
         self._session_id = response.thread.id
         self._notification_thread = threading.Thread(
@@ -738,7 +752,10 @@ class CodexEngineSession:
         try:
             terminate_descendants(self._app_server_pid())
         finally:
-            self._client.close()
+            try:
+                self._client.close()
+            finally:
+                self._catalog_resources.close()
 
     def _cancel_watchdog(self, watch: _CancelWatch) -> None:
         if not self._settled(watch.acknowledged, _CANCEL_WATCHDOG_TIMEOUT_SECONDS):
