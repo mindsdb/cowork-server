@@ -13,9 +13,14 @@ import json
 import logging
 import time
 import uuid
+from datetime import datetime
 
 from cowork.build_info import KEY_ANTON_VERSION, account_ids, build_trace_metadata, surface
-from cowork.handlers.turn_errors import WORKER_UNRESPONSIVE_TYPE_NAME, remote_turn_error
+from cowork.handlers.turn_errors import (
+    RESET_AT_CODES,
+    WORKER_UNRESPONSIVE_TYPE_NAME,
+    remote_turn_error,
+)
 from cowork.services.providers import minds_chat_base_url
 from cowork.db.scoped import TenantScope
 from cowork.services import product_permissions
@@ -351,6 +356,28 @@ UNRESPONSIVE_WORKER_ERROR = (
 )
 
 
+def _remote_reset_at(*, code: str, value: object) -> str | None:
+    """The worker's ``reset_at`` for a failed turn, or None to leave it off.
+
+    anton's worker sends the gate's reset instant on a billing stop the gate
+    timed, and scratchpad-controller forwards it beside ``error``. It is kept
+    only for the codes whose card offers waiting (``RESET_AT_CODES``) and only
+    as an instant with a UTC offset: a naive time names a different moment in
+    every timezone, so the card would count down to the wrong one. Returned in
+    ``datetime.isoformat()``'s extended form, which a browser's ``Date``
+    parses; Python also accepts compact forms that it does not.
+    """
+    if code not in RESET_AT_CODES or not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.utcoffset() is None:
+        return None
+    return parsed.isoformat()
+
+
 def step_stream_events(data: dict) -> list:
     """Reconstruct anton Stream* events from one `turn_step` reply.
 
@@ -621,9 +648,14 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                         yield "turn_failed", _workspace_permission_failure()
                         return
                     # Classify once; the SSE frame and the persisted events
-                    # log must carry the same (code, message).
+                    # log must carry the same (code, message), and the same
+                    # reset_at. An older worker sends no reset_at, and its
+                    # frame stays as it was.
                     code, message = remote_turn_error(data.get("error"))
                     data = {**data, "code": code, "message": message}
+                    reset_at = _remote_reset_at(code=code, value=data.pop("reset_at", None))
+                    if reset_at is not None:
+                        data["reset_at"] = reset_at
                     logger.warning(
                         "Remote turn failed conversation=%s correlation_id=%s error=%s",
                         conversation_id, corr, data.get("error"),

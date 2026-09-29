@@ -78,13 +78,30 @@ def test_rows_are_kept_out_of_the_replayable_event_log(persister):
 
 def test_remote_path_gates_rows_on_a_clean_finish():
     """Rows arrive before the terminal event and persist() also runs on failure
-    and cancellation, so the gate is what keeps a torn turn text-only."""
+    and cancellation, so the gate is what keeps a torn turn text-only.
+
+    Two `persist(clean=True)` call sites live on the SAME clean-finish path:
+    one fires as soon as the terminal frame is about to go out,
+    so the assistant message's real id can ride it; the other is the
+    original unconditional call after the formatter loop drains, kept as a
+    fallback for a formatter that returns without yielding a terminal frame
+    (persist() is idempotent, so it's a no-op once the first one ran). The
+    failure/cancellation branches below must still never opt into `clean`.
+    """
     src = _norm(r.ResponsesHandler._produce_remote)
     assert "def persist(*, clean: bool = False)" in src
     assert "tool_rows=turn_rows if clean else None" in src
     assert "persist(clean=True)" in src
-    # Exactly one caller opts in; the failure paths must not.
-    assert src.count("persist(clean=True)") == 1
+    # Both clean=True call sites live on the success path: the early one
+    # fires as the terminal frame is about to go out, so the
+    # assistant message's real id can ride it; the other is the original
+    # unconditional call after the formatter loop drains, kept as a fallback
+    # for a formatter that returns without yielding a terminal frame
+    # (persist() is idempotent, so it's a no-op once the first one ran).
+    assert src.count("persist(clean=True)") == 2
+    # Failure, user Stop, shutdown and watchdog interruption all use plain
+    # persist(): none may retain a torn set of tool rows as a clean finish.
+    assert src.count("persist()") == 4
 
 
 IN_PROCESS_PERSISTERS = [
