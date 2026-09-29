@@ -40,6 +40,14 @@ One current worker advertises one concurrent run because it owns one retained en
 
 The runtime persists its computer identity and private token in its own mode-`0600` data directory, then reconnects with bounded backoff after transient control-plane outages. Renaming a Computer updates its durable display name without rotating identity; revoking it increments the registration epoch and invalidates its runtime credential. The desktop control plane remains loopback-only, so cross-device development builds must be configured with a reachable control-plane URL. A hosted control plane naturally supplies its HTTPS origin without changing the runtime command or protocol.
 
+### Codex model metadata
+
+Before starting or resuming an app-server session, the Codex adapter fetches the native model catalog through the configured inference proxy using its scoped token. The request carries the SDK's `client_version` and `originator: codex_mindshub_cowork`; the proxy forwards the originator so inference returns native metadata rather than the model picker's OpenAI-compatible list.
+
+The adapter supplies a private, per-session catalog file through Codex's `model_catalog_json` startup override. It retains the file until the app-server closes and removes it on startup failure. Fetch failures, invalid catalog shapes, and missing selected models stop startup rather than silently using fallback metadata.
+
+Upstream instructions, context windows, and reasoning capabilities remain intact. The adapter defaults missing `supports_parallel_tool_calls` to `false` for the pinned 0.147.0 runtime, which requires that field. The separate preventive auto-compaction limit remains unchanged.
+
 ## Protocol and fencing
 
 The protocol version is `1.0`. Runtime requests carry a computer identity, lease ID, execution epoch and monotonic per-run event sequence where applicable.
