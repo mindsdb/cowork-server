@@ -20,6 +20,7 @@ from cowork.coding.contracts import (
 from cowork.coding.git_transport import ALLOWED_GIT_PROTOCOLS
 from cowork.coding.local_copy import LocalCopyError, LocalCopyManager
 from cowork.coding.workspace_key import managed_key
+from cowork.common.paths import O_NOFOLLOW, open_fd
 from cowork.common.settings.app_settings import get_app_settings
 
 
@@ -895,8 +896,7 @@ class WorkspaceManager:
             if before.st_size > MAX_TEXT_DIFF_BYTES:
                 return DiffFile(path=rel_path, status="??", patch="Binary or large new file", binary=True)
 
-            flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-            descriptor = os.open(path, flags)
+            descriptor = open_fd(path, os.O_RDONLY | O_NOFOLLOW)
             with os.fdopen(descriptor, "rb") as handle:
                 opened = os.fstat(handle.fileno())
                 # On platforms without O_NOFOLLOW, also refuse a path swapped
