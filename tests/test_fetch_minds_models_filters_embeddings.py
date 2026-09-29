@@ -98,7 +98,7 @@ def test_decision_models_are_excluded_from_picker_and_cached_catalog(monkeypatch
     assert listing.labels == {}
     assert listing.providers == {}
     assert listing.families == {}
-    assert providers.cached_minds_models("https://api.mindshub.ai") == listing
+    assert providers.cached_minds_models("https://api.mindshub.ai", api_key="mdb_test") == listing
 
 
 def test_embedding_ids_are_dropped_when_the_endpoint_has_no_flag(monkeypatch):

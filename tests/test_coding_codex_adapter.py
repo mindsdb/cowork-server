@@ -117,6 +117,37 @@ def test_codex_model_discovery_classifies_authentication_failures(
         )
 
 
+def test_codex_model_discovery_reports_an_unreadable_model_list_plainly(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A gzip body without a Content-Encoding header reaches httpx undecoded.
+    response = httpx.Response(
+        200,
+        content=b"\x1f\x8b\x08\x00compressed",
+        headers={"content-type": "application/json"},
+        request=httpx.Request("GET", "https://api.mindshub.ai/v1/models"),
+    )
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def get(self, *_args, **_kwargs) -> httpx.Response:
+            return response
+
+    monkeypatch.setattr(codex_module.httpx, "Client", lambda **_kwargs: FakeClient())
+
+    with pytest.raises(codex_module.ModelDiscoveryUnavailableError, match="Couldn't load models from MindsHub"):
+        codex_module.CodexEngine().discover_models(
+            EngineCredentials(minds_url="https://api.mindshub.ai", minds_api_key="mdb_test"),
+        )
+    assert "content-encoding None" in caplog.text
+    assert "codec" not in caplog.text
+
+
 def test_codex_child_environment_never_contains_the_real_mindshub_key() -> None:
     environment = codex_config.client_environment(Path("/tmp/codex-home"))
     assert environment == {

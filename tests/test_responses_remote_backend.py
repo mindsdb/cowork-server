@@ -830,6 +830,80 @@ async def test_produce_remote_persists_on_failure(monkeypatch):
                                    "request_id": "corr-remote-failure"}
 
 
+_RESET_AT = "2026-09-26T00:00:00+00:00"
+
+
+async def _remote_failure_frames(monkeypatch, failed_data):
+    """Run one remote turn that ends in ``failed_data``.
+
+    Returns the streamed response.failed payload and the persisted events.
+    """
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_failed", failed_data
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    buffer = _RecBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+        turn_llm={"correlation_id": "corr-reset-at"},
+    )
+    failed = [f for f in buffer.frames if "response.failed" in f]
+    assert len(failed) == 1
+    return json.loads(failed[0].split("data: ", 1)[1].strip()), saved["events"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "code", "message"),
+    [
+        (
+            "FreeServingPausedError: paused",
+            "free_serving_paused",
+            (
+                "Free MindsHub Air is paused for everyone until the daily budget resets. "
+                "Add credits to keep working now."
+            ),
+        ),
+        (
+            "AllowanceExhaustedError: exhausted",
+            "included_allowance_exhausted",
+            "You have no free MindsHub Air allowance left. Add credits to keep working now.",
+        ),
+    ],
+)
+async def test_produce_remote_failure_carries_the_workers_reset_at(
+    monkeypatch, error, code, message
+):
+    # The hosted card says when the free way forward comes back, as the desktop
+    # one does. The streamed frame and the persisted event must agree, or the
+    # card loses the time on reload.
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": error, "code": code, "message": message, "reset_at": _RESET_AT,
+    })
+    expected = {
+        "type": "response.failed", "code": code, "error": message,
+        "reset_at": _RESET_AT, "request_id": "corr-reset-at",
+    }
+    assert frame == expected
+    assert events[-1] == expected
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_failure_without_reset_at_keeps_its_shape(monkeypatch):
+    # An older worker sends none, so the frame stays exactly as before.
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": "FreeServingPausedError: paused", "code": "free_serving_paused",
+        "message": "Free MindsHub Air is paused.",
+    })
+    assert "reset_at" not in frame
+    assert "reset_at" not in events[-1]
+
+
 @pytest.mark.asyncio
 async def test_produce_remote_mints_a_request_id_when_none_was_resolved_upstream(monkeypatch):
     # Most turns never go through the router gate that pre-mints a correlation
@@ -1906,3 +1980,140 @@ async def test_a_forced_continuation_persists_only_the_replacement(monkeypatch):
     )
 
     assert saved["assistant"] == "REPLACEMENT"
+
+
+# ── The persisted assistant message id rides the completion frame ──
+
+def _remote_handler_with_message_id(monkeypatch, saved, *, assistant_message_id):
+    """Same DB-layer fake as _remote_handler, but save_assistant_turn returns
+    a real (fake) Message so the completion-frame wiring can be asserted —
+    _remote_handler's own fake returns None, which every other test in this
+    file relies on NOT mattering."""
+    handler = _handler()
+    handler.principal = object()
+    handler._remote_seed_history = lambda session, conv_id: ([], None)
+
+    class FakeConversationService:
+        def __init__(self, session):
+            pass
+
+        def get_conversation(self, conv_id):
+            return object()
+
+        def save_user_message(self, conv_id, content, *, pending=False):
+            saved["user"] = content
+            return SimpleNamespace(id=uuid4())
+
+        def finalize_pending(self, conv_id, message_id=None):
+            pass
+
+        def save_assistant_turn(self, conv_id, text, events, harness=None, tool_rows=None):
+            saved["assistant"] = text
+            saved["events"] = events
+            if assistant_message_id is None:
+                return None
+            return SimpleNamespace(id=assistant_message_id)
+
+    class FakeSession:
+        def commit(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
+    monkeypatch.setattr(responses_mod, "ScopedSession", lambda s, scope: FakeSession())
+    monkeypatch.setattr(responses_mod, "get_open_session", lambda: None)
+    monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: _FakeScope())
+    return handler
+
+
+def _payload(frame):
+    return json.loads(frame.split("data: ", 1)[1])
+
+
+class _RecordingBuffer:
+    def __init__(self):
+        self.frames: list[str] = []
+
+    async def append(self, kind, record):
+        self.frames.append(record["sse"])
+
+    async def close(self, reason):
+        self.frames.append(f"CLOSE:{reason}")
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_completed_frame_carries_the_assistant_message_id(monkeypatch):
+    saved = {}
+    real_id = uuid4()
+    handler = _remote_handler_with_message_id(monkeypatch, saved, assistant_message_id=real_id)
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "hello"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    completed = [f for f in buffer.frames if f.startswith("event: response.completed")]
+    assert len(completed) == 1
+    assert _payload(completed[0])["assistant_message_id"] == str(real_id)
+    # persist() only ran once despite the early + fallback call sites.
+    assert saved["assistant"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_failed_frame_carries_the_id_when_something_persisted(monkeypatch):
+    saved = {}
+    real_id = uuid4()
+    handler = _remote_handler_with_message_id(monkeypatch, saved, assistant_message_id=real_id)
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "partial"}
+        yield "turn_failed", {"error": "boom", "code": "anton_error", "message": "An unexpected error occurred."}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+        turn_llm={"correlation_id": "corr-1"},
+    )
+
+    failed = [f for f in buffer.frames if f.startswith("event: response.failed")]
+    assert len(failed) == 1
+    payload = _payload(failed[0])
+    assert payload["assistant_message_id"] == str(real_id)
+    # The failure event persisted alongside it does NOT carry the id (same
+    # convention as request_id/code) — only the live wire frame does.
+    assert "assistant_message_id" not in saved["events"][-1]
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_completed_frame_omits_the_id_when_nothing_persisted(monkeypatch):
+    """An empty turn (save_assistant_turn's own early-return) must not crash
+    the frame-injection path, and must OMIT the field, not send it as null."""
+    saved = {}
+    handler = _remote_handler_with_message_id(monkeypatch, saved, assistant_message_id=None)
+
+    async def fake_replies(**kwargs):
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    completed = [f for f in buffer.frames if f.startswith("event: response.completed")]
+    assert len(completed) == 1
+    assert "assistant_message_id" not in _payload(completed[0])

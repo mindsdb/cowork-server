@@ -93,7 +93,11 @@ async def test_test_providers_does_not_persist(monkeypatch):
     from cowork.api.v1.endpoints import settings as ep
 
     async def fake_ping(providers):
-        return {"anthropic": "ok"}, {"anthropic": "connected"}
+        from cowork.services.providers import ProviderPingResults
+
+        return ProviderPingResults(
+            statuses={"anthropic": "ok"}, details={"anthropic": "connected"}, denials={}
+        )
 
     monkeypatch.setattr(ep, "ping_providers", fake_ping)
 
