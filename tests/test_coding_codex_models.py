@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import itertools
 import json
 import sys
 import tomllib
@@ -19,17 +20,20 @@ from cowork.coding.engines.base import EngineCredentials, EngineSessionConfig
 def catalog() -> dict:
     return {"models": [{
         "slug": "fable",
+        "visibility": "list",
         "context_window": 200000,
         "base_instructions": "Version-matched upstream instructions",
         "supported_reasoning_levels": [{"effort": "high", "description": "High"}],
     }]}
 
 
-def mock_catalog(monkeypatch, payload, status=200):
+def mock_catalog(monkeypatch, payload, status=200, content=None):
     requests = []
 
     def respond(request):
         requests.append(request)
+        if content is not None:
+            return httpx.Response(status, content=content)
         return httpx.Response(status, json=payload)
 
     client_class = httpx.Client
@@ -65,7 +69,9 @@ def test_catalog_preserves_explicit_parallel_tool_support(monkeypatch, catalog):
     ({"data": [{"id": "fable"}]}, "native Codex model catalog"),
     ({"models": []}, "native Codex model catalog"),
     ({"models": [None]}, "native Codex model catalog"),
-    ({"models": [{"slug": "other"}]}, "selected model is missing"),
+    ({"models": [{"slug": "other", "visibility": "list"}]}, "selected model is missing"),
+    ({"models": [{"slug": "fable", "visibility": "hide"}]}, "selected model is missing"),
+    ({"models": [{"slug": "fable"}]}, "selected model is missing"),
 ])
 def test_catalog_rejects_fallback_conditions(monkeypatch, payload, message):
     mock_catalog(monkeypatch, payload)
@@ -106,6 +112,25 @@ def test_catalog_reports_transport_and_json_errors(monkeypatch, failure):
     with pytest.raises(RuntimeError, match="Unable to load Codex model metadata"):
         with codex_models.model_catalog("http://proxy", "token", "0.147.0", "fable"):
             pytest.fail("Failed discovery must not start Codex")
+
+
+def test_catalog_deadline_bounds_a_trickled_response(monkeypatch, catalog):
+    # Each chunk arrives within the per-operation timeout but advances the clock.
+    clock = itertools.count(step=10)
+    monkeypatch.setattr(codex_models.time, "monotonic", lambda: next(clock))
+    body = json.dumps(catalog).encode()
+    chunks = []
+
+    def trickle():
+        for byte in body:
+            chunks.append(byte)
+            yield bytes([byte])
+
+    mock_catalog(monkeypatch, catalog, content=trickle())
+    with pytest.raises(RuntimeError, match="Unable to load Codex model metadata"):
+        with codex_models.model_catalog("http://proxy", "token", "0.147.0", "fable"):
+            pytest.fail("A fetch past its deadline must not start Codex")
+    assert len(chunks) < len(body)
 
 
 @pytest.mark.parametrize("existing_session_id", [None, "existing-thread"])
