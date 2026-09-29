@@ -2351,6 +2351,132 @@ def test_project_fork_keeps_every_folder_change_isolated_and_reviewable(tmp_path
     assert engine.forked_additional_dirs[-1] == tuple(child.additional_dirs)
 
 
+def test_existing_task_can_adopt_commands_added_to_the_project_later(tmp_path: Path) -> None:
+    app = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(
+        ProjectCreateRequest(
+            name="Late checks",
+            folders=[ProjectFolder(id="app", name="App", path=str(app))],
+            default_engine_id="fake",
+            default_model="fake-model",
+        )
+    )
+    early = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Started before any checks existed"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, early.id, SessionStatus.completed)
+    assert service.validate_project(early.id) == []
+
+    live = service.projects.get(project.id)
+    service.projects.update(project.id, ProjectUpdateRequest(resources=[
+        resource.model_copy(update={
+            "commands": [
+                ProjectCommand(
+                    id="late-check",
+                    label="Late check",
+                    argv=[sys.executable, "-c", "print('late')"],
+                    phase="validate",
+                ),
+                ProjectCommand(id="serve", label="Serve", argv=[sys.executable, "-m", "http.server"], phase="run"),
+            ],
+        })
+        for resource in live.resources
+    ]))
+
+    # The snapshot still rules until the user asks for the new commands.
+    assert service.validate_project(early.id) == []
+    assert service.project_action_page(early.id).items == []
+
+    summary = service.refresh_project_commands(early.id)
+
+    assert (summary.validate_count, summary.run_count) == (1, 1)
+    results = service.validate_project(early.id)
+    assert [(result["label"], result["return_code"]) for result in results] == [("Late check", 0)]
+    assert [item.id for item in service.project_action_page(early.id).items] == ["serve"]
+    assert service.get_session(early.id).resource_ids == early.resource_ids
+    assert any(event.title == "Project commands updated" for event in service.events(early.id).items)
+
+    # New tasks keep receiving the saved commands without any extra step.
+    late = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Started after"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, late.id, SessionStatus.completed)
+    assert [result["label"] for result in service.validate_project(late.id)] == ["Late check"]
+
+
+def test_refreshing_commands_reaches_a_leased_remote_worker_before_reporting_success(tmp_path: Path) -> None:
+    service = service_with(tmp_path, FakeEngine())
+    created, remote = remote_task(tmp_path, service)
+    run, lease_id = service.control.acquire_lease(remote.id)
+    runtime_event(service, run, lease_id, 1, "status", {"status": "ready"})
+    live = service.projects.get(created.project_id)
+    check = ProjectCommand(id="late-check", label="Late check", argv=["npm", "test"], phase="validate")
+    service.projects.update(live.id, ProjectUpdateRequest(resources=[
+        resource.model_copy(update={"commands": [check]}) for resource in live.resources
+    ]))
+
+    outcome: dict[str, object] = {}
+
+    def refresh() -> None:
+        try:
+            outcome["summary"] = service.refresh_project_commands(created.id)
+        except Exception as exc:  # noqa: BLE001 - surfaced through the assertion below
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=refresh)
+    worker.start()
+    deadline = time.monotonic() + 5
+    pushed = None
+    while pushed is None and time.monotonic() < deadline:
+        pushed = next((
+            item for item in service.control.claim_commands(run.id, remote.id, lease_id, run.epoch)
+            if item.kind == "operation" and item.payload.get("operation") == "refresh_project"
+        ), None)
+        if pushed is None:
+            time.sleep(0.02)
+    assert pushed is not None, "the refresh never reached the leased worker"
+    # The worker receives exactly the commands that were saved, keyed by resource.
+    assert pushed.payload["commands"] == {"repo": [check.model_dump(mode="json")]}
+    # Success is not reported until the worker has taken the commands.
+    assert worker.is_alive()
+
+    service.acknowledge_runtime_command(run.id, pushed.id, run.computer_id, lease_id, run.epoch, {"resources": 1}, None)
+    worker.join(timeout=5)
+
+    assert "error" not in outcome, outcome.get("error")
+    summary = outcome["summary"]
+    assert (summary.validate_count, summary.run_count) == (1, 0)
+    task = service.control.store.get_task(created.task_id)
+    assert [command.id for command in task.execution_project.resources[0].commands] == ["late-check"]
+
+
+def test_refreshing_commands_for_an_unleased_remote_run_only_updates_the_snapshot(tmp_path: Path) -> None:
+    service = service_with(tmp_path, FakeEngine())
+    created, remote = remote_task(tmp_path, service)
+    live = service.projects.get(created.project_id)
+    check = ProjectCommand(id="late-check", label="Late check", argv=["npm", "test"], phase="validate")
+    service.projects.update(live.id, ProjectUpdateRequest(resources=[
+        resource.model_copy(update={"commands": [check]}) for resource in live.resources
+    ]))
+
+    summary = service.refresh_project_commands(created.id)
+
+    assert (summary.validate_count, summary.run_count) == (1, 0)
+    run, lease_id = service.control.acquire_lease(remote.id)
+    kinds = [item.kind for item in service.control.claim_commands(run.id, remote.id, lease_id, run.epoch)]
+    assert "operation" not in kinds
+    # The lease itself carries the refreshed snapshot, so nothing needed pushing.
+    lease = service.control.store.get_task(created.task_id)
+    assert [command.id for command in lease.execution_project.resources[0].commands] == ["late-check"]
+
+
 def test_scoped_task_validation_and_fork_use_immutable_project_snapshot(tmp_path: Path) -> None:
     app = repository(tmp_path)
     docs = tmp_path / "docs"

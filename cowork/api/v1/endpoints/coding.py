@@ -45,7 +45,7 @@ from cowork.coding.contracts import (
     GitIdentity,
     GitIdentityRequest,
 )
-from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, StateConflict
+from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, ModelDiscoveryUnavailableError, StateConflict
 from cowork.coding.contracts import ModeTurnRequest
 from cowork.coding.questions import QuestionResponse
 from cowork.coding.control_models import TaskResourceScope
@@ -72,6 +72,7 @@ from cowork.coding.project_models import (
     ProjectActionPage,
     ProjectActionRunRequest,
     ProjectActionRunResponse,
+    ProjectCommandRefresh,
     ProjectCreateRequest,
     ProjectFolder,
     ProjectPage,
@@ -85,6 +86,7 @@ from cowork.coding.project_models import (
     canonical_model_id,
 )
 from cowork.coding.reasoning import check_reasoning_effort
+from cowork.coding.repository_setup import RepositorySetupService
 from cowork.coding.redaction import redact_text
 from cowork.coding.runtime_protocol import (
     ComputerUpdateRequest,
@@ -147,6 +149,13 @@ def _credentials(settings) -> EngineCredentials:
     )
 
 
+def _model_levels(settings):
+    """The cached MindsHub listing fetched with this install's own credential."""
+    return cached_minds_models(
+        settings.minds_url, api_key=provider_api_key_str(settings, Provider.MINDS_CLOUD)
+    )
+
+
 def _integration_service(scope: ScopeDep):
     integrations = DeveloperIntegrationService(scope)
     try:
@@ -164,6 +173,12 @@ def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, ModelDiscoveryAuthenticationError):
         return HTTPException(
             status_code=401,
+            detail=str(exc),
+            headers={"X-MindsHub-Error-Code": exc.code},
+        )
+    if isinstance(exc, ModelDiscoveryUnavailableError):
+        return HTTPException(
+            status_code=502,
             detail=str(exc),
             headers={"X-MindsHub-Error-Code": exc.code},
         )
@@ -342,7 +357,7 @@ def create_code_project(body: ProjectCreateRequest, session: SessionDep, scope: 
     if body.default_reasoning_effort is not None:
         settings = _settings(session, scope)
         model = canonical_model_id(body.default_model or settings.coding_agent_model)
-        _call(check_reasoning_effort, model, body.default_reasoning_effort, cached_minds_models(settings.minds_url))
+        _call(check_reasoning_effort, model, body.default_reasoning_effort, _model_levels(settings))
     return _call(_service().projects.create, body)
 
 
@@ -356,7 +371,7 @@ def update_code_project(project_id: str, body: ProjectUpdateRequest, session: Se
     if body.default_reasoning_effort is not None:
         current = _call(_service().projects.get, project_id)
         model = canonical_model_id(body.default_model) if body.default_model else current.default_model
-        _call(check_reasoning_effort, model, body.default_reasoning_effort, cached_minds_models(_settings(session, scope).minds_url))
+        _call(check_reasoning_effort, model, body.default_reasoning_effort, _model_levels(_settings(session, scope)))
     return _call(_service().projects.update, project_id, body)
 
 
@@ -373,6 +388,27 @@ def inspect_code_project_folders(project_id: str):
 @router.post("/project-resources/inspect")
 def inspect_local_project_resource(body: ProjectFolder):
     return _call(_service().projects.resolve_local_resource, body)
+
+
+@router.get("/projects/{project_id}/repository-status")
+def code_project_repository_status(project_id: str):
+    service = _service()
+    project = _call(service.projects.get, project_id)
+    return {"items": _call(RepositorySetupService(service.workspaces, service.control.local_computer.id).status, project)}
+
+
+@router.get("/projects/{project_id}/repositories/{resource_id}/diff")
+def code_project_repository_diff(project_id: str, resource_id: str):
+    service = _service()
+    project = _call(service.projects.get, project_id)
+    return {"files": _call(RepositorySetupService(service.workspaces, service.control.local_computer.id).diff, project, resource_id)}
+
+
+@router.get("/projects/{project_id}/repositories/{resource_id}/branches")
+def code_project_repository_branches(project_id: str, resource_id: str):
+    service = _service()
+    project = _call(service.projects.get, project_id)
+    return {"items": _call(RepositorySetupService(service.workspaces, service.control.local_computer.id).branches, project, resource_id)}
 
 
 @router.get("/projects/{project_id}/resources")
@@ -475,7 +511,7 @@ def create_session(body: SessionCreateRequest, session: SessionDep, scope: Scope
         default_engine=settings.coding_agent_engine,
         default_model=settings.coding_agent_model,
         code_skills=CodeSkillService(scope),
-        model_levels=cached_minds_models(settings.minds_url),
+        model_levels=_model_levels(settings),
     )
 
 
@@ -579,7 +615,7 @@ def update_session(session_id: str, body: SessionUpdateRequest, session: Session
     if body.reasoning_effort is not None:
         current = _call(_service().get_session, session_id)
         model = canonical_model_id(body.model) if body.model else current.model
-        _call(check_reasoning_effort, model, body.reasoning_effort, cached_minds_models(_settings(session, scope).minds_url))
+        _call(check_reasoning_effort, model, body.reasoning_effort, _model_levels(_settings(session, scope)))
     return _call(_service().update_session_config, session_id, body)
 
 
@@ -757,6 +793,11 @@ def run_project_action(
 @router.get("/sessions/{session_id}/project-actions", response_model=ProjectActionPage)
 def project_actions(session_id: str):
     return _call(_service().project_action_page, session_id)
+
+
+@router.post("/sessions/{session_id}/project-commands/refresh", response_model=ProjectCommandRefresh)
+def refresh_project_commands(session_id: str):
+    return _call(_service().refresh_project_commands, session_id)
 
 
 @router.post("/sessions/{session_id}/terminals", response_model=TerminalTabState)

@@ -18,7 +18,7 @@ from cowork.coding.contracts import (
     TaskWorkspace,
     WorkspaceKind,
 )
-from cowork.coding.control_models import RunStatus, TaskControlSnapshot
+from cowork.coding.control_models import RunStatus, TaskControlSnapshot, TaskResourceScope
 from cowork.coding.control_service import ControlPlaneService
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.engines.registry import CodingEngineRegistry
@@ -26,6 +26,7 @@ from cowork.coding.playbooks import PlaybookService
 from cowork.coding.project_models import CodeProject, canonical_model_id
 from cowork.coding.project_service import CodeProjectService
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
+from cowork.coding.repository_setup import task_project
 from cowork.coding.reasoning import ModelLevels, resolve_reasoning_effort
 from cowork.coding.skill_models import SkillResolution
 from cowork.coding.skill_runtime import SkillRuntimeResolver
@@ -147,6 +148,14 @@ class CodingSessionFactory:
         model_levels: ModelLevels | None = None,
     ) -> CodingSession:
         project = self.projects.get(request.project_id) if request.project_id else None
+        if request.repository_setup is not None and project is not None:
+            if request.computer_id not in {None, self.control.local_computer.id}:
+                raise ValueError("Repository choices are available on this computer. Switch to this computer first")
+            project = task_project(
+                project, request.repository_setup, request.resource_ids,
+                local_computer_id=self.control.local_computer.id,
+            )
+            project = self.control.runtime_project(project, TaskResourceScope(), self.control.local_computer.id)
         engine_id = request.engine_id or (project.default_engine_id if project else default_engine)
         model = canonical_model_id(request.model or (project.default_model if project else default_model))
         # A task chooses its own effort; otherwise it inherits the project's,
@@ -172,8 +181,9 @@ class CodingSessionFactory:
             prompt=request.prompt,
             project=project,
             requested_resource_ids=request.resource_ids,
-            computer_id=self.control.local_computer.id if request.task_mode == "plan" else request.computer_id,
+            computer_id=self.control.local_computer.id if request.task_mode == "plan" or request.repository_setup is not None else request.computer_id,
             engine_id=engine_id,
+            repository_setup=request.repository_setup,
             standalone_computer_id=self.control.local_computer.id if project is None else None,
         )
         if control_snapshot.computer.id != self.control.local_computer.id:
@@ -228,6 +238,9 @@ class CodingSessionFactory:
                 list(preparation.task_workspaces) if preparation else [],
                 preparation.fallback_workspace if preparation else None,
             )
+            if request.repository_setup and request.repository_setup.branch and preparation:
+                for workspace in preparation.task_workspaces:
+                    self.project_workspaces.rollback_task_branch(workspace)
             raise
 
     def _prepare_local_session(
@@ -263,12 +276,12 @@ class CodingSessionFactory:
             )
 
         selected_project = self._selected_project(project, request.resource_ids)
-        prepared = self.project_workspaces.prepare(session_id, selected_project)
         guidance, playbook_summary = (
             self.playbooks.guidance(selected_project.id)
             if selected_project.playbook
             else ("", None)
         )
+        prepared = self.project_workspaces.prepare(session_id, selected_project, request.repository_setup)
         permission_mode = (
             request.permission_mode
             if "permission_mode" in request.model_fields_set

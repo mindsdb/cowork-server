@@ -31,7 +31,7 @@ from cowork.coding.contracts import (
     WorkspaceInspection,
 )
 from cowork.coding.control_errors import StateConflict
-from cowork.coding.control_models import RunStatus
+from cowork.coding.control_models import CodeTask, RunStatus
 from cowork.coding.control_service import ControlPlaneService
 from cowork.coding.control_store import ControlPlaneStore
 from cowork.coding.delivery import ProjectDeliveryService
@@ -45,6 +45,7 @@ from cowork.coding.project_models import (
     ProjectActionPage,
     ProjectActionRunRequest,
     ProjectActionRunResponse,
+    ProjectCommandRefresh,
 )
 from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.project_tasks import ProjectTaskOperations
@@ -65,7 +66,7 @@ from cowork.coding.store import CodingStore
 from cowork.coding.task_delivery import TaskDeliveryService
 from cowork.coding.terminal_service import TaskTerminalService
 from cowork.coding.turns import RunningTurn, TurnExecutor
-from cowork.coding.workspace import WorkspaceManager
+from cowork.coding.workspace import WorkspaceError, WorkspaceManager
 from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
@@ -471,6 +472,72 @@ class CodingService(
 
     def project_action_page(self, session_id: str) -> ProjectActionPage:
         return self.project_actions.list(session_id)
+
+    def refresh_project_commands(self, session_id: str) -> ProjectCommandRefresh:
+        """Let an existing task adopt the commands now saved in Project settings.
+
+        A task freezes its project at creation, so commands added later reach
+        only new tasks. This is the explicit opt-in for an older task; it
+        touches commands alone and leaves the task's resource scope frozen.
+        """
+
+        session = self.get_session(session_id)
+        if not session.project_id or not session.task_id:
+            raise WorkspaceError("This task is not linked to a Code Project")
+        project = self.projects.get(session.project_id)
+        task = self.control.refresh_task_commands(session.task_id, project)
+        self._push_commands_to_active_lease(session, task)
+        # The snapshot holds only the resources in the task's scope, so its
+        # commands are exactly the ones this task can be offered.
+        commands = [
+            command
+            for resource in (task.execution_project.resources if task.execution_project else [])
+            for command in resource.commands
+        ]
+        summary = ProjectCommandRefresh(
+            validate_count=sum(command.phase == "validate" for command in commands),
+            run_count=sum(command.phase == "run" for command in commands),
+        )
+        self._emit(
+            session.id,
+            CodingEvent(
+                type=EventType.session,
+                title="Project commands updated",
+                text=(
+                    f"This task now uses the commands saved in Project settings: "
+                    f"{summary.validate_count} validation, {summary.run_count} run."
+                ),
+                phase="completed",
+            ),
+        )
+        return summary
+
+    def _push_commands_to_active_lease(self, session: CodingSession, task: CodeTask) -> None:
+        """A leased remote worker holds its own copy of the project, so hand it the new commands.
+
+        A run that has not been leased yet reads the refreshed snapshot when
+        it is, and a finished run cannot run checks at all, so only an active
+        lease needs the push. If the worker does not take it, the saved
+        commands stay saved and the caller hears that the computer lagged,
+        rather than a success it would contradict on the next Run checks.
+        """
+
+        if not self._is_remote(session) or not session.run_id or task.execution_project is None:
+            return
+        run = self.control.store.get_run(session.run_id)
+        if not run.lease_id or run.status in {RunStatus.completed, RunStatus.cancelled, RunStatus.failed}:
+            return
+        commands = {
+            resource.id: [command.model_dump(mode="json") for command in resource.commands]
+            for resource in task.execution_project.resources
+        }
+        try:
+            self.remote.operation(session, "refresh_project", {"commands": commands})
+        except RuntimeError as exc:
+            raise WorkspaceError(
+                "The commands were saved, but the selected computer has not picked them up yet "
+                f"({exc}). Retry once it is online."
+            ) from exc
 
     def _execution_project(self, session: CodingSession) -> CodeProject | None:
         if not session.task_id:

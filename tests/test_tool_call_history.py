@@ -204,6 +204,16 @@ def _visible(session, conv):
     ]
 
 
+def _assistant_message_id(session, conv, answer_text):
+    """delete_turn is anchored by message id, not a UI position."""
+    return next(
+        m["id"]
+        for m in ConversationService(session).get_messages(conv.id)
+        if (m["role"].value if hasattr(m["role"], "value") else m["role"]) == "assistant"
+        and m["content"] == answer_text
+    )
+
+
 def test_turns_stay_ordered_within_same_second(session, conversation):
     """Every row here shares one created_at (server now() is second-precision);
     monotonic seq alone must keep the turns from interleaving."""
@@ -222,7 +232,7 @@ def test_delete_second_turn_keeps_first(session, conversation):
     _persist_named_turn(session, conversation, "q2", "a2")
     svc = ConversationService(session)
 
-    deleted = svc.delete_turn(conversation.id, 1)  # UI's 2nd assistant turn
+    deleted = svc.delete_turn(conversation.id, _assistant_message_id(session, conversation, "a2"))
 
     assert _visible(session, conversation) == [("user", "q1"), ("assistant", "a1")]
     # Turn 2's four rows (user + tool_use + tool_result + answer) are gone.
@@ -237,6 +247,6 @@ def test_delete_first_turn_clears_all(session, conversation):
     _persist_named_turn(session, conversation, "q2", "a2")
     svc = ConversationService(session)
 
-    svc.delete_turn(conversation.id, 0)
+    svc.delete_turn(conversation.id, _assistant_message_id(session, conversation, "a1"))
 
     assert svc.get_ordered_messages(conversation.id) == []
