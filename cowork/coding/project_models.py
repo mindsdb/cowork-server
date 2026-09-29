@@ -100,6 +100,9 @@ class RepositoryResource(BaseModel):
     provider: Literal["github", "gitlab", "bitbucket", "git"] = "git"
     repository: str | None = Field(default=None, max_length=512)
     connector_name: str | None = Field(default=None, max_length=512)
+    # Older projects inferred connector_name for delivery. Only an explicit
+    # picker choice opts into using it for clone/fetch; preserve legacy Git auth.
+    use_connector_for_clone: bool = False
     local_path: str | None = Field(default=None, max_length=32_768)
     computer_id: str | None = Field(default=None, max_length=128)
     default_branch: str | None = Field(default=None, max_length=255)
@@ -108,6 +111,8 @@ class RepositoryResource(BaseModel):
 
     @model_validator(mode="after")
     def require_source(self) -> RepositoryResource:
+        if self.use_connector_for_clone and not self.connector_name:
+            raise ValueError("connector-based cloning requires a connection name")
         if not self.source_url and not self.local_path:
             raise ValueError("repository resources require a remote URL or local checkout")
         if not self.source_url and not self.computer_id:

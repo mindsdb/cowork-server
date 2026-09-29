@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,10 +11,12 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
 from cowork.api.v1.endpoints import coding
 from cowork.coding.integrations import GitPushCredentials, local_repository_credentials
 from cowork.coding.project_models import CodeProject, ProjectConnection, RepositoryResource
+from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
 from cowork.coding.repository_setup_models import TaskRepositorySetup
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager
@@ -177,7 +180,7 @@ def test_clone_and_refresh_receive_ephemeral_credentials_but_local_git_operation
 
 @pytest.mark.parametrize("require_local", [False, True])
 def test_existing_local_checkout_does_not_need_connector_credentials(tmp_path, require_local):
-    resource = RepositoryResource(id="repo", name="Local", local_path=str(tmp_path), source_url="https://github.com/acme/private.git", connector_name="work")
+    resource = RepositoryResource(id="repo", name="Local", local_path=str(tmp_path), source_url="https://github.com/acme/private.git", connector_name="work", use_connector_for_clone=True)
     project = CodeProject(id="project", name="Project", resources=[resource])
     manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path / "coding"), repository_credentials=lambda *_: pytest.fail("local checkout should not contact GitHub"))
     assert manager._runtime_folder(resource, project, require_local=require_local).path == str(tmp_path)
@@ -188,6 +191,7 @@ def test_missing_local_checkout_checks_local_changes_before_resolving_credential
     resource = RepositoryResource(
         id="repo", name="Private", local_path=str(tmp_path / "missing"),
         source_url="https://github.com/acme/private.git", connector_name="work",
+        use_connector_for_clone=True,
     )
     project = CodeProject(id="project", name="Project", resources=[resource])
     resolve_credentials = Mock(side_effect=WorkspaceError("Connection unavailable"))
@@ -210,6 +214,7 @@ def test_connected_repository_clone_and_refresh_support_task_branch_choices(tmp_
     resource = RepositoryResource(
         id="repo", name="Private", source_url=str(remote),
         connector_name="work", default_branch="staging",
+        use_connector_for_clone=True,
     )
     project = CodeProject(id="project", name="Project", resources=[resource])
     credentials = GitPushCredentials(str(remote), {
@@ -279,23 +284,66 @@ def test_manual_public_repository_does_not_inherit_a_projects_github_connection(
     assert all(call.kwargs.get("environment") is None for call in calls)
 
 
+@pytest.mark.parametrize("removed", [False, True])
+def test_legacy_saved_connector_does_not_become_a_clone_requirement(tmp_path, removed):
+    # Exact serialization from staging 9930ce43: a manual URL inherited the sole
+    # connection. It predates any explicit request to use that connection for Git.
+    raw = json.loads((Path(__file__).parent / "fixtures/code-project-inferred-connector-v2.json").read_text())
+    if removed:
+        raw["connections"] = []
+    store = CodeProjectStore(tmp_path)
+    (store.root / "legacy-public.json").write_text(json.dumps(raw))
+    resolve_credentials = Mock(side_effect=WorkspaceError("Connection unavailable"))
+    manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path), repository_credentials=resolve_credentials)
+
+    def run(cwd, *args, **kwargs):
+        if args[0] == "clone":
+            Path(args[-1]).mkdir()
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    manager.workspaces.git.run = Mock(side_effect=run)
+    project = store.get("legacy-public")
+    manager._runtime_folder(project.resources[0], project)
+    store.save(project)
+    reloaded = store.get(project.id)
+    manager._runtime_folder(reloaded.resources[0], reloaded)
+
+    assert reloaded.resources[0].connector_name == "work"  # Keep delivery metadata.
+    assert reloaded.resources[0].use_connector_for_clone is False
+    resolve_credentials.assert_not_called()
+    calls = manager.workspaces.git.run.call_args_list
+    assert [call.args[1] for call in calls][:2] == ["clone", "fetch"]
+    assert all(call.kwargs.get("environment") is None for call in calls)
+
+
 def test_explicit_repository_connection_survives_reload_and_does_not_fall_back_on_auth_failure(tmp_path):
     project = CodeProject(
         id="project", name="Project",
-        resources=[RepositoryResource(id="private", name="Private", source_url="https://github.com/acme/private.git", connector_name="work")],
+        resources=[RepositoryResource(id="private", name="Private", source_url="https://github.com/acme/private.git", connector_name="work", use_connector_for_clone=True)],
         connections=[ProjectConnection(provider="github", name="work")],
     )
-    project = CodeProject.model_validate_json(project.model_dump_json())
+    store = CodeProjectStore(tmp_path)
+    store.save(project)
+    project = store.get(project.id)
     resource = project.resources[0]
     resolve_credentials = Mock(side_effect=WorkspaceError("Connection unavailable"))
     manager = ProjectWorkspaceManager(WorkspaceManager(tmp_path), repository_credentials=resolve_credentials)
     manager.workspaces.git.run = Mock()
 
     assert resource.connector_name == "work"
+    assert resource.use_connector_for_clone is True
     with pytest.raises(WorkspaceError, match="Connection unavailable"):
         manager._runtime_folder(resource, project)
     resolve_credentials.assert_called_once_with(project, resource)
     manager.workspaces.git.run.assert_not_called()
+
+
+def test_explicit_clone_auth_requires_a_connection_name():
+    with pytest.raises(ValidationError, match="connection name"):
+        RepositoryResource(
+            id="repo", name="Private", source_url="https://github.com/acme/private.git",
+            use_connector_for_clone=True,
+        )
 
 
 def test_removed_connector_does_not_fall_back_to_another_projects_connection():

@@ -271,7 +271,7 @@ class ProjectWorkspaceManager:
             if not resource.source_url:
                 raise WorkspaceError(f"Repository is unavailable on this computer: {resource.name}")
             credentials = None
-            if resource.connector_name and self.repository_credentials:
+            if resource.use_connector_for_clone and self.repository_credentials:
                 credentials = self.repository_credentials(project, resource)
             path = self._repository_cache(resource, credentials)
         return resource_folder(resource.model_copy(update={"local_path": str(path)}))
