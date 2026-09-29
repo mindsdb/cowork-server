@@ -149,6 +149,21 @@ class ComparisonService:
             return min(count, side.continued_turn_count)
         return count
 
+    def turn_starts(self, side: ComparisonSide) -> list[datetime]:
+        """When each of the side's turns started: its user messages, in order.
+
+        Every turn, including any after the side was continued; the caller decides
+        how many the comparison owns.
+        """
+        from cowork.services.conversations import _is_tool_row
+
+        messages = self.session.exec(
+            self.session.select(Message)
+            .where(Message.conversation_id == side.conversation_id, Message.role == Role.user)
+            .order_by(Message.seq, Message.created_at)
+        ).all()
+        return [m.created_at for m in messages if m.created_at is not None and not _is_tool_row(m.content)]
+
     def contained_side(self, conversation: Conversation) -> ComparisonSide | None:
         """The side a conversation is, while it is still contained.
 

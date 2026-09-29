@@ -1,15 +1,17 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Path, status
+from fastapi import APIRouter, Depends, HTTPException, Path, Request, status
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSessionDep
 from cowork.models.comparison import Comparison
+from cowork.principal import hub_credential
 from cowork.schemas.comparisons import (
     ComparisonContinueRequest,
     ComparisonCreateRequest,
     ComparisonResponse,
     ComparisonVerdictRequest,
+    ComparisonUsageResponse,
 )
 from cowork.services.comparisons import (
     ComparisonConflictError,
@@ -18,6 +20,7 @@ from cowork.services.comparisons import (
     ProjectTooLargeToCopyError,
     SideSpec,
 )
+from cowork.services.comparison_usage import comparison_usage
 from cowork.services.projects import ProjectNameLockBusyError, ProjectNotFoundError
 
 # AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
@@ -94,6 +97,19 @@ def create_comparison(body: ComparisonCreateRequest, scoped: ScopedSessionDep):
 def get_comparison(comparison_id: UUID, scoped: ScopedSessionDep):
     service = ComparisonService(scoped)
     return _response(service, _get(service, comparison_id))
+
+
+@router.get("/{comparison_id}/usage")
+async def get_comparison_usage(comparison_id: UUID, request: Request, scoped: ScopedSessionDep):
+    """Tokens and list-price cost per turn for each side, read from the gateway as the caller."""
+    service = ComparisonService(scoped)
+    comparison = _get(service, comparison_id)
+    sides = [
+        (side.label, str(side.conversation_id), service.turn_starts(side), side.continued_turn_count)
+        for side in sorted(comparison.sides, key=lambda s: s.label)
+    ]
+    usage = await comparison_usage(sides, bearer_token=hub_credential(request))
+    return usage.model_dump(by_alias=True)
 
 
 @router.delete("/{comparison_id}", status_code=status.HTTP_204_NO_CONTENT)

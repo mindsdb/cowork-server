@@ -55,3 +55,33 @@ class ComparisonResponse(CamelResponse):
     verdicts: list[ComparisonVerdictResponse]
     #: The latest judged turn's winner, or None before the first verdict.
     verdict: str | None = None
+
+
+class TurnUsage(CamelResponse):
+    turn: int
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_write_tokens: int = 0
+    #: List-price estimate over this turn's priced calls; None when none were priced.
+    estimated_cost_usd: float | None = None
+    unpriced_calls: int = 0
+
+
+class SideUsage(CamelResponse):
+    #: False when the gateway had nothing for this side: no MindsHub calls (a
+    #: BYOK model), a gateway without the usage route, or a failed read.
+    available: bool
+    turns: list[TurnUsage] = Field(default_factory=list)
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_write_tokens: int = 0
+    estimated_cost_usd: float | None = None
+    unpriced_calls: int = 0
+    #: The gateway stopped at its row cap, so the totals are a floor.
+    truncated: bool = False
+
+
+class ComparisonUsageResponse(CamelResponse):
+    sides: dict[str, SideUsage]
