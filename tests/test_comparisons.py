@@ -385,12 +385,17 @@ def test_delete_removes_the_sandboxes_but_not_a_continued_task(client):
     body = _create(client).json()
     a, b = body["sides"]
     project = _real_project(client, "delete-target")
+    # Something the side wrote outside its artifacts, which Continue leaves behind.
+    a_work = Path(_project(a["projectId"]).path) / "analysis.csv"
+    a_work.write_text("region,total\n")
     client.post(f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": project["id"]})
     b_path = Path(_project(b["projectId"]).path)
 
     assert client.delete(f"/api/v1/comparisons/{body['id']}").status_code == 204
     assert client.get(f"/api/v1/comparisons/{body['id']}").status_code == 404
-    assert _project(a["projectId"]) is None
+    # The continued task's working files survive the delete.
+    assert _project(a["projectId"]) is not None
+    assert a_work.read_text() == "region,total\n"
     assert _project(b["projectId"]) is None
     assert not b_path.exists()
     assert _conversation(b["conversationId"]) is None

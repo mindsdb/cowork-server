@@ -313,10 +313,11 @@ class ComparisonService:
         return conversation
 
     def delete_comparison(self, comparison_id: UUID) -> None:
-        """Remove the comparison and both sandboxes with everything in them.
+        """Remove the comparison and the sandboxes of the sides not continued.
 
-        A side that was continued lives on as a task in its real project; only
-        its now-empty sandbox goes.
+        A continued side's sandbox is kept. Continue moves only the side's
+        artifacts, so the files its turns wrote are still there, and deleting
+        the comparison must not delete a live task's work.
         """
         from cowork.streaming.registry import registry
 
@@ -325,7 +326,7 @@ class ComparisonService:
             handle = registry.get(str(side.conversation_id))
             if side.continued_at is None and handle is not None and handle.is_running:
                 raise ComparisonConflictError("Stop both sides before deleting the comparison")
-        project_ids = [side.project_id for side in comparison.sides]
+        project_ids = [side.project_id for side in comparison.sides if side.continued_at is None]
         self.session.delete(comparison)
         self.session.commit()
         projects = ProjectService(self.session)
