@@ -31,6 +31,7 @@ from cowork.coding.project_models import (
 )
 from cowork.coding.repository_setup_models import TaskRepositorySetup
 from cowork.coding.service import CodingService
+from cowork.coding.workspace import WorkspaceError
 
 
 def hold_preparation(monkeypatch: pytest.MonkeyPatch, service: CodingService) -> tuple[threading.Event, threading.Event]:
@@ -187,6 +188,63 @@ def test_invalid_attachments_are_rejected_before_the_task_is_created(tmp_path: P
             "fake-model",
         )
     assert service.list_sessions(True).items == []
+
+
+@pytest.mark.parametrize(
+    ("folder", "allow_direct_folder", "message"),
+    [
+        ("missing", True, "Choose an existing local folder"),
+        ("plain", False, "Local folder isolation was not enabled"),
+    ],
+)
+def test_a_folder_preparation_would_refuse_is_rejected_before_the_task_is_created(
+    folder: str, allow_direct_folder: bool, message: str, tmp_path: Path
+) -> None:
+    (tmp_path / "plain").mkdir()
+    service = service_with(tmp_path, FakeEngine())
+    with pytest.raises(WorkspaceError, match=message):
+        service.create_session(
+            SessionCreateRequest(path=str(tmp_path / folder), prompt="Go", allow_direct_folder=allow_direct_folder),
+            CREDS,
+            "fake",
+            "fake-model",
+        )
+    assert service.list_sessions(True).items == []
+
+
+def test_a_command_sent_as_the_first_prompt_is_shown_once(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    created = service.create_session(SessionCreateRequest(path=str(repo), prompt="/status"), CREDS, "fake", "fake-model")
+    wait_for_status(service, created.id, SessionStatus.ready)
+
+    titles = [event.title for event in service.events(created.id).items]
+    assert titles.count("You") == 1
+    assert "Task status" in titles
+
+
+@pytest.mark.parametrize("send", ["steer", "queue_turn"])
+def test_a_follow_up_behind_a_command_first_prompt_still_runs(
+    send: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    started, release = hold_preparation(monkeypatch, service)
+    created = service.create_session(SessionCreateRequest(path=str(repo), prompt="/status"), CREDS, "fake", "fake-model")
+    assert started.wait(timeout=3)
+
+    getattr(service, send)(created.id, "Now build the feature")
+    if send == "steer":
+        service.steer(created.id, "And update the docs")
+    release.set()
+    wait_for_status(service, created.id, SessionStatus.completed)
+
+    # /status starts no turn, so the first follow-up becomes the turn.
+    assert engine.prompts == ["Now build the feature"]
+    if send == "steer":
+        assert [prompt for _, prompt in engine.steers] == ["And update the docs"]
+    assert service.get_session(created.id).queued_instructions == []
 
 
 def test_a_follow_up_queued_while_preparing_runs_after_the_first_turn(

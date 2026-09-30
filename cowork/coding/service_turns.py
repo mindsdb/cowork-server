@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import logging
 import threading
 import uuid
@@ -19,7 +20,7 @@ from cowork.coding.contracts import (
 )
 from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_models import TERMINAL_RUN_STATUSES, RunStatus, RuntimeCommand, RuntimeEvent, TaskRun
-from cowork.coding.engines.base import EngineCredentials, EngineSession
+from cowork.coding.engines.base import EngineCredentials, EngineInputReference, EngineSession
 from cowork.coding.reasoning import ModelLevels
 from cowork.coding.session_factory import PendingLocalSession
 from cowork.coding.turns import RunningTurn, fail_turn, mark_running
@@ -138,6 +139,41 @@ class CodingTurnOperations:
                 # Instructions sent while the workspace was preparing reach the
                 # first turn as soon as it is ready for steering.
                 started.pending_steers.extend(preparing.pending_steers)
+                return
+            # A first prompt such as /status runs at once and starts no turn,
+            # so work sent while the task prepared would wait for one forever.
+            try:
+                self._start_waiting_work(session_id, credentials, preparing.pending_steers)
+            except Exception as exc:
+                logger.warning("Coding task %s could not start its waiting work", session_id, exc_info=True)
+                self._emit(
+                    session_id,
+                    CodingEvent(type=EventType.error, title="Follow-up did not start", text=str(exc), phase="failed"),
+                )
+
+    def _start_waiting_work(
+        self,
+        session_id: str,
+        credentials: EngineCredentials,
+        steers: list[tuple[str, tuple[EngineInputReference, ...]]],
+    ) -> None:
+        if not steers:
+            if self.get_session(session_id).queued_instructions:
+                self.run_next_queued(session_id, credentials)
+            return
+        # The first follow-up becomes the turn, and the rest steer it. Each is
+        # already in the timeline as a follow-up.
+        (prompt, attachments), *rest = steers
+        self._submit_turn(
+            session_id,
+            prompt,
+            credentials,
+            [InputReference(**dataclasses.asdict(item)) for item in attachments],
+            announced=True,
+        )
+        started = self._running.get(session_id)
+        if started is not None:
+            started.pending_steers.extend(rest)
 
     def submit_turn(
         self,
@@ -216,12 +252,12 @@ class CodingTurnOperations:
         intent = self._validated_command_intent(self.get_session(session_id), prompt, attachments)
         if intent.runs_immediately:
             if maintenance_reserved:
-                return self.commands.run_immediate(session_id, intent, prompt, credentials)
+                return self.commands.run_immediate(session_id, intent, prompt, credentials, announced=announced)
             with self._maintenance_session(
                 session_id,
                 "Wait for the active turn to finish before running this command",
             ):
-                return self.commands.run_immediate(session_id, intent, prompt, credentials)
+                return self.commands.run_immediate(session_id, intent, prompt, credentials, announced=announced)
         with self._lock:
             session = self.get_session(session_id)
             if session_id in self._maintenance and not maintenance_reserved:

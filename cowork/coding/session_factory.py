@@ -250,6 +250,16 @@ class CodingSessionFactory:
                 code_skills,
                 reasoning_effort,
             )
+        try:
+            # Preparation runs in the background, so reject a folder it would
+            # refuse now, while the composer can still show the error.
+            if project is None:
+                self.workspaces.check_source(request.path or "", request.allow_direct_folder)
+            validate_directories(request.additional_dirs)
+        except Exception:
+            with suppress(KeyError, ValueError):
+                self.control.set_run_status(control_snapshot.run.id, RunStatus.failed)
+            raise
         self.control.set_run_status(control_snapshot.run.id, RunStatus.preparing)
         pending = PendingLocalSession(
             session_id=session_id,
