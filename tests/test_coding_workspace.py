@@ -581,6 +581,67 @@ def test_a_failed_clone_leaves_no_partial_tree_behind_the_byte_copy(
     assert sorted(path.name for path in prepared.workspace_path.iterdir()) == ["notes.txt"]
 
 
+@pytest.mark.skipif(os.name == "nt", reason="FIFOs and directory modes are POSIX")
+@pytest.mark.parametrize("clone", [True, False])
+def test_a_special_file_in_a_read_only_directory_is_skipped(
+    clone: bool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "plain"
+    locked = source / "locked"
+    locked.mkdir(parents=True)
+    (locked / "notes.txt").write_text("v1\n", encoding="utf-8")
+    os.mkfifo(locked / "pipe.fifo")
+    locked.chmod(0o555)
+    if not clone:
+        disable_clone(monkeypatch)
+    manager = WorkspaceManager(tmp_path / "coding")
+    try:
+        prepared = manager.prepare("locked-1", str(source), allow_direct_folder=True)
+        baseline = manager.local_copies.baselines_root / managed_key("locked-1")
+        for root in (prepared.workspace_path, baseline):
+            assert (root / "locked" / "notes.txt").read_text(encoding="utf-8") == "v1\n"
+            assert not (root / "locked" / "pipe.fifo").exists()
+            # The copy keeps the source's directory mode.
+            assert stat.S_IMODE((root / "locked").stat().st_mode) == 0o555
+    finally:
+        for directory in tmp_path.rglob("locked"):
+            directory.chmod(0o755)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="directory modes are POSIX")
+def test_a_failed_copy_with_read_only_directories_can_be_retried(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = tmp_path / "plain"
+    locked = source / "locked"
+    locked.mkdir(parents=True)
+    (locked / "notes.txt").write_text("v1\n", encoding="utf-8")
+    locked.chmod(0o555)
+    manager = WorkspaceManager(tmp_path / "coding")
+    real_copy_tree = local_copy_module.LocalCopyManager._copy_tree.__func__
+    calls = 0
+
+    def fail_second_copy(cls, copy_source: Path, target: Path) -> None:
+        nonlocal calls
+        calls += 1
+        real_copy_tree(cls, copy_source, target)
+        if calls == 2:
+            raise OSError(28, "No space left on device", str(target))
+
+    try:
+        monkeypatch.setattr(local_copy_module.LocalCopyManager, "_copy_tree", classmethod(fail_second_copy))
+        with pytest.raises(WorkspaceError):
+            manager.prepare("retry-1", str(source), allow_direct_folder=True)
+        monkeypatch.undo()
+
+        # Both partial trees, read-only directories included, were removed.
+        prepared = manager.prepare("retry-1", str(source), allow_direct_folder=True)
+        assert (prepared.workspace_path / "locked" / "notes.txt").read_text(encoding="utf-8") == "v1\n"
+    finally:
+        for directory in tmp_path.rglob("locked"):
+            directory.chmod(0o755)
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="clonefile is macOS only")
 def test_a_local_copy_on_apfs_is_a_copy_on_write_clone(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     source = tmp_path / "plain"
