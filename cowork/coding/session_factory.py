@@ -24,9 +24,9 @@ from cowork.coding.control_service import ControlPlaneService
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.engines.registry import CodingEngineRegistry
 from cowork.coding.playbooks import PlaybookService
-from cowork.coding.project_models import CodeProject, canonical_model_id
+from cowork.coding.project_models import CodeProject, ProjectCommand, canonical_model_id
 from cowork.coding.project_service import CodeProjectService
-from cowork.coding.project_workspaces import ProjectWorkspaceManager
+from cowork.coding.project_workspaces import CommandResult, ProjectWorkspaceManager
 from cowork.coding.repository_setup import task_project
 from cowork.coding.reasoning import ModelLevels, resolve_reasoning_effort
 from cowork.coding.skill_models import SkillResolution
@@ -66,6 +66,36 @@ class PendingLocalSession:
     reasoning_effort: str | None
     control_snapshot: TaskControlSnapshot
     code_skills: CodeSkillService | None
+
+
+# CodingSession fields that only workspace preparation and skill resolution
+# can produce. Everything else on a placeholder is owned by the user or the
+# turn lifecycle while the task prepares.
+_PREPARED_FIELDS = (
+    "resource_ids",
+    "source_path",
+    "workspace_path",
+    "workspace_kind",
+    "workspaces",
+    "repository_root",
+    "base_revision",
+    "source_dirty",
+    "guidance_summary",
+    "developer_instructions",
+    "resolved_skills",
+    "skill_roots",
+    "skill_instructions",
+    "environment",
+    "allocated_ports",
+)
+
+
+def _adopt_preparation(current: CodingSession, prepared: CodingSession) -> None:
+    for name in _PREPARED_FIELDS:
+        setattr(current, name, getattr(prepared, name))
+    # Other project folders are prepared as extra directories; keep any the
+    # user added while the task prepared.
+    current.additional_dirs = list(dict.fromkeys([*prepared.additional_dirs, *current.additional_dirs]))
 
 
 def task_title(prompt: str) -> str:
@@ -282,12 +312,10 @@ class CodingSessionFactory:
                 contexts=contexts,
                 reasoning_effort=pending.reasoning_effort,
             )
-            current = self.store.load_session(session_id)
-            # The placeholder has been visible and editable since ``begin``.
-            session.title = current.title
-            session.pinned = current.pinned
-            session.status = SessionStatus.running
-            self.store.save_session(session)
+            # The placeholder has been visible and editable since ``begin``:
+            # queued follow-ups, title, pin and config changes stay, and only
+            # what preparation produced is merged in.
+            session = self.store.update_session(session_id, lambda current: _adopt_preparation(current, session))
             self.control.attach_prepared_workspaces(
                 pending.control_snapshot.run.id,
                 list(preparation.task_workspaces) or [preparation.primary],
@@ -295,7 +323,7 @@ class CodingSessionFactory:
             self.control.set_run_status(pending.control_snapshot.run.id, RunStatus.ready)
             self._emit_workspace_ready(session)
             if preparation.project and not cancelled():
-                self._run_setup(session, preparation.project)
+                self._run_setup(session, preparation.project, cancelled)
             return self.store.load_session(session.id)
         except Exception:
             self.skills.cleanup(session_id)
@@ -352,6 +380,20 @@ class CodingSessionFactory:
             status=SessionStatus.running,
             source_contexts=list(request.source_contexts),
         )
+
+    def release(self, session: CodingSession) -> None:
+        """Release a prepared task's workspaces and skills after it was deleted."""
+        if session.workspaces:
+            self.project_workspaces.cleanup(session.id, session.workspaces)
+        elif session.workspace_kind in {WorkspaceKind.git_worktree, WorkspaceKind.local_copy}:
+            self.workspaces.cleanup(
+                session.id,
+                session.source_path,
+                session.workspace_path,
+                session.workspace_kind,
+                session.base_revision,
+            )
+        self.skills.cleanup(session.id)
 
     def _release_workspaces(self, session_id: str, preparation: LocalSessionPreparation) -> None:
         if preparation.task_workspaces:
@@ -627,9 +669,28 @@ class CodingSessionFactory:
             ),
         )
 
-    def _run_setup(self, session: CodingSession, project: CodeProject) -> None:
-        results = self.project_workspaces.run_commands(project, session.workspaces, "setup", session.allocated_ports)
-        for result in results:
+    def _run_setup(
+        self,
+        session: CodingSession,
+        project: CodeProject,
+        cancelled: Callable[[], bool] = lambda: False,
+    ) -> None:
+        def item_id(command_id: str, folder_id: str) -> str:
+            return f"setup:{folder_id}:{command_id}"
+
+        def started(command: ProjectCommand, workspace: TaskWorkspace) -> None:
+            self.emit(
+                session.id,
+                CodingEvent(
+                    type=EventType.command,
+                    title=command.label,
+                    phase="started",
+                    item_id=item_id(command.id, workspace.folder_id),
+                    data={"folderId": workspace.folder_id, "phase": "setup"},
+                ),
+            )
+
+        def finished(result: CommandResult) -> None:
             self.emit(
                 session.id,
                 CodingEvent(
@@ -637,9 +698,20 @@ class CodingSessionFactory:
                     title=result.label,
                     text=result.output,
                     phase="completed" if result.return_code == 0 else "failed",
+                    item_id=item_id(result.command_id, result.folder_id),
                     data={"folderId": result.folder_id, "returnCode": result.return_code, "phase": "setup"},
                 ),
             )
+
+        results = self.project_workspaces.run_commands(
+            project,
+            session.workspaces,
+            "setup",
+            session.allocated_ports,
+            on_start=started,
+            on_result=finished,
+            stop=cancelled,
+        )
         failed = next((result for result in results if result.return_code != 0), None)
         if failed:
             note = (

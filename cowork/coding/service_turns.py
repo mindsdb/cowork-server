@@ -89,12 +89,15 @@ class CodingTurnOperations:
                 return running is not None and running.cancel_requested
 
         try:
-            self.session_factory.complete(pending, cancelled)
+            prepared = self.session_factory.complete(pending, cancelled)
         except Exception as exc:
+            with self._lock:
+                preparing = self._running.pop(session_id, None)
+            if preparing is not None and preparing.delete_requested:
+                # ``complete`` has already released what it made.
+                return
             logger.warning("Coding task %s could not prepare its workspace", session_id, exc_info=True)
             message = f"The task workspace could not be prepared: {exc}"
-            with self._lock:
-                self._running.pop(session_id, None)
             self._emit(
                 session_id,
                 CodingEvent(type=EventType.error, title="Task did not start", text=message, phase="failed"),
@@ -103,6 +106,9 @@ class CodingTurnOperations:
             return
         with self._lock:
             preparing = self._running.pop(session_id, None)
+            if preparing is not None and preparing.delete_requested:
+                self.session_factory.release(prepared)
+                return
             if preparing is None or preparing.cancel_requested:
                 self._emit(
                     session_id,
@@ -423,6 +429,8 @@ class CodingTurnOperations:
         with self._lock:
             session = self.get_session(session_id)
             self.commands.validate(session, intent.name)
+            if attachments and not session.workspace_path and not self._is_remote(session):
+                raise RuntimeError("Attach files once the task workspace is ready")
             validate_references(session, attachments)
             instruction = QueuedInstruction(
                 id=str(uuid.uuid4()),
@@ -594,21 +602,19 @@ class CodingTurnOperations:
                 engine = running.engine
                 turn_id = running.turn_id
             preparing = running.preparing
-        stopping = CodingEvent(
-            type=EventType.session,
-            title="Stopping task",
-            text=(
-                "Cancellation requested. The task stops once its workspace is ready."
-                if preparing
-                else "Cancellation requested. The agent is cleaning up the active turn."
+        self._emit(
+            session_id,
+            CodingEvent(
+                type=EventType.session,
+                title="Stopping task",
+                text=(
+                    "Cancellation requested. The task stops once its current preparation step ends."
+                    if preparing
+                    else "Cancellation requested. The agent is cleaning up the active turn."
+                ),
+                phase="pending",
             ),
-            phase="pending",
         )
-        if preparing:
-            # The Run is still preparing; don't project the session onto it.
-            self.store.append_event(session_id, stopping)
-        else:
-            self._emit(session_id, stopping)
         try:
             try:
                 self.questions.cancel_session(session_id)

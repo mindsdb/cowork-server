@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from functools import lru_cache
 from pathlib import Path
 
@@ -324,6 +324,22 @@ class CodingService(
 
     def delete_session(self, session_id: str) -> None:
         session = self.get_session(session_id)
+        with self._lock:
+            preparing = self._running.get(session_id)
+            if preparing is not None and preparing.preparing:
+                # Deleting stops preparation. The preparation thread releases
+                # any workspace it has already made once its current step ends.
+                preparing.cancel_requested = True
+                preparing.delete_requested = True
+            else:
+                preparing = None
+        if preparing is not None:
+            with suppress(FileNotFoundError):
+                self.store.delete_session(session.id)
+            self.skill_runtime.cleanup(session.id)
+            if session.run_id:
+                self.control.delete_task(session.run_id)
+            return
         if self._is_remote(session):
             self.remote.require_idle(session, "deleting this coding task")
             self.remote.release_workspace(session)
@@ -454,18 +470,18 @@ class CodingService(
         return self.registry.get(engine_id).discover_models(credentials)
 
     def extension_inventory(self, session_id: str, credentials: EngineCredentials):
-        session = self.get_session(session_id)
+        session = self._prepared_session(session_id)
         self._require_task_capability(session, TaskCapability.extensions)
         runtime = self.runtimes.open(session, credentials)
         return runtime.extension_inventory()
 
     def platform_status(self, session_id: str, credentials: EngineCredentials):
-        session = self.get_session(session_id)
+        session = self._prepared_session(session_id)
         self._require_task_capability(session, TaskCapability.platform_settings)
         return self.runtimes.open(session, credentials).platform_status()
 
     def setup_windows_sandbox(self, session_id: str, credentials: EngineCredentials):
-        session = self.get_session(session_id)
+        session = self._prepared_session(session_id)
         self._require_task_capability(session, TaskCapability.platform_settings)
         return self.runtimes.open(session, credentials).setup_windows_sandbox()
 
