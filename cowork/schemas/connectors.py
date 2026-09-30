@@ -128,6 +128,20 @@ class ConnectorMetadataResponse(BaseModel):
 class ConnectorSpecResponse(ConnectorMetadataResponse):
     keywords: list[str] = []
     form: ConnectorForm
+    # Agent-facing notes on using this connector's API once connected: traps,
+    # efficient endpoints, auth quirks. The chat agent sees them only when a
+    # connection of this engine exists; the credential prober sees them while
+    # testing one. Declared here so specs validate; the registry does not copy
+    # them into API responses, read them via ConnectorSpecRegistry.usage_notes_for.
+    #
+    # Writing rules: English, imperative, only what the agent cannot guess. No
+    # #/##/### headings outside code fences (the text sits under a ### heading).
+    # Written for both readers: no references to one reader's tools (e.g.
+    # report_success), and never explain where credentials live or how env var
+    # names are built, since each reader's own prompt does that and they differ.
+    # Describe per-method differences by field name (`app_password`,
+    # `access_token`), not by env var name.
+    usage_notes: str | None = None
 
 
 class MatchRequest(BaseModel):
