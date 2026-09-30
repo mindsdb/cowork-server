@@ -23,6 +23,11 @@ from cowork.services.conversations import ConversationService
 logger = logging.getLogger(__name__)
 
 
+def _probe_usage_notes(connector_id: str) -> str | None:
+    """The connector spec's agent-facing usage notes for the probe, or None."""
+    return registry.usage_notes_for([connector_id]).get(connector_id)
+
+
 def _extract_connection_label_fields(credentials: dict) -> tuple[str, str]:
     """Pop `label`/`_label` and `user_label`/`_user_label` out of `credentials`
     in place, returning (label, user_label). Both are non-credential display
@@ -260,6 +265,7 @@ class ProbeHandler:
                 workspace=workspace,
                 form_spec=form_spec,
                 skipped=skipped,
+                usage_notes=_probe_usage_notes(connector_id),
             )
             try:
                 async for kind, payload in probe.run():
