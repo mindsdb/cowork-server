@@ -10,6 +10,8 @@ import os
 import shutil
 import stat
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -51,6 +53,37 @@ def _clone_tree(source: Path, target: Path) -> None:
         raise CloneUnavailable(code, os.strerror(code), str(source))
 
 
+@contextmanager
+def _writable(directory: Path) -> Iterator[None]:
+    """Let the owner remove entries from a directory, then restore its mode.
+
+    A clone keeps directory modes, so a source folder marked read-only yields
+    a read-only directory the sweep cannot unlink from.
+    """
+    mode = os.lstat(directory).st_mode
+    writable = mode | stat.S_IWUSR | stat.S_IXUSR
+    if writable != mode:
+        os.chmod(directory, stat.S_IMODE(writable))
+    try:
+        yield
+    finally:
+        if writable != mode:
+            os.chmod(directory, stat.S_IMODE(mode))
+
+
+def _force_remove(path: Path) -> None:
+    """Remove a managed tree even where its directories are read-only."""
+
+    def retry_writable(function, failed: str, _exc: BaseException) -> None:
+        parent = os.path.dirname(failed)
+        with suppress(OSError):
+            os.chmod(parent, stat.S_IMODE(os.lstat(parent).st_mode) | stat.S_IWUSR | stat.S_IXUSR)
+            function(failed)
+
+    if path.exists() or path.is_symlink():
+        shutil.rmtree(path, onexc=retry_writable)
+
+
 @dataclass(frozen=True)
 class PreparedLocalCopy:
     source: Path
@@ -81,8 +114,8 @@ class LocalCopyManager:
             self._copy_tree(source, baseline)
             self._copy_tree(source, workspace)
         except Exception as exc:
-            shutil.rmtree(workspace, ignore_errors=True)
-            shutil.rmtree(baseline, ignore_errors=True)
+            _force_remove(workspace)
+            _force_remove(baseline)
             if isinstance(exc, OSError):
                 raise self._copy_failure("The task folder could not be copied", exc) from exc
             raise
@@ -104,8 +137,8 @@ class LocalCopyManager:
             self._copy_tree(current_workspace, workspace)
             self._copy_tree(parent_baseline, baseline)
         except Exception as exc:
-            shutil.rmtree(workspace, ignore_errors=True)
-            shutil.rmtree(baseline, ignore_errors=True)
+            _force_remove(workspace)
+            _force_remove(baseline)
             if isinstance(exc, OSError):
                 raise self._copy_failure("The existing task copy could not be duplicated", exc) from exc
             raise
@@ -248,13 +281,13 @@ class LocalCopyManager:
     def _copy_tree(cls, source: Path, target: Path) -> None:
         try:
             _clone_tree(source, target)
-        except CloneUnavailable as exc:
-            logger.debug("Falling back to a byte copy of %s: %s", source, exc)
-            # A failed clone can leave a partial tree behind.
-            shutil.rmtree(target, ignore_errors=True)
-            shutil.copytree(source, target, symlinks=True, ignore=cls._skip_unsupported)
-        else:
             cls._remove_unsupported(target)
+        except OSError as exc:
+            logger.debug("Falling back to a byte copy of %s: %s", source, exc)
+            # A failed clone or sweep can leave a partial tree behind, possibly
+            # with read-only directories.
+            _force_remove(target)
+            shutil.copytree(source, target, symlinks=True, ignore=cls._skip_unsupported)
 
     @classmethod
     def _remove_unsupported(cls, root: Path) -> None:
@@ -262,12 +295,18 @@ class LocalCopyManager:
         # Drop them so a cloned tree matches what the byte copy produces.
         pending = [root]
         while pending:
-            with os.scandir(pending.pop()) as entries:
+            directory = pending.pop()
+            with os.scandir(directory) as entries:
+                special = []
                 for entry in entries:
                     if entry.is_dir(follow_symlinks=False):
                         pending.append(Path(entry.path))
                     elif not entry.is_file(follow_symlinks=False) and not entry.is_symlink():
-                        os.unlink(entry.path)
+                        special.append(entry.path)
+            if special:
+                with _writable(directory):
+                    for path in special:
+                        os.unlink(path)
 
     @staticmethod
     def _copy_failure(subject: str, exc: OSError) -> LocalCopyError:
