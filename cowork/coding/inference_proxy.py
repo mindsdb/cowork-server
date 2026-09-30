@@ -3,10 +3,11 @@ from __future__ import annotations
 import asyncio
 import json
 
+import anyio
 import httpx
 from fastapi import HTTPException, Request
-from starlette.background import BackgroundTask
 from starlette.responses import Response, StreamingResponse
+from starlette.types import Receive, Scope, Send
 
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.inference_trace import trace_headers
@@ -37,6 +38,31 @@ RATE_LIMIT_DEFAULT_WAIT_SECONDS = 2.0
 # Codex holds the request open while the proxy waits, so the total wait stays
 # well under its stream idle timeout.
 RATE_LIMIT_MAX_TOTAL_WAIT_SECONDS = 45.0
+
+# One client per event loop keeps connections to MindsHub open across requests.
+# A new client per request paid a TCP and TLS handshake on every model call of
+# every turn. An httpx client is bound to the loop it first ran on, so a loop
+# change (tests run one per test) gets a fresh client.
+_client: tuple[asyncio.AbstractEventLoop, httpx.AsyncClient] | None = None
+
+
+def _inference_client() -> httpx.AsyncClient:
+    global _client
+    loop = asyncio.get_running_loop()
+    if _client is None or _client[0] is not loop or _client[1].is_closed:
+        _client = (loop, httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=None)))
+    return _client[1]
+
+
+async def close_inference_client() -> None:
+    """Close the shared client during shutdown. Idempotent."""
+    global _client
+    if _client is None:
+        return
+    loop, client = _client
+    _client = None
+    if loop is asyncio.get_running_loop():
+        await client.aclose()
 
 
 def inference_url(minds_url: str, path: str, query: str = "") -> str:
@@ -147,34 +173,46 @@ async def proxy_inference(request: Request, path: str, credentials: EngineCreden
 
     body = inference_body(await read_inference_body(request))
     headers = {**inference_headers(request, credentials.minds_api_key), **trace_headers(request)}
-    client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=None))
     url = inference_url(credentials.minds_url, path, request.url.query)
-    try:
-        upstream = await _send_through_rate_limits(client, request.method, url, headers, body)
-    except BaseException:
-        # Cancellation while waiting out Retry-After lands here too.
-        await client.aclose()
-        raise
+    upstream = await _send_through_rate_limits(_inference_client(), request.method, url, headers, body)
     if isinstance(upstream, Response):
-        await client.aclose()
         return upstream
-
-    async def close_upstream() -> None:
-        await upstream.aclose()
-        await client.aclose()
 
     if upstream.status_code in TERMINAL_UPSTREAM_CODES:
         try:
             raw = await _read_bounded(upstream, MAX_REJECTION_BODY_BYTES)
         finally:
-            await close_upstream()
+            await upstream.aclose()
         return _terminal_response(upstream, raw)
-    return StreamingResponse(
-        upstream.aiter_bytes(),
-        status_code=upstream.status_code,
-        headers=_response_headers(upstream),
-        background=BackgroundTask(close_upstream),
-    )
+    return _UpstreamStreamingResponse(upstream)
+
+
+class _UpstreamStreamingResponse(StreamingResponse):
+    """Stream an upstream body and always return its connection to the pool.
+
+    The close runs when the response call exits, however it exits. A close in
+    the body generator's ``finally`` never runs when Codex disconnects before
+    the body starts, because Starlette then cancels the response before the
+    generator is entered. Starlette also skips background tasks on a
+    disconnect. Either way the pooled connection would stay checked out.
+    """
+
+    def __init__(self, upstream: httpx.Response) -> None:
+        super().__init__(
+            upstream.aiter_bytes(),
+            status_code=upstream.status_code,
+            headers=_response_headers(upstream),
+        )
+        self._upstream = upstream
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Shielded, so the cancellation that ended the stream can't also
+            # interrupt the close.
+            with anyio.CancelScope(shield=True):
+                await self._upstream.aclose()
 
 
 async def _send_through_rate_limits(
