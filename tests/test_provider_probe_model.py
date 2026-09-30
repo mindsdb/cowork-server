@@ -98,6 +98,72 @@ def test_ping_provider_missing_key_still_fails_fast(monkeypatch):
     assert status == "fail" and "key" in detail.lower()
 
 
+# ── no fallback to the default MindsHub host when unconfigured ──
+
+
+def test_ping_provider_without_a_url_refuses_when_hub_not_configured(monkeypatch):
+    _patch(monkeypatch)
+    ping = asyncio.run(
+        ping_provider({"type": "minds-cloud", "apiKey": "mdb_x"}, minds_hub_configured=False)
+    )
+    assert ping.status == "fail"
+    assert "url" in ping.detail.lower()
+    assert _CapturingClient.captured == {}
+
+
+def test_ping_provider_without_a_url_falls_back_when_hub_is_configured(monkeypatch):
+    _patch(monkeypatch)
+    ping = asyncio.run(
+        ping_provider({"type": "minds-cloud", "apiKey": "mdb_x"}, minds_hub_configured=True)
+    )
+    assert ping.status == "ok"
+
+
+def test_ping_provider_an_explicit_url_still_goes_out_even_when_not_configured(monkeypatch):
+    """An explicit MindsHub URL in the body is how MindsHub gets set up."""
+    _patch(monkeypatch)
+    ping = asyncio.run(
+        ping_provider(
+            {"type": "minds-cloud", "apiKey": "mdb_x", "mindsUrl": "https://api.mindshub.ai"},
+            minds_hub_configured=False,
+        )
+    )
+    assert ping.status == "ok"
+
+
+def test_validate_minds_without_a_url_refuses_when_hub_not_configured(monkeypatch):
+    _patch(monkeypatch)
+    result = asyncio.run(validate_minds("mdb_x", "", allow_default_host=False))
+    assert result["ok"] is False
+    assert "url" in result["error"].lower()
+    assert _CapturingClient.captured == {}
+
+
+def test_validate_minds_without_a_url_falls_back_when_hub_is_configured(monkeypatch):
+    _patch(monkeypatch)
+    result = asyncio.run(validate_minds("mdb_x", "", allow_default_host=True))
+    assert result["ok"] is True
+
+
+def test_validate_provider_minds_without_a_url_refuses_when_hub_not_configured(monkeypatch):
+    _patch(monkeypatch)
+    result = asyncio.run(
+        validate_provider("minds", "mdb_x", base_url=None, minds_hub_configured=False)
+    )
+    assert result["ok"] is False
+    assert _CapturingClient.captured == {}
+
+
+def test_validate_provider_minds_with_an_explicit_url_still_goes_out(monkeypatch):
+    _patch(monkeypatch)
+    result = asyncio.run(
+        validate_provider(
+            "minds", "mdb_x", base_url="https://api.mindshub.ai", minds_hub_configured=False
+        )
+    )
+    assert result["ok"] is True
+
+
 def test_ping_minds_cloud_surfaces_provider_message(monkeypatch):
     # minds-cloud is the one provider routed through _chat_probe (real chat
     # completions), so its failures carry the gateway's actionable reason
@@ -439,7 +505,7 @@ def test_a_passing_probe_names_no_reason(monkeypatch):
 
 
 def test_ping_providers_reports_denials_only_for_the_types_that_have_one(monkeypatch):
-    async def _fake_ping(p):
+    async def _fake_ping(p, **_kwargs):
         if p["type"] == "minds-cloud":
             return ProviderPing(
                 status="fail", detail="HTTP 429",
@@ -468,7 +534,7 @@ def test_the_last_card_of_a_type_decides_its_denial_too(monkeypatch):
         ProviderPing(status="fail", detail="HTTP 500"),
     ])
 
-    async def _fake_ping(p):
+    async def _fake_ping(p, **_kwargs):
         return next(answers)
 
     monkeypatch.setattr(providers, "ping_provider", _fake_ping)

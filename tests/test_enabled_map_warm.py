@@ -113,8 +113,8 @@ def test_warm_noops_without_a_minds_key(monkeypatch):
 
 
 def test_warm_ignores_a_publish_key_and_stays_silent(monkeypatch):
-    """ANTON_PUBLISH_API_KEY (ENG-3045) is a publish credential, not a MindsHub
-    one — it must not wake this warm even with an explicit publish URL set."""
+    """ANTON_PUBLISH_API_KEY is a publish credential, not a MindsHub one — it
+    must not wake this warm even with an explicit publish URL set."""
     from cowork.services import providers
 
     monkeypatch.setenv("ANTON_PUBLISH_API_KEY", "self-hosted-secret")
