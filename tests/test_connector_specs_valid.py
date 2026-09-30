@@ -13,6 +13,7 @@ validates clean. Hence the explicit unknown-key check below.
 """
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -223,3 +224,39 @@ class TestLangfuseSpec:
     def _field(spec, name):
         method = next(m for m in spec.form.methods if m.id == "api-key")
         return next(f for f in method.fields if f.name == name)
+
+
+# usage_notes are inserted under a `###` heading in the agent's prompt, so a
+# `#`/`##`/`###` line of their own would break its structure. Fenced code is
+# exempt: a `# comment` there is a code comment, not a heading.
+_HEADING = re.compile(r"^#{1,3}(\s|$)")
+
+
+def _headings_outside_fences(text: str) -> list[str]:
+    found, in_fence = [], False
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("```"):
+            in_fence = not in_fence
+            continue
+        if not in_fence and _HEADING.match(stripped):
+            found.append(line)
+    return found
+
+
+def test_heading_check_ignores_comments_inside_code_fences():
+    assert _headings_outside_fences("Use it.\n```python\n# step 1\nx = 1\n```\n") == []
+    assert _headings_outside_fences("## Quirks\nUse it.") == ["## Quirks"]
+    assert _headings_outside_fences("#### deep\n#hashtag") == []
+
+
+@pytest.mark.parametrize("path", SPEC_FILES, ids=lambda p: p.stem)
+def test_usage_notes_have_no_top_level_headings(path: Path):
+    notes = json.loads(path.read_text(encoding="utf-8")).get("usage_notes")
+    # The type itself is checked by test_spec_is_valid_json_and_matches_the_schema.
+    if not isinstance(notes, str):
+        return
+    assert not _headings_outside_fences(notes), (
+        f"{path.name}: usage_notes must not contain #, ## or ### headings outside "
+        "code fences — they are rendered under a ### heading in the agent's prompt"
+    )
