@@ -470,6 +470,68 @@ def test_a_local_copy_is_reviewable_and_applies_back_without_git(
     assert (source / "added.txt").read_text(encoding="utf-8") == "new\n"
 
 
+def prepared_copy(tmp_path: Path, key: str) -> tuple[Path, Path, WorkspaceManager]:
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "notes.txt").write_text("v1\n", encoding="utf-8")
+    (source / "script.sh").write_text("echo hi\n", encoding="utf-8")
+    manager = WorkspaceManager(tmp_path / "coding")
+    prepared = manager.prepare(key, str(source), allow_direct_folder=True)
+    return source, prepared.workspace_path, manager
+
+
+def shift_mtime(path: Path) -> None:
+    # Force a distinct modification time so a test never depends on clock resolution.
+    info = path.stat()
+    os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns + 1_000_000_000))
+
+
+def test_reviewing_an_untouched_local_copy_reads_no_file_content(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source, workspace, manager = prepared_copy(tmp_path, "stat-1")
+    monkeypatch.setattr(
+        local_copy_module.LocalCopyManager,
+        "_digest",
+        staticmethod(lambda path: pytest.fail(f"read {path}")),
+    )
+
+    assert manager.local_copies.diff(workspace) == []
+    assert manager.local_copies.preflight(source, workspace) == []
+
+
+def test_a_same_size_edit_is_reviewed_and_a_touch_alone_is_not(tmp_path: Path) -> None:
+    _source, workspace, manager = prepared_copy(tmp_path, "stat-2")
+    (workspace / "notes.txt").write_text("v2\n", encoding="utf-8")
+    shift_mtime(workspace / "notes.txt")
+    shift_mtime(workspace / "script.sh")
+
+    changed = manager.local_copies.diff(workspace)
+
+    assert [(item.path, item.status) for item in changed] == [("notes.txt", "M")]
+    assert "+v2" in changed[0].patch
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_a_mode_only_change_is_reviewed(tmp_path: Path) -> None:
+    _source, workspace, manager = prepared_copy(tmp_path, "stat-3")
+    (workspace / "script.sh").chmod(0o755)
+
+    assert [item.path for item in manager.local_copies.diff(workspace)] == ["script.sh"]
+
+
+def test_a_same_size_source_edit_still_stops_handoff(tmp_path: Path) -> None:
+    source, workspace, manager = prepared_copy(tmp_path, "stat-4")
+    (workspace / "notes.txt").write_text("v2\n", encoding="utf-8")
+    shift_mtime(workspace / "notes.txt")
+    (source / "notes.txt").write_text("v3\n", encoding="utf-8")
+    shift_mtime(source / "notes.txt")
+
+    with pytest.raises(LocalCopyError, match="changed outside the task: notes.txt"):
+        manager.local_copies.apply(source, workspace)
+    assert (source / "notes.txt").read_text(encoding="utf-8") == "v3\n"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="sockets and FIFOs are POSIX")
 def test_a_local_copy_skips_entries_a_copy_cannot_reproduce(tmp_path: Path) -> None:
     source = tmp_path / "plain"

@@ -11,6 +11,7 @@ import shutil
 import stat
 import sys
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,6 +86,17 @@ def _force_remove(path: Path) -> None:
 
 
 @dataclass(frozen=True)
+class _Entry:
+    """A tree entry as review and handoff compare it; file content is read only on demand."""
+
+    kind: str
+    mode: int = 0
+    size: int = 0
+    mtime_ns: int = 0
+    target: str = ""
+
+
+@dataclass(frozen=True)
 class PreparedLocalCopy:
     source: Path
     workspace: Path
@@ -146,15 +158,11 @@ class LocalCopyManager:
 
     def diff(self, workspace: Path) -> list[DiffFile]:
         baseline = self._baseline_for(workspace)
-        before = self._manifest(baseline)
-        after = self._manifest(workspace)
-        paths = sorted(set(before) | set(after))
+        before, after = self._manifests(baseline, workspace)
         files: list[DiffFile] = []
-        for relative in paths:
+        for relative in self._changed(baseline, before, workspace, after):
             old = before.get(relative)
             new = after.get(relative)
-            if old == new:
-                continue
             status = "A" if old is None else "D" if new is None else "M"
             patch, binary = self._patch(baseline / relative, workspace / relative, relative)
             additions = sum(1 for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
@@ -180,10 +188,8 @@ class LocalCopyManager:
 
     def preflight(self, source: Path, workspace: Path) -> list[str]:
         baseline = self._baseline_for(workspace)
-        before = self._manifest(baseline)
-        current_source = self._manifest(source)
-        task = self._manifest(workspace)
-        changed = sorted(path for path in set(before) | set(task) if before.get(path) != task.get(path))
+        before, current_source, task = self._manifests(baseline, source, workspace)
+        changed = self._changed(baseline, before, workspace, task)
         # A skipped entry is in no manifest, so a task file at its path reads as
         # a clean addition and would replace a live socket, pipe or device.
         occupied = self._occupied_by_special(source, changed)
@@ -191,7 +197,11 @@ class LocalCopyManager:
             preview = ", ".join(occupied[:5])
             suffix = "…" if len(occupied) > 5 else ""
             raise LocalCopyError(f"Handoff stopped before changing the source; a socket, pipe or device still occupies: {preview}{suffix}")
-        conflicts = [path for path in changed if current_source.get(path) != before.get(path)]
+        conflicts = [
+            path
+            for path in changed
+            if not self._same(path, baseline, before.get(path), source, current_source.get(path))
+        ]
         if conflicts:
             preview = ", ".join(conflicts[:5])
             suffix = "…" if len(conflicts) > 5 else ""
@@ -357,42 +367,98 @@ class LocalCopyManager:
                 occupied.append(relative)
         return occupied
 
+    @classmethod
+    def _changed(
+        cls,
+        before_root: Path,
+        before: dict[str, _Entry],
+        after_root: Path,
+        after: dict[str, _Entry],
+    ) -> list[str]:
+        return [
+            relative
+            for relative in sorted(set(before) | set(after))
+            if not cls._same(relative, before_root, before.get(relative), after_root, after.get(relative))
+        ]
+
+    @classmethod
+    def _same(
+        cls,
+        relative: str,
+        left_root: Path,
+        left: _Entry | None,
+        right_root: Path,
+        right: _Entry | None,
+    ) -> bool:
+        if left is None or right is None:
+            return left is right
+        if left.kind != right.kind or left.mode != right.mode or left.target != right.target:
+            return False
+        if left.kind != "file":
+            return True
+        if left.size != right.size:
+            return False
+        # Clones and copy2 keep modification times, so an untouched file
+        # matches on stat and is never read. This is git's index heuristic.
+        if left.mtime_ns == right.mtime_ns:
+            return True
+        return cls._digest(left_root / relative) == cls._digest(right_root / relative)
+
     @staticmethod
-    def _manifest(root: Path) -> dict[str, str]:
-        result: dict[str, str] = {}
+    def _digest(path: Path) -> str:
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return "unreadable"
+        return digest.hexdigest()
+
+    @classmethod
+    def _manifests(cls, *roots: Path) -> list[dict[str, _Entry]]:
+        # A walk is dominated by lstat calls, which release the GIL, so the
+        # trees are walked side by side.
+        with ThreadPoolExecutor(max_workers=len(roots)) as pool:
+            return list(pool.map(cls._manifest, roots))
+
+    @staticmethod
+    def _manifest(root: Path) -> dict[str, _Entry]:
+        """Stat every reviewable entry under ``root`` without reading content.
+
+        Keep Git metadata in isolated copies so nested repositories remain
+        usable, but never scan it as source content for review or handoff.
+        A symlinked directory is one link entry and is never descended.
+        """
+        result: dict[str, _Entry] = {}
         if not root.is_dir():
             return result
-        paths: list[Path] = []
-        # Keep Git metadata in isolated copies so nested repositories remain
-        # usable, but never scan it as source content for review or handoff.
-        for directory, directories, filenames in os.walk(root, topdown=True, followlinks=False):
-            current = Path(directory)
-            retained: list[str] = []
-            for name in sorted(directories):
-                path = current / name
-                if name == ".git":
-                    continue
-                if path.is_symlink():
-                    paths.append(path)
-                else:
-                    retained.append(name)
-            directories[:] = retained
-            paths.extend(current / name for name in sorted(filenames) if name != ".git")
-
-        for path in sorted(paths):
-            relative = path.relative_to(root).as_posix()
+        pending: list[tuple[str, str]] = [(str(root), "")]
+        while pending:
+            directory, prefix = pending.pop()
             try:
-                info = path.lstat()
-                if stat.S_ISLNK(info.st_mode):
-                    result[relative] = f"link:{os.readlink(path)}"
-                elif stat.S_ISREG(info.st_mode):
-                    digest = hashlib.sha256()
-                    with path.open("rb") as handle:
-                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                            digest.update(chunk)
-                    result[relative] = f"file:{info.st_mode & 0o777}:{digest.hexdigest()}"
+                entries = list(os.scandir(directory))
             except OSError:
-                result[relative] = "unreadable"
+                continue
+            for entry in entries:
+                if entry.name == ".git":
+                    continue
+                relative = prefix + entry.name
+                try:
+                    if entry.is_symlink():
+                        result[relative] = _Entry("link", target=os.readlink(entry.path))
+                    elif entry.is_dir(follow_symlinks=False):
+                        pending.append((entry.path, relative + "/"))
+                    elif entry.is_file(follow_symlinks=False):
+                        info = entry.stat(follow_symlinks=False)
+                        result[relative] = _Entry(
+                            "file",
+                            mode=info.st_mode & 0o777,
+                            size=info.st_size,
+                            mtime_ns=info.st_mtime_ns,
+                        )
+                except OSError:
+                    result[relative] = _Entry("unreadable")
         return result
 
     @staticmethod
