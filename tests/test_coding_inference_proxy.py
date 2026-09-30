@@ -10,6 +10,7 @@ from cowork.api.v1.endpoints.coding import (
     _inference_url,
     _require_inference_client,
 )
+import asyncio
 import json
 
 import httpx
@@ -344,14 +345,33 @@ async def test_proxy_reuses_one_upstream_client_across_requests(monkeypatch: pyt
 
 
 @pytest.mark.asyncio
-async def test_proxy_closes_the_upstream_when_codex_stops_reading(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "disconnect_after",
+    ["http.response.start", "http.response.body", None],
+    ids=["before-the-body", "mid-body", "complete"],
+)
+async def test_proxy_returns_the_upstream_connection_however_the_stream_ends(
+    monkeypatch: pytest.MonkeyPatch, disconnect_after: str | None
+) -> None:
     stream = _ClosingStream()
     _mock_upstream(monkeypatch, [httpx.Response(200, stream=stream)])
-
     response = await _proxy()
-    iterator = response.body_iterator
-    assert await anext(iterator) == b"data: one\n\n"
-    # A disconnect closes the body iterator before it is exhausted.
-    await iterator.aclose()
+    gone = asyncio.Event()
+
+    async def receive() -> dict[str, object]:
+        await gone.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, object]) -> None:
+        if message["type"] == disconnect_after:
+            gone.set()
+            # Codex is gone, so this send never completes. ``asyncio.sleep``
+            # is stubbed out by ``_mock_upstream``.
+            await asyncio.Event().wait()
+
+    # ASGI 2.3, which uvicorn speaks, streams alongside a disconnect listener.
+    # A complete stream ends the call itself, which cancels the listener.
+    scope = {"type": "http", "asgi": {"spec_version": "2.3"}}
+    await asyncio.wait_for(response(scope, receive, send), timeout=5)
 
     assert stream.closed
