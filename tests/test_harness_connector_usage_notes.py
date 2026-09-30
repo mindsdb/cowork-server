@@ -2,6 +2,7 @@
 API rules moved out of the Picker block into google_drive's spec, so they
 appear once and for every Drive connection."""
 import json
+from contextlib import asynccontextmanager
 
 import pytest
 from pydantic import SecretStr
@@ -34,20 +35,26 @@ def test_no_picked_files_no_picker_guidance():
     assert harness._picked_files_guidance({}) == ""
 
 
-@pytest.fixture
-def drive_vault(tmp_path):
+def _drive_vault(tmp_path, **extra_fields):
     from anton.core.datasources.data_vault import LocalDataVault
 
     vault = LocalDataVault(tmp_path / "vault")
-    vault.save("google_drive", "work", {
-        "auth_type": "oauth",
-        "access_token": "tok",
-        "_picked_files": json.dumps([{"id": "f1", "name": "Roadmap.gdoc"}]),
-    })
+    vault.save("google_drive", "work", {"auth_type": "oauth", "access_token": "tok", **extra_fields})
     return vault
 
 
-async def test_usage_notes_reach_the_session_config(monkeypatch, drive_vault):
+@pytest.fixture
+def drive_vault(tmp_path):
+    return _drive_vault(tmp_path, _picked_files=json.dumps([{"id": "f1", "name": "Roadmap.gdoc"}]))
+
+
+@pytest.fixture
+def drive_vault_without_picks(tmp_path):
+    return _drive_vault(tmp_path)
+
+
+@asynccontextmanager
+async def _session_config(monkeypatch, vault):
     from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
     from cowork.db.session import get_open_session
     from cowork.services.conversations import ConversationService
@@ -65,7 +72,7 @@ async def test_usage_notes_reach_the_session_config(monkeypatch, drive_vault):
     # Capture the config instead of starting scratchpad processes.
     monkeypatch.setattr(harness, "build_chat_session", lambda config: config)
     monkeypatch.setattr(
-        "anton.core.datasources.data_vault.LocalDataVault", lambda *_a, **_k: drive_vault
+        "anton.core.datasources.data_vault.LocalDataVault", lambda *_a, **_k: vault
     )
     monkeypatch.setenv("ANTON_SCRATCHPAD_PERSIST_SESSION", "false")
 
@@ -75,11 +82,24 @@ async def test_usage_notes_reach_the_session_config(monkeypatch, drive_vault):
         )
         config, _, _ = await harness.AntonHarness()._build_chat_session(conversation)
         try:
-            assert config.connector_usage_notes == registry.usage_notes_for(["google_drive"])
-            suffix = config.system_prompt_context.suffix
-            assert "Roadmap.gdoc" in suffix  # the Picker block still renders
-            assert "corpora" not in suffix   # ...without the moved Drive API rules
+            yield config
         finally:
             client = config.llm_client
             for provider in (client.planning_provider, client.coding_provider, client.router_provider):
                 await provider._client.close()
+
+
+async def test_usage_notes_reach_the_session_config(monkeypatch, drive_vault):
+    async with _session_config(monkeypatch, drive_vault) as config:
+        assert config.connector_usage_notes == registry.usage_notes_for(["google_drive"])
+        suffix = config.system_prompt_context.suffix
+        assert "Roadmap.gdoc" in suffix  # the Picker block still renders
+        assert "corpora" not in suffix   # ...without the moved Drive API rules
+
+
+async def test_drive_notes_reach_the_session_config_without_picked_files(
+    monkeypatch, drive_vault_without_picks
+):
+    async with _session_config(monkeypatch, drive_vault_without_picks) as config:
+        assert "corpora='allDrives'" in config.connector_usage_notes["google_drive"]
+        assert "Google Picker" not in config.system_prompt_context.suffix
