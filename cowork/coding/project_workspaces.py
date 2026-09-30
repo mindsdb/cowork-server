@@ -107,7 +107,15 @@ class ProjectCommandRunner:
         workspaces: tuple[TaskWorkspace, ...],
         phase: str,
         ports: dict[str, int],
+        on_start: Callable[[ProjectCommand, TaskWorkspace], None] | None = None,
+        on_result: Callable[[CommandResult], None] | None = None,
+        stop: Callable[[], bool] | None = None,
     ) -> list[CommandResult]:
+        """Run a phase's commands in order, reporting each as it starts and ends.
+
+        ``stop`` is checked before each command, so a cancelled task skips the
+        rest of its commands.
+        """
         if _org_mode():
             raise WorkspaceError("Local Code Project commands are not available on this deployment")
         by_id = {workspace.folder_id: workspace for workspace in workspaces}
@@ -118,7 +126,14 @@ class ProjectCommandRunner:
         for folder in project.folders:
             workspace = by_id[folder.id]
             for command in (item for item in folder.commands if item.phase == phase):
-                results.append(self._run_one(command, workspace, environment))
+                if stop is not None and stop():
+                    return results
+                if on_start is not None:
+                    on_start(command, workspace)
+                result = self._run_one(command, workspace, environment)
+                results.append(result)
+                if on_result is not None:
+                    on_result(result)
         return results
 
     @staticmethod
@@ -436,8 +451,11 @@ class ProjectWorkspaceManager:
         workspaces: list[TaskWorkspace],
         phase: str,
         ports: dict[str, int],
+        on_start: Callable[[ProjectCommand, TaskWorkspace], None] | None = None,
+        on_result: Callable[[CommandResult], None] | None = None,
+        stop: Callable[[], bool] | None = None,
     ) -> list[CommandResult]:
-        return self.commands.run(project, tuple(workspaces), phase, ports)
+        return self.commands.run(project, tuple(workspaces), phase, ports, on_start, on_result, stop)
 
     def diff(self, workspaces: list[TaskWorkspace]) -> list[DiffFile]:
         files: list[DiffFile] = []
