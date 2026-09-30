@@ -562,6 +562,10 @@ class ControlPlaneService:
                 # renderer, so ordinary UI events must never project its stale
                 # status back into a leased/fenced remote run.
                 return
+            if run.status == RunStatus.preparing and session.status == SessionStatus.running:
+                # A new task's placeholder reads as running while its workspace
+                # prepares; only preparation moves the Run on to ready.
+                return
             transition_run(run, _SESSION_STATUS[session.status], error=session.last_error)
 
         return self.store.update_run(session.run_id, reconcile)

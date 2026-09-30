@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from functools import lru_cache
 from pathlib import Path
 
@@ -66,7 +66,7 @@ from cowork.coding.skill_runtime import SkillRuntimeResolver
 from cowork.coding.store import CodingStore
 from cowork.coding.task_delivery import TaskDeliveryService
 from cowork.coding.terminal_service import TaskTerminalService
-from cowork.coding.turns import RunningTurn, TurnExecutor
+from cowork.coding.turns import RunningTurn, TurnExecutor, fail_turn
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager
 from cowork.common.settings.app_settings import get_app_settings
 
@@ -140,7 +140,7 @@ class CodingService(
             lock=self._lock,
         )
         self.project_tasks = ProjectTaskOperations(
-            get_session=self.get_session,
+            get_session=self._prepared_session,
             maintenance_session=self._maintenance_session,
             emit=self._emit,
             store=self.store,
@@ -186,10 +186,10 @@ class CodingService(
             self.store,
             self.runtimes,
             self.remote,
-            self.get_session,
+            self._prepared_session,
         )
         self.project_actions = ProjectActionService(
-            get_session=self.get_session,
+            get_session=self._prepared_session,
             projects=self.projects,
             terminals=self.task_terminals,
             get_computer=self.control.store.get_computer,
@@ -207,6 +207,7 @@ class CodingService(
         )
         self.store.reconcile_interrupted()
         for session in self.store.list_sessions():
+            session = self._fail_abandoned_preparation(session)
             try:
                 project = self.projects.get(session.project_id) if session.project_id else None
             except (KeyError, ValueError) as exc:
@@ -264,6 +265,33 @@ class CodingService(
         except (FileNotFoundError, ValueError) as exc:
             raise KeyError("coding session not found") from exc
 
+    def _prepared_session(self, session_id: str) -> CodingSession:
+        """Return a task whose workspace exists, refusing one still preparing."""
+        session = self.get_session(session_id)
+        if not session.workspace_path and not self._is_remote(session):
+            raise RuntimeError("The task workspace is still being prepared")
+        return session
+
+    def _fail_abandoned_preparation(self, session: CodingSession) -> CodingSession:
+        # A local task with no workspace was preparing when the previous
+        # process stopped; nothing will finish that preparation now.
+        if session.workspace_path or not session.run_id or self._is_remote(session):
+            return session
+        try:
+            run = self.control.store.get_run(session.run_id)
+        except KeyError:
+            return session
+        if run.status != RunStatus.preparing:
+            return session
+        message = "The app stopped before the task workspace was ready. Start the task again."
+        self.store.append_event(
+            session.id,
+            CodingEvent(type=EventType.error, title="Task did not start", text=message, phase="failed"),
+            lambda current: fail_turn(current, False, message),
+        )
+        self.control.set_run_status(run.id, RunStatus.failed)
+        return self.store.load_session(session.id)
+
     def _control_view(self, session: CodingSession) -> CodingSession:
         """Project canonical Task Run state onto the compatibility session."""
 
@@ -297,6 +325,22 @@ class CodingService(
 
     def delete_session(self, session_id: str) -> None:
         session = self.get_session(session_id)
+        with self._lock:
+            preparing = self._running.get(session_id)
+            if preparing is not None and preparing.preparing:
+                # Deleting stops preparation. The preparation thread releases
+                # any workspace it has already made once its current step ends.
+                preparing.cancel_requested = True
+                preparing.delete_requested = True
+            else:
+                preparing = None
+        if preparing is not None:
+            with suppress(FileNotFoundError):
+                self.store.delete_session(session.id)
+            self.skill_runtime.cleanup(session.id)
+            if session.run_id:
+                self.control.delete_task(session.run_id)
+            return
         if self._is_remote(session):
             self.remote.require_idle(session, "deleting this coding task")
             self.remote.release_workspace(session)
@@ -322,7 +366,7 @@ class CodingService(
         return self.lifecycle.set_pinned(session_id, pinned)
 
     def fork_session(self, session_id: str, credentials: EngineCredentials) -> CodingSession:
-        session = self.get_session(session_id)
+        session = self._prepared_session(session_id)
         self._require_task_capability(session, TaskCapability.fork)
         return self.get_session(self.lifecycle.fork_session(session_id, credentials).id)
 
@@ -427,18 +471,18 @@ class CodingService(
         return self.registry.get(engine_id).discover_models(credentials)
 
     def extension_inventory(self, session_id: str, credentials: EngineCredentials):
-        session = self.get_session(session_id)
+        session = self._prepared_session(session_id)
         self._require_task_capability(session, TaskCapability.extensions)
         runtime = self.runtimes.open(session, credentials)
         return runtime.extension_inventory()
 
     def platform_status(self, session_id: str, credentials: EngineCredentials):
-        session = self.get_session(session_id)
+        session = self._prepared_session(session_id)
         self._require_task_capability(session, TaskCapability.platform_settings)
         return self.runtimes.open(session, credentials).platform_status()
 
     def setup_windows_sandbox(self, session_id: str, credentials: EngineCredentials):
-        session = self.get_session(session_id)
+        session = self._prepared_session(session_id)
         self._require_task_capability(session, TaskCapability.platform_settings)
         return self.runtimes.open(session, credentials).setup_windows_sandbox()
 
