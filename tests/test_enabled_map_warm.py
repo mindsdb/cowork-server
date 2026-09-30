@@ -112,6 +112,32 @@ def test_warm_noops_without_a_minds_key(monkeypatch):
         session.close()
 
 
+def test_warm_ignores_a_publish_key_and_stays_silent(monkeypatch):
+    """ANTON_PUBLISH_API_KEY (ENG-3045) is a publish credential, not a MindsHub
+    one — it must not wake this warm even with an explicit publish URL set."""
+    from cowork.services import providers
+
+    monkeypatch.setenv("ANTON_PUBLISH_API_KEY", "self-hosted-secret")
+    monkeypatch.setenv("ANTON_PUBLISH_URL", "http://publisher-api:8081")
+
+    called = False
+
+    async def fake_fetch(url, key, *, force_refresh=False, tenant_key=None):
+        nonlocal called
+        called = True
+        return _listing(FREE_ENABLED)
+
+    monkeypatch.setattr(providers, "fetch_minds_models", fake_fetch)
+    session = _fresh_session()
+    try:
+        _clear(session, "minds_api_key", "minds_url", "minds_model_enabled")
+        changed = asyncio.run(providers.warm_enabled_model_map(session))
+        assert changed is False
+        assert called is False
+    finally:
+        session.close()
+
+
 def test_warm_is_fail_open_on_fetch_failure(monkeypatch):
     from cowork.services import providers
 
