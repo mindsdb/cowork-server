@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
 
+import anyio
 import httpx
 from fastapi import HTTPException, Request
 from starlette.responses import Response, StreamingResponse
+from starlette.types import Receive, Scope, Send
 
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.inference_trace import trace_headers
@@ -183,22 +184,35 @@ async def proxy_inference(request: Request, path: str, credentials: EngineCreden
         finally:
             await upstream.aclose()
         return _terminal_response(upstream, raw)
-    return StreamingResponse(
-        _stream_and_close(upstream),
-        status_code=upstream.status_code,
-        headers=_response_headers(upstream),
-    )
+    return _UpstreamStreamingResponse(upstream)
 
 
-async def _stream_and_close(upstream: httpx.Response) -> AsyncIterator[bytes]:
-    # Closing the response returns its connection to the shared pool. This runs
-    # in ``finally`` rather than as a background task, which Starlette skips
-    # when Codex disconnects mid-stream, and a pooled connection would leak.
-    try:
-        async for chunk in upstream.aiter_bytes():
-            yield chunk
-    finally:
-        await upstream.aclose()
+class _UpstreamStreamingResponse(StreamingResponse):
+    """Stream an upstream body and always return its connection to the pool.
+
+    The close runs when the response call exits, however it exits. A close in
+    the body generator's ``finally`` never runs when Codex disconnects before
+    the body starts, because Starlette then cancels the response before the
+    generator is entered. Starlette also skips background tasks on a
+    disconnect. Either way the pooled connection would stay checked out.
+    """
+
+    def __init__(self, upstream: httpx.Response) -> None:
+        super().__init__(
+            upstream.aiter_bytes(),
+            status_code=upstream.status_code,
+            headers=_response_headers(upstream),
+        )
+        self._upstream = upstream
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # Shielded, so the cancellation that ended the stream can't also
+            # interrupt the close.
+            with anyio.CancelScope(shield=True):
+                await self._upstream.aclose()
 
 
 async def _send_through_rate_limits(
