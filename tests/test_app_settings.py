@@ -281,12 +281,12 @@ def test_turn_queue_settings_is_remote(monkeypatch):
     assert TurnQueueSettings().is_remote is False  # default is "inprocess"
 
 
-def test_turn_queue_settings_jev_shadow_is_off_unless_the_env_turns_it_on(monkeypatch):
-    monkeypatch.delenv("COWORK_TURN_JEV_SHADOW_ENABLED", raising=False)
-    assert TurnQueueSettings(_env_file=None).jev_shadow_enabled is False
+def test_turn_queue_settings_jev_is_off_unless_the_env_turns_it_on(monkeypatch):
+    monkeypatch.delenv("COWORK_TURN_JEV_ENABLED", raising=False)
+    assert TurnQueueSettings(_env_file=None).jev_enabled is False
 
-    monkeypatch.setenv("COWORK_TURN_JEV_SHADOW_ENABLED", "true")
-    assert TurnQueueSettings(_env_file=None).jev_shadow_enabled is True
+    monkeypatch.setenv("COWORK_TURN_JEV_ENABLED", "true")
+    assert TurnQueueSettings(_env_file=None).jev_enabled is True
 
 
 def test_stale_organization_boundary_mode_env_var_is_inert(monkeypatch):

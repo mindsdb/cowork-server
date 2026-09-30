@@ -306,61 +306,11 @@ async def test_route_request_runs_gate_under_org_scope(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_route_request_ignores_jev_result_even_when_it_contradicts_the_gate(monkeypatch):
-    """The shadow probe is logging-only. A Jev result that confidently
-    disagrees with the gate, or is an error dict, must never change the
-    decision `_route_request` returns."""
-    import cowork.handlers.responses as responses
-    from cowork.handlers import jev_shadow
-
-    handler = _routing_handler(monkeypatch)
-    monkeypatch.setattr(
-        responses,
-        "ConversationService",
-        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
-    )
-    async def fake_decide_route(**_kwargs):
-        return RouteDecision(route=DIRECT_CONTEXT, reason="test", text="hi")
-
-    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
-
-    async def loud_wrong_jev(**_kwargs):
-        return {"jev_choice": "needs_agent", "jev_confidence": 0.99, "jev_ms": 5}
-
-    monkeypatch.setattr(jev_shadow, "probe", loud_wrong_jev)
-
-    decision, _turn_llm = await handler._route_request(
-        conversation_id=None,
-        harness_input=[{"type": "text", "text": "Hello"}],
-        has_attachments=False,
-        has_disabled_connections=False,
-    )
-
-    assert decision.route == DIRECT_CONTEXT
-    assert decision.text == "hi"
-
-    async def jev_error(**_kwargs):
-        return {"jev_error": "timeout", "jev_ms": 3000}
-
-    monkeypatch.setattr(jev_shadow, "probe", jev_error)
-
-    decision, _turn_llm = await handler._route_request(
-        conversation_id=None,
-        harness_input=[{"type": "text", "text": "Hello"}],
-        has_attachments=False,
-        has_disabled_connections=False,
-    )
-
-    assert decision.route == DIRECT_CONTEXT
-    assert decision.text == "hi"
-
-
-@pytest.mark.asyncio
 async def test_gate_and_jev_probe_share_the_turns_correlation_id(monkeypatch):
     """The gate's trace context carries the turn's correlation_id, and
     the detached probe inherits it, so the real probe's Jev call is attributed
     to the conversation (origin:harness, not direct-api) and joins the gate
-    decision it shadows. Only the HTTP client is faked: the context has to cross
+    decision it races. Only the HTTP client is faked: the context has to cross
     the gate's create_task for this to pass."""
     import asyncio
     import json
@@ -369,7 +319,7 @@ async def test_gate_and_jev_probe_share_the_turns_correlation_id(monkeypatch):
     from anton.core.llm.tracing import get_trace_context
     from cowork.handlers import jev_shadow
 
-    monkeypatch.setenv("COWORK_TURN_JEV_SHADOW_ENABLED", "true")
+    monkeypatch.setenv("COWORK_TURN_JEV_ENABLED", "true")
     handler = _routing_handler(monkeypatch)
     monkeypatch.setattr(
         responses,
@@ -423,7 +373,7 @@ async def test_gate_and_jev_probe_share_the_turns_correlation_id(monkeypatch):
     headers = seen["probe_headers"]
     assert "Langfuse-Session-Id" not in headers
     assert "cowork-gate" not in headers["Langfuse-Tags"]
-    assert jev_shadow.JEV_SHADOW_TAG in headers["Langfuse-Tags"]
+    assert jev_shadow.JEV_ROUTE_TAG in headers["Langfuse-Tags"]
     metadata = json.loads(headers["Langfuse-Metadata"])
     assert (metadata["correlation_id"], metadata["harness"], metadata["conversation_id"]) == (
         "corr-1",
@@ -435,8 +385,8 @@ async def test_gate_and_jev_probe_share_the_turns_correlation_id(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_gate_sends_no_jev_probe_unless_shadow_mode_is_turned_on(monkeypatch):
-    """A remote turn with a minted minds-cloud key and no shadow override sends
+async def test_gate_sends_no_jev_probe_unless_jev_is_turned_on(monkeypatch):
+    """A remote turn with a minted minds-cloud key and Jev not turned on sends
     nothing to '/v1/decisions'. The probe runs on the turn's own key: Jev is
     zero-priced, so it charges no wallet, but with the default on every turn on
     an unfunded org would draw that org's free Jev allowance in the background.
@@ -451,7 +401,7 @@ async def test_gate_sends_no_jev_probe_unless_shadow_mode_is_turned_on(monkeypat
     from cowork.common.settings.app_settings import TurnQueueSettings
     from cowork.handlers import jev_shadow
 
-    monkeypatch.delenv("COWORK_TURN_JEV_SHADOW_ENABLED", raising=False)
+    monkeypatch.delenv("COWORK_TURN_JEV_ENABLED", raising=False)
     # The handler's settings skip the .env chain, so a repo-root .env cannot
     # turn the probe on or off here and only the field default decides.
     monkeypatch.setattr(responses, "TurnQueueSettings", functools.partial(TurnQueueSettings, _env_file=None))
@@ -496,7 +446,7 @@ async def test_gate_sends_no_jev_probe_unless_shadow_mode_is_turned_on(monkeypat
         has_attachments=False,
         has_disabled_connections=False,
     )
-    await asyncio.gather(*list(responses._jev_shadow_tasks))
+    await asyncio.gather(*list(responses._jev_tasks))
 
     assert decision.fallback is False
     assert decision.reason == "test"
@@ -533,48 +483,159 @@ async def test_gate_without_a_minted_turn_key_carries_no_correlation_id(monkeypa
     assert seen["gate_context"].metadata == {"cowork_server_version": "1.2.3"}
 
 
-@pytest.mark.asyncio
-async def test_route_request_returns_promptly_even_when_jev_is_slow(monkeypatch):
-    """The probe must be detached, not awaited alongside the gate: a ready
-    gate decision returning only after Jev finishes would mean a 'shadow'
-    probe delays every real turn it shadows, exactly what it must never do."""
-    import asyncio
-    import time
-
+def _jev_handler(monkeypatch, *, gate, jev, holdout_rate=0.0, minted=True):
+    """A hosted turn with Jev on, a scripted gate and a scripted Jev answer."""
     import cowork.handlers.responses as responses
     from cowork.handlers import jev_shadow
 
+    monkeypatch.setenv("COWORK_TURN_JEV_ENABLED", "true")
+    monkeypatch.setattr(responses, "_JEV_HOLDOUT_RATE", holdout_rate)
     handler = _routing_handler(monkeypatch)
     monkeypatch.setattr(
         responses,
         "ConversationService",
         lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
     )
+    llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
 
-    async def fast_decide_route(**_kwargs):
-        return RouteDecision(route=DIRECT_CONTEXT, reason="test", text="hi")
+    async def fake_binding():
+        if not minted:
+            return None, None
+        return SimpleNamespace(label="minds_cloud"), {"correlation_id": "corr-1", "llm": llm_block}
 
-    monkeypatch.setattr(responses, "decide_route", fast_decide_route)
+    handler._router_binding = fake_binding
+    monkeypatch.setattr(responses, "decide_route", gate)
+    monkeypatch.setattr(jev_shadow, "probe", jev)
+    return handler
 
-    async def slow_jev(**_kwargs):
-        await asyncio.sleep(0.25)
-        return {"jev_choice": "needs_agent", "jev_confidence": 0.9, "jev_ms": 250}
 
-    monkeypatch.setattr(jev_shadow, "probe", slow_jev)
-
-    started = time.monotonic()
-    decision, _turn_llm = await handler._route_request(
-        conversation_id=None,
-        harness_input=[{"type": "text", "text": "Hello"}],
+async def _route(handler):
+    return await handler._route_request(
+        conversation_id="conv-1",
+        harness_input=[{"type": "text", "text": "What is the price of Bitcoin?"}],
         has_attachments=False,
         has_disabled_connections=False,
     )
-    elapsed = time.monotonic() - started
+
+
+_CONFIDENT_AGENT = {
+    "jev_choice": "needs_agent", "jev_confidence": 0.97, "jev_p_needs_agent": 0.97,
+    "jev_model": "jev-1.13.0", "jev_ms": 5,
+}
+
+
+@pytest.mark.asyncio
+async def test_jev_jev_confident_needs_agent_delegates_and_cancels_the_gate(monkeypatch):
+    import asyncio
+    import time
+
+    gate_cancelled = asyncio.Event()
+
+    async def slow_gate(**_kwargs):
+        try:
+            await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            gate_cancelled.set()
+            raise
+        return RouteDecision(route=DIRECT_CONTEXT, reason="test", text="hi")
+
+    async def jev(**_kwargs):
+        return _CONFIDENT_AGENT
+
+    handler = _jev_handler(monkeypatch, gate=slow_gate, jev=jev)
+    started = time.monotonic()
+    decision, turn_llm = await _route(handler)
+
+    assert time.monotonic() - started < 1
+    assert gate_cancelled.is_set()
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.reason == "jev_needs_agent"
+    assert (decision.provider, decision.model) == ("minds_cloud", "jev-1.13.0")
+    assert decision.text == ""
+    # The delegated turn still reuses the key minted for the gate.
+    assert turn_llm["correlation_id"] == "corr-1"
+
+
+@pytest.mark.parametrize(
+    "jev_result",
+    [
+        {"jev_choice": "answer_directly", "jev_confidence": 0.99, "jev_p_needs_agent": 0.01, "jev_ms": 5},
+        {"jev_choice": "needs_agent", "jev_confidence": 0.6, "jev_p_needs_agent": 0.85, "jev_ms": 5},
+        {"jev_error": "http_429", "jev_ms": 5},
+        None,
+    ],
+)
+@pytest.mark.asyncio
+async def test_jev_jev_without_a_confident_needs_agent_waits_for_the_gate(monkeypatch, jev_result):
+    import asyncio
+
+    async def gate(**_kwargs):
+        await asyncio.sleep(0.05)
+        return RouteDecision(route=DIRECT_CONTEXT, reason="test", text="hi")
+
+    async def jev(**_kwargs):
+        return jev_result
+
+    decision, _turn_llm = await _route(_jev_handler(monkeypatch, gate=gate, jev=jev))
 
     assert decision.route == DIRECT_CONTEXT
-    assert elapsed < 0.1  # nowhere near the slow probe's 0.25s
+    assert decision.text == "hi"
 
-    await asyncio.sleep(0.3)  # let the detached probe finish before teardown
+
+@pytest.mark.asyncio
+async def test_jev_holdout_turn_waits_for_the_gate_even_when_jev_is_confident(monkeypatch):
+    import asyncio
+
+    async def gate(**_kwargs):
+        await asyncio.sleep(0.05)
+        return RouteDecision(route=DIRECT_CONTEXT, reason="test", text="hi")
+
+    async def jev(**_kwargs):
+        return _CONFIDENT_AGENT
+
+    handler = _jev_handler(monkeypatch, gate=gate, jev=jev, holdout_rate=1.0)
+    decision, _turn_llm = await _route(handler)
+
+    assert decision.route == DIRECT_CONTEXT
+    assert decision.text == "hi"
+
+
+@pytest.mark.asyncio
+async def test_jev_gate_decision_first_does_not_wait_for_jev(monkeypatch):
+    import asyncio
+    import time
+
+    import cowork.handlers.responses as responses
+
+    async def gate(**_kwargs):
+        return RouteDecision(route=DIRECT_CONTEXT, reason="test", text="hi")
+
+    async def slow_jev(**_kwargs):
+        await asyncio.sleep(0.25)
+        return _CONFIDENT_AGENT
+
+    handler = _jev_handler(monkeypatch, gate=gate, jev=slow_jev)
+    started = time.monotonic()
+    decision, _turn_llm = await _route(handler)
+
+    assert time.monotonic() - started < 0.1
+    assert decision.route == DIRECT_CONTEXT
+    # The late Jev answer is logged, never routed on.
+    await asyncio.gather(*list(responses._jev_tasks))
+
+
+@pytest.mark.asyncio
+async def test_jev_without_a_minted_key_runs_the_gate_alone(monkeypatch):
+    async def gate(**_kwargs):
+        return RouteDecision(route=DIRECT_CONTEXT, reason="test", text="hi")
+
+    async def jev(**_kwargs):
+        raise AssertionError("desktop and BYOK turns must not call Jev")
+
+    handler = _jev_handler(monkeypatch, gate=gate, jev=jev, minted=False)
+    decision, _turn_llm = await _route(handler)
+
+    assert decision.route == DIRECT_CONTEXT
 
 
 @pytest.mark.asyncio
