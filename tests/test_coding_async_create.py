@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -14,6 +16,7 @@ from coding_service_fakes import (
     wait_for_status,
 )
 
+from cowork.coding import project_workspaces
 from cowork.coding.contracts import (
     EventType,
     InputReference,
@@ -21,6 +24,11 @@ from cowork.coding.contracts import (
     SessionStatus,
 )
 from cowork.coding.control_models import RunStatus
+from cowork.coding.project_models import (
+    ProjectCommand,
+    ProjectCreateRequest,
+    ProjectFolder,
+)
 from cowork.coding.service import CodingService
 
 
@@ -178,3 +186,109 @@ def test_invalid_attachments_are_rejected_before_the_task_is_created(tmp_path: P
             "fake-model",
         )
     assert service.list_sessions(True).items == []
+
+
+def test_a_follow_up_queued_while_preparing_runs_after_the_first_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    started, release = hold_preparation(monkeypatch, service)
+    created = create(service, repo)
+    assert started.wait(timeout=3)
+
+    service.queue_turn(created.id, "Then add tests")
+    with pytest.raises(RuntimeError, match="once the task workspace is ready"):
+        service.queue_turn(created.id, "Read this", [InputReference(name="README.md", path=str(repo / "README.md"))])
+    release.set()
+    wait_for_status(service, created.id, SessionStatus.completed)
+    deadline = time.monotonic() + 3
+    while len(engine.prompts) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+    assert engine.prompts == ["Build the feature", "Then add tests"]
+    assert service.get_session(created.id).queued_instructions == []
+    # Events emitted while preparing never try to move the Run past preparing.
+    assert "Could not synchronize Task Run state" not in caplog.text
+
+
+def test_setup_commands_report_progress_while_they_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    project = service.projects.create(
+        ProjectCreateRequest(
+            name="Setup",
+            folders=[ProjectFolder(
+                id="app",
+                name="App",
+                path=str(repo),
+                commands=[ProjectCommand(id="install", label="Install dependencies", argv=["true"], phase="setup")],
+            )],
+            default_engine_id="fake",
+            default_model="fake-model",
+        )
+    )
+    running, finish = threading.Event(), threading.Event()
+    run_one = project_workspaces.ProjectCommandRunner._run_one
+
+    def slow(command, workspace, environment):
+        running.set()
+        assert finish.wait(timeout=5)
+        return run_one(command, workspace, environment)
+
+    monkeypatch.setattr(project_workspaces.ProjectCommandRunner, "_run_one", staticmethod(slow))
+    created = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Build it"), CREDS, "fake", "fake-model"
+    )
+    assert running.wait(timeout=3)
+
+    live = [event for event in service.events(created.id).items if event.title == "Install dependencies"]
+    assert [(event.type, event.phase) for event in live] == [(EventType.command, "started")]
+    finish.set()
+    wait_for_status(service, created.id, SessionStatus.completed)
+    setup = [event for event in service.events(created.id).items if event.title == "Install dependencies"]
+    assert [event.phase for event in setup] == ["started", "completed"]
+    assert setup[0].item_id == setup[1].item_id
+
+
+def test_deleting_a_task_while_it_prepares_removes_it_and_its_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    started, release = hold_preparation(monkeypatch, service)
+    created = create(service, repo)
+    assert started.wait(timeout=3)
+    thread = service._running[created.id].thread
+
+    service.delete_session(created.id)
+
+    with pytest.raises(KeyError):
+        service.get_session(created.id)
+    assert service.list_sessions(True).items == []
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert engine.prompts == []
+    # The worktree preparation made after the delete was released again.
+    worktrees = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"], cwd=repo, capture_output=True, text=True, check=True
+    ).stdout
+    assert worktrees.count("worktree ") == 1
+
+
+def test_runtime_settings_wait_for_the_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    started, release = hold_preparation(monkeypatch, service)
+    created = create(service, repo)
+    assert started.wait(timeout=3)
+
+    for operation in (service.extension_inventory, service.platform_status):
+        with pytest.raises(RuntimeError, match="still being prepared"):
+            operation(created.id, CREDS)
+    release.set()
+    wait_for_status(service, created.id, SessionStatus.completed)

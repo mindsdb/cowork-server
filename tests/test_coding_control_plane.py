@@ -942,7 +942,6 @@ def test_run_status_is_only_assigned_by_the_transition_table() -> None:
         "remote_execution.py": {"current"},
         "run_recovery.py": {"workspace"},
         "service.py": {"session"},
-        "session_factory.py": {"session"},  # A new task's CodingSession while it prepares.
         "service_turns.py": {"current"},
         "service_questions.py": {"current"},  # CodingSession waiting state; never TaskRun.
         "service_planning.py": {"current"},  # CodingSession rollback; sync uses transition_run.

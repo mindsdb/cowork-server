@@ -39,6 +39,8 @@ class RunningTurn:
     interruption_requested: bool = False
     # Reserves a new task while its workspace prepares, before any engine exists.
     preparing: bool = False
+    # The task was deleted while preparing; its thread releases what it made.
+    delete_requested: bool = False
     pending_steers: list[tuple[str, tuple[EngineInputReference, ...]]] = field(default_factory=list)
 
     def route_steer(
