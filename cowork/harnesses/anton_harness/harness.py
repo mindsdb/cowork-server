@@ -1199,9 +1199,9 @@ class AntonHarness:
                 ),
                 workspace=workspace,
                 data_vault=data_vault,
-                # Dropped, not raised, on an anton that predates the field; the
-                # uv.lock upgrade (same PR) and the anton-agent floor keep such
-                # an anton from shipping.
+                # Dropped, not raised, on an anton that predates the field: the
+                # uv.lock pin and the anton-agent floor must include it, or the
+                # Drive API rules are lost.
                 **supported_kwargs(ChatSessionConfig, connector_usage_notes=connector_usage_notes),
                 **overlay_kwargs,
                 initial_history=initial_history,
