@@ -369,6 +369,7 @@ async def test_gate_and_jev_probe_share_the_turns_correlation_id(monkeypatch):
     from anton.core.llm.tracing import get_trace_context
     from cowork.handlers import jev_shadow
 
+    monkeypatch.setenv("COWORK_TURN_JEV_SHADOW_ENABLED", "true")
     handler = _routing_handler(monkeypatch)
     monkeypatch.setattr(
         responses,
@@ -431,6 +432,75 @@ async def test_gate_and_jev_probe_share_the_turns_correlation_id(monkeypatch):
     )
     # The context is the gate's alone: it does not leak past the gate block.
     assert get_trace_context() is None
+
+
+@pytest.mark.asyncio
+async def test_gate_sends_no_jev_probe_unless_shadow_mode_is_turned_on(monkeypatch):
+    """A remote turn with a minted minds-cloud key and no shadow override sends
+    nothing to '/v1/decisions'. The probe runs on the turn's own key: Jev is
+    zero-priced, so it charges no wallet, but with the default on every turn on
+    an unfunded org would draw that org's free Jev allowance in the background.
+    Only the HTTP client is faked, the gate's own decision (not the
+    router_unavailable fallback) proves the gate block ran through the probe
+    spawn, and the detached probe task is awaited to the end, so a default
+    flipped back on makes the POST this test forbids."""
+    import asyncio
+    import functools
+
+    import cowork.handlers.responses as responses
+    from cowork.common.settings.app_settings import TurnQueueSettings
+    from cowork.handlers import jev_shadow
+
+    monkeypatch.delenv("COWORK_TURN_JEV_SHADOW_ENABLED", raising=False)
+    # The handler's settings skip the .env chain, so a repo-root .env cannot
+    # turn the probe on or off here and only the field default decides.
+    monkeypatch.setattr(responses, "TurnQueueSettings", functools.partial(TurnQueueSettings, _env_file=None))
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
+    )
+    llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
+
+    async def fake_binding():
+        return None, {"correlation_id": "corr-1", "llm": llm_block}
+
+    handler._router_binding = fake_binding
+
+    async def fake_decide_route(**_kwargs):
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+    posted_urls = []
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def post(self, url, *, headers, json):
+            posted_urls.append(url)
+            return SimpleNamespace(status_code=402, json=lambda: {})
+
+    monkeypatch.setattr(jev_shadow.httpx, "AsyncClient", _Client)
+
+    decision, _turn_llm = await handler._route_request(
+        conversation_id="conv-1",
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+    await asyncio.gather(*list(responses._jev_shadow_tasks))
+
+    assert decision.fallback is False
+    assert decision.reason == "test"
+    assert posted_urls == []
 
 
 @pytest.mark.asyncio
@@ -1659,3 +1729,88 @@ def test_the_adjective_denial_still_catches_the_prod_failure():
 
     assert denies_our_product("There is no verified Cowork desktop app that I could find.")
     assert denies_our_product("There's no such app as MindsHub Cowork that I know of.")
+
+
+# ── the gate's own tool must never reach history as a direct answer ──────────
+
+
+_GATE_TOOL_ANSWERS = [
+    # A local server that fails to parse the model's call streams it as text.
+    '<tool_call>\n{"name": "delegate", "arguments": {"reason": "needs files"}}\n</tool_call>',
+    'delegate(reason="the user wants a file created")',
+    "[TOOL_CALLS][{\"name\": \"delegate\", \"arguments\": {}}]",
+    "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>handoff",
+    # A small model answering "list your tools" from its one visible tool.
+    "I have one tool available:\n\n- **delegate**: forwards the task to the assistant's backend.",
+    "The only tool I can use is the delegate tool.",
+    "Tools:\n- delegate: Delegate when a request requires the full agent.",
+    "I have one delegate-tool for handing work to the backend.",
+    "My only capability is delegate_tool, which hands work to the backend.",
+]
+
+
+@pytest.mark.parametrize("answer", _GATE_TOOL_ANSWERS)
+def test_gate_tool_matcher_catches_text_calls_and_self_descriptions(answer):
+    from cowork.handlers.response_routing import names_gate_tool
+
+    assert names_gate_tool(answer) is not None
+
+
+def test_gate_tool_matcher_does_not_fire_on_related_words():
+    """Whole word only: inflections and compounds of the tool name still ship."""
+    from cowork.handlers.response_routing import names_gate_tool
+
+    for benign in (
+        "Those permissions were delegated to the admin group.",
+        "Delegation works best when the owner of each task is clear.",
+        "Use redelegate to move your stake to another validator.",
+        "Hi there, how can I help?",
+    ):
+        assert names_gate_tool(benign) is None, benign
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "Try to delegate tasks to your team so you can focus on the roadmap.",
+        "Set the table view's delegate property to your view controller.",
+        "In C#, a delegate is a type that references a method.",
+    ],
+)
+def test_known_gate_tool_over_fires_are_accepted_and_pinned(sentence):
+    """Ordinary uses of the word DO fire, deliberately.
+
+    The paraphrases a model uses to describe its one visible tool vary far more
+    than the name does, so the name is matched as a whole word. A false positive
+    costs one hop on a path that fails open. Narrowing the matcher means updating
+    this test on purpose, not deleting it.
+    """
+    from cowork.handlers.response_routing import names_gate_tool
+
+    assert names_gate_tool(sentence) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", _GATE_TOOL_ANSWERS)
+async def test_streamed_gate_answer_naming_the_gate_tool_is_discarded_and_delegated(answer):
+    """Streamed as text, as a local endpoint sends it, and never shipped.
+
+    Only a DIRECT_CONTEXT route reaches `_handle_direct_response`, which is what
+    persists an answer, so the delegated route keeps the gate's tool out of the
+    agent's history.
+    """
+    provider = _StreamProvider([_text(answer[:20]), _text(answer[20:]), _complete()])
+
+    decision = await decide_route(
+        history=[{"role": "user", "content": "list the tools you have access to"}],
+        has_non_text_input=False,
+        has_attachments=False,
+        has_disabled_connections=False,
+        binding=_binding(provider),
+    )
+
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.reason == "router_answer_named_gate_tool"
+    assert decision.text == ""
+    assert decision.fallback is False
+    assert decision.model == "gate-model"

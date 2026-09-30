@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import aiohttp
 import httpx
 from anton.core.dispatch import Attachment, InboundEvent, InboundMessage, PlatformAddress
 
@@ -221,8 +222,6 @@ class DiscordBridge:
         webhook only carries slash commands and needs a public URL). One
         connection lifecycle per call — the ingress manager reconnects when it
         returns. No session resume; dedupe absorbs any replays on reconnect."""
-        import aiohttp
-
         bot_token = (self._secrets.get("bot_token") or "").strip()
         if not bot_token:
             return

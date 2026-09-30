@@ -99,11 +99,9 @@ def test_remote_path_gates_rows_on_a_clean_finish():
     # for a formatter that returns without yielding a terminal frame
     # (persist() is idempotent, so it's a no-op once the first one ran).
     assert src.count("persist(clean=True)") == 2
-    # The three failure/cancellation branches call plain persist() (no
-    # `clean=True`) exactly three times between them — one bare call
-    # (CancelledError) and two captured into `assistant_msg` (the two
-    # response.failed branches, which thread the id into that frame).
-    assert src.count("persist()") == 3
+    # Failure, user Stop, shutdown and watchdog interruption all use plain
+    # persist(): none may retain a torn set of tool rows as a clean finish.
+    assert src.count("persist()") == 4
 
 
 IN_PROCESS_PERSISTERS = [
