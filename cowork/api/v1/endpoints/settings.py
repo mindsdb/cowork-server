@@ -31,7 +31,7 @@ from cowork.api.v1.permissions import (
 from cowork.common.paths import cowork_home
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
-from cowork.principal import Principal, caller_bearer, can_manage_org, get_principal
+from cowork.principal import Principal, caller_bearer, can_manage_org, get_principal, minds_hub_configured
 from cowork.schemas.base import CamelRequest
 from cowork.schemas.settings import (
     ProviderPingResponse,
@@ -529,7 +529,10 @@ async def test_providers(
         pingable.append(card)
 
     # ping_provider still reads the card's wire keys from a plain dict.
-    results = await ping_providers([card.model_dump(by_alias=True) for card in pingable])
+    results = await ping_providers(
+        [card.model_dump(by_alias=True) for card in pingable],
+        minds_hub_configured=scope.org_mode or minds_hub_configured(s),
+    )
     statuses, details = results.statuses, results.details
     for ptype, reason in refused.items():
         # setdefault, not update: ping_providers keys by type, so two cards of
@@ -590,8 +593,12 @@ class _ValidateProviderBody(CamelRequest):
 # they cannot reach directly. OpenByDesign's bar is "would this be a problem
 # with no layer in front of it", and this would.
 @router.post("/validate-provider", dependencies=[Depends(require(AuthenticatedInOrgMode))])
-async def validate_provider_endpoint(body: _ValidateProviderBody):
-    return await validate_provider_svc(body.provider, body.api_key, body.base_url, body.model)
+async def validate_provider_endpoint(body: _ValidateProviderBody, session: SessionDep, scope: ScopeDep):
+    s = SettingService(session, scope).load()
+    return await validate_provider_svc(
+        body.provider, body.api_key, body.base_url, body.model,
+        minds_hub_configured=scope.org_mode or minds_hub_configured(s),
+    )
 
 
 def _fill_missing(target: dict, extra: dict, *, skip: Optional[set[str]] = None) -> None:

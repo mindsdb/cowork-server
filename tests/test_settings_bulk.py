@@ -92,7 +92,7 @@ async def test_bulk_endpoint_400s_on_invalid_and_writes_nothing():
 async def test_test_providers_does_not_persist(monkeypatch):
     from cowork.api.v1.endpoints import settings as ep
 
-    async def fake_ping(providers):
+    async def fake_ping(providers, **_kwargs):
         from cowork.services.providers import ProviderPingResults
 
         return ProviderPingResults(

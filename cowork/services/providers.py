@@ -1178,8 +1178,15 @@ def _probe_denial(*, response: httpx.Response) -> GatewayDenial | None:
         return None
 
 
-async def ping_provider(p: dict[str, Any]) -> ProviderPing:
-    """Ping a single provider and return its :class:`ProviderPing`."""
+async def ping_provider(p: dict[str, Any], *, minds_hub_configured: bool = True) -> ProviderPing:
+    """Ping a single provider and return its :class:`ProviderPing`.
+
+    ``minds_hub_configured`` gates the minds-cloud fallback to the default
+    MindsHub host when the card carries no ``mindsUrl``: a self-hosted install
+    with no MindsHub key must never reach out to it just to find out. Callers
+    that never touch MindsHub (org mode, or a deployment that has a key) pass
+    the default ``True``.
+    """
     ptype = p.get("type")
     key = (p.get("apiKey") or "").strip()
     timeout = httpx.Timeout(12.0)
@@ -1256,7 +1263,11 @@ async def ping_provider(p: dict[str, Any]) -> ProviderPing:
         if ptype == "minds-cloud":
             if not key:
                 return ProviderPing(status="fail", detail="missing API key")
-            base = (p.get("mindsUrl") or default_minds_api_host()).rstrip("/")
+            base = (p.get("mindsUrl") or "").rstrip("/")
+            if not base:
+                if not minds_hub_configured:
+                    return ProviderPing(status="fail", detail="missing MindsHub URL")
+                base = default_minds_api_host().rstrip("/")
             chat_url = minds_chat_base_url(base)
             # Probe with a UNIVERSALLY-CALLABLE model, never the configured/
             # default one. This is a connectivity + auth check for the provider,
@@ -1287,9 +1298,14 @@ async def ping_provider(p: dict[str, Any]) -> ProviderPing:
     return ProviderPing(status="fail", detail="unknown provider type")
 
 
-async def ping_providers(providers: list[dict[str, Any]]) -> ProviderPingResults:
+async def ping_providers(
+    providers: list[dict[str, Any]], *, minds_hub_configured: bool = True
+) -> ProviderPingResults:
     """Ping multiple providers in parallel. Returns their results keyed by type."""
-    results = await asyncio.gather(*[ping_provider(p) for p in providers], return_exceptions=True)
+    results = await asyncio.gather(
+        *[ping_provider(p, minds_hub_configured=minds_hub_configured) for p in providers],
+        return_exceptions=True,
+    )
     statuses: dict[str, str] = {}
     details: dict[str, str] = {}
     denials: dict[str, GatewayDenial] = {}
@@ -1331,8 +1347,16 @@ async def validate_anthropic(api_key: str, model: str = "claude-sonnet-4-6") -> 
         return {"ok": False, "error": "Cannot connect"}
 
 
-async def validate_minds(api_key: str, base_url: str = "") -> dict[str, Any]:
-    base_url = base_url or default_minds_api_host()
+async def validate_minds(
+    api_key: str, base_url: str = "", *, allow_default_host: bool = True
+) -> dict[str, Any]:
+    if not base_url:
+        # No fallback to the default MindsHub host when it isn't configured:
+        # a self-hosted install with no MindsHub key must not reach out to it
+        # just to validate a card that names no URL.
+        if not allow_default_host:
+            return {"ok": False, "error": "missing MindsHub URL"}
+        base_url = default_minds_api_host()
     # Probe the real inference path rather than `/models`: listing routes
     # are not deployed on every MindsHub host and 404/401 even for valid
     # keys, which blocked onboarding with a working key. A 1-token chat
@@ -1414,12 +1438,17 @@ async def validate_openai_compatible(api_key: str, base_url: str = "https://api.
 
 async def validate_provider(provider: str, api_key: str,
                             base_url: str | None = None,
-                            model: str | None = None) -> dict[str, Any]:
-    """Validate credentials for a given provider type."""
+                            model: str | None = None, *,
+                            minds_hub_configured: bool = True) -> dict[str, Any]:
+    """Validate credentials for a given provider type.
+
+    ``minds_hub_configured`` gates ``validate_minds``'s fallback to the
+    default MindsHub host when ``base_url`` is empty; see ``validate_minds``.
+    """
     if provider == "anthropic":
         return await validate_anthropic(api_key, model or "claude-sonnet-4-6")
     if provider == "minds":
-        return await validate_minds(api_key, base_url or default_minds_api_host())
+        return await validate_minds(api_key, base_url or "", allow_default_host=minds_hub_configured)
     if provider == "openai-compatible":
         resolved_base = base_url or "https://api.openai.com/v1"
         # A caller that omits the model against a MindsHub host gets the free
