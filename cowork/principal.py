@@ -287,9 +287,9 @@ def minds_hub_configured(settings: "UserSettings") -> bool:
     MindsHub. Org mode does not call this: MindsHub is its exclusive provider,
     so the check has nothing to add there.
     """
-    from cowork.common.settings.user_settings import Provider, provider_api_key
+    from cowork.common.settings.user_settings import Provider, provider_api_key_str
 
-    return provider_api_key(settings, Provider.MINDS_CLOUD) is not None
+    return bool(provider_api_key_str(settings, Provider.MINDS_CLOUD))
 
 
 def caller_bearer(request: Request | None) -> str:

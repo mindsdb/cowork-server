@@ -17,6 +17,7 @@ from cowork.principal import (
     TrustedHeaderMiddleware,
     get_principal,
     identity_trace_metadata,
+    minds_hub_configured,
 )
 
 ORIGIN = "http://localhost:1234"
@@ -520,3 +521,29 @@ def test_identity_trace_metadata_does_not_mutate_base():
     base = {"harness": "anton"}
     identity_trace_metadata(principal, base)
     assert base == {"harness": "anton"}
+
+
+# ── minds_hub_configured ────────────────────────────────────────────
+
+
+def test_minds_hub_configured_true_for_a_real_key():
+    from cowork.common.settings.user_settings import UserSettings
+
+    settings = UserSettings.model_validate({"minds_api_key": "mdb_test"})
+    assert minds_hub_configured(settings) is True
+
+
+def test_minds_hub_configured_false_for_no_key():
+    from cowork.common.settings.user_settings import UserSettings
+
+    settings = UserSettings.model_validate({"minds_api_key": None})
+    assert minds_hub_configured(settings) is False
+
+
+def test_minds_hub_configured_false_for_an_empty_string_key():
+    """A blank env value (e.g. `MINDS_API_KEY: ${MINDS_API_KEY:-}` in compose,
+    unset) must read as unconfigured, not as a present credential."""
+    from cowork.common.settings.user_settings import UserSettings
+
+    settings = UserSettings.model_validate({"minds_api_key": ""})
+    assert minds_hub_configured(settings) is False
