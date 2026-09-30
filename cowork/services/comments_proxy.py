@@ -158,21 +158,26 @@ def _forward_headers(api_key: str) -> dict[str, str]:
 def _upstream_or_refusal(request: Request) -> tuple[str, str] | Response:
     """The upstream to call, or the response to answer with instead.
 
-    Both forwarders need the same two refusals, and the org one has to happen
-    BEFORE the request goes out: an upstream call carrying no Authorization comes
-    back as the gateway's own 401 page, which the renderer shows as "Session
-    expired" — a wrong and unactionable message for a server-side gap.
+    Both forwarders need the same two refusals, and they have to happen BEFORE
+    the request goes out: an upstream call carrying no Authorization comes back
+    as the gateway's own 401 page (org) or an auth failure the renderer can't
+    explain (desktop) — a wrong and unactionable message for a server-side gap
+    either way.
 
-    Desktop keeps its old shape, empty key included. There the credential is a
-    user setting that may legitimately be unset, and the request has always gone
-    out anyway.
+    The test is the credential, not "MindsHub is configured" — a desktop on an
+    ``openai_compatible`` MindsHub endpoint resolves its credential from that
+    provider's own key (``resolve_inference_endpoint``) and keeps forwarding,
+    same as one with a minds-cloud key.
     """
     base, credential = resolve_comments_upstream(request)
     if not base:
         return PlainTextResponse("inference endpoint not configured", status_code=503)
-    if _org_mode() and not credential:
-        logger.warning("comments proxy: org request carries no caller credential")
-        return PlainTextResponse("missing caller credential", status_code=401)
+    if not credential:
+        if _org_mode():
+            logger.warning("comments proxy: org request carries no caller credential")
+            return PlainTextResponse("missing caller credential", status_code=401)
+        logger.warning("comments proxy: local request has no MindsHub credential")
+        return PlainTextResponse("missing MindsHub credential", status_code=401)
     return base, credential
 
 
