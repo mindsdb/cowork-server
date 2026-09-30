@@ -381,10 +381,14 @@ class CodingSessionFactory:
             source_contexts=list(request.source_contexts),
         )
 
-    def release(self, session: CodingSession) -> None:
-        """Release a prepared task's workspaces and skills after it was deleted."""
+    def release(self, session: CodingSession, request: SessionCreateRequest) -> None:
+        """Release a prepared task's workspaces, task branches and skills after it was deleted."""
         if session.workspaces:
             self.project_workspaces.cleanup(session.id, session.workspaces)
+            if request.repository_setup and request.repository_setup.branch:
+                # Only a branch still at its base revision is deleted.
+                for workspace in session.workspaces:
+                    self.project_workspaces.rollback_task_branch(workspace)
         elif session.workspace_kind in {WorkspaceKind.git_worktree, WorkspaceKind.local_copy}:
             self.workspaces.cleanup(
                 session.id,

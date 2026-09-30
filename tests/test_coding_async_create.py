@@ -29,6 +29,7 @@ from cowork.coding.project_models import (
     ProjectCreateRequest,
     ProjectFolder,
 )
+from cowork.coding.repository_setup_models import TaskRepositorySetup
 from cowork.coding.service import CodingService
 
 
@@ -274,10 +275,7 @@ def test_deleting_a_task_while_it_prepares_removes_it_and_its_workspace(
     assert not thread.is_alive()
     assert engine.prompts == []
     # The worktree preparation made after the delete was released again.
-    worktrees = subprocess.run(
-        ["git", "worktree", "list", "--porcelain"], cwd=repo, capture_output=True, text=True, check=True
-    ).stdout
-    assert worktrees.count("worktree ") == 1
+    assert git_output(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
 
 
 def test_runtime_settings_wait_for_the_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -292,3 +290,56 @@ def test_runtime_settings_wait_for_the_workspace(tmp_path: Path, monkeypatch: py
             operation(created.id, CREDS)
     release.set()
     wait_for_status(service, created.id, SessionStatus.completed)
+
+
+def test_deleting_a_task_before_its_first_turn_rolls_back_its_new_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    project = service.projects.create(
+        ProjectCreateRequest(
+            name="Branch",
+            folders=[ProjectFolder(id="app", name="App", path=str(repo))],
+            default_engine_id="fake",
+            default_model="fake-model",
+        )
+    )
+    prepared, handoff = threading.Event(), threading.Event()
+    complete = service.session_factory.complete
+
+    def held(*args, **kwargs):
+        # Hold the task after preparation finishes, before its first turn.
+        session = complete(*args, **kwargs)
+        prepared.set()
+        assert handoff.wait(timeout=5)
+        return session
+
+    monkeypatch.setattr(service.session_factory, "complete", held)
+    created = service.create_session(
+        SessionCreateRequest(
+            project_id=project.id,
+            prompt="Build it",
+            repository_setup=TaskRepositorySetup(branch="feat/aborted"),
+        ),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    assert prepared.wait(timeout=3)
+    assert "feat/aborted" in git_output(repo, "branch", "--list")
+    thread = service._running[created.id].thread
+
+    service.delete_session(created.id)
+    handoff.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert engine.prompts == []
+    assert "feat/aborted" not in git_output(repo, "branch", "--list")
+    assert git_output(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+
+
+def git_output(cwd: Path, *args: str) -> str:
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True).stdout
