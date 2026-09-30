@@ -252,6 +252,8 @@ def test_task_titles_are_compact_and_end_cleanly() -> None:
     "source_url",
     [
         "ext::sh -c touch /tmp/cowork-git-rce",
+        "ext::ssh://example.com/repository.git",
+        "https::https://example.com/repository.git",
         "file:///private/repository",
         "git://example.com/repository.git",
         "http://example.com/repository.git",
@@ -261,6 +263,15 @@ def test_task_titles_are_compact_and_end_cleanly() -> None:
 def test_repository_resources_reject_unsafe_git_transports(source_url: str) -> None:
     with pytest.raises(ValidationError, match="repository"):
         RepositoryResource(id="repo", name="Repo", source_url=source_url)
+
+
+@pytest.mark.parametrize("source_url", [
+    "https://[2606:4700::6810:1]/acme/repository.git",
+    "https://[2606:4700::6810:1]:8443/acme/repository.git",
+    "ssh://git@[2606:4700::6810:1]:2222/acme/repository.git",
+])
+def test_repository_resources_accept_ipv6_transport_authorities(source_url: str) -> None:
+    assert RepositoryResource(id="repo", name="Repo", source_url=source_url).source_url == source_url
 
 
 def test_git_runner_cannot_have_its_transport_allowlist_overridden(tmp_path: Path, monkeypatch) -> None:
