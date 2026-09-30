@@ -93,6 +93,7 @@ class RuntimeManager:
                 environment=tuple(session.environment.items()),
                 session_id=session.id,
                 cowork_root=str(self._root),
+                project_linked=bool(session.project_id),
                 workspace_label=session.project_name or Path(session.source_path).name or "Workspace",
             ),
             credentials=credentials,

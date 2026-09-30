@@ -201,6 +201,7 @@ async def lifespan(app: FastAPI):
         from cowork.channels.webhooks import drain_background_tasks
         from cowork.common.chat_session import drain_scratchpad_closes
         from cowork.common.http_client import close_proxy_client
+        from cowork.coding.inference_proxy import close_inference_client
         from cowork.services.artifacts import shutdown_launched_backends
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
         from cowork.coding.service import get_coding_service
@@ -226,6 +227,7 @@ async def lifespan(app: FastAPI):
         shutdown_launched_backends()
         await close_scratchpads()
         await close_proxy_client()
+        await close_inference_client()
 
 
 class _NoStoreMiddleware:
