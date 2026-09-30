@@ -127,6 +127,42 @@ def test_503_when_endpoint_unconfigured(monkeypatch):
     assert r.status_code == 503
 
 
+def test_local_refuses_without_a_credential_and_never_calls_upstream(monkeypatch):
+    """A legacy comment key with no credential: the request must not go out
+    with no Authorization — that reads as the upstream's own auth failure."""
+    monkeypatch.setattr(cp, "resolve_inference_endpoint", lambda settings=None: (BASE, ""))
+    fake = _FakeClient(response=httpx.Response(200, json={}))
+    monkeypatch.setattr(cp, "get_proxy_client", lambda: fake)
+
+    r = client.get("/api/v1/artifact-comments/alice/rep123/threads")
+
+    assert r.status_code == 401
+    assert fake.calls == {}
+
+
+def test_local_stream_refuses_without_a_credential(monkeypatch):
+    monkeypatch.setattr(cp, "resolve_inference_endpoint", lambda settings=None: (BASE, ""))
+    fake = _FakeClient(stream_upstream=_FakeUpstream(200, None))
+    monkeypatch.setattr(cp, "get_proxy_client", lambda: fake)
+
+    r = client.get("/api/v1/artifact-comments/alice/rep123/stream")
+
+    assert r.status_code == 401
+    assert fake.calls == {}
+
+
+def test_local_with_an_openai_compatible_mindshub_key_still_forwards(monkeypatch):
+    """The test is the resolved credential, not which provider produced it."""
+    monkeypatch.setattr(cp, "resolve_inference_endpoint", lambda settings=None: (BASE, "mdb_oaikey"))
+    fake = _FakeClient(response=httpx.Response(200, json={"threads": []}))
+    monkeypatch.setattr(cp, "get_proxy_client", lambda: fake)
+
+    r = client.get("/api/v1/artifact-comments/alice/rep123/threads")
+
+    assert r.status_code == 200
+    assert fake.calls["rest"]["headers"]["Authorization"] == "Bearer mdb_oaikey"
+
+
 class _FakeSettings:
     def __init__(self, openai_base_url, minds_url="https://api.mindshub.ai"):
         self.openai_base_url = openai_base_url
