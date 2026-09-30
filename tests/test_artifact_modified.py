@@ -191,6 +191,8 @@ class _FakeUserSettings:
 
 
 class _FakeAppSettings:
+    tenancy_mode = "local"
+
     class connector:  # noqa: N801
         vault_dir = "/tmp/does-not-matter"
 

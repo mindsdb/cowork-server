@@ -239,6 +239,15 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
     authenticates with that provider's own key — so pointing the provider at
     dev/staging publishes there too. api key is "" when the chosen provider has none.
 
+    ``ANTON_PUBLISH_API_KEY`` (local mode only, same gate ``UserSettings`` itself
+    reads env under) overrides all of that: a self-hosted install publishes with
+    its own key against an explicit publish URL only, never against a host
+    derived from the active provider — that host can be a MindsDB one, and this
+    key must never reach it. No explicit URL (``ANTON_PUBLISH_URL`` or the
+    ``publish_url`` setting) means no publish target to trust, so this refuses
+    ("", "") rather than falling back to the derived host. Org mode never reads
+    this: a cluster env var must not reach every tenant's publish flow.
+
     Resolution order for the publish base URL (first non-empty wins):
       1. ``ANTON_PUBLISH_URL`` env var — an operator/dev override that trumps
          the stored setting (the DB row would otherwise shadow env; see
@@ -246,13 +255,21 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
       2. the ``publish_url`` setting;
       3. the host derived from the active provider endpoint.
     """
+    if get_app_settings().tenancy_mode == "local":
+        publish_api_key = os.environ.get("ANTON_PUBLISH_API_KEY", "").strip()
+    else:
+        publish_api_key = ""
+    env_publish_url = os.environ.get("ANTON_PUBLISH_URL", "").strip()
+    if publish_api_key:
+        explicit_url = env_publish_url or settings.publish_url or ""
+        return (explicit_url, publish_api_key) if explicit_url else ("", "")
+
     oai_host = (urlparse(settings.openai_base_url or "").hostname or "").lower()
     if oai_host.startswith("api") and oai_host.endswith(".mindshub.ai"):
         endpoint = settings.openai_base_url
         api_key = _secret_str(provider_api_key(settings, Provider.OPENAI_COMPATIBLE))
     else:
         endpoint, api_key = settings.minds_url, _secret_str(settings.minds_api_key)
-    env_publish_url = os.environ.get("ANTON_PUBLISH_URL", "").strip()
     publish_url = env_publish_url or settings.publish_url or publish_url_for_endpoint(endpoint)
     return publish_url, api_key
 
