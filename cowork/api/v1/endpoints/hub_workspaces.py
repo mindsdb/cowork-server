@@ -134,9 +134,19 @@ async def set_active_hub_workspace(
     missing from the listing is a grant the caller does not hold, and that is a
     403. A workspace in the listing but stamped archived is a 409, so the UI can
     say retrying will not help instead of offering a loop with no exit.
+
+    A third case sits ahead of both: a local install with no MindsHub key
+    configured. That is not "could not reach MindsHub" — no request was even
+    made — so it gets its own 409 naming the real reason, distinct from the
+    503 a genuinely unreachable MindsHub still gets below.
     """
     settings = SettingService(session, scope).load()
-    bearer = hub_credential(request) if _hub_available(scope, settings) else ""
+    if not _hub_available(scope, settings):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="MindsHub is not configured on this install",
+        )
+    bearer = hub_credential(request)
     org_id = scope.org_id or ""
     user_id = scope.user_id or ""
     listing = await fetch_hub_workspaces(bearer_token=bearer, org_id=org_id, user_id=user_id)

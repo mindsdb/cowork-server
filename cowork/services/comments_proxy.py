@@ -168,6 +168,14 @@ def _upstream_or_refusal(request: Request) -> tuple[str, str] | Response:
     ``openai_compatible`` MindsHub endpoint resolves its credential from that
     provider's own key (``resolve_inference_endpoint``) and keeps forwarding,
     same as one with a minds-cloud key.
+
+    The local refusal answers 503, not 401: the renderer's
+    ``useArtifactComments`` treats any 401/403 as a terminal "session expired"
+    and stops retrying, which fits the org case (a caller's own bearer really
+    did expire) but not this one — a self-hosted install with no MindsHub key
+    configured has no session to expire, and the fix is a config change, not a
+    reload. 503 joins the "inference endpoint not configured" case just above,
+    which the same hook already treats as transient and keeps retrying.
     """
     base, credential = resolve_comments_upstream(request)
     if not base:
@@ -177,7 +185,7 @@ def _upstream_or_refusal(request: Request) -> tuple[str, str] | Response:
             logger.warning("comments proxy: org request carries no caller credential")
             return PlainTextResponse("missing caller credential", status_code=401)
         logger.warning("comments proxy: local request has no MindsHub credential")
-        return PlainTextResponse("missing MindsHub credential", status_code=401)
+        return PlainTextResponse("missing MindsHub credential", status_code=503)
     return base, credential
 
 

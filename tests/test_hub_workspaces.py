@@ -186,10 +186,12 @@ def test_local_mode_with_the_desktop_runtime_credential_still_asks(session, call
 
 
 def test_local_mode_with_no_minds_key_refuses_the_switch_without_asking(session, calls):
+    """409, not 503: no request was made, so this isn't "could not reach
+    MindsHub" — MindsHub was never configured on this install."""
     with pytest.raises(HTTPException) as caught:
         _activate(session, LOCAL_SCOPE, WS_CLIENT_A, bearer="jwt-abc")
 
-    assert caught.value.status_code == 503
+    assert caught.value.status_code == 409
     assert calls.asked == []
 
 
