@@ -1,14 +1,14 @@
-"""Shadow-mode timing probe for Jev (TypeSafe, served via MindsHub's
-``/v1/decisions``) against Cowork's own respond-vs-delegate gate.
+"""Jev (TypeSafe, served via MindsHub's ``/v1/decisions``) on Cowork's own
+respond-vs-delegate gate.
 
-Asks Jev the same question the LLM gate answers, on the same turn, purely for
-comparison. Off unless ``COWORK_TURN_JEV_SHADOW_ENABLED`` is set to true,
-because the call runs on the turn's own minted key. Jev is zero-priced, so the
+Asks Jev the same question the LLM gate answers, on the same turn; a confident
+needs_agent delegates without the gate (``responses._route_with_jev``). Off
+unless ``COWORK_TURN_JEV_ENABLED`` is true, because the call runs on the turn's
+own minted key. Jev is zero-priced, so the
 call charges no wallet, but on an unfunded org each call draws from that org's
-free Jev allowance. Never used to route: `probe`'s result is not read by
-`decide_route` and must never affect it. Any failure here, a bad response, a
-timeout, a network error, is swallowed and logged; a broken shadow probe must
-never break or slow down a real turn beyond its own timeout.
+free Jev allowance. Any failure here, a bad response, a timeout, a network
+error, is swallowed and returned as ``jev_error``; a broken probe must never
+break a real turn, it just leaves the decision to the gate.
 """
 from __future__ import annotations
 
@@ -68,7 +68,15 @@ _ROUTE_QUESTION: dict[str, Any] = {
 
 # Separates the probe's Jev traces from the gate's own ("cowork-gate") and from
 # user turns in Langfuse.
-JEV_SHADOW_TAG = "jev-shadow"
+JEV_ROUTE_TAG = "jev-route"
+
+
+def _probability(value: object) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"probability is not numeric: {value!r}")
+    if not 0 <= value <= 1:
+        raise ValueError(f"probability out of range: {value!r}")
+    return float(value)
 
 
 def _elapsed_ms(started: float) -> int:
@@ -76,12 +84,12 @@ def _elapsed_ms(started: float) -> int:
 
 
 def _trace_headers() -> dict[str, str]:
-    """Langfuse headers attributing the probe to the turn whose gate it shadows.
+    """Langfuse headers attributing the probe to the turn whose gate it races.
 
     Without them the gateway stamps the call ``origin:direct-api``: from its
     side a probe on the user's minted key is indistinguishable from that user
     calling Jev directly. The probe runs under the gate's anton
-    TraceContext (``_spawn_jev_shadow_probe``), so this reads it rather than
+    TraceContext (``_route_with_jev``), so this reads it rather than
     re-deriving the turn's identity.
 
     Deliberately narrower than anton's own header builder, which serves LLM
@@ -103,7 +111,7 @@ def _trace_headers() -> dict[str, str]:
     if ctx is None:
         return {}
     headers: dict[str, str] = {}
-    tags = [ctx.harness, surface_tag(ctx.surface) if ctx.surface else None, JEV_SHADOW_TAG]
+    tags = [ctx.harness, surface_tag(ctx.surface) if ctx.surface else None, JEV_ROUTE_TAG]
     headers["Langfuse-Tags"] = ",".join(t for t in tags if t)
     metadata: dict[str, object] = dict(ctx.metadata or {})
     metadata.pop("turn_id", None)
@@ -126,17 +134,17 @@ async def probe(
 ) -> dict[str, Any] | None:
     """One `/v1/decisions` call on the turn's minted minds-cloud credential.
 
-    Returns `jev_*` fields for logging, or None when shadow mode is off or no
-    minted credential is available (desktop/BYOK turns mint no such block).
+    Returns `jev_*` fields, or None when Jev is off or no minted
+    credential is available (desktop/BYOK turns mint no such block).
 
     Wrapped in `asyncio.timeout`, not just httpx's own timeout kwarg: httpx's
     applies per phase (connect/write/read/pool) and measures inactivity, not
     total elapsed time, so a trickling response could run past the budget
-    without tripping it. The probe runs detached from the turn it shadows
-    (`_spawn_jev_shadow_probe`), so a slow probe never delays the turn, but an
+    without tripping it. A probe the gate beats keeps running detached
+    (`_route_with_jev`), so a slow probe never delays the turn, but an
     unbounded one would still hold its task and connection open indefinitely.
     """
-    if not settings.jev_shadow_enabled or not llm_block:
+    if not settings.jev_enabled or not llm_block:
         return None
     base_url = str(llm_block.get("base_url") or "").rstrip("/")
     api_key = llm_block.get("api_key")
@@ -170,7 +178,7 @@ async def probe(
     except httpx.HTTPError:
         return {"jev_ms": _elapsed_ms(started), "jev_error": "transport_error"}
     except Exception:
-        logger.warning("[jev-shadow] probe failed", exc_info=True)
+        logger.warning("[jev-route] probe failed", exc_info=True)
         return {"jev_ms": _elapsed_ms(started), "jev_error": "exception"}
 
     elapsed_ms = _elapsed_ms(started)
@@ -189,12 +197,16 @@ async def probe(
             raise ValueError(f"confidence is not numeric: {confidence!r}")
         if not math.isfinite(confidence) or not (0 <= confidence <= 1):
             raise ValueError(f"confidence out of range: {confidence!r}")
+        # Confidence is a spread statistic, not this probability; live mode
+        # thresholds on P(needs_agent).
+        p_needs_agent = _probability(answer["probabilities"]["needs_agent"])
         return {
             "jev_ms": elapsed_ms,
             "jev_choice": choice,
             "jev_confidence": confidence,
+            "jev_p_needs_agent": p_needs_agent,
             "jev_model": body.get("model"),
         }
     except Exception:
-        logger.warning("[jev-shadow] malformed response", exc_info=True)
+        logger.warning("[jev-route] malformed response", exc_info=True)
         return {"jev_ms": elapsed_ms, "jev_error": "malformed_response"}
