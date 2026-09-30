@@ -59,7 +59,27 @@ def test_env_key_without_any_explicit_url_is_refused(monkeypatch):
     url, key = _resolve_publish_endpoint(_settings(minds_url="https://api.mindshub.ai"))
 
     assert (url, key) == ("", "")
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="ANTON_PUBLISH_API_KEY is set"):
+        desktop_publish_credential()
+
+
+def test_the_refusal_names_the_missing_url_not_a_missing_key(monkeypatch):
+    """The operator already set the key; telling them to set it again is a
+    dead end. A missing key and a missing URL need different messages."""
+    monkeypatch.setenv("ANTON_PUBLISH_API_KEY", "self-hosted-secret")
+    monkeypatch.delenv("ANTON_PUBLISH_URL", raising=False)
+
+    with pytest.raises(ValueError) as exc:
+        desktop_publish_credential()
+
+    assert "publish URL" in str(exc.value)
+    assert "Configure your provider API key" not in str(exc.value)
+
+
+def test_no_key_at_all_still_names_the_provider_key(monkeypatch):
+    monkeypatch.delenv("ANTON_PUBLISH_API_KEY", raising=False)
+
+    with pytest.raises(ValueError, match="Configure your provider API key"):
         desktop_publish_credential()
 
 

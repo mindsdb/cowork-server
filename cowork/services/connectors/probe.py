@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from anton.config.settings import AntonSettings
 from anton.core.datasources.data_vault import LocalDataVault
 from cowork.build_info import surface_kwarg
 from cowork.common.chat_session import build_chat_session
@@ -441,8 +442,6 @@ class CredentialProbe:
         # agent turn (it runs a `ChatSession`), so it must honor an operator's
         # ANTON_WEB_SEARCH_ENABLED / ANTON_WEB_FETCH_ENABLED the same as a
         # user turn, not silently default both to on.
-        from anton.config.settings import AntonSettings
-
         anton_settings = AntonSettings()
 
         config = ChatSessionConfig(

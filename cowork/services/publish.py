@@ -189,11 +189,29 @@ def desktop_artifact_and_base(raw_path: str) -> tuple[Path, Path]:
     raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
 
+def _missing_publish_key_message(action: str) -> str:
+    """The right refusal message for an empty key from ``_resolve_publish_endpoint``.
+
+    Two different situations both come back as an empty key: no provider is
+    configured at all, or ``ANTON_PUBLISH_API_KEY`` is set but names no
+    explicit publish URL (``_resolve_publish_endpoint`` refuses rather than
+    falling back to a MindsDB host there). Reporting the second as "configure
+    your API key" would tell an operator who already set the key to do the one
+    thing they already did.
+    """
+    if get_app_settings().tenancy_mode == "local" and os.environ.get("ANTON_PUBLISH_API_KEY", "").strip():
+        return (
+            "ANTON_PUBLISH_API_KEY is set, but no publish URL is configured "
+            "(set ANTON_PUBLISH_URL, or the publish URL in Settings)"
+        )
+    return f"Configure your provider API key in Settings {action}"
+
+
 def desktop_publish_credential() -> tuple[str, str]:
     """(api_key, publish_url) from the active provider, for the desktop path."""
     publish_url, api_key = _resolve_publish_endpoint(get_user_settings())
     if not api_key:
-        raise ValueError("Configure your provider API key in Settings before publishing")
+        raise ValueError(_missing_publish_key_message("before publishing"))
     return api_key, publish_url
 
 
@@ -813,7 +831,7 @@ def list_versions(raw_path: str) -> dict:
     settings = get_user_settings()
     publish_url, api_key = _resolve_publish_endpoint(settings)
     if not api_key:
-        raise ValueError("Configure your provider API key in Settings to view versions")
+        raise ValueError(_missing_publish_key_message("to view versions"))
 
     _published_json, _key, report_id = _resolve_report_id(raw_path)
 
@@ -869,7 +887,7 @@ def activate_version(raw_path: str, md5: str) -> dict:
     settings = get_user_settings()
     publish_url, api_key = _resolve_publish_endpoint(settings)
     if not api_key:
-        raise ValueError("Configure your provider API key in Settings before rolling back")
+        raise ValueError(_missing_publish_key_message("before rolling back"))
 
     published_json, published_key, report_id = _resolve_report_id(raw_path)
 

@@ -33,7 +33,6 @@ import logging
 from base64 import urlsafe_b64decode
 from collections.abc import Collection
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 from uuid import UUID
 
 from fastapi import Request
@@ -42,9 +41,7 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp
 
 from cowork.common.settings.app_settings import get_app_settings
-
-if TYPE_CHECKING:
-    from cowork.common.settings.user_settings import UserSettings
+from cowork.common.settings.user_settings import Provider, UserSettings, provider_api_key_str
 
 logger = logging.getLogger(__name__)
 
@@ -277,7 +274,7 @@ def hub_credential(request: Request | None) -> str:
     return caller_bearer(request)
 
 
-def minds_hub_configured(settings: "UserSettings") -> bool:
+def minds_hub_configured(settings: UserSettings) -> bool:
     """True when a MindsHub key resolves for ``settings``.
 
     The local-mode gate for every outbound MindsHub call this server makes on
@@ -287,8 +284,6 @@ def minds_hub_configured(settings: "UserSettings") -> bool:
     MindsHub. Org mode does not call this: MindsHub is its exclusive provider,
     so the check has nothing to add there.
     """
-    from cowork.common.settings.user_settings import Provider, provider_api_key_str
-
     return bool(provider_api_key_str(settings, Provider.MINDS_CLOUD))
 
 

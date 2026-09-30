@@ -487,7 +487,7 @@ def test_local_mode_with_no_minds_key_never_forwards_the_header(session, calls):
     assert calls.asked == []
 
 
-def test_local_mode_with_the_desktop_runtime_credential_still_forwards(session, calls):
+def test_local_mode_with_a_stored_minds_key_still_forwards(session, calls):
     SettingService(session, LOCAL_SCOPE).upsert_setting("minds_api_key", "mdb_test")
     calls.answers[svc.ENTITLEMENTS_PATH] = ENTITLEMENTS
     calls.answers[svc.WALLET_PATH] = WALLET
@@ -496,6 +496,27 @@ def test_local_mode_with_the_desktop_runtime_credential_still_forwards(session, 
 
     assert view.reachable is True
     assert view.balance.usd == 8.42
+
+
+def test_local_mode_with_the_desktop_runtime_credential_still_forwards(session, calls):
+    """The overlay a signed-in desktop hands over at runtime — never a stored
+    row — must configure the hub the same way a stored key does."""
+    from cowork.common.settings.runtime_credential import (
+        clear_minds_credential,
+        set_minds_credential,
+    )
+
+    set_minds_credential("mdb_runtime")
+    try:
+        calls.answers[svc.ENTITLEMENTS_PATH] = ENTITLEMENTS
+        calls.answers[svc.WALLET_PATH] = WALLET
+
+        view = asyncio.run(ep.get_hub_usage(FakeRequest(), session, TenantScope()))
+
+        assert view.reachable is True
+        assert view.balance.usd == 8.42
+    finally:
+        clear_minds_credential()
 
 
 # ── permission wiring (ENG-2094): the bare-function tests above never touch
