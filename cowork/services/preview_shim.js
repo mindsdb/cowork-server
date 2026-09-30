@@ -49,7 +49,9 @@
   try {
     /* capture = true: resource failures (<script src>, <link>, <img>) do not
        bubble to window, so a plain listener never sees them. They are the
-       direct diagnosis for a CDN blocked by the shell's CSP. */
+       direct diagnosis for a CDN blocked by the shell's CSP. A load the
+       policy blocks fires here AND in the securitypolicyviolation listener
+       below, so one blocked file arrives at the renderer as two reports. */
     window.addEventListener('error', function (ev) {
       try {
         if (ev instanceof ErrorEvent) {

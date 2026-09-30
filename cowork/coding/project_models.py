@@ -78,6 +78,17 @@ class ProjectActionPage(BaseModel):
     preview_pending: bool = False
 
 
+class ProjectCommandRefresh(BaseModel):
+    """What a task can run after adopting the project's current commands.
+
+    Counts cover only the folders in the task's scope, since those are the
+    only commands the task will ever be offered.
+    """
+
+    validate_count: int = Field(ge=0)
+    run_count: int = Field(ge=0)
+
+
 class ReviewFileActionRequest(BaseModel):
     folder_id: str | None = Field(default=None, min_length=1, max_length=120)
     path: str = Field(min_length=1, max_length=32_768)

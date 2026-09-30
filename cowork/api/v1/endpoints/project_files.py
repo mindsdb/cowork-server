@@ -40,6 +40,7 @@ from cowork.common.paths import (
     open_pinned_child,
     opened_subdir_nofollow,
     pinned_dir,
+    read_bounded,
     safe_join,
 )
 from cowork.db.scoped import (
@@ -948,15 +949,7 @@ def _read_project_bytes(
     try:
         if st.st_size > TEXT_MAX_BYTES:
             raise HTTPException(status_code=413, detail="File too large to edit")
-        chunks: list[bytes] = []
-        remaining = st.st_size
-        while remaining:
-            chunk = os.read(fd, min(remaining, 1 << 16))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        return b"".join(chunks)
+        return b"".join(read_bounded(fd, st.st_size))
     finally:
         cm.__exit__(None, None, None)
 
@@ -1024,24 +1017,22 @@ def _pinned_stream(
 
     A `FileResponse` takes a path and opens it after the handler returns, which
     is the one thing the pinning exists to avoid, so the bytes come off the
-    descriptor instead. Content-Length comes from `fstat` on that same
-    descriptor, so it describes the file being sent rather than whatever the name
-    resolves to next.
+    descriptor instead. No Content-Length is declared: the file can change
+    while it is read (an agent still writing it), and a length taken from
+    `fstat` would then disagree with the bytes sent, which browsers report as
+    `ERR_CONTENT_LENGTH_MISMATCH` (ENG-2950). Chunked transfer sends exactly
+    what the descriptor yields. The `fstat` size still bounds the body, so a
+    file that keeps growing cannot keep the response open.
     """
     cm, fd, st = _pinned_regular_file(target, base)
 
     def _chunks():
         try:
-            while chunk := os.read(fd, 1 << 16):
-                yield chunk
+            yield from read_bounded(fd, st.st_size)
         finally:
             cm.__exit__(None, None, None)
 
-    return StreamingResponse(
-        _chunks(),
-        media_type=media_type,
-        headers={**headers, "Content-Length": str(st.st_size)},
-    )
+    return StreamingResponse(_chunks(), media_type=media_type, headers=headers)
 
 
 @router.get(
