@@ -307,3 +307,51 @@ def test_retry_after_parses_delta_seconds_and_falls_back_on_anything_else() -> N
     assert retry_after_seconds(None) == RATE_LIMIT_DEFAULT_WAIT_SECONDS
     assert retry_after_seconds("-1") == RATE_LIMIT_DEFAULT_WAIT_SECONDS
     assert retry_after_seconds("Wed, 21 Oct 2026 07:28:00 GMT") == RATE_LIMIT_DEFAULT_WAIT_SECONDS
+
+
+class _ClosingStream(httpx.AsyncByteStream):
+    """An upstream body that records when the proxy closes it."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def __aiter__(self):
+        yield b"data: one\n\n"
+        yield b"data: two\n\n"
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_proxy_reuses_one_upstream_client_across_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    created = 0
+    real_client = httpx.AsyncClient
+
+    def factory(**kwargs):
+        nonlocal created
+        created += 1
+        return real_client(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=b"ok")), **kwargs)
+
+    monkeypatch.setattr(inference_proxy_module.httpx, "AsyncClient", factory)
+
+    for _ in range(3):
+        response = await _proxy()
+        assert b"".join([chunk async for chunk in response.body_iterator]) == b"ok"
+
+    assert created == 1
+    await inference_proxy_module.close_inference_client()
+
+
+@pytest.mark.asyncio
+async def test_proxy_closes_the_upstream_when_codex_stops_reading(monkeypatch: pytest.MonkeyPatch) -> None:
+    stream = _ClosingStream()
+    _mock_upstream(monkeypatch, [httpx.Response(200, stream=stream)])
+
+    response = await _proxy()
+    iterator = response.body_iterator
+    assert await anext(iterator) == b"data: one\n\n"
+    # A disconnect closes the body iterator before it is exhausted.
+    await iterator.aclose()
+
+    assert stream.closed
