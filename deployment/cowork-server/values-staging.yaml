@@ -56,6 +56,11 @@ deployment:
     - name: COWORK_TURN_MINDS_BASE_URL
       value: "https://api.staging.mindshub.ai/v1"
 
+    # A confident Jev needs_agent skips the gate. Prod stays off until the
+    # data-processing sign-off and the free Jev allowance question are settled.
+    - name: COWORK_TURN_JEV_ENABLED
+      value: "true"
+
     # Agent tool budgets — deployment-level DEFAULTS for users who never set
     # the per-user setting (hosted has no Settings UI; inference cost lands on
     # the operator). Uncommented values below equal the code defaults, so
