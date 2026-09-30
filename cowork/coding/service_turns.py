@@ -107,7 +107,7 @@ class CodingTurnOperations:
         with self._lock:
             preparing = self._running.pop(session_id, None)
             if preparing is not None and preparing.delete_requested:
-                self.session_factory.release(prepared)
+                self.session_factory.release(prepared, request)
                 return
             if preparing is None or preparing.cancel_requested:
                 self._emit(
