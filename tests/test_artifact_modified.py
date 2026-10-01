@@ -572,7 +572,7 @@ def test_publish_bundle_md5_is_time_independent(tmp_path: Path):
 from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 from anton.publisher import _FULLSTACK_EXCLUDED
 from cowork.api.v1.endpoints.artifact_workspace import _PRIVATE_DRAFT_ENTRIES
-from cowork.services.artifacts import _HOUSEKEEPING_FILES, _user_files, content_mtime_ns
+from cowork.services.artifacts import _user_files, content_mtime_ns
 
 
 def _publish_fullstack(tmp_path: Path) -> Path:
@@ -598,10 +598,9 @@ def test_fullstack_modified_false_when_only_backend_log_changes(tmp_path: Path):
     assert card["modified"] is False
 
 
-def test_housekeeping_lists_consistent(tmp_path: Path):
+def test_housekeeping_lists_consistent():
     """The mtime walk and the draft deny-list share anton's set, and the
     publisher bundle excludes the same names."""
-    assert _HOUSEKEEPING_FILES is NON_CONTENT_NAMES
     assert _PRIVATE_DRAFT_ENTRIES is NON_CONTENT_NAMES
     assert _FULLSTACK_EXCLUDED == NON_CONTENT_NAMES
     assert {"backend.log", ".revisions"} <= NON_CONTENT_NAMES
@@ -627,6 +626,17 @@ def test_state_and_generation_files_are_not_content(tmp_path: Path):
     assert _user_files(tmp_path) == [index]
     assert _content_mtime(tmp_path) == 1000
     assert content_mtime_ns(tmp_path) == 1000 * 10**9
+
+
+def test_nested_names_matching_non_content_names_are_content(tmp_path: Path):
+    """Only the first path component decides: nested files are content."""
+    prd = tmp_path / "static" / "prd.md"
+    log = tmp_path / "static" / "backend.log"
+    prd.parent.mkdir()
+    prd.write_text("x", encoding="utf-8")
+    log.write_text("x", encoding="utf-8")
+
+    assert sorted(_user_files(tmp_path)) == [log, prd]
 
 
 def test_state_manifest_is_content(tmp_path: Path):

@@ -153,10 +153,6 @@ BG_CYCLE = [
     "linear-gradient(135deg, #fff, var(--stone-150))",
 ]
 
-# Top-level names matched against the first path component in
-# `_user_files_with_mtimes`: anton owns the set of non-content names.
-_HOUSEKEEPING_FILES = NON_CONTENT_NAMES
-
 TEXT_EXTENSIONS = {
     ".html", ".md", ".txt", ".csv", ".json", ".py", ".js",
     ".ts", ".tsx", ".css", ".log",
@@ -316,7 +312,8 @@ def _user_files_with_mtimes(folder: Path) -> list[tuple[Path, int]]:
                 continue
             for entry in entries:
                 entry_top = top if top is not None else entry.name
-                if entry_top in _HOUSEKEEPING_FILES:
+                # First path component only: `static/prd.md` is content.
+                if entry_top in NON_CONTENT_NAMES:
                     continue
                 try:
                     if entry.is_dir(follow_symlinks=False):

@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 from cowork.services.artifact_lock import artifact_lock
 
 EDITABLE_EXTENSIONS = frozenset({".md", ".txt", ".html", ".htm"})
@@ -293,7 +294,7 @@ def resolve_source(folder: Path, metadata: dict, rel_path: str | None = None) ->
             p for p in folder.rglob("*")
             if p.is_file()
             and p.suffix.lower() in EDITABLE_EXTENSIONS
-            and JOURNAL_DIRNAME not in p.relative_to(folder).parts
+            and p.relative_to(folder).parts[0] not in NON_CONTENT_NAMES
         )
         if not candidates:
             raise RevisionValidationError("Artifact has no editable source file")
