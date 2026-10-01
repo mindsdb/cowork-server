@@ -39,6 +39,7 @@ from cowork.common.paths import (
     dir_unlink,
 )
 from cowork.common.settings.app_settings import get_app_settings
+from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 
 if TYPE_CHECKING:
     from cowork.db.scoped import ScopedSession
@@ -152,12 +153,9 @@ BG_CYCLE = [
     "linear-gradient(135deg, #fff, var(--stone-150))",
 ]
 
-# Files that aren't user content for the `modified` badge's mtime gate.
-# Keep in sync with anton.publisher._FULLSTACK_EXCLUDED — the running
-# backend's runtime log (`backend.log`) is excluded from the published
-# bundle there, so it must not count toward content mtime here either,
-# or it would constantly trip the gate and force a false badge.
-_HOUSEKEEPING_FILES = {"metadata.json", "README.md", "backend.log", ".published.json", ".revisions"}
+# Top-level names matched against the first path component in
+# `_user_files_with_mtimes`: anton owns the set of non-content names.
+_HOUSEKEEPING_FILES = NON_CONTENT_NAMES
 
 TEXT_EXTENSIONS = {
     ".html", ".md", ".txt", ".csv", ".json", ".py", ".js",
@@ -439,10 +437,10 @@ def _content_mtime(folder: Path) -> int:
     """Max mtime (int seconds) across an artifact's user content files.
 
     Disk-derived, so it reflects in-place edits the metadata.json mtime
-    misses. Housekeeping files (`metadata.json`, `README.md`,
-    `.published.json`) are excluded — they're not user content. Used both as
-    the renderer's cache-bust token and as the cheap "changed since publish"
-    gate for the `modified` badge.
+    misses. Names in anton's `NON_CONTENT_NAMES` (housekeeping, STATE runtime
+    files, generation inputs, `.revisions/`) are excluded — not user content.
+    Used both as the renderer's cache-bust token and as the cheap "changed
+    since publish" gate for the `modified` badge.
     """
     try:
         max_ns = max((ns for _, ns in _user_files_with_mtimes(folder)), default=0)
