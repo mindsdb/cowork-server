@@ -292,7 +292,7 @@ def resolve_source(folder: Path, metadata: dict, rel_path: str | None = None) ->
     if not candidate_rel:
         candidates = sorted(
             p for p in folder.rglob("*")
-            if p.is_file()
+            if p.is_file() and not p.is_symlink()
             and p.suffix.lower() in EDITABLE_EXTENSIONS
             and (rel_parts := p.relative_to(folder).parts)[0] not in NON_CONTENT_NAMES
             and JOURNAL_DIRNAME not in rel_parts

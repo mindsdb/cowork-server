@@ -1378,3 +1378,17 @@ def test_auto_pick_skips_nested_journal_files(tmp_path):
     _, rel = revision_service.resolve_source(tmp_path, {})
 
     assert rel == "b.html"
+
+
+def test_auto_pick_skips_a_symlinked_source(tmp_path):
+    folder = tmp_path / "linked"
+    folder.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("secret\n", encoding="utf-8")
+    (folder / "a.md").symlink_to(outside)
+    (folder / "b.html").write_text("<p>ok</p>", encoding="utf-8")
+
+    target, rel = revision_service.resolve_source(folder, {})
+
+    assert rel == "b.html"
+    assert target.name == "b.html"
