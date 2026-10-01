@@ -265,9 +265,9 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
         parts = _relative_file_parts(requested.strip())
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid artifact source path") from exc
-    # The journal only, matching the inner gate, and at any depth rather than
-    # just the first component. The private-listing set is a different
-    # question: it hides README.md, which is a source the service itself picks.
+    # Only the journal (any depth), like the inner gate: the private-listing
+    # set is not rejected because `metadata.primary` or an explicit path may
+    # legitimately name README.md or prd.md as the editable source.
     if JOURNAL_DIRNAME in parts:
         raise HTTPException(status_code=422, detail="Invalid artifact source path")
     folder_name = _artifact_folder_component(source, folder)

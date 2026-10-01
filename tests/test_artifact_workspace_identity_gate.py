@@ -463,11 +463,12 @@ def test_symlinks_and_missing_entries_are_not_found_before_the_service(
 
 
 @pytest.fixture
-def auto_picked_source_artifact(tmp_path, monkeypatch):
-    """An artifact whose editable source is the one the service picks itself.
+def reported_source_artifact(request, tmp_path, monkeypatch):
+    """An artifact whose editable source is the one the service reports itself.
 
-    `metadata["primary"]` is optional, and without it `resolve_source` takes
-    the sorted-first editable content file, skipping the store's `README.md`.
+    Parametrized with the metadata. Without `primary`, `resolve_source` takes
+    the sorted-first editable content file, skipping the store's private
+    names; with `primary` it may name one of those (`README.md`, `prd.md`).
     """
     from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
     from cowork.services.artifacts import ProjectArtifacts
@@ -477,12 +478,13 @@ def auto_picked_source_artifact(tmp_path, monkeypatch):
     folder = base / "brief"
     folder.mkdir(parents=True)
     (folder / "README.md").write_text("# readme\n", encoding="utf-8")
+    (folder / "prd.md").write_text("# prd\n", encoding="utf-8")
     (folder / "index.html").write_text("<h1>x</h1>\n", encoding="utf-8")
     source = ProjectArtifacts(
         base=base, project_id=None, project_name="project",
         trusted_anchor=project, root_parts=(".anton", "artifacts"),
     )
-    metadata = {"type": "file"}
+    metadata = dict(request.param)
     monkeypatch.setattr(
         workspace_ep, "_owner_workspace",
         lambda *_args: (source, folder, metadata, {"canEdit": True, "canAddressWithAgent": True, "canResolveComments": True}),
@@ -490,7 +492,16 @@ def auto_picked_source_artifact(tmp_path, monkeypatch):
     return SimpleNamespace(source=source, folder=folder, metadata=metadata)
 
 
-def test_the_path_a_get_reports_can_be_saved_back(auto_picked_source_artifact, client):
+@pytest.mark.parametrize(
+    ("reported_source_artifact", "expected_path"),
+    [
+        ({"type": "file"}, "index.html"),
+        ({"type": "file", "primary": "README.md"}, "README.md"),
+        ({"type": "file", "primary": "prd.md"}, "prd.md"),
+    ],
+    indirect=["reported_source_artifact"],
+)
+def test_the_path_a_get_reports_can_be_saved_back(reported_source_artifact, expected_path, client):
     """The round trip a client actually performs: read, then save what it read.
 
     The selector must accept every path the service is willing to report. A
@@ -500,7 +511,7 @@ def test_the_path_a_get_reports_can_be_saved_back(auto_picked_source_artifact, c
     read = client.get(_WORKSPACE_URL)
     assert read.status_code == 200, read.text
     reported = read.json()["path"]
-    assert reported == "index.html"
+    assert reported == expected_path
 
     saved = client.put(_WORKSPACE_URL, json={
         "content": "# edited\n",
@@ -509,7 +520,7 @@ def test_the_path_a_get_reports_can_be_saved_back(auto_picked_source_artifact, c
     })
 
     assert saved.status_code == 200, saved.text
-    assert (auto_picked_source_artifact.folder / "index.html").read_text() == "# edited\n"
+    assert (reported_source_artifact.folder / expected_path).read_text() == "# edited\n"
 
 
 def test_the_names_handed_to_the_filesystem_are_the_ones_scandir_returned(
