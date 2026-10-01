@@ -463,7 +463,7 @@ def test_symlinks_and_missing_entries_are_not_found_before_the_service(
 
 
 @pytest.fixture
-def readme_backed_artifact(tmp_path, monkeypatch):
+def auto_picked_source_artifact(tmp_path, monkeypatch):
     """An artifact whose editable source is the one the service picks itself.
 
     `metadata["primary"]` is optional, and without it `resolve_source` takes
@@ -490,7 +490,7 @@ def readme_backed_artifact(tmp_path, monkeypatch):
     return SimpleNamespace(source=source, folder=folder, metadata=metadata)
 
 
-def test_the_path_a_get_reports_can_be_saved_back(readme_backed_artifact, client):
+def test_the_path_a_get_reports_can_be_saved_back(auto_picked_source_artifact, client):
     """The round trip a client actually performs: read, then save what it read.
 
     The selector must accept every path the service is willing to report. A
@@ -509,7 +509,7 @@ def test_the_path_a_get_reports_can_be_saved_back(readme_backed_artifact, client
     })
 
     assert saved.status_code == 200, saved.text
-    assert (readme_backed_artifact.folder / "index.html").read_text() == "# edited\n"
+    assert (auto_picked_source_artifact.folder / "index.html").read_text() == "# edited\n"
 
 
 def test_the_names_handed_to_the_filesystem_are_the_ones_scandir_returned(
