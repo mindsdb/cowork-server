@@ -729,3 +729,40 @@ def test_a_folder_outside_the_sources_base_is_refused(editable_artifact, tmp_pat
         )
 
     assert refused.value.status_code == 404
+
+
+@pytest.fixture
+def served_html_app(tmp_path, monkeypatch):
+    from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
+    from cowork.services.artifacts import ProjectArtifacts
+
+    project = tmp_path / "project"
+    base = project / ".anton" / "artifacts"
+    folder = base / "app"
+    folder.mkdir(parents=True)
+    (folder / "index.html").write_text("<h1>hi</h1>", encoding="utf-8")
+    (folder / "prd.md").write_text("# PRD", encoding="utf-8")
+    (folder / ".anton_state.db").write_bytes(b"SQLite format 3\x00")
+    source = ProjectArtifacts(
+        base=base, project_id=None, project_name="project",
+        trusted_anchor=project, root_parts=(".anton", "artifacts"),
+    )
+    monkeypatch.setattr(
+        workspace_ep, "review_artifact_for_request",
+        lambda *_args: (source, folder, {"type": "html-app"}, True),
+    )
+    return "/api/v1/artifacts/drafts/local/0123456789abcdef0123456789abcdef"
+
+
+@pytest.mark.parametrize("name", ["prd.md", ".anton_state.db"])
+def test_draft_route_hides_non_content_files(client, served_html_app, name):
+    """Generation inputs and STATE files are not readable through a draft."""
+    res = client.get(f"{served_html_app}/{name}")
+
+    assert res.status_code == 404, res.text
+
+
+def test_draft_route_still_serves_content(client, served_html_app):
+    res = client.get(f"{served_html_app}/index.html")
+
+    assert res.status_code == 200, res.text

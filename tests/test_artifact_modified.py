@@ -566,11 +566,13 @@ def test_publish_bundle_md5_is_time_independent(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Task 2: backend.log excluded from the mtime gate
+# Non-content files excluded from the mtime gate
 # ---------------------------------------------------------------------------
 
-from cowork.services.artifacts import _HOUSEKEEPING_FILES
+from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 from anton.publisher import _FULLSTACK_EXCLUDED
+from cowork.api.v1.endpoints.artifact_workspace import _PRIVATE_DRAFT_ENTRIES
+from cowork.services.artifacts import _HOUSEKEEPING_FILES, _user_files, content_mtime_ns
 
 
 def _publish_fullstack(tmp_path: Path) -> Path:
@@ -597,10 +599,42 @@ def test_fullstack_modified_false_when_only_backend_log_changes(tmp_path: Path):
 
 
 def test_housekeeping_lists_consistent(tmp_path: Path):
-    """backend.log must be excluded both from the mtime gate (cowork-server)
-    and from the published bundle (anton publisher)."""
-    assert "backend.log" in _HOUSEKEEPING_FILES
-    assert "backend.log" in _FULLSTACK_EXCLUDED
+    """The mtime walk and the draft deny-list share anton's set, and the
+    publisher bundle excludes the same names."""
+    assert _HOUSEKEEPING_FILES is NON_CONTENT_NAMES
+    assert _PRIVATE_DRAFT_ENTRIES is NON_CONTENT_NAMES
+    assert _FULLSTACK_EXCLUDED == NON_CONTENT_NAMES
+    assert {"backend.log", ".revisions"} <= NON_CONTENT_NAMES
+
+
+def test_state_and_generation_files_are_not_content(tmp_path: Path):
+    """STATE driver files and generation inputs must not show on the card,
+    move the mtime gate, or count as a turn's edit."""
+    index = tmp_path / "index.html"
+    index.write_text("<h1>hi</h1>", encoding="utf-8")
+    _touch(index, 1000.0)
+    noise = [
+        ".anton_state.db", ".anton_state.db-wal", ".anton_state.db-shm",
+        ".state_manifest.published.json", "prd.md", "spec.md",
+        "openapi.json", "discovery.json", ".revisions/r1.json",
+    ]
+    for rel in noise:
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x", encoding="utf-8")
+        _touch(p, 9999.0)
+
+    assert _user_files(tmp_path) == [index]
+    assert _content_mtime(tmp_path) == 1000
+    assert content_mtime_ns(tmp_path) == 1000 * 10**9
+
+
+def test_state_manifest_is_content(tmp_path: Path):
+    """The publisher bundles state_manifest.json, so it is a deliverable."""
+    manifest = tmp_path / "state_manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+
+    assert _user_files(tmp_path) == [manifest]
 
 
 # ---------------------------------------------------------------------------
