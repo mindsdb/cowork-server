@@ -420,13 +420,9 @@ async def test_stream_remote_replies_attaches_connector_usage_notes(monkeypatch)
     monkeypatch.setattr(prod, "get_redis", lambda: fake)
     monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
 
-    async def fake_mint(**kw):
-        return "mdb_turnkey"
-
     async def fake_list_active_connections(**kw):
         return [{"engine": "google_drive", "name": "work"}, {"engine": "gmail", "name": "me"}]
 
-    monkeypatch.setattr(prod, "mint_turn_key", fake_mint)
     monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
     monkeypatch.setattr(
         registry, "usage_notes_for",
@@ -441,35 +437,13 @@ async def test_stream_remote_replies_attaches_connector_usage_notes(monkeypatch)
     assert params["connectors"] == {"google_drive": {"usage_notes": "NOTE-google_drive"}}
 
 
-@pytest.mark.asyncio
-async def test_stream_remote_replies_omits_connectors_when_no_engine_has_notes(monkeypatch):
+def test_connectors_block_is_none_when_nothing_has_notes(monkeypatch):
     from cowork.services.connectors.specs._registry import registry
 
-    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
-    monkeypatch.setattr(prod, "get_redis", lambda: fake)
-    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
-
-    async def fake_mint(**kw):
-        return "mdb_turnkey"
-
-    async def fake_list_active_connections(**kw):
-        return [{"engine": "gmail", "name": "me"}]
-
-    monkeypatch.setattr(prod, "mint_turn_key", fake_mint)
-    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
-    monkeypatch.setattr(registry, "usage_notes_for", lambda engines: {})
-
-    await _drain(prod.stream_remote_replies(
-        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
-    ))
-
-    params = json.loads(fake.added[0][1]["payload"])["params"]
-    assert "connectors" not in params
-
-
-def test_connectors_block_is_none_without_oauth_connections():
     assert prod._connectors_block(None) is None
     assert prod._connectors_block({"connections": []}) is None
+    monkeypatch.setattr(registry, "usage_notes_for", lambda engines: {})
+    assert prod._connectors_block({"connections": [{"engine": "gmail", "name": "me"}]}) is None
 
 
 @pytest.mark.asyncio

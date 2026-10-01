@@ -18,6 +18,7 @@ from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
+from cowork.services.connectors.specs._registry import registry
 from cowork.services.projects import display_label
 
 
@@ -1117,12 +1118,14 @@ class AntonHarness:
         # that predate the MCP client, and promoting it to anton's `main` is
         # a separate release step (ENG-1816). An unguarded import would turn
         # that window into a failure on EVERY turn, not just MCP ones.
+        # This turn's connections, listed once for MCP discovery and the usage notes.
+        vault_connections = data_vault.list_connections() if data_vault is not None else []
         mcp_tool_defs: list = []
         mcp_sessions: list = []
         mcp_wiring = _anton_mcp_wiring() if data_vault is not None else None
         if mcp_wiring is not None:
             mcp_tool_defs, mcp_sessions = await mcp_wiring.discover_mcp_tools_async(
-                data_vault, data_vault.list_connections()
+                data_vault, vault_connections
             )
 
         try:
@@ -1137,10 +1140,8 @@ class AntonHarness:
                 )
                 # Agent-facing API notes for this turn's connected engines.
                 # `data_vault` is already filtered by `disabled_connections`.
-                from cowork.services.connectors.specs._registry import registry
-
                 connector_usage_notes = registry.usage_notes_for(
-                    c["engine"] for c in data_vault.list_connections()
+                    c["engine"] for c in vault_connections
                 )
 
             # Canonical order (ConversationService._MESSAGE_ORDER: seq, role, id);

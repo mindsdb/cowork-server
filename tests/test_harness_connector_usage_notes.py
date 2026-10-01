@@ -4,7 +4,6 @@ appear once and for every Drive connection."""
 import json
 from contextlib import asynccontextmanager
 
-import pytest
 from pydantic import SecretStr
 
 from cowork.common.settings.user_settings import Provider, UserSettings
@@ -43,16 +42,6 @@ def _drive_vault(tmp_path, **extra_fields):
     return vault
 
 
-@pytest.fixture
-def drive_vault(tmp_path):
-    return _drive_vault(tmp_path, _picked_files=json.dumps([{"id": "f1", "name": "Roadmap.gdoc"}]))
-
-
-@pytest.fixture
-def drive_vault_without_picks(tmp_path):
-    return _drive_vault(tmp_path)
-
-
 @asynccontextmanager
 async def _session_config(monkeypatch, vault):
     from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
@@ -89,17 +78,16 @@ async def _session_config(monkeypatch, vault):
                 await provider._client.close()
 
 
-async def test_usage_notes_reach_the_session_config(monkeypatch, drive_vault):
-    async with _session_config(monkeypatch, drive_vault) as config:
+async def test_usage_notes_reach_the_session_config(monkeypatch, tmp_path):
+    vault = _drive_vault(tmp_path, _picked_files=json.dumps([{"id": "f1", "name": "Roadmap.gdoc"}]))
+    async with _session_config(monkeypatch, vault) as config:
         assert config.connector_usage_notes == registry.usage_notes_for(["google_drive"])
         suffix = config.system_prompt_context.suffix
         assert "Roadmap.gdoc" in suffix  # the Picker block still renders
         assert "corpora" not in suffix   # ...without the moved Drive API rules
 
 
-async def test_drive_notes_reach_the_session_config_without_picked_files(
-    monkeypatch, drive_vault_without_picks
-):
-    async with _session_config(monkeypatch, drive_vault_without_picks) as config:
+async def test_drive_notes_reach_the_session_config_without_picked_files(monkeypatch, tmp_path):
+    async with _session_config(monkeypatch, _drive_vault(tmp_path)) as config:
         assert "corpora='allDrives'" in config.connector_usage_notes["google_drive"]
         assert "Google Picker" not in config.system_prompt_context.suffix
