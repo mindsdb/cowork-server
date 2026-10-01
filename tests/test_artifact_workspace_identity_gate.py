@@ -467,8 +467,7 @@ def readme_backed_artifact(tmp_path, monkeypatch):
     """An artifact whose editable source is the one the service picks itself.
 
     `metadata["primary"]` is optional, and without it `resolve_source` takes
-    the sorted-first editable file. `README.md` sorts ahead of any lowercase
-    name, so it is the source the GET reports for artifacts like this one.
+    the sorted-first editable content file, skipping the store's `README.md`.
     """
     from cowork.api.v1.endpoints import artifact_workspace as workspace_ep
     from cowork.services.artifacts import ProjectArtifacts
@@ -501,7 +500,7 @@ def test_the_path_a_get_reports_can_be_saved_back(readme_backed_artifact, client
     read = client.get(_WORKSPACE_URL)
     assert read.status_code == 200, read.text
     reported = read.json()["path"]
-    assert reported == "README.md"
+    assert reported == "index.html"
 
     saved = client.put(_WORKSPACE_URL, json={
         "content": "# edited\n",
@@ -510,7 +509,7 @@ def test_the_path_a_get_reports_can_be_saved_back(readme_backed_artifact, client
     })
 
     assert saved.status_code == 200, saved.text
-    assert (readme_backed_artifact.folder / "README.md").read_text() == "# edited\n"
+    assert (readme_backed_artifact.folder / "index.html").read_text() == "# edited\n"
 
 
 def test_the_names_handed_to_the_filesystem_are_the_ones_scandir_returned(

@@ -1348,3 +1348,22 @@ def test_agent_repair_reports_conflict_when_base_moves_during_turn(artifact):
     assert detail["repair"]["status"] == "conflict"
     assert detail["repair"]["revisionId"] == agent_revision["id"]
     assert agent_revision["commentThreadIds"] == []
+
+
+def test_auto_pick_skips_store_housekeeping_files(tmp_path):
+    for name in ("README.md", "metadata.json", "index.html"):
+        (tmp_path / name).write_text("x", encoding="utf-8")
+
+    target, rel = revision_service.resolve_source(tmp_path, {})
+
+    assert rel == "index.html"
+    assert target == (tmp_path / "index.html").resolve()
+
+
+def test_auto_pick_skips_generation_inputs(tmp_path):
+    for name in ("prd.md", "notes.md"):
+        (tmp_path / name).write_text("x", encoding="utf-8")
+
+    _, rel = revision_service.resolve_source(tmp_path, {})
+
+    assert rel == "notes.md"
