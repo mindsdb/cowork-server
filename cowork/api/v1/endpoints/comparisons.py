@@ -152,11 +152,18 @@ def continue_side(
 ):
     service = ComparisonService(scoped)
     try:
-        conversation = service.continue_side(comparison_id, label, body.project_id, model_label=body.model_label)
+        continued = service.continue_side(comparison_id, label, body.project_id, model_label=body.model_label)
     except (ComparisonNotFoundError, ProjectNotFoundError) as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ComparisonConflictError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
-    return {"conversationId": str(conversation.id), "projectId": str(conversation.project_id)}
+    conversation = continued.conversation
+    # carriedAll false: some of the side's work stayed in the comparison;
+    # continuing again into the same project carries the rest.
+    return {
+        "conversationId": str(conversation.id),
+        "projectId": str(conversation.project_id),
+        "carriedAll": continued.carried_all,
+    }

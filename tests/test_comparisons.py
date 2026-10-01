@@ -335,7 +335,7 @@ def test_continue_moves_the_side_into_a_real_project(client):
         f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": project["id"]}
     )
     assert r.status_code == 200, r.text
-    assert r.json() == {"conversationId": side_a["conversationId"], "projectId": project["id"]}
+    assert r.json() == {"conversationId": side_a["conversationId"], "projectId": project["id"], "carriedAll": True}
     assert str(_conversation(side_a["conversationId"]).project_id) == project["id"]
 
     after = client.get(f"/api/v1/comparisons/{body['id']}").json()
@@ -482,11 +482,170 @@ def test_a_file_that_cannot_be_copied_keeps_the_sandbox(tmp_path):
     unreadable.write_text("x")
     unreadable.chmod(0)
     try:
-        copied, complete = copy_side_changes(sandbox, destination, "Run (Kimi)", copied={})
+        result = copy_side_changes(sandbox, destination, "Run (Kimi)", copied={})
     finally:
         unreadable.chmod(0o644)
 
-    assert (copied, complete) == (1, False)
+    assert (result.files, result.complete) == (1, False)
+
+
+def test_a_desktop_side_brings_back_a_folder_named_conversations(client):
+    body = _create(client).json()
+    a = body["sides"][0]
+    sandbox = Path(_project(a["projectId"]).path)
+    # Only a hosted project keeps task workspaces in `conversations/`; on the
+    # desktop that name is the user's.
+    (sandbox / "conversations").mkdir()
+    (sandbox / "conversations" / "interview.md").write_text("notes")
+    target = _real_project(client, "conversations-target")
+
+    r = client.post(
+        f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": target["id"], "modelLabel": "Kimi"}
+    )
+
+    assert r.status_code == 200, r.text
+    carried = Path(target["path"]) / "Build a sales dashboard (Kimi)" / "conversations" / "interview.md"
+    assert carried.read_text() == "notes"
+
+
+def test_a_folder_that_cannot_be_read_keeps_the_sandbox(tmp_path):
+    from cowork.services.comparisons import copy_side_changes
+
+    sandbox, destination = tmp_path / "s", tmp_path / "d"
+    (sandbox / "locked").mkdir(parents=True)
+    destination.mkdir()
+    (sandbox / "locked" / "results.csv").write_text("x")
+    (sandbox / "ok.txt").write_text("ok")
+    (sandbox / "locked").chmod(0)
+    try:
+        result = copy_side_changes(sandbox, destination, "Run (Kimi)", copied={})
+    finally:
+        (sandbox / "locked").chmod(0o755)
+
+    assert (result.files, result.complete) == (1, False)
+
+
+def test_a_folder_deeper_than_the_walk_keeps_the_sandbox(tmp_path, monkeypatch):
+    from cowork.services import comparisons
+
+    sandbox, destination = tmp_path / "s", tmp_path / "d"
+    (sandbox / "a" / "b").mkdir(parents=True)
+    destination.mkdir()
+    (sandbox / "a" / "b" / "deep.txt").write_text("x")
+    monkeypatch.setattr(comparisons, "_COPY_MAX_DEPTH", 1)
+
+    assert comparisons.copy_side_changes(sandbox, destination, "Run (Kimi)", copied={}).complete is False
+
+
+def test_a_copy_cut_short_leaves_no_partial_file_in_the_project(tmp_path, monkeypatch):
+    from cowork.services import comparisons
+
+    sandbox, destination = tmp_path / "s", tmp_path / "d"
+    sandbox.mkdir()
+    destination.mkdir()
+    (sandbox / "big.csv").write_text("0123456789")
+    monkeypatch.setattr(comparisons, "_COPY_CHUNK", 2)
+    monkeypatch.setattr(comparisons, "_COPY_MAX_BYTES", 5)
+
+    result = comparisons.copy_side_changes(sandbox, destination, "Run (Kimi)", copied={})
+
+    assert result.complete is False
+    assert list((destination / "Run (Kimi)").iterdir()) == []
+
+
+def test_a_partial_carry_says_so_and_a_retry_finishes_it_in_the_same_folder(client, monkeypatch):
+    from cowork.services import comparisons
+
+    body = _create(client).json()
+    a = body["sides"][0]
+    sandbox = Path(_project(a["projectId"]).path)
+    for i in range(3):
+        (sandbox / f"out{i}.csv").write_text(f"x{i}")
+    target = _real_project(client, "retry-target")
+    url = f"/api/v1/comparisons/{body['id']}/sides/a/continue"
+    request = {"projectId": target["id"], "modelLabel": "Kimi"}
+
+    monkeypatch.setattr(comparisons, "_COPY_MAX_FILES", 1)
+    first = client.post(url, json=request)
+    assert first.status_code == 200, first.text
+    assert first.json()["carriedAll"] is False
+    assert _project(a["projectId"]) is not None
+
+    monkeypatch.setattr(comparisons, "_COPY_MAX_FILES", 2000)
+    again = client.post(url, json=request)
+
+    assert again.status_code == 200, again.text
+    assert again.json() == {"conversationId": a["conversationId"], "projectId": target["id"], "carriedAll": True}
+    folders = [p.name for p in Path(target["path"]).iterdir() if not p.name.startswith(".")]
+    assert folders == ["Build a sales dashboard (Kimi)"]
+    folder = Path(target["path"]) / folders[0]
+    assert sorted(p.read_text() for p in folder.iterdir()) == ["x0", "x1", "x2"]
+    # Everything is in the project now, so the sandbox goes, and the side is done.
+    assert _project(a["projectId"]) is None
+    assert client.post(url, json=request).status_code == 409
+
+
+def test_a_retry_never_overwrites_a_carried_file_the_user_has_since_changed(client, monkeypatch):
+    from cowork.services import comparisons
+
+    body = _create(client).json()
+    a = body["sides"][0]
+    sandbox = Path(_project(a["projectId"]).path)
+    (sandbox / "a.csv").write_text("side")
+    (sandbox / "b.csv").write_text("side")
+    target = _real_project(client, "edited-target")
+    url = f"/api/v1/comparisons/{body['id']}/sides/a/continue"
+    request = {"projectId": target["id"], "modelLabel": "Kimi"}
+    monkeypatch.setattr(comparisons, "_COPY_MAX_FILES", 1)
+    assert client.post(url, json=request).json()["carriedAll"] is False
+    folder = Path(target["path"]) / "Build a sales dashboard (Kimi)"
+    (folder / "a.csv").write_text("edited in the project")
+    monkeypatch.setattr(comparisons, "_COPY_MAX_FILES", 2000)
+
+    again = client.post(url, json=request)
+
+    assert again.json()["carriedAll"] is False
+    assert (folder / "a.csv").read_text() == "edited in the project"
+    assert (folder / "b.csv").read_text() == "side"
+    assert (sandbox / "a.csv").read_text() == "side"
+
+
+def test_a_retry_into_a_different_project_is_refused(client, monkeypatch):
+    from cowork.services import comparisons
+
+    body = _create(client).json()
+    sandbox = Path(_project(body["sides"][0]["projectId"]).path)
+    for i in range(2):
+        (sandbox / f"out{i}.csv").write_text("x")
+    first, other = _real_project(client, "first-target"), _real_project(client, "other-target")
+    url = f"/api/v1/comparisons/{body['id']}/sides/a/continue"
+    monkeypatch.setattr(comparisons, "_COPY_MAX_FILES", 1)
+    client.post(url, json={"projectId": first["id"]})
+
+    assert client.post(url, json={"projectId": other["id"]}).status_code == 409
+
+
+def test_a_long_model_name_is_shortened_rather_than_refused():
+    from cowork.schemas.comparisons import ComparisonContinueRequest
+
+    body = ComparisonContinueRequest.model_validate({"projectId": str(uuid4()), "modelLabel": "x" * 5000})
+
+    assert body.model_label == "x" * 80
+
+
+def test_a_long_model_name_still_continues(client):
+    body = _create(client).json()
+    (Path(_project(body["sides"][0]["projectId"]).path) / "out.csv").write_text("x")
+    target = _real_project(client, "long-label-target")
+    label = "Claude Opus 5.5 (1M context) " * 5
+
+    r = client.post(
+        f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": target["id"], "modelLabel": label}
+    )
+
+    assert r.status_code == 200, r.text
+    [folder] = [p.name for p in Path(target["path"]).iterdir() if not p.name.startswith(".")]
+    assert folder == "Build a sales dashboard (Claude Opus 5.5 (1M context) Claude Opus)"
 
 
 def test_a_hosted_side_takes_its_whole_workspace_along(tmp_path):
@@ -522,7 +681,8 @@ def test_a_second_carry_into_the_same_project_gets_its_own_folder(tmp_path):
     (sandbox / "a.txt").write_text("a")
     (destination / "Run (Kimi)").mkdir()
 
-    assert copy_side_changes(sandbox, destination, "Run (Kimi)", copied={}) == (1, True)
+    result = copy_side_changes(sandbox, destination, "Run (Kimi)", copied={})
+    assert (result.folder, result.files, result.complete) == ("Run (Kimi) 2", 1, True)
     assert (destination / "Run (Kimi) 2" / "a.txt").read_text() == "a"
 
 

@@ -68,6 +68,11 @@ class ComparisonSide(BaseSQLModel, table=True):
         sa_type=sa.JSON,  # type: ignore
         description="Files copied into the sandbox from the source project, by relative path and SHA-256",
     )
+    #: The folder of the destination project a desktop Continue copied the
+    #: side's work into, so carrying again after a partial carry finishes it.
+    carried_folder: str | None = Field(
+        default=None, max_length=255, description="Project folder the side's work was copied into on Continue"
+    )
     #: The side's cost as last read from the gateway, so the history list can
     #: show it without a gateway read per row. Written by the usage route.
     usage_snapshot: dict | None = Field(

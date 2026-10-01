@@ -2,9 +2,12 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import Field
+from pydantic import Field, field_validator
 
 from cowork.schemas.base import CamelRequest, CamelResponse
+
+# Longer than the folder name keeps (see `_carried_folder_name`).
+_MODEL_LABEL_MAX = 80
 
 
 class ComparisonSideRequest(CamelRequest):
@@ -27,8 +30,14 @@ class ComparisonVerdictRequest(CamelRequest):
 class ComparisonContinueRequest(CamelRequest):
     project_id: UUID
     #: The model's name as the screen shows it, for the folder the side's work
-    #: lands in. Only a name: it is cleaned before it touches a path.
-    model_label: str | None = Field(default=None, max_length=80)
+    #: lands in. Only a name: it is cleaned and shortened before it touches a
+    #: path, so a long one is shortened here rather than refused.
+    model_label: str | None = None
+
+    @field_validator("model_label", mode="before")
+    @classmethod
+    def _shorten_model_label(cls, value: object) -> object:
+        return value[:_MODEL_LABEL_MAX] if isinstance(value, str) else value
 
 
 class ComparisonSideResponse(CamelResponse):
