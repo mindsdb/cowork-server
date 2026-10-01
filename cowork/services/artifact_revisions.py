@@ -13,13 +13,13 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
+from anton.core.artifacts.internal_files import REVISIONS_DIRNAME
 from cowork.services.artifact_lock import artifact_lock
 
 EDITABLE_EXTENSIONS = frozenset({".md", ".txt", ".html", ".htm"})
 MAX_SOURCE_BYTES = 2_000_000
 MAX_REVISIONS = 80
-JOURNAL_DIRNAME = ".revisions"
+JOURNAL_DIRNAME = REVISIONS_DIRNAME
 # A queued repair whose turn never reported inside this window is presumed
 # dead. Without it a turn killed between minting the handoff and starting the
 # agent gates that source path forever.
@@ -290,16 +290,20 @@ def resolve_source(folder: Path, metadata: dict, rel_path: str | None = None) ->
     canonical_folder = folder.resolve(strict=False)
     candidate_rel = (rel_path or metadata.get("primary") or "").strip().replace("\\", "/")
     if not candidate_rel:
-        candidates = sorted(
-            p for p in folder.rglob("*")
-            if p.is_file() and not p.is_symlink()
-            and p.suffix.lower() in EDITABLE_EXTENSIONS
-            and (rel_parts := p.relative_to(folder).parts)[0] not in NON_CONTENT_NAMES
-            and JOURNAL_DIRNAME not in rel_parts
+        # The card's own walk: content files only, no symlinks. The journal is
+        # also refused below the top level, as the explicit-path gate does.
+        from cowork.services.artifacts import _user_files
+
+        target = min(
+            (
+                p for p in _user_files(folder)
+                if p.suffix.lower() in EDITABLE_EXTENSIONS
+                and JOURNAL_DIRNAME not in p.relative_to(folder).parts
+            ),
+            default=None,
         )
-        if not candidates:
+        if target is None:
             raise RevisionValidationError("Artifact has no editable source file")
-        target = candidates[0]
     else:
         parts = Path(candidate_rel).parts
         if Path(candidate_rel).is_absolute() or ".." in parts or JOURNAL_DIRNAME in parts:
