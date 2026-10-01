@@ -73,6 +73,13 @@ class ComparisonSide(BaseSQLModel, table=True):
     carried_folder: str | None = Field(
         default=None, max_length=255, description="Project folder the side's work was copied into on Continue"
     )
+    #: Continue left some of the side's work in its sandbox, which is kept;
+    #: continuing again into the same project carries the rest.
+    carry_incomplete: bool = Field(
+        default=False,
+        sa_column_kwargs={"server_default": sa.false()},
+        description="Continue could not carry all of the side's work; its sandbox is kept for a retry",
+    )
     #: The side's cost as last read from the gateway, so the history list can
     #: show it without a gateway read per row. Written by the usage route.
     usage_snapshot: dict | None = Field(

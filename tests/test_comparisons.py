@@ -604,10 +604,313 @@ def test_a_retry_never_overwrites_a_carried_file_the_user_has_since_changed(clie
 
     again = client.post(url, json=request)
 
-    assert again.json()["carriedAll"] is False
+    # The user's copy wins and counts as carried, so an edit can't keep every
+    # retry incomplete and the sandbox around for good.
+    assert again.json()["carriedAll"] is True
     assert (folder / "a.csv").read_text() == "edited in the project"
     assert (folder / "b.csv").read_text() == "side"
-    assert (sandbox / "a.csv").read_text() == "side"
+    assert _project(a["projectId"]) is None
+
+
+def test_a_partly_carried_side_says_so_and_where_a_retry_goes(client, monkeypatch):
+    from cowork.services import comparisons
+
+    body = _create(client).json()
+    sandbox = Path(_project(body["sides"][0]["projectId"]).path)
+    for i in range(2):
+        (sandbox / f"out{i}.csv").write_text(f"x{i}")
+    target = _real_project(client, "flag-target")
+    url = f"/api/v1/comparisons/{body['id']}/sides/a/continue"
+
+    def sides():
+        [listed] = [c["sides"] for c in client.get("/api/v1/comparisons/?limit=200").json()["comparisons"] if c["id"] == body["id"]]
+        fetched = client.get(f"/api/v1/comparisons/{body['id']}").json()["sides"]
+        assert listed == fetched
+        return {s["label"]: (s["carryIncomplete"], s["continuedProjectId"]) for s in fetched}
+
+    assert sides() == {"a": (False, None), "b": (False, None)}
+    monkeypatch.setattr(comparisons, "_COPY_MAX_FILES", 1)
+    client.post(url, json={"projectId": target["id"]})
+    # Read back as stored, not from the Continue response, so it holds after a reload.
+    assert sides() == {"a": (True, target["id"]), "b": (False, None)}
+
+    monkeypatch.setattr(comparisons, "_COPY_MAX_FILES", 2000)
+    assert client.post(url, json={"projectId": target["id"]}).json()["carriedAll"] is True
+    assert sides() == {"a": (False, target["id"]), "b": (False, None)}
+
+
+def test_a_fully_carried_side_is_not_marked_incomplete(client):
+    body = _create(client).json()
+    (Path(_project(body["sides"][0]["projectId"]).path) / "out.csv").write_text("x")
+    target = _real_project(client, "complete-target")
+
+    client.post(f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": target["id"]})
+
+    side = client.get(f"/api/v1/comparisons/{body['id']}").json()["sides"][0]
+    assert (side["carryIncomplete"], side["continuedProjectId"]) == (False, target["id"])
+
+
+def test_a_file_that_appears_while_its_copy_is_written_is_never_replaced(tmp_path, monkeypatch):
+    from cowork.services import comparisons
+
+    sandbox, destination = tmp_path / "s", tmp_path / "d"
+    sandbox.mkdir()
+    destination.mkdir()
+    (sandbox / "report.md").write_text("from the side")
+    real_copy = comparisons._copy_file
+
+    def copy_then_race(src, dst, name, budget, **kwargs):
+        real_copy(src, dst, name, budget, **kwargs)
+        # A sync client or editor writes the same name between the check and the publish.
+        (destination / "Run (Kimi)" / name).write_text("written meanwhile")
+
+    monkeypatch.setattr(comparisons, "_copy_file", copy_then_race)
+
+    result = comparisons.copy_side_changes(sandbox, destination, "Run (Kimi)", copied={})
+
+    folder = destination / "Run (Kimi)"
+    assert (folder / "report.md").read_text() == "written meanwhile"
+    assert sorted(p.name for p in folder.iterdir()) == ["report.md"]
+    assert result.complete is True
+
+
+@pytest.mark.parametrize("errno_name", ["EXDEV", "EPERM", "ENOTSUP"])
+def test_without_hard_links_a_file_is_still_carried_and_never_replaces_one(tmp_path, monkeypatch, errno_name):
+    import errno
+
+    from cowork.services import comparisons
+
+    sandbox, destination = tmp_path / "s", tmp_path / "d"
+    sandbox.mkdir()
+    destination.mkdir()
+    (sandbox / "new.md").write_text("new")
+    (sandbox / "raced.md").write_text("from the side")
+
+    def no_links(*args, **kwargs):
+        raise OSError(getattr(errno, errno_name), "no hard links here")
+
+    monkeypatch.setattr(comparisons.os, "link", no_links)
+    real_copy = comparisons._copy_file
+
+    def copy_then_race(src, dst, name, budget, **kwargs):
+        real_copy(src, dst, name, budget, **kwargs)
+        if name == "raced.md":
+            (destination / "Run (Kimi)" / name).write_text("written meanwhile")
+
+    monkeypatch.setattr(comparisons, "_copy_file", copy_then_race)
+
+    result = comparisons.copy_side_changes(sandbox, destination, "Run (Kimi)", copied={})
+
+    folder = destination / "Run (Kimi)"
+    assert (folder / "new.md").read_text() == "new"
+    assert (folder / "raced.md").read_text() == "written meanwhile"
+    assert sorted(p.name for p in folder.iterdir()) == ["new.md", "raced.md"]
+    assert result.complete is True
+
+
+def test_an_entry_that_cannot_be_stat_ed_keeps_the_sandbox(tmp_path, monkeypatch):
+    from cowork.services import comparisons
+
+    sandbox, destination = tmp_path / "s", tmp_path / "d"
+    sandbox.mkdir()
+    destination.mkdir()
+    (sandbox / "ok.txt").write_text("ok")
+    (sandbox / "vanishing.txt").write_text("x")
+    real_lstat = comparisons.dir_lstat
+
+    def lstat(directory, name):
+        if name == "vanishing.txt":
+            raise PermissionError(name)
+        return real_lstat(directory, name)
+
+    monkeypatch.setattr(comparisons, "dir_lstat", lstat)
+
+    result = comparisons.copy_side_changes(sandbox, destination, "Run (Kimi)", copied={})
+
+    assert (result.files, result.complete) == (1, False)
+
+
+def test_a_folder_whose_listing_fails_keeps_the_sandbox(tmp_path, monkeypatch):
+    from cowork.services import comparisons
+
+    sandbox, destination = tmp_path / "s", tmp_path / "d"
+    (sandbox / "sub").mkdir(parents=True)
+    destination.mkdir()
+    (sandbox / "sub" / "inner.txt").write_text("x")
+    (sandbox / "ok.txt").write_text("ok")
+    real_scandir = comparisons.dir_scandir
+
+    def scandir(directory):
+        if directory.path.name == "sub":
+            raise OSError("listing failed")
+        return real_scandir(directory)
+
+    monkeypatch.setattr(comparisons, "dir_scandir", scandir)
+
+    result = comparisons.copy_side_changes(sandbox, destination, "Run (Kimi)", copied={})
+
+    assert (result.files, result.complete) == (1, False)
+
+
+def test_a_hosted_workspace_that_is_a_link_is_not_followed(tmp_path):
+    from cowork.services.comparisons import _carry_side_work
+
+    side = SimpleNamespace(conversation_id=uuid4(), copied_files={})
+    sandbox, destination, elsewhere = tmp_path / "sandbox", tmp_path / "project", tmp_path / "elsewhere"
+    (sandbox / "conversations").mkdir(parents=True)
+    elsewhere.mkdir()
+    (elsewhere / "secret.txt").write_text("not the side's")
+    (sandbox / "conversations" / str(side.conversation_id)).symlink_to(elsewhere)
+    destination.mkdir()
+
+    assert _carry_side_work(side, sandbox=sandbox, destination=destination, folder_name="x", org_mode=True) is False
+    assert not (destination / "conversations").exists()
+    assert (elsewhere / "secret.txt").read_text() == "not the side's"
+
+
+def test_a_hosted_workspace_already_in_the_project_is_merged_without_overwriting(tmp_path):
+    from cowork.services.comparisons import _carry_side_work
+
+    side = SimpleNamespace(conversation_id=uuid4(), copied_files={})
+    sandbox, destination = tmp_path / "sandbox", tmp_path / "project"
+    workspace = sandbox / "conversations" / str(side.conversation_id)
+    (workspace / "out").mkdir(parents=True)
+    (workspace / "out" / "chart.png").write_bytes(b"side")
+    (workspace / "notes.md").write_text("side")
+    target = destination / "conversations" / str(side.conversation_id)
+    target.mkdir(parents=True)
+    # The task ran in the project after a partial carry, so its workspace exists there.
+    (target / "notes.md").write_text("written in the project")
+
+    for _ in range(2):  # the same on every retry
+        assert _carry_side_work(side, sandbox=sandbox, destination=destination, folder_name="x", org_mode=True) is True
+    assert (target / "notes.md").read_text() == "written in the project"
+    assert (target / "out" / "chart.png").read_bytes() == b"side"
+
+
+@pytest.mark.parametrize("kind", ["link", "file"])
+def test_a_hosted_target_that_is_not_a_folder_is_left_alone(tmp_path, kind):
+    from cowork.services.comparisons import _carry_side_work
+
+    side = SimpleNamespace(conversation_id=uuid4(), copied_files={})
+    sandbox, destination, elsewhere = tmp_path / "sandbox", tmp_path / "project", tmp_path / "elsewhere"
+    workspace = sandbox / "conversations" / str(side.conversation_id)
+    workspace.mkdir(parents=True)
+    (workspace / "notes.md").write_text("side")
+    (destination / "conversations").mkdir(parents=True)
+    elsewhere.mkdir()
+    target = destination / "conversations" / str(side.conversation_id)
+    if kind == "link":
+        target.symlink_to(elsewhere)
+    else:
+        target.write_text("not a folder")
+
+    assert _carry_side_work(side, sandbox=sandbox, destination=destination, folder_name="x", org_mode=True) is False
+    assert [p.name for p in (destination / "conversations").iterdir()] == [str(side.conversation_id)]
+    assert list(elsewhere.iterdir()) == []
+    assert (workspace / "notes.md").read_text() == "side"
+
+
+def test_a_hosted_side_with_no_workspace_has_nothing_to_carry(tmp_path):
+    from cowork.services.comparisons import _carry_side_work
+
+    side = SimpleNamespace(conversation_id=uuid4(), copied_files={})
+    (tmp_path / "sandbox").mkdir()
+    (tmp_path / "project").mkdir()
+
+    assert _carry_side_work(
+        side, sandbox=tmp_path / "sandbox", destination=tmp_path / "project", folder_name="x", org_mode=True
+    ) is True
+
+
+def test_a_side_whose_kept_sandbox_is_gone_stops_offering_the_rest(client, monkeypatch):
+    from cowork.services import comparisons
+
+    body = _create(client).json()
+    a = body["sides"][0]
+    sandbox = Path(_project(a["projectId"]).path)
+    for i in range(2):
+        (sandbox / f"out{i}.csv").write_text("x")
+    target = _real_project(client, "gone-target")
+    url = f"/api/v1/comparisons/{body['id']}/sides/a/continue"
+    monkeypatch.setattr(comparisons, "_COPY_MAX_FILES", 1)
+    client.post(url, json={"projectId": target["id"]})
+    session = get_open_session()
+    try:
+        ProjectService(ScopedSession(session, LOCAL_SCOPE)).delete_project(UUID(a["projectId"]))
+    finally:
+        session.close()
+
+    assert client.post(url, json={"projectId": target["id"]}).status_code == 409
+    assert client.get(f"/api/v1/comparisons/{body['id']}").json()["sides"][0]["carryIncomplete"] is False
+
+
+def test_a_hosted_merge_that_cannot_copy_everything_keeps_the_sandbox(tmp_path):
+    from cowork.services.comparisons import _carry_side_work
+
+    side = SimpleNamespace(conversation_id=uuid4(), copied_files={})
+    sandbox, destination = tmp_path / "sandbox", tmp_path / "project"
+    workspace = sandbox / "conversations" / str(side.conversation_id)
+    workspace.mkdir(parents=True)
+    locked = workspace / "locked.csv"
+    locked.write_text("x")
+    (destination / "conversations" / str(side.conversation_id)).mkdir(parents=True)
+    locked.chmod(0)
+    try:
+        carried = _carry_side_work(side, sandbox=sandbox, destination=destination, folder_name="x", org_mode=True)
+    finally:
+        locked.chmod(0o644)
+
+    assert carried is False
+
+
+def test_an_unreadable_side_file_is_not_carried_by_a_same_named_project_file(tmp_path):
+    from cowork.services.comparisons import copy_side_changes
+
+    sandbox, destination = tmp_path / "s", tmp_path / "d"
+    sandbox.mkdir()
+    (destination / "Run (Kimi)").mkdir(parents=True)
+    (destination / "Run (Kimi)" / "report.md").write_text("the user's")
+    unreadable = sandbox / "report.md"
+    unreadable.write_text("the side's")
+    unreadable.chmod(0)
+    try:
+        result = copy_side_changes(sandbox, destination, "Run (Kimi)", copied={}, into="Run (Kimi)")
+    finally:
+        unreadable.chmod(0o644)
+
+    # The side's version could not be read, so it can't be shown to be there.
+    assert result.complete is False
+    assert (destination / "Run (Kimi)" / "report.md").read_text() == "the user's"
+
+
+def test_a_digest_never_reads_through_a_link(tmp_path):
+    from cowork.common.paths import pinned_dir
+    from cowork.services.comparisons import _file_digest
+
+    (tmp_path / "real.txt").write_text("x")
+    (tmp_path / "link.txt").symlink_to(tmp_path / "real.txt")
+
+    with pinned_dir(tmp_path) as d:
+        assert _file_digest(d, "real.txt") is not None
+        assert _file_digest(d, "link.txt") is None
+
+
+def test_a_file_copy_never_reads_through_a_link(tmp_path):
+    from cowork.common.paths import pinned_dir
+    from cowork.services.comparisons import _copy_file, _CopyBudget
+
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+    (tmp_path / "outside.txt").write_text("outside")
+    (src / "link.txt").symlink_to(tmp_path / "outside.txt")
+    budget = _CopyBudget()
+
+    with pinned_dir(src) as s, pinned_dir(dst) as d:
+        _copy_file(s, d, "link.txt", budget)
+
+    assert (budget.files, list(dst.iterdir())) == (0, [])
 
 
 def test_a_retry_into_a_different_project_is_refused(client, monkeypatch):

@@ -49,6 +49,11 @@ class ComparisonSideResponse(CamelResponse):
     turn_count: int
     continued_at: datetime | None = None
     continued_turn_count: int | None = None
+    #: Continue left some of the side's work behind; continuing again into
+    #: `continued_project_id` carries the rest.
+    carry_incomplete: bool = False
+    #: The project the continued side's task is in; None until continued.
+    continued_project_id: UUID | None = None
     #: The side's cost as last read, for the history list; None until it has been.
     usage: "SideUsageSnapshot | None" = None
 

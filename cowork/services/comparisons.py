@@ -18,6 +18,7 @@ conversation into a real project, and from then on it is an ordinary task.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import logging
 import os
@@ -31,10 +32,10 @@ from uuid import UUID
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
+    dir_link,
     dir_lstat,
     dir_mkdir,
     dir_open,
-    dir_rename,
     dir_scandir,
     dir_unlink,
     open_pinned_child,
@@ -183,6 +184,16 @@ class ComparisonService:
             return min(count, side.continued_turn_count)
         return count
 
+    def continued_project_id(self, side: ComparisonSide) -> UUID | None:
+        """The project a continued side's task is in: where carrying the rest
+        of its work must go."""
+        if side.continued_at is None:
+            return None
+        conversation = self.session.exec(
+            self.session.select(Conversation).where(Conversation.id == side.conversation_id)
+        ).first()
+        return conversation.project_id if conversation is not None else None
+
     def turn_starts(self, side: ComparisonSide) -> list[datetime]:
         """When each of the side's turns started: its user messages, in order.
 
@@ -327,6 +338,11 @@ class ComparisonService:
         side = self.side(comparison, label)
         kept_sandbox = self._kept_sandbox(side) if side.continued_at is not None else None
         if side.continued_at is not None and kept_sandbox is None:
+            if side.carry_incomplete:
+                # The sandbox went some other way; there is nothing left to offer.
+                side.carry_incomplete = False
+                self.session.add(side)
+                self.session.commit()
             raise ComparisonConflictError("This side was already continued")
         destination = ProjectService(self.session).get_project(destination_project_id)
         if is_comparison_sandbox(destination.name):
@@ -361,6 +377,7 @@ class ComparisonService:
                 emptied_sandbox = source
         conversation = conversations.update_conversation(conversation.id, project_id=destination.id)
 
+        side.carry_incomplete = not carried_all
         side.continued_turn_count = turn_count
         side.continued_at = datetime.now(timezone.utc)
         self.session.add(side)
@@ -400,6 +417,7 @@ class ComparisonService:
             folder_name=_carried_folder_name(comparison.title, model_label or side.model),
             org_mode=self.session.scope.org_mode,
         )
+        side.carry_incomplete = not carried_all
         self.session.add(side)
         self.session.commit()
         if carried_all:
@@ -471,7 +489,9 @@ def _carry_side_work(
 
     Hosted: a task works in its own `conversations/<id>` folder, workspace and
     scratchpad session included, so that folder moves as a whole, to where a
-    task in the destination would have had it.
+    task in the destination would have had it. When the task already has that
+    folder there (it ran in the project after a partial carry), the side's
+    files are merged into it instead, never replacing one already there.
 
     Desktop: a task works in the project's own folder, and the sandbox also
     holds the copy of the source project the comparison started from. Only
@@ -487,8 +507,17 @@ def _carry_side_work(
         target = destination / "conversations" / str(side.conversation_id)
         if not workspace.exists():
             return True
-        if workspace.is_symlink() or not workspace.is_dir() or target.exists():
+        if workspace.is_symlink() or not workspace.is_dir() or target.is_symlink():
             return False
+        if target.exists():
+            if not target.is_dir():
+                return False
+            try:
+                merged = copy_side_changes(workspace, target.parent, target.name, copied={}, into=target.name)
+            except OSError:
+                logger.exception("Could not merge a continued side's workspace into its project")
+                return False
+            return merged.complete
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             os.rename(workspace, target)
@@ -586,11 +615,20 @@ def _is_plain_dir(path: Path) -> bool:
         return False
 
 
-def _carry_file(src: PinnedDir, dst: PinnedDir, name: str, digest: str | None, budget: _CopyBudget) -> bool:
-    """Put one changed file in the folder. True when the folder holds it.
+#: link() errors that mean "no hard links here", not "this file failed".
+_NO_HARD_LINKS = frozenset(
+    code for code in (getattr(errno, n, None) for n in ("EXDEV", "EPERM", "ENOTSUP", "EOPNOTSUPP", "EMLINK")) if code
+)
 
-    Written under a temporary name and moved into place, so a copy cut short
-    by the budget or an error never leaves a partial file in the project.
+
+def _carry_file(src: PinnedDir, dst: PinnedDir, name: str, digest: str | None, budget: _CopyBudget) -> bool:
+    """Put one changed file in the folder. True when the folder holds it, or
+    already holds something of the user's under that name, which wins.
+
+    Written under a temporary name, then published with a hard link, which
+    fails rather than replace a file that appeared meanwhile (a rename would
+    replace it). So a copy cut short never leaves a partial file, and nothing
+    in the project is overwritten.
     """
     if digest is None:
         return False
@@ -599,21 +637,56 @@ def _carry_file(src: PinnedDir, dst: PinnedDir, name: str, digest: str | None, b
     except FileNotFoundError:
         pass
     else:
-        return _file_digest(dst, name) == digest
+        return True
     temp = f".carry-{os.urandom(8).hex()}.partial"
     before = budget.files
     try:
         _copy_file(src, dst, name, budget, dst_name=temp)
         if budget.files == before:
             return False
-        dir_rename(dst, temp, dst, name)
+        try:
+            dir_link(dst, temp, name)
+        except FileExistsError:
+            return True
+        except OSError as e:
+            if e.errno not in _NO_HARD_LINKS:
+                raise
+            return _publish_by_exclusive_copy(dst, temp, name)
         return True
-    except BaseException:
+    finally:
         try:
             dir_unlink(dst, temp)
         except OSError:
             pass
+
+
+def _publish_by_exclusive_copy(dst: PinnedDir, temp: str, name: str) -> bool:
+    """Without hard links: create `name` exclusively and copy the finished
+    temporary file into it, so an existing name is still never replaced."""
+    binary = getattr(os, "O_BINARY", 0)
+    try:
+        fd_out = dir_open(dst, name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | O_NOFOLLOW | binary, 0o644)
+    except FileExistsError:
+        return True
+    try:
+        fd_in = dir_open(dst, temp, os.O_RDONLY | O_NOFOLLOW | binary)
+        try:
+            while chunk := os.read(fd_in, _COPY_CHUNK):
+                view = memoryview(chunk)
+                while view:
+                    view = view[os.write(fd_out, view):]
+        finally:
+            os.close(fd_in)
+    except BaseException:
+        os.close(fd_out)
+        # Created exclusively above, so the name is this copy's own.
+        try:
+            dir_unlink(dst, name)
+        except OSError:
+            pass
         raise
+    os.close(fd_out)
+    return True
 
 
 def _changed_files(sandbox_root: Path, copied: dict[str, str]) -> tuple[dict[str, str | None], bool]:

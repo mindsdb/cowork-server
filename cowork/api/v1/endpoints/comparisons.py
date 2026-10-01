@@ -51,6 +51,8 @@ def _response(service: ComparisonService, comparison: Comparison) -> dict:
                 "turn_count": service.turn_count(side),
                 "continued_at": side.continued_at,
                 "continued_turn_count": side.continued_turn_count,
+                "carry_incomplete": side.carry_incomplete,
+                "continued_project_id": service.continued_project_id(side),
                 "usage": side.usage_snapshot,
             }
             for side in sorted(comparison.sides, key=lambda s: s.label)
