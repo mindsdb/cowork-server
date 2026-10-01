@@ -1,8 +1,11 @@
 """The credential prober sees the connector's usage notes, so API traps (e.g. a
 redirect that strips Authorization) can live there instead of in the
 user-facing method description."""
+import asyncio
+
 from cowork.handlers import probe as probe_handler
-from cowork.services.connectors.probe import CredentialProbe
+from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
+from cowork.services.connectors.submissions import store
 
 
 def _prompt(**kw):
@@ -35,3 +38,37 @@ def test_handler_resolves_notes_from_the_registry(monkeypatch):
 
     monkeypatch.setattr(probe_handler.registry, "usage_notes_for", lambda engines: {})
     assert probe_handler._probe_usage_notes("langfuse") is None
+
+
+def test_handler_hands_the_resolved_notes_to_the_probe(monkeypatch):
+    created: list[dict] = []
+
+    class RecordingProbe:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+        async def run(self):
+            yield "verdict", ProbeOutcome(status="failure", error="stop here")
+
+    monkeypatch.setattr(probe_handler, "CredentialProbe", RecordingProbe)
+    monkeypatch.setattr(probe_handler.ProbeHandler, "_build_llm_client", staticmethod(lambda: object()))
+    monkeypatch.setattr(
+        probe_handler.registry, "usage_notes_for",
+        lambda engines: {e: f"NOTE-{e}" for e in engines},
+    )
+    submission_id = store.stage(
+        form_id="langfuse-connector", connector_id="langfuse", conversation_id=None,
+        values={"public_key": "pk", "secret_key": "sk"},
+    )
+
+    async def drain():
+        return [
+            chunk async for chunk in probe_handler.ProbeHandler(session=None).run(
+                submission_id, "langfuse", None, "", None
+            )
+        ]
+
+    asyncio.run(drain())
+
+    assert [kw["usage_notes"] for kw in created] == ["NOTE-langfuse"]
+    assert created[0]["engine"] == "langfuse"
