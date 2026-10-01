@@ -227,19 +227,28 @@ class TestLangfuseSpec:
 
 
 # usage_notes are inserted under a `###` heading in the agent's prompt, so a
-# `#`/`##`/`###` line of their own would break its structure. Fenced code is
-# exempt: a `# comment` there is a code comment, not a heading.
-_HEADING = re.compile(r"^#{1,3}(\s|$)")
+# `#`/`##`/`###` line of their own would break its structure. Code is exempt: a
+# `# comment` in a fence or an indented block is a code comment, not a heading.
+# Follows the CommonMark rules for these constructs, which is all that is needed
+# to tell the two apart.
+_HEADING = re.compile(r" {0,3}#{1,3}(\s|$)")
+_FENCE_OPEN = re.compile(r" {0,3}(`{3,}|~{3,})")
+_INDENTED_CODE = re.compile(r" {4}|\t")
 
 
 def _headings_outside_fences(text: str) -> list[str]:
-    found, in_fence = [], False
+    found: list[str] = []
+    fence = ""
     for line in text.splitlines():
-        stripped = line.lstrip()
-        if stripped.startswith("```"):
-            in_fence = not in_fence
+        if fence:
+            closing = re.fullmatch(r" {0,3}(" + fence[0] + r"{%d,})\s*" % len(fence), line)
+            if closing:
+                fence = ""
             continue
-        if not in_fence and _HEADING.match(stripped):
+        opening = _FENCE_OPEN.match(line)
+        if opening:
+            fence = opening.group(1)
+        elif not _INDENTED_CODE.match(line) and _HEADING.match(line):
             found.append(line)
     return found
 
@@ -248,6 +257,26 @@ def test_heading_check_ignores_comments_inside_code_fences():
     assert _headings_outside_fences("Use it.\n```python\n# step 1\nx = 1\n```\n") == []
     assert _headings_outside_fences("## Quirks\nUse it.") == ["## Quirks"]
     assert _headings_outside_fences("#### deep\n#hashtag") == []
+
+
+def test_heading_check_ignores_comments_inside_indented_code():
+    assert _headings_outside_fences("Run:\n\n    # step 1\n    x = 1\n") == []
+    assert _headings_outside_fences("Run:\n\n\t# step 1\n") == []
+    # Up to three leading spaces still make a heading.
+    assert _headings_outside_fences("   ## Quirks") == ["   ## Quirks"]
+
+
+def test_heading_check_follows_fence_rules():
+    assert _headings_outside_fences("~~~\n# step 1\n~~~\n") == []
+    # A fence closes only on its own character, with at least its own length.
+    assert _headings_outside_fences("~~~\n```\n# x\n~~~\n") == []
+    assert _headings_outside_fences("```\n~~~\n# x\n```\n") == []
+    assert _headings_outside_fences("````\n```\n# x\n````\n") == []
+    assert _headings_outside_fences("````\n```\n````\n# x\n") == ["# x"]
+    # Four leading spaces make it indented code, not a fence opener.
+    assert _headings_outside_fences("    ```\n# x\n") == ["# x"]
+    # Text after a closing fence's run makes it a content line, not a closer.
+    assert _headings_outside_fences("```\n``` not a close\n# x\n```\n") == []
 
 
 @pytest.mark.parametrize("path", SPEC_FILES, ids=lambda p: p.stem)
