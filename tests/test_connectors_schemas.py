@@ -1,7 +1,8 @@
 import asyncio
 
+import httpx
 import pytest
-from fastapi.routing import APIRoute, serialize_response
+from fastapi import FastAPI
 from pydantic import ValidationError
 
 from cowork.schemas.connectors import (
@@ -66,11 +67,24 @@ class TestSpecUsageNotesStayOutOfResponses:
         assert "usage_notes" not in spec.model_dump_json()
 
     def test_route_response_omits_notes(self):
-        route = APIRoute("/spec", lambda: None, response_model=ConnectorSpecResponse)
+        app = FastAPI()
 
-        body = asyncio.run(
-            serialize_response(field=route.response_field, response_content=self._spec())
-        )
+        @app.get("/x", response_model=ConnectorSpecResponse)
+        def read_spec():
+            return self._spec()
 
+        async def fetch() -> httpx.Response:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                return await client.get("/x")
+
+        response = asyncio.run(fetch())
+
+        assert response.status_code == 200
+        body = response.json()
         assert body["id"] == "demo"
         assert "usage_notes" not in body
+        properties = app.openapi()["components"]["schemas"]["ConnectorSpecResponse"]["properties"]
+        assert "id" in properties
+        assert "usage_notes" not in properties
