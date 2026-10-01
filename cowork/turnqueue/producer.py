@@ -24,6 +24,7 @@ from cowork.handlers.turn_errors import (
 from cowork.services.providers import minds_chat_base_url
 from cowork.db.scoped import TenantScope
 from cowork.services import product_permissions
+from cowork.services.connectors.specs._registry import registry
 from cowork.services.product_permissions import require_product_permission
 from cowork.turnqueue.auth_keys import list_active_connections, mint_turn_key
 from cowork.turnqueue.models import TurnJob, TurnReply
@@ -210,14 +211,9 @@ def _connectors_block(oauth_connections: dict | None) -> dict | None:
     `oauth` block: anton renders notes only for engines its vault connects,
     and on web that vault is built from `oauth` alone.
     """
-    from cowork.services.connectors.specs._registry import registry
-
     connections = (oauth_connections or {}).get("connections") or []
-    engines = {c.get("engine") for c in connections if isinstance(c, dict) and c.get("engine")}
-    notes = registry.usage_notes_for(sorted(engines))
-    if not notes:
-        return None
-    return {engine: {"usage_notes": text} for engine, text in notes.items()}
+    notes = registry.usage_notes_for(dict.fromkeys(c.get("engine") for c in connections))
+    return {engine: {"usage_notes": text} for engine, text in notes.items()} or None
 
 
 # What the reply loop reports when the worker stops answering. Shaped like the

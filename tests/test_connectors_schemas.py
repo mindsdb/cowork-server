@@ -1,8 +1,6 @@
-import asyncio
-
-import httpx
 import pytest
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from cowork.schemas.connectors import (
@@ -73,13 +71,7 @@ class TestSpecUsageNotesStayOutOfResponses:
         def read_spec():
             return self._spec()
 
-        async def fetch() -> httpx.Response:
-            async with httpx.AsyncClient(
-                transport=httpx.ASGITransport(app=app), base_url="http://test"
-            ) as client:
-                return await client.get("/x")
-
-        response = asyncio.run(fetch())
+        response = TestClient(app).get("/x")
 
         assert response.status_code == 200
         body = response.json()

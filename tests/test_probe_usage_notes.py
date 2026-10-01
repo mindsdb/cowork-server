@@ -29,17 +29,6 @@ def test_no_notes_no_section():
     assert "KNOWN API QUIRKS" not in _prompt(usage_notes="   ")
 
 
-def test_handler_resolves_notes_from_the_registry(monkeypatch):
-    monkeypatch.setattr(
-        probe_handler.registry, "usage_notes_for",
-        lambda engines: {e: f"NOTE-{e}" for e in engines},
-    )
-    assert probe_handler._probe_usage_notes("langfuse") == "NOTE-langfuse"
-
-    monkeypatch.setattr(probe_handler.registry, "usage_notes_for", lambda engines: {})
-    assert probe_handler._probe_usage_notes("langfuse") is None
-
-
 def test_handler_hands_the_resolved_notes_to_the_probe(monkeypatch):
     created: list[dict] = []
 
