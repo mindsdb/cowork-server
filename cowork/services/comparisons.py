@@ -18,7 +18,6 @@ conversation into a real project, and from then on it is an ordinary task.
 
 from __future__ import annotations
 
-import errno
 import hashlib
 import logging
 import os
@@ -491,7 +490,9 @@ def _carry_side_work(
     scratchpad session included, so that folder moves as a whole, to where a
     task in the destination would have had it. When the task already has that
     folder there (it ran in the project after a partial carry), the side's
-    files are merged into it instead, never replacing one already there.
+    files are merged into it instead, its `.anton` agent state included but
+    not its scratchpad environments (rebuilt on use), never replacing a file
+    already there.
 
     Desktop: a task works in the project's own folder, and the sandbox also
     holds the copy of the source project the comparison started from. Only
@@ -513,7 +514,9 @@ def _carry_side_work(
             if not target.is_dir():
                 return False
             try:
-                merged = copy_side_changes(workspace, target.parent, target.name, copied={}, into=target.name)
+                merged = copy_side_changes(
+                    workspace, target.parent, target.name, copied={}, into=target.name, agent_state=True
+                )
             except OSError:
                 logger.exception("Could not merge a continued side's workspace into its project")
                 return False
@@ -554,6 +557,7 @@ def copy_side_changes(
     *,
     copied: dict[str, str],
     into: str | None = None,
+    agent_state: bool = False,
 ) -> CarryResult:
     """Copy the sandbox files that are not an unchanged copy of the source into
     one folder of `destination_root`, named `folder_name` unless that is taken.
@@ -565,9 +569,11 @@ def copy_side_changes(
 
     Same rules as `copy_project_files`: regular files and directories only,
     never through a link, and within the same budget. Left out: `.anton`
-    (artifacts move separately; scratchpad environments are rebuilt on use).
+    (artifacts move separately; scratchpad environments are rebuilt on use),
+    unless `agent_state`, for a task's own workspace, where `.anton` holds its
+    agent state; its scratchpad environments are still left out.
     """
-    changed, examined_all = _changed_files(sandbox_root, copied)
+    changed, examined_all = _changed_files(sandbox_root, copied, agent_state=agent_state)
     if not changed:
         return CarryResult(folder=into, files=0, complete=examined_all)
     if into is not None and _is_plain_dir(destination_root / into):
@@ -615,12 +621,6 @@ def _is_plain_dir(path: Path) -> bool:
         return False
 
 
-#: link() errors that mean "no hard links here", not "this file failed".
-_NO_HARD_LINKS = frozenset(
-    code for code in (getattr(errno, n, None) for n in ("EXDEV", "EPERM", "ENOTSUP", "EOPNOTSUPP", "EMLINK")) if code
-)
-
-
 def _carry_file(src: PinnedDir, dst: PinnedDir, name: str, digest: str | None, budget: _CopyBudget) -> bool:
     """Put one changed file in the folder. True when the folder holds it, or
     already holds something of the user's under that name, which wins.
@@ -648,9 +648,10 @@ def _carry_file(src: PinnedDir, dst: PinnedDir, name: str, digest: str | None, b
             dir_link(dst, temp, name)
         except FileExistsError:
             return True
-        except OSError as e:
-            if e.errno not in _NO_HARD_LINKS:
-                raise
+        except OSError:
+            # No hard links here, by whichever errno this filesystem uses for
+            # it (Windows reports FAT and exFAT as EINVAL); the exclusive copy
+            # never replaces a file either.
             return _publish_by_exclusive_copy(dst, temp, name)
         return True
     finally:
@@ -689,11 +690,14 @@ def _publish_by_exclusive_copy(dst: PinnedDir, temp: str, name: str) -> bool:
     return True
 
 
-def _changed_files(sandbox_root: Path, copied: dict[str, str]) -> tuple[dict[str, str | None], bool]:
+def _changed_files(
+    sandbox_root: Path, copied: dict[str, str], *, agent_state: bool = False
+) -> tuple[dict[str, str | None], bool]:
     """Sandbox files whose content is not in `copied`, by relative path, with
     their SHA-256 (None when unreadable); and whether every entry could be
     examined. Something the walk could not look into may be work, so it
-    keeps the sandbox."""
+    keeps the sandbox. A top-level `.anton` is left out, or with
+    `agent_state` only its scratchpad environments."""
     changed: dict[str, str | None] = {}
     examined_all = True
 
@@ -705,7 +709,9 @@ def _changed_files(sandbox_root: Path, copied: dict[str, str]) -> tuple[dict[str
             examined_all = False
             return
         for name in names:
-            if not rel and name == ".anton":
+            if not rel and name == ".anton" and not agent_state:
+                continue
+            if rel == ".anton/" and name == _SCRATCHPAD_VENVS:
                 continue
             try:
                 st = dir_lstat(directory, name)
@@ -735,6 +741,10 @@ def _changed_files(sandbox_root: Path, copied: dict[str, str]) -> tuple[dict[str
     with pinned_dir(sandbox_root) as root:
         walk(root, "", 0)
     return changed, examined_all
+
+
+#: Under a workspace's `.anton`: per-pad Python environments, rebuilt on use.
+_SCRATCHPAD_VENVS = "scratchpad-venvs"
 
 
 def _file_digest(directory: PinnedDir, name: str) -> str | None:

@@ -674,7 +674,8 @@ def test_a_file_that_appears_while_its_copy_is_written_is_never_replaced(tmp_pat
     assert result.complete is True
 
 
-@pytest.mark.parametrize("errno_name", ["EXDEV", "EPERM", "ENOTSUP"])
+# EINVAL and EACCES: how Windows reports a FAT/exFAT drive or a network share.
+@pytest.mark.parametrize("errno_name", ["EXDEV", "EPERM", "ENOTSUP", "EINVAL", "EACCES"])
 def test_without_hard_links_a_file_is_still_carried_and_never_replaces_one(tmp_path, monkeypatch, errno_name):
     import errno
 
@@ -786,6 +787,44 @@ def test_a_hosted_workspace_already_in_the_project_is_merged_without_overwriting
         assert _carry_side_work(side, sandbox=sandbox, destination=destination, folder_name="x", org_mode=True) is True
     assert (target / "notes.md").read_text() == "written in the project"
     assert (target / "out" / "chart.png").read_bytes() == b"side"
+
+
+def test_a_hosted_merge_brings_the_sides_agent_state_but_not_its_scratchpad_environments(tmp_path):
+    from cowork.services.comparisons import _carry_side_work
+
+    side = SimpleNamespace(conversation_id=uuid4(), copied_files={})
+    sandbox, destination = tmp_path / "sandbox", tmp_path / "project"
+    workspace = sandbox / "conversations" / str(side.conversation_id)
+    (workspace / ".anton" / "episodes").mkdir(parents=True)
+    (workspace / ".anton" / "episodes" / "1.jsonl").write_text("side episode")
+    (workspace / ".anton" / "anton.md").write_text("side instructions")
+    (workspace / ".anton" / "scratchpad-venvs" / "sales" / "bin").mkdir(parents=True)
+    (workspace / ".anton" / "scratchpad-venvs" / "sales" / "bin" / "python").write_text("venv")
+    (workspace / "notes.md").write_text("side")
+    target = destination / "conversations" / str(side.conversation_id)
+    (target / ".anton").mkdir(parents=True)
+    (target / ".anton" / "anton.md").write_text("edited in the project")
+
+    assert _carry_side_work(side, sandbox=sandbox, destination=destination, folder_name="x", org_mode=True) is True
+    assert (target / ".anton" / "episodes" / "1.jsonl").read_text() == "side episode"
+    assert (target / ".anton" / "anton.md").read_text() == "edited in the project"
+    assert (target / "notes.md").read_text() == "side"
+    assert not (target / ".anton" / "scratchpad-venvs").exists()
+
+
+def test_a_desktop_carry_still_leaves_the_projects_agent_state_out(tmp_path):
+    from cowork.services.comparisons import copy_side_changes
+
+    sandbox, destination = tmp_path / "s", tmp_path / "d"
+    (sandbox / ".anton" / "episodes").mkdir(parents=True)
+    (sandbox / ".anton" / "episodes" / "1.jsonl").write_text("episode")
+    (sandbox / "report.md").write_text("work")
+    destination.mkdir()
+
+    result = copy_side_changes(sandbox, destination, "Run (Kimi)", copied={})
+
+    assert result.complete is True
+    assert sorted(p.name for p in (destination / "Run (Kimi)").iterdir()) == ["report.md"]
 
 
 @pytest.mark.parametrize("kind", ["link", "file"])
