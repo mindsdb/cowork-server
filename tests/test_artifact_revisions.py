@@ -1367,3 +1367,14 @@ def test_auto_pick_skips_generation_inputs(tmp_path):
     _, rel = revision_service.resolve_source(tmp_path, {})
 
     assert rel == "report.md"
+
+
+def test_auto_pick_skips_nested_journal_files(tmp_path):
+    journal = tmp_path / "assets" / ".revisions"
+    journal.mkdir(parents=True)
+    (journal / "a.html").write_text("x", encoding="utf-8")
+    (tmp_path / "b.html").write_text("x", encoding="utf-8")
+
+    _, rel = revision_service.resolve_source(tmp_path, {})
+
+    assert rel == "b.html"

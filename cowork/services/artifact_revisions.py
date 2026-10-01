@@ -294,7 +294,8 @@ def resolve_source(folder: Path, metadata: dict, rel_path: str | None = None) ->
             p for p in folder.rglob("*")
             if p.is_file()
             and p.suffix.lower() in EDITABLE_EXTENSIONS
-            and p.relative_to(folder).parts[0] not in NON_CONTENT_NAMES
+            and (rel_parts := p.relative_to(folder).parts)[0] not in NON_CONTENT_NAMES
+            and JOURNAL_DIRNAME not in rel_parts
         )
         if not candidates:
             raise RevisionValidationError("Artifact has no editable source file")
