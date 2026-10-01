@@ -437,8 +437,7 @@ def _content_mtime(folder: Path) -> int:
     """Max mtime (int seconds) across an artifact's user content files.
 
     Disk-derived, so it reflects in-place edits the metadata.json mtime
-    misses. Names in anton's `NON_CONTENT_NAMES` (housekeeping, STATE runtime
-    files, generation inputs, `.revisions/`) are excluded — not user content.
+    misses. Names in anton's `NON_CONTENT_NAMES` are excluded — not user content.
     Used both as the renderer's cache-bust token and as the cheap "changed
     since publish" gate for the `modified` badge.
     """
