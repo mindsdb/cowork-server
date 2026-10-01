@@ -229,8 +229,8 @@ class TestLangfuseSpec:
 # usage_notes are inserted under a `###` heading in the agent's prompt, so a
 # `#`/`##`/`###` line of their own would break its structure. Code is exempt: a
 # `# comment` in a fence or an indented block is a code comment, not a heading.
-# Follows the CommonMark rules for these constructs, which is all that is needed
-# to tell the two apart.
+# Known limitation: code nested inside list items is not modelled; every line
+# indented by 4+ spaces or a tab counts as code.
 _HEADING = re.compile(r" {0,3}#{1,3}(\s|$)")
 _FENCE_OPEN = re.compile(r" {0,3}(`{3,}|~{3,})")
 _INDENTED_CODE = re.compile(r" {4}|\t")

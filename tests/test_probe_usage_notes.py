@@ -5,7 +5,7 @@ import asyncio
 
 from cowork.handlers import probe as probe_handler
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
-from cowork.services.connectors.submissions import store
+from cowork.services.connectors.submissions import SubmissionStore
 
 
 def _prompt(**kw):
@@ -56,6 +56,8 @@ def test_handler_hands_the_resolved_notes_to_the_probe(monkeypatch):
         probe_handler.registry, "usage_notes_for",
         lambda engines: {e: f"NOTE-{e}" for e in engines},
     )
+    store = SubmissionStore()
+    monkeypatch.setattr(probe_handler, "store", store)
     submission_id = store.stage(
         form_id="langfuse-connector", connector_id="langfuse", conversation_id=None,
         values={"public_key": "pk", "secret_key": "sk"},
