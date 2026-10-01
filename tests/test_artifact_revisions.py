@@ -1361,9 +1361,9 @@ def test_auto_pick_skips_store_housekeeping_files(tmp_path):
 
 
 def test_auto_pick_skips_generation_inputs(tmp_path):
-    for name in ("prd.md", "notes.md"):
+    for name in ("prd.md", "report.md"):
         (tmp_path / name).write_text("x", encoding="utf-8")
 
     _, rel = revision_service.resolve_source(tmp_path, {})
 
-    assert rel == "notes.md"
+    assert rel == "report.md"
