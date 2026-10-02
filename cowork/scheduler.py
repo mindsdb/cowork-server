@@ -250,7 +250,7 @@ async def execute_schedule(
             # request in flight.
             from cowork.db.scoped import unsafe_unscoped_session
             stream = await ResponsesHandler(
-                unsafe_unscoped_session(session), principal=principal
+                unsafe_unscoped_session(session), principal=principal, interactive=False
             ).handle(request)
             async for _ in stream:
                 pass
