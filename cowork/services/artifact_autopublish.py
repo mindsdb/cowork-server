@@ -381,6 +381,13 @@ async def autopublish_project_artifacts(
         return set()
     if not _is_enabled(scope):
         return set()
+    from cowork.services.projects import path_in_comparison_sandbox
+
+    if path_in_comparison_sandbox(artifacts_base):
+        # publish_artifact would refuse each one anyway; skipping here keeps a
+        # comparison turn from minting a publish key and logging failures.
+        _record("skipped", reason="comparison_side")
+        return set()
     if not project_id:
         # Fail closed once, instead of raising in `_publish_one` for every slug.
         _record("skipped", reason="no_project_id")

@@ -13,6 +13,7 @@ from cowork.api.v1.endpoints import (
     capabilities,
     channels,
     comments,
+    comparisons,
     coding,
     coding_personal_skills,
     coding_runtime,
@@ -73,6 +74,7 @@ api_router.include_router(responses.router, prefix="/responses", tags=["response
 api_router.include_router(files.router, prefix="/files", tags=["files"])
 api_router.include_router(schedules.router, prefix="/schedules", tags=["schedules"])
 api_router.include_router(pins.router, prefix="/pins", tags=["pins"])
+api_router.include_router(comparisons.router, prefix="/comparisons", tags=["comparisons"])
 api_router.include_router(skills.router, prefix="/skills", tags=["skills"])
 api_router.include_router(memory.router, prefix="/memory", tags=["memory"])
 api_router.include_router(channels.router, prefix="/channels", tags=["channels"])

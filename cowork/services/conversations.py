@@ -443,6 +443,20 @@ class ConversationService:
             stmt = stmt.where(
                 Conversation.project_id == (project_id or self._default_project_id())
             )
+        else:
+            # A cross-project list is what a person browses, so it leaves out
+            # the model-comparison sides; their own project's list still has
+            # them. autoescape: `_` is a LIKE wildcard, and the prefix starts
+            # with one.
+            from cowork.services.projects import COMPARISON_SANDBOX_PREFIX
+
+            stmt = stmt.where(
+                Conversation.project_id.not_in(
+                    sa_select(Project.id).where(
+                        Project.name.startswith(COMPARISON_SANDBOX_PREFIX, autoescape=True)
+                    )
+                )
+            )
         # created_at then id break ties deterministically so equal-activity rows
         # (e.g. two empty conversations) keep a stable order across polls.
         stmt = stmt.order_by(
