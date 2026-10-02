@@ -17,6 +17,44 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 #: below any epoch value, so an epoch fails validation instead of silently
 #: disabling the controller's timeout. Mirrors payload.MAX_DEADLINE_MS.
 MAX_DEADLINE_MS = 24 * 60 * 60 * 1000
+DATASOURCE_PROTOCOL_VERSION = 1
+MAX_DATASOURCE_CONNECTIONS = 100
+
+
+def _validate_datasource_block(value: object) -> None:
+    if not isinstance(value, dict):
+        raise ValueError("datasource must be an object")
+    if set(value) != {"protocol_version", "connections"}:
+        raise ValueError("datasource contains unsupported fields")
+    block_version = value.get("protocol_version")
+    # `True == 1` and `1.0 == 1`, so an equality check alone accepts a block
+    # that is not v1 and this then treats it as one. Same rule as the ids below.
+    if (
+        isinstance(block_version, bool)
+        or not isinstance(block_version, int)
+        or block_version != DATASOURCE_PROTOCOL_VERSION
+    ):
+        raise ValueError("unsupported datasource protocol version")
+    connections = value.get("connections")
+    if not isinstance(connections, list) or not connections or len(connections) > MAX_DATASOURCE_CONNECTIONS:
+        raise ValueError("datasource connections are invalid")
+    seen: set[int] = set()
+    for connection in connections:
+        if not isinstance(connection, dict) or set(connection) != {"connection_id", "credential_version"}:
+            raise ValueError("datasource connection reference is invalid")
+        connection_id = connection.get("connection_id")
+        version = connection.get("credential_version")
+        if (
+            isinstance(connection_id, bool)
+            or not isinstance(connection_id, int)
+            or connection_id < 1
+            or isinstance(version, bool)
+            or not isinstance(version, int)
+            or version < 1
+            or connection_id in seen
+        ):
+            raise ValueError("datasource connection reference is invalid")
+        seen.add(connection_id)
 
 
 class TurnJob(BaseModel):
@@ -53,6 +91,8 @@ class TurnJob(BaseModel):
     def _workspace_mode_is_declared(self) -> TurnJob:
         if self.op == "anton_turn_v2" and self.params.get("workspace_mode") not in ("persistent", "ephemeral"):
             raise ValueError("anton_turn_v2 requires a persistent or ephemeral workspace_mode")
+        if "datasource" in self.params:
+            _validate_datasource_block(self.params["datasource"])
         return self
 
     @field_validator("deadline_ms")

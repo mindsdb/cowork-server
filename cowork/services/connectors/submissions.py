@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Sequence
 from typing import Any
+
+from cowork.schemas.connectors import ConnectorField
 
 
 class SubmissionStore:
@@ -55,3 +58,19 @@ class SubmissionStore:
 
 
 store = SubmissionStore()
+
+
+def missing_required_fields(
+    fields: Sequence[ConnectorField], values: dict[str, Any], skipped: Sequence[str]
+) -> list[str]:
+    """Names of the required fields a submission neither filled nor skipped.
+
+    Blank counts as missing: the form posts an untouched text input as "".
+    """
+    skipped_set = set(skipped)
+    return [
+        f.name for f in fields
+        if f.required
+        and f.name not in skipped_set
+        and (values.get(f.name) is None or str(values.get(f.name, "")).strip() == "")
+    ]
