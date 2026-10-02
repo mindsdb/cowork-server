@@ -107,6 +107,33 @@ def test_remote_history_scrubs_secrets(monkeypatch):
     assert "[REDACTED_API_KEY]" in history[0]["content"]
 
 
+async def test_remote_history_scrubs_a_registered_vault_secret_by_value(monkeypatch, tmp_path, request):
+    """A datasource password has no API-key shape, so only its registered
+    value can redact it before the seed lands in the Redis job. The call
+    sites are pinned by their own ordering tests."""
+    from anton.core.datasources.data_vault import LocalDataVault
+    from anton.utils.datasources import _reset_registered_ds_vars
+
+    from cowork.services.connectors.vault_secrets import register_vault_secrets
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "vault"))
+    LocalDataVault(tmp_path / "vault").save("postgres", "mydb", {
+        "host": "db.example.com", "port": "5432", "database": "app",
+        "user": "svc", "password": "hunter2xyz",
+    })
+    request.addfinalizer(_reset_registered_ds_vars)
+
+    await register_vault_secrets(LOCAL_SCOPE)
+    _fake_history(monkeypatch, [_msg("user", "the password is hunter2xyz")])
+
+    history, _ = ResponsesHandler._remote_seed_history(_FakeScoped(), uuid4())
+
+    blob = json.dumps(history)
+    assert "hunter2xyz" not in blob
+    assert "[DS_" in blob
+
+
 # ── seeding the pod with the saved compaction ────────────────────────────────
 
 
@@ -233,6 +260,81 @@ def _remote_handler(monkeypatch, saved):
     monkeypatch.setattr(responses_mod, "get_open_session", lambda: None)
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: _FakeScope())
     return handler
+
+
+async def test_the_producer_task_scrubs_the_job_history_with_the_requests_registration(
+    monkeypatch, tmp_path, request,
+):
+    """handle() registers the vault's secrets in the request task, while the
+    job history is built in the producer task the run registry spawns. The
+    registration must reach it, or the pod gets the password in plain text."""
+    from anton.core.datasources.data_vault import LocalDataVault
+    from anton.utils.datasources import _reset_registered_ds_vars
+
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.services.connectors.vault_secrets import register_vault_secrets
+    from cowork.streaming.registry import RunRegistry
+
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "vault"))
+    LocalDataVault(tmp_path / "vault").save("postgres", "mydb", {
+        "host": "db.example.com", "port": "5432", "database": "app",
+        "user": "svc", "password": "hunter2xyz",
+    })
+    request.addfinalizer(_reset_registered_ds_vars)
+
+    handler = _remote_handler(monkeypatch, {})
+    # The real seed builder, run where the producer runs it.
+    handler._remote_seed_history = (
+        lambda session, conv_id: ResponsesHandler._remote_seed_history(_FakeScoped(), conv_id)
+    )
+    rows = [_msg("user", "the password is hunter2xyz")]
+
+    class ConversationServiceWithHistory(responses_mod.ConversationService):
+        def get_ordered_messages(self, conv_id):
+            return rows
+
+        def get_conversation(self, conv_id):
+            return SimpleNamespace(
+                history_summary=None, history_summary_cutoff_id=None, project=None,
+            )
+
+    monkeypatch.setattr(responses_mod, "ConversationService", ConversationServiceWithHistory)
+    monkeypatch.setattr(
+        responses_mod, "get_user_settings",
+        lambda scope=None: SimpleNamespace(history_compaction_enabled=True),
+    )
+    captured = {}
+
+    async def fake_replies(**kwargs):
+        captured.update(kwargs)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    class _Buffer(_FakeBuffer):
+        latest_seq = 0
+
+    conv_id = uuid4()
+    buffer = _Buffer()
+    await register_vault_secrets(LOCAL_SCOPE)
+    run = await RunRegistry().start(
+        conversation_id=str(conv_id),
+        turn_id=0,
+        buffer=buffer,
+        producer_coro=handler._produce_remote(
+            conv_id=conv_id,
+            input_text="hi",
+            original_content="hi",
+            model="anton",
+            harness_id="anton",
+            buffer=buffer,
+        ),
+    )
+    await run.task
+
+    blob = json.dumps(captured["history"])
+    assert "hunter2xyz" not in blob
+    assert "[DS_" in blob
 
 
 def test_remote_memory_filters_out_personal_global_tier(monkeypatch):
@@ -828,6 +930,80 @@ async def test_produce_remote_persists_on_failure(monkeypatch):
     assert saved["events"][-1] == {"type": "response.failed", "code": "anton_error",
                                    "error": "An unexpected error occurred.",
                                    "request_id": "corr-remote-failure"}
+
+
+_RESET_AT = "2026-09-26T00:00:00+00:00"
+
+
+async def _remote_failure_frames(monkeypatch, failed_data):
+    """Run one remote turn that ends in ``failed_data``.
+
+    Returns the streamed response.failed payload and the persisted events.
+    """
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_failed", failed_data
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    buffer = _RecBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+        turn_llm={"correlation_id": "corr-reset-at"},
+    )
+    failed = [f for f in buffer.frames if "response.failed" in f]
+    assert len(failed) == 1
+    return json.loads(failed[0].split("data: ", 1)[1].strip()), saved["events"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "code", "message"),
+    [
+        (
+            "FreeServingPausedError: paused",
+            "free_serving_paused",
+            (
+                "Free MindsHub Air is paused for everyone until the daily budget resets. "
+                "Add credits to keep working now."
+            ),
+        ),
+        (
+            "AllowanceExhaustedError: exhausted",
+            "included_allowance_exhausted",
+            "You have no free MindsHub Air allowance left. Add credits to keep working now.",
+        ),
+    ],
+)
+async def test_produce_remote_failure_carries_the_workers_reset_at(
+    monkeypatch, error, code, message
+):
+    # The hosted card says when the free way forward comes back, as the desktop
+    # one does. The streamed frame and the persisted event must agree, or the
+    # card loses the time on reload.
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": error, "code": code, "message": message, "reset_at": _RESET_AT,
+    })
+    expected = {
+        "type": "response.failed", "code": code, "error": message,
+        "reset_at": _RESET_AT, "request_id": "corr-reset-at",
+    }
+    assert frame == expected
+    assert events[-1] == expected
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_failure_without_reset_at_keeps_its_shape(monkeypatch):
+    # An older worker sends none, so the frame stays exactly as before.
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": "FreeServingPausedError: paused", "code": "free_serving_paused",
+        "message": "Free MindsHub Air is paused.",
+    })
+    assert "reset_at" not in frame
+    assert "reset_at" not in events[-1]
 
 
 @pytest.mark.asyncio
