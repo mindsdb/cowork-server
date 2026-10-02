@@ -107,6 +107,33 @@ def test_remote_history_scrubs_secrets(monkeypatch):
     assert "[REDACTED_API_KEY]" in history[0]["content"]
 
 
+async def test_remote_history_scrubs_a_registered_vault_secret_by_value(monkeypatch, tmp_path, request):
+    """A datasource password has no API-key shape, so only its registered
+    value can redact it before the seed lands in the Redis job. The call
+    sites are pinned by their own ordering tests."""
+    from anton.core.datasources.data_vault import LocalDataVault
+    from anton.utils.datasources import _reset_registered_ds_vars
+
+    from cowork.services.connectors.vault_secrets import register_vault_secrets
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "vault"))
+    LocalDataVault(tmp_path / "vault").save("postgres", "mydb", {
+        "host": "db.example.com", "port": "5432", "database": "app",
+        "user": "svc", "password": "hunter2xyz",
+    })
+    request.addfinalizer(_reset_registered_ds_vars)
+
+    await register_vault_secrets(LOCAL_SCOPE)
+    _fake_history(monkeypatch, [_msg("user", "the password is hunter2xyz")])
+
+    history, _ = ResponsesHandler._remote_seed_history(_FakeScoped(), uuid4())
+
+    blob = json.dumps(history)
+    assert "hunter2xyz" not in blob
+    assert "[DS_" in blob
+
+
 # ── seeding the pod with the saved compaction ────────────────────────────────
 
 
@@ -233,6 +260,81 @@ def _remote_handler(monkeypatch, saved):
     monkeypatch.setattr(responses_mod, "get_open_session", lambda: None)
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: _FakeScope())
     return handler
+
+
+async def test_the_producer_task_scrubs_the_job_history_with_the_requests_registration(
+    monkeypatch, tmp_path, request,
+):
+    """handle() registers the vault's secrets in the request task, while the
+    job history is built in the producer task the run registry spawns. The
+    registration must reach it, or the pod gets the password in plain text."""
+    from anton.core.datasources.data_vault import LocalDataVault
+    from anton.utils.datasources import _reset_registered_ds_vars
+
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.services.connectors.vault_secrets import register_vault_secrets
+    from cowork.streaming.registry import RunRegistry
+
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "vault"))
+    LocalDataVault(tmp_path / "vault").save("postgres", "mydb", {
+        "host": "db.example.com", "port": "5432", "database": "app",
+        "user": "svc", "password": "hunter2xyz",
+    })
+    request.addfinalizer(_reset_registered_ds_vars)
+
+    handler = _remote_handler(monkeypatch, {})
+    # The real seed builder, run where the producer runs it.
+    handler._remote_seed_history = (
+        lambda session, conv_id: ResponsesHandler._remote_seed_history(_FakeScoped(), conv_id)
+    )
+    rows = [_msg("user", "the password is hunter2xyz")]
+
+    class ConversationServiceWithHistory(responses_mod.ConversationService):
+        def get_ordered_messages(self, conv_id):
+            return rows
+
+        def get_conversation(self, conv_id):
+            return SimpleNamespace(
+                history_summary=None, history_summary_cutoff_id=None, project=None,
+            )
+
+    monkeypatch.setattr(responses_mod, "ConversationService", ConversationServiceWithHistory)
+    monkeypatch.setattr(
+        responses_mod, "get_user_settings",
+        lambda scope=None: SimpleNamespace(history_compaction_enabled=True),
+    )
+    captured = {}
+
+    async def fake_replies(**kwargs):
+        captured.update(kwargs)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    class _Buffer(_FakeBuffer):
+        latest_seq = 0
+
+    conv_id = uuid4()
+    buffer = _Buffer()
+    await register_vault_secrets(LOCAL_SCOPE)
+    run = await RunRegistry().start(
+        conversation_id=str(conv_id),
+        turn_id=0,
+        buffer=buffer,
+        producer_coro=handler._produce_remote(
+            conv_id=conv_id,
+            input_text="hi",
+            original_content="hi",
+            model="anton",
+            harness_id="anton",
+            buffer=buffer,
+        ),
+    )
+    await run.task
+
+    blob = json.dumps(captured["history"])
+    assert "hunter2xyz" not in blob
+    assert "[DS_" in blob
 
 
 def test_remote_memory_filters_out_personal_global_tier(monkeypatch):
@@ -830,6 +932,80 @@ async def test_produce_remote_persists_on_failure(monkeypatch):
                                    "request_id": "corr-remote-failure"}
 
 
+_RESET_AT = "2026-09-26T00:00:00+00:00"
+
+
+async def _remote_failure_frames(monkeypatch, failed_data):
+    """Run one remote turn that ends in ``failed_data``.
+
+    Returns the streamed response.failed payload and the persisted events.
+    """
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_failed", failed_data
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    buffer = _RecBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+        turn_llm={"correlation_id": "corr-reset-at"},
+    )
+    failed = [f for f in buffer.frames if "response.failed" in f]
+    assert len(failed) == 1
+    return json.loads(failed[0].split("data: ", 1)[1].strip()), saved["events"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "code", "message"),
+    [
+        (
+            "FreeServingPausedError: paused",
+            "free_serving_paused",
+            (
+                "Free MindsHub Air is paused for everyone until the daily budget resets. "
+                "Add credits to keep working now."
+            ),
+        ),
+        (
+            "AllowanceExhaustedError: exhausted",
+            "included_allowance_exhausted",
+            "You have no free MindsHub Air allowance left. Add credits to keep working now.",
+        ),
+    ],
+)
+async def test_produce_remote_failure_carries_the_workers_reset_at(
+    monkeypatch, error, code, message
+):
+    # The hosted card says when the free way forward comes back, as the desktop
+    # one does. The streamed frame and the persisted event must agree, or the
+    # card loses the time on reload.
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": error, "code": code, "message": message, "reset_at": _RESET_AT,
+    })
+    expected = {
+        "type": "response.failed", "code": code, "error": message,
+        "reset_at": _RESET_AT, "request_id": "corr-reset-at",
+    }
+    assert frame == expected
+    assert events[-1] == expected
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_failure_without_reset_at_keeps_its_shape(monkeypatch):
+    # An older worker sends none, so the frame stays exactly as before.
+    frame, events = await _remote_failure_frames(monkeypatch, {
+        "error": "FreeServingPausedError: paused", "code": "free_serving_paused",
+        "message": "Free MindsHub Air is paused.",
+    })
+    assert "reset_at" not in frame
+    assert "reset_at" not in events[-1]
+
+
 @pytest.mark.asyncio
 async def test_produce_remote_mints_a_request_id_when_none_was_resolved_upstream(monkeypatch):
     # Most turns never go through the router gate that pre-mints a correlation
@@ -1416,13 +1592,15 @@ async def test_a_bad_draft_does_not_break_the_turn(monkeypatch):
 # them into the same shared tree cowork-server reads, which is what lets the
 # before/after diff work from here at all.
 
-def _artifact(folder, slug, *, body="<html>report</html>"):
+def _artifact(folder, slug, *, body="<html>report</html>", conversation_id=None):
     target = folder / slug
     target.mkdir(parents=True, exist_ok=True)
     (target / "report.html").write_text(body)
-    (target / "metadata.json").write_text(
-        json.dumps({"slug": slug, "type": "html-app", "title": slug})
-    )
+    meta = {"slug": slug, "type": "html-app", "title": slug}
+    if conversation_id is not None:
+        # What anton's artifact tools write: the creating conversation first.
+        meta["provenance"] = [{"conversation": str(conversation_id), "turns": []}]
+    (target / "metadata.json").write_text(json.dumps(meta))
     return target
 
 
@@ -1505,17 +1683,19 @@ async def test_produce_remote_cards_an_artifact_the_worker_wrote(monkeypatch, tm
         fake_autopublish,
     )
 
+    conv_id = uuid4()
+
     async def fake_replies(**kwargs):
         yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
         yield "turn_delta", {"text": "done"}
         # The worker writes into the shared tree mid-turn.
-        _artifact(artifacts_base, "sales-report")
+        _artifact(artifacts_base, "sales-report", conversation_id=conv_id)
         yield "turn_completed", {}
 
     monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
 
     await handler._produce_remote(
-        conv_id=uuid4(), input_text="hi", original_content="hi",
+        conv_id=conv_id, input_text="hi", original_content="hi",
         model="anton", harness_id="anton", buffer=_FakeBuffer(),
     )
 
@@ -1528,6 +1708,56 @@ async def test_produce_remote_cards_an_artifact_the_worker_wrote(monkeypatch, tm
     assert len(cards) == 1
     assert cards[0]["artifact"]["slug"] == "sales-report"
     assert cards[0]["artifact"]["projectName"] == "proj"
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_does_not_claim_a_concurrent_siblings_artifact(monkeypatch, tmp_path):
+    """ENG-2961: the project base is shared, so a folder that merely appeared
+    during this turn may be a sibling turn's. Only artifacts whose provenance
+    names this conversation are indexed, owned and carded."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    project_dir = tmp_path / "proj"
+    artifacts_base = project_dir / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    conversation = _conversation_at(project_dir)
+    monkeypatch.setattr(
+        responses_mod.ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: (
+            conversation, artifacts_base,
+            str(conversation.project_id), conversation.project.name,
+        )),
+    )
+
+    published = {}
+
+    async def fake_autopublish(base, scope, *, touched, **kwargs):
+        published["touched"] = set(touched)
+        return set(touched)
+
+    monkeypatch.setattr(
+        "cowork.services.artifact_autopublish.autopublish_project_artifacts",
+        fake_autopublish,
+    )
+    conv_id = uuid4()
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        _artifact(artifacts_base, "mine", conversation_id=conv_id)
+        _artifact(artifacts_base, "sibling", conversation_id=uuid4())
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=conv_id, input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert published["touched"] == {"mine"}
+    cards = [e for e in saved["events"] if e.get("type") == "response.artifact_created"]
+    assert [c["artifact"]["slug"] for c in cards] == ["mine"]
 
 
 @pytest.mark.asyncio
@@ -1584,6 +1814,105 @@ async def test_produce_remote_does_not_card_a_failed_turn(monkeypatch, tmp_path)
 
     assert indexed.get("ran") is True
     assert not [e for e in saved["events"] if e.get("type") == "response.artifact_created"]
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_claims_an_unattributed_artifact_of_a_failed_turn(monkeypatch, tmp_path):
+    """ENG-2961 R1: anton writes metadata.json with empty provenance first and
+    appends the turn's entry right after, so a turn cut short in between leaves
+    a folder with no provenance. On a non-clean exit that folder is still this
+    turn's; one naming another conversation is still dropped."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    project_dir = tmp_path / "proj"
+    artifacts_base = project_dir / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    conversation = _conversation_at(project_dir)
+    monkeypatch.setattr(
+        responses_mod.ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: (
+            conversation, artifacts_base,
+            str(conversation.project_id), conversation.project.name,
+        )),
+    )
+
+    from cowork.services import task_objects
+
+    # The provenance filter now runs inside `index_turn_artifacts`; what it
+    # kept is what reaches the index step.
+    indexed = {"new": set()}
+
+    def spy_index_new(conversation, conversation_id, project_id, slugs, scope):
+        indexed["new"] = set(slugs)
+
+    monkeypatch.setattr(task_objects, "_index_new_slugs", spy_index_new)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        _artifact(artifacts_base, "half-written")
+        _artifact(artifacts_base, "sibling", conversation_id=uuid4())
+        yield "turn_failed", {"error": "boom", "code": "anton_error", "message": "failed"}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert indexed["new"] == {"half-written"}
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_drops_an_unattributed_artifact_of_a_clean_turn(monkeypatch, tmp_path):
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    project_dir = tmp_path / "proj"
+    artifacts_base = project_dir / ".anton" / "artifacts"
+    artifacts_base.mkdir(parents=True)
+    conversation = _conversation_at(project_dir)
+    monkeypatch.setattr(
+        responses_mod.ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: (
+            conversation, artifacts_base,
+            str(conversation.project_id), conversation.project.name,
+        )),
+    )
+
+    from cowork.services import task_objects
+
+    # The provenance filter now runs inside `index_turn_artifacts`; what it
+    # kept is what reaches the index step.
+    indexed = {"new": set()}
+
+    def spy_index_new(conversation, conversation_id, project_id, slugs, scope):
+        indexed["new"] = set(slugs)
+
+    monkeypatch.setattr(task_objects, "_index_new_slugs", spy_index_new)
+
+    async def fake_autopublish(base, scope, *, touched, **kwargs):
+        return set(touched)
+
+    monkeypatch.setattr(
+        "cowork.services.artifact_autopublish.autopublish_project_artifacts",
+        fake_autopublish,
+    )
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        _artifact(artifacts_base, "handmade")
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert indexed["new"] == set()
 
 
 # ── turn history ─────────────────────────────────────────────────────────────
@@ -1753,3 +2082,140 @@ async def test_a_forced_continuation_persists_only_the_replacement(monkeypatch):
     )
 
     assert saved["assistant"] == "REPLACEMENT"
+
+
+# ── The persisted assistant message id rides the completion frame ──
+
+def _remote_handler_with_message_id(monkeypatch, saved, *, assistant_message_id):
+    """Same DB-layer fake as _remote_handler, but save_assistant_turn returns
+    a real (fake) Message so the completion-frame wiring can be asserted —
+    _remote_handler's own fake returns None, which every other test in this
+    file relies on NOT mattering."""
+    handler = _handler()
+    handler.principal = object()
+    handler._remote_seed_history = lambda session, conv_id: ([], None)
+
+    class FakeConversationService:
+        def __init__(self, session):
+            pass
+
+        def get_conversation(self, conv_id):
+            return object()
+
+        def save_user_message(self, conv_id, content, *, pending=False):
+            saved["user"] = content
+            return SimpleNamespace(id=uuid4())
+
+        def finalize_pending(self, conv_id, message_id=None):
+            pass
+
+        def save_assistant_turn(self, conv_id, text, events, harness=None, tool_rows=None):
+            saved["assistant"] = text
+            saved["events"] = events
+            if assistant_message_id is None:
+                return None
+            return SimpleNamespace(id=assistant_message_id)
+
+    class FakeSession:
+        def commit(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
+    monkeypatch.setattr(responses_mod, "ScopedSession", lambda s, scope: FakeSession())
+    monkeypatch.setattr(responses_mod, "get_open_session", lambda: None)
+    monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: _FakeScope())
+    return handler
+
+
+def _payload(frame):
+    return json.loads(frame.split("data: ", 1)[1])
+
+
+class _RecordingBuffer:
+    def __init__(self):
+        self.frames: list[str] = []
+
+    async def append(self, kind, record):
+        self.frames.append(record["sse"])
+
+    async def close(self, reason):
+        self.frames.append(f"CLOSE:{reason}")
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_completed_frame_carries_the_assistant_message_id(monkeypatch):
+    saved = {}
+    real_id = uuid4()
+    handler = _remote_handler_with_message_id(monkeypatch, saved, assistant_message_id=real_id)
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "hello"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    completed = [f for f in buffer.frames if f.startswith("event: response.completed")]
+    assert len(completed) == 1
+    assert _payload(completed[0])["assistant_message_id"] == str(real_id)
+    # persist() only ran once despite the early + fallback call sites.
+    assert saved["assistant"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_failed_frame_carries_the_id_when_something_persisted(monkeypatch):
+    saved = {}
+    real_id = uuid4()
+    handler = _remote_handler_with_message_id(monkeypatch, saved, assistant_message_id=real_id)
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "partial"}
+        yield "turn_failed", {"error": "boom", "code": "anton_error", "message": "An unexpected error occurred."}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+        turn_llm={"correlation_id": "corr-1"},
+    )
+
+    failed = [f for f in buffer.frames if f.startswith("event: response.failed")]
+    assert len(failed) == 1
+    payload = _payload(failed[0])
+    assert payload["assistant_message_id"] == str(real_id)
+    # The failure event persisted alongside it does NOT carry the id (same
+    # convention as request_id/code) — only the live wire frame does.
+    assert "assistant_message_id" not in saved["events"][-1]
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_completed_frame_omits_the_id_when_nothing_persisted(monkeypatch):
+    """An empty turn (save_assistant_turn's own early-return) must not crash
+    the frame-injection path, and must OMIT the field, not send it as null."""
+    saved = {}
+    handler = _remote_handler_with_message_id(monkeypatch, saved, assistant_message_id=None)
+
+    async def fake_replies(**kwargs):
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    buffer = _RecordingBuffer()
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    )
+
+    completed = [f for f in buffer.frames if f.startswith("event: response.completed")]
+    assert len(completed) == 1
+    assert "assistant_message_id" not in _payload(completed[0])

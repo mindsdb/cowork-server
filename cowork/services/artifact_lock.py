@@ -7,6 +7,8 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
+from cowork.common.paths import open_fd
+
 
 @contextmanager
 def artifact_lock(folder: Path, *, timeout: float = 5.0):
@@ -23,7 +25,7 @@ def artifact_lock(folder: Path, *, timeout: float = 5.0):
     token = f"{os.getpid()}:{uuid.uuid4().hex}\n"
     while True:
         try:
-            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            fd = open_fd(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             try:
                 os.write(fd, token.encode("ascii"))
             finally:

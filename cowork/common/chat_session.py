@@ -21,11 +21,21 @@ below as a new execution site and fails, so a third caller cannot be added
 without either routing through this function or being reviewed as an exception.
 Guarding `turn_stream` instead would be invisible to that test, since it is a
 method call on whatever the caller named its session object.
+
+Both callers also stop their session's scratchpad processes through
+`close_session_scratchpads`. It closes pads only, never `ChatSession.close()`,
+and nothing else in cowork-server stops them.
 """
 
 from __future__ import annotations
 
+import asyncio
+import functools
+import logging
+
 from cowork.common.settings.app_settings import get_app_settings
+
+logger = logging.getLogger(__name__)
 
 NO_IN_PROCESS_TURN_DETAIL = (
     "Agent turns do not run inside this deployment's server process; "
@@ -53,3 +63,78 @@ def build_chat_session(config):
     from anton.core.session import ChatSession
 
     return ChatSession(config)
+
+
+# Strong references for the detached closes below: asyncio holds only a weak
+# reference to a task once nothing else does, so a dropped `create_task` result
+# can be garbage-collected mid-flight. Discarded on completion.
+_scratchpad_closes: set[asyncio.Task[None]] = set()
+
+
+def close_session_scratchpads(session, *, owner: str) -> None:
+    """Kill the scratchpad processes a finished ChatSession started.
+
+    Every pad is a child process that exits only when told to. Dropping the
+    session does not stop it, because asyncio's child watcher keeps the pad's
+    transport referenced, so without this call each turn that ran Python
+    leaves a process behind until the server exits.
+
+    Pads only. `ChatSession.close()` also reaps the full-stack backends the
+    session launched, and those must keep serving after the turn. anton has no
+    public pads-only close, so this calls `session._scratchpads.close_all()`,
+    as anton's own CLI does on Ctrl-C. `close_all()` keeps each pad's
+    namespace snapshot on disk, and the next turn's fresh pad restores it.
+
+    Scheduled, never awaited, so a caller's `finally` can use it without an
+    `await`. A second cancel while the caller unwinds (Stop pressed twice, or
+    Stop then shutdown) would cut an awaited close off after its first pad;
+    the task runs to completion either way. It never raises, so the caller's
+    later cleanup steps still run. `drain_scratchpad_closes` waits for any
+    still running at shutdown.
+    """
+    manager = getattr(session, "_scratchpads", None)
+    if manager is None:
+        # anton's ChatSession.__init__ always sets it, so None means an anton
+        # release renamed it. The desktop wheel installs anton outside uv.lock,
+        # where no test pins the name, so say so instead of leaking quietly.
+        logger.warning("Cannot close the scratchpads of %s: the session has no _scratchpads", owner)
+        return
+    try:
+        task = asyncio.get_running_loop().create_task(manager.close_all())
+    except Exception:
+        logger.exception("Could not schedule closing the scratchpads of %s", owner)
+        return
+    _scratchpad_closes.add(task)
+    task.add_done_callback(functools.partial(_log_scratchpad_close, owner=owner))
+
+
+def _log_scratchpad_close(task: asyncio.Task[None], *, owner: str) -> None:
+    _scratchpad_closes.discard(task)
+    if task.cancelled():
+        logger.warning("Closing the scratchpads of %s was cancelled; some may still be running", owner)
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.warning("Closing the scratchpads of %s failed", owner, exc_info=exc)
+
+
+async def drain_scratchpad_closes(*, timeout: float = 5.0) -> None:
+    """Wait for scheduled scratchpad closes, for shutdown.
+
+    A close still pending when the event loop stops is destroyed with its
+    pads alive. Turns that finished unwinding inside `registry.shutdown()`'s
+    grace have queued their close by now, and closes queued while this waits
+    are picked up too. A turn that shutdown cancels mid-cell is the exception:
+    anton kills that pad itself, swallows the cancel and carries on, so its
+    close can come after this returns. Any pad still alive when the server
+    exits reads EOF on stdin and exits. `asyncio.wait` does not cancel on
+    timeout, so a slow close keeps running for as long as the loop does.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while pending := [task for task in _scratchpad_closes if not task.done()]:
+        left = deadline - loop.time()
+        if left <= 0:
+            logger.warning("%d scratchpad close(s) did not finish within %.1fs", len(pending), timeout)
+            return
+        await asyncio.wait(pending, timeout=left)

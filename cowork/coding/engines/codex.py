@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import importlib.util
+import logging
 import os
 import re
 import sys
@@ -25,7 +26,7 @@ from cowork.coding.contracts import (
     RuntimePlatformStatus,
     TerminalShellPreference,
 )
-from cowork.coding.control_errors import ModelDiscoveryAuthenticationError
+from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, ModelDiscoveryUnavailableError
 from cowork.coding.engines import codex_config, codex_events
 from cowork.coding.engines.base import (
     ApprovalHandler,
@@ -47,6 +48,7 @@ from cowork.coding.processes import (
 from cowork.coding.redaction import redact_text, sanitize
 from cowork.common.settings.app_settings import get_app_settings
 
+logger = logging.getLogger(__name__)
 ADAPTER_VERSION = "1"
 
 _EXPECTED_ACTIVE_TURN = re.compile(r"expected active turn id `([^`]+)`")
@@ -95,6 +97,8 @@ class CodexEngine:
                 "terminal": "supported",
                 "goals": "supported",
                 "forking": "supported",
+                "planning": "supported",
+                "questions": "supported",
             },
             commands=[
                 EngineCommand(name="goal", label="Goal", description="View it alone, or set, edit, pause, resume, or clear a durable objective", argument_hint="set|edit|pause|resume|clear", action="goal"),
@@ -149,7 +153,19 @@ class CodexEngine:
                         "or switch back to the environment you signed into."
                     ) from exc
                 raise
-            payload = response.json()
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                # A decode error names bytes, not a cause the user can act on.
+                # Keep the transport details for diagnosis instead.
+                logger.warning(
+                    "MindsHub model list was not JSON (status %s, content-type %r, content-encoding %r, first bytes %r)",
+                    response.status_code,
+                    response.headers.get("content-type"),
+                    response.headers.get("content-encoding"),
+                    response.content[:8],
+                )
+                raise ModelDiscoveryUnavailableError("Couldn't load models from MindsHub. Try again.") from exc
         models: list[str] = []
         for row in payload.get("data", []) if isinstance(payload, dict) else []:
             if not isinstance(row, dict) or not isinstance(row.get("id"), str):
@@ -212,6 +228,7 @@ class CodexEngineSession:
         )
         self._skill_roots = None if config.skill_roots is None else tuple(config.skill_roots)
         self._model = config.model
+        self._task_mode = config.task_mode
         self._reasoning_effort = config.reasoning_effort
         self._service_tier = config.service_tier
         self._personality = config.personality
@@ -275,6 +292,14 @@ class CodexEngineSession:
                 "approvalsReviewer": "user",
                 "sandboxPolicy": self._sandbox_policy,
                 "summary": "concise",
+                "collaborationMode": {
+                    "mode": "plan" if self._task_mode == "plan" else "default",
+                    "settings": {
+                        "model": self._model,
+                        "reasoning_effort": self._reasoning_effort,
+                        "developer_instructions": None,
+                    },
+                },
             },
         )
         return response.turn.id

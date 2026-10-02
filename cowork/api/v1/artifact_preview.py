@@ -6,7 +6,8 @@ from pathlib import Path
 from fastapi import Request
 from fastapi.responses import HTMLResponse
 
-from cowork.services.comments_layer import ACTIVATION_PARAM, inject_layer
+from cowork.services.comments_layer import ACTIVATION_PARAM
+from cowork.services.preview_html import prepare_preview_html
 
 NO_CACHE_HEADERS = {"Cache-Control": "no-cache, must-revalidate"}
 
@@ -24,9 +25,42 @@ NO_CACHE_HEADERS = {"Cache-Control": "no-cache, must-revalidate"}
 HTML_SANDBOX_CSP = "sandbox allow-scripts allow-popups allow-forms allow-modals"
 
 
-def wants_comment_layer(media_type: str, request: Request) -> bool:
-    """Whether this top-level HTML request opted into review markers."""
-    return media_type == "text/html" and ACTIVATION_PARAM in request.query_params
+def wants_comment_layer(request: Request) -> bool:
+    """Whether this top-level HTML request opted into review markers.
+
+    Callers only reach here after already establishing the response is
+    text/html, so that check is not repeated.
+    """
+    return ACTIVATION_PARAM in request.query_params
+
+
+# Mirrors the string forms Pydantic's bool coercion accepts for a `Query()`
+# parameter. Anything else -- garbage, or the empty string FastAPI itself
+# would 422 on -- is treated as "no", the same as the key being absent.
+_TRUE_DOWNLOAD_VALUES = frozenset({"1", "true", "yes", "on", "y", "t"})
+
+
+def wants_download(request: Request) -> bool:
+    """Whether this request asked for the raw file instead of the preview.
+
+    `/serve` and `/preview-asset` used to gate this on mere key presence
+    (`"download" not in request.query_params`), so `?download=0` suppressed
+    the shim there while the `/drafts` route -- which parses `download` as a
+    real `Query(bool)` -- kept injecting it for the same query string. One
+    predicate, with the same truthiness `Query(bool)` gives, keeps the three
+    routes agreeing on what `?download=0` means.
+    """
+    raw = request.query_params.get("download")
+    return raw is not None and raw.strip().lower() in _TRUE_DOWNLOAD_VALUES
+
+
+def wants_html_preview(media_type: str, request: Request) -> bool:
+    """Whether to serve the injected HTML preview rather than the raw file.
+
+    The one predicate the file-serving routes share, so a change to what
+    counts as previewable HTML lands in every route at once.
+    """
+    return media_type == "text/html" and not wants_download(request)
 
 
 def artifact_response_headers(media_type: str) -> dict[str, str]:
@@ -37,10 +71,13 @@ def artifact_response_headers(media_type: str) -> dict[str, str]:
     return NO_CACHE_HEADERS
 
 
-def html_with_comment_layer(target: Path) -> HTMLResponse | None:
-    """Return injected HTML, or ``None`` when the file is not UTF-8 text."""
+def html_preview_response(target: Path, *, comments: bool) -> HTMLResponse | None:
+    """Return the prepared HTML, or ``None`` when the file is not UTF-8 text."""
     try:
         html = target.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
-    return HTMLResponse(inject_layer(html), headers=artifact_response_headers("text/html"))
+    return HTMLResponse(
+        prepare_preview_html(html, comments=comments),
+        headers=artifact_response_headers("text/html"),
+    )
