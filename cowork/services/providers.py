@@ -16,7 +16,12 @@ import httpx
 from pydantic import SecretStr
 
 from cowork.common.settings import runtime_credential
-from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
+from cowork.common.settings.app_settings import (
+    AGENT_ROLE_NAMES,
+    current_direct_model,
+    default_minds_api_host,
+    supported_direct_effort,
+)
 from cowork.handlers.turn_errors import GatewayDenial, gateway_denial
 from cowork.services.hub_workspaces import sweep_cache
 
@@ -1486,6 +1491,11 @@ def build_llm_client(
 
     settings = get_user_settings()
     same_coding_provider = settings.resolved_coding_provider == settings.resolved_planning_provider
+    # A conversation remembers its composer pick, so it can name a model the
+    # provider has since stopped serving; read it the way a stored pin is read.
+    model_override = current_direct_model(
+        settings.resolved_planning_provider.value, model_override
+    )
     planning_model = model_override or settings.resolved_planning_model
     coding_model = (
         model_override
@@ -1667,6 +1677,19 @@ def build_llm_client(
         coding_model,
         settings.coding_reasoning_effort,
     )
+
+    # Direct providers publish no effort levels, so the compiled catalog is the
+    # only check before the call. A level saved before the provider dropped it
+    # (OpenAI's "minimal") would otherwise be rejected on every turn.
+    def _accepted(role: Provider, model: str | None, effort: str | None):
+        if role in (Provider.OPENAI, Provider.ANTHROPIC):
+            return supported_direct_effort(model, effort)
+        return effort
+
+    planning_effort = _accepted(
+        settings.resolved_planning_provider, planning_model, planning_effort
+    )
+    coding_effort = _accepted(settings.resolved_coding_provider, coding_model, coding_effort)
 
     # Use the *resolved* provider/model (not the raw stored fields) so a
     # configured key takes effect even when planning_provider still points at

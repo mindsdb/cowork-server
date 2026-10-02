@@ -27,7 +27,7 @@ from cowork.common.paths import cowork_home
 RECOMMENDED_MODELS: dict[str, list[str]] = {
     "minds-cloud": [],
     "anthropic": ["claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
-    "openai": ["gpt-5.5", "gpt-5.5-mini", "o3", "o4-mini"],
+    "openai": ["gpt-5.5", "gpt-5.4-mini", "o3", "o4-mini"],
     # Live-overlaid from Google's OpenAI-compatible /models when a Gemini key is
     # configured (see recommended_models endpoint); this static list is only the
     # fallback for the pre-key onboarding pick and offline loads. The old
@@ -63,8 +63,10 @@ MODEL_ROLE_DEFAULTS: dict[str, dict[str, str]] = {
     },
     "openai": {
         "planning": "gpt-5.5",
-        "coding": "gpt-5.5-mini",
-        "router": "gpt-5.5-mini",
+        # gpt-5.5 has no mini that OpenAI serves, so the fast roles take the
+        # newest one that exists. The router default is also the gate's model.
+        "coding": "gpt-5.4-mini",
+        "router": "gpt-5.4-mini",
     },
     "gemini": {
         # All three roles use the one id confirmed to work on a fresh
@@ -125,6 +127,23 @@ RECOMMENDED_PAIR: dict[str, tuple[str, ...]] = {
     "openai-compatible": ("",) * len(AGENT_ROLE_ORDER),
 }
 
+# Direct-provider ids this catalog once offered that the provider does not
+# serve, read back as their replacement so a model the picker saved does not
+# 404 every turn. Keyed by the Provider enum value, like the tables above.
+# "gpt-5.5-mini" was offered as the OpenAI coding/router default but is absent
+# from OpenAI's /v1/models and 404s on both endpoints.
+RETIRED_DIRECT_MODELS: dict[str, dict[str, str]] = {
+    "openai": {"gpt-5.5-mini": "gpt-5.4-mini"},
+}
+
+
+def current_direct_model(provider: str, model: str | None) -> str | None:
+    """``model`` for ``provider``, with a retired id swapped for its replacement."""
+    if model is None:
+        return None
+    return RETIRED_DIRECT_MODELS.get(provider, {}).get(model, model)
+
+
 # Reasoning-effort capability for direct (BYOK) provider models. minds-cloud
 # advertises its levels live via MindsHub's `/v1/models`; direct Anthropic/OpenAI
 # have no such endpoint, so the levels are hand-maintained here. Keyed by exact
@@ -138,16 +157,38 @@ RECOMMENDED_PAIR: dict[str, tuple[str, ...]] = {
 # "max" is supported on Opus 4.6+ and Sonnet 4.6 (not Haiku/older Sonnets);
 # "xhigh" was added in Opus 4.7, so only Opus 4.7/4.8 carry it. Haiku 4.5 has no
 # effort support and is intentionally absent.
+#
+# OpenAI: the GPT-5.x models reject "minimal" on both endpoints and accept
+# none/low/medium/high/xhigh. gpt-5.5 defaults to medium, gpt-5.4-mini to none.
 DIRECT_EFFORT_CATALOG: dict[str, dict] = {
     "claude-opus-4-8":   {"efforts": ["low", "medium", "high", "xhigh", "max"], "default": "high"},
     "claude-opus-4-7":   {"efforts": ["low", "medium", "high", "xhigh", "max"], "default": "high"},
     "claude-opus-4-6":   {"efforts": ["low", "medium", "high", "max"], "default": "high"},
     "claude-sonnet-4-6": {"efforts": ["low", "medium", "high", "max"], "default": "high"},
-    "gpt-5.5":      {"efforts": ["minimal", "low", "medium", "high"], "default": "medium"},
-    "gpt-5.5-mini": {"efforts": ["minimal", "low", "medium", "high"], "default": "medium"},
+    "gpt-5.5":      {"efforts": ["none", "low", "medium", "high", "xhigh"], "default": "medium"},
+    "gpt-5.4-mini": {"efforts": ["none", "low", "medium", "high", "xhigh"], "default": "none"},
     "o3":      {"efforts": ["low", "medium", "high"], "default": "medium"},
     "o4-mini": {"efforts": ["low", "medium", "high"], "default": "medium"},
 }
+
+# A level a provider stopped accepting, mapped to the one that replaced it.
+# OpenAI's documented successor to "minimal" is "none".
+RETIRED_EFFORTS: dict[str, str] = {"minimal": "none"}
+
+
+def supported_direct_effort(model: str | None, effort: str | None) -> str | None:
+    """``effort`` as ``model`` accepts it, per ``DIRECT_EFFORT_CATALOG``.
+
+    A level the model lists passes through. A retired level becomes its
+    successor if the model lists that, and anything else the model does not
+    list is dropped, so the call runs at the model's own default instead of
+    being rejected. A model the catalog does not describe is left alone.
+    """
+    entry = DIRECT_EFFORT_CATALOG.get(model or "")
+    if entry is None or not effort or effort in entry["efforts"]:
+        return effort
+    successor = RETIRED_EFFORTS.get(effort)
+    return successor if successor in entry["efforts"] else None
 
 
 # ── Environment-aware MindsHub URLs ─────────────────────────────────
