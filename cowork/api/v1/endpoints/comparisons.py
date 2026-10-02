@@ -33,7 +33,11 @@ router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 _SIDE_LABEL = r"^[ab]$"
 
 
-def _response(service: ComparisonService, comparison: Comparison) -> dict:
+def _response(service: ComparisonService, comparison: Comparison, continued: dict | None = None) -> dict:
+    """`continued`: `service.continued_sides` for a page that holds this
+    comparison, so a list reads it once rather than per comparison."""
+    if continued is None:
+        continued = service.continued_sides([comparison])
     verdicts = sorted(comparison.verdicts, key=lambda v: v.turn_index)
     return ComparisonResponse.serialize({
         "id": comparison.id,
@@ -51,8 +55,8 @@ def _response(service: ComparisonService, comparison: Comparison) -> dict:
                 "turn_count": service.turn_count(side),
                 "continued_at": side.continued_at,
                 "continued_turn_count": side.continued_turn_count,
-                "carry_incomplete": side.carry_incomplete,
-                "continued_project_id": service.continued_project_id(side),
+                "carry_incomplete": continued[side.id].carry_incomplete if side.id in continued else False,
+                "continued_project_id": continued[side.id].project_id if side.id in continued else None,
                 "usage": side.usage_snapshot,
             }
             for side in sorted(comparison.sides, key=lambda s: s.label)
@@ -76,8 +80,10 @@ def list_comparisons(scoped: ScopedSessionDep, limit: int = 50, offset: int = 0)
     offset = max(0, offset)
     # One past the page says whether there is another, without a count.
     page = service.list_comparisons(limit=limit + 1, offset=offset)
+    shown = page[:limit]
+    continued = service.continued_sides(shown)
     return {
-        "comparisons": [_response(service, c) for c in page[:limit]],
+        "comparisons": [_response(service, c, continued) for c in shown],
         "hasMore": len(page) > limit,
     }
 

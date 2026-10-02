@@ -28,6 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
+from sqlalchemy.orm import defer
+
 from cowork.common.paths import (
     O_NOFOLLOW,
     PinnedDir,
@@ -37,7 +39,9 @@ from cowork.common.paths import (
     dir_open,
     dir_scandir,
     dir_unlink,
+    dir_rename,
     open_pinned_child,
+    opened_subdir_nofollow,
     pinned_dir,
 )
 from cowork.db.scoped import ScopedSession, TenantScope
@@ -113,6 +117,12 @@ class ContinuedSide:
 
 
 @dataclass(frozen=True)
+class ContinuedState:
+    carry_incomplete: bool
+    project_id: UUID | None
+
+
+@dataclass(frozen=True)
 class SideSpec:
     model: str
     reasoning_effort: str | None = None
@@ -134,7 +144,12 @@ class ComparisonService:
     def list_comparisons(self, limit: int = 50, offset: int = 0) -> list[Comparison]:
         return list(
             self.session.exec(
-                self._own().order_by(Comparison.created_at.desc(), Comparison.id).offset(offset).limit(limit)
+                self._own()
+                # Only Continue reads it, and it can hold thousands of entries.
+                .options(defer(Comparison.copied_files))
+                .order_by(Comparison.created_at.desc(), Comparison.id)
+                .offset(offset)
+                .limit(limit)
             ).all()
         )
 
@@ -183,15 +198,38 @@ class ComparisonService:
             return min(count, side.continued_turn_count)
         return count
 
-    def continued_project_id(self, side: ComparisonSide) -> UUID | None:
-        """The project a continued side's task is in: where carrying the rest
-        of its work must go."""
-        if side.continued_at is None:
-            return None
-        conversation = self.session.exec(
-            self.session.select(Conversation).where(Conversation.id == side.conversation_id)
-        ).first()
-        return conversation.project_id if conversation is not None else None
+    def continued_sides(self, comparisons: list[Comparison]) -> dict[UUID, ContinuedState]:
+        """For each continued side, by side id: whether some of its work is
+        still in its sandbox, and the project its task is in now (where
+        carrying the rest must go). Two queries however many comparisons.
+
+        A continued side's sandbox outlives Continue only when something could
+        not be carried, so the sandbox still being there is the answer."""
+        continued = [side for c in comparisons for side in c.sides if side.continued_at is not None]
+        if not continued:
+            return {}
+        sandbox_ids = {
+            project.id
+            for project in self.session.exec(
+                self.session.select(Project).where(Project.id.in_([side.project_id for side in continued]))
+            ).all()
+            if is_comparison_sandbox(project.name)
+        }
+        task_projects = {
+            conversation.id: conversation.project_id
+            for conversation in self.session.exec(
+                self.session.select(Conversation).where(
+                    Conversation.id.in_([side.conversation_id for side in continued])
+                )
+            ).all()
+        }
+        return {
+            side.id: ContinuedState(
+                carry_incomplete=side.project_id in sandbox_ids,
+                project_id=task_projects.get(side.conversation_id),
+            )
+            for side in continued
+        }
 
     def turn_starts(self, side: ComparisonSide) -> list[datetime]:
         """When each of the side's turns started: its user messages, in order.
@@ -258,14 +296,11 @@ class ComparisonService:
             # model. The source project's name keeps the agent's framing the
             # same as in the real project.
             sandbox_label = display_label(source) if source else title
+            org_mode = self.session.scope.org_mode
+            manifests: list[dict[str, str]] = []
             for label, spec in zip(SIDE_LABELS, sides):
                 sandbox = projects.create_comparison_sandbox(sandbox_label)
                 created.append(sandbox)
-                copied: dict[str, str] = {}
-                if source is not None:
-                    copy_project_files(
-                        Path(source.path), Path(sandbox.path), org_mode=self.session.scope.org_mode, manifest=copied
-                    )
                 conversation = Conversation(
                     topic=title,
                     project_id=sandbox.id,
@@ -275,6 +310,12 @@ class ComparisonService:
                 )
                 self.session.add(conversation)
                 self.session.flush()
+                if source is not None and org_mode:
+                    seed_hosted_side(Path(source.path), Path(sandbox.path), conversation.id)
+                elif source is not None:
+                    copied: dict[str, str] = {}
+                    copy_project_files(Path(source.path), Path(sandbox.path), org_mode=False, manifest=copied)
+                    manifests.append(copied)
                 comparison.sides.append(
                     ComparisonSide(
                         label=label,
@@ -282,9 +323,15 @@ class ComparisonService:
                         reasoning_effort=spec.reasoning_effort,
                         project_id=sandbox.id,
                         conversation_id=conversation.id,
-                        copied_files=copied,
                     )
                 )
+            if manifests:
+                # A file that changed between the two copies is in neither
+                # side's manifest, so Continue counts it as the side's work.
+                first, *rest = manifests
+                comparison.copied_files = {
+                    path: digest for path, digest in first.items() if all(m.get(path) == digest for m in rest)
+                }
             self.session.add(comparison)
             self.session.commit()
         except Exception:
@@ -326,22 +373,17 @@ class ComparisonService:
         side row stays, with the message count at the moment of continuing, so
         the comparison keeps showing what was compared.
 
-        When some of the work could not be carried, the sandbox is kept and
-        asking again, into the same project, carries the rest.
+        When some of the work could not be carried (an artifact that would
+        not move included), the sandbox is kept and asking again, into the same
+        project, carries the rest.
         """
         from cowork.services.conversations import ConversationService
-        from cowork.services.task_objects import TaskObjectService
         from cowork.streaming.registry import registry
 
         comparison = self.get_comparison(comparison_id)
         side = self.side(comparison, label)
         kept_sandbox = self._kept_sandbox(side) if side.continued_at is not None else None
         if side.continued_at is not None and kept_sandbox is None:
-            if side.carry_incomplete:
-                # The sandbox went some other way; there is nothing left to offer.
-                side.carry_incomplete = False
-                self.session.add(side)
-                self.session.commit()
             raise ComparisonConflictError("This side was already continued")
         destination = ProjectService(self.session).get_project(destination_project_id)
         if is_comparison_sandbox(destination.name):
@@ -364,19 +406,11 @@ class ComparisonService:
         emptied_sandbox = None
         carried_all = True
         if source is not None and source.id != destination.id:
-            TaskObjectService(self.session).relocate_to_project(conversation, source, destination)
-            carried_all = _carry_side_work(
-                side,
-                sandbox=Path(source.path),
-                destination=Path(destination.path),
-                folder_name=_carried_folder_name(comparison.title, model_label or side.model),
-                org_mode=self.session.scope.org_mode,
-            )
+            carried_all = self._carry(side, comparison, conversation, source, destination, model_label)
             if carried_all and is_comparison_sandbox(source.name):
                 emptied_sandbox = source
         conversation = conversations.update_conversation(conversation.id, project_id=destination.id)
 
-        side.carry_incomplete = not carried_all
         side.continued_turn_count = turn_count
         side.continued_at = datetime.now(timezone.utc)
         self.session.add(side)
@@ -409,19 +443,37 @@ class ComparisonService:
     ) -> ContinuedSide:
         if conversation.project_id != destination.id:
             raise ComparisonConflictError("This side was already continued into another project")
-        carried_all = _carry_side_work(
-            side,
-            sandbox=Path(sandbox.path),
-            destination=Path(destination.path),
-            folder_name=_carried_folder_name(comparison.title, model_label or side.model),
-            org_mode=self.session.scope.org_mode,
-        )
-        side.carry_incomplete = not carried_all
+        carried_all = self._carry(side, comparison, conversation, sandbox, destination, model_label)
         self.session.add(side)
         self.session.commit()
         if carried_all:
             self._remove_sandbox(sandbox)
         return ContinuedSide(conversation=conversation, carried_all=carried_all)
+
+    def _carry(
+        self,
+        side: ComparisonSide,
+        comparison: Comparison,
+        conversation: Conversation,
+        sandbox: Project,
+        destination: Project,
+        model_label: str | None,
+    ) -> bool:
+        """Move the side's artifacts and carry its other work; True when
+        nothing is left in the sandbox that the task still needs. An artifact
+        whose move failed is still there, and is moved by the next carry."""
+        from cowork.services.task_objects import TaskObjectService
+
+        relocation = TaskObjectService(self.session).relocate_artifacts(conversation, sandbox, destination)
+        work_carried = _carry_side_work(
+            side,
+            sandbox=Path(sandbox.path),
+            destination=Path(destination.path),
+            folder_name=_carried_folder_name(comparison.title, model_label or side.model),
+            org_mode=self.session.scope.org_mode,
+            copied=comparison.copied_files or {},
+        )
+        return work_carried and relocation.left == 0
 
     def _remove_sandbox(self, sandbox: Project) -> None:
         _release_project_runtime(sandbox.path)
@@ -482,7 +534,13 @@ def _carried_folder_name(title: str, model_label: str) -> str:
 
 
 def _carry_side_work(
-    side: ComparisonSide, *, sandbox: Path, destination: Path, folder_name: str, org_mode: bool
+    side: ComparisonSide,
+    *,
+    sandbox: Path,
+    destination: Path,
+    folder_name: str,
+    org_mode: bool,
+    copied: dict[str, str] | None = None,
 ) -> bool:
     """Bring what a continued side worked on into the real project.
 
@@ -495,49 +553,62 @@ def _carry_side_work(
     already there.
 
     Desktop: a task works in the project's own folder, and the sandbox also
-    holds the copy of the source project the comparison started from. Only
-    what the side created or changed is copied, into one folder named for the
-    comparison and the side, so nothing in the real project is overwritten.
+    holds the copy of the source project the comparison started from (`copied`,
+    its files' SHA-256 by relative path). Only what the side created or changed
+    is copied, into one folder named for the comparison and the side, so
+    nothing in the real project is overwritten.
 
     True when everything was carried, so the sandbox holds nothing the task
     still needs. The folder used is recorded on the side, so carrying again
     after a partial carry finishes the same folder.
     """
     if org_mode:
-        workspace = sandbox / "conversations" / str(side.conversation_id)
-        target = destination / "conversations" / str(side.conversation_id)
-        if not workspace.exists():
-            return True
-        if workspace.is_symlink() or not workspace.is_dir() or target.is_symlink():
-            return False
-        if target.exists():
-            if not target.is_dir():
-                return False
-            try:
-                merged = copy_side_changes(
-                    workspace, target.parent, target.name, copied={}, into=target.name, agent_state=True
-                )
-            except OSError:
-                logger.exception("Could not merge a continued side's workspace into its project")
-                return False
-            return merged.complete
-        try:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            os.rename(workspace, target)
-        except OSError:
-            logger.exception("Could not move a continued side's workspace into its project")
-            return False
-        return True
+        return _carry_hosted_workspace(str(side.conversation_id), sandbox=sandbox, destination=destination)
     try:
-        result = copy_side_changes(
-            sandbox, destination, folder_name, copied=side.copied_files or {}, into=side.carried_folder
-        )
+        result = copy_side_changes(sandbox, destination, folder_name, copied=copied or {}, into=side.carried_folder)
     except OSError:
         logger.exception("Could not copy a continued side's work into its project")
         return False
     if result.folder is not None:
         side.carried_folder = result.folder
     return result.complete
+
+
+def _carry_hosted_workspace(conversation: str, *, sandbox: Path, destination: Path) -> bool:
+    """Move `conversations/<id>` from the sandbox into the destination, or
+    merge it into the one already there. Both `conversations` folders are
+    opened without following a link, and every step after is relative to them,
+    so nothing on either side can redirect the move."""
+    try:
+        with opened_subdir_nofollow(sandbox, "conversations") as source:
+            try:
+                st = dir_lstat(source, conversation)
+            except FileNotFoundError:
+                return True
+            if not stat_module.S_ISDIR(st.st_mode):
+                return False
+            with opened_subdir_nofollow(destination, "conversations", create=True) as target:
+                try:
+                    existing = dir_lstat(target, conversation)
+                except FileNotFoundError:
+                    dir_rename(source, conversation, target, conversation)
+                    return True
+                if not stat_module.S_ISDIR(existing.st_mode):
+                    return False
+                workspace = open_pinned_child(source, conversation)
+                try:
+                    merged = _copy_changes(
+                        workspace, target, conversation, copied={}, into=conversation, agent_state=True
+                    )
+                finally:
+                    workspace.close()
+                return merged.complete
+    except FileNotFoundError:
+        # No `conversations` in the sandbox: the side never ran a turn.
+        return True
+    except OSError:
+        logger.exception("Could not carry a continued side's workspace into its project")
+        return False
 
 
 @dataclass
@@ -573,19 +644,35 @@ def copy_side_changes(
     unless `agent_state`, for a task's own workspace, where `.anton` holds its
     agent state; its scratchpad environments are still left out.
     """
-    changed, examined_all = _changed_files(sandbox_root, copied, agent_state=agent_state)
+    with pinned_dir(sandbox_root) as src_root, pinned_dir(destination_root) as dst_parent:
+        return _copy_changes(src_root, dst_parent, folder_name, copied=copied, into=into, agent_state=agent_state)
+
+
+def _copy_changes(
+    src_root: PinnedDir,
+    dst_parent: PinnedDir,
+    folder_name: str,
+    *,
+    copied: dict[str, str],
+    into: str | None,
+    agent_state: bool,
+) -> CarryResult:
+    changed, examined_all = _changed_files(src_root, copied, agent_state=agent_state)
     if not changed:
         return CarryResult(folder=into, files=0, complete=examined_all)
-    if into is not None and _is_plain_dir(destination_root / into):
+    if into is not None and _is_plain_child_dir(dst_parent, into):
         name = into
     else:
         name, n = folder_name, 2
-        while (destination_root / name).exists():
+        while _child_exists(dst_parent, name):
             name, n = f"{folder_name} {n}", n + 1
-        (destination_root / name).mkdir()
+        dir_mkdir(dst_parent, name)
     budget = _CopyBudget()
     failed = 0
-    with pinned_dir(sandbox_root) as src_root, pinned_dir(destination_root / name) as dst_root:
+    # Opened without following a link, like every step below it: the folder
+    # was checked through its parent's handle, and this open keeps that.
+    dst_root = open_pinned_child(dst_parent, name)
+    try:
         for rel, digest in changed.items():
             parts = rel.split("/")
             src_dirs, dst_dirs = [], []
@@ -611,14 +698,24 @@ def copy_side_changes(
             finally:
                 for d in reversed(src_dirs + dst_dirs):
                     d.close()
+    finally:
+        dst_root.close()
     return CarryResult(folder=name, files=budget.files, complete=examined_all and failed == 0)
 
 
-def _is_plain_dir(path: Path) -> bool:
+def _is_plain_child_dir(parent: PinnedDir, name: str) -> bool:
     try:
-        return stat_module.S_ISDIR(path.lstat().st_mode)
+        return stat_module.S_ISDIR(dir_lstat(parent, name).st_mode)
     except OSError:
         return False
+
+
+def _child_exists(parent: PinnedDir, name: str) -> bool:
+    try:
+        dir_lstat(parent, name)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def _carry_file(src: PinnedDir, dst: PinnedDir, name: str, digest: str | None, budget: _CopyBudget) -> bool:
@@ -691,7 +788,7 @@ def _publish_by_exclusive_copy(dst: PinnedDir, temp: str, name: str) -> bool:
 
 
 def _changed_files(
-    sandbox_root: Path, copied: dict[str, str], *, agent_state: bool = False
+    root: PinnedDir, copied: dict[str, str], *, agent_state: bool = False
 ) -> tuple[dict[str, str | None], bool]:
     """Sandbox files whose content is not in `copied`, by relative path, with
     their SHA-256 (None when unreadable); and whether every entry could be
@@ -738,8 +835,7 @@ def _changed_files(
                 if digest is None or copied.get(path) != digest:
                     changed[path] = digest
 
-    with pinned_dir(sandbox_root) as root:
-        walk(root, "", 0)
+    walk(root, "", 0)
     return changed, examined_all
 
 
@@ -840,8 +936,29 @@ class _CopyBudget:
             )
 
 
+def seed_hosted_side(source_root: Path, sandbox_root: Path, conversation_id: UUID) -> None:
+    """Copy a source project into a hosted side's sandbox.
+
+    A hosted turn sees only its conversation workspace,
+    `<sandbox>/conversations/<id>`, so the project's files go there, where the
+    side can read them. Its instructions and memory stay at the sandbox root,
+    where each turn stages them from (`stage_project_instructions`).
+    """
+    copy_project_files(source_root, sandbox_root, org_mode=True, parts="agent")
+    budget = _CopyBudget()
+    with pinned_dir(source_root) as src, opened_subdir_nofollow(
+        sandbox_root, "conversations", str(conversation_id), create=True
+    ) as workspace:
+        _copy_children(src, workspace, budget, depth=0, top_level=True, org_mode=True, rel=None, parts="files")
+
+
 def copy_project_files(
-    source_root: Path, dest_root: Path, *, org_mode: bool, manifest: dict[str, str] | None = None
+    source_root: Path,
+    dest_root: Path,
+    *,
+    org_mode: bool,
+    manifest: dict[str, str] | None = None,
+    parts: str = "all",
 ) -> int:
     """Copy a project's files into a sandbox. Returns the number of files copied.
 
@@ -857,16 +974,19 @@ def copy_project_files(
 
     `manifest`, when given, is filled with each copied file's relative path
     and SHA-256 (the `.anton` files it keeps are not listed).
+
+    `parts`: "all", "agent" (only the kept `.anton` state) or "files"
+    (everything but it).
     """
     budget = _CopyBudget(manifest=manifest)
     with pinned_dir(source_root) as src, pinned_dir(dest_root) as dst:
-        _copy_children(src, dst, budget, depth=0, top_level=True, org_mode=org_mode, rel="")
+        _copy_children(src, dst, budget, depth=0, top_level=True, org_mode=org_mode, rel="", parts=parts)
     return budget.files
 
 
 def _copy_children(
     src: PinnedDir, dst: PinnedDir, budget: _CopyBudget, *, depth: int, top_level: bool, org_mode: bool,
-    rel: str | None,
+    rel: str | None, parts: str = "all",
 ) -> None:
     """``rel`` is this directory's path within the copy, or None where files are
     not recorded (the kept ``.anton`` state)."""
@@ -876,6 +996,8 @@ def _copy_children(
         names = sorted(entry.name for entry in scan)
     for name in names:
         if top_level and org_mode and name == "conversations":
+            continue
+        if top_level and parts != "all" and (name == ".anton") != (parts == "agent"):
             continue
         try:
             st = dir_lstat(src, name)

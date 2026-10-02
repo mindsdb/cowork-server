@@ -1,13 +1,13 @@
 """Model comparisons: two sides of one task, and the user's verdicts.
 
-Revision ID: a7c4e9b2d1f3
+Revision ID: a7c3e5f9b2d4
 Revises: 3e4b5f7586d3
 """
 
 from alembic import op
 import sqlalchemy as sa
 
-revision = "a7c4e9b2d1f3"
+revision = "a7c3e5f9b2d4"
 down_revision = "3e4b5f7586d3"
 branch_labels = None
 depends_on = None
@@ -39,6 +39,7 @@ def upgrade() -> None:
             sa.Column("title", sa.String(255), nullable=False),
             sa.Column("source_project_id", sa.Uuid(), nullable=True),
             sa.Column("source_project_label", sa.String(255), nullable=True),
+            sa.Column("copied_files", sa.JSON(), nullable=True),
             *_ownership(),
             sa.PrimaryKeyConstraint("id"),
         )
@@ -56,6 +57,8 @@ def upgrade() -> None:
             sa.Column("conversation_id", sa.Uuid(), nullable=False),
             sa.Column("continued_at", sa.DateTime(timezone=True), nullable=True),
             sa.Column("continued_turn_count", sa.Integer(), nullable=True),
+            sa.Column("carried_folder", sa.String(255), nullable=True),
+            sa.Column("usage_snapshot", sa.JSON(), nullable=True),
             *_ownership(),
             sa.ForeignKeyConstraint(["comparison_id"], ["comparisons.id"]),
             sa.PrimaryKeyConstraint("id"),

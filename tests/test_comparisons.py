@@ -234,6 +234,82 @@ def test_create_from_a_project_copies_its_files_into_both_sides(client, tmp_path
     assert (root / ".anton" / "artifacts" / "live-report" / ".published.json").is_file()
 
 
+@pytest.fixture()
+def hosted(tmp_path, monkeypatch):
+    """An org-mode session on its own in-memory database, as a hosted member."""
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(tmp_path))
+    from cowork.common.settings.app_settings import get_app_settings
+
+    get_app_settings.cache_clear()
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, SQLModel, create_engine
+
+    from cowork.db.scoped import TenantScope
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    SQLModel.metadata.create_all(engine)
+    org = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
+    session = ScopedSession(Session(engine), TenantScope(True, org, "alice"))
+    try:
+        yield SimpleNamespace(session=session, org=org)
+    finally:
+        session.close()
+        get_app_settings.cache_clear()
+
+
+def test_a_hosted_side_reads_the_source_projects_files_from_its_own_workspace(hosted, tmp_path):
+    from cowork.services.comparisons import ComparisonService, SideSpec
+    from cowork.services.files import stage_project_instructions
+
+    source_root = tmp_path / "source"
+    _seed_source(source_root)
+    source = Project(name="source", path=str(source_root))
+    hosted.session.add(source)
+    hosted.session.commit()
+
+    comparison = ComparisonService(hosted.session).create_comparison(
+        title="t", sides=[SideSpec("kimi"), SideSpec("qwen")], source_project_id=source.id
+    )
+
+    for side in comparison.sides:
+        sandbox = Path(hosted.session.get(Project, side.project_id).path)
+        # A hosted turn sees only this folder.
+        workspace = sandbox / "conversations" / str(side.conversation_id)
+        assert (workspace / "data" / "sales.csv").read_text() == "region,total\nwest,10\n"
+        assert (workspace / "notes.md").is_file()
+        assert not (sandbox / "data").exists()
+        # Instructions stay at the root, where each turn stages them from.
+        assert stage_project_instructions(sandbox, side.conversation_id)
+        assert (workspace / ".anton" / "anton.md").read_text() == "Always use EUR."
+        assert (sandbox / ".anton" / "memory" / "rules.md").is_file()
+        assert not (workspace / ".anton" / "memory").exists()
+    # A hosted carry moves the workspace whole, so nothing is hashed or kept.
+    assert comparison.copied_files is None
+
+
+def test_a_desktop_comparison_keeps_one_manifest_and_the_history_list_does_not_load_it(client):
+    import sqlalchemy as sa
+
+    from cowork.models.comparison import Comparison
+    from cowork.services.comparisons import ComparisonService
+
+    source = _real_project(client, "manifest-source")
+    _seed_source(Path(source["path"]))
+    body = _create(client, source_project_id=source["id"]).json()
+
+    session = get_open_session()
+    try:
+        comparison = session.get(Comparison, UUID(body["id"]))
+        assert set(comparison.copied_files) == {"data/sales.csv", "notes.md"}
+        session.expunge_all()
+        listed = [c for c in ComparisonService(ScopedSession(session, LOCAL_SCOPE)).list_comparisons(limit=200) if c.id == comparison.id]
+        assert "copied_files" in sa.inspect(listed[0]).unloaded
+    finally:
+        session.close()
+
+
 def test_copy_skips_member_workspaces_only_on_a_hosted_deployment(tmp_path):
     from cowork.services.comparisons import copy_project_files
 
@@ -439,6 +515,48 @@ def test_continue_brings_what_the_side_made_or_changed_into_the_project(client, 
     assert not sandbox.exists()
 
 
+def _make_artifact(project_root: Path, slug: str, conversation_id: str) -> Path:
+    import json
+
+    folder = project_root / ".anton" / "artifacts" / slug
+    folder.mkdir(parents=True)
+    (folder / "metadata.json").write_text(json.dumps({"provenance": [{"conversation": conversation_id}]}))
+    (folder / "index.html").write_text("<h1>report</h1>")
+    return folder
+
+
+def test_an_artifact_that_cannot_be_moved_keeps_the_sandbox_and_a_retry_moves_it(client, monkeypatch):
+    from cowork.services import task_objects
+
+    body = _create(client).json()
+    a = body["sides"][0]
+    sandbox = Path(_project(a["projectId"]).path)
+    _make_artifact(sandbox, "report", a["conversationId"])
+    target = _real_project(client, "artifact-target")
+    url = f"/api/v1/comparisons/{body['id']}/sides/a/continue"
+    real_move = task_objects.shutil.move
+
+    def refuse(src, dst):
+        raise PermissionError(13, "Permission denied", src)
+
+    monkeypatch.setattr(task_objects.shutil, "move", refuse)
+    first = client.post(url, json={"projectId": target["id"]})
+
+    assert first.status_code == 200, first.text
+    assert first.json()["carriedAll"] is False
+    assert (sandbox / ".anton" / "artifacts" / "report" / "index.html").is_file()
+    assert _project(a["projectId"]) is not None
+    assert client.get(f"/api/v1/comparisons/{body['id']}").json()["sides"][0]["carryIncomplete"] is True
+
+    monkeypatch.setattr(task_objects.shutil, "move", real_move)
+    again = client.post(url, json={"projectId": target["id"]})
+
+    assert again.json()["carriedAll"] is True
+    assert (Path(target["path"]) / ".anton" / "artifacts" / "report" / "index.html").is_file()
+    assert _project(a["projectId"]) is None
+    assert client.get(f"/api/v1/comparisons/{body['id']}").json()["sides"][0]["carryIncomplete"] is False
+
+
 def test_continue_with_nothing_new_makes_no_folder(client):
     source = _real_project(client, "untouched-source")
     _seed_source(Path(source["path"]))
@@ -639,6 +757,32 @@ def test_a_partly_carried_side_says_so_and_where_a_retry_goes(client, monkeypatc
     assert sides() == {"a": (False, target["id"]), "b": (False, None)}
 
 
+def test_the_history_reads_continued_sides_in_one_query_per_table_however_many(client):
+    from sqlalchemy import event
+
+    for i in range(3):
+        body = _create(client, title=f"page {i}").json()
+        target = _real_project(client, f"page-target-{i}")
+        client.post(f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": target["id"]})
+    session = get_open_session()
+    engine = session.get_bind()
+    session.close()
+    statements: list[str] = []
+
+    def record(conn, cursor, statement, *args):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        page = client.get("/api/v1/comparisons/?limit=200").json()["comparisons"]
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    assert sum(1 for c in page for side in c["sides"] if side["continuedAt"]) >= 3
+    assert sum(1 for s in statements if "FROM projects" in s) == 1
+    assert sum(1 for s in statements if "FROM conversations" in s) == 1
+
+
 def test_a_fully_carried_side_is_not_marked_incomplete(client):
     body = _create(client).json()
     (Path(_project(body["sides"][0]["projectId"]).path) / "out.csv").write_text("x")
@@ -756,7 +900,7 @@ def test_a_folder_whose_listing_fails_keeps_the_sandbox(tmp_path, monkeypatch):
 def test_a_hosted_workspace_that_is_a_link_is_not_followed(tmp_path):
     from cowork.services.comparisons import _carry_side_work
 
-    side = SimpleNamespace(conversation_id=uuid4(), copied_files={})
+    side = SimpleNamespace(conversation_id=uuid4())
     sandbox, destination, elsewhere = tmp_path / "sandbox", tmp_path / "project", tmp_path / "elsewhere"
     (sandbox / "conversations").mkdir(parents=True)
     elsewhere.mkdir()
@@ -769,10 +913,67 @@ def test_a_hosted_workspace_that_is_a_link_is_not_followed(tmp_path):
     assert (elsewhere / "secret.txt").read_text() == "not the side's"
 
 
+def test_a_hosted_sandbox_whose_conversations_folder_is_a_link_is_not_followed(tmp_path):
+    from cowork.services.comparisons import _carry_side_work
+
+    side = SimpleNamespace(conversation_id=uuid4())
+    sandbox, destination, elsewhere = tmp_path / "sandbox", tmp_path / "project", tmp_path / "elsewhere"
+    sandbox.mkdir()
+    destination.mkdir()
+    (elsewhere / str(side.conversation_id)).mkdir(parents=True)
+    (elsewhere / str(side.conversation_id) / "secret.txt").write_text("not the side's")
+    (sandbox / "conversations").symlink_to(elsewhere)
+
+    assert _carry_side_work(side, sandbox=sandbox, destination=destination, folder_name="x", org_mode=True) is False
+    assert (elsewhere / str(side.conversation_id) / "secret.txt").read_text() == "not the side's"
+    assert not (destination / "conversations" / str(side.conversation_id)).exists()
+
+
+def test_a_hosted_project_whose_conversations_folder_is_a_link_is_not_followed(tmp_path):
+    from cowork.services.comparisons import _carry_side_work
+
+    side = SimpleNamespace(conversation_id=uuid4())
+    sandbox, destination, elsewhere = tmp_path / "sandbox", tmp_path / "project", tmp_path / "elsewhere"
+    (sandbox / "conversations" / str(side.conversation_id)).mkdir(parents=True)
+    (sandbox / "conversations" / str(side.conversation_id) / "report.md").write_text("the side's")
+    destination.mkdir()
+    elsewhere.mkdir()
+    (destination / "conversations").symlink_to(elsewhere)
+
+    assert _carry_side_work(side, sandbox=sandbox, destination=destination, folder_name="x", org_mode=True) is False
+    assert list(elsewhere.iterdir()) == []
+    assert (sandbox / "conversations" / str(side.conversation_id) / "report.md").is_file()
+
+
+def test_a_carried_folder_swapped_for_a_link_before_it_is_opened_is_not_followed(tmp_path, monkeypatch):
+    import shutil
+
+    from cowork.services import comparisons
+
+    sandbox, destination, elsewhere = tmp_path / "s", tmp_path / "d", tmp_path / "elsewhere"
+    sandbox.mkdir()
+    destination.mkdir()
+    elsewhere.mkdir()
+    (sandbox / "out.csv").write_text("x")
+    real_budget = comparisons._CopyBudget
+
+    def swap_then_budget(*args, **kwargs):
+        # Between the folder being made and its open, something replaces it.
+        shutil.rmtree(destination / "F")
+        (destination / "F").symlink_to(elsewhere)
+        return real_budget(*args, **kwargs)
+
+    monkeypatch.setattr(comparisons, "_CopyBudget", swap_then_budget)
+
+    with pytest.raises(OSError):
+        comparisons.copy_side_changes(sandbox, destination, "F", copied={})
+    assert list(elsewhere.iterdir()) == []
+
+
 def test_a_hosted_workspace_already_in_the_project_is_merged_without_overwriting(tmp_path):
     from cowork.services.comparisons import _carry_side_work
 
-    side = SimpleNamespace(conversation_id=uuid4(), copied_files={})
+    side = SimpleNamespace(conversation_id=uuid4())
     sandbox, destination = tmp_path / "sandbox", tmp_path / "project"
     workspace = sandbox / "conversations" / str(side.conversation_id)
     (workspace / "out").mkdir(parents=True)
@@ -792,7 +993,7 @@ def test_a_hosted_workspace_already_in_the_project_is_merged_without_overwriting
 def test_a_hosted_merge_brings_the_sides_agent_state_but_not_its_scratchpad_environments(tmp_path):
     from cowork.services.comparisons import _carry_side_work
 
-    side = SimpleNamespace(conversation_id=uuid4(), copied_files={})
+    side = SimpleNamespace(conversation_id=uuid4())
     sandbox, destination = tmp_path / "sandbox", tmp_path / "project"
     workspace = sandbox / "conversations" / str(side.conversation_id)
     (workspace / ".anton" / "episodes").mkdir(parents=True)
@@ -831,7 +1032,7 @@ def test_a_desktop_carry_still_leaves_the_projects_agent_state_out(tmp_path):
 def test_a_hosted_target_that_is_not_a_folder_is_left_alone(tmp_path, kind):
     from cowork.services.comparisons import _carry_side_work
 
-    side = SimpleNamespace(conversation_id=uuid4(), copied_files={})
+    side = SimpleNamespace(conversation_id=uuid4())
     sandbox, destination, elsewhere = tmp_path / "sandbox", tmp_path / "project", tmp_path / "elsewhere"
     workspace = sandbox / "conversations" / str(side.conversation_id)
     workspace.mkdir(parents=True)
@@ -853,7 +1054,7 @@ def test_a_hosted_target_that_is_not_a_folder_is_left_alone(tmp_path, kind):
 def test_a_hosted_side_with_no_workspace_has_nothing_to_carry(tmp_path):
     from cowork.services.comparisons import _carry_side_work
 
-    side = SimpleNamespace(conversation_id=uuid4(), copied_files={})
+    side = SimpleNamespace(conversation_id=uuid4())
     (tmp_path / "sandbox").mkdir()
     (tmp_path / "project").mkdir()
 
@@ -887,7 +1088,7 @@ def test_a_side_whose_kept_sandbox_is_gone_stops_offering_the_rest(client, monke
 def test_a_hosted_merge_that_cannot_copy_everything_keeps_the_sandbox(tmp_path):
     from cowork.services.comparisons import _carry_side_work
 
-    side = SimpleNamespace(conversation_id=uuid4(), copied_files={})
+    side = SimpleNamespace(conversation_id=uuid4())
     sandbox, destination = tmp_path / "sandbox", tmp_path / "project"
     workspace = sandbox / "conversations" / str(side.conversation_id)
     workspace.mkdir(parents=True)
@@ -993,7 +1194,7 @@ def test_a_long_model_name_still_continues(client):
 def test_a_hosted_side_takes_its_whole_workspace_along(tmp_path):
     from cowork.services.comparisons import _carry_side_work
 
-    side = SimpleNamespace(conversation_id=uuid4(), copied_files={})
+    side = SimpleNamespace(conversation_id=uuid4())
     sandbox, destination = tmp_path / "sandbox", tmp_path / "project"
     workspace = sandbox / "conversations" / str(side.conversation_id)
     workspace.mkdir(parents=True)

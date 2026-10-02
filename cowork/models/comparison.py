@@ -28,6 +28,15 @@ class Comparison(BaseSQLModel, table=True):
     source_project_label: str | None = Field(
         default=None, max_length=255, description="That project's name when the comparison started"
     )
+    #: Relative path -> SHA-256 of each file copied from the source project,
+    #: so a desktop Continue can tell what a side created or changed from what
+    #: it was given. Both sides start from the same copy, so it is kept once;
+    #: NULL on a hosted deployment, which carries a side's workspace whole.
+    copied_files: dict | None = Field(
+        default=None,
+        sa_type=sa.JSON,  # type: ignore
+        description="Files copied into both sandboxes from the source project, by relative path and SHA-256",
+    )
     org_id: str | None = Field(default=None, index=True, max_length=36, description="Owning organization; NULL on local/desktop rows")
     created_by: str | None = Field(default=None, max_length=36, description="User who created the row; NULL on local/desktop rows")
 
@@ -61,24 +70,10 @@ class ComparisonSide(BaseSQLModel, table=True):
     continued_turn_count: int | None = Field(
         default=None, description="Turns the conversation had when it was continued; the comparison shows those"
     )
-    #: Relative path -> SHA-256 of each file copied from the source project, so
-    #: Continue can tell what the side created or changed from what it was given.
-    copied_files: dict | None = Field(
-        default=None,
-        sa_type=sa.JSON,  # type: ignore
-        description="Files copied into the sandbox from the source project, by relative path and SHA-256",
-    )
     #: The folder of the destination project a desktop Continue copied the
     #: side's work into, so carrying again after a partial carry finishes it.
     carried_folder: str | None = Field(
         default=None, max_length=255, description="Project folder the side's work was copied into on Continue"
-    )
-    #: Continue left some of the side's work in its sandbox, which is kept;
-    #: continuing again into the same project carries the rest.
-    carry_incomplete: bool = Field(
-        default=False,
-        sa_column_kwargs={"server_default": sa.false()},
-        description="Continue could not carry all of the side's work; its sandbox is kept for a retry",
     )
     #: The side's cost as last read from the gateway, so the history list can
     #: show it without a gateway read per row. Written by the usage route.
