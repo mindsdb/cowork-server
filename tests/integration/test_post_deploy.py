@@ -8,8 +8,8 @@ Skipped unless COWORK_BASE_URL is set, so a normal `pytest` run ignores them.
 The identity comes from auth, which provisions throwaway test users for CI.
 Permanent dev/staging POST to its internal endpoint with the provisioning
 secret; PR envs POST to /dev/mint-test-user/, which is mounted only where
-`ephemeral` is on and needs no secret. Prod uses a dedicated standing identity
-while its fixture password remains committed. Every source
+`ephemeral` is on and needs no secret. Prod uses a dedicated standing identity,
+because auth refuses to provision in production. Every source
 provides the user_id and organization_id these tests send as headers.
 
 The provisioning call uses auth's Service so it works both before and after

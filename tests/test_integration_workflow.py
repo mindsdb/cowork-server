@@ -42,8 +42,10 @@ def test_prod_standing_key_docs_require_authoritative_environment_guards() -> No
     """The workflow guard must not be presented as protection for the key."""
     normalized_readme = " ".join(README.split())
     for required in (
-        "Do not store or use `COWORK_TEST_API_KEY` yet",
-        "nonempty required-reviewer rule",
+        "The identity is a dedicated account, never a person's",
+        "Never add the address to the staff roster",
+        "organization's UUID as `/v1/authenticate/` returns it",
+        "can_admins_bypass: false",
         "only entry is the `main` branch",
         "Workflow code is therefore defense in depth, not the authority",
         "protected_branches: false",
