@@ -66,8 +66,14 @@ class TestWebSearchFlavorRouting:
 
         client = providers.build_llm_client()
 
-        assert client.planning_provider.native_web_tools() == WEB_TOOLS
-        assert client.coding_provider.native_web_tools() == WEB_TOOLS
+        # An anton without the Responses marker keeps chat.completions, where
+        # direct OpenAI has no native web tools.
+        from anton.core.llm.openai import OpenAIProvider
+
+        ready = getattr(OpenAIProvider, "RESPONSES_TRANSPORT_READY", False) is True
+        expected = WEB_TOOLS if ready else set()
+        assert client.planning_provider.native_web_tools() == expected
+        assert client.coding_provider.native_web_tools() == expected
 
     def test_openai_compatible_third_party_is_generic(self, monkeypatch):
         # A third-party openai-compatible endpoint has no native web search and

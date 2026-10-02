@@ -114,13 +114,20 @@ def test_openai_never_inherits_contaminated_base(build):
 
 
 def test_direct_openai_uses_the_responses_transport(build):
+    # Follows the installed anton: CI can run against an anton that predates
+    # the marker, where the generic flavor is the correct outcome (covered by
+    # the skew test below on every build).
+    ready = getattr(_RealOpenAIProvider, "RESPONSES_TRANSPORT_READY", False) is True
     settings = UserSettings(
         planning_provider=Provider.OPENAI,
         coding_provider=Provider.OPENAI,
         openai_api_key=SecretStr("sk-openai"),
     )
     _client, calls = build(settings)
-    assert all(kw["flavor"] == _RealOpenAIProvider.FLAVOR_OPENAI for kw in calls["openai"])
+    if ready:
+        assert all(kw["flavor"] == _RealOpenAIProvider.FLAVOR_OPENAI for kw in calls["openai"])
+    else:
+        assert all("flavor" not in kw for kw in calls["openai"])
 
 
 def test_direct_openai_stays_generic_on_an_anton_without_a_ready_transport(
