@@ -9,7 +9,7 @@ from cowork.handlers import jev_shadow
 
 def _settings(**overrides):
     fields = {
-        "jev_shadow_enabled": True,
+        "jev_enabled": True,
         "jev_shadow_model": "jev",
         "jev_shadow_timeout_seconds": 1.0,
         **overrides,
@@ -61,7 +61,7 @@ LLM_BLOCK = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "http
 @pytest.mark.asyncio
 async def test_probe_disabled_is_noop(monkeypatch):
     monkeypatch.setattr(jev_shadow.httpx, "AsyncClient", lambda **_: (_ for _ in ()).throw(AssertionError("must not call out")))
-    result = await jev_shadow.probe(messages=[], llm_block=LLM_BLOCK, settings=_settings(jev_shadow_enabled=False))
+    result = await jev_shadow.probe(messages=[], llm_block=LLM_BLOCK, settings=_settings(jev_enabled=False))
     assert result is None
 
 
@@ -76,7 +76,10 @@ async def test_probe_without_minted_credential_is_noop(monkeypatch):
 async def test_probe_success_extracts_choice_and_confidence(monkeypatch):
     body = {
         "model": "jev-1.13.0",
-        "answers": {"route": {"type": "choice", "choice": "needs_agent", "confidence": 0.87, "probabilities": {}}},
+        "answers": {"route": {
+            "type": "choice", "choice": "needs_agent", "confidence": 0.87,
+            "probabilities": {"needs_agent": 0.93, "answer_directly": 0.07},
+        }},
         "usage": {"input_tokens": 42, "output_tokens": 0},
     }
     captured = {}
@@ -89,6 +92,7 @@ async def test_probe_success_extracts_choice_and_confidence(monkeypatch):
 
     assert result["jev_choice"] == "needs_agent"
     assert result["jev_confidence"] == 0.87
+    assert result["jev_p_needs_agent"] == 0.93
     assert result["jev_model"] == "jev-1.13.0"
     assert isinstance(result["jev_ms"], int)
     assert captured["url"] == "https://minds.example/v1/decisions"
@@ -107,6 +111,9 @@ async def test_probe_success_extracts_choice_and_confidence(monkeypatch):
         {"choice": "needs_agent", "confidence": True},
         {"choice": "needs_agent", "confidence": float("inf")},
         {"choice": "needs_agent", "confidence": float("nan")},
+        {"choice": "needs_agent", "confidence": 0.5},
+        {"choice": "needs_agent", "confidence": 0.5, "probabilities": {"needs_agent": 1.5}},
+        {"choice": "needs_agent", "confidence": 0.5, "probabilities": {"needs_agent": True}},
     ],
 )
 @pytest.mark.asyncio
@@ -189,7 +196,10 @@ async def test_probe_enforces_a_hard_wall_clock_timeout(monkeypatch):
 
 _SUCCESS_BODY = {
     "model": "jev-1.13.0",
-    "answers": {"route": {"type": "choice", "choice": "needs_agent", "confidence": 0.9, "probabilities": {}}},
+    "answers": {"route": {
+        "type": "choice", "choice": "needs_agent", "confidence": 0.9,
+        "probabilities": {"needs_agent": 0.95, "answer_directly": 0.05},
+    }},
     "usage": {"input_tokens": 1, "output_tokens": 0},
 }
 
@@ -210,7 +220,7 @@ async def _probe_headers(monkeypatch, context):
 
 
 @pytest.mark.asyncio
-async def test_probe_attributes_its_trace_to_the_turn_it_shadows(monkeypatch):
+async def test_probe_attributes_its_trace_to_the_turn_it_routes(monkeypatch):
     """Without these headers the gateway stamps the probe
     origin:direct-api, indistinguishable from the user calling Jev directly."""
     import json
@@ -236,7 +246,7 @@ async def test_probe_attributes_its_trace_to_the_turn_it_shadows(monkeypatch):
     # conversation. The conversation id rides in the metadata instead.
     assert "Langfuse-Session-Id" not in headers
     # The probe's own tag, not the gate's: a probe trace must not read as a gate call.
-    assert headers["Langfuse-Tags"].split(",") == ["anton", "surface:web", jev_shadow.JEV_SHADOW_TAG]
+    assert headers["Langfuse-Tags"].split(",") == ["anton", "surface:web", jev_shadow.JEV_ROUTE_TAG]
     metadata = json.loads(headers["Langfuse-Metadata"])
     # harness is what flips the gateway's origin tag to origin:harness.
     assert metadata == {
@@ -269,3 +279,4 @@ async def test_probe_outside_a_turn_sends_only_its_credential_and_kind(monkeypat
     headers = await _probe_headers(monkeypatch, None)
 
     assert headers == {"Authorization": "Bearer turn-key", "X-Minds-Request-Kind": "probe"}
+
