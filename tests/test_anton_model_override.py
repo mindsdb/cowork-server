@@ -126,3 +126,33 @@ async def test_session_model_selection_reaches_provider_and_stays_per_turn(monke
                 client = config.llm_client
                 for provider in (client.planning_provider, client.coding_provider, client.router_provider):
                     await provider._client.close()
+
+
+@pytest.mark.asyncio
+async def test_web_flags_from_anton_settings_reach_the_session_config(monkeypatch):
+    """ANTON_WEB_FETCH_ENABLED / ANTON_WEB_SEARCH_ENABLED must reach
+    ChatSessionConfig, not just the AntonSettings object built alongside it."""
+    from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+    from cowork.db.session import get_open_session
+    from cowork.services.conversations import ConversationService
+
+    saved = UserSettings(
+        _env_file=None,
+        planning_provider=Provider.OPENAI,
+        coding_provider=Provider.OPENAI,
+        router_provider=Provider.OPENAI,
+        openai_api_key=SecretStr("test-only-key"),
+    )
+    monkeypatch.setattr("cowork.common.settings.user_settings.get_user_settings", lambda: saved)
+    monkeypatch.setattr(harness, "build_chat_session", lambda config: config)
+    monkeypatch.setattr("anton.core.datasources.data_vault.LocalDataVault", None)
+    monkeypatch.setenv("ANTON_SCRATCHPAD_PERSIST_SESSION", "false")
+    monkeypatch.setenv("ANTON_WEB_FETCH_ENABLED", "false")
+
+    with get_open_session() as db:
+        service = ConversationService(ScopedSession(db, LOCAL_SCOPE))
+        conversation = service.create_conversation(topic="WEB-FLAGS")
+        config, _, _ = await harness.AntonHarness()._build_chat_session(conversation, model=None)
+
+    assert config.web_fetch_enabled is False
+    assert config.web_search_enabled is True  # unset flag keeps its default

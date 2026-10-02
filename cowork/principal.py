@@ -41,6 +41,7 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp
 
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.user_settings import Provider, UserSettings, provider_api_key_str
 
 logger = logging.getLogger(__name__)
 
@@ -271,6 +272,19 @@ def hub_credential(request: Request | None) -> str:
     if get_app_settings().tenancy_mode != "org":
         return ""
     return caller_bearer(request)
+
+
+def minds_hub_configured(settings: UserSettings) -> bool:
+    """True when a MindsHub key resolves for ``settings``.
+
+    The local-mode gate for every outbound MindsHub call this server makes on
+    a self-hosted install: the hub routes (``hub_credential`` callers) and the
+    provider test routes both ask this before forwarding or falling back, so a
+    desktop that was never signed in and has no key configured never reaches
+    MindsHub. Org mode does not call this: MindsHub is its exclusive provider,
+    so the check has nothing to add there.
+    """
+    return bool(provider_api_key_str(settings, Provider.MINDS_CLOUD))
 
 
 def caller_bearer(request: Request | None) -> str:
