@@ -178,6 +178,90 @@ def surface_kwarg(config_cls) -> dict[str, str]:
         return {}
 
 
+def _uuid_or_none(value) -> str | None:
+    """Canonical lowercase UUID, or None. The only shape an account id may take
+    on its way to analytics: anything else (an email being the likely mistake)
+    would reach PostHog as a distinct_id."""
+    from uuid import UUID
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return str(UUID(value.strip()))
+    except ValueError:
+        return None
+
+
+def account_ids(user_id, org_id) -> dict[str, str]:
+    """``{"user_id", "organization_id"}`` for whichever of the two is a UUID."""
+    out: dict[str, str] = {}
+    user = _uuid_or_none(user_id)
+    org = _uuid_or_none(org_id)
+    if user:
+        out["user_id"] = user
+    if org:
+        out["organization_id"] = org
+    return out
+
+
+def desktop_account() -> dict[str, str]:
+    """The signed-in desktop user's account ids, from the held MindsHub JWT.
+
+    For analytics attribution only (ENG-2121): anton keys ``turn_completed`` on
+    ``user_id``, so a completed turn joins the same PostHog person as sign-up
+    and payment. The desktop sidecar has no principal; the only identity it
+    holds is the credential the desktop app hands over (``runtime_credential``),
+    and when that is a Keycloak JWT its ``sub`` is the distinct_id the desktop
+    renderer already keys on, read from the same claims
+    (``activate_organization`` for the org, as the renderer does).
+
+    **Decoded, not verified.** Same as the renderer: this decides nothing about
+    access, and only the service the token is forwarded to can verify it. A
+    forged token here could only misattribute that machine's own turns, which
+    anyone can already do by posting to PostHog directly.
+
+    Only the two ids leave this function, never the email or name the token
+    also carries. Returns ``{}`` for anything else: no credential, a
+    user-supplied ``mdb_`` API key (no identity in it), a malformed token, or
+    org mode (the holder returns None there). Never raises.
+    """
+    import base64
+
+    try:
+        from cowork.common.settings import runtime_credential
+
+        token = runtime_credential.get_minds_credential() or ""
+        parts = token.split(".")
+        if len(parts) != 3 or not parts[1]:
+            return {}
+        payload = json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+        if not isinstance(payload, dict):
+            return {}
+        org = payload.get("activate_organization")
+        org_id = org.get("id") if isinstance(org, dict) else None
+        ids = account_ids(payload.get("sub"), org_id)
+        # An org without a user identifies nobody; keep the pair or the user.
+        return ids if "user_id" in ids else {}
+    except Exception:
+        logger.debug("build_info: could not read the desktop account", exc_info=True)
+        return {}
+
+
+def account_kwargs(config_cls) -> dict[str, str]:
+    """``{"user_id", "organization_id"}`` for ``ChatSessionConfig``, or ``{}``.
+
+    Same version-skew guard as ``surface_kwarg``: the pinned anton may predate
+    ENG-2121, and an unexpected keyword would raise on every turn. Absent
+    rather than empty when there is no account, so the event falls back to the
+    install fingerprint exactly as before. Never raises.
+    """
+    try:
+        return supported_kwargs(config_cls, **desktop_account())
+    except Exception:  # pragma: no cover - defensive: never fail a turn over telemetry
+        logger.warning("could not resolve the turn's account", exc_info=True)
+        return {}
+
+
 @lru_cache(maxsize=None)
 def install_channel() -> str:
     """How this server was installed: hosted / git / pypi / local / unknown.

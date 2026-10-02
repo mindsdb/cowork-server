@@ -14,18 +14,20 @@ from cowork.coding.contracts import (
     EventType,
     PermissionMode,
     SessionCreateRequest,
+    SessionStatus,
     SourceContext,
     TaskWorkspace,
     WorkspaceKind,
 )
-from cowork.coding.control_models import RunStatus, TaskControlSnapshot
+from cowork.coding.control_models import RunStatus, TaskControlSnapshot, TaskResourceScope
 from cowork.coding.control_service import ControlPlaneService
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.engines.registry import CodingEngineRegistry
 from cowork.coding.playbooks import PlaybookService
-from cowork.coding.project_models import CodeProject, canonical_model_id
+from cowork.coding.project_models import CodeProject, ProjectCommand, canonical_model_id
 from cowork.coding.project_service import CodeProjectService
-from cowork.coding.project_workspaces import ProjectWorkspaceManager
+from cowork.coding.project_workspaces import CommandResult, ProjectWorkspaceManager
+from cowork.coding.repository_setup import task_project
 from cowork.coding.reasoning import ModelLevels, resolve_reasoning_effort
 from cowork.coding.skill_models import SkillResolution
 from cowork.coding.skill_runtime import SkillRuntimeResolver
@@ -49,6 +51,51 @@ class LocalSessionPreparation:
     guidance: str
     playbook_summary: str | None
     environment: dict[str, str]
+
+
+@dataclass(frozen=True)
+class PendingLocalSession:
+    """A local task recorded by ``begin`` whose workspace is not prepared yet."""
+
+    session_id: str
+    request: SessionCreateRequest
+    project: CodeProject | None
+    engine_id: str
+    adapter_version: str
+    model: str
+    reasoning_effort: str | None
+    control_snapshot: TaskControlSnapshot
+    code_skills: CodeSkillService | None
+
+
+# CodingSession fields that only workspace preparation and skill resolution
+# can produce. Everything else on a placeholder is owned by the user or the
+# turn lifecycle while the task prepares.
+_PREPARED_FIELDS = (
+    "resource_ids",
+    "source_path",
+    "workspace_path",
+    "workspace_kind",
+    "workspaces",
+    "repository_root",
+    "base_revision",
+    "source_dirty",
+    "guidance_summary",
+    "developer_instructions",
+    "resolved_skills",
+    "skill_roots",
+    "skill_instructions",
+    "environment",
+    "allocated_ports",
+)
+
+
+def _adopt_preparation(current: CodingSession, prepared: CodingSession) -> None:
+    for name in _PREPARED_FIELDS:
+        setattr(current, name, getattr(prepared, name))
+    # Other project folders are prepared as extra directories; keep any the
+    # user added while the task prepared.
+    current.additional_dirs = list(dict.fromkeys([*prepared.additional_dirs, *current.additional_dirs]))
 
 
 def task_title(prompt: str) -> str:
@@ -137,7 +184,7 @@ class CodingSessionFactory:
         self.emit = emit
         self.control = control
 
-    def create(
+    def begin(
         self,
         request: SessionCreateRequest,
         credentials: EngineCredentials,
@@ -145,8 +192,22 @@ class CodingSessionFactory:
         default_model: str,
         code_skills: CodeSkillService | None = None,
         model_levels: ModelLevels | None = None,
-    ) -> CodingSession:
+    ) -> CodingSession | PendingLocalSession:
+        """Validate a new task and record it before any slow workspace work.
+
+        A connected-computer task is complete here and returns its session. A
+        local task returns a PendingLocalSession whose placeholder session is
+        already visible; ``complete`` prepares its workspace.
+        """
         project = self.projects.get(request.project_id) if request.project_id else None
+        if request.repository_setup is not None and project is not None:
+            if request.computer_id not in {None, self.control.local_computer.id}:
+                raise ValueError("Repository choices are available on this computer. Switch to this computer first")
+            project = task_project(
+                project, request.repository_setup, request.resource_ids,
+                local_computer_id=self.control.local_computer.id,
+            )
+            project = self.control.runtime_project(project, TaskResourceScope(), self.control.local_computer.id)
         engine_id = request.engine_id or (project.default_engine_id if project else default_engine)
         model = canonical_model_id(request.model or (project.default_model if project else default_model))
         # A task chooses its own effort; otherwise it inherits the project's,
@@ -164,14 +225,17 @@ class CodingSessionFactory:
             raise RuntimeError("MindsHub is not connected. Sign in or configure a MindsHub API key first.")
 
         session_id = str(uuid.uuid4())
+        if request.task_mode == "plan" and request.computer_id not in {None, self.control.local_computer.id}:
+            raise ValueError("Plan mode is available on this computer; choose Build for a connected computer")
         control_snapshot = self.control.create_task_run(
             task_id=session_id,
             title=task_title(request.prompt),
             prompt=request.prompt,
             project=project,
             requested_resource_ids=request.resource_ids,
-            computer_id=request.computer_id,
+            computer_id=self.control.local_computer.id if request.task_mode == "plan" or request.repository_setup is not None else request.computer_id,
             engine_id=engine_id,
+            repository_setup=request.repository_setup,
             standalone_computer_id=self.control.local_computer.id if project is None else None,
         )
         if control_snapshot.computer.id != self.control.local_computer.id:
@@ -186,47 +250,185 @@ class CodingSessionFactory:
                 code_skills,
                 reasoning_effort,
             )
-        self.control.set_run_status(control_snapshot.run.id, RunStatus.preparing)
-        preparation: LocalSessionPreparation | None = None
         try:
-            preparation = self._prepare_local_session(session_id, request, project)
-            contexts = list(request.source_contexts)
-            skill_resolution = self.skills.resolve(session_id, preparation.project, code_skills)
-            session = self._build_local_session(
-                session_id=session_id,
-                request=request,
-                engine_id=engine_id,
-                adapter_version=capabilities.adapter_version,
-                model=model,
-                control_snapshot=control_snapshot,
-                preparation=preparation,
-                skill_resolution=skill_resolution,
-                contexts=contexts,
-                reasoning_effort=reasoning_effort,
-            )
-            self.store.save_session(session)
-            task = self.control.store.get_task(control_snapshot.task.id)
-            task.source_contexts = contexts
-            self.control.store.save_task(task)
-            self.control.attach_prepared_workspaces(
-                control_snapshot.run.id,
-                list(preparation.task_workspaces) or [preparation.primary],
-            )
-            self.control.set_run_status(control_snapshot.run.id, RunStatus.ready)
-            self._emit_workspace_ready(session)
-            if preparation.project:
-                self._run_setup(session, preparation.project)
-            return self.store.load_session(session.id)
+            # Preparation runs in the background, so reject a folder it would
+            # refuse now, while the composer can still show the error.
+            if project is None:
+                self.workspaces.check_source(request.path or "", request.allow_direct_folder)
+            validate_directories(request.additional_dirs)
         except Exception:
             with suppress(KeyError, ValueError):
                 self.control.set_run_status(control_snapshot.run.id, RunStatus.failed)
-            self.skills.cleanup(session_id)
-            self.discard_by_id(
-                session_id,
-                list(preparation.task_workspaces) if preparation else [],
-                preparation.fallback_workspace if preparation else None,
-            )
             raise
+        self.control.set_run_status(control_snapshot.run.id, RunStatus.preparing)
+        pending = PendingLocalSession(
+            session_id=session_id,
+            request=request,
+            project=project,
+            engine_id=engine_id,
+            adapter_version=capabilities.adapter_version,
+            model=model,
+            reasoning_effort=reasoning_effort,
+            control_snapshot=control_snapshot,
+            code_skills=code_skills,
+        )
+        try:
+            self.store.save_session(self._placeholder_session(pending))
+            task = self.control.store.get_task(control_snapshot.task.id)
+            task.source_contexts = list(request.source_contexts)
+            self.control.store.save_task(task)
+            # Append without projecting the placeholder's status onto the Run,
+            # which stays ``preparing`` until the workspace exists.
+            self.store.append_event(
+                session_id,
+                CodingEvent(type=EventType.user_message, title="You", text=request.prompt, phase="completed"),
+            )
+            self.store.append_event(
+                session_id,
+                CodingEvent(
+                    type=EventType.session,
+                    title="Preparing task workspace",
+                    text="Creating an isolated copy of the task folders.",
+                    phase="pending",
+                ),
+            )
+        except Exception:
+            self.abandon(pending)
+            raise
+        return pending
+
+    def complete(self, pending: PendingLocalSession, cancelled: Callable[[], bool]) -> CodingSession:
+        """Prepare a pending task's workspace and run its setup commands.
+
+        On failure the workspace is released and the Run fails, but the task
+        record stays so the user can see why it did not start.
+        """
+        session_id = pending.session_id
+        request = pending.request
+        preparation: LocalSessionPreparation | None = None
+        try:
+            preparation = self._prepare_local_session(session_id, request, pending.project)
+            contexts = list(request.source_contexts)
+            skill_resolution = self.skills.resolve(session_id, preparation.project, pending.code_skills)
+            session = self._build_local_session(
+                session_id=session_id,
+                request=request,
+                engine_id=pending.engine_id,
+                adapter_version=pending.adapter_version,
+                model=pending.model,
+                control_snapshot=pending.control_snapshot,
+                preparation=preparation,
+                skill_resolution=skill_resolution,
+                contexts=contexts,
+                reasoning_effort=pending.reasoning_effort,
+            )
+            # The placeholder has been visible and editable since ``begin``:
+            # queued follow-ups, title, pin and config changes stay, and only
+            # what preparation produced is merged in.
+            session = self.store.update_session(session_id, lambda current: _adopt_preparation(current, session))
+            self.control.attach_prepared_workspaces(
+                pending.control_snapshot.run.id,
+                list(preparation.task_workspaces) or [preparation.primary],
+            )
+            self.control.set_run_status(pending.control_snapshot.run.id, RunStatus.ready)
+            self._emit_workspace_ready(session)
+            if preparation.project and not cancelled():
+                self._run_setup(session, preparation.project, cancelled)
+            return self.store.load_session(session.id)
+        except Exception:
+            self.skills.cleanup(session_id)
+            if preparation is not None:
+                self._release_workspaces(session_id, preparation)
+                if request.repository_setup and request.repository_setup.branch:
+                    for workspace in preparation.task_workspaces:
+                        self.project_workspaces.rollback_task_branch(workspace)
+            with suppress(FileNotFoundError):
+                self.store.update_session(session_id, self._forget_workspace)
+            raise
+
+    def abandon(self, pending: PendingLocalSession) -> None:
+        """Remove a task that never started preparing its workspace."""
+        with suppress(KeyError, ValueError):
+            self.control.set_run_status(pending.control_snapshot.run.id, RunStatus.failed)
+        with suppress(FileNotFoundError):
+            self.store.delete_session(pending.session_id)
+
+    def _placeholder_session(self, pending: PendingLocalSession) -> CodingSession:
+        request = pending.request
+        project = pending.project
+        permission_mode = (
+            request.permission_mode
+            if "permission_mode" in request.model_fields_set or project is None
+            else project.permission_mode
+        )
+        snapshot = pending.control_snapshot
+        return CodingSession(
+            id=pending.session_id,
+            title=task_title(request.prompt),
+            engine_id=pending.engine_id,
+            engine_adapter_version=pending.adapter_version,
+            model=pending.model,
+            permission_mode=permission_mode,
+            task_mode=request.task_mode,
+            reasoning_effort=pending.reasoning_effort,
+            service_tier=request.service_tier,
+            personality=request.personality,
+            network_access=request.network_access or permission_mode.value == "full_access",
+            web_search=request.web_search,
+            task_id=snapshot.task.id,
+            run_id=snapshot.run.id,
+            computer_id=snapshot.computer.id,
+            scope_all_project_resources=request.resource_ids is None,
+            runtime_epoch=snapshot.run.epoch,
+            project_id=project.id if project else None,
+            project_name=project.name if project else None,
+            source_path=request.path or "",
+            # Empty until ``complete`` prepares it; workspace operations refuse
+            # a local task without one.
+            workspace_path="",
+            workspace_kind=WorkspaceKind.local_copy,
+            status=SessionStatus.running,
+            source_contexts=list(request.source_contexts),
+        )
+
+    def release(self, session: CodingSession, request: SessionCreateRequest) -> None:
+        """Release a prepared task's workspaces, task branches and skills after it was deleted."""
+        if session.workspaces:
+            self.project_workspaces.cleanup(session.id, session.workspaces)
+            if request.repository_setup and request.repository_setup.branch:
+                # Only a branch still at its base revision is deleted.
+                for workspace in session.workspaces:
+                    self.project_workspaces.rollback_task_branch(workspace)
+        elif session.workspace_kind in {WorkspaceKind.git_worktree, WorkspaceKind.local_copy}:
+            self.workspaces.cleanup(
+                session.id,
+                session.source_path,
+                session.workspace_path,
+                session.workspace_kind,
+                session.base_revision,
+            )
+        self.skills.cleanup(session.id)
+
+    def _release_workspaces(self, session_id: str, preparation: LocalSessionPreparation) -> None:
+        if preparation.task_workspaces:
+            self.project_workspaces.cleanup(session_id, list(preparation.task_workspaces))
+            return
+        workspace = preparation.fallback_workspace
+        if workspace and workspace.workspace_kind in {WorkspaceKind.git_worktree, WorkspaceKind.local_copy}:
+            self.workspaces.cleanup(
+                session_id,
+                workspace.source_path,
+                workspace.workspace_path,
+                workspace.workspace_kind,
+                workspace.base_revision,
+            )
+
+    @staticmethod
+    def _forget_workspace(session: CodingSession) -> None:
+        session.workspace_path = ""
+        session.workspace_kind = WorkspaceKind.local_copy
+        session.workspaces = []
+        session.allocated_ports = {}
 
     def _prepare_local_session(
         self,
@@ -261,12 +463,12 @@ class CodingSessionFactory:
             )
 
         selected_project = self._selected_project(project, request.resource_ids)
-        prepared = self.project_workspaces.prepare(session_id, selected_project)
         guidance, playbook_summary = (
             self.playbooks.guidance(selected_project.id)
             if selected_project.playbook
             else ("", None)
         )
+        prepared = self.project_workspaces.prepare(session_id, selected_project, request.repository_setup)
         permission_mode = (
             request.permission_mode
             if "permission_mode" in request.model_fields_set
@@ -332,6 +534,7 @@ class CodingSessionFactory:
             engine_adapter_version=adapter_version,
             model=model,
             permission_mode=preparation.permission_mode,
+            task_mode=request.task_mode,
             reasoning_effort=reasoning_effort,
             service_tier=request.service_tier,
             personality=request.personality,
@@ -461,37 +664,6 @@ class CodingSessionFactory:
                 self.control.set_run_status(control_snapshot.run.id, RunStatus.failed)
             raise
 
-    def discard(self, session: CodingSession) -> None:
-        self.discard_by_id(session.id, session.workspaces)
-
-    def discard_by_id(
-        self,
-        session_id: str,
-        task_workspaces: list[TaskWorkspace],
-        fallback_workspace: TaskWorkspace | None = None,
-    ) -> None:
-        try:
-            session = self.store.load_session(session_id)
-        except FileNotFoundError:
-            session = None
-        if task_workspaces:
-            self.project_workspaces.cleanup(session_id, task_workspaces)
-        else:
-            workspace = session or fallback_workspace
-            if workspace and workspace.workspace_kind in {WorkspaceKind.git_worktree, WorkspaceKind.local_copy}:
-                self.workspaces.cleanup(
-                    session_id,
-                    workspace.source_path,
-                    workspace.workspace_path,
-                    workspace.workspace_kind,
-                    workspace.base_revision,
-                )
-        try:
-            self.store.delete_session(session_id)
-        except FileNotFoundError:
-            pass
-        self.skills.cleanup(session_id)
-
     def _emit_workspace_ready(self, session: CodingSession) -> None:
         count = len(session.workspaces) or 1
         self.emit(
@@ -511,9 +683,28 @@ class CodingSessionFactory:
             ),
         )
 
-    def _run_setup(self, session: CodingSession, project: CodeProject) -> None:
-        results = self.project_workspaces.run_commands(project, session.workspaces, "setup", session.allocated_ports)
-        for result in results:
+    def _run_setup(
+        self,
+        session: CodingSession,
+        project: CodeProject,
+        cancelled: Callable[[], bool] = lambda: False,
+    ) -> None:
+        def item_id(command_id: str, folder_id: str) -> str:
+            return f"setup:{folder_id}:{command_id}"
+
+        def started(command: ProjectCommand, workspace: TaskWorkspace) -> None:
+            self.emit(
+                session.id,
+                CodingEvent(
+                    type=EventType.command,
+                    title=command.label,
+                    phase="started",
+                    item_id=item_id(command.id, workspace.folder_id),
+                    data={"folderId": workspace.folder_id, "phase": "setup"},
+                ),
+            )
+
+        def finished(result: CommandResult) -> None:
             self.emit(
                 session.id,
                 CodingEvent(
@@ -521,9 +712,20 @@ class CodingSessionFactory:
                     title=result.label,
                     text=result.output,
                     phase="completed" if result.return_code == 0 else "failed",
+                    item_id=item_id(result.command_id, result.folder_id),
                     data={"folderId": result.folder_id, "returnCode": result.return_code, "phase": "setup"},
                 ),
             )
+
+        results = self.project_workspaces.run_commands(
+            project,
+            session.workspaces,
+            "setup",
+            session.allocated_ports,
+            on_start=started,
+            on_result=finished,
+            stop=cancelled,
+        )
         failed = next((result for result in results if result.return_code != 0), None)
         if failed:
             note = (

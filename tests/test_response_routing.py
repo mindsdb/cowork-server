@@ -356,6 +356,184 @@ async def test_route_request_ignores_jev_result_even_when_it_contradicts_the_gat
 
 
 @pytest.mark.asyncio
+async def test_gate_and_jev_probe_share_the_turns_correlation_id(monkeypatch):
+    """The gate's trace context carries the turn's correlation_id, and
+    the detached probe inherits it, so the real probe's Jev call is attributed
+    to the conversation (origin:harness, not direct-api) and joins the gate
+    decision it shadows. Only the HTTP client is faked: the context has to cross
+    the gate's create_task for this to pass."""
+    import asyncio
+    import json
+
+    import cowork.handlers.responses as responses
+    from anton.core.llm.tracing import get_trace_context
+    from cowork.handlers import jev_shadow
+
+    monkeypatch.setenv("COWORK_TURN_JEV_SHADOW_ENABLED", "true")
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
+    )
+    llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
+
+    async def fake_binding():
+        return None, {"correlation_id": "corr-1", "llm": llm_block}
+
+    handler._router_binding = fake_binding
+    seen = {}
+
+    async def fake_decide_route(**_kwargs):
+        seen["gate_context"] = get_trace_context()
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+    sent = asyncio.Event()
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def post(self, _url, *, headers, json):
+            seen["probe_headers"] = headers
+            sent.set()
+            return SimpleNamespace(status_code=500, json=lambda: {})
+
+    monkeypatch.setattr(jev_shadow.httpx, "AsyncClient", _Client)
+
+    await handler._route_request(
+        conversation_id="conv-1",
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+        trace_metadata={"cowork_server_version": "1.2.3"},
+    )
+    await asyncio.wait_for(sent.wait(), timeout=2)
+
+    gate = seen["gate_context"]
+    assert gate.metadata["correlation_id"] == "corr-1"
+    assert gate.turn_id is None
+    headers = seen["probe_headers"]
+    assert "Langfuse-Session-Id" not in headers
+    assert "cowork-gate" not in headers["Langfuse-Tags"]
+    assert jev_shadow.JEV_SHADOW_TAG in headers["Langfuse-Tags"]
+    metadata = json.loads(headers["Langfuse-Metadata"])
+    assert (metadata["correlation_id"], metadata["harness"], metadata["conversation_id"]) == (
+        "corr-1",
+        "anton",
+        "conv-1",
+    )
+    # The context is the gate's alone: it does not leak past the gate block.
+    assert get_trace_context() is None
+
+
+@pytest.mark.asyncio
+async def test_gate_sends_no_jev_probe_unless_shadow_mode_is_turned_on(monkeypatch):
+    """A remote turn with a minted minds-cloud key and no shadow override sends
+    nothing to '/v1/decisions'. The probe runs on the turn's own key: Jev is
+    zero-priced, so it charges no wallet, but with the default on every turn on
+    an unfunded org would draw that org's free Jev allowance in the background.
+    Only the HTTP client is faked, the gate's own decision (not the
+    router_unavailable fallback) proves the gate block ran through the probe
+    spawn, and the detached probe task is awaited to the end, so a default
+    flipped back on makes the POST this test forbids."""
+    import asyncio
+    import functools
+
+    import cowork.handlers.responses as responses
+    from cowork.common.settings.app_settings import TurnQueueSettings
+    from cowork.handlers import jev_shadow
+
+    monkeypatch.delenv("COWORK_TURN_JEV_SHADOW_ENABLED", raising=False)
+    # The handler's settings skip the .env chain, so a repo-root .env cannot
+    # turn the probe on or off here and only the field default decides.
+    monkeypatch.setattr(responses, "TurnQueueSettings", functools.partial(TurnQueueSettings, _env_file=None))
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
+    )
+    llm_block = {"provider": "minds-cloud", "api_key": "turn-key", "base_url": "https://minds.example/v1"}
+
+    async def fake_binding():
+        return None, {"correlation_id": "corr-1", "llm": llm_block}
+
+    handler._router_binding = fake_binding
+
+    async def fake_decide_route(**_kwargs):
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+    posted_urls = []
+
+    class _Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def post(self, url, *, headers, json):
+            posted_urls.append(url)
+            return SimpleNamespace(status_code=402, json=lambda: {})
+
+    monkeypatch.setattr(jev_shadow.httpx, "AsyncClient", _Client)
+
+    decision, _turn_llm = await handler._route_request(
+        conversation_id="conv-1",
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+    await asyncio.gather(*list(responses._jev_shadow_tasks))
+
+    assert decision.fallback is False
+    assert decision.reason == "test"
+    assert posted_urls == []
+
+
+@pytest.mark.asyncio
+async def test_gate_without_a_minted_turn_key_carries_no_correlation_id(monkeypatch):
+    import cowork.handlers.responses as responses
+    from anton.core.llm.tracing import get_trace_context
+
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: []),
+    )
+    seen = {}
+
+    async def fake_decide_route(**_kwargs):
+        seen["gate_context"] = get_trace_context()
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+
+    await handler._route_request(
+        conversation_id="conv-1",
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+        trace_metadata={"cowork_server_version": "1.2.3"},
+    )
+
+    assert seen["gate_context"].metadata == {"cowork_server_version": "1.2.3"}
+
+
+@pytest.mark.asyncio
 async def test_route_request_returns_promptly_even_when_jev_is_slow(monkeypatch):
     """The probe must be detached, not awaited alongside the gate: a ready
     gate decision returning only after Jev finishes would mean a 'shadow'
@@ -442,6 +620,98 @@ async def test_route_request_scrubs_secrets_from_history_and_current_prompt(monk
     assert leaked_key not in blob
     assert current_key not in blob
     assert blob.count("[REDACTED_API_KEY]") == 2
+
+
+@pytest.mark.asyncio
+async def test_route_request_scrubs_a_registered_vault_secret_by_value(monkeypatch, tmp_path, request):
+    """A datasource password has no API-key shape, so only its registered
+    value can redact it. Covers the scrub given the registration; the call
+    site is pinned by test_handle_registers_vault_secrets_before_routing."""
+    from uuid import uuid4
+
+    from anton.core.datasources.data_vault import LocalDataVault
+    from anton.utils.datasources import _reset_registered_ds_vars
+
+    from cowork.services.connectors.vault_secrets import register_vault_secrets
+    from cowork.models.message_event import MessageEvent  # noqa: F401 — resolves the ORM relationship
+    from cowork.models.message import Message
+    from cowork.schemas.responses import Role
+    import cowork.handlers.responses as responses
+
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "vault"))
+    LocalDataVault(tmp_path / "vault").save("postgres", "mydb", {
+        "host": "db.example.com", "port": "5432", "database": "app",
+        "user": "svc", "password": "hunter2xyz",
+    })
+    request.addfinalizer(_reset_registered_ds_vars)
+
+    handler = _routing_handler(monkeypatch)
+    await register_vault_secrets(handler.scope)
+
+    cid = uuid4()
+    rows = [Message(conversation_id=cid, role=Role.user, content="the password is hunter2xyz")]
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: rows),
+    )
+    seen = {}
+
+    async def fake_decide_route(**kwargs):
+        seen.update(kwargs)
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+
+    await handler._route_request(
+        conversation_id=cid,
+        harness_input=[{"type": "text", "text": "hi"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+
+    blob = str(seen["history"])
+    assert "hunter2xyz" not in blob
+    assert "[DS_" in blob
+
+
+@pytest.mark.asyncio
+async def test_handle_registers_vault_secrets_before_routing(monkeypatch):
+    """The gate scrubs history inside _route_request, so the vault's secrets
+    must be registered before it runs, not later in _build_chat_session."""
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = uuid4()
+    conversation = SimpleNamespace(id=conv_id, messages=[])
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_conversation=lambda _cid: conversation),
+    )
+    calls = []
+
+    async def fake_register(scope):
+        calls.append(("register", scope))
+
+    monkeypatch.setattr(responses, "register_vault_secrets", fake_register)
+
+    class _StopHere(Exception):
+        pass
+
+    async def fake_route_request(**kwargs):
+        calls.append(("route_request", None))
+        raise _StopHere
+
+    handler._route_request = fake_route_request
+
+    with pytest.raises(_StopHere):
+        await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id)))
+
+    assert calls == [("register", handler.scope), ("route_request", None)]
 
 
 @pytest.mark.asyncio
@@ -571,13 +841,15 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
             resolved_router_provider=Provider.MINDS_CLOUD,
             resolved_router_model="kimi",        # the user's summarization pick
             resolved_gate_model="mindshub_air",  # what the gate actually runs on
+            hub_workspace_id="ws-1",
         ),
     )
     block = {"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "http://gw/v1"}
     minted = {}
 
-    async def fake_mint(*, org_id, user_id, correlation_id, settings):
+    async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
         minted["corr"] = correlation_id
+        minted["workspace_id"] = workspace_id
         return block
 
     monkeypatch.setattr(producer, "_mint_llm_block", fake_mint)
@@ -589,6 +861,44 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
     assert binding.model == "mindshub_air"
     assert type(binding.provider).__name__ == "OpenAIProvider"
     assert turn_llm == {"correlation_id": minted["corr"], "llm": block}
+    # The routing gate's own pre-mint must carry the caller's picked workspace
+    # too — this key is what a delegated remote turn ends up reusing as its
+    # `llm` block, so skipping it here would silently exempt every hosted-org
+    # turn that goes through the gate from workspace attribution.
+    assert minted["workspace_id"] == "ws-1"
+
+
+@pytest.mark.asyncio
+async def test_router_binding_omits_workspace_id_when_none_picked(monkeypatch):
+    import cowork.handlers.responses as responses
+    import cowork.turnqueue.producer as producer
+    from cowork.common.settings.user_settings import Provider
+
+    handler = _routing_handler(monkeypatch)
+    monkeypatch.setattr(
+        responses, "TurnQueueSettings",
+        lambda: SimpleNamespace(backend="remote", is_remote=True, turn_key_ttl_seconds=1200),
+    )
+    monkeypatch.setattr(
+        responses, "get_user_settings",
+        lambda scope: SimpleNamespace(
+            resolved_router_provider=Provider.MINDS_CLOUD,
+            resolved_router_model="kimi",
+            resolved_gate_model="mindshub_air",
+            hub_workspace_id="",
+        ),
+    )
+    minted = {}
+
+    async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
+        minted["workspace_id"] = workspace_id
+        return {"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "http://gw/v1"}
+
+    monkeypatch.setattr(producer, "_mint_llm_block", fake_mint)
+
+    await handler._router_binding()
+
+    assert minted["workspace_id"] is None
 
 
 @pytest.mark.asyncio
@@ -1419,3 +1729,88 @@ def test_the_adjective_denial_still_catches_the_prod_failure():
 
     assert denies_our_product("There is no verified Cowork desktop app that I could find.")
     assert denies_our_product("There's no such app as MindsHub Cowork that I know of.")
+
+
+# ── the gate's own tool must never reach history as a direct answer ──────────
+
+
+_GATE_TOOL_ANSWERS = [
+    # A local server that fails to parse the model's call streams it as text.
+    '<tool_call>\n{"name": "delegate", "arguments": {"reason": "needs files"}}\n</tool_call>',
+    'delegate(reason="the user wants a file created")',
+    "[TOOL_CALLS][{\"name\": \"delegate\", \"arguments\": {}}]",
+    "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>handoff",
+    # A small model answering "list your tools" from its one visible tool.
+    "I have one tool available:\n\n- **delegate**: forwards the task to the assistant's backend.",
+    "The only tool I can use is the delegate tool.",
+    "Tools:\n- delegate: Delegate when a request requires the full agent.",
+    "I have one delegate-tool for handing work to the backend.",
+    "My only capability is delegate_tool, which hands work to the backend.",
+]
+
+
+@pytest.mark.parametrize("answer", _GATE_TOOL_ANSWERS)
+def test_gate_tool_matcher_catches_text_calls_and_self_descriptions(answer):
+    from cowork.handlers.response_routing import names_gate_tool
+
+    assert names_gate_tool(answer) is not None
+
+
+def test_gate_tool_matcher_does_not_fire_on_related_words():
+    """Whole word only: inflections and compounds of the tool name still ship."""
+    from cowork.handlers.response_routing import names_gate_tool
+
+    for benign in (
+        "Those permissions were delegated to the admin group.",
+        "Delegation works best when the owner of each task is clear.",
+        "Use redelegate to move your stake to another validator.",
+        "Hi there, how can I help?",
+    ):
+        assert names_gate_tool(benign) is None, benign
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "Try to delegate tasks to your team so you can focus on the roadmap.",
+        "Set the table view's delegate property to your view controller.",
+        "In C#, a delegate is a type that references a method.",
+    ],
+)
+def test_known_gate_tool_over_fires_are_accepted_and_pinned(sentence):
+    """Ordinary uses of the word DO fire, deliberately.
+
+    The paraphrases a model uses to describe its one visible tool vary far more
+    than the name does, so the name is matched as a whole word. A false positive
+    costs one hop on a path that fails open. Narrowing the matcher means updating
+    this test on purpose, not deleting it.
+    """
+    from cowork.handlers.response_routing import names_gate_tool
+
+    assert names_gate_tool(sentence) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", _GATE_TOOL_ANSWERS)
+async def test_streamed_gate_answer_naming_the_gate_tool_is_discarded_and_delegated(answer):
+    """Streamed as text, as a local endpoint sends it, and never shipped.
+
+    Only a DIRECT_CONTEXT route reaches `_handle_direct_response`, which is what
+    persists an answer, so the delegated route keeps the gate's tool out of the
+    agent's history.
+    """
+    provider = _StreamProvider([_text(answer[:20]), _text(answer[20:]), _complete()])
+
+    decision = await decide_route(
+        history=[{"role": "user", "content": "list the tools you have access to"}],
+        has_non_text_input=False,
+        has_attachments=False,
+        has_disabled_connections=False,
+        binding=_binding(provider),
+    )
+
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.reason == "router_answer_named_gate_tool"
+    assert decision.text == ""
+    assert decision.fallback is False
+    assert decision.model == "gate-model"

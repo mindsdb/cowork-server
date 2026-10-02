@@ -7,6 +7,7 @@ from uuid import UUID
 from cowork.db.scoped import ScopedSession
 from cowork.handlers.responses import ResponsesHandler
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
+from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
 
 
@@ -44,6 +45,9 @@ async def remote_turn_events(
         snapshot_artifact_state,
     )
 
+    # A channel turn never goes through handle(), which registers these for
+    # a web turn; the seed history below is scrubbed against them.
+    await register_vault_secrets(session.scope)
     seeded_history, seed_info = ResponsesHandler._remote_seed_history(session, conv_id)
     artifacts = ResponsesHandler._remote_artifacts_context(session, conv_id)
     before_slugs, before_mtimes = (
@@ -53,6 +57,8 @@ async def remote_turn_events(
     touched_slugs: set[str] = set()
     turn_scope = None
     artifact_writes_allowed = False
+    # Set only on turn_completed; see `turn_created_slugs(accept_unattributed=)`.
+    completed_cleanly = False
 
     try:
         async for kind, data in stream_remote_replies(
@@ -91,6 +97,7 @@ async def remote_turn_events(
                     for reason in reasons:
                         yield StreamTaskProgress(phase="skill_draft_dropped", message=reason)
             elif kind == "turn_completed":
+                completed_cleanly = True
                 break
             elif kind == "turn_failed":
                 message = data.get("message") or GENERIC_TURN_ERROR_MESSAGE
@@ -101,6 +108,8 @@ async def remote_turn_events(
             new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
                 artifacts[0], conv_id, artifacts[2], artifacts[1],
                 before_slugs, before_mtimes,
+                attribute_by_provenance=True,
+                completed_cleanly=completed_cleanly,
             )
 
     if artifacts is not None and artifact_writes_allowed:

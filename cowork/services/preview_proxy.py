@@ -10,9 +10,11 @@ Each request looks up the artifact dir by token, re-reads `port` from
 `metadata.json` on every call (so a backend restart on a fresh port is
 picked up automatically), and streams the upstream response back. CORS
 headers are injected on every response — artifact backends aren't
-required to know about CORS, and the sandboxed iframe has an opaque
-origin, so without these headers every fetch from artifact JS would be
-blocked browser-side.
+required to know about CORS, and the framed page may be cross-origin to the
+backend it calls, so without these headers every fetch from artifact JS would
+be blocked browser-side. (The frame is NOT at an opaque origin: this branch is
+the one preview path that gets `allow-same-origin` — see ArtifactViewerBody.jsx
+in the cowork repo.)
 """
 from __future__ import annotations
 
@@ -27,7 +29,8 @@ from starlette.responses import PlainTextResponse, Response, StreamingResponse
 
 from cowork.common.http_client import get_proxy_client
 from cowork.services.artifacts import _NO_EXEC_DETAIL, _org_mode, get_preview_mount
-from cowork.services.comments_layer import ACTIVATION_PARAM, inject_layer
+from cowork.services.comments_layer import ACTIVATION_PARAM
+from cowork.services.preview_html import prepare_preview_html
 
 logger = logging.getLogger(__name__)
 
@@ -197,15 +200,22 @@ async def proxy_artifact_request(
             b'name="api-base" content=""',
             f'name="api-base" content="{proxy_prefix}"'.encode(),
         )
-        # Inject the on-artifact comment marker layer when the renderer opts in
-        # (same activation flag as the static serve path). Fullstack previews
-        # flow through this proxy rather than serve_artifact_file, so this is the
-        # equivalent injection point for them.
-        if ACTIVATION_PARAM in request.query_params:
-            try:
-                patched = inject_layer(patched.decode("utf-8")).encode("utf-8")
-            except UnicodeDecodeError:
-                pass
+        # Inject the preview shim, and the on-artifact comment marker layer when
+        # the renderer opts in (same activation flag as the static serve path).
+        # Fullstack previews flow through this proxy rather than
+        # serve_artifact_file, so this is the equivalent injection point.
+        #
+        # Only the root document is patched, so an HTML page on another path of
+        # a fullstack artifact gets neither. Accepted: the anton template
+        # generates a single static/index.html, so no generated artifact has
+        # a second HTML entry point for this gap to affect today.
+        try:
+            patched = prepare_preview_html(
+                patched.decode("utf-8"),
+                comments=ACTIVATION_PARAM in request.query_params,
+            ).encode("utf-8")
+        except UnicodeDecodeError:
+            pass
         resp_headers = dict(_strip_hop_headers(upstream.headers, drop_cors=True))
         resp_headers.update(cors)
         # Drop Content-Length — the patched body may be larger than the

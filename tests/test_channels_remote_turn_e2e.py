@@ -278,3 +278,131 @@ def test_a_remote_turn_failure_delivers_an_error_message_not_silence(monkeypatch
             session.close()
         _delete_channel_events("slack:event:Ev-remote-fail-1")
         _delete_binding_and_its_rows("slack", "D1", ORG_A)
+
+
+class _ReplyOnlyRedis:
+    """The Redis calls stream_remote_replies makes, answering with fixed replies.
+
+    Stubs the transport only, so the producer's own turn_failed classification
+    runs on the pod's raw error string.
+    """
+
+    def __init__(self, replies: list[tuple[str, dict]]):
+        self._replies = [
+            {"payload": json.dumps({"correlation_id": "corr-billing", "kind": kind, "data": data})}
+            for kind, data in replies
+        ]
+
+    async def delete(self, *keys): return len(keys)
+    async def sadd(self, key, member): return 1
+    async def hset(self, key, mapping=None): return 1
+    async def expire(self, key, seconds): return 1
+    async def xadd(self, stream, fields): return "1-0"
+
+    async def xread(self, streams, count=None, block=None):
+        if not self._replies:
+            return None
+        stream = next(iter(streams))
+        return [[stream, [["9-0", self._replies.pop(0)]]]]
+
+
+def test_a_remote_allowance_stop_posts_the_allowance_message_not_out_of_credits(
+    monkeypatch, org_mode_remote_backend, granted_product_permissions,
+):
+    # The pod raises anton's AllowanceExhaustedError and sends it as the scrubbed
+    # "TypeName: message" string. The channel reply is the classified message,
+    # so without a mapping for that name the user reads a generic error, and
+    # with the old parent-type mapping they read "You're out of credits".
+    from cowork.handlers import turn_errors as te
+    from cowork.turnqueue import producer
+
+    monkeypatch.setattr(
+        "cowork.handlers.responses.ResponsesHandler._stage_remote_workspace_files",
+        staticmethod(lambda session, conv_id: None),
+    )
+    monkeypatch.setattr(
+        "cowork.handlers.responses.ResponsesHandler._remote_artifacts_context",
+        staticmethod(lambda session, conv_id: None),
+    )
+    monkeypatch.setattr(
+        "cowork.handlers.responses.ResponsesHandler._remote_seed_history",
+        staticmethod(lambda session, conv_id: ([], None)),
+    )
+    monkeypatch.setattr(
+        "cowork.handlers.responses.ResponsesHandler._remote_workspace",
+        staticmethod(lambda session, conv_id: {}),
+    )
+
+    async def fake_llm_block(**kwargs):
+        return {"api_key": "mdb_turnkey"}
+
+    async def no_oauth_block(**kwargs):
+        return None
+
+    fake_redis = _ReplyOnlyRedis([
+        ("progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}),
+        ("turn_failed", {
+            "error": "AllowanceExhaustedError: Your included allowance for "
+                     "'mindshub_air' is exhausted.",
+        }),
+    ])
+    monkeypatch.setattr(producer, "get_redis", lambda: fake_redis)
+    monkeypatch.setattr(producer, "_new_correlation_id", lambda: "corr-billing")
+    monkeypatch.setattr(producer, "_mint_llm_block", fake_llm_block)
+    monkeypatch.setattr(producer, "_mint_oauth_block", no_oauth_block)
+
+    posted: list[tuple[str, dict]] = []
+    real_post = httpx.AsyncClient.post
+
+    async def fake_post(self, url, json=None, **kw):
+        if not str(url).startswith("https://slack.com/api"):
+            return await real_post(self, url, json=json, **kw)
+        posted.append((str(url).rsplit("/", 1)[-1], json))
+
+        class R:
+            def json(self):
+                return {"ok": True, "ts": "1700000003.000000"}
+        return R()
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", fake_post)
+
+    from cowork.server import create_app
+    app = create_app()
+    adapters = app.state.channel_adapters
+
+    session = get_open_session()
+    try:
+        svc = ChannelConfigService(ScopedSession(session, TenantScope(org_mode=True, org_id=ORG_A)))
+        svc.set_config("slack", {"bot_token": "xoxb-org-a-billing", "signing_secret": SIGNING_SECRET})
+        svc.set_external_account_id("slack", "T-ORG-A-BILLING")
+    finally:
+        session.close()
+
+    try:
+        async def flow():
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                assert await adapters.get_or_refresh("slack", ORG_A) is not None
+                body = _slack_event_body("T-ORG-A-BILLING", "Ev-remote-billing-1")
+                r = await client.post(
+                    "/api/v1/channels/slack/events", content=body,
+                    headers=_signed_slack_headers(body, SIGNING_SECRET),
+                )
+                assert r.status_code == 200
+                await drain_background_tasks()
+
+        asyncio.run(flow())
+
+        sends = [p for (m, p) in posted if m == "chat.postMessage"]
+        assert len(sends) == 1
+        assert sends[0]["text"] == te.ALLOWANCE_EXHAUSTED_USER_MESSAGE
+        assert te.TOKEN_LIMIT_USER_MESSAGE not in sends[0]["text"]
+        assert "out of credits" not in sends[0]["text"].lower()
+    finally:
+        session = get_open_session()
+        try:
+            ChannelConfigService(ScopedSession(session, TenantScope(org_mode=True, org_id=ORG_A))).delete_config("slack")
+        finally:
+            session.close()
+        _delete_channel_events("slack:event:Ev-remote-billing-1")
+        _delete_binding_and_its_rows("slack", "D1", ORG_A)

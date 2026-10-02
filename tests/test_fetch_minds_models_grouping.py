@@ -284,3 +284,54 @@ def test_missing_url_or_key_short_circuits(monkeypatch):
 
     assert asyncio.run(fetch_minds_models("", _KEY)) == providers._empty_listing()
     assert asyncio.run(fetch_minds_models(_URL, "")) == providers._empty_listing()
+
+
+# ── Why a locked model is locked ────────────────────────────────────────────
+#
+# `enabled: false` alone reads as "the wallet can't pay", so the picker offered
+# credits for a model an admin had restricted, which money cannot unlock. The
+# row's `disabled_reason` says which lock it is.
+
+
+def test_a_disabled_rows_reason_is_recorded(monkeypatch):
+    _serve(
+        monkeypatch,
+        {
+            "data": [
+                _row("opus", enabled=False, disabled_reason="model_restricted"),
+                _row("sonnet", enabled=False, disabled_reason="wallet_empty"),
+                _row("mindshub_air", enabled=True),
+            ]
+        },
+    )
+
+    listing = asyncio.run(fetch_minds_models(_URL, _KEY))
+
+    assert listing.disabled_reasons == {"opus": "model_restricted", "sonnet": "wallet_empty"}
+    assert listing.enabled == {"opus": False, "sonnet": False, "mindshub_air": True}
+
+
+def test_a_reason_on_an_enabled_row_is_ignored(monkeypatch):
+    # A reason only ever explains a lock. Kept for an enabled row, it would
+    # label a model the member can use.
+    _serve(
+        monkeypatch,
+        {
+            "data": [
+                _row("opus", enabled=True, disabled_reason="model_restricted"),
+                _row("sonnet", disabled_reason="model_restricted"),
+            ]
+        },
+    )
+
+    assert asyncio.run(fetch_minds_models(_URL, _KEY)).disabled_reasons == {}
+
+
+@pytest.mark.parametrize("junk", [None, 42, "", "   ", ["model_restricted"]])
+def test_a_junk_reason_is_treated_as_absent(monkeypatch, junk):
+    _serve(monkeypatch, {"data": [_row("opus", enabled=False, disabled_reason=junk)]})
+
+    listing = asyncio.run(fetch_minds_models(_URL, _KEY))
+
+    assert listing.disabled_reasons == {}
+    assert listing.enabled == {"opus": False}
