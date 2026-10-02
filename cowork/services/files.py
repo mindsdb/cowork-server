@@ -19,6 +19,7 @@ from cowork.common.paths import (
     dir_scandir,
     dir_stat,
     dir_unlink,
+    open_fd,
     open_pinned_child,
     pinned_dir,
     safe_join,
@@ -138,10 +139,13 @@ def stage_project_instructions(
         # O_NOFOLLOW + no O_CREAT: the workspace is writable by the untrusted
         # pod and safe_join is not atomic, so a symlink planted at dest after
         # the check must fail (ELOOP) rather than truncate its target, and a
-        # file that vanished in between must not be recreated here.
+        # file that vanished in between must not be recreated here. Windows
+        # has no O_NOFOLLOW (the constant is 0 there), which leaves only that
+        # post-check race open; Windows runs local mode only, with no untrusted
+        # pod to plant the link (see ``cowork.common.paths``).
         try:
             if dest.is_file() and dest.stat().st_size > 0:
-                fd = os.open(dest, os.O_WRONLY | os.O_TRUNC | os.O_NOFOLLOW)
+                fd = open_fd(dest, os.O_WRONLY | os.O_TRUNC | O_NOFOLLOW)
                 os.close(fd)
         except OSError:
             pass

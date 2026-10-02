@@ -47,7 +47,7 @@ RECOMMENDED_MODELS: dict[str, list[str]] = {
 # it the lookup misses → None (not the prior provider's model), which trips
 # config_status's model gate ("select a model") rather than misrouting.
 #
-# The one model MindsHub's free monthly allowance covers; every other alias
+# The one model MindsHub's free included allowance covers; every other alias
 # bills the wallet. It is also every minds-cloud role default below, so the
 # name is declared here rather than beside the org-mode fallback that used to
 # be its only reader.
@@ -231,6 +231,17 @@ def default_publish_url() -> str:
     return f"https://view.{slug}.mindshub.ai" if slug else "https://view.mindshub.ai"
 
 
+def _launched_by_pre_token_desktop() -> bool:
+    # Desktop builds before 2026-07-05 never send the bearer token but still
+    # auto-update this server, so defaulting auth on would 401 them. They set
+    # host 127.0.0.1 and no COWORK_SERVER_OWNER; every token-aware build sets the
+    # owner, and the Docker image binds 0.0.0.0.
+    return (
+        os.environ.get("COWORK_SERVER_HOST") == "127.0.0.1"
+        and not os.environ.get("COWORK_SERVER_OWNER")
+    )
+
+
 def _env_file_chain() -> list[str]:
     """The ``.env`` search path (pydantic-settings is "last wins").
 
@@ -350,6 +361,18 @@ class FileSettings(Settings):
     )  # FILE_ROOT_DIR or COWORK_FILES_DIR or FILES_ROOT_DIR
 
 
+class CodingSettings(Settings):
+    root_dir: str = Field(
+        default_factory=lambda: str(cowork_home() / "coding"),
+        validation_alias=AliasChoices("COWORK_CODING_DIR"),
+        description=(
+            "Root directory for the coding store, its git workspaces and code "
+            "projects. Org mode does not route this through scoped_storage_root, "
+            "so it is not partitioned per organization there."
+        ),
+    )  # COWORK_CODING_DIR
+
+
 class StorageSettings(Settings):
     # Org mode only: stores live under <shared_root>/<org_id>/<store>/ (one
     # mountable subtree per org). Local mode never reads this; in org mode the
@@ -423,6 +446,12 @@ class OAuthSettings(Settings):
     supabase_client_secret: str = Field(default="", validation_alias=AliasChoices("SUPABASE_CLIENT_SECRET"))
 
     posthog_client_id: str = Field(default="", validation_alias=AliasChoices("POSTHOG_CLIENT_ID"))
+
+    # HubSpot's MCP Auth App — a fixed client_id/secret pair, same shape as
+    # Google/Linear/GitHub/Supabase, but the resulting token can only call
+    # HubSpot's remote MCP server, never its REST API.
+    hubspot_client_id: str = Field(default="", validation_alias=AliasChoices("HUBSPOT_CLIENT_ID"))
+    hubspot_client_secret: str = Field(default="", validation_alias=AliasChoices("HUBSPOT_CLIENT_SECRET"))
 
     # Browser-side key for the Google Picker widget (drive.file scope only
     # grants access to files the user explicitly picks via this UI).
@@ -535,6 +564,29 @@ class TurnQueueSettings(Settings):
             "per-PR / non-standard envs whose host the slug logic cannot derive. Empty = derive."
         ),
     )  # COWORK_TURN_MINDS_BASE_URL
+    jev_shadow_enabled: bool = Field(
+        default=False,
+        description=(
+            "Fire a Jev '/v1/decisions' call alongside the LLM gate on every remote turn, "
+            "purely for latency/agreement comparison. Never used to route; logged only. "
+            "Requires a minted minds-cloud credential, so it's a no-op unless backend is "
+            "'remote'. Off by default: the call runs on the turn's own minted key and "
+            "sends the turn's text history as state. Jev is zero-priced, so it charges no "
+            "wallet, but on an unfunded org every turn draws that org's free Jev allowance "
+            "in the background, and a refused call shows up only as the "
+            "'jev_error=http_<status>' field of the '[jev-shadow]' warning that "
+            "responses._spawn_jev_shadow_probe logs."
+        ),
+    )  # COWORK_TURN_JEV_SHADOW_ENABLED
+    jev_shadow_model: str = Field(
+        default="jev",
+        description="MindsHub catalog alias passed to the shadow '/v1/decisions' call.",
+    )  # COWORK_TURN_JEV_SHADOW_MODEL
+    jev_shadow_timeout_seconds: float = Field(
+        default=3.0,
+        gt=0,
+        description="Hard wall-clock timeout for the shadow Jev call (enforced via asyncio.timeout, not just httpx's own per-phase timeout). Independent of the gate's own budget, since a slow or hung probe must never hold up the turn it's shadowing.",
+    )  # COWORK_TURN_JEV_SHADOW_TIMEOUT_SECONDS
     minds_coding_model: str = Field(
         default="",
         description=(
@@ -607,10 +659,24 @@ class AppSettings(Settings):
         validation_alias=AliasChoices("COWORK_REQUIRE_AUTH"),
         description=(
             "Require a bearer token on all API requests (except /health). "
-            "Set COWORK_AUTH_TOKEN to a fixed token, or leave it empty to "
+            "Defaults on in local/desktop tenancy unless explicitly set. Set "
+            "COWORK_AUTH_TOKEN to a fixed token, or leave it empty to "
             "auto-generate one on first startup (written back to ~/.cowork/.env)."
         ),
     )
+
+    @model_validator(mode="after")
+    def _default_require_auth_in_local_mode(self) -> "AppSettings":
+        """Only when nothing set it explicitly, and never in org mode:
+        create_app() refuses to boot with require_auth=True there (the token
+        would be mirrored into shared storage every org can read), so
+        defaulting it on would turn "nobody configured this" into a boot
+        failure instead of leaving org's own ingress auth as the boundary.
+        """
+        if self.tenancy_mode != "org" and "require_auth" not in self.model_fields_set:
+            self.require_auth = not _launched_by_pre_token_desktop()
+        return self
+
     auth_token: str = Field(
         default="",
         validation_alias=AliasChoices("COWORK_AUTH_TOKEN"),
@@ -643,20 +709,6 @@ class AppSettings(Settings):
             "resolving under COWORK_HOME exactly as before. Defaults to the "
             "container's own temp directory, which is never the shared EFS "
             "mount and is gone on pod restart."
-        ),
-    )
-    hub_workspaces_force_on: bool = Field(
-        default=False,
-        validation_alias=AliasChoices("COWORK_HUB_WORKSPACES_FORCE_ON"),
-        description=(
-            "Development override that turns the MindsHub workspace surfaces on "
-            "where no Statsig rule targets you. ON only: it cannot switch the "
-            "surfaces off, so it can never be used to escape the kill switch. "
-            "The switch itself is auth's `authorization_ui` gate, declared in "
-            "that repo's configs/statsig_gates.json and read through the "
-            "entitlements payload; this exists so the surface can be walked "
-            "before a rule exists for your environment. Never set in a deployed "
-            "environment."
         ),
     )
     ask_user_enabled: bool = Field(
@@ -839,6 +891,7 @@ class AppSettings(Settings):
     skill: SkillSettings = Field(default_factory=SkillSettings)  # SKILL_*
     connector: ConnectorSettings = Field(default_factory=ConnectorSettings)  # CONNECTOR_*
     memory: MemorySettings = Field(default_factory=MemorySettings)  # MEMORY_*
+    coding: CodingSettings = Field(default_factory=CodingSettings)  # CODING_*
 
 
 @lru_cache

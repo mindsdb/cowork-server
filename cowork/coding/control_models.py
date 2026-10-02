@@ -16,6 +16,7 @@ from cowork.coding.contracts import (
     utc_now,
 )
 from cowork.coding.project_models import CodeProject
+from cowork.coding.repository_setup_models import TaskRepositorySetup
 
 CONTROL_SCHEMA_VERSION = 1
 RUNTIME_PROTOCOL_VERSION = "1.0"
@@ -155,6 +156,7 @@ class CodeTask(BaseModel):
     # project can evolve independently without silently broadening an existing
     # task or changing the repositories used by a recovered run.
     execution_project: CodeProject | None = None
+    repository_setup: TaskRepositorySetup | None = None
     source_contexts: list[SourceContext] = Field(default_factory=list, max_length=24)
     deliveries: list[DeliveryRecord] = Field(default_factory=list, max_length=250)
     created_at: datetime = Field(default_factory=utc_now)

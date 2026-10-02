@@ -23,7 +23,8 @@ CATALOG = ["mindshub_air", "claude-sonnet-5", "deepseek-v4-pro"]
 
 def _listing(ids):
     return providers.MindsModelListing(
-        ids=ids, efforts={}, enabled={}, labels={}, providers={}, families={}, role_defaults={}
+        ids=ids, efforts={}, enabled={}, labels={}, providers={}, families={}, role_defaults={},
+        disabled_reasons={},
     )
 
 
@@ -443,8 +444,8 @@ def test_org_mode_gates_via_the_operator_catalog(monkeypatch):
     get_app_settings.cache_clear()
     seen = {}
 
-    async def _fake_org(*, org_id, bearer_token, refresh=False):
-        seen["org_id"], seen["bearer"] = org_id, bearer_token
+    async def _fake_org(*, org_id, user_id, bearer_token, refresh=False):
+        seen["org_id"], seen["user_id"], seen["bearer"] = org_id, user_id, bearer_token
         return _listing(list(CATALOG))
 
     monkeypatch.setattr(providers, "fetch_org_model_catalog", _fake_org)
@@ -453,13 +454,13 @@ def test_org_mode_gates_via_the_operator_catalog(monkeypatch):
         assert s.minds_api_key is None, "hosted stores no key — the old soft-pass"
         reason = asyncio.run(providers.model_value_rejection(
             s, "planning_model", "deepseek-v4-flash",
-            org_id="org-123", bearer_token="jwt-abc",
+            org_id="org-123", user_id="user-1", bearer_token="jwt-abc",
         ))
         assert reason is not None
-        assert seen == {"org_id": "org-123", "bearer": "jwt-abc"}
+        assert seen == {"org_id": "org-123", "user_id": "user-1", "bearer": "jwt-abc"}
         assert asyncio.run(providers.model_value_rejection(
             s, "planning_model", "mindshub_air",
-            org_id="org-123", bearer_token="jwt-abc",
+            org_id="org-123", user_id="user-1", bearer_token="jwt-abc",
         )) is None
     finally:
         get_app_settings.cache_clear()
@@ -479,7 +480,7 @@ def test_org_mode_without_a_bearer_still_soft_fails(monkeypatch):
     try:
         assert asyncio.run(providers.model_value_rejection(
             _org_settings(), "planning_model", "deepseek-v4-flash",
-            org_id="org-123", bearer_token="",
+            org_id="org-123", user_id="user-1", bearer_token="",
         )) is None
     finally:
         get_app_settings.cache_clear()
@@ -510,8 +511,8 @@ def test_org_mode_gate_is_wired_through_the_endpoint(monkeypatch):
 
     seen = {}
 
-    async def _fake_org(*, org_id, bearer_token, refresh=False):
-        seen["org_id"], seen["bearer"] = org_id, bearer_token
+    async def _fake_org(*, org_id, user_id, bearer_token, refresh=False):
+        seen["org_id"], seen["user_id"], seen["bearer"] = org_id, user_id, bearer_token
         return _listing(list(CATALOG))
 
     async def _no_local(*a, **k):
@@ -542,10 +543,11 @@ def test_org_mode_gate_is_wired_through_the_endpoint(monkeypatch):
         )
         assert res.status_code == 400, res.text
         assert "deepseek-v4-flash" in res.json()["detail"]
-        # Both halves of the wiring: the scope's org id and the CALLER's bearer
-        # must reach the operator catalog. Gutting either one restores the
-        # silent no-op this fix removed.
-        assert seen == {"org_id": "org-123", "bearer": "jwt-abc"}
+        # Every part of the wiring: the scope's org id, the scope's user id
+        # and the CALLER's bearer must reach the operator catalog. Gutting the
+        # org id or the bearer restores the silent no-op this fix removed, and
+        # the user id keeps one member's cached catalog from answering another.
+        assert seen == {"org_id": "org-123", "user_id": "user-1", "bearer": "jwt-abc"}
 
         assert client.put(
             "/api/v1/settings/planning_model",

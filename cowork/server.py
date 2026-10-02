@@ -18,6 +18,7 @@ from cowork.api.v1.router import api_router as v1_router
 from starlette.responses import JSONResponse
 
 from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token, sync_auth_token
+from cowork.coding.inference_proxy import INFERENCE_PATHS
 from cowork.db.scoped import MissingTenantScopeError
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.common.logger import setup_logging
@@ -94,9 +95,44 @@ async def _warm_model_map_on_boot() -> bool:
         warm_session.close()
 
 
+async def _cancel_and_wait(task: asyncio.Task | None) -> None:
+    """Stop one background task at shutdown and wait for it to finish."""
+    if task is None:
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def _run_artifact_owner_backfill() -> None:
+    """Background, one-time owner backfill (ENG-2961). Never affects startup."""
+    try:
+        from cowork.services.artifact_owner_backfill import run_artifact_owner_backfill
+
+        await asyncio.to_thread(run_artifact_owner_backfill)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("artifact owner backfill failed (non-fatal)")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_dev_setup()
+    # History recovery also retries buffers sealed by an earlier failed sweep.
+    try:
+        from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
+        from cowork.db.session import get_open_session
+        from cowork.streaming import get_streams_dir
+        from cowork.streaming.recovery import seal_orphan_turns_in_history
+
+        history_session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
+        try:
+            seal_orphan_turns_in_history(history_session, get_streams_dir())
+        finally:
+            history_session.close()
+    except Exception:
+        logger.exception("turn-history boot recovery failed (non-fatal)")
     # Seal any turn buffers left open by a previous process (crash/restart)
     # so reconnecting clients get a clean Interrupted end-of-stream rather
     # than hanging. GC of old buffers happens lazily; cheap no-op when none.
@@ -148,34 +184,50 @@ async def lifespan(app: FastAPI):
     start_scheduler()
     await _start_channels(app)
     app.state.channel_ingress_reconciler = None
+    app.state.artifact_owner_backfill = None
     if get_app_settings().tenancy_mode == "org":
         from cowork.channels.ingress import start_reconciler
 
         app.state.channel_ingress_reconciler = start_reconciler(
             app.state.channel_ingress, app.state.channel_adapters
         )
+        # Background so the port binds without waiting for an EFS walk.
+        app.state.artifact_owner_backfill = asyncio.create_task(
+            _run_artifact_owner_backfill()
+        )
     try:
         yield
     finally:
         from cowork.channels.webhooks import drain_background_tasks
+        from cowork.common.chat_session import drain_scratchpad_closes
         from cowork.common.http_client import close_proxy_client
+        from cowork.coding.inference_proxy import close_inference_client
         from cowork.services.artifacts import shutdown_launched_backends
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
         from cowork.coding.service import get_coding_service
+        from cowork.streaming.registry import registry
 
-        reconciler = getattr(app.state, "channel_ingress_reconciler", None)
-        if reconciler is not None:
-            reconciler.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await reconciler
+        # Uvicorn's request drain is bounded by the image command. Persist
+        # interrupted turns before their database and runtime resources close.
+        cancelled = await registry.shutdown()
+        if cancelled:
+            logger.warning("Cancelled %d in-flight turn(s) for shutdown", cancelled)
+
+        await _cancel_and_wait(getattr(app.state, "channel_ingress_reconciler", None))
+        await _cancel_and_wait(getattr(app.state, "artifact_owner_backfill", None))
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
+        # After both turn drains above: each turn they unwound has queued the
+        # close of its scratchpad processes, and those must finish before the
+        # event loop stops.
+        await drain_scratchpad_closes()
         await app.state.channel_adapters.shutdown()
         get_coding_service().close_all()
         shutdown_launched_backends()
         await close_scratchpads()
         await close_proxy_client()
+        await close_inference_client()
 
 
 class _NoStoreMiddleware:
@@ -227,10 +279,10 @@ def create_app() -> FastAPI:
     async def _missing_tenant_scope(request, exc):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
-    # Optional bearer-token auth.  Off by default; enabled when
-    # COWORK_REQUIRE_AUTH=true.  Token is auto-generated on first startup
-    # when COWORK_AUTH_TOKEN is not set, then persisted to <cowork_home>/.env
-    # so the desktop app and subsequent server runs share the same secret.
+    # Bearer-token auth. On by default in local mode (see AppSettings.
+    # require_auth). Token is auto-generated on first startup when
+    # COWORK_AUTH_TOKEN is not set, then persisted to <cowork_home>/.env so
+    # the desktop app and subsequent server runs share the same secret.
     #
     # Registered BEFORE CORS so CORS ends up the outer layer (Starlette applies
     # the last-added middleware outermost): a 401 from the auth layer still
@@ -284,6 +336,13 @@ def create_app() -> FastAPI:
         env_path = cowork_home() / ".env"
         token = settings.auth_token or ensure_auth_token(env_path)
         sync_auth_token(env_path, token)
+        # Codex has a separate, process-local inference credential, not the
+        # desktop's API token. These exact routes retain their own constant-time
+        # credential check and LoopbackDesktopOnly guard. Do not exempt the
+        # coding prefix: that would expose task/filesystem APIs to the agent.
+        channel_webhook_paths.update(
+            f"/api/v1/coding/inference/{path}" for path in INFERENCE_PATHS
+        )
         app.add_middleware(
             BearerTokenMiddleware, token=token, exempt_paths=channel_webhook_paths
         )

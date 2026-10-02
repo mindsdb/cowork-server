@@ -112,6 +112,94 @@ def test_app_settings_rejects_invalid_tenancy_mode(monkeypatch):
         AppSettings(_env_file=None)
 
 
+def test_require_auth_defaults_on_in_local_mode(monkeypatch):
+    monkeypatch.delenv("COWORK_REQUIRE_AUTH", raising=False)
+    monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+    monkeypatch.delenv("COWORK_SERVER_HOST", raising=False)
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.tenancy_mode == "local"
+    assert settings.require_auth is True
+
+
+def test_require_auth_defaults_on_for_token_aware_desktop(monkeypatch):
+    monkeypatch.delenv("COWORK_REQUIRE_AUTH", raising=False)
+    monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+    monkeypatch.setenv("COWORK_SERVER_HOST", "127.0.0.1")
+    monkeypatch.setenv("COWORK_SERVER_OWNER", "abc123")
+
+    assert AppSettings(_env_file=None).require_auth is True
+
+
+@pytest.mark.parametrize("owner", [None, ""])
+def test_require_auth_defaults_off_for_pre_token_desktop(monkeypatch, owner):
+    # Desktop builds before 2026-07-05 launch the auto-updated server with
+    # host/port but no owner, and never send the bearer token.
+    monkeypatch.delenv("COWORK_REQUIRE_AUTH", raising=False)
+    monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+    if owner is None:
+        monkeypatch.delenv("COWORK_SERVER_OWNER", raising=False)
+    else:
+        monkeypatch.setenv("COWORK_SERVER_OWNER", owner)
+    monkeypatch.setenv("COWORK_SERVER_HOST", "127.0.0.1")
+
+    assert AppSettings(_env_file=None).require_auth is False
+
+
+def test_require_auth_defaults_on_for_docker_image(monkeypatch):
+    # The all-in-one image binds every interface and sets no owner.
+    monkeypatch.delenv("COWORK_REQUIRE_AUTH", raising=False)
+    monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+    monkeypatch.delenv("COWORK_SERVER_OWNER", raising=False)
+    monkeypatch.setenv("COWORK_SERVER_HOST", "0.0.0.0")
+
+    assert AppSettings(_env_file=None).require_auth is True
+
+
+def test_require_auth_explicit_true_wins_for_pre_token_desktop(monkeypatch):
+    monkeypatch.setenv("COWORK_REQUIRE_AUTH", "true")
+    monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+    monkeypatch.delenv("COWORK_SERVER_OWNER", raising=False)
+    monkeypatch.setenv("COWORK_SERVER_HOST", "127.0.0.1")
+
+    assert AppSettings(_env_file=None).require_auth is True
+
+
+def test_require_auth_stays_off_in_org_mode_by_default(monkeypatch):
+    # create_app() refuses to boot with require_auth=True in org mode (the
+    # token would be mirrored into shared storage every org can read) — so
+    # defaulting it on there would turn "nobody configured this" into a boot
+    # failure instead of leaving the ingress as org's own auth boundary.
+    monkeypatch.delenv("COWORK_REQUIRE_AUTH", raising=False)
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.require_auth is False
+
+
+def test_require_auth_explicit_false_is_respected_in_local_mode(monkeypatch):
+    monkeypatch.setenv("COWORK_REQUIRE_AUTH", "false")
+    monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.require_auth is False
+
+
+def test_require_auth_explicit_true_is_respected_in_org_mode(monkeypatch):
+    # Not the recommended shape (create_app() still refuses to boot this
+    # combination) — this only pins that the settings layer itself doesn't
+    # second-guess an explicit choice, boot-time refusal is create_app()'s job.
+    monkeypatch.setenv("COWORK_REQUIRE_AUTH", "true")
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+
+    settings = AppSettings(_env_file=None)
+
+    assert settings.require_auth is True
+
+
 def test_single_tenant_harness_hidden_from_options_in_org_mode(monkeypatch):
     from cowork.common.settings.app_settings import get_app_settings
     from cowork.common.settings.user_settings import _harness_options
@@ -191,6 +279,14 @@ def test_turn_queue_settings_is_remote(monkeypatch):
 
     monkeypatch.delenv("COWORK_TURN_BACKEND", raising=False)
     assert TurnQueueSettings().is_remote is False  # default is "inprocess"
+
+
+def test_turn_queue_settings_jev_shadow_is_off_unless_the_env_turns_it_on(monkeypatch):
+    monkeypatch.delenv("COWORK_TURN_JEV_SHADOW_ENABLED", raising=False)
+    assert TurnQueueSettings(_env_file=None).jev_shadow_enabled is False
+
+    monkeypatch.setenv("COWORK_TURN_JEV_SHADOW_ENABLED", "true")
+    assert TurnQueueSettings(_env_file=None).jev_shadow_enabled is True
 
 
 def test_stale_organization_boundary_mode_env_var_is_inert(monkeypatch):

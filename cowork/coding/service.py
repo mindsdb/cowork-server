@@ -3,11 +3,14 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from functools import lru_cache
 from pathlib import Path
 
 from cowork.coding.approvals import ApprovalBroker
+from cowork.coding.questions import QuestionBroker
+from cowork.coding.service_questions import CodingQuestionOperations
+from cowork.coding.service_planning import CodingPlanningOperations
 from cowork.coding.commands import CodingCommandHandler
 from cowork.coding.context import (
     validate_directories,
@@ -28,10 +31,11 @@ from cowork.coding.contracts import (
     WorkspaceInspection,
 )
 from cowork.coding.control_errors import StateConflict
-from cowork.coding.control_models import RunStatus
+from cowork.coding.control_models import CodeTask, RunStatus
 from cowork.coding.control_service import ControlPlaneService
 from cowork.coding.control_store import ControlPlaneStore
 from cowork.coding.delivery import ProjectDeliveryService
+from cowork.coding.integrations import local_repository_credentials
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.engines.registry import CodingEngineRegistry, engine_registry
 from cowork.coding.playbooks import PlaybookService
@@ -42,6 +46,7 @@ from cowork.coding.project_models import (
     ProjectActionPage,
     ProjectActionRunRequest,
     ProjectActionRunResponse,
+    ProjectCommandRefresh,
 )
 from cowork.coding.project_store import CodeProjectStore
 from cowork.coding.project_tasks import ProjectTaskOperations
@@ -61,14 +66,16 @@ from cowork.coding.skill_runtime import SkillRuntimeResolver
 from cowork.coding.store import CodingStore
 from cowork.coding.task_delivery import TaskDeliveryService
 from cowork.coding.terminal_service import TaskTerminalService
-from cowork.coding.turns import RunningTurn, TurnExecutor
-from cowork.coding.workspace import WorkspaceManager
-from cowork.common.paths import cowork_home
+from cowork.coding.turns import RunningTurn, TurnExecutor, fail_turn
+from cowork.coding.workspace import WorkspaceError, WorkspaceManager
+from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
 
 
 class CodingService(
+    CodingPlanningOperations,
+    CodingQuestionOperations,
     CodingWorkspaceFilesOperations,
     CodingDeliveryOperations,
     CodingTerminalOperations,
@@ -108,13 +115,17 @@ class CodingService(
         )
         self.playbooks = PlaybookService(root, self.project_store, self.workspaces.git)
         self.skill_runtime = SkillRuntimeResolver(self.skill_library)
-        self.project_workspaces = ProjectWorkspaceManager(self.workspaces)
+        self.project_workspaces = ProjectWorkspaceManager(self.workspaces, repository_credentials=local_repository_credentials)
         self.delivery = ProjectDeliveryService(self.workspaces.git)
         self._lock = threading.RLock()
         self._running: dict[str, RunningTurn] = {}
         self._maintenance: set[str] = set()
-        self.approvals = ApprovalBroker(self._approval_opened, self._approval_closed)
-        self.runtimes = RuntimeManager(root, self.registry, self.approvals.request)
+        self.approvals = ApprovalBroker(
+            self._approval_opened, self._approval_closed,
+            lambda session_id: self.store.load_session(session_id).command_approval_grants,
+        )
+        self.questions = QuestionBroker(self._question_opened, self._question_closed)
+        self.runtimes = RuntimeManager(root, self.registry, self._engine_request)
         self.lifecycle = SessionLifecycleOperations(
             maintenance_session=self._maintenance_session,
             emit=self._emit,
@@ -129,7 +140,7 @@ class CodingService(
             lock=self._lock,
         )
         self.project_tasks = ProjectTaskOperations(
-            get_session=self.get_session,
+            get_session=self._prepared_session,
             maintenance_session=self._maintenance_session,
             emit=self._emit,
             store=self.store,
@@ -175,10 +186,10 @@ class CodingService(
             self.store,
             self.runtimes,
             self.remote,
-            self.get_session,
+            self._prepared_session,
         )
         self.project_actions = ProjectActionService(
-            get_session=self.get_session,
+            get_session=self._prepared_session,
             projects=self.projects,
             terminals=self.task_terminals,
             get_computer=self.control.store.get_computer,
@@ -196,6 +207,7 @@ class CodingService(
         )
         self.store.reconcile_interrupted()
         for session in self.store.list_sessions():
+            session = self._fail_abandoned_preparation(session)
             try:
                 project = self.projects.get(session.project_id) if session.project_id else None
             except (KeyError, ValueError) as exc:
@@ -253,6 +265,33 @@ class CodingService(
         except (FileNotFoundError, ValueError) as exc:
             raise KeyError("coding session not found") from exc
 
+    def _prepared_session(self, session_id: str) -> CodingSession:
+        """Return a task whose workspace exists, refusing one still preparing."""
+        session = self.get_session(session_id)
+        if not session.workspace_path and not self._is_remote(session):
+            raise RuntimeError("The task workspace is still being prepared")
+        return session
+
+    def _fail_abandoned_preparation(self, session: CodingSession) -> CodingSession:
+        # A local task with no workspace was preparing when the previous
+        # process stopped; nothing will finish that preparation now.
+        if session.workspace_path or not session.run_id or self._is_remote(session):
+            return session
+        try:
+            run = self.control.store.get_run(session.run_id)
+        except KeyError:
+            return session
+        if run.status != RunStatus.preparing:
+            return session
+        message = "The app stopped before the task workspace was ready. Start the task again."
+        self.store.append_event(
+            session.id,
+            CodingEvent(type=EventType.error, title="Task did not start", text=message, phase="failed"),
+            lambda current: fail_turn(current, False, message),
+        )
+        self.control.set_run_status(run.id, RunStatus.failed)
+        return self.store.load_session(session.id)
+
     def _control_view(self, session: CodingSession) -> CodingSession:
         """Project canonical Task Run state onto the compatibility session."""
 
@@ -286,6 +325,22 @@ class CodingService(
 
     def delete_session(self, session_id: str) -> None:
         session = self.get_session(session_id)
+        with self._lock:
+            preparing = self._running.get(session_id)
+            if preparing is not None and preparing.preparing:
+                # Deleting stops preparation. The preparation thread releases
+                # any workspace it has already made once its current step ends.
+                preparing.cancel_requested = True
+                preparing.delete_requested = True
+            else:
+                preparing = None
+        if preparing is not None:
+            with suppress(FileNotFoundError):
+                self.store.delete_session(session.id)
+            self.skill_runtime.cleanup(session.id)
+            if session.run_id:
+                self.control.delete_task(session.run_id)
+            return
         if self._is_remote(session):
             self.remote.require_idle(session, "deleting this coding task")
             self.remote.release_workspace(session)
@@ -311,7 +366,7 @@ class CodingService(
         return self.lifecycle.set_pinned(session_id, pinned)
 
     def fork_session(self, session_id: str, credentials: EngineCredentials) -> CodingSession:
-        session = self.get_session(session_id)
+        session = self._prepared_session(session_id)
         self._require_task_capability(session, TaskCapability.fork)
         return self.get_session(self.lifecycle.fork_session(session_id, credentials).id)
 
@@ -416,18 +471,18 @@ class CodingService(
         return self.registry.get(engine_id).discover_models(credentials)
 
     def extension_inventory(self, session_id: str, credentials: EngineCredentials):
-        session = self.get_session(session_id)
+        session = self._prepared_session(session_id)
         self._require_task_capability(session, TaskCapability.extensions)
         runtime = self.runtimes.open(session, credentials)
         return runtime.extension_inventory()
 
     def platform_status(self, session_id: str, credentials: EngineCredentials):
-        session = self.get_session(session_id)
+        session = self._prepared_session(session_id)
         self._require_task_capability(session, TaskCapability.platform_settings)
         return self.runtimes.open(session, credentials).platform_status()
 
     def setup_windows_sandbox(self, session_id: str, credentials: EngineCredentials):
-        session = self.get_session(session_id)
+        session = self._prepared_session(session_id)
         self._require_task_capability(session, TaskCapability.platform_settings)
         return self.runtimes.open(session, credentials).setup_windows_sandbox()
 
@@ -463,6 +518,72 @@ class CodingService(
     def project_action_page(self, session_id: str) -> ProjectActionPage:
         return self.project_actions.list(session_id)
 
+    def refresh_project_commands(self, session_id: str) -> ProjectCommandRefresh:
+        """Let an existing task adopt the commands now saved in Project settings.
+
+        A task freezes its project at creation, so commands added later reach
+        only new tasks. This is the explicit opt-in for an older task; it
+        touches commands alone and leaves the task's resource scope frozen.
+        """
+
+        session = self.get_session(session_id)
+        if not session.project_id or not session.task_id:
+            raise WorkspaceError("This task is not linked to a Code Project")
+        project = self.projects.get(session.project_id)
+        task = self.control.refresh_task_commands(session.task_id, project)
+        self._push_commands_to_active_lease(session, task)
+        # The snapshot holds only the resources in the task's scope, so its
+        # commands are exactly the ones this task can be offered.
+        commands = [
+            command
+            for resource in (task.execution_project.resources if task.execution_project else [])
+            for command in resource.commands
+        ]
+        summary = ProjectCommandRefresh(
+            validate_count=sum(command.phase == "validate" for command in commands),
+            run_count=sum(command.phase == "run" for command in commands),
+        )
+        self._emit(
+            session.id,
+            CodingEvent(
+                type=EventType.session,
+                title="Project commands updated",
+                text=(
+                    f"This task now uses the commands saved in Project settings: "
+                    f"{summary.validate_count} validation, {summary.run_count} run."
+                ),
+                phase="completed",
+            ),
+        )
+        return summary
+
+    def _push_commands_to_active_lease(self, session: CodingSession, task: CodeTask) -> None:
+        """A leased remote worker holds its own copy of the project, so hand it the new commands.
+
+        A run that has not been leased yet reads the refreshed snapshot when
+        it is, and a finished run cannot run checks at all, so only an active
+        lease needs the push. If the worker does not take it, the saved
+        commands stay saved and the caller hears that the computer lagged,
+        rather than a success it would contradict on the next Run checks.
+        """
+
+        if not self._is_remote(session) or not session.run_id or task.execution_project is None:
+            return
+        run = self.control.store.get_run(session.run_id)
+        if not run.lease_id or run.status in {RunStatus.completed, RunStatus.cancelled, RunStatus.failed}:
+            return
+        commands = {
+            resource.id: [command.model_dump(mode="json") for command in resource.commands]
+            for resource in task.execution_project.resources
+        }
+        try:
+            self.remote.operation(session, "refresh_project", {"commands": commands})
+        except RuntimeError as exc:
+            raise WorkspaceError(
+                "The commands were saved, but the selected computer has not picked them up yet "
+                f"({exc}). Retry once it is online."
+            ) from exc
+
     def _execution_project(self, session: CodingSession) -> CodeProject | None:
         if not session.task_id:
             return None
@@ -489,13 +610,18 @@ class CodingService(
         """Checkpoint active turns before the desktop terminates the sidecar tree."""
         with self._lock:
             active_sessions = list(self._running)
+            for running in self._running.values():
+                running.cancel_requested = True
         for session_id in active_sessions:
             try:
-                self.approvals.cancel_session(session_id)
+                try:
+                    self.questions.cancel_session(session_id)
+                finally:
+                    self.approvals.cancel_session(session_id)
             except Exception:
                 # Shutdown must continue releasing the remaining tasks and
                 # runtimes even if one persisted approval cannot be updated.
-                logger.exception("Could not cancel approval while shutting down task %s", session_id)
+                logger.exception("Could not cancel pending input while shutting down task %s", session_id)
         return self.turns.interrupt(active_sessions)
 
     def _approval_opened(self, session_id: str, pending: PendingApproval) -> None:
@@ -518,7 +644,15 @@ class CodingService(
             lambda current: self._open_approval(current, pending),
         )
 
-    def _approval_closed(self, session_id: str, pending: PendingApproval, decision: ApprovalDecision) -> None:
+    def _approval_closed(
+        self, session_id: str, pending: PendingApproval, decision: ApprovalDecision,
+        command_grant: str | None = None,
+    ) -> None:
+        def close_and_remember(current: CodingSession) -> None:
+            self._close_approval(current)
+            if command_grant and command_grant not in current.command_approval_grants:
+                current.command_approval_grants = [*current.command_approval_grants[-255:], command_grant]
+
         self._emit(
             session_id,
             CodingEvent(
@@ -528,7 +662,7 @@ class CodingService(
                 phase="completed",
                 data={"approvalId": pending.id, "decision": decision.value},
             ),
-            self._close_approval,
+            close_and_remember,
         )
 
     def _emit(
@@ -559,6 +693,11 @@ class CodingService(
 
     @staticmethod
     def _apply_config_update(session: CodingSession, values: dict) -> None:
+        if any(
+            name in values and values[name] != getattr(session, name)
+            for name in ("permission_mode", "network_access", "additional_dirs")
+        ):
+            session.command_approval_grants = []
         for name, value in values.items():
             setattr(session, name, value)
 
@@ -600,4 +739,4 @@ class CodingService(
 
 @lru_cache(maxsize=1)
 def get_coding_service() -> CodingService:
-    return CodingService(cowork_home() / "coding")
+    return CodingService(Path(get_app_settings().coding.root_dir))
