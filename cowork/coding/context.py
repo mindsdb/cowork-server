@@ -58,6 +58,20 @@ def workspace_files(session: CodingSession, query: str = "", limit: int = 40) ->
     return matches
 
 
+def require_attachments_exist(attachments: list[InputReference] | tuple[InputReference, ...]) -> None:
+    """Reject absolute attachment paths that are already missing.
+
+    A new task validates its attachments against the prepared workspace only
+    when its first turn starts, so check the obvious failure up front.
+    """
+    for item in attachments:
+        if item.resource_id and item.relative_path:
+            continue
+        path = Path(item.path)
+        if path.is_absolute() and not path.exists():
+            raise ValueError(f"Attached file is unavailable: {item.name}")
+
+
 def validate_references(
     session: CodingSession,
     attachments: list[InputReference] | tuple[InputReference, ...],

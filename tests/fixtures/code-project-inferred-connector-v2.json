@@ -1,0 +1,51 @@
+{
+  "schema_version": 2,
+  "id": "legacy-public",
+  "name": "Legacy public project",
+  "resources": [
+    {
+      "kind": "repository",
+      "id": "repo",
+      "name": "Public",
+      "source_url": "https://github.com/acme/public.git",
+      "provider": "github",
+      "repository": "acme/public",
+      "connector_name": "work",
+      "local_path": null,
+      "computer_id": null,
+      "default_branch": null,
+      "checkout_strategy": "worktree",
+      "commands": []
+    }
+  ],
+  "folders": [
+    {
+      "id": "repo",
+      "name": "Public",
+      "path": "https://github.com/acme/public.git",
+      "base_branch": null,
+      "commands": []
+    }
+  ],
+  "playbook": null,
+  "skill_sources": [],
+  "connections": [
+    {
+      "provider": "github",
+      "name": "work",
+      "label": ""
+    }
+  ],
+  "environment": {
+    "variables": {},
+    "port_names": [
+      "PORT"
+    ]
+  },
+  "default_engine_id": "codex",
+  "default_model": "gpt",
+  "default_reasoning_effort": null,
+  "permission_mode": "supervised",
+  "created_at": "2026-09-25T00:00:00Z",
+  "updated_at": "2026-09-25T00:00:00Z"
+}

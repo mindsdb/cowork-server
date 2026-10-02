@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import difflib
+import errno
 import hashlib
 import logging
 import os
 import shutil
 import stat
+import sys
+from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,6 +27,73 @@ MAX_LOCAL_TEXT_BYTES = 2 * 1024 * 1024
 
 class LocalCopyError(RuntimeError):
     pass
+
+
+class CloneUnavailable(OSError):
+    """The filesystem cannot clone this tree, so a byte copy is needed instead."""
+
+
+_libc: ctypes.CDLL | None = None
+
+
+def _clone_tree(source: Path, target: Path) -> None:
+    """Clone a whole directory tree copy-on-write in one call (APFS only).
+
+    A 7 GB, 289k-file folder clones in about 9 s, where ``copytree`` takes
+    about a minute, and the clone shares blocks with its source until either
+    side writes. Raises CloneUnavailable when the platform, filesystem or
+    volume pair cannot clone, so the caller can fall back to a byte copy.
+    """
+    global _libc
+    if sys.platform != "darwin":
+        raise CloneUnavailable(errno.ENOTSUP, "clonefile is macOS only")
+    if _libc is None:
+        _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+    if _libc.clonefile(os.fsencode(source), os.fsencode(target), 0) != 0:
+        code = ctypes.get_errno()
+        raise CloneUnavailable(code, os.strerror(code), str(source))
+
+
+@contextmanager
+def _writable(directory: Path) -> Iterator[None]:
+    """Let the owner remove entries from a directory, then restore its mode.
+
+    A clone keeps directory modes, so a source folder marked read-only yields
+    a read-only directory the sweep cannot unlink from.
+    """
+    mode = os.lstat(directory).st_mode
+    writable = mode | stat.S_IWUSR | stat.S_IXUSR
+    if writable != mode:
+        os.chmod(directory, stat.S_IMODE(writable))
+    try:
+        yield
+    finally:
+        if writable != mode:
+            os.chmod(directory, stat.S_IMODE(mode))
+
+
+def _force_remove(path: Path) -> None:
+    """Remove a managed tree even where its directories are read-only."""
+
+    def retry_writable(function, failed: str, _exc: BaseException) -> None:
+        parent = os.path.dirname(failed)
+        with suppress(OSError):
+            os.chmod(parent, stat.S_IMODE(os.lstat(parent).st_mode) | stat.S_IWUSR | stat.S_IXUSR)
+            function(failed)
+
+    if path.exists() or path.is_symlink():
+        shutil.rmtree(path, onexc=retry_writable)
+
+
+@dataclass(frozen=True)
+class _Entry:
+    """A tree entry as review and handoff compare it; file content is read only on demand."""
+
+    kind: str
+    mode: int = 0
+    size: int = 0
+    mtime_ns: int = 0
+    target: str = ""
 
 
 @dataclass(frozen=True)
@@ -49,11 +123,11 @@ class LocalCopyManager:
         workspace.parent.mkdir(parents=True, exist_ok=True)
         baseline.parent.mkdir(parents=True, exist_ok=True)
         try:
-            shutil.copytree(source, baseline, symlinks=True, ignore=self._skip_unsupported)
-            shutil.copytree(source, workspace, symlinks=True, ignore=self._skip_unsupported)
+            self._copy_tree(source, baseline)
+            self._copy_tree(source, workspace)
         except Exception as exc:
-            shutil.rmtree(workspace, ignore_errors=True)
-            shutil.rmtree(baseline, ignore_errors=True)
+            _force_remove(workspace)
+            _force_remove(baseline)
             if isinstance(exc, OSError):
                 raise self._copy_failure("The task folder could not be copied", exc) from exc
             raise
@@ -72,11 +146,11 @@ class LocalCopyManager:
         # inherited changes disappear from review and handoff.
         parent_baseline = self._baseline_for(current_workspace)
         try:
-            shutil.copytree(current_workspace, workspace, symlinks=True, ignore=self._skip_unsupported)
-            shutil.copytree(parent_baseline, baseline, symlinks=True, ignore=self._skip_unsupported)
+            self._copy_tree(current_workspace, workspace)
+            self._copy_tree(parent_baseline, baseline)
         except Exception as exc:
-            shutil.rmtree(workspace, ignore_errors=True)
-            shutil.rmtree(baseline, ignore_errors=True)
+            _force_remove(workspace)
+            _force_remove(baseline)
             if isinstance(exc, OSError):
                 raise self._copy_failure("The existing task copy could not be duplicated", exc) from exc
             raise
@@ -84,15 +158,11 @@ class LocalCopyManager:
 
     def diff(self, workspace: Path) -> list[DiffFile]:
         baseline = self._baseline_for(workspace)
-        before = self._manifest(baseline)
-        after = self._manifest(workspace)
-        paths = sorted(set(before) | set(after))
+        before, after = self._manifests(baseline, workspace)
         files: list[DiffFile] = []
-        for relative in paths:
+        for relative in self._changed(baseline, before, workspace, after):
             old = before.get(relative)
             new = after.get(relative)
-            if old == new:
-                continue
             status = "A" if old is None else "D" if new is None else "M"
             patch, binary = self._patch(baseline / relative, workspace / relative, relative)
             additions = sum(1 for line in patch.splitlines() if line.startswith("+") and not line.startswith("+++"))
@@ -118,10 +188,8 @@ class LocalCopyManager:
 
     def preflight(self, source: Path, workspace: Path) -> list[str]:
         baseline = self._baseline_for(workspace)
-        before = self._manifest(baseline)
-        current_source = self._manifest(source)
-        task = self._manifest(workspace)
-        changed = sorted(path for path in set(before) | set(task) if before.get(path) != task.get(path))
+        before, current_source, task = self._manifests(baseline, source, workspace)
+        changed = self._changed(baseline, before, workspace, task)
         # A skipped entry is in no manifest, so a task file at its path reads as
         # a clean addition and would replace a live socket, pipe or device.
         occupied = self._occupied_by_special(source, changed)
@@ -129,7 +197,11 @@ class LocalCopyManager:
             preview = ", ".join(occupied[:5])
             suffix = "…" if len(occupied) > 5 else ""
             raise LocalCopyError(f"Handoff stopped before changing the source; a socket, pipe or device still occupies: {preview}{suffix}")
-        conflicts = [path for path in changed if current_source.get(path) != before.get(path)]
+        conflicts = [
+            path
+            for path in changed
+            if not self._same(path, baseline, before.get(path), source, current_source.get(path))
+        ]
         if conflicts:
             preview = ", ".join(conflicts[:5])
             suffix = "…" if len(conflicts) > 5 else ""
@@ -185,7 +257,7 @@ class LocalCopyManager:
             if recovery.exists():
                 shutil.rmtree(recovery)
             try:
-                shutil.copytree(workspace, recovery, symlinks=True, ignore=self._skip_unsupported)
+                self._copy_tree(workspace, recovery)
             except OSError as exc:
                 raise self._copy_failure("The task copy could not be saved for recovery", exc) from exc
         shutil.rmtree(workspace, ignore_errors=True)
@@ -214,6 +286,37 @@ class LocalCopyManager:
             return path.relative_to(root.resolve())
         except ValueError:
             return None
+
+    @classmethod
+    def _copy_tree(cls, source: Path, target: Path) -> None:
+        try:
+            _clone_tree(source, target)
+            cls._remove_unsupported(target)
+        except OSError as exc:
+            logger.debug("Falling back to a byte copy of %s: %s", source, exc)
+            # A failed clone or sweep can leave a partial tree behind, possibly
+            # with read-only directories.
+            _force_remove(target)
+            shutil.copytree(source, target, symlinks=True, ignore=cls._skip_unsupported)
+
+    @classmethod
+    def _remove_unsupported(cls, root: Path) -> None:
+        # A clone reproduces sockets, FIFOs and device nodes as inert entries.
+        # Drop them so a cloned tree matches what the byte copy produces.
+        pending = [root]
+        while pending:
+            directory = pending.pop()
+            with os.scandir(directory) as entries:
+                special = []
+                for entry in entries:
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(Path(entry.path))
+                    elif not entry.is_file(follow_symlinks=False) and not entry.is_symlink():
+                        special.append(entry.path)
+            if special:
+                with _writable(directory):
+                    for path in special:
+                        os.unlink(path)
 
     @staticmethod
     def _copy_failure(subject: str, exc: OSError) -> LocalCopyError:
@@ -264,42 +367,98 @@ class LocalCopyManager:
                 occupied.append(relative)
         return occupied
 
+    @classmethod
+    def _changed(
+        cls,
+        before_root: Path,
+        before: dict[str, _Entry],
+        after_root: Path,
+        after: dict[str, _Entry],
+    ) -> list[str]:
+        return [
+            relative
+            for relative in sorted(set(before) | set(after))
+            if not cls._same(relative, before_root, before.get(relative), after_root, after.get(relative))
+        ]
+
+    @classmethod
+    def _same(
+        cls,
+        relative: str,
+        left_root: Path,
+        left: _Entry | None,
+        right_root: Path,
+        right: _Entry | None,
+    ) -> bool:
+        if left is None or right is None:
+            return left is right
+        if left.kind != right.kind or left.mode != right.mode or left.target != right.target:
+            return False
+        if left.kind != "file":
+            return True
+        if left.size != right.size:
+            return False
+        # Clones and copy2 keep modification times, so an untouched file
+        # matches on stat and is never read. This is git's index heuristic.
+        if left.mtime_ns == right.mtime_ns:
+            return True
+        return cls._digest(left_root / relative) == cls._digest(right_root / relative)
+
     @staticmethod
-    def _manifest(root: Path) -> dict[str, str]:
-        result: dict[str, str] = {}
+    def _digest(path: Path) -> str:
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            return "unreadable"
+        return digest.hexdigest()
+
+    @classmethod
+    def _manifests(cls, *roots: Path) -> list[dict[str, _Entry]]:
+        # A walk is dominated by lstat calls, which release the GIL, so the
+        # trees are walked side by side.
+        with ThreadPoolExecutor(max_workers=len(roots)) as pool:
+            return list(pool.map(cls._manifest, roots))
+
+    @staticmethod
+    def _manifest(root: Path) -> dict[str, _Entry]:
+        """Stat every reviewable entry under ``root`` without reading content.
+
+        Keep Git metadata in isolated copies so nested repositories remain
+        usable, but never scan it as source content for review or handoff.
+        A symlinked directory is one link entry and is never descended.
+        """
+        result: dict[str, _Entry] = {}
         if not root.is_dir():
             return result
-        paths: list[Path] = []
-        # Keep Git metadata in isolated copies so nested repositories remain
-        # usable, but never scan it as source content for review or handoff.
-        for directory, directories, filenames in os.walk(root, topdown=True, followlinks=False):
-            current = Path(directory)
-            retained: list[str] = []
-            for name in sorted(directories):
-                path = current / name
-                if name == ".git":
-                    continue
-                if path.is_symlink():
-                    paths.append(path)
-                else:
-                    retained.append(name)
-            directories[:] = retained
-            paths.extend(current / name for name in sorted(filenames) if name != ".git")
-
-        for path in sorted(paths):
-            relative = path.relative_to(root).as_posix()
+        pending: list[tuple[str, str]] = [(str(root), "")]
+        while pending:
+            directory, prefix = pending.pop()
             try:
-                info = path.lstat()
-                if stat.S_ISLNK(info.st_mode):
-                    result[relative] = f"link:{os.readlink(path)}"
-                elif stat.S_ISREG(info.st_mode):
-                    digest = hashlib.sha256()
-                    with path.open("rb") as handle:
-                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                            digest.update(chunk)
-                    result[relative] = f"file:{info.st_mode & 0o777}:{digest.hexdigest()}"
+                entries = list(os.scandir(directory))
             except OSError:
-                result[relative] = "unreadable"
+                continue
+            for entry in entries:
+                if entry.name == ".git":
+                    continue
+                relative = prefix + entry.name
+                try:
+                    if entry.is_symlink():
+                        result[relative] = _Entry("link", target=os.readlink(entry.path))
+                    elif entry.is_dir(follow_symlinks=False):
+                        pending.append((entry.path, relative + "/"))
+                    elif entry.is_file(follow_symlinks=False):
+                        info = entry.stat(follow_symlinks=False)
+                        result[relative] = _Entry(
+                            "file",
+                            mode=info.st_mode & 0o777,
+                            size=info.st_size,
+                            mtime_ns=info.st_mtime_ns,
+                        )
+                except OSError:
+                    result[relative] = _Entry("unreadable")
         return result
 
     @staticmethod
