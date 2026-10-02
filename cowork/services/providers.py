@@ -1510,7 +1510,7 @@ def build_llm_client(
     supports_api_key_provider = "api_key_provider" in openai_provider_params
     warned_about_static_runtime_credential = False
 
-    def _make_provider(role: Provider, effort: str | None = None):
+    def _make_provider(role: Provider, effort: str | None = None, *, model: str | None = None):
         nonlocal warned_about_static_runtime_credential
         # Only pass reasoning_effort when it's actually set. This keeps
         # build_llm_client compatible with anton builds whose provider __init__
@@ -1616,7 +1616,7 @@ def build_llm_client(
         # base is None for anthropic/openai → SDK default host (OpenAIProvider
         # accepts base_url=None; AnthropicProvider takes no base_url kwarg).
         #
-        # Direct OpenAI deliberately keeps the default (generic) flavor. The
+        # Legacy OpenAI models keep the default (generic) flavor. The
         # flavor that would enable OpenAI's native web tools, FLAVOR_OPENAI,
         # also switches the whole transport from chat.completions to the
         # Responses API, whose path in anton does not yet:
@@ -1627,7 +1627,16 @@ def build_llm_client(
         # - attach Langfuse trace headers.
         # Native web search here waits on those gaps being closed in anton.
         if cls is OpenAIProvider:
-            return cls(api_key=key.get_secret_value(), base_url=base, **effort_kw)
+            # New OpenAI model families use the native Responses transport,
+            # including function tools with a reasoning effort. Keep legacy
+            # models and compatible endpoints on their existing transport.
+            transport_kw = (
+                {"flavor": OpenAIProvider.FLAVOR_OPENAI}
+                if (model or "").startswith(("gpt-6", "gpt-5.6"))
+                else {}
+            )
+            return cls(api_key=key.get_secret_value(), base_url=base,
+                       **transport_kw, **effort_kw)
         return cls(api_key=key.get_secret_value(), **effort_kw)
 
     # Routing & summarization role: the cheap front-model that runs history
@@ -1640,7 +1649,7 @@ def build_llm_client(
         _params = inspect.signature(LLMClient.__init__).parameters
         if "router_provider" in _params:
             router_kw = {
-                "router_provider": _make_provider(settings.resolved_router_provider, None),
+                "router_provider": _make_provider(settings.resolved_router_provider, None, model=router_model),
                 "router_model": router_model,
             }
     except (ValueError, TypeError):
@@ -1676,11 +1685,13 @@ def build_llm_client(
         planning_provider=_make_provider(
             settings.resolved_planning_provider,
             planning_effort,
+            model=planning_model,
         ),
         planning_model=planning_model,
         coding_provider=_make_provider(
             settings.resolved_coding_provider,
             coding_effort,
+            model=coding_model,
         ),
         coding_model=coding_model,
         **router_kw,
