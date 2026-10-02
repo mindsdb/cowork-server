@@ -2,7 +2,9 @@
 API rules moved out of the Picker block into google_drive's spec, so they
 appear once and for every Drive connection."""
 import json
+import shutil
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from pydantic import SecretStr
 
@@ -43,7 +45,7 @@ def _drive_vault(tmp_path, **extra_fields):
 
 
 @asynccontextmanager
-async def _session_config(monkeypatch, vault):
+async def _session_config(monkeypatch, vault, *, vault_factory=None, **build_kwargs):
     from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
     from cowork.db.session import get_open_session
     from cowork.services.conversations import ConversationService
@@ -61,7 +63,8 @@ async def _session_config(monkeypatch, vault):
     # Capture the config instead of starting scratchpad processes.
     monkeypatch.setattr(harness, "build_chat_session", lambda config: config)
     monkeypatch.setattr(
-        "anton.core.datasources.data_vault.LocalDataVault", lambda *_a, **_k: vault
+        "anton.core.datasources.data_vault.LocalDataVault",
+        vault_factory or (lambda *_a, **_k: vault),
     )
     monkeypatch.setenv("ANTON_SCRATCHPAD_PERSIST_SESSION", "false")
 
@@ -69,10 +72,14 @@ async def _session_config(monkeypatch, vault):
         conversation = ConversationService(ScopedSession(db, LOCAL_SCOPE)).create_conversation(
             topic="usage-notes"
         )
-        config, _, _ = await harness.AntonHarness()._build_chat_session(conversation)
+        config, temp_vault_dir, _ = await harness.AntonHarness()._build_chat_session(
+            conversation, **build_kwargs
+        )
         try:
             yield config
         finally:
+            if temp_vault_dir:
+                shutil.rmtree(temp_vault_dir, ignore_errors=True)
             client = config.llm_client
             for provider in (client.planning_provider, client.coding_provider, client.router_provider):
                 await provider._client.close()
@@ -91,3 +98,24 @@ async def test_drive_notes_reach_the_session_config_without_picked_files(monkeyp
     async with _session_config(monkeypatch, _drive_vault(tmp_path)) as config:
         assert "corpora='allDrives'" in config.connector_usage_notes["google_drive"]
         assert "Google Picker" not in config.system_prompt_context.suffix
+
+
+async def test_disabled_connection_gets_no_notes(monkeypatch, tmp_path):
+    from anton.core.datasources.data_vault import LocalDataVault
+    from cowork.common.settings.app_settings import get_app_settings
+
+    source_vault = _drive_vault(tmp_path)
+    source_dir = Path(get_app_settings().connector.vault_dir)
+
+    # The harness reads the source vault, then copies the enabled connections
+    # into a fresh temp vault; only the source path may map to the fake.
+    def vault_for(path):
+        return source_vault if Path(path) == source_dir else LocalDataVault(path)
+
+    async with _session_config(
+        monkeypatch,
+        source_vault,
+        vault_factory=vault_for,
+        disabled_connections=[{"engine": "google_drive", "name": "work"}],
+    ) as config:
+        assert config.connector_usage_notes == {}
