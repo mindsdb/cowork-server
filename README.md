@@ -903,7 +903,7 @@ Environment variables fall into two namespaces:
 
 | Variable | Harness | Description |
 |----------|---------|-------------|
-| `ANTON_PUBLISH_URL` | Anton | Artifact publish endpoint |
+| `ANTON_PUBLISH_URL` | Anton | Artifact publish endpoint. Pointed anywhere but MindsHub's service, it takes HTML and Markdown only: sharing a full-stack app is refused before anything is uploaded, because that upload carries the app's connection credentials |
 | `ANTON_SKILLS_ROOT_DIR` | Anton | Skill file storage |
 | `ANTON_GLOBAL_MEMORY_ROOT_DIR` | Anton | Global memory files |
 
