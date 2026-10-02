@@ -1,13 +1,14 @@
 from pathlib import Path
+import re
 import shlex
 import sys
 
 import pytest
 from pydantic import ValidationError
 
-from coding_service_fakes import CREDS, FakeEngine, service_with
+from coding_service_fakes import CREDS, FakeEngine, service_with, wait_for_status, wait_for_workspace
 from test_coding_projects import git, repository
-from cowork.coding.contracts import SessionCreateRequest
+from cowork.coding.contracts import SessionCreateRequest, SessionStatus
 from cowork.coding.control_models import TaskResourceScope
 from cowork.coding.project_models import (
     CodeProject,
@@ -389,6 +390,7 @@ def test_real_session_factory_persists_choices_and_restores_named_workspace(tmp_
         "fake",
         "fake-model",
     )
+    session = wait_for_workspace(service, session.id)
     stored = service.control.store.get_task(session.id)
     assert stored.repository_setup == options
     assert stored.execution_project.resources[0].default_branch == "staging"
@@ -447,12 +449,13 @@ def test_task_setup_rejects_a_saved_checkout_replaced_by_a_directory(tmp_path, i
     repo.mkdir()
     (repo / "unrelated.txt").write_text("not the selected repository")
     original_index = (moved / ".git/index").read_bytes()
-    with pytest.raises(WorkspaceError, match="no longer.*Git checkout"):
-        service.create_session(
-            SessionCreateRequest(project_id=project.id, prompt="Read files", engine_id="fake",
-                                 repository_setup=TaskRepositorySetup(include_local_changes=True)),
-            CREDS, "fake", "fake-model",
-        )
+    created = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Read files", engine_id="fake",
+                             repository_setup=TaskRepositorySetup(include_local_changes=True)),
+        CREDS, "fake", "fake-model",
+    )
+    failed = wait_for_status(service, created.id, SessionStatus.failed)
+    assert re.search("no longer.*Git checkout", failed.last_error or "")
     assert (repo / "unrelated.txt").read_text() == "not the selected repository"
     assert (moved / ".git/index").read_bytes() == original_index
     assert not list(service.project_workspaces.workspaces.worktrees_root.rglob("unrelated.txt"))
@@ -565,17 +568,19 @@ def test_failure_after_preparation_removes_only_the_new_unmodified_branch(
         raise RuntimeError("skill resolution failed")
 
     monkeypatch.setattr(service.session_factory.skills, "resolve", fail)
-    with pytest.raises(RuntimeError, match="skill resolution failed"):
-        service.create_session(
-            SessionCreateRequest(
-                project_id=project.id,
-                prompt="Read",
-                engine_id="fake",
-                repository_setup=TaskRepositorySetup(branch="feat/retry"),
-            ),
-            CREDS,
-            "fake",
-            "fake-model",
-        )
+    created = service.create_session(
+        SessionCreateRequest(
+            project_id=project.id,
+            prompt="Read",
+            engine_id="fake",
+            repository_setup=TaskRepositorySetup(branch="feat/retry"),
+        ),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    failed = wait_for_status(service, created.id, SessionStatus.failed)
+    assert "skill resolution failed" in (failed.last_error or "")
+    assert failed.workspace_path == ""
     assert "feat/retry" not in git(repo, "branch", "--list")
     assert len(git(repo, "worktree", "list", "--porcelain").split("worktree ")) == 2
