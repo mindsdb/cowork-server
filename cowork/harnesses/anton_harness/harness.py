@@ -24,6 +24,18 @@ from cowork.services.projects import display_label
 logger = get_logger(__name__)
 
 
+def _prewarm_scratchpad_kwarg(config_cls) -> dict:
+    """``{"prewarm_scratchpad": True}`` when the installed anton has it, else ``{}``.
+
+    The server is long-lived, so booting the scratchpad in the background while
+    the first model call runs hides its start-up from the first tool call.
+    cowork-server pins anton to a branch, so the field can be missing, and
+    passing it then would TypeError every turn.
+    """
+    fields = getattr(config_cls, "__dataclass_fields__", None) or {}
+    return {"prewarm_scratchpad": True} if "prewarm_scratchpad" in fields else {}
+
+
 def _anton_mcp_wiring():
     """anton's MCP wiring module, or ``None`` when the installed anton predates it.
 
@@ -1243,6 +1255,7 @@ class AntonHarness:
                 # also rejects this kwarg — passing it there is a TypeError
                 # that takes down every turn.
                 **({"mcp_sessions": mcp_sessions} if mcp_wiring is not None else {}),
+                **_prewarm_scratchpad_kwarg(ChatSessionConfig),
                 cells=cells
             )
             # Not `ChatSession(config)` directly: every construction of anton's
