@@ -4,7 +4,6 @@ import hashlib
 import json
 import logging
 import shutil
-from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
@@ -18,13 +17,6 @@ logger = logging.getLogger(__name__)
 
 KIND_ARTIFACT = "artifact"
 KIND_FILE = "file"
-
-
-@dataclass(frozen=True)
-class ArtifactRelocation:
-    moved: int
-    #: Artifact folders still in the source because their move failed.
-    left: int
 
 
 def _artifacts_base(project: Project) -> Path:
@@ -160,9 +152,9 @@ class TaskObjectService:
         Best-effort: a failure on one object is logged and skipped rather
         than aborting the whole move. Returns the moved-artifact count.
         """
-        return self.relocate_artifacts(conversation, source, dest).moved
+        return self._relocate_artifacts(conversation, source, dest)
 
-    def relocate_artifacts(self, conversation: Conversation, source: Project, dest: Project) -> ArtifactRelocation:
+    def _relocate_artifacts(self, conversation: Conversation, source: Project, dest: Project) -> int:
         """Move the task's artifact folders and retarget its index rows.
 
         Org mode (ENG-2961, D8): only folders owned by the task's creator move,
@@ -172,7 +164,7 @@ class TaskObjectService:
         """
         rows = self.reconcile_conversation(conversation, source)
         if not rows:
-            return ArtifactRelocation(moved=0, left=0)
+            return 0
         src_base = _artifacts_base(source)
         dest_base = _artifacts_base(dest)
         dest_base.mkdir(parents=True, exist_ok=True)
@@ -194,7 +186,7 @@ class TaskObjectService:
                 self.session, src_root, [row.ref for row in rows]
             )
         rekeys: list[tuple[str, str]] = []
-        moved = left = 0
+        moved = 0
         for row in rows:
             src_folder = src_base / row.ref
             if not src_folder.is_dir():
@@ -218,7 +210,6 @@ class TaskObjectService:
                 shutil.move(str(src_folder), str(dest_base / dest_slug))
             except OSError:
                 logger.warning("Could not move artifact %r to project %r", row.ref, dest.name, exc_info=True)
-                left += 1
                 continue
             if org_mode:
                 rekeys.append((row.ref, dest_slug))
@@ -241,7 +232,7 @@ class TaskObjectService:
                         "Could not move the owner of artifact %r to project %r",
                         old_slug, dest.name, exc_info=True,
                     )
-        return ArtifactRelocation(moved=moved, left=left)
+        return moved
 
     @staticmethod
     def _unique_slug(dest_base: Path, slug: str, conversation_id: UUID) -> str:

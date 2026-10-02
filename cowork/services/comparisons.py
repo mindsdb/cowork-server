@@ -460,11 +460,15 @@ class ComparisonService:
         model_label: str | None,
     ) -> bool:
         """Move the side's artifacts and carry its other work; True when
-        nothing is left in the sandbox that the task still needs. An artifact
-        whose move failed is still there, and is moved by the next carry."""
+        nothing is left in the sandbox that the task still needs.
+
+        Artifacts are judged by what is still in the sandbox, not by what the
+        move reports: it skips some on purpose (in org mode, one with no
+        recorded owner or never indexed), and a skipped artifact would
+        otherwise go with the sandbox."""
         from cowork.services.task_objects import TaskObjectService
 
-        relocation = TaskObjectService(self.session).relocate_artifacts(conversation, sandbox, destination)
+        TaskObjectService(self.session).relocate_to_project(conversation, sandbox, destination)
         work_carried = _carry_side_work(
             side,
             sandbox=Path(sandbox.path),
@@ -473,7 +477,7 @@ class ComparisonService:
             org_mode=self.session.scope.org_mode,
             copied=comparison.copied_files or {},
         )
-        return work_carried and relocation.left == 0
+        return work_carried and not _artifacts_left(Path(sandbox.path))
 
     def _remove_sandbox(self, sandbox: Project) -> None:
         _release_project_runtime(sandbox.path)
@@ -524,6 +528,35 @@ def _folder_part(text: str, limit: int) -> str:
     first_line = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
     cleaned = " ".join(_FOLDER_UNSAFE.sub(" ", first_line).split()).strip(" .")
     return cleaned[:limit].rstrip(" .")
+
+
+def _artifacts_left(sandbox: Path) -> bool:
+    """Whether the sandbox still holds an artifact, so it must not be removed.
+
+    An artifact is a real directory in `.anton/artifacts` (dot-named ones are
+    bookkeeping, such as locks). Only what the side made can be there: the
+    copy of a source project leaves its artifacts out. An artifacts folder
+    that cannot be read counts as holding one.
+    """
+    try:
+        with pinned_dir(sandbox) as root:
+            anton = open_pinned_child(root, ".anton")
+            try:
+                artifacts = open_pinned_child(anton, "artifacts")
+                try:
+                    with dir_scandir(artifacts) as scan:
+                        return any(
+                            not entry.name.startswith(".") and entry.is_dir(follow_symlinks=False)
+                            for entry in scan
+                        )
+                finally:
+                    artifacts.close()
+            finally:
+                anton.close()
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return True
 
 
 def _carried_folder_name(title: str, model_label: str) -> str:

@@ -557,6 +557,116 @@ def test_an_artifact_that_cannot_be_moved_keeps_the_sandbox_and_a_retry_moves_it
     assert client.get(f"/api/v1/comparisons/{body['id']}").json()["sides"][0]["carryIncomplete"] is False
 
 
+def _hosted_continue_with_artifact(hosted, tmp_path, *, indexed: bool):
+    """A hosted side whose sandbox holds one artifact the move will skip:
+    indexed to the side with no owner row (a failed owner write at turn end),
+    or never indexed (org mode does not scan the disk)."""
+    from cowork.services.comparisons import ComparisonService, SideSpec
+    from cowork.services.task_objects import TaskObjectService
+
+    service = ComparisonService(hosted.session)
+    comparison = service.create_comparison(title="t", sides=[SideSpec("kimi"), SideSpec("qwen")])
+    side = comparison.sides[0]
+    sandbox = Path(hosted.session.get(Project, side.project_id).path)
+    folder = _make_artifact(sandbox, "report", str(side.conversation_id))
+    if indexed:
+        TaskObjectService(hosted.session).index_artifact(side.conversation_id, side.project_id, "report")
+    destination_root = tmp_path / "projects" / "real"
+    destination_root.mkdir(parents=True)
+    destination = Project(name="real", path=str(destination_root))
+    hosted.session.add(destination)
+    hosted.session.commit()
+    continued = service.continue_side(comparison.id, "a", destination.id)
+    return service, comparison, side, sandbox, folder, continued
+
+
+@pytest.mark.parametrize("indexed", [True, False], ids=["indexed-without-owner", "never-indexed"])
+def test_a_hosted_continue_keeps_an_artifact_the_move_skipped(hosted, tmp_path, indexed):
+    service, comparison, side, sandbox, folder, continued = _hosted_continue_with_artifact(
+        hosted, tmp_path, indexed=indexed
+    )
+
+    assert continued.carried_all is False
+    assert (folder / "index.html").read_text() == "<h1>report</h1>"
+    assert hosted.session.get(Project, side.project_id) is not None
+    # The screen offers the rest for as long as the sandbox holds it.
+    assert service.continued_sides([service.get_comparison(comparison.id)])[side.id].carry_incomplete is True
+
+
+def test_a_desktop_continue_keeps_an_artifact_it_could_not_index(client):
+    body = _create(client).json()
+    a = body["sides"][0]
+    sandbox = Path(_project(a["projectId"]).path)
+    folder = sandbox / ".anton" / "artifacts" / "report"
+    folder.mkdir(parents=True)
+    # No provenance: nothing ties it to the side, so it is never indexed or moved.
+    (folder / "index.html").write_text("<h1>report</h1>")
+    target = _real_project(client, "unindexed-target")
+
+    r = client.post(f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": target["id"]})
+
+    assert r.status_code == 200, r.text
+    assert r.json()["carriedAll"] is False
+    assert (folder / "index.html").is_file()
+    assert _project(a["projectId"]) is not None
+    assert client.get(f"/api/v1/comparisons/{body['id']}").json()["sides"][0]["carryIncomplete"] is True
+
+
+def test_a_hosted_continue_keeps_the_sandbox_when_its_artifacts_cannot_be_read(hosted, tmp_path):
+    from cowork.services.comparisons import ComparisonService, SideSpec
+
+    service = ComparisonService(hosted.session)
+    comparison = service.create_comparison(title="t", sides=[SideSpec("kimi"), SideSpec("qwen")])
+    side = comparison.sides[0]
+    sandbox = Path(hosted.session.get(Project, side.project_id).path)
+    folder = _make_artifact(sandbox, "report", str(side.conversation_id))
+    artifacts = folder.parent
+    destination_root = tmp_path / "projects" / "real"
+    destination_root.mkdir(parents=True)
+    destination = Project(name="real", path=str(destination_root))
+    hosted.session.add(destination)
+    hosted.session.commit()
+    artifacts.chmod(0)
+    try:
+        continued = service.continue_side(comparison.id, "a", destination.id)
+    finally:
+        artifacts.chmod(0o755)
+
+    assert continued.carried_all is False
+    assert (folder / "index.html").is_file()
+
+
+def test_a_link_in_the_artifacts_folder_does_not_keep_the_sandbox(client, tmp_path):
+    body = _create(client).json()
+    a = body["sides"][0]
+    sandbox = Path(_project(a["projectId"]).path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (sandbox / ".anton" / "artifacts").mkdir(parents=True)
+    (sandbox / ".anton" / "artifacts" / "planted").symlink_to(elsewhere, target_is_directory=True)
+    target = _real_project(client, "link-target")
+
+    r = client.post(f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": target["id"]})
+
+    assert r.json()["carriedAll"] is True
+    assert _project(a["projectId"]) is None
+    # Removing the sandbox removed the link, not what it pointed at.
+    assert elsewhere.is_dir()
+
+
+def test_a_sandbox_with_only_an_artifacts_lock_folder_is_still_removed(client):
+    body = _create(client).json()
+    a = body["sides"][0]
+    sandbox = Path(_project(a["projectId"]).path)
+    (sandbox / ".anton" / "artifacts" / ".locks").mkdir(parents=True)
+    target = _real_project(client, "locks-target")
+
+    r = client.post(f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": target["id"]})
+
+    assert r.json()["carriedAll"] is True
+    assert _project(a["projectId"]) is None
+
+
 def test_continue_with_nothing_new_makes_no_folder(client):
     source = _real_project(client, "untouched-source")
     _seed_source(Path(source["path"]))
