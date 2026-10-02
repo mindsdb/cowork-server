@@ -495,3 +495,60 @@ def test_model_override_preserves_other_provider_roles_and_credentials(build, ef
     assert calls["openai"][0]["api_key"] == "openai-key"
     assert all(kw["api_key"] == "anthropic-key" for kw in calls["anthropic"])
     assert calls["anthropic"][-1]["reasoning_effort"] == "high"
+
+
+# ── Effort levels a direct model no longer accepts ──────────────────────
+#
+# OpenAI dropped "minimal" from its GPT-5.x models, so a level saved before
+# then (in settings or on a conversation) must not be rejected on every turn.
+
+def _direct_openai(**kw) -> UserSettings:
+    return UserSettings(
+        planning_provider=Provider.OPENAI, coding_provider=Provider.OPENAI,
+        router_provider=Provider.OPENAI, openai_api_key=SecretStr("sk-openai"),
+        **kw,
+    )
+
+
+@pytest.mark.parametrize(
+    "model,stored,sent",
+    [
+        ("gpt-5.5", "minimal", "none"),       # the documented successor
+        ("gpt-5.4-mini", "minimal", "none"),
+        ("o3", "minimal", None),              # no successor it accepts: model default
+        ("gpt-5.5", "max", None),             # never accepted: model default
+        ("gpt-5.5", "xhigh", "xhigh"),        # accepted levels pass through
+        ("some-new-model", "minimal", "minimal"),  # not in the catalog: untouched
+    ],
+)
+def test_stored_effort_is_sent_as_the_model_accepts_it(build, model, stored, sent):
+    settings = _direct_openai(
+        planning_model=model, coding_model=model,
+        planning_reasoning_effort=stored, coding_reasoning_effort=stored,
+    )
+    _client, calls = build(settings)
+    _router, planning, coding = calls["openai"]
+    assert planning.get("reasoning_effort") == sent
+    assert coding.get("reasoning_effort") == sent
+
+
+def test_a_conversations_saved_minimal_effort_is_sent_as_none(build):
+    _client, calls = build(_direct_openai(planning_model="gpt-5.5"), effort_override="minimal")
+    assert calls["openai"][1]["reasoning_effort"] == "none"
+
+
+def test_a_conversations_retired_model_pick_runs_on_its_replacement(build):
+    client, _calls = build(_direct_openai(), model_override="gpt-5.5-mini")
+    assert client.planning_model == "gpt-5.4-mini"
+
+
+def test_minds_cloud_effort_is_not_checked_against_the_direct_catalog(build):
+    # MindsHub advertises its own levels live; a colliding alias must not be
+    # filtered through the hand-maintained direct table.
+    settings = UserSettings(
+        planning_provider=Provider.MINDS_CLOUD, coding_provider=Provider.MINDS_CLOUD,
+        minds_api_key=SecretStr("mdb-key"), minds_url="https://api.mindshub.ai",
+        coding_model="gpt-5.5", coding_reasoning_effort="minimal",
+    )
+    _client, calls = build(settings)
+    assert calls["openai"][-1].get("reasoning_effort") == "minimal"
