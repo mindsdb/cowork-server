@@ -495,3 +495,31 @@ def test_model_override_preserves_other_provider_roles_and_credentials(build, ef
     assert calls["openai"][0]["api_key"] == "openai-key"
     assert all(kw["api_key"] == "anthropic-key" for kw in calls["anthropic"])
     assert calls["anthropic"][-1]["reasoning_effort"] == "high"
+
+
+@pytest.mark.parametrize("model", ["gpt-6.1-sol", "gpt-6.1-sol-2026-09-29", "gpt-6-astra", "gpt-5.6-sol"])
+def test_new_direct_openai_families_use_native_responses(build, model):
+    settings = UserSettings(
+        planning_provider=Provider.OPENAI, coding_provider=Provider.OPENAI,
+        router_provider=Provider.OPENAI, planning_model=model, coding_model=model,
+        router_model=model, openai_api_key=SecretStr("offline-openai-key"),
+        planning_reasoning_effort="low", coding_reasoning_effort="low",
+    )
+    client, calls = build(settings)
+    assert len(calls["openai"]) == 3
+    assert all(call["flavor"] == _RealOpenAIProvider.FLAVOR_OPENAI for call in calls["openai"])
+    assert calls["openai"][-1]["reasoning_effort"] == "low"
+    assert client.planning_model == client.coding_model == model
+
+
+def test_native_responses_selection_preserves_compatible_endpoint_transport(build):
+    settings = UserSettings(
+        planning_provider=Provider.OPENAI_COMPATIBLE, coding_provider=Provider.OPENAI_COMPATIBLE,
+        router_provider=Provider.OPENAI_COMPATIBLE, planning_model="gpt-6.1-sol",
+        coding_model="gpt-6.1-sol", router_model="gpt-6.1-sol",
+        openai_compatible_api_key=SecretStr("offline-compatible-key"),
+        openai_base_url="https://models.example.test/v1",
+    )
+    _, calls = build(settings)
+    assert all("flavor" not in call for call in calls["openai"])
+    assert all(call["base_url"] == "https://models.example.test/v1" for call in calls["openai"])
