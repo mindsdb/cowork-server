@@ -13,6 +13,7 @@ validates clean. Hence the explicit unknown-key check below.
 """
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,10 @@ from cowork.services.connectors.specs._registry import ConnectorSpecRegistry
 
 SPECS_DIR = Path(__file__).parent.parent / "cowork" / "services" / "connectors" / "specs"
 SPEC_FILES = sorted(SPECS_DIR.glob("*.json"))
+
+# About 400 tokens. usage_notes are not truncated at runtime, so this is the
+# only guard on their size.
+USAGE_NOTES_MAX_CHARS = 1600
 
 # Keys present in shipped specs that no model declares, so validation drops
 # them. Allowed here so this suite goes green on the existing corpus rather
@@ -223,3 +228,80 @@ class TestLangfuseSpec:
     def _field(spec, name):
         method = next(m for m in spec.form.methods if m.id == "api-key")
         return next(f for f in method.fields if f.name == name)
+
+
+# usage_notes are inserted under a `###` heading in the agent's prompt, so a
+# `#`/`##`/`###` line of their own would break its structure. Code is exempt: a
+# `# comment` in a fence or an indented block is a code comment, not a heading.
+# Known limitation: code nested inside list items is not modelled; every line
+# indented by 4+ spaces or a tab counts as code.
+_HEADING = re.compile(r" {0,3}#{1,3}(\s|$)")
+_FENCE_OPEN = re.compile(r" {0,3}(`{3,}|~{3,})")
+_INDENTED_CODE = re.compile(r" {4}|\t")
+
+
+def _headings_outside_fences(text: str) -> list[str]:
+    found: list[str] = []
+    fence = ""
+    for line in text.splitlines():
+        if fence:
+            closing = re.fullmatch(r" {0,3}(" + fence[0] + r"{%d,})\s*" % len(fence), line)
+            if closing:
+                fence = ""
+            continue
+        opening = _FENCE_OPEN.match(line)
+        if opening:
+            fence = opening.group(1)
+        elif not _INDENTED_CODE.match(line) and _HEADING.match(line):
+            found.append(line)
+    return found
+
+
+def test_heading_check_ignores_comments_inside_code_fences():
+    assert _headings_outside_fences("Use it.\n```python\n# step 1\nx = 1\n```\n") == []
+    assert _headings_outside_fences("## Quirks\nUse it.") == ["## Quirks"]
+    assert _headings_outside_fences("#### deep\n#hashtag") == []
+
+
+def test_heading_check_ignores_comments_inside_indented_code():
+    assert _headings_outside_fences("Run:\n\n    # step 1\n    x = 1\n") == []
+    assert _headings_outside_fences("Run:\n\n\t# step 1\n") == []
+    # Up to three leading spaces still make a heading.
+    assert _headings_outside_fences("   ## Quirks") == ["   ## Quirks"]
+
+
+def test_heading_check_follows_fence_rules():
+    assert _headings_outside_fences("~~~\n# step 1\n~~~\n") == []
+    # A fence closes only on its own character, with at least its own length.
+    assert _headings_outside_fences("~~~\n```\n# x\n~~~\n") == []
+    assert _headings_outside_fences("```\n~~~\n# x\n```\n") == []
+    assert _headings_outside_fences("````\n```\n# x\n````\n") == []
+    assert _headings_outside_fences("````\n```\n````\n# x\n") == ["# x"]
+    # Four leading spaces make it indented code, not a fence opener.
+    assert _headings_outside_fences("    ```\n# x\n") == ["# x"]
+    # Text after a closing fence's run makes it a content line, not a closer.
+    assert _headings_outside_fences("```\n``` not a close\n# x\n```\n") == []
+
+
+@pytest.mark.parametrize("path", SPEC_FILES, ids=lambda p: p.stem)
+def test_usage_notes_have_no_top_level_headings(path: Path):
+    notes = json.loads(path.read_text(encoding="utf-8")).get("usage_notes")
+    # The type itself is checked by test_spec_is_valid_json_and_matches_the_schema.
+    if not isinstance(notes, str):
+        return
+    assert not _headings_outside_fences(notes), (
+        f"{path.name}: usage_notes must not contain #, ## or ### headings outside "
+        "code fences — they are rendered under a ### heading in the agent's prompt"
+    )
+
+
+@pytest.mark.parametrize("path", SPEC_FILES, ids=lambda p: p.stem)
+def test_usage_notes_fit_the_length_limit(path: Path):
+    notes = json.loads(path.read_text(encoding="utf-8")).get("usage_notes")
+    if not isinstance(notes, str):
+        return
+    assert len(notes) <= USAGE_NOTES_MAX_CHARS, (
+        f"{path.name}: usage_notes is {len(notes)} chars, over the {USAGE_NOTES_MAX_CHARS} limit. "
+        "They are sent in the system prompt on every LLM call for each connected engine; "
+        "keep only what the agent cannot guess."
+    )

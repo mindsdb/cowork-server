@@ -260,6 +260,7 @@ class ProbeHandler:
                 workspace=workspace,
                 form_spec=form_spec,
                 skipped=skipped,
+                usage_notes=registry.usage_notes_for([connector_id]).get(connector_id),
             )
             try:
                 async for kind, payload in probe.run():

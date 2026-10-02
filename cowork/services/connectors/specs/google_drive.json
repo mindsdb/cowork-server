@@ -19,6 +19,7 @@
     "slides"
   ],
   "description": "Read, search, and manage files in your Google Drive (including Docs, Sheets, and Slides).",
+  "usage_notes": "On every Drive API call pass `supportsAllDrives=true`; on `files.list()`/`files.search()` also pass `includeItemsFromAllDrives=true`. Without them Shared Drive items return 404 notFound; for regular files they are no-ops, so always send them. Never pass `corpora='allDrives'`: it can return files beyond what the user granted this connection. Omit `corpora` or use `corpora='user'`.",
   "category": "files",
   "logo": "folder",
   "logo_color": "#1FA463",

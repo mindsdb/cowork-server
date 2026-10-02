@@ -86,6 +86,7 @@ class CredentialProbe:
         form_spec: dict | None = None,
         skipped: list[str] | None = None,
         timeout_seconds: float = 90.0,
+        usage_notes: str | None = None,
     ) -> None:
         self.engine = engine
         self.credentials = credentials
@@ -94,6 +95,9 @@ class CredentialProbe:
         self.form_spec = form_spec or {}
         self.skipped = list(skipped or [])
         self.timeout_seconds = timeout_seconds
+        # The prober makes the first real API call, so it needs the same API
+        # traps the chat agent is told about.
+        self.usage_notes = (usage_notes or "").strip()
         self._outcome = ProbeOutcome()
         self._pending: list[tuple[str, Any]] = []
 
@@ -259,6 +263,10 @@ class CredentialProbe:
             "if there's no usable info, request_extra_field with the "
             "minimum needed.\n"
         )
+        quirks = (
+            f"——— KNOWN API QUIRKS ———\n{self.usage_notes}\n\n"
+            if self.usage_notes else ""
+        )
         return (
             f"You are a connection prober for `{self.engine}`. Your only job is "
             f"to determine if the credentials we just collected actually "
@@ -276,6 +284,7 @@ class CredentialProbe:
             f"remove_field, request_extra_field) take a `method_id` "
             f"parameter — pass the method whose fields you're touching.\n\n"
             f"{roster}\n\n"
+            f"{quirks}"
             f"——— STEPS (follow in order) ———\n"
             f"1. Call `set_status` with a short message like \"Loading credentials…\".\n"
             f"2. In the scratchpad, parse the .env file (e.g. `dotenv_values('{env_path}')`). "
