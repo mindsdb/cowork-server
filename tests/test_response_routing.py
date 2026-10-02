@@ -1814,3 +1814,122 @@ async def test_streamed_gate_answer_naming_the_gate_tool_is_discarded_and_delega
     assert decision.text == ""
     assert decision.fallback is False
     assert decision.model == "gate-model"
+
+
+# --- a follow-up to tool work delegates without a gate call (S2) -------------
+
+
+def _tool_turn(prompt="pull the sales table", result="rows: 1204", answer="Pulled 1,204 rows."):
+    return [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "scratchpad", "input": {"code": "..."}},
+        ]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": result}]},
+        {"role": "assistant", "content": answer},
+    ]
+
+
+def _no_gate(monkeypatch):
+    import cowork.handlers.response_routing as routing
+
+    async def gate_must_not_run(binding, *, history):
+        raise AssertionError("the gate must not be called")
+
+    monkeypatch.setattr(routing, "_gate", gate_must_not_run)
+    monkeypatch.setattr(routing, "_settings_binding", lambda: (_ for _ in ()).throw(AssertionError("no binding needed")))
+
+
+async def _route(history):
+    return await decide_route(history=history, has_non_text_input=False,
+                              has_attachments=False, has_disabled_connections=False)
+
+
+@pytest.mark.asyncio
+async def test_follow_up_to_tool_work_delegates_without_gate_call(monkeypatch):
+    _no_gate(monkeypatch)
+    decision = await _route(_tool_turn() + [{"role": "user", "content": "Add a short summary above the detail."}])
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.reason == "prior_turn_ran_tools"
+    assert not decision.fallback and decision.text == ""
+
+
+@pytest.mark.asyncio
+async def test_follow_up_in_another_language_delegates_too(monkeypatch):
+    _no_gate(monkeypatch)
+    decision = await _route(_tool_turn() + [{"role": "user", "content": "Ajoute un résumé, s'il te plaît."}])
+    assert decision.reason == "prior_turn_ran_tools"
+
+
+@pytest.mark.asyncio
+async def test_plain_previous_turn_still_reaches_the_gate(monkeypatch):
+    import cowork.handlers.response_routing as routing
+
+    seen = []
+
+    async def fake_gate(binding, *, history):
+        seen.append(history)
+        return "Hello!"
+
+    monkeypatch.setattr(routing, "_gate", fake_gate)
+    monkeypatch.setattr(routing, "_settings_binding", lambda: RouterBinding(provider=object(), model="m", label="x"))
+    # Tool work two turns ago, then a plain exchange: only the turn right before the prompt counts.
+    history = _tool_turn() + [
+        {"role": "user", "content": "thanks"},
+        {"role": "assistant", "content": "You're welcome."},
+        {"role": "user", "content": "hi again"},
+    ]
+    decision = await _route(history)
+    assert decision.route == DIRECT_CONTEXT and seen
+
+
+def test_prior_turn_ran_tools_shapes():
+    from cowork.handlers.response_routing import prior_turn_ran_tools
+
+    prompt = {"role": "user", "content": "next"}
+    assert prior_turn_ran_tools(_tool_turn() + [prompt])
+    assert not prior_turn_ran_tools([{"role": "user", "content": "hi"}])
+    assert not prior_turn_ran_tools([{"role": "user", "content": "a"}, {"role": "assistant", "content": "b"}, prompt])
+    # A bounded window that starts inside a long tool loop still sees the work.
+    assert prior_turn_ran_tools(_tool_turn()[2:] + [prompt])
+    # Mixed text and tool_use in one assistant row.
+    assert prior_turn_ran_tools([
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": [{"type": "text", "text": "Checking."},
+                                          {"type": "tool_use", "id": "t", "name": "web_search", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t", "content": "x"}]},
+        {"role": "assistant", "content": "Done."},
+        prompt,
+    ])
+    # System rows and unknown blocks are ignored.
+    assert not prior_turn_ran_tools([
+        {"role": "system", "content": [{"type": "tool_use"}]},
+        {"role": "user", "content": "a"}, {"role": "assistant", "content": [{"type": "unknown"}]}, prompt,
+    ])
+
+
+@pytest.mark.asyncio
+async def test_persisted_tool_rows_delegate_end_to_end(monkeypatch):
+    """Rows exactly as persisted, through `to_openai_message` (what `_route_request` sends)."""
+    from uuid import uuid4
+
+    from cowork.models.message_event import MessageEvent  # noqa: F401 — resolves the ORM relationship
+    from cowork.models.message import Message
+    from cowork.schemas.responses import Role
+
+    _no_gate(monkeypatch)
+    cid = uuid4()
+    rows = [
+        Message(conversation_id=cid, role=Role.user, content="pull the sales table"),
+        Message(conversation_id=cid, role=Role.assistant, content=[
+            {"type": "tool_use", "id": "t1", "name": "scratchpad", "input": {"code": "..."}},
+        ]),
+        Message(conversation_id=cid, role=Role.user, content=[
+            {"type": "tool_result", "tool_use_id": "t1", "content": "rows: 1204"},
+        ]),
+        Message(conversation_id=cid, role=Role.assistant, content="Pulled 1,204 rows."),
+    ]
+    history = [m.to_openai_message().model_dump() for m in rows]
+    history.append({"role": "user", "content": "now chart it"})
+    decision = await _route(history)
+    assert decision.reason == "prior_turn_ran_tools"
