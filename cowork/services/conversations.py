@@ -905,9 +905,9 @@ class ConversationService:
         for offset, message in enumerate(ordered_rows):
             message.seq = base_seq + offset
             self.session.add(message)
-        self.session.commit()
-        self.session.refresh(assistant_msg)
-
+        # Flush for foreign-key ordering, but commit the text and its events
+        # together: a crash must not leave an answer without its failure marker.
+        self.session.flush()
         for event_seq, event_data in enumerate(events):
             self.session.add(
                 MessageEvent(
@@ -916,8 +916,9 @@ class ConversationService:
                     event_data=event_data,
                 )
             )
+        self.session.commit()
+        self.session.refresh(assistant_msg)
         if events:
-            self.session.commit()
             # A skill card supersedes its earlier versions: when this turn emits a
             # `skill_created`, drop the same slug's earlier skill_created events so
             # history holds ONE card per skill (the latest). Keeps the on-disk
@@ -929,6 +930,54 @@ class ConversationService:
                     conversation_id, assistant_msg.id, new_slugs
                 )
         return assistant_msg
+
+    def recover_interrupted_turn(
+        self, conversation_id: UUID, turn_id: int, text: str, terminal_event: dict,
+    ) -> bool:
+        """Recover a file-backed turn, including an older partial DB commit.
+
+        A terminal event proves the existing reply was saved completely. A
+        message row alone does not: older writers committed events separately.
+        """
+        conversation = self.get_conversation(conversation_id)
+        messages = self.get_ordered_messages(conversation_id, include_pending=True)
+        if turn_id >= len(messages):
+            return False
+        question = messages[turn_id]
+        if question.role != Role.user or _is_tool_row(question.content):
+            return False
+        reply = None
+        for message in messages[turn_id + 1:]:
+            if _is_tool_row(message.content):
+                continue
+            if message.role == Role.user:
+                # A later turn owns this row; do not attach this orphan's text
+                # to it or append an answer in the wrong transcript position.
+                return False
+            if message.role == Role.assistant:
+                reply = message
+                break
+        if reply is not None:
+            events = self.session.exec(
+                self.session.select(MessageEvent)
+                .where(MessageEvent.message_id == reply.id)
+            ).all()
+            if any(e.event_data.get("type") in {"response.completed", "response.failed"} for e in events):
+                return False
+            self.session.add(MessageEvent(
+                message_id=reply.id,
+                sequence_number=max((e.sequence_number for e in events), default=-1) + 1,
+                event_data=terminal_event,
+            ))
+        question.pending = False
+        self.session.add(question)
+        if reply is None:
+            self.save_assistant_turn(
+                conversation_id, text, [terminal_event], harness=conversation.harness,
+            )
+        else:
+            self.session.commit()
+        return True
 
     def _supersede_skill_cards(
         self, conversation_id: UUID, keep_message_id: UUID, slugs: set[str]

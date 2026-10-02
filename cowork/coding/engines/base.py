@@ -52,6 +52,9 @@ class EngineSessionConfig:
     environment: tuple[tuple[str, str], ...] = ()
     session_id: str = ""
     cowork_root: str = ""
+    # The local integration MCP server serves a Code Project's connections.
+    # A folder task has none, and the server would start only to exit.
+    project_linked: bool = False
     workspace_label: str = ""
     inference_base_url: str = ""
     inference_api_key: str = ""

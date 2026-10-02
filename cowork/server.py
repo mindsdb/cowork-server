@@ -119,6 +119,20 @@ async def _run_artifact_owner_backfill() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_dev_setup()
+    # History recovery also retries buffers sealed by an earlier failed sweep.
+    try:
+        from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
+        from cowork.db.session import get_open_session
+        from cowork.streaming import get_streams_dir
+        from cowork.streaming.recovery import seal_orphan_turns_in_history
+
+        history_session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
+        try:
+            seal_orphan_turns_in_history(history_session, get_streams_dir())
+        finally:
+            history_session.close()
+    except Exception:
+        logger.exception("turn-history boot recovery failed (non-fatal)")
     # Seal any turn buffers left open by a previous process (crash/restart)
     # so reconnecting clients get a clean Interrupted end-of-stream rather
     # than hanging. GC of old buffers happens lazily; cheap no-op when none.
@@ -185,21 +199,35 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         from cowork.channels.webhooks import drain_background_tasks
+        from cowork.common.chat_session import drain_scratchpad_closes
         from cowork.common.http_client import close_proxy_client
+        from cowork.coding.inference_proxy import close_inference_client
         from cowork.services.artifacts import shutdown_launched_backends
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
         from cowork.coding.service import get_coding_service
+        from cowork.streaming.registry import registry
+
+        # Uvicorn's request drain is bounded by the image command. Persist
+        # interrupted turns before their database and runtime resources close.
+        cancelled = await registry.shutdown()
+        if cancelled:
+            logger.warning("Cancelled %d in-flight turn(s) for shutdown", cancelled)
 
         await _cancel_and_wait(getattr(app.state, "channel_ingress_reconciler", None))
         await _cancel_and_wait(getattr(app.state, "artifact_owner_backfill", None))
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
+        # After both turn drains above: each turn they unwound has queued the
+        # close of its scratchpad processes, and those must finish before the
+        # event loop stops.
+        await drain_scratchpad_closes()
         await app.state.channel_adapters.shutdown()
         get_coding_service().close_all()
         shutdown_launched_backends()
         await close_scratchpads()
         await close_proxy_client()
+        await close_inference_client()
 
 
 class _NoStoreMiddleware:

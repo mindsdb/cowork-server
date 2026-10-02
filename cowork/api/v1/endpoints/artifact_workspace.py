@@ -25,6 +25,7 @@ from cowork.common.paths import (
     dir_open,
     dir_scandir,
     open_pinned_child,
+    read_bounded,
 )
 from cowork.api.v1.artifact_scope import review_artifact_for_request
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
@@ -351,11 +352,19 @@ def _draft_stream(
     *,
     extra_headers: dict[str, str] | None = None,
 ):
-    """Stream bytes from the pinned descriptor and close every held handle."""
+    """Stream at most *size* bytes from the pinned descriptor and close every
+    held handle.
+
+    No ``Content-Length``: the agent may still be writing the file, and a
+    length taken from ``fstat`` would then disagree with the bytes read, which
+    the browser reports as ``ERR_CONTENT_LENGTH_MISMATCH`` (ENG-2950). Chunked
+    transfer sends exactly what the descriptor yields. *size* (the ``fstat``
+    size at authorization) still bounds the body, so a file that keeps growing
+    cannot keep the response open.
+    """
     def chunks():
         try:
-            while chunk := os.read(fd, 1 << 16):
-                yield chunk
+            yield from read_bounded(fd, size)
         finally:
             resources.close()
 
@@ -363,11 +372,7 @@ def _draft_stream(
         chunks(),
         resources=resources,
         media_type=media_type,
-        headers={
-            **_DRAFT_RESPONSE_HEADERS,
-            **(extra_headers or {}),
-            "Content-Length": str(size),
-        },
+        headers={**_DRAFT_RESPONSE_HEADERS, **(extra_headers or {})},
     )
 
 

@@ -63,17 +63,18 @@ from cowork.handlers.turn_errors import (
     CONTENT_REPAIR_CODES,
     GENERIC_TURN_ERROR_CODE,
     GENERIC_TURN_ERROR_MESSAGE,
+    INTERRUPTED_TURN_MESSAGE,
     MODEL_UNAVAILABLE_CODES,
-    ALLOWANCE_EXHAUSTED_CODE,
     PROVIDER_OVERLOADED_CODE,
     RATE_LIMITED_CODE,
     REMOTE_CANCEL_LITERAL,
     REMOTE_CANCEL_VIA_FAIL_JOB,
+    RESET_AT_CODES,
     auth_error_detail,
     friendly_turn_error,
+    gate_reset_at,
     model_unavailable_info,
     provider_overloaded_info,
-    allowance_reset_at,
     response_failed_payload,
     retry_after_seconds,
     retry_at_instant,
@@ -81,6 +82,7 @@ from cowork.handlers.turn_errors import (
 )
 from cowork.db.scoped import ScopedSession, TenantScope, scope_from_principal
 from cowork.principal import Principal, identity_trace_metadata
+from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.product_permissions import (
@@ -418,6 +420,10 @@ class ResponsesHandler:
         # this is a stable per-conversation index for the buffer file.
         turn_id = len(conversation.messages)
 
+        # Before the gate: it and the producer task both scrub history in this
+        # request's context, and nothing registered the vault's secrets yet.
+        await register_vault_secrets(self.scope)
+
         disabled = (
             [dc.model_dump() for dc in request.disabled_connections]
             if request.disabled_connections else None
@@ -564,7 +570,8 @@ class ResponsesHandler:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
         try:
             # Scrub credentials: this history bypasses the normal turn's
-            # _scrub_user_input/_stamp_message pass. Bounded to the rows
+            # _scrub_user_input/_stamp_message pass. Its DS_* values were
+            # registered by handle(), not _build_chat_session. Bounded to the rows
             # decide_route can actually use (_text_history keeps at most
             # _MAX_HISTORY_MESSAGES) so scrubbing doesn't pay for the whole
             # conversation on every gated turn.
@@ -1567,13 +1574,18 @@ class ResponsesHandler:
                 "correlation_id=%s code=%s", conv_id, corr, code,
                 extra={"request_id": corr},
             )
-            collected_events.append(response_failed_payload(message, code, request_id=corr))
+            # The producer keeps `reset_at` only for RESET_AT_CODES and only as
+            # an offset-aware instant (`_remote_reset_at` in producer.py), so
+            # it rides both the frame and the persisted event as sent.
+            reset_at = failure.get("reset_at")
+            collected_events.append(response_failed_payload(
+                message, code, reset_at=reset_at, request_id=corr))
             # Persist before building the frame — a client's SSE
             # reader stops at response.failed, so any id has to ride this
             # frame, not one after it.
             assistant_msg = persist()
             await buffer.append("sse", {"sse": response_failed_sse(
-                message, code, request_id=corr,
+                message, code, reset_at=reset_at, request_id=corr,
                 assistant_message_id=_message_id_str(assistant_msg),
             )})
             if code in CONTENT_REPAIR_CODES:
@@ -1598,6 +1610,18 @@ class ResponsesHandler:
             if lifecycle.discarded:
                 # Same reasoning as _run_turn's discarded branch — see there.
                 logger.info("[responses] discarded remote turn %s — not persisting", conv_id)
+                return
+            if lifecycle.shutting_down or lifecycle.timed_out:
+                collected_events.extend(cancelled_ask_user_retirements(collected_events))
+                collected_events.append(response_failed_payload(
+                    INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
+                ))
+                assistant_msg = persist()
+                await buffer.append("sse", {"sse": response_failed_sse(
+                    INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
+                    assistant_message_id=_message_id_str(assistant_msg),
+                )})
+                await buffer.close("interrupted")
                 return
             # Partial text generated before cancellation is persisted.
             persist()
@@ -1764,6 +1788,18 @@ class ResponsesHandler:
                 # truncation. So drop the turn entirely.
                 logger.info("[responses] discarded turn %s — not persisting", conv_id)
                 return
+            if lifecycle.shutting_down or lifecycle.timed_out:
+                collected_events.extend(cancelled_ask_user_retirements(collected_events))
+                collected_events.append(response_failed_payload(
+                    INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
+                ))
+                assistant_msg = persist()
+                await buffer.append("sse", {"sse": response_failed_sse(
+                    INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
+                    assistant_message_id=_message_id_str(assistant_msg),
+                )})
+                await buffer.close("interrupted")
+                return
             # Nothing special is emitted on cancellation.
             # The partial text and events generated before cancellation are persisted.
             # A question that was on screen when Stop was pressed never got its
@@ -1851,11 +1887,13 @@ class ResponsesHandler:
                 # resolved_planning_provider would name the wrong provider when
                 # the *coding* model was the one rejected.
                 extra = {"model": model_info[1] if model_info else ""}
-            elif code == ALLOWANCE_EXHAUSTED_CODE:
-                # When the free grant refreshes (ENG-1537). The gate sends it on
-                # this denial and only this one, so the card can offer waiting as
-                # a real alternative to paying instead of only asking for money.
-                _reset = allowance_reset_at(exc)
+            elif code in RESET_AT_CODES:
+                # When the free way forward comes back: the spent allowance
+                # refills, or the free-Air fuse resets at the end of the UTC
+                # day. The gate sends it on these denials and not on a
+                # velocity one, so the card can offer waiting as a real
+                # alternative to paying instead of only asking for money.
+                _reset = gate_reset_at(exc)
                 if _reset is not None:
                     extra = {"reset_at": _reset}
             elif code == RATE_LIMITED_CODE:
@@ -2259,8 +2297,9 @@ async def sse_from_buffer(buffer, from_seq: int = 0) -> AsyncGenerator[str, None
     """Serialize a turn buffer to the SSE wire, replaying from ``from_seq``
     then live-tailing. Used by both the initial POST /responses stream
     (from_seq=0) and reconnects via GET /responses/tail. The terminal record
-    just ends the stream — the harness's own response.completed/failed frame
-    was already written as a normal record.
+    ends the stream — the harness's own response.completed/failed frame was
+    already written as a normal record. User Stop has no such frame, so its
+    terminal is turned into ``response.cancelled`` here.
 
     Emits a comment heartbeat whenever the buffer has been quiet for
     ``SSE_KEEPALIVE_SECONDS``, so an intermediary cannot mistake a pending
@@ -2290,6 +2329,8 @@ async def sse_from_buffer(buffer, from_seq: int = 0) -> AsyncGenerator[str, None
             # Checked BEFORE prefetching: the terminal record ends the stream,
             # so scheduling another __anext__() here would only be cancelled.
             if rec.is_terminal:
+                if rec.data.get("reason") == "cancelled":
+                    yield sse_frame("response.cancelled", {"type": "response.cancelled"})
                 return
             pending = asyncio.ensure_future(records.__anext__())
             sse = rec.data.get("sse")
