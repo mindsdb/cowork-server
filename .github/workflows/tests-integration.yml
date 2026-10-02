@@ -13,6 +13,11 @@ on:
         description: Self-hosted runner in the deployment's cluster
         required: true
         type: string
+      ref:
+        description: 'Branch/SHA whose tests to run; "" means the ref that triggered the run'
+        required: false
+        type: string
+        default: ""
 
 defaults:
   run:
@@ -27,6 +32,8 @@ jobs:
       name: ${{ inputs.deploy-env }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref }}
       - name: Setup uv
         uses: astral-sh/setup-uv@v7
         with:
