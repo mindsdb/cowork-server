@@ -23,6 +23,7 @@ from coding_service_fakes import (
     repository,
     service_with,
     wait_for_status,
+    wait_for_workspace,
     wait_for_steers,
 )
 
@@ -1265,10 +1266,9 @@ def test_non_git_session_reports_its_isolated_local_copy(tmp_path: Path) -> None
         "fake",
         "fake-model",
     )
-    wait_for_status(service, created.id, SessionStatus.completed)
+    created = wait_for_status(service, created.id, SessionStatus.completed)
 
-    ready = service.events(created.id).items[0]
-    assert ready.title == "Task workspace ready"
+    ready = next(event for event in service.events(created.id).items if event.title == "Task workspace ready")
     assert ready.text == "Created an isolated task workspace."
     assert ready.data["workspaceKind"] == "local_copy"
     assert created.workspace_path != str(folder.resolve())
@@ -1288,7 +1288,7 @@ def test_repository_without_commits_can_start_a_coding_session(tmp_path: Path) -
         "fake",
         "fake-model",
     )
-    wait_for_status(service, created.id, SessionStatus.completed)
+    created = wait_for_status(service, created.id, SessionStatus.completed)
 
     assert created.workspace_kind == WorkspaceKind.local_copy
     assert created.workspace_path != str(repo.resolve())
@@ -2032,7 +2032,7 @@ def test_turn_accepts_native_file_references_and_workspace_mentions(tmp_path: Pa
         "fake",
         "fake-model",
     )
-    wait_for_status(service, created.id, SessionStatus.completed)
+    created = wait_for_status(service, created.id, SessionStatus.completed)
 
     assert len(engine.attachments[0]) == 1
     assert engine.attachments[0][0].name == "src/feature.py"
@@ -2120,7 +2120,7 @@ def test_fork_copies_conversation_and_working_changes_to_an_independent_worktree
     parent = service.create_session(
         SessionCreateRequest(path=str(repo), prompt="Build the feature"), CREDS, "fake", "fake-model"
     )
-    wait_for_status(service, parent.id, SessionStatus.completed)
+    parent = wait_for_status(service, parent.id, SessionStatus.completed)
     changed = Path(parent.workspace_path, "README.md")
     changed.write_text("forked work\n", encoding="utf-8")
     service.set_pinned(parent.id, True)
@@ -2325,7 +2325,7 @@ def test_project_fork_keeps_every_folder_change_isolated_and_reviewable(tmp_path
         "fake",
         "fake-model",
     )
-    wait_for_status(service, parent.id, SessionStatus.completed)
+    parent = wait_for_status(service, parent.id, SessionStatus.completed)
     (Path(parent.workspaces[0].workspace_path) / "README.md").write_text("parent app\n", encoding="utf-8")
     (Path(parent.workspaces[1].workspace_path) / "plan.txt").write_text("parent notes\n", encoding="utf-8")
 
@@ -2368,7 +2368,7 @@ def test_existing_task_can_adopt_commands_added_to_the_project_later(tmp_path: P
         "fake",
         "fake-model",
     )
-    wait_for_status(service, early.id, SessionStatus.completed)
+    early = wait_for_status(service, early.id, SessionStatus.completed)
     assert service.validate_project(early.id) == []
 
     live = service.projects.get(project.id)
@@ -2524,7 +2524,7 @@ def test_scoped_task_validation_and_fork_use_immutable_project_snapshot(tmp_path
         "fake",
         "fake-model",
     )
-    wait_for_status(service, parent.id, SessionStatus.completed)
+    parent = wait_for_status(service, parent.id, SessionStatus.completed)
 
     live = service.projects.get(project.id)
     changed_resources = [
@@ -2579,7 +2579,7 @@ def test_project_runtime_opens_in_primary_workspace_and_keeps_other_folders_avai
         "fake",
         "fake-model",
     )
-    wait_for_status(service, task.id, SessionStatus.completed)
+    task = wait_for_status(service, task.id, SessionStatus.completed)
 
     primary = task.workspaces[0].workspace_path
     secondary = task.workspaces[1].workspace_path
@@ -2608,7 +2608,7 @@ def test_project_delivery_is_planned_then_explicitly_publishes_a_draft_pr(tmp_pa
         "fake",
         "fake-model",
     )
-    wait_for_status(service, task.id, SessionStatus.completed)
+    task = wait_for_status(service, task.id, SessionStatus.completed)
     (Path(task.workspace_path) / "README.md").write_text("delivery\n", encoding="utf-8")
 
     assert service.delivery_plan(task.id).items[0].status == "needs_commit"
@@ -2789,7 +2789,7 @@ def test_project_delivery_can_publish_a_selected_repository_with_its_own_copy(tm
         "fake",
         "fake-model",
     )
-    wait_for_status(service, task.id, SessionStatus.completed)
+    task = wait_for_status(service, task.id, SessionStatus.completed)
     for workspace in task.workspaces:
         (Path(workspace.workspace_path) / "README.md").write_text(f"{workspace.folder_name}\n", encoding="utf-8")
     service.commit(task.id, "Prepare delivery")
@@ -2916,7 +2916,7 @@ def test_project_task_resumes_same_workspaces_and_ports_after_service_restart(tm
         "fake",
         "fake-model",
     )
-    wait_for_status(first, task.id, SessionStatus.completed)
+    task = wait_for_status(first, task.id, SessionStatus.completed)
     original_paths = [item.workspace_path for item in first.get_session(task.id).workspaces]
     original_ports = first.get_session(task.id).allocated_ports
     original_engine_session_id = first.get_session(task.id).engine_session_id
@@ -2933,6 +2933,7 @@ def test_project_task_resumes_same_workspaces_and_ports_after_service_restart(tm
         "fake",
         "fake-model",
     )
+    next_task = wait_for_workspace(restarted, next_task.id)
 
     assert [item.workspace_path for item in loaded.workspaces] == original_paths
     assert loaded.allocated_ports == original_ports
