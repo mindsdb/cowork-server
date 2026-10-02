@@ -29,6 +29,10 @@ from cowork.services.connectors.specs._registry import ConnectorSpecRegistry
 SPECS_DIR = Path(__file__).parent.parent / "cowork" / "services" / "connectors" / "specs"
 SPEC_FILES = sorted(SPECS_DIR.glob("*.json"))
 
+# About 400 tokens. usage_notes are not truncated at runtime, so this is the
+# only guard on their size.
+USAGE_NOTES_MAX_CHARS = 1600
+
 # Keys present in shipped specs that no model declares, so validation drops
 # them. Allowed here so this suite goes green on the existing corpus rather
 # than blocking on a cleanup — but each one is dead weight, not a feature:
@@ -288,4 +292,16 @@ def test_usage_notes_have_no_top_level_headings(path: Path):
     assert not _headings_outside_fences(notes), (
         f"{path.name}: usage_notes must not contain #, ## or ### headings outside "
         "code fences — they are rendered under a ### heading in the agent's prompt"
+    )
+
+
+@pytest.mark.parametrize("path", SPEC_FILES, ids=lambda p: p.stem)
+def test_usage_notes_fit_the_length_limit(path: Path):
+    notes = json.loads(path.read_text(encoding="utf-8")).get("usage_notes")
+    if not isinstance(notes, str):
+        return
+    assert len(notes) <= USAGE_NOTES_MAX_CHARS, (
+        f"{path.name}: usage_notes is {len(notes)} chars, over the {USAGE_NOTES_MAX_CHARS} limit. "
+        "They are sent in the system prompt on every LLM call for each connected engine; "
+        "keep only what the agent cannot guess."
     )
