@@ -108,4 +108,4 @@ USER app
 
 EXPOSE 9010
 
-CMD ["python", "-m", "uvicorn", "cowork.server:app", "--host", "0.0.0.0", "--port", "9010", "--forwarded-allow-ips", "*"]
+CMD ["python", "-m", "uvicorn", "cowork.server:app", "--host", "0.0.0.0", "--port", "9010", "--forwarded-allow-ips", "*", "--timeout-graceful-shutdown", "2"]

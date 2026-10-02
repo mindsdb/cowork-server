@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import dataclasses
+import logging
 import threading
 import uuid
 
 from cowork.coding.commands import CommandIntent
 from cowork.coding.connector_capabilities import ConnectorCapability
-from cowork.coding.context import validate_references
+from cowork.coding.context import require_attachments_exist, validate_references
 from cowork.coding.contracts import (
     CodingEvent,
     CodingSession,
@@ -18,10 +20,20 @@ from cowork.coding.contracts import (
 )
 from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_models import TERMINAL_RUN_STATUSES, RunStatus, RuntimeCommand, RuntimeEvent, TaskRun
-from cowork.coding.engines.base import EngineCredentials, EngineSession
+from cowork.coding.engines.base import EngineCredentials, EngineInputReference, EngineSession
 from cowork.coding.reasoning import ModelLevels
+from cowork.coding.session_factory import PendingLocalSession
 from cowork.coding.turns import RunningTurn, fail_turn, mark_running
 from cowork.services.skills import CodeSkillService
+
+
+logger = logging.getLogger(__name__)
+
+
+def _await_first_turn(current: CodingSession) -> None:
+    # The placeholder is ``running`` so the task reads as active while it
+    # prepares; the first turn's own start marks it running again.
+    current.status = SessionStatus.ready
 
 
 class CodingTurnOperations:
@@ -36,7 +48,8 @@ class CodingTurnOperations:
         code_skills: CodeSkillService | None = None,
         model_levels: ModelLevels | None = None,
     ) -> CodingSession:
-        session = self.session_factory.create(
+        """Record a task and return it; a local task prepares in the background."""
+        begun = self.session_factory.begin(
             request,
             credentials,
             default_engine,
@@ -44,16 +57,123 @@ class CodingTurnOperations:
             code_skills,
             model_levels=model_levels,
         )
-        if self._is_remote(session):
-            intent = self._validated_command_intent(session, request.prompt, request.attachments)
-            self.remote.queue_turn(session, request.prompt, request.attachments, intent)
-            return self.get_session(session.id)
+        if isinstance(begun, CodingSession):
+            intent = self._validated_command_intent(begun, request.prompt, request.attachments)
+            self.remote.queue_turn(begun, request.prompt, request.attachments, intent)
+            return self.get_session(begun.id)
         try:
-            self.submit_turn(session.id, request.prompt, credentials, request.attachments)
+            self._validated_command_intent(self.get_session(begun.session_id), request.prompt, request.attachments)
+            require_attachments_exist(request.attachments)
+            thread = threading.Thread(
+                target=self._prepare_and_start,
+                args=(begun, credentials),
+                name=f"coding-prepare-{begun.session_id[:8]}",
+                daemon=True,
+            )
+            with self._lock:
+                self._running[begun.session_id] = RunningTurn(engine=None, turn_id="", thread=thread, preparing=True)
+            thread.start()
         except Exception:
-            self.session_factory.discard(session)
+            with self._lock:
+                self._running.pop(begun.session_id, None)
+            self.session_factory.abandon(begun)
             raise
-        return self.get_session(session.id)
+        return self.get_session(begun.session_id)
+
+    def _prepare_and_start(self, pending: PendingLocalSession, credentials: EngineCredentials) -> None:
+        session_id = pending.session_id
+        request = pending.request
+
+        def cancelled() -> bool:
+            with self._lock:
+                running = self._running.get(session_id)
+                return running is not None and running.cancel_requested
+
+        try:
+            prepared = self.session_factory.complete(pending, cancelled)
+        except Exception as exc:
+            with self._lock:
+                preparing = self._running.pop(session_id, None)
+            if preparing is not None and preparing.delete_requested:
+                # ``complete`` has already released what it made.
+                return
+            logger.warning("Coding task %s could not prepare its workspace", session_id, exc_info=True)
+            message = f"The task workspace could not be prepared: {exc}"
+            self._emit(
+                session_id,
+                CodingEvent(type=EventType.error, title="Task did not start", text=message, phase="failed"),
+                lambda current: fail_turn(current, False, message),
+            )
+            return
+        with self._lock:
+            preparing = self._running.pop(session_id, None)
+            if preparing is not None and preparing.delete_requested:
+                self.session_factory.release(prepared, request)
+                return
+            if preparing is None or preparing.cancel_requested:
+                self._emit(
+                    session_id,
+                    CodingEvent(
+                        type=EventType.session,
+                        title="Task stopped",
+                        text="Stopped before the agent started.",
+                        phase="completed",
+                    ),
+                    lambda current: fail_turn(current, True, ""),
+                )
+                return
+            self.store.update_session(session_id, _await_first_turn)
+            try:
+                self._submit_turn(session_id, request.prompt, credentials, request.attachments, announced=True)
+            except Exception as exc:
+                logger.warning("Coding task %s could not start its first turn", session_id, exc_info=True)
+                message = str(exc)
+                self._emit(
+                    session_id,
+                    CodingEvent(type=EventType.error, title="Task did not start", text=message, phase="failed"),
+                    lambda current: fail_turn(current, False, message),
+                )
+                return
+            started = self._running.get(session_id)
+            if started is not None:
+                # Instructions sent while the workspace was preparing reach the
+                # first turn as soon as it is ready for steering.
+                started.pending_steers.extend(preparing.pending_steers)
+                return
+            # A first prompt such as /status runs at once and starts no turn,
+            # so work sent while the task prepared would wait for one forever.
+            try:
+                self._start_waiting_work(session_id, credentials, preparing.pending_steers)
+            except Exception as exc:
+                logger.warning("Coding task %s could not start its waiting work", session_id, exc_info=True)
+                self._emit(
+                    session_id,
+                    CodingEvent(type=EventType.error, title="Follow-up did not start", text=str(exc), phase="failed"),
+                )
+
+    def _start_waiting_work(
+        self,
+        session_id: str,
+        credentials: EngineCredentials,
+        steers: list[tuple[str, tuple[EngineInputReference, ...]]],
+    ) -> None:
+        if not steers:
+            if self.get_session(session_id).queued_instructions:
+                self.run_next_queued(session_id, credentials)
+            return
+        # The first follow-up becomes the turn, and the rest steer it. Each is
+        # already in the timeline as a follow-up.
+        (prompt, attachments), *rest = steers
+        self._submit_turn(
+            session_id,
+            prompt,
+            credentials,
+            [InputReference(**dataclasses.asdict(item)) for item in attachments],
+            announced=True,
+        )
+        started = self._running.get(session_id)
+        if started is not None:
+            started.pending_steers.extend(rest)
 
     def submit_turn(
         self,
@@ -122,17 +242,22 @@ class CodingTurnOperations:
         *,
         maintenance_reserved: bool = False,
         continue_completed: bool = False,
+        announced: bool = False,
     ) -> CodingSession:
-        """Validate and launch one turn, optionally inside a service reservation."""
+        """Validate and launch one turn, optionally inside a service reservation.
+
+        ``announced`` means the prompt is already in the timeline, as it is for
+        a new task's first turn.
+        """
         intent = self._validated_command_intent(self.get_session(session_id), prompt, attachments)
         if intent.runs_immediately:
             if maintenance_reserved:
-                return self.commands.run_immediate(session_id, intent, prompt, credentials)
+                return self.commands.run_immediate(session_id, intent, prompt, credentials, announced=announced)
             with self._maintenance_session(
                 session_id,
                 "Wait for the active turn to finish before running this command",
             ):
-                return self.commands.run_immediate(session_id, intent, prompt, credentials)
+                return self.commands.run_immediate(session_id, intent, prompt, credentials, announced=announced)
         with self._lock:
             session = self.get_session(session_id)
             if session_id in self._maintenance and not maintenance_reserved:
@@ -142,13 +267,21 @@ class CodingTurnOperations:
                 SessionStatus.awaiting_approval,
             }:
                 raise RuntimeError("This coding task already has a running turn")
+            if not session.workspace_path:
+                raise RuntimeError("This task did not start because its workspace could not be prepared. Start a new task.")
             engine_attachments = validate_references(session, attachments)
             # Mode changes must finish preflight before allocating a new run.
             if continue_completed:
                 self._continue_completed_task(session)
             self._emit(
                 session_id,
-                CodingEvent(type=EventType.user_message, title="You", text=prompt, phase="completed"),
+                CodingEvent(
+                    type=EventType.session,
+                    title="Starting agent",
+                    phase="started",
+                )
+                if announced
+                else CodingEvent(type=EventType.user_message, title="You", text=prompt, phase="completed"),
                 mark_running,
             )
             thread = threading.Thread(
@@ -246,6 +379,8 @@ class CodingTurnOperations:
         with self._lock:
             session = self.get_session(session_id)
             self.commands.validate(session, intent.name)
+            if attachments and not session.workspace_path:
+                raise RuntimeError("Attach files once the task workspace is ready")
             engine_attachments = validate_references(session, attachments)
             running = self._running.get(session_id)
             if running is None:
@@ -330,6 +465,8 @@ class CodingTurnOperations:
         with self._lock:
             session = self.get_session(session_id)
             self.commands.validate(session, intent.name)
+            if attachments and not session.workspace_path and not self._is_remote(session):
+                raise RuntimeError("Attach files once the task workspace is ready")
             validate_references(session, attachments)
             instruction = QueuedInstruction(
                 id=str(uuid.uuid4()),
@@ -500,12 +637,17 @@ class CodingTurnOperations:
             if running.turn_id and running.engine is not None:
                 engine = running.engine
                 turn_id = running.turn_id
+            preparing = running.preparing
         self._emit(
             session_id,
             CodingEvent(
                 type=EventType.session,
                 title="Stopping task",
-                text="Cancellation requested. The agent is cleaning up the active turn.",
+                text=(
+                    "Cancellation requested. The task stops once its current preparation step ends."
+                    if preparing
+                    else "Cancellation requested. The agent is cleaning up the active turn."
+                ),
                 phase="pending",
             ),
         )

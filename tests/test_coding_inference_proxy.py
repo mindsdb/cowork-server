@@ -10,6 +10,7 @@ from cowork.api.v1.endpoints.coding import (
     _inference_url,
     _require_inference_client,
 )
+import asyncio
 import json
 
 import httpx
@@ -19,8 +20,11 @@ from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.engines.codex_config import LOCAL_PROXY_TOKEN
 from cowork.coding.inference_proxy import (
     MAX_INFERENCE_BODY_BYTES,
+    RATE_LIMIT_DEFAULT_WAIT_SECONDS,
+    RATE_LIMIT_RETRIES,
     proxy_inference,
     read_inference_body,
+    retry_after_seconds,
     terminal_rejection,
     upstream_error_message,
 )
@@ -194,3 +198,180 @@ async def test_proxy_streams_successful_and_retryable_responses_unchanged(monkey
     assert response.status_code == 503
     assert response.headers["retry-after"] == "2"
     assert "x-mindshub-error-code" not in response.headers
+
+
+def _mock_upstream(monkeypatch: pytest.MonkeyPatch, responses: list[httpx.Response]) -> list[float]:
+    """Serve ``responses`` in order (repeating the last) and record proxy sleeps instead of waiting."""
+    calls = iter(responses)
+    last = responses[-1]
+    sleeps: list[float] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return next(calls, last)
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        inference_proxy_module.httpx,
+        "AsyncClient",
+        lambda **kwargs: real_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    monkeypatch.setattr(inference_proxy_module.asyncio, "sleep", fake_sleep)
+    return sleeps
+
+
+def _rate_limited(retry_after: str | None = "1") -> httpx.Response:
+    return httpx.Response(
+        429,
+        json={"error": {"message": "Rate limit exceeded for model 'gpt'. Please slow down and retry.", "code": "rate_limited"}},
+        headers={"retry-after": retry_after} if retry_after is not None else {},
+    )
+
+
+async def _proxy(body: bytes = b"{}"):
+    request = _request([(b"content-type", b"application/json")], body)
+    return await proxy_inference(request, "responses", EngineCredentials(minds_url="https://api.example", minds_api_key="mdb_key"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["included_allowance_exhausted", "free_air_daily_spend_fuse_exceeded"])
+async def test_proxy_fails_a_reset_bound_429_terminally_without_waiting(monkeypatch: pytest.MonkeyPatch, code: str) -> None:
+    upstream = httpx.Response(
+        429,
+        json={"error": {"message": "Your included allowance for 'gpt' is exhausted.", "code": code}},
+        headers={"x-mindshub-reset-at": "2026-09-26T19:00:00Z", "x-should-retry": "false"},
+    )
+    sleeps = _mock_upstream(monkeypatch, [upstream, httpx.Response(200, content=b"ok")])
+
+    response = await _proxy()
+
+    assert sleeps == []
+    assert response.status_code == 400
+    assert response.headers["x-mindshub-error-code"] == code
+    assert response.headers["x-mindshub-upstream-status"] == "429"
+    assert response.headers["x-mindshub-reset-at"] == "2026-09-26T19:00:00Z"
+    assert json.loads(response.body)["error"]["code"] == code
+
+
+@pytest.mark.asyncio
+async def test_proxy_waits_out_a_velocity_429_and_streams_the_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps = _mock_upstream(monkeypatch, [_rate_limited("3"), _rate_limited(None), httpx.Response(200, content=b"data: ok")])
+
+    response = await _proxy()
+
+    assert sleeps == [3.0, RATE_LIMIT_DEFAULT_WAIT_SECONDS]
+    assert response.status_code == 200
+    chunks = [chunk async for chunk in response.body_iterator]
+    assert b"".join(chunks) == b"data: ok"
+
+
+@pytest.mark.asyncio
+async def test_proxy_fails_a_persistent_velocity_429_as_terminal_rate_limited(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps = _mock_upstream(monkeypatch, [_rate_limited("1")])
+
+    response = await _proxy()
+
+    assert len(sleeps) == RATE_LIMIT_RETRIES
+    assert response.status_code == 400
+    assert response.headers["x-mindshub-error-code"] == "rate_limited"
+    error = json.loads(response.body)["error"]
+    assert error["code"] == "rate_limited"
+    assert error["message"] == "Rate limit exceeded for model 'gpt'. Please slow down and retry."
+
+
+@pytest.mark.asyncio
+async def test_proxy_does_not_hold_codex_past_the_wait_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps = _mock_upstream(monkeypatch, [_rate_limited("600"), httpx.Response(200, content=b"ok")])
+
+    response = await _proxy()
+
+    assert sleeps == []
+    assert response.status_code == 400
+    assert response.headers["x-mindshub-error-code"] == "rate_limited"
+
+
+@pytest.mark.asyncio
+async def test_proxy_treats_an_unlabelled_429_as_a_velocity_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    sleeps = _mock_upstream(monkeypatch, [httpx.Response(429, content=b"Too Many Requests"), httpx.Response(200, content=b"ok")])
+
+    response = await _proxy()
+
+    assert sleeps == [RATE_LIMIT_DEFAULT_WAIT_SECONDS]
+    assert response.status_code == 200
+
+
+def test_retry_after_parses_delta_seconds_and_falls_back_on_anything_else() -> None:
+    assert retry_after_seconds("4") == 4.0
+    assert retry_after_seconds("0") == 0.0
+    assert retry_after_seconds(None) == RATE_LIMIT_DEFAULT_WAIT_SECONDS
+    assert retry_after_seconds("-1") == RATE_LIMIT_DEFAULT_WAIT_SECONDS
+    assert retry_after_seconds("Wed, 21 Oct 2026 07:28:00 GMT") == RATE_LIMIT_DEFAULT_WAIT_SECONDS
+
+
+class _ClosingStream(httpx.AsyncByteStream):
+    """An upstream body that records when the proxy closes it."""
+
+    def __init__(self) -> None:
+        self.closed = False
+
+    async def __aiter__(self):
+        yield b"data: one\n\n"
+        yield b"data: two\n\n"
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_proxy_reuses_one_upstream_client_across_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    created = 0
+    real_client = httpx.AsyncClient
+
+    def factory(**kwargs):
+        nonlocal created
+        created += 1
+        return real_client(transport=httpx.MockTransport(lambda request: httpx.Response(200, content=b"ok")), **kwargs)
+
+    monkeypatch.setattr(inference_proxy_module.httpx, "AsyncClient", factory)
+
+    for _ in range(3):
+        response = await _proxy()
+        assert b"".join([chunk async for chunk in response.body_iterator]) == b"ok"
+
+    assert created == 1
+    await inference_proxy_module.close_inference_client()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "disconnect_after",
+    ["http.response.start", "http.response.body", None],
+    ids=["before-the-body", "mid-body", "complete"],
+)
+async def test_proxy_returns_the_upstream_connection_however_the_stream_ends(
+    monkeypatch: pytest.MonkeyPatch, disconnect_after: str | None
+) -> None:
+    stream = _ClosingStream()
+    _mock_upstream(monkeypatch, [httpx.Response(200, stream=stream)])
+    response = await _proxy()
+    gone = asyncio.Event()
+
+    async def receive() -> dict[str, object]:
+        await gone.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, object]) -> None:
+        if message["type"] == disconnect_after:
+            gone.set()
+            # Codex is gone, so this send never completes. ``asyncio.sleep``
+            # is stubbed out by ``_mock_upstream``.
+            await asyncio.Event().wait()
+
+    # ASGI 2.3, which uvicorn speaks, streams alongside a disconnect listener.
+    # A complete stream ends the call itself, which cancels the listener.
+    scope = {"type": "http", "asgi": {"spec_version": "2.3"}}
+    await asyncio.wait_for(response(scope, receive, send), timeout=5)
+
+    assert stream.closed

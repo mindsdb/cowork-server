@@ -52,7 +52,8 @@ class OAuthConfig(BaseModel):
             raise ValueError("redirect_host must be a loopback hostname")
         return v
 
-    # Only set on the `browser_oauth_builtin` method — the service-id slug
+    # Set on the zero-field OAuth method (`browser_oauth_builtin`, or `mcp`
+    # for HubSpot) — the service-id slug
     # (e.g. "google-drive") used in the /connectors/oauth/{service}/... web
     # fallback routes. The engine name and this slug have already diverged
     # historically (e.g. engine google_analytics_4 -> service
@@ -113,6 +114,11 @@ class ConnectorMetadataResponse(BaseModel):
     logo_color: str | None = None
     aliases: list[str] = []
     featured: bool = False
+    # A short caveat the directory shows as a badge + tooltip on the tile —
+    # something true about connecting that the user is better off knowing
+    # before they start, not a status field. Set only where there is one;
+    # None renders no badge at all.
+    notice: str | None = None
     # Org (cloud) mode only: False marks a connector the hosted build can't
     # run yet, so the directory can list it under a desktop-only group instead
     # of hiding it. Always True on desktop, where the whole registry works.
