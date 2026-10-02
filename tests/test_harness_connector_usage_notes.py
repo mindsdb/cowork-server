@@ -6,6 +6,7 @@ import shutil
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import pytest
 from pydantic import SecretStr
 
 from cowork.common.settings.user_settings import Provider, UserSettings
@@ -100,7 +101,17 @@ async def test_drive_notes_reach_the_session_config_without_picked_files(monkeyp
         assert "Google Picker" not in config.system_prompt_context.suffix
 
 
-async def test_disabled_connection_gets_no_notes(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("disabled", "expect_notes"),
+    [
+        ([{"engine": "google_drive", "name": "work"}], False),
+        # Control: the same setup without the disable still yields the notes,
+        # so the disabled case cannot pass because the fake vault is broken.
+        ([], True),
+    ],
+    ids=["disabled", "enabled"],
+)
+async def test_disabled_connection_gets_no_notes(monkeypatch, tmp_path, disabled, expect_notes):
     from anton.core.datasources.data_vault import LocalDataVault
     from cowork.common.settings.app_settings import get_app_settings
 
@@ -116,6 +127,6 @@ async def test_disabled_connection_gets_no_notes(monkeypatch, tmp_path):
         monkeypatch,
         source_vault,
         vault_factory=vault_for,
-        disabled_connections=[{"engine": "google_drive", "name": "work"}],
+        disabled_connections=disabled,
     ) as config:
-        assert config.connector_usage_notes == {}
+        assert ("google_drive" in config.connector_usage_notes) is expect_notes
