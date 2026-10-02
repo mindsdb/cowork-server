@@ -115,17 +115,6 @@ def persist_connection(
         # persisting the literal sentinel.
         target = vault.read_record(connector_id, base_slug)
         cred, is_edit = resolve_keep_sentinels(cred, target)
-        # Carry forward a previously-stored secret this save didn't resupply
-        # (e.g. Google Ads' developer_token on a reconnect that doesn't
-        # re-collect it) — same reasoning as the _label/_picked_files
-        # carry-forward below: a save must not silently drop something
-        # already provided just because this particular request didn't
-        # resend it. `target` is already scoped to this account (base_slug
-        # is account-derived), so this can't leak another account's secret.
-        target_fields = (target or {}).get("fields", {})
-        for key in secure_keys_for(connector_id, method, target_fields):
-            if key not in cred and target_fields.get(key):
-                cred[key] = target_fields[key]
         payload = {**cred, "_connector_id": connector_id}
         if method:
             payload["_method"] = method
@@ -141,6 +130,15 @@ def persist_connection(
         # full save here must not silently revoke files the user already granted
         # access to.
         existing = target if slug == base_slug else vault.read_record(connector_id, slug)
+        # Carry forward a stored secret this save didn't resupply (e.g. Google
+        # Ads' developer_token on a reconnect that doesn't re-collect it). Only
+        # from `existing`, the record this save replaces: the record at
+        # `base_slug` can belong to a different account that shares the slug.
+        existing_fields = (existing or {}).get("fields", {})
+        for key in secure_keys_for(connector_id, method, existing_fields):
+            if key not in payload and existing_fields.get(key):
+                payload[key] = existing_fields[key]
+        secure_keys = secure_keys_for(connector_id, method, payload)
         if not label:
             label = str((existing or {}).get("fields", {}).get("_label", "")).strip()
         if label:
