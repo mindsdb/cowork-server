@@ -76,6 +76,14 @@ jobs:
     # fork contributor gets the CI that matters to them.
     uses: ./.github/workflows/tests-unit.yml
 
+  wheels-available:
+    # Ungated for the same reason as the unit tests: GitHub-hosted, secret-free,
+    # and this is the check a fork contributor most needs, since it fails on a
+    # platform they are unlikely to own.
+    permissions:
+      contents: read
+    uses: ./.github/workflows/wheels-available.yml
+
   workflow-lint:
     # actionlint, the caller/callee permission check, and a zizmor audit, from the
     # one place every service repo shares. Ungated for the same reason as the unit

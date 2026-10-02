@@ -109,3 +109,38 @@ def test_sync_auth_token_mirrors_and_is_idempotent(tmp_path):
     assert _read_token(env) == "fixed-123"
     sync_auth_token(env, "fixed-123")  # no duplicate line / no error
     assert _read_token(env) == "fixed-123"
+
+
+def test_real_app_requires_the_generated_token_by_default_in_local_mode(monkeypatch, tmp_path):
+    """End-to-end through create_app(), not the tiny mirror app above: proves
+    the default actually reaches production wiring — conversations only
+    declares AuthenticatedInOrgMode, a no-op in local mode, so this bearer
+    check is the only thing guarding it once auth is on.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.delenv("COWORK_REQUIRE_AUTH", raising=False)
+    monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
+    get_app_settings.cache_clear()
+    try:
+        from cowork.server import create_app
+
+        # No `with`: skipping the lifespan skips boot migrations, which would
+        # collide with the schema conftest already created.
+        client = TestClient(create_app())
+        try:
+            no_token = client.get("/api/v1/conversations/")
+            assert no_token.status_code == 401
+
+            token = _read_token(tmp_path / ".env")
+            assert token  # create_app() must have generated + written one
+
+            authed = client.get(
+                "/api/v1/conversations/", headers={"Authorization": f"Bearer {token}"}
+            )
+            assert authed.status_code == 200
+        finally:
+            client.close()
+    finally:
+        get_app_settings.cache_clear()

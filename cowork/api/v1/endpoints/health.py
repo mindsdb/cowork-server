@@ -132,3 +132,18 @@ def health() -> dict:
         "aid": "" if _org_mode else _anton_install_id(),
         **settings.config_status,
     }
+
+
+# OpenByDesign, standalone reason: the kubelet sends this one with no identity
+# headers and has nowhere to get any, so a route that demanded a credential
+# would answer 401 to every probe and get the pod killed.
+@router.get("/live", response_model=dict, dependencies=[Depends(require(OpenByDesign))])
+async def live() -> dict:
+    """Liveness only: the process answers. No database, no filesystem, no settings —
+    a probe that can fail for an external reason turns a dependency outage into a pod kill.
+
+    `async def`, not `def`: a sync endpoint runs through Starlette's threadpool,
+    the same pool `run_in_threadpool` feeds artifact scans into, so a sync
+    `live()` would queue behind a saturated pool instead of answering directly.
+    """
+    return {"status": "ok"}

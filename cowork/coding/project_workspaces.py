@@ -6,8 +6,10 @@ import shutil
 import socket
 import subprocess
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from cowork.coding.contracts import DiffFile, GitState, TaskWorkspace, WorkspaceKind
 from cowork.coding.control_models import ExecutionWorkspace, WorkspaceStatus
@@ -29,6 +31,11 @@ from cowork.coding.workspace import (
     _org_mode,
 )
 from cowork.coding.workspace_key import managed_key
+from cowork.coding.repository_setup_models import TaskRepositorySetup
+from cowork.coding.repository_setup import inspect_repository_checkout
+
+if TYPE_CHECKING:
+    from cowork.coding.integrations import GitPushCredentials
 
 
 @dataclass(frozen=True)
@@ -100,7 +107,15 @@ class ProjectCommandRunner:
         workspaces: tuple[TaskWorkspace, ...],
         phase: str,
         ports: dict[str, int],
+        on_start: Callable[[ProjectCommand, TaskWorkspace], None] | None = None,
+        on_result: Callable[[CommandResult], None] | None = None,
+        stop: Callable[[], bool] | None = None,
     ) -> list[CommandResult]:
+        """Run a phase's commands in order, reporting each as it starts and ends.
+
+        ``stop`` is checked before each command, so a cancelled task skips the
+        rest of its commands.
+        """
         if _org_mode():
             raise WorkspaceError("Local Code Project commands are not available on this deployment")
         by_id = {workspace.folder_id: workspace for workspace in workspaces}
@@ -111,7 +126,14 @@ class ProjectCommandRunner:
         for folder in project.folders:
             workspace = by_id[folder.id]
             for command in (item for item in folder.commands if item.phase == phase):
-                results.append(self._run_one(command, workspace, environment))
+                if stop is not None and stop():
+                    return results
+                if on_start is not None:
+                    on_start(command, workspace)
+                result = self._run_one(command, workspace, environment)
+                results.append(result)
+                if on_result is not None:
+                    on_result(result)
         return results
 
     @staticmethod
@@ -157,28 +179,54 @@ class ProjectWorkspaceManager:
         workspaces: WorkspaceManager,
         ports: PortAllocator | None = None,
         commands: ProjectCommandRunner | None = None,
+        repository_credentials: Callable[[CodeProject, RepositoryResource], GitPushCredentials] | None = None,
     ) -> None:
         self.workspaces = workspaces
         self.ports = ports or PortAllocator()
         self.commands = commands or ProjectCommandRunner()
+        self.repository_credentials = repository_credentials
         self._lock = threading.RLock()
 
-    def prepare(self, session_id: str, project: CodeProject) -> PreparedProjectWorkspace:
+    def prepare(self, session_id: str, project: CodeProject, setup: TaskRepositorySetup | None = None) -> PreparedProjectWorkspace:
         with self._lock:
             prepared: list[TaskWorkspace] = []
             try:
                 for resource in project.resources:
-                    folder = self._runtime_folder(resource)
+                    include_local_changes = bool(
+                        setup and setup.include_local_changes and isinstance(resource, RepositoryResource)
+                        and resource.local_path
+                    )
+                    folder = self._runtime_folder(resource, project, require_local=include_local_changes)
                     key = self._key(session_id, folder.id)
-                    item = self.workspaces.prepare(key, folder.path, True, folder.base_branch)
-                    prepared.append(self._task_workspace(session_id, project.name, folder, item))
+                    if setup is not None and isinstance(resource, RepositoryResource):
+                        inspection = inspect_repository_checkout(self.workspaces, Path(folder.path))
+                        if not inspection.revision and (setup.branch or not setup.include_local_changes):
+                            raise WorkspaceError(f"{resource.name} has no commits. Make an initial commit, or leave the task branch blank and include local changes")
+                    item = self.workspaces.prepare(
+                        key, folder.path, True, folder.base_branch,
+                        include_local_changes=include_local_changes,
+                    )
+                    prepared.append(self._task_workspace(
+                        session_id, project.name, folder, item, task_branch=setup.branch if setup else None,
+                    ))
                 ports = self.ports.allocate(session_id, project.environment.port_names)
                 return PreparedProjectWorkspace(primary=prepared[0], workspaces=tuple(prepared), ports=ports)
             except Exception:
                 for workspace in reversed(prepared):
                     self._cleanup_one(session_id, workspace)
+                    if setup and setup.branch and workspace.task_branch == setup.branch:
+                        # Only branches successfully created by this preparation.
+                        self.rollback_task_branch(workspace)
                 self.ports.release(session_id)
                 raise
+
+    def rollback_task_branch(self, workspace: TaskWorkspace) -> None:
+        """Delete only our still-unmodified branch after failed preparation."""
+        if workspace.task_branch and workspace.base_revision:
+            self.workspaces.git.run(
+                Path(workspace.source_path), "update-ref", "-d", f"refs/heads/{workspace.task_branch}",
+                workspace.base_revision, check=False,
+            )
 
     def restore(
         self,
@@ -197,7 +245,7 @@ class ProjectWorkspaceManager:
                 record = by_resource[resource.id]
                 if record.status != WorkspaceStatus.ready or not record.path:
                     raise WorkspaceError(f"The workspace for {resource.name} is no longer available")
-                folder = self._runtime_folder(resource)
+                folder = self._runtime_folder(resource, project)
                 expected = (self.workspaces.worktrees_root / managed_key(self._key(session_id, folder.id))).resolve()
                 actual = Path(record.path).expanduser().resolve()
                 if actual != expected or not actual.is_dir():
@@ -224,26 +272,47 @@ class ProjectWorkspaceManager:
             ports = self.ports.allocate(session_id, project.environment.port_names)
             return PreparedProjectWorkspace(primary=restored[0], workspaces=tuple(restored), ports=ports)
 
-    def _runtime_folder(self, resource: ProjectResource) -> ProjectFolder:
+    def _runtime_folder(
+        self, resource: ProjectResource, project: CodeProject, *, require_local: bool = False,
+    ) -> ProjectFolder:
         if isinstance(resource, LocalFolderResource):
             return resource_folder(resource)
         path = Path(resource.local_path).expanduser() if resource.local_path else None
         if path is None or not path.is_dir():
+            if require_local:
+                raise WorkspaceError(
+                    f"The local checkout for {resource.name} is unavailable. Reconnect it or choose Start from committed code"
+                )
             if not resource.source_url:
                 raise WorkspaceError(f"Repository is unavailable on this computer: {resource.name}")
-            path = self._repository_cache(resource)
+            credentials = None
+            if resource.use_connector_for_clone and self.repository_credentials:
+                credentials = self.repository_credentials(project, resource)
+            path = self._repository_cache(resource, credentials)
         return resource_folder(resource.model_copy(update={"local_path": str(path)}))
 
-    def _repository_cache(self, resource: RepositoryResource) -> Path:
+    def _repository_cache(self, resource: RepositoryResource, credentials: GitPushCredentials | None = None) -> Path:
         assert resource.source_url is not None
         try:
             source_url = validate_git_source(resource.source_url)
         except ValueError as exc:
             raise WorkspaceError(str(exc)) from exc
         key = hashlib.sha256(source_url.encode()).hexdigest()[:24]
+        environment = None
+        if credentials:
+            source_url = validate_git_source(credentials.remote_url)
+            # Auth is process-local and URL-scoped. Do not forward it through
+            # redirects or save it in the repository's config.
+            config_count = int(credentials.environment.get("GIT_CONFIG_COUNT", "0"))
+            environment = {
+                **credentials.environment,
+                "GIT_CONFIG_COUNT": str(config_count + 1),
+                f"GIT_CONFIG_KEY_{config_count}": "http.followRedirects",
+                f"GIT_CONFIG_VALUE_{config_count}": "false",
+            }
         root = self.workspaces.root / "repositories" / key
         if root.is_dir():
-            self._refresh_repository_cache(root, resource)
+            self._refresh_repository_cache(root, resource, environment)
             return root
         root.parent.mkdir(parents=True, exist_ok=True)
         temporary = root.with_name(f".{root.name}.tmp")
@@ -257,6 +326,7 @@ class ProjectWorkspaceManager:
                 source_url,
                 str(temporary),
                 check=False,
+                environment=environment,
             )
             if result.returncode != 0:
                 detail = (result.stderr or result.stdout or "Git clone failed").strip()
@@ -267,7 +337,9 @@ class ProjectWorkspaceManager:
                 shutil.rmtree(temporary)
         return root
 
-    def _refresh_repository_cache(self, root: Path, resource: RepositoryResource) -> None:
+    def _refresh_repository_cache(
+        self, root: Path, resource: RepositoryResource, environment: dict[str, str] | None = None,
+    ) -> None:
         fetched = self.workspaces.git.run(
             root,
             "fetch",
@@ -275,6 +347,7 @@ class ProjectWorkspaceManager:
             "--prune",
             "origin",
             check=False,
+            environment=environment,
         )
         if fetched.returncode != 0:
             detail = (fetched.stderr or fetched.stdout or "Git fetch failed").strip()
@@ -378,8 +451,11 @@ class ProjectWorkspaceManager:
         workspaces: list[TaskWorkspace],
         phase: str,
         ports: dict[str, int],
+        on_start: Callable[[ProjectCommand, TaskWorkspace], None] | None = None,
+        on_result: Callable[[CommandResult], None] | None = None,
+        stop: Callable[[], bool] | None = None,
     ) -> list[CommandResult]:
-        return self.commands.run(project, tuple(workspaces), phase, ports)
+        return self.commands.run(project, tuple(workspaces), phase, ports, on_start, on_result, stop)
 
     def diff(self, workspaces: list[TaskWorkspace]) -> list[DiffFile]:
         files: list[DiffFile] = []
@@ -522,12 +598,15 @@ class ProjectWorkspaceManager:
         folder: ProjectFolder,
         prepared: PreparedWorkspace,
         base_branch: str | None = None,
+        task_branch: str | None = None,
     ) -> TaskWorkspace:
         branch = None
+        branch_created = False
         try:
             if prepared.kind == WorkspaceKind.git_worktree:
-                branch = self._task_branch(project_name, session_id)
+                branch = task_branch or self._task_branch(project_name, session_id)
                 self.workspaces.create_branch(str(prepared.workspace_path), branch)
+                branch_created = True
             resolved_base_branch = base_branch or folder.base_branch
             if prepared.kind == WorkspaceKind.git_worktree and not resolved_base_branch:
                 resolved_base_branch = self.workspaces.inspect(str(prepared.source_path)).branch
@@ -551,6 +630,11 @@ class ProjectWorkspaceManager:
                 prepared.kind,
                 prepared.base_revision,
             )
+            if task_branch and branch_created and prepared.base_revision:
+                self.workspaces.git.run(
+                    prepared.source_path, "update-ref", "-d", f"refs/heads/{task_branch}",
+                    prepared.base_revision, check=False,
+                )
             raise
 
     @staticmethod

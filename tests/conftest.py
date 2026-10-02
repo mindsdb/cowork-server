@@ -28,6 +28,11 @@ os.environ["COWORK_FILES_DIR"] = str(TMP / "files")
 # Without this, org-scoped tests write into the developer's real ~/.cowork/.
 os.environ["COWORK_SHARED_DIR"] = str(TMP / "shared")
 os.environ["ENV"] = "test"
+# require_auth now defaults on in local mode. Every test in this suite drives
+# create_app() through TestClient/ASGITransport with no bearer token, so
+# leaving the default on would 401 nearly everything. A test that means to
+# exercise the auth-on behavior sets this back explicitly.
+os.environ["COWORK_REQUIRE_AUTH"] = "false"
 
 import pytest
 from sqlmodel import Session, SQLModel
@@ -59,6 +64,40 @@ def db_schema():
 
 
 @pytest.fixture(autouse=True)
+def keep_seeded_general_path():
+    """Put the seeded ``general`` row's path back after each test.
+
+    The default-project resolver writes on a read path: it re-points this row
+    onto whatever ``COWORK_PROJECTS_DIR`` currently names, so a test that moves
+    the root and then reaches a route leaves the row inside its own
+    ``tmp_path``, which pytest deletes. Later tests that resolve ``general``
+    from settings rather than from the row then disagree with it.
+
+    This repairs leakage only, at teardown. The write itself is asserted in
+    tests/test_general_project_root_change.py, so hiding it here costs no
+    coverage.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.session import get_engine
+    from cowork.models.project import Project
+    from cowork.services.projects import GENERAL_PROJECT_ID
+
+    engine = get_engine(get_app_settings().database.uri)
+    with Session(engine) as read:
+        seeded = read.get(Project, GENERAL_PROJECT_ID)
+        original = seeded.path if seeded is not None else None
+    yield
+    if original is None:
+        return
+    with Session(engine) as write:
+        row = write.get(Project, GENERAL_PROJECT_ID)
+        if row is not None and row.path != original:
+            row.path = original
+            write.add(row)
+            write.commit()
+
+
+@pytest.fixture(autouse=True)
 def close_coding_services():
     yield
     from coding_service_fakes import close_services
@@ -75,6 +114,55 @@ def trust_test_client_host():
     guards._TRUSTED_LOOPBACK_HOSTS = production | {"testserver"}
     yield
     guards._TRUSTED_LOOPBACK_HOSTS = production
+
+
+@pytest.fixture
+def cleanup_tmp_projects(tmp_path):
+    """Delete Project rows created under this test's `tmp_path`, plus their
+    dependent TaskObject, Conversation, and SharedResourceAttribution rows.
+
+    Several artifact-ownership test modules create real Project rows against
+    the session-scoped test DB; a leaked row (especially one with a real
+    `.anton/artifacts` dir) pollutes other modules that scan or query all
+    projects. Not autouse: opt in per module with
+    `pytestmark = pytest.mark.usefixtures("cleanup_tmp_projects")`.
+    """
+    from sqlalchemy import delete, or_
+    from sqlmodel import select
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.session import get_engine
+    from cowork.models.conversation import Conversation
+    from cowork.models.project import Project
+    from cowork.models.shared_resource import SharedResourceAttribution
+    from cowork.models.task_object import TaskObject
+
+    yield
+
+    engine = get_engine(get_app_settings().database.uri)
+    with Session(engine) as session:
+        leaked_ids = list(
+            session.exec(
+                select(Project.id).where(Project.path.startswith(tmp_path.as_posix()))
+            ).all()
+        )
+        if not leaked_ids:
+            return
+        session.exec(delete(TaskObject).where(TaskObject.project_id.in_(leaked_ids)))
+        session.exec(delete(Conversation).where(Conversation.project_id.in_(leaked_ids)))
+        # `artifact_resource_key` always starts with "<project_id>/".
+        session.exec(
+            delete(SharedResourceAttribution).where(
+                or_(
+                    *(
+                        SharedResourceAttribution.resource_key.startswith(f"{pid}/")
+                        for pid in leaked_ids
+                    )
+                )
+            )
+        )
+        session.exec(delete(Project).where(Project.id.in_(leaked_ids)))
+        session.commit()
 
 
 @pytest.fixture

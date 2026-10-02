@@ -27,7 +27,7 @@ from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings  # noqa: F401
 
 from cowork.services.connectors.persist import vault_for_scope
-from cowork.services.providers import publish_url_for_endpoint
+from cowork.services.providers import is_mindshub_publish_url, publish_url_for_endpoint
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
 from anton.minds_client import describe_minds_connection_error
 from anton.publisher import PUBLISH_JOB_BUDGET_S, PublishJobFailed
@@ -289,6 +289,13 @@ def list_publishable() -> dict:
 # publish their directory regardless of the primary file's suffix.
 PUBLISHABLE_STATIC_SUFFIXES = (".html", ".md")
 
+# What Share and the agent's publish tool report for a full-stack artifact when
+# the publish URL is not MindsHub's service (`is_mindshub_publish_url`).
+FULLSTACK_PUBLISH_UNSUPPORTED = (
+    "Full-stack apps can't be shared from this deployment. Its publishing "
+    "service accepts HTML and Markdown artifacts only."
+)
+
 # Self-contained page wrapper for rendered Markdown. No external assets so
 # the published bundle is a single index.html the viewer serves standalone.
 # Styled to match Anton's dashboards (GitHub-dark palette + system fonts —
@@ -392,6 +399,7 @@ def publish_artifact(
     password: str | None = None,
     access: dict | None = None,
     scope: TenantScope | None = None,
+    project_id: str | None = None,
     job_budget_s: float = PUBLISH_JOB_BUDGET_S,
     on_job_accepted: Callable[[dict], None] | None = None,
 ) -> dict:
@@ -420,7 +428,12 @@ def publish_artifact(
     anton's callback, invoked with the 202 body the moment the server accepts
     the job, so a caller that abandons the thread on its own timeout can tell
     "upload still in flight" from "job accepted, still polling".
+
+    `project_id` is the artifact's project; required in organization mode,
+    where the owner lookup is keyed by it.
     """
+    if scope is not None and scope.org_mode and project_id is None:
+        raise ValueError("publish_artifact requires project_id in organization mode")
     if not api_key:
         raise ValueError("Publishing requires an API key")
 
@@ -429,6 +442,12 @@ def publish_artifact(
     )
     if not is_fullstack and publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
         raise ValueError("Only HTML and Markdown artifacts can be published")
+    # Refuse before anything is built: `anton.publisher.publish` puts the
+    # artifact's datasource credentials, in plaintext, in the body of a
+    # full-stack upload, and a service that can't run the app would receive
+    # them only to answer 400.
+    if is_fullstack and not is_mindshub_publish_url(publish_url):
+        raise ValueError(FULLSTACK_PUBLISH_UNSUPPORTED)
 
     try:
         from anton.publisher import publish
@@ -460,7 +479,9 @@ def publish_artifact(
         if scope is not None and scope.org_mode:
             from cowork.services.artifact_authorization_identity import publish_authorization_key
 
-            canonical_artifact_key = publish_authorization_key(artifact_id, artifacts_base, scope)
+            canonical_artifact_key = publish_authorization_key(
+                artifact_id, artifacts_base, published_dir.name, project_id, scope
+            )
         else:
             canonical_artifact_key = artifact_key(artifact_id)
 

@@ -42,17 +42,32 @@ def _local_client() -> TestClient:
     return TestClient(create_app(), client=("127.0.0.1", 50000))
 
 
-def test_options_on_responses_is_open_in_org_mode(org_client):
+def test_options_on_responses_is_open_in_org_mode(monkeypatch):
     """A route declared OpenByDesign has to actually be open.
 
     The responses router used to declare AuthenticatedInOrgMode at router
     level, and FastAPI ADDS a route-level dependency to its router's rather
     than substituting for it — so the OPTIONS route carried both and answered
     401, under a comment saying it "carries its own OpenByDesign instead".
-    TrustedHeaderMiddleware returns before building a Principal on any OPTIONS
-    request, so there was never one to satisfy the stricter check.
+
+    A bare OPTIONS (no CORS preflight headers at all) under
+    identity_enforce=audit, not a real preflight: TrustedHeaderMiddleware's
+    own OPTIONS bypass requires Origin + Access-Control-Request-Method
+    together now, and asserting against that pair here would make this test
+    describe the middleware's bypass, not the route's own dependency, and
+    break the moment that pair is tightened further. Audit mode lets a
+    request with no identity through regardless of method, so what actually
+    answers 200 here is the route's own OpenByDesign — the exact thing this
+    test exists to prove.
     """
-    resp = org_client.options("/api/v1/responses/")
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "audit")
+    from cowork.common.settings.app_settings import get_app_settings
+
+    get_app_settings.cache_clear()
+    client = TestClient(create_app())
+
+    resp = client.options("/api/v1/responses/")
 
     assert resp.status_code == 200
     assert resp.json() == {"message": "OK"}

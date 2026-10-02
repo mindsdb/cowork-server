@@ -1,0 +1,65 @@
+name: Wheels Available
+
+# Every platform we ship to must be installable from wheels alone.
+#
+# The desktop app installs this package with `uv tool install` on user machines
+# that have no compiler, and the PyPI install channel deliberately ships no
+# Xcode Command Line Tools step. So when a dependency resolves to a version
+# with no wheel for an architecture, uv falls back to building it from source
+# and the app dead-ends at "Install cowork-server".
+#
+# That is not hypothetical. cryptography stopped publishing macOS x86_64 wheels
+# at 49.0.0; a cap was added in #320 to hold Intel Macs on 48.x, and a routine
+# dependency bump (#502) deleted it five weeks later. Nothing in this repo went
+# red, and the next Intel-Mac user to install was hard-blocked (ENG-2864).
+# This job is what would have caught it, on the PR that removed the constraint.
+#
+# It runs on PRs AND before both publishes, because those catch different
+# things: the PR run blames the change, and the publish run is what stops a
+# broken artifact reaching PyPI when a dependency's wheel matrix changes under
+# a tree nobody touched.
+#
+# The weekly run that closes the between-releases gap lives in its own
+# trigger-shaped caller, `wheels-available-weekly.yml`. It cannot live here:
+# this file is called by `dev-build-deploy.yml`, whose `permissions: contents:
+# read` CAPS what a called workflow may request, and the failure notification
+# needs `actions: read`. Requesting it here fails the caller at startup
+# validation, taking every PR check with it.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  wheels-available:
+    # GitHub-hosted and secret-free on purpose, like the unit tests, so a fork
+    # contributor gets the signal that matters to them.
+    #
+    # It installs nothing and runs no dependency at runtime, but do NOT read
+    # that as "executes no third-party code": step 1 of the script resolves
+    # WITHOUT `--only-binary`, so when a package publishes no PEP 658 metadata
+    # uv may download and build its sdist to read the metadata, which runs that
+    # package's `setup.py`. Exactly the exposure `uv lock` and `uv sync`
+    # already carry here, on a runner with no secrets and a read-only token —
+    # but stated plainly rather than claimed away, because the reason this job
+    # can be ungated is the blast radius, not an absolute.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+
+      # Resolution only — no venv, no install. The script cross-resolves for
+      # every platform via `--python-platform`, so one ubuntu runner covers
+      # macOS and Windows too, and no Intel-Mac hardware is needed.
+      - name: Check every shipped platform resolves to versions with wheels
+        run: bash scripts/check_wheels_available.sh

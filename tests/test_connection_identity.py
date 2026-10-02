@@ -308,6 +308,73 @@ class TestConnectionLabel:
         assert set_connection_label("gmail", "nope", "X", vault=vault) is None
 
 
+class TestPersistConnectionSecretCarryForward:
+    """A re-save must not silently drop a previously-stored secret field the
+    connector spec declares (e.g. Google Ads' developer_token) just because
+    this particular save didn't resupply it — same reasoning as the label/
+    picked-files carry-forward above, extended to any spec-marked secret."""
+
+    def test_developer_token_preserved_when_later_save_omits_it(self, tmp_path):
+        vault = LocalDataVault(tmp_path)
+        first = {"account_email": "user@example.com", "access_token": "tok1", "developer_token": "ABCDE-FGHIJ-KLMNO"}
+        slug = persist_connection("google_ads", "browser_oauth_builtin", "", first, vault=vault)
+
+        # Reconnect (e.g. token refresh flow) that doesn't re-collect the field.
+        second = {"account_email": "user@example.com", "access_token": "tok2"}
+        persist_connection("google_ads", "browser_oauth_builtin", "", second, vault=vault)
+
+        rec = vault.read_record("google_ads", slug)
+        assert rec["fields"]["developer_token"] == "ABCDE-FGHIJ-KLMNO"
+        assert "developer_token" in rec["secure_keys"]
+        assert rec["fields"]["access_token"] == "tok2"
+
+    def test_resupplied_developer_token_overwrites_the_prior_value(self, tmp_path):
+        vault = LocalDataVault(tmp_path)
+        first = {"account_email": "user@example.com", "access_token": "tok1", "developer_token": "OLD-TOKEN"}
+        slug = persist_connection("google_ads", "browser_oauth_builtin", "", first, vault=vault)
+
+        second = {"account_email": "user@example.com", "access_token": "tok2", "developer_token": "NEW-TOKEN"}
+        persist_connection("google_ads", "browser_oauth_builtin", "", second, vault=vault)
+
+        assert vault.read_record("google_ads", slug)["fields"]["developer_token"] == "NEW-TOKEN"
+
+    def test_another_account_under_the_same_name_does_not_get_the_first_accounts_secret(self, tmp_path):
+        vault = LocalDataVault(tmp_path)
+        first = {"account_email": "a@example.com", "access_token": "tok-a", "developer_token": "A-SECRET"}
+        first_slug = persist_connection("google_ads", "browser_oauth_builtin", "ads", first, vault=vault)
+
+        second = {"account_email": "b@example.com", "access_token": "tok-b"}
+        second_slug = persist_connection("google_ads", "browser_oauth_builtin", "ads", second, vault=vault)
+
+        assert second_slug != first_slug
+        second_fields = vault.read_record("google_ads", second_slug)["fields"]
+        assert "developer_token" not in second_fields
+        assert second_fields["access_token"] == "tok-b"
+        assert vault.read_record("google_ads", first_slug)["fields"]["developer_token"] == "A-SECRET"
+
+    def test_emails_that_derive_the_same_slug_do_not_share_a_secret(self, tmp_path):
+        vault = LocalDataVault(tmp_path)
+        first = {"account_email": "a.b@corp.com", "access_token": "tok-1", "developer_token": "FIRST-SECRET"}
+        first_slug = persist_connection("google_ads", "browser_oauth_builtin", "", first, vault=vault)
+
+        second = {"account_email": "a+b@corp.com", "access_token": "tok-2"}
+        second_slug = persist_connection("google_ads", "browser_oauth_builtin", "", second, vault=vault)
+
+        assert second_slug == f"{first_slug}-2"
+        assert "developer_token" not in vault.read_record("google_ads", second_slug)["fields"]
+
+    def test_a_form_save_under_a_colleagues_name_does_not_get_their_password(self, tmp_path):
+        vault = LocalDataVault(tmp_path)
+        first = {"host": "cache.internal", "port": "6379", "password": "first-password"}
+        first_slug = persist_connection("redis", "manual", "cache", first, vault=vault)
+
+        second = {"host": "cache.internal", "port": "6380"}
+        second_slug = persist_connection("redis", "manual", "cache", second, vault=vault)
+
+        assert second_slug != first_slug
+        assert "password" not in vault.read_record("redis", second_slug)["fields"]
+
+
 class TestDisplayName:
     """The card/detail display name: derived identity only (email/host) —
     no longer prefers `_label`/`_user_label`; the connection's title comes

@@ -62,6 +62,11 @@ _MAX_TURN_IDLE_SECONDS = _idle_bound_seconds()
 # fully wedged producer is at most _MAX_TURN_IDLE_SECONDS + this.
 _IDLE_POLL_SECONDS = 15
 
+# Bound on RunRegistry.shutdown()'s wait for in-flight turns to persist their
+# partial answer before the process exits. The container's stop deadline must
+# cover Uvicorn's earlier request-drain budget (2s), this wait, and teardown.
+TURN_SHUTDOWN_GRACE_SECONDS = 5
+
 
 @dataclass
 class TurnLifecycle:
@@ -79,9 +84,16 @@ class TurnLifecycle:
     under it". Set from ``RunRegistry.discard``, which runs in a threadpool
     thread (the delete endpoint is a sync ``def``); a plain attribute write is
     safe there, unlike ``Task.cancel()``.
+
+    ``shutting_down`` means "the server is exiting, not the user's own Stop".
+    Set BEFORE the cancel, same ordering as ``discarded``: a producer's
+    ``CancelledError`` handler checks it to persist an interrupted turn.
     """
 
     discarded: bool = False
+    shutting_down: bool = False
+    # Watchdog expiry is an interruption, separate from deliberate user Stop.
+    timed_out: bool = False
 
 
 @dataclass
@@ -182,8 +194,9 @@ class RunRegistry:
                     conversation_id, existing.turn_id,
                 )
                 return existing
+            lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
             task = asyncio.create_task(
-                self._run_bounded(producer_coro, buffer, conversation_id, turn_id),
+                self._run_bounded(producer_coro, buffer, conversation_id, turn_id, lifecycle),
                 name=f"turn[{conversation_id}/{turn_id}]",
             )
             handle = RunHandle(
@@ -196,20 +209,22 @@ class RunRegistry:
                 user_id=user_id,
                 # The SAME object the producer coroutine closed over, so
                 # discard() can tell it to drop the turn on the floor.
-                lifecycle=lifecycle if lifecycle is not None else TurnLifecycle(),
+                lifecycle=lifecycle,
             )
             self._by_cid[conversation_id] = handle
             return handle
 
     async def _run_bounded(
         self, producer_coro, buffer: StreamBuffer, conversation_id: str, turn_id: int,
+        lifecycle: TurnLifecycle,
     ) -> None:
         """Run a producer under the idle bound (see module comment).
 
-        On reap the producer is cancelled; its CancelledError handler seals the
-        buffer with a terminal record (the user-Stop path), so the tail ends and
-        the client releases its slot. An external cancel/discard cancels this
-        wrapper and ``await task`` forwards it into the producer, so
+        On reap the producer is marked interrupted before cancellation. Its
+        CancelledError handler persists a failure and seals the buffer, so a
+        stalled answer never looks like a deliberate user Stop. An external
+        cancel/discard cancels this wrapper and ``await task`` forwards it into
+        the producer, so
         ``RunHandle.cancel``/``discard`` still work; a producer that raises on
         its own propagates unchanged.
         """
@@ -232,6 +247,7 @@ class RunRegistry:
                         last_seq, last_progress = seq, loop.time()
                     elif loop.time() - last_progress >= _MAX_TURN_IDLE_SECONDS:
                         reaped = True
+                        lifecycle.timed_out = True
                         logger.warning(
                             "Turn for conversation %s (turn %d) made no progress for %ss; "
                             "producer cancelled and its buffer sealed.",
@@ -317,6 +333,37 @@ class RunRegistry:
                 "Could not cancel the discarded producer for conversation %s",
                 conversation_id, exc_info=True,
             )
+
+    async def shutdown(self, timeout_seconds: float = TURN_SHUTDOWN_GRACE_SECONDS) -> int:
+        """Cancel every running turn so its partial answer persists instead of
+        vanishing under a SIGKILL. Marks ``shutting_down`` before cancelling,
+        same ordering rule as ``discard``. Bounded by ``timeout_seconds``;
+        a turn still unwinding past it is left for the next boot's seal.
+        """
+        handles = self.in_flight()
+        if not handles:
+            return 0
+        for handle in handles:
+            handle.lifecycle.shutting_down = True
+        for handle in handles:
+            handle.task.cancel()
+        done, pending = await asyncio.wait(
+            [h.task for h in handles], timeout=timeout_seconds
+        )
+        if pending:
+            logger.warning(
+                "%d turn(s) still unwinding past the %ss shutdown budget; "
+                "left for boot recovery to seal.", len(pending), timeout_seconds,
+            )
+        for task in done:
+            if task.cancelled():
+                continue
+            exc = task.exception()
+            if exc is not None:
+                logger.error(
+                    "Turn raised while unwinding for shutdown", exc_info=exc,
+                )
+        return len(handles)
 
     def reset(self) -> None:
         """Forget every handle without touching the producer tasks.

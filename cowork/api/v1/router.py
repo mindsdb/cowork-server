@@ -14,6 +14,7 @@ from cowork.api.v1.endpoints import (
     channels,
     comments,
     coding,
+    coding_personal_skills,
     coding_runtime,
     conversations,
     files,
@@ -85,6 +86,7 @@ api_router.include_router(
 )
 api_router.include_router(search.router, prefix="/search", tags=["search"])
 api_router.include_router(coding.router, prefix="/coding", tags=["coding"])
+api_router.include_router(coding_personal_skills.router, prefix="/coding/skills/personal", tags=["coding"])
 api_router.include_router(coding_runtime.router, prefix="/coding/runtime", tags=["coding-runtime"])
 api_router.include_router(hub_workspaces.router, prefix="/hub/workspaces", tags=["hub-workspaces"])
 api_router.include_router(hub_usage.router, prefix="/hub/usage", tags=["hub-usage"])
