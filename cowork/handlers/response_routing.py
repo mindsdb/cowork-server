@@ -492,6 +492,24 @@ def ineligible_reason(*, has_non_text_input: bool, has_attachments: bool, has_di
     return None
 
 
+
+# Naming a concrete file requires the full agent's file context even when the
+# question is phrased conversationally. This only delegates; it never authorizes
+# file access or fabricates a fast answer. Normal tool and completion checks run.
+_FILE_CONTEXT_RE = re.compile(
+    r"(?<![\w])[^\s<>\"'`/\\]+\.(?:json|csv|tsv|xlsx|xls|parquet|html|htm|md|docx|pdf|pptx|png|jpg|jpeg)(?![\w]|\.[\w])",
+    re.IGNORECASE,
+)
+
+
+def explicit_file_context(history: list[dict]) -> bool:
+    latest = next((m for m in reversed(history) if m.get("role") == "user"), None)
+    if latest is None:
+        return False
+    text = _condense_content(latest.get("content")) or ""
+    return bool(_FILE_CONTEXT_RE.search(text))
+
+
 async def decide_route(
     *,
     history: list[dict],
@@ -514,6 +532,9 @@ async def decide_route(
     )
     if reason:
         return RouteDecision(route=DELEGATED_AGENTIC, reason=reason)
+
+    if explicit_file_context(history):
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="explicit_file_context")
 
     messages = _text_history(history)
     if not messages:
