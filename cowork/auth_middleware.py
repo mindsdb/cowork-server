@@ -26,6 +26,8 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp
 
+from cowork.common.paths import open_fd
+
 logger = logging.getLogger(__name__)
 
 # Paths that are always accessible without a token (health probe + CORS preflight).
@@ -125,7 +127,7 @@ def _write_token(env_path: Path, token: str) -> None:
     # from the start — never world-readable in the gap between write and chmod.
     # For a pre-existing file the mode arg is ignored, so still chmod to tighten
     # any looser permissions.
-    fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd = open_fd(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(new_text)
     try:

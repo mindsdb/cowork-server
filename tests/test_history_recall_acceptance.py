@@ -14,8 +14,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from sqlmodel import Session
 
-from anton.core.llm.provider import LLMResponse, ProviderConnectionInfo, ToolCall, Usage
-from anton.core.session import ChatSession, ChatSessionConfig
+from anton.core.llm.provider import LLMResponse, ProviderConnectionInfo, StreamComplete, ToolCall, Usage
+from anton.core.session import ChatSession, ChatSessionConfig, _VerifierVerdict
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
@@ -37,6 +37,25 @@ _BASE_TIME = datetime(2026, 1, 1, tzinfo=timezone.utc)
 SECRET = "hunter2-staging"
 
 
+def _as_plan_stream(plan_fn):
+    """Adapt a `.plan`-shaped function into a `.plan_stream`-shaped async
+    generator yielding one `StreamComplete`.
+
+    `ChatSession.turn()` is now documented as "a non-streaming compatibility
+    wrapper over `turn_stream`" — it always drives the call through
+    `plan_stream_with_recovery`/`self._llm.plan_stream(...)` internally, even
+    for this non-streaming entry point. Without this, `plan_stream` resolves
+    to an unconfigured AsyncMock attribute; `async for` on its return value
+    fails, anton's retry loop swallows that failure and gives up with zero
+    real LLM calls per turn — silently, so the turn just never compacts
+    instead of raising anything that points at the real cause.
+    """
+    async def _plan_stream(messages, **kwargs):
+        yield StreamComplete(response=plan_fn(messages, **kwargs))
+
+    return _plan_stream
+
+
 def _base_llm():
     llm = AsyncMock()
     llm.coding_provider = MagicMock()
@@ -44,8 +63,21 @@ def _base_llm():
         return_value=ProviderConnectionInfo(provider="anthropic", api_key="test")
     )
     llm.coding_model = "claude-sonnet-4-6"
+    # History summarization budgets itself off this (a plain string in real
+    # usage) — an unconfigured AsyncMock attribute here isn't a string, so
+    # context_window()'s `model.startswith(prefix)` silently returns an
+    # unawaited coroutine instead of raising anywhere near the real cause.
+    llm.router_model = "claude-sonnet-4-6"
     llm.planning_provider = MagicMock()
     llm.planning_provider.native_web_tools = MagicMock(return_value=set())
+    # The completion verifier (ENG-716) calls this every turn to self-assess
+    # whether the assistant's reply actually finished the request. An
+    # unconfigured AsyncMock here returns another AsyncMock as the "verdict",
+    # which the verifier's own status check can't classify — always say the
+    # turn completed, which is all every scenario in this file needs.
+    llm.generate_object_code = AsyncMock(
+        return_value=_VerifierVerdict(status="COMPLETE", reason="test stub — always complete")
+    )
     return llm
 
 
@@ -69,6 +101,7 @@ def _forgetful_llm():
         )
 
     llm.plan = AsyncMock(side_effect=_plan)
+    llm.plan_stream = _as_plan_stream(_plan)
     llm.summarize = AsyncMock(
         side_effect=lambda *a, **kw: LLMResponse(content="## Goal\nSet up the staging deploy.")
     )
@@ -96,6 +129,7 @@ def _recalling_llm(query: str):
         return LLMResponse(content=f"From the archive: {json.dumps(messages[-1]['content'])}")
 
     llm.plan = AsyncMock(side_effect=_plan)
+    llm.plan_stream = _as_plan_stream(_plan)
     return llm
 
 
@@ -172,7 +206,29 @@ class TestDroppedFactIsRecoverable:
             initial_history=initial_history,
             tools=[tool],
         ))
-        reply = await session.turn("What was the staging password again?")
+        # Not session.turn() here: it wraps turn_stream(enable_interaction=False),
+        # which skips creating session.emitter — but every tool call now goes
+        # through _dispatch_draining(), which unconditionally reads
+        # self.emitter.get(). A real anton gap (reproduces on both `main` and
+        # `staging`, unrelated to this PR or ENG-1816), but a harmless one for
+        # cowork-server specifically: AntonHarness.stream_response() always
+        # calls turn_stream() directly, never the bare .turn() wrapper, so
+        # production never hits it. Drive turn_stream() directly instead —
+        # the same API real usage exercises — and read the reply the same way
+        # .turn()'s own docstring says it does.
+        async for _event in session.turn_stream("What was the staging password again?"):
+            pass
+        last = session._history[-1] if session._history else None
+        reply = ""
+        if isinstance(last, dict) and last.get("role") == "assistant":
+            content = last.get("content")
+            if isinstance(content, str):
+                reply = content
+            elif isinstance(content, list):
+                reply = "".join(
+                    block.get("text", "") for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                )
 
         assert SECRET in reply
 

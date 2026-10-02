@@ -442,6 +442,21 @@ def test_stage_project_instructions_noop_without_anton_md(tmp_path):
     assert stage_project_instructions(proj, str(uuid4())) is False
 
 
+def test_clearing_staged_instructions_works_without_os_o_nofollow(tmp_path, monkeypatch):
+    """Windows has no ``os.O_NOFOLLOW``; clearing a stale staged copy must not
+    raise AttributeError there (ENG-2950)."""
+    from cowork.services.files import stage_project_instructions
+    conv = str(uuid4())
+    proj = tmp_path / "proj"
+    staged = proj / "conversations" / conv / ".anton" / "anton.md"
+    staged.parent.mkdir(parents=True)
+    staged.write_text("stale rules")
+    monkeypatch.delattr("os.O_NOFOLLOW")
+
+    assert stage_project_instructions(proj, conv) is False
+    assert staged.read_bytes() == b""
+
+
 def test_stage_prunes_a_deleted_attachment(engine, tmp_path):
     svc = _svc(engine, _scope(ORG_A))
     conv = str(uuid4())
