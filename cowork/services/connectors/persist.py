@@ -48,6 +48,7 @@ def persist_connection(
     user_label: str | None = None,
     replace_existing: bool = False,
     default_label: str | None = None,
+    default_fields: dict[str, str] | None = None,
     vault=None,
     scope: "TenantScope | None" = None,
 ) -> str:
@@ -77,6 +78,14 @@ def persist_connection(
     ``replace_existing`` is reserved for an explicit reconnect of the named
     record. It replaces that record atomically after the caller has validated
     the new credential, while retaining its label and picked-file metadata.
+
+    ``default_fields`` generalizes the same "default once, then sticky"
+    behavior ``default_label``/``user_label`` already have, for any other
+    per-connector bookkeeping key a caller wants seeded on a genuinely new
+    connection but never silently reset on a later reconnect (e.g. HubSpot's
+    MCP connector defaulting ``_access_mode`` to ``"read"`` — a token
+    refresh/re-auth reaching this same save path must not clobber a value the
+    user already upgraded to ``"write"``).
     """
     if vault is None:
         vault = vault_for_scope(scope)
@@ -106,17 +115,6 @@ def persist_connection(
         # persisting the literal sentinel.
         target = vault.read_record(connector_id, base_slug)
         cred, is_edit = resolve_keep_sentinels(cred, target)
-        # Carry forward a previously-stored secret this save didn't resupply
-        # (e.g. Google Ads' developer_token on a reconnect that doesn't
-        # re-collect it) — same reasoning as the _label/_picked_files
-        # carry-forward below: a save must not silently drop something
-        # already provided just because this particular request didn't
-        # resend it. `target` is already scoped to this account (base_slug
-        # is account-derived), so this can't leak another account's secret.
-        target_fields = (target or {}).get("fields", {})
-        for key in secure_keys_for(connector_id, method, target_fields):
-            if key not in cred and target_fields.get(key):
-                cred[key] = target_fields[key]
         payload = {**cred, "_connector_id": connector_id}
         if method:
             payload["_method"] = method
@@ -132,6 +130,15 @@ def persist_connection(
         # full save here must not silently revoke files the user already granted
         # access to.
         existing = target if slug == base_slug else vault.read_record(connector_id, slug)
+        # Carry forward a stored secret this save didn't resupply (e.g. Google
+        # Ads' developer_token on a reconnect that doesn't re-collect it). Only
+        # from `existing`, the record this save replaces: the record at
+        # `base_slug` can belong to a different account that shares the slug.
+        existing_fields = (existing or {}).get("fields", {})
+        for key in secure_keys_for(connector_id, method, existing_fields):
+            if key not in payload and existing_fields.get(key):
+                payload[key] = existing_fields[key]
+        secure_keys = secure_keys_for(connector_id, method, payload)
         if not label:
             label = str((existing or {}).get("fields", {}).get("_label", "")).strip()
         if label:
@@ -161,6 +168,16 @@ def persist_connection(
         existing_picked_files = (existing or {}).get("fields", {}).get("_picked_files")
         if existing_picked_files:
             payload.setdefault("_picked_files", existing_picked_files)
+        for key, value in (default_fields or {}).items():
+            # Carry the existing record's value forward when it has one —
+            # never overwrite it. Falls back to `value` (the caller's
+            # default) both for a genuinely new connection AND for an
+            # existing record that predates this field entirely (found in
+            # review: the record-exists-but-lacks-the-key case previously
+            # left the key unset rather than backfilled, silently relying
+            # on every downstream reader defaulting it the same way).
+            prior = (existing.get("fields") or {}).get(key) if existing is not None else None
+            payload.setdefault(key, prior if prior is not None else value)
         vault.save(connector_id, slug, payload, secure_keys=secure_keys)
         return slug
 
