@@ -117,20 +117,19 @@ async def _run_artifact_owner_backfill() -> None:
 
 
 def _warm_agent_runtime() -> None:
-    """Pre-import modules the first agent turn otherwise loads lazily."""
-    import importlib
+    """Pre-import modules the first agent turn otherwise loads lazily.
 
-    for name in (
-        "anton.core.llm.openai",
-        "anton.core.llm.anthropic",
-        "anton.minds_client",
-        "anton.core.session",
-        "anton.core.tools.tool_handlers",
-    ):
-        try:
-            importlib.import_module(name)
-        except Exception:
-            logger.debug("agent runtime warm-up skipped %s", name, exc_info=True)
+    Plain imports, not a loop over ``importlib.import_module``: dynamic imports
+    are banned under cowork/ (tests/test_no_subprocess_static.py).
+    """
+    try:
+        import anton.core.llm.openai  # noqa: F401
+        import anton.core.llm.anthropic  # noqa: F401
+        import anton.minds_client  # noqa: F401
+        import anton.core.session  # noqa: F401
+        import anton.core.tools.tool_handlers  # noqa: F401
+    except Exception:
+        logger.debug("agent runtime warm-up stopped early", exc_info=True)
 
 
 @asynccontextmanager
