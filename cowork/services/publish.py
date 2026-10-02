@@ -66,7 +66,7 @@ def raise_publish_permission_error(exc: Exception) -> None:
     """Preserve the artifact consumer's explicit authority result through wrappers.
 
     Two transports carry it: a synchronous /upload answers with an HTTPError,
-    an asynchronous one (ENG-1580) reports the job's failure as a
+    an asynchronous one reports the job's failure as a
     PublishJobFailed carrying the same status code. Authorization (403) is
     always synchronous, so only the 503 case is mirrored for jobs.
     """
@@ -424,7 +424,7 @@ def publish_artifact(
     another org's secrets.
 
     `job_budget_s` caps how long an asynchronously accepted publish (server
-    202, ENG-1580) is polled; defaults to anton's. `on_job_accepted` is
+    202) is polled; defaults to anton's. `on_job_accepted` is
     anton's callback, invoked with the 202 body the moment the server accepts
     the job, so a caller that abandons the thread on its own timeout can tell
     "upload still in flight" from "job accepted, still polling".

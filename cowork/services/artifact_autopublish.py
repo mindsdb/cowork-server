@@ -47,7 +47,7 @@ AUTOPUBLISH_ACCESS: dict = {"mode": "restricted", "emails": [], "owner_only": Tr
 # thread and a held lock.
 _MIN_START_BUDGET_S = 5.0
 
-# Time budgets (ENG-1580). Three numbers must agree:
+# Time budgets. Three numbers must agree:
 #   PUBLISH_POST_TIMEOUT_S      anton's urllib timeout on the POST /upload itself
 #                               (imported, so a change in anton moves the budget)
 #   job_budget_for(ttl, t)      how long anton polls an accepted (202) job
@@ -290,7 +290,7 @@ def _plan(artifacts_base: Path, slugs: list[str]) -> list[tuple[str, PublishDeci
 
     Static goes first because publishing a fullstack artifact triggers a dependency
     install on the backend and regularly runs longer than this reconciler's
-    per-turn budget (the server builds it asynchronously since ENG-1580, but the
+    per-turn budget (the server builds it asynchronously, but the
     poll still takes minutes); with the opposite order one slow fullstack would
     eat the whole budget and the static artifacts would never get a link.
 

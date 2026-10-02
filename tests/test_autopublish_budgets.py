@@ -1,4 +1,4 @@
-"""The three autopublish time budgets must stay consistent (ENG-1580).
+"""The three autopublish time budgets must stay consistent.
 
 publish_artifact runs in a thread that outlives asyncio.wait_for. It may keep
 polling an async publish job and then write .published.json; the slug lock
