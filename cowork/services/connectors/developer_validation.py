@@ -17,6 +17,13 @@ from urllib.parse import urlparse
 import httpx
 from httpx._utils import get_environment_proxies
 
+from cowork.services.connectors.egress import (
+    EgressHostNotPublic,
+    EgressHostUnresolved,
+    connection_attempts,
+    vetted_public_addresses,
+)
+
 
 class DeveloperCredentialError(ValueError):
     """The submitted credential or connector configuration is invalid."""
@@ -127,26 +134,15 @@ def require_public_host(
     """Reject private/custom GitHub endpoints before attaching credentials; return the validated addresses."""
 
     try:
-        literal = ipaddress.ip_address(hostname)
-        addresses = [literal]
-    except ValueError:
-        try:
-            records = resolver(hostname, 443, type=socket.SOCK_STREAM)
-        except OSError as exc:
-            raise DeveloperProviderUnavailable(
-                "The GitHub Enterprise host could not be resolved. Check the base URL."
-            ) from exc
-        addresses = []
-        for record in records:
-            try:
-                addresses.append(ipaddress.ip_address(record[4][0]))
-            except (IndexError, ValueError):
-                continue
-    if not addresses or any(not address.is_global for address in addresses):
+        return vetted_public_addresses(hostname, resolver)
+    except EgressHostUnresolved as exc:
+        raise DeveloperProviderUnavailable(
+            "The GitHub Enterprise host could not be resolved. Check the base URL."
+        ) from exc
+    except EgressHostNotPublic as exc:
         raise DeveloperCredentialError(
             "GitHub Enterprise must use a publicly routable HTTPS host."
-        )
-    return addresses
+        ) from exc
 
 
 class PinnedHostError(httpx.ConnectError):
@@ -207,12 +203,17 @@ class PinnedHostTransport(httpx.BaseTransport):
         except (DeveloperCredentialError, DeveloperProviderUnavailable) as exc:
             raise PinnedHostError(exc, request) from exc
         transport = self._transport_for(host)
-        for address in addresses[:-1]:
+        # The request's own connect timeout is the budget for all attempts, and
+        # only a failure to connect moves on, before the token has been written.
+        timeouts = request.extensions.get("timeout", {})
+        attempts = connection_attempts(addresses, total_seconds=timeouts.get("connect"))
+        for address, connect_seconds in attempts[:-1]:
             try:
-                return transport.handle_request(self._pinned(request, host, str(address)))
-            except httpx.ConnectError:
+                return transport.handle_request(self._pinned(request, host, str(address), connect_seconds))
+            except (httpx.ConnectError, httpx.ConnectTimeout):
                 continue
-        return transport.handle_request(self._pinned(request, host, str(addresses[-1])))
+        address, connect_seconds = attempts[-1]
+        return transport.handle_request(self._pinned(request, host, str(address), connect_seconds))
 
     def _transport_for(self, host: str) -> httpx.BaseTransport:
         # HTTP connection pools key connections by the rewritten IP origin.
@@ -229,13 +230,15 @@ class PinnedHostTransport(httpx.BaseTransport):
             return transport
 
     @staticmethod
-    def _pinned(request: httpx.Request, host: str, address: str) -> httpx.Request:
+    def _pinned(request: httpx.Request, host: str, address: str, connect_seconds: float | None) -> httpx.Request:
+        """Return ``request`` aimed at ``address``, verified as ``host``, with its own connect timeout."""
+        timeouts = {**request.extensions.get("timeout", {}), "connect": connect_seconds}
         return httpx.Request(
             request.method,
             request.url.copy_with(host=address),
             headers=request.headers,
             stream=request.stream,
-            extensions={**request.extensions, "sni_hostname": host},
+            extensions={**request.extensions, "sni_hostname": host, "timeout": timeouts},
         )
 
     def close(self) -> None:
