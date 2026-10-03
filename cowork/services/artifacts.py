@@ -1155,6 +1155,7 @@ def _prepare_artifact_card(
     pinned_folder: PinnedDir | None,
     pinned_root: PinnedDir | None,
     artifacts_base: Path | None = None,
+    project_label: str = "",
 ) -> _PreparedArtifactCard | None:
     """Assemble the shared card shape without any filesystem mutation."""
     logical_folder = folder
@@ -1217,7 +1218,9 @@ def _prepare_artifact_card(
         "path": primary_path,
         "primary": meta.get("primary") or None,
         "projectId": project_id,
-        "projectName": project_name,
+        # What the card shows. The serve URL below carries `project_name`
+        # instead, because the serve route resolves the project by name.
+        "projectName": project_label or project_name,
         # The conversation that produced the artifact, so a comment addressed
         # with the agent from the artifacts list resumes that chat instead of
         # opening a fresh one. Empty for artifacts written before provenance —
@@ -1291,6 +1294,7 @@ def card_for_folder(
     *,
     project_id: str | None = None,
     project_name: str = "",
+    project_label: str = "",
     _pinned_folder: PinnedDir | None = None,
     _pinned_root: PinnedDir | None = None,
     artifacts_base: Path | None = None,
@@ -1331,6 +1335,7 @@ def card_for_folder(
         pinned_folder=_pinned_folder,
         pinned_root=_pinned_root,
         artifacts_base=artifacts_base,
+        project_label=project_label,
     )
     if prepared is None:
         return None
