@@ -447,6 +447,12 @@ class OAuthSettings(Settings):
 
     posthog_client_id: str = Field(default="", validation_alias=AliasChoices("POSTHOG_CLIENT_ID"))
 
+    # HubSpot's MCP Auth App — a fixed client_id/secret pair, same shape as
+    # Google/Linear/GitHub/Supabase, but the resulting token can only call
+    # HubSpot's remote MCP server, never its REST API.
+    hubspot_client_id: str = Field(default="", validation_alias=AliasChoices("HUBSPOT_CLIENT_ID"))
+    hubspot_client_secret: str = Field(default="", validation_alias=AliasChoices("HUBSPOT_CLIENT_SECRET"))
+
     # Browser-side key for the Google Picker widget (drive.file scope only
     # grants access to files the user explicitly picks via this UI).
     google_picker_api_key: str = Field(default="", validation_alias=AliasChoices("GOOGLE_PICKER_API_KEY"))
@@ -536,6 +542,8 @@ class TurnQueueSettings(Settings):
             "protocol has no heartbeat, so a long tool run legitimately produces no reply "
             "for minutes — tighten it once the pod sends one. <= 0 disables the bound, "
             "which means an unresponsive worker leaves the turn spinning forever."
+            " An open ask_user question produces no reply either: keep this above the "
+            "pod's question timeout (ANTON_CLOUD_ASK_USER_TIMEOUT_SECONDS, 300 s)."
         ),
     )  # COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS
     auth_internal_base_url: str = Field(
@@ -548,7 +556,12 @@ class TurnQueueSettings(Settings):
     )  # COWORK_TURN_AUTH_INTERNAL_SECRET
     turn_key_ttl_seconds: int = Field(
         default=1200,
-        description="TTL, in seconds, of the minted per-turn MindsHub key (20 min; keep within auth's turn_key_max_ttl_seconds).",
+        description=(
+            "TTL, in seconds, of the minted per-turn MindsHub key (20 min; keep within "
+            "auth's turn_key_max_ttl_seconds). scratchpad-controller's "
+            "MAX_TURN_WALL_CLOCK_SECONDS (1080) is derived from it (TTL - 120); change "
+            "both together."
+        ),
     )  # COWORK_TURN_TURN_KEY_TTL_SECONDS
     minds_base_url: str = Field(
         default="",

@@ -41,6 +41,7 @@ class _FakeBuffer:
 def _handler() -> ResponsesHandler:
     handler = object.__new__(ResponsesHandler)
     handler.scoped = _FakeScoped()
+    handler.interactive = True
     return handler
 
 
@@ -105,6 +106,33 @@ def test_remote_history_scrubs_secrets(monkeypatch):
 
     assert leaked_key not in json.dumps(history)
     assert "[REDACTED_API_KEY]" in history[0]["content"]
+
+
+async def test_remote_history_scrubs_a_registered_vault_secret_by_value(monkeypatch, tmp_path, request):
+    """A datasource password has no API-key shape, so only its registered
+    value can redact it before the seed lands in the Redis job. The call
+    sites are pinned by their own ordering tests."""
+    from anton.core.datasources.data_vault import LocalDataVault
+    from anton.utils.datasources import _reset_registered_ds_vars
+
+    from cowork.services.connectors.vault_secrets import register_vault_secrets
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "vault"))
+    LocalDataVault(tmp_path / "vault").save("postgres", "mydb", {
+        "host": "db.example.com", "port": "5432", "database": "app",
+        "user": "svc", "password": "hunter2xyz",
+    })
+    request.addfinalizer(_reset_registered_ds_vars)
+
+    await register_vault_secrets(LOCAL_SCOPE)
+    _fake_history(monkeypatch, [_msg("user", "the password is hunter2xyz")])
+
+    history, _ = ResponsesHandler._remote_seed_history(_FakeScoped(), uuid4())
+
+    blob = json.dumps(history)
+    assert "hunter2xyz" not in blob
+    assert "[DS_" in blob
 
 
 # ── seeding the pod with the saved compaction ────────────────────────────────
@@ -233,6 +261,81 @@ def _remote_handler(monkeypatch, saved):
     monkeypatch.setattr(responses_mod, "get_open_session", lambda: None)
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: _FakeScope())
     return handler
+
+
+async def test_the_producer_task_scrubs_the_job_history_with_the_requests_registration(
+    monkeypatch, tmp_path, request,
+):
+    """handle() registers the vault's secrets in the request task, while the
+    job history is built in the producer task the run registry spawns. The
+    registration must reach it, or the pod gets the password in plain text."""
+    from anton.core.datasources.data_vault import LocalDataVault
+    from anton.utils.datasources import _reset_registered_ds_vars
+
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.services.connectors.vault_secrets import register_vault_secrets
+    from cowork.streaming.registry import RunRegistry
+
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "vault"))
+    LocalDataVault(tmp_path / "vault").save("postgres", "mydb", {
+        "host": "db.example.com", "port": "5432", "database": "app",
+        "user": "svc", "password": "hunter2xyz",
+    })
+    request.addfinalizer(_reset_registered_ds_vars)
+
+    handler = _remote_handler(monkeypatch, {})
+    # The real seed builder, run where the producer runs it.
+    handler._remote_seed_history = (
+        lambda session, conv_id: ResponsesHandler._remote_seed_history(_FakeScoped(), conv_id)
+    )
+    rows = [_msg("user", "the password is hunter2xyz")]
+
+    class ConversationServiceWithHistory(responses_mod.ConversationService):
+        def get_ordered_messages(self, conv_id):
+            return rows
+
+        def get_conversation(self, conv_id):
+            return SimpleNamespace(
+                history_summary=None, history_summary_cutoff_id=None, project=None,
+            )
+
+    monkeypatch.setattr(responses_mod, "ConversationService", ConversationServiceWithHistory)
+    monkeypatch.setattr(
+        responses_mod, "get_user_settings",
+        lambda scope=None: SimpleNamespace(history_compaction_enabled=True),
+    )
+    captured = {}
+
+    async def fake_replies(**kwargs):
+        captured.update(kwargs)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    class _Buffer(_FakeBuffer):
+        latest_seq = 0
+
+    conv_id = uuid4()
+    buffer = _Buffer()
+    await register_vault_secrets(LOCAL_SCOPE)
+    run = await RunRegistry().start(
+        conversation_id=str(conv_id),
+        turn_id=0,
+        buffer=buffer,
+        producer_coro=handler._produce_remote(
+            conv_id=conv_id,
+            input_text="hi",
+            original_content="hi",
+            model="anton",
+            harness_id="anton",
+            buffer=buffer,
+        ),
+    )
+    await run.task
+
+    blob = json.dumps(captured["history"])
+    assert "hunter2xyz" not in blob
+    assert "[DS_" in blob
 
 
 def test_remote_memory_filters_out_personal_global_tier(monkeypatch):
@@ -2117,3 +2220,123 @@ async def test_produce_remote_completed_frame_omits_the_id_when_nothing_persiste
     completed = [f for f in buffer.frames if f.startswith("event: response.completed")]
     assert len(completed) == 1
     assert "assistant_message_id" not in _payload(completed[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag,expected", [(None, True), ("false", False)])
+async def test_produce_remote_marks_the_turn_interactive_per_setting(monkeypatch, flag, expected):
+    from cowork.common.settings.app_settings import get_app_settings
+
+    if flag is None:
+        monkeypatch.delenv("COWORK_ASK_USER_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("COWORK_ASK_USER_ENABLED", flag)
+    get_app_settings.cache_clear()
+    saved, captured = {}, {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def fake_replies(**kwargs):
+        captured.update(kwargs)
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    try:
+        await handler._produce_remote(
+            conv_id=uuid4(), input_text="hi", original_content="hi",
+            model="anton", harness_id="anton", buffer=_RecBuffer(),
+        )
+    finally:
+        get_app_settings.cache_clear()
+    assert captured["interactive"] is expected
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_stays_noninteractive_when_the_handler_is_built_that_way(monkeypatch):
+    """A scheduled/cron turn (cowork/scheduler.py) builds the handler with
+    interactive=False because nobody is watching to answer an ask_user card —
+    that must hold even when the account has ask_user_enabled on."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_ASK_USER_ENABLED", "true")
+    get_app_settings.cache_clear()
+    saved, captured = {}, {}
+    handler = _remote_handler(monkeypatch, saved)
+    handler.interactive = False
+
+    async def fake_replies(**kwargs):
+        captured.update(kwargs)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    try:
+        await handler._produce_remote(
+            conv_id=uuid4(), input_text="hi", original_content="hi",
+            model="anton", harness_id="anton", buffer=_RecBuffer(),
+        )
+    finally:
+        get_app_settings.cache_clear()
+    assert captured["interactive"] is False
+
+
+_ASK_STEP = {"step": "ask_user", "id": "ask:1", "prompt": "Which database?",
+             "options": [{"value": "pg"}, {"value": "my"}], "select": "one",
+             "allow_custom": True, "timeout_s": 300}
+
+
+def _retirements(events):
+    return [e for e in events if e.get("type") == "response.ask_user_answered"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["failed", "cancelled", "exception"])
+async def test_produce_remote_retires_an_open_question(monkeypatch, ending):
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    _fake_redis(monkeypatch, flag_set=False)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_step", _ASK_STEP
+        if ending == "failed":
+            yield "turn_failed", {"error": "RuntimeError: boom",
+                                  "code": "anton_error", "message": "An unexpected error occurred."}
+        elif ending == "cancelled":
+            yield "turn_failed", {"error": "cancelled"}   # the controller's own cancel literal
+        else:
+            raise RuntimeError("reply loop broke")
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_RecBuffer(),
+    )
+
+    events = saved["events"]
+    assert any(e.get("type") == "response.ask_user" for e in events)
+    assert _retirements(events) == [{
+        "type": "response.ask_user_answered", "question_id": "ask:1",
+        "status": "cancelled", "values": [], "text": "",
+    }]
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_does_not_retire_an_answered_question(monkeypatch):
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    _fake_redis(monkeypatch, flag_set=False)
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_step", _ASK_STEP
+        yield "turn_step", {"step": "ask_user_answered", "id": "ask:1", "status": "answered",
+                            "values": ["pg"], "text": "", "answer_id": "a1"}
+        yield "turn_failed", {"error": "RuntimeError: boom",
+                              "code": "anton_error", "message": "An unexpected error occurred."}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_RecBuffer(),
+    )
+    assert [e["status"] for e in _retirements(saved["events"])] == ["answered"]

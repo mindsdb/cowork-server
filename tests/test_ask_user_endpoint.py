@@ -261,14 +261,14 @@ async def test_an_unmapped_submit_result_is_not_reported_as_accepted(
     understand its own state".
 
     Mutation proof (recorded 2026-07-31): replacing
-    `case _: raise AssertionError(...)` with `case _: return {"accepted": True}`
+    the raising default in `_answer_response` with `return {"accepted": True}`
     (i.e. the pre-fix implicit else) makes this return 200 and the test fails.
     """
     monkeypatch.setattr(
         "cowork.api.v1.endpoints.responses.broker.submit",
         lambda *a, **k: "a-result-that-does-not-exist-yet",
     )
-    with pytest.raises(AssertionError, match="unhandled SubmitResult"):
+    with pytest.raises(AssertionError, match="unhandled answer result"):
         _post(client, values=["pg"])
 
 

@@ -45,7 +45,7 @@ from cowork.coding.contracts import (
     GitIdentity,
     GitIdentityRequest,
 )
-from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, StateConflict
+from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, ModelDiscoveryUnavailableError, StateConflict
 from cowork.coding.contracts import ModeTurnRequest
 from cowork.coding.questions import QuestionResponse
 from cowork.coding.control_models import TaskResourceScope
@@ -65,6 +65,7 @@ from cowork.coding.inference_proxy import (
     proxy_inference,
 )
 from cowork.coding.integrations import DeveloperIntegrationService
+from cowork.coding.repository_discovery import GitHubRepositoryPage
 from cowork.coding.project_models import (
     DraftPullRequestRequest,
     PlaybookConfigureRequest,
@@ -72,6 +73,7 @@ from cowork.coding.project_models import (
     ProjectActionPage,
     ProjectActionRunRequest,
     ProjectActionRunResponse,
+    ProjectCommandRefresh,
     ProjectCreateRequest,
     ProjectFolder,
     ProjectPage,
@@ -85,6 +87,7 @@ from cowork.coding.project_models import (
     canonical_model_id,
 )
 from cowork.coding.reasoning import check_reasoning_effort
+from cowork.coding.repository_setup import RepositorySetupService
 from cowork.coding.redaction import redact_text
 from cowork.coding.runtime_protocol import (
     ComputerUpdateRequest,
@@ -165,12 +168,27 @@ def _integration_service(scope: ScopeDep):
 IntegrationsDep = Annotated[DeveloperIntegrationService, Depends(_integration_service)]
 
 
+@router.get("/github/repositories", response_model=GitHubRepositoryPage)
+def list_github_repositories(
+    integrations: IntegrationsDep,
+    connection_name: Annotated[str, Query(min_length=1, max_length=512)],
+    page: Annotated[int, Query(ge=1, le=10_000)] = 1,
+):
+    return _call(integrations.repositories, connection_name, page)
+
+
 def _http_error(exc: Exception) -> HTTPException:
     if isinstance(exc, KeyError):
         return HTTPException(status_code=404, detail=str(exc).strip("'"))
     if isinstance(exc, ModelDiscoveryAuthenticationError):
         return HTTPException(
             status_code=401,
+            detail=str(exc),
+            headers={"X-MindsHub-Error-Code": exc.code},
+        )
+    if isinstance(exc, ModelDiscoveryUnavailableError):
+        return HTTPException(
+            status_code=502,
             detail=str(exc),
             headers={"X-MindsHub-Error-Code": exc.code},
         )
@@ -380,6 +398,27 @@ def inspect_code_project_folders(project_id: str):
 @router.post("/project-resources/inspect")
 def inspect_local_project_resource(body: ProjectFolder):
     return _call(_service().projects.resolve_local_resource, body)
+
+
+@router.get("/projects/{project_id}/repository-status")
+def code_project_repository_status(project_id: str):
+    service = _service()
+    project = _call(service.projects.get, project_id)
+    return {"items": _call(RepositorySetupService(service.workspaces, service.control.local_computer.id).status, project)}
+
+
+@router.get("/projects/{project_id}/repositories/{resource_id}/diff")
+def code_project_repository_diff(project_id: str, resource_id: str):
+    service = _service()
+    project = _call(service.projects.get, project_id)
+    return {"files": _call(RepositorySetupService(service.workspaces, service.control.local_computer.id).diff, project, resource_id)}
+
+
+@router.get("/projects/{project_id}/repositories/{resource_id}/branches")
+def code_project_repository_branches(project_id: str, resource_id: str):
+    service = _service()
+    project = _call(service.projects.get, project_id)
+    return {"items": _call(RepositorySetupService(service.workspaces, service.control.local_computer.id).branches, project, resource_id)}
 
 
 @router.get("/projects/{project_id}/resources")
@@ -764,6 +803,11 @@ def run_project_action(
 @router.get("/sessions/{session_id}/project-actions", response_model=ProjectActionPage)
 def project_actions(session_id: str):
     return _call(_service().project_action_page, session_id)
+
+
+@router.post("/sessions/{session_id}/project-commands/refresh", response_model=ProjectCommandRefresh)
+def refresh_project_commands(session_id: str):
+    return _call(_service().refresh_project_commands, session_id)
 
 
 @router.post("/sessions/{session_id}/terminals", response_model=TerminalTabState)

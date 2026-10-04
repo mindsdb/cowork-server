@@ -623,6 +623,98 @@ async def test_route_request_scrubs_secrets_from_history_and_current_prompt(monk
 
 
 @pytest.mark.asyncio
+async def test_route_request_scrubs_a_registered_vault_secret_by_value(monkeypatch, tmp_path, request):
+    """A datasource password has no API-key shape, so only its registered
+    value can redact it. Covers the scrub given the registration; the call
+    site is pinned by test_handle_registers_vault_secrets_before_routing."""
+    from uuid import uuid4
+
+    from anton.core.datasources.data_vault import LocalDataVault
+    from anton.utils.datasources import _reset_registered_ds_vars
+
+    from cowork.services.connectors.vault_secrets import register_vault_secrets
+    from cowork.models.message_event import MessageEvent  # noqa: F401 — resolves the ORM relationship
+    from cowork.models.message import Message
+    from cowork.schemas.responses import Role
+    import cowork.handlers.responses as responses
+
+    monkeypatch.setenv("COWORK_VAULT_DIR", str(tmp_path / "vault"))
+    LocalDataVault(tmp_path / "vault").save("postgres", "mydb", {
+        "host": "db.example.com", "port": "5432", "database": "app",
+        "user": "svc", "password": "hunter2xyz",
+    })
+    request.addfinalizer(_reset_registered_ds_vars)
+
+    handler = _routing_handler(monkeypatch)
+    await register_vault_secrets(handler.scope)
+
+    cid = uuid4()
+    rows = [Message(conversation_id=cid, role=Role.user, content="the password is hunter2xyz")]
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_ordered_messages=lambda _cid: rows),
+    )
+    seen = {}
+
+    async def fake_decide_route(**kwargs):
+        seen.update(kwargs)
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+
+    await handler._route_request(
+        conversation_id=cid,
+        harness_input=[{"type": "text", "text": "hi"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+
+    blob = str(seen["history"])
+    assert "hunter2xyz" not in blob
+    assert "[DS_" in blob
+
+
+@pytest.mark.asyncio
+async def test_handle_registers_vault_secrets_before_routing(monkeypatch):
+    """The gate scrubs history inside _route_request, so the vault's secrets
+    must be registered before it runs, not later in _build_chat_session."""
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = uuid4()
+    conversation = SimpleNamespace(id=conv_id, messages=[])
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(get_conversation=lambda _cid: conversation),
+    )
+    calls = []
+
+    async def fake_register(scope):
+        calls.append(("register", scope))
+
+    monkeypatch.setattr(responses, "register_vault_secrets", fake_register)
+
+    class _StopHere(Exception):
+        pass
+
+    async def fake_route_request(**kwargs):
+        calls.append(("route_request", None))
+        raise _StopHere
+
+    handler._route_request = fake_route_request
+
+    with pytest.raises(_StopHere):
+        await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id)))
+
+    assert calls == [("register", handler.scope), ("route_request", None)]
+
+
+@pytest.mark.asyncio
 async def test_route_request_does_not_hand_the_composer_pick_to_the_gate(monkeypatch):
     """ENG-1851: the composer's per-conversation pick drives Anton's turn, not
     the gate. `_route_request` no longer accepts or forwards it."""
@@ -1637,3 +1729,88 @@ def test_the_adjective_denial_still_catches_the_prod_failure():
 
     assert denies_our_product("There is no verified Cowork desktop app that I could find.")
     assert denies_our_product("There's no such app as MindsHub Cowork that I know of.")
+
+
+# ── the gate's own tool must never reach history as a direct answer ──────────
+
+
+_GATE_TOOL_ANSWERS = [
+    # A local server that fails to parse the model's call streams it as text.
+    '<tool_call>\n{"name": "delegate", "arguments": {"reason": "needs files"}}\n</tool_call>',
+    'delegate(reason="the user wants a file created")',
+    "[TOOL_CALLS][{\"name\": \"delegate\", \"arguments\": {}}]",
+    "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>handoff",
+    # A small model answering "list your tools" from its one visible tool.
+    "I have one tool available:\n\n- **delegate**: forwards the task to the assistant's backend.",
+    "The only tool I can use is the delegate tool.",
+    "Tools:\n- delegate: Delegate when a request requires the full agent.",
+    "I have one delegate-tool for handing work to the backend.",
+    "My only capability is delegate_tool, which hands work to the backend.",
+]
+
+
+@pytest.mark.parametrize("answer", _GATE_TOOL_ANSWERS)
+def test_gate_tool_matcher_catches_text_calls_and_self_descriptions(answer):
+    from cowork.handlers.response_routing import names_gate_tool
+
+    assert names_gate_tool(answer) is not None
+
+
+def test_gate_tool_matcher_does_not_fire_on_related_words():
+    """Whole word only: inflections and compounds of the tool name still ship."""
+    from cowork.handlers.response_routing import names_gate_tool
+
+    for benign in (
+        "Those permissions were delegated to the admin group.",
+        "Delegation works best when the owner of each task is clear.",
+        "Use redelegate to move your stake to another validator.",
+        "Hi there, how can I help?",
+    ):
+        assert names_gate_tool(benign) is None, benign
+
+
+@pytest.mark.parametrize(
+    "sentence",
+    [
+        "Try to delegate tasks to your team so you can focus on the roadmap.",
+        "Set the table view's delegate property to your view controller.",
+        "In C#, a delegate is a type that references a method.",
+    ],
+)
+def test_known_gate_tool_over_fires_are_accepted_and_pinned(sentence):
+    """Ordinary uses of the word DO fire, deliberately.
+
+    The paraphrases a model uses to describe its one visible tool vary far more
+    than the name does, so the name is matched as a whole word. A false positive
+    costs one hop on a path that fails open. Narrowing the matcher means updating
+    this test on purpose, not deleting it.
+    """
+    from cowork.handlers.response_routing import names_gate_tool
+
+    assert names_gate_tool(sentence) is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", _GATE_TOOL_ANSWERS)
+async def test_streamed_gate_answer_naming_the_gate_tool_is_discarded_and_delegated(answer):
+    """Streamed as text, as a local endpoint sends it, and never shipped.
+
+    Only a DIRECT_CONTEXT route reaches `_handle_direct_response`, which is what
+    persists an answer, so the delegated route keeps the gate's tool out of the
+    agent's history.
+    """
+    provider = _StreamProvider([_text(answer[:20]), _text(answer[20:]), _complete()])
+
+    decision = await decide_route(
+        history=[{"role": "user", "content": "list the tools you have access to"}],
+        has_non_text_input=False,
+        has_attachments=False,
+        has_disabled_connections=False,
+        binding=_binding(provider),
+    )
+
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.reason == "router_answer_named_gate_tool"
+    assert decision.text == ""
+    assert decision.fallback is False
+    assert decision.model == "gate-model"
