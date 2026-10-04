@@ -54,8 +54,15 @@ jobs:
     # Independent of the release chain on purpose: a scan finding should not hold
     # up the wheel the desktop installs from, and a failed publish should not hide
     # a broken image. Both land in this one run tree, and `notify` covers both.
+    #
+    # workflow_dispatch can be pointed at any ref; only staging builds and deploys
+    # the staging image. The trust policy of the `gha-cowork-server-ecr-dev` role
+    # and mindsdb/deployer's `deploy.yml` both refuse any other ref anyway, so
+    # this only turns a misdirected dispatch into a skip instead of a red run.
+    if: github.ref == 'refs/heads/staging'
     permissions:
       contents: read
+      id-token: write  # the build assumes its ECR role through GitHub OIDC
     uses: ./.github/workflows/build-deploy.yml
     with:
       build-environment: staging
