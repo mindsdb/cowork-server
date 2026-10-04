@@ -51,19 +51,17 @@ jobs:
     # it enters the reusable production path, while leaving push-to-main
     # unchanged. This is defense in depth against an accidental dispatch, not
     # the credential boundary: a selected branch can change this workflow. The
-    # prod GitHub Environment must first have a nonempty reviewer rule, prevent
-    # self-review, disable admin bypass, and allow exactly one `main` Branch
-    # rule. Add credentials only after that policy is active. Count evidence
-    # only from a fresh attempt 1 started afterward and approved at the prod gate
-    # by an eligible reviewer other than both the actor and triggering actor.
-    # See README.md.
+    # boundary is the prod GitHub Environment, which admits only `main` and
+    # lets no admin bypass that, together with the trust policy of the
+    # `gha-cowork-server-ecr-prod` role and mindsdb/deployer's `deploy.yml`,
+    # which both check for `main` themselves. See README.md.
     if: github.ref == 'refs/heads/main'
     permissions:
       contents: read
+      id-token: write  # the build assumes its ECR role through GitHub OIDC
     uses: ./.github/workflows/build-deploy.yml
     with:
       build-environment: production
-      build-runner: mdb-prod
       # On again now that prod is stood up. It was off because the rollout ran
       # against a namespace with no cowork-server release and no
       # scratchpad-controller, which failed every push to main.
