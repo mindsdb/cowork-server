@@ -30,6 +30,11 @@ networkPolicy:
   enabled: true
 
 deployment:
+  # The prod-tier repository. Only builds from main push here, so a PR or
+  # staging build can never supply the image prod runs.
+  image:
+    repository: 168681354662.dkr.ecr.us-east-1.amazonaws.com/mindsdb-cowork-server
+
   ingress:
     enabled: true
     name: cowork-server

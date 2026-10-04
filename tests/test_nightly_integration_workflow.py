@@ -28,7 +28,6 @@ def test_nightly_workflow_calls_staging_suite_and_reports_its_result():
     uses: ./.github/workflows/tests-integration.yml
     with:
       deploy-env: staging
-      runner: mdb-dev
       # A scheduled run starts on the default branch. Without this, the job
       # would check main's copy of the tests against staging's pods.
       ref: staging

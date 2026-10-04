@@ -37,6 +37,23 @@ helm upgrade --namespace $K8S_NAMESPACE --install $CURRENT_HELM_CHART $HELM_CHAR
 
 Swap `CI_ENVIRONMENT_SLUG` / `K8S_NAMESPACE` for `staging` or `prod` to target those environments.
 
+## Image repositories
+
+Images live in two ECR repositories in account `168681354662`:
+
+| Repository | Holds | Pulled by |
+| --- | --- | --- |
+| `mindsdb-cowork-server-dev` | PR images (`development-*`) and staging images (`staging-*`) | PR environments, `dev`, `staging` |
+| `mindsdb-cowork-server` | Images built from `main` (`production-*`) | `prod` |
+
+`values.yaml` points at the dev-tier repository, and `values-prod.yaml` overrides
+it with the prod-tier one. Each tier has its own push role.
+`gha-cowork-server-ecr-dev` can write only the dev-tier repository, and
+`gha-cowork-server-ecr-prod` trusts only a `main` build in the `prod` GitHub
+Environment, so no PR build can replace an image prod deploys.
+`.github/workflows/build-deploy.yml` picks the repository and role for each
+build.
+
 ## Required cluster secrets
 
 The chart references two Secrets that must exist in the target namespace:
@@ -52,7 +69,7 @@ The chart references two Secrets that must exist in the target namespace:
 In `staging` and `prod` this chart renders a NetworkPolicy (`networkPolicy.enabled`
 is true in those values files), so whoever runs the upgrade needs
 `create networkpolicies` in the target namespace. Without it the release fails and
-`--atomic` rolls the whole deploy back. CI runs as
+`--atomic` rolls the whole deploy back. The upgrade runs in mindsdb/deployer as
 `system:serviceaccount:infrastructure:<env>-gha-runner`, which holds the verb only
 in the namespaces listed under `runner_deploy_namespaces` in
 Kubernetes-Foundational-Services. See the `networkPolicy` block in `values.yaml`
@@ -137,9 +154,10 @@ git revert -m 1 dc79a531
 Later commits touched `cowork/principal.py`, so expect conflicts there. The
 revert and its conflict resolution go through review like any other change. A
 revert merged to `staging` deploys through `publish-staging.yml`, which has no
-approval gate. Production takes the revert only from `main`: `publish.yml` then
-waits at the `prod` GitHub Environment for a Devops approval before
-`build-deploy / deploy` runs. A push to `main` also syncs into `staging`. Unlike
+approval gate. Production takes the revert only from `main`: `publish.yml` builds
+the image, and its `build-deploy / deploy` job has mindsdb/deployer roll it out.
+Neither environment waits for an approval. A push to `main` also syncs into
+`staging`. Unlike
 an image rollback, the revert backs out nothing else, and later deploys keep it.
 
 After the backout, check every replica's image and repeat the probes below.
