@@ -20,6 +20,7 @@ from cowork.common.settings.app_settings import (
     ROLE_MODEL_DEFAULTS,
     ROUTER_MODEL_DEFAULTS,
     Settings,
+    current_direct_model,
     default_minds_url,
     get_app_settings,
 )
@@ -1117,6 +1118,13 @@ class UserSettings(Settings):
         # against router_provider — split-provider configs disagree between
         # the two. Tracked on ENG-1632 as a follow-up; changing it here would
         # alter resolution for existing split configs.
+        #
+        # A stored direct-provider pin the provider no longer serves reads back
+        # as its replacement (the picker wrote the old defaults back as pins),
+        # so the role keeps working and the next save persists the new id.
+        self.planning_model = current_direct_model(self.planning_provider.value, self.planning_model)
+        self.coding_model = current_direct_model(self.coding_provider.value, self.coding_model)
+        self.router_model = current_direct_model(self.router_provider.value, self.router_model)
         enabled_map = self._minds_enabled_map()
         if self.planning_model is None:
             self.planning_model = _enabled_aware_default(
