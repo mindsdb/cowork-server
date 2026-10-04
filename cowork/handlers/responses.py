@@ -16,7 +16,7 @@ from sqlmodel import Session
 from cowork.build_info import build_trace_metadata
 from cowork.common.chat_session import in_process_agent_allowed
 from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
-from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings
+from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings, get_app_settings
 from cowork.common.settings.user_settings import (
     Provider,
     get_user_settings,
@@ -82,6 +82,7 @@ from cowork.handlers.turn_errors import (
 )
 from cowork.db.scoped import ScopedSession, TenantScope, scope_from_principal
 from cowork.principal import Principal, identity_trace_metadata
+from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.product_permissions import (
@@ -320,7 +321,9 @@ def _message_id_str(message: Message | None) -> str | None:
 
 
 class ResponsesHandler:
-    def __init__(self, session: Session, principal: Principal | None = None) -> None:
+    def __init__(
+        self, session: Session, principal: Principal | None = None, interactive: bool = True
+    ) -> None:
         self.session = session
         self.principal = principal
         self.scope = scope_from_principal(principal)
@@ -331,6 +334,8 @@ class ResponsesHandler:
         self.harness_name = get_user_settings(self.scope).harness
         self.harness = None
         self.last_conversation_id: str | None = None
+        # Whether a person is watching this turn and can answer ask_user cards.
+        self.interactive = interactive
 
     def _get_harness(self):
         if self.harness is None:
@@ -418,6 +423,10 @@ class ResponsesHandler:
         # persisted yet (deferred to the producer for the streaming path), so
         # this is a stable per-conversation index for the buffer file.
         turn_id = len(conversation.messages)
+
+        # Before the gate: it and the producer task both scrub history in this
+        # request's context, and nothing registered the vault's secrets yet.
+        await register_vault_secrets(self.scope)
 
         disabled = (
             [dc.model_dump() for dc in request.disabled_connections]
@@ -565,7 +574,8 @@ class ResponsesHandler:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
         try:
             # Scrub credentials: this history bypasses the normal turn's
-            # _scrub_user_input/_stamp_message pass. Bounded to the rows
+            # _scrub_user_input/_stamp_message pass. Its DS_* values were
+            # registered by handle(), not _build_chat_session. Bounded to the rows
             # decide_route can actually use (_text_history keeps at most
             # _MAX_HISTORY_MESSAGES) so scrubbing doesn't pay for the whole
             # conversation on every gated turn.
@@ -1372,6 +1382,9 @@ class ResponsesHandler:
                     correlation_id=corr,
                     llm=(turn_llm or {}).get("llm"),
                     disabled=disabled,
+                    # Questions need someone to answer them: this path serves
+                    # the web UI, which renders the card and posts /answer.
+                    interactive=self.interactive and get_app_settings().ask_user_enabled,
                 ):
                     if kind == "progress" and data.get("phase") == "workspace_authorized":
                         artifact_writes_allowed = data.get("workspace_mode") == "persistent"
@@ -1572,6 +1585,8 @@ class ResponsesHandler:
             # an offset-aware instant (`_remote_reset_at` in producer.py), so
             # it rides both the frame and the persisted event as sent.
             reset_at = failure.get("reset_at")
+            # The pod never got to retire a question it was blocked on.
+            collected_events.extend(cancelled_ask_user_retirements(collected_events))
             collected_events.append(response_failed_payload(
                 message, code, reset_at=reset_at, request_id=corr))
             # Persist before building the frame — a client's SSE
@@ -1617,7 +1632,9 @@ class ResponsesHandler:
                 )})
                 await buffer.close("interrupted")
                 return
-            # Partial text generated before cancellation is persisted.
+            # Partial text generated before cancellation is persisted, with
+            # every question the Stop left open retired.
+            collected_events.extend(cancelled_ask_user_retirements(collected_events))
             persist()
             await buffer.close("cancelled")
         except Exception:
@@ -1625,6 +1642,7 @@ class ResponsesHandler:
                 "[responses] remote turn failed for conversation %s correlation_id=%s",
                 conv_id, corr, extra={"request_id": corr},
             )
+            collected_events.extend(cancelled_ask_user_retirements(collected_events))
             collected_events.append(response_failed_payload(
                 GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr))
             # Persist before building the frame — see the

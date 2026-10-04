@@ -267,6 +267,9 @@ def is_same_account(existing_record: dict | None, payload: dict, secure_keys: li
     """
     if not existing_record:
         return False
+    # A secret the stored record holds but this save omits is still a secret,
+    # not an identity field that makes the same account look different.
+    secure_keys = sorted(set(secure_keys or []) | set(existing_record.get("secure_keys") or []))
     return _nonsecret_identity(existing_record.get("fields", {}), secure_keys) == \
         _nonsecret_identity(payload, secure_keys)
 
