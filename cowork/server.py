@@ -125,17 +125,43 @@ AGENT_RUNTIME_MODULES = (
     "anton.core.session",
     "anton.core.tools.tool_handlers",
 )
+# Also paid by the first turn of a process, but only once it is under way: the
+# MCP wiring the harness imports for every session (it pulls in the mcp
+# package), and the OpenAI client's resource modules, imported on a client's
+# first `.responses` access. About 0.7 s together, so they load in the
+# background after startup instead of delaying it.
+TURN_PATH_MODULES = (
+    "anton.core.mcp.wiring",
+    "openai.resources",
+)
 
 
-def _warm_agent_runtime() -> None:
-    """Import the agent runtime at startup. A module that fails is left for the turn."""
+def _warm_agent_runtime(modules=AGENT_RUNTIME_MODULES) -> None:
+    """Import the agent runtime ahead of the first turn. A module that fails is left for the turn."""
     import importlib
 
-    for name in AGENT_RUNTIME_MODULES:
+    for name in modules:
         try:
             importlib.import_module(name)
         except Exception:
             logger.debug("agent runtime warm-up skipped %s", name, exc_info=True)
+
+
+def _warm_turn_path() -> None:
+    """Load what the first turn would otherwise load while the user waits.
+
+    Besides the modules, an OpenAI client looks up the platform for its request
+    headers on its first request; the standard library shells out for part of
+    that once per process and caches it, so asking here takes it off the turn.
+    """
+    import platform
+
+    _warm_agent_runtime(TURN_PATH_MODULES)
+    try:
+        platform.platform()
+        platform.machine()
+    except Exception:
+        logger.debug("platform warm-up skipped", exc_info=True)
 
 
 @asynccontextmanager
@@ -143,6 +169,9 @@ async def lifespan(app: FastAPI):
     run_dev_setup()
     # Before the server reports ready, so the first turn does not pay for imports.
     await asyncio.to_thread(_warm_agent_runtime)
+    # After it: a turn that starts first waits on the same import locks, so it is
+    # never slower than without this, and startup is not delayed by it.
+    app.state.turn_path_warm_up = asyncio.create_task(asyncio.to_thread(_warm_turn_path))
     # History recovery also retries buffers sealed by an earlier failed sweep.
     try:
         from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
@@ -239,6 +268,7 @@ async def lifespan(app: FastAPI):
 
         await _cancel_and_wait(getattr(app.state, "channel_ingress_reconciler", None))
         await _cancel_and_wait(getattr(app.state, "artifact_owner_backfill", None))
+        await _cancel_and_wait(getattr(app.state, "turn_path_warm_up", None))
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
