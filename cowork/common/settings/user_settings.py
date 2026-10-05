@@ -596,6 +596,21 @@ class UserSettings(Settings):
             "model's default. Only meaningful for models that advertise effort levels."
         ),
     )
+    router_reasoning_effort: str | None = Field(
+        default=None,
+        title="Routing & Summarization Reasoning Effort",
+        description=(
+            "Opaque reasoning-effort level for the router model, which runs "
+            "history summarization. The composer's per-task pick never applies "
+            "to it. None or empty sends no effort, which a model that doesn't "
+            "reason needs: it refuses any reasoning_effort. The route gate "
+            "shares the router's provider but runs resolved_gate_model, so the "
+            "effort is sent only while that is the router model: always on "
+            "openai-compatible, elsewhere only at the provider's default router "
+            "model. On openai-compatible, a router model that reasons by default "
+            "takes the gate's function tool on chat completions only at 'none'."
+        ),
+    )
     # Router role: the cheap front-model that runs history summarization (and
     # later gates each turn, respond-vs-delegate). Selectable so a user can
     # point routing + summarization at a cheap model independently of the
