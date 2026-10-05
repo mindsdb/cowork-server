@@ -16,12 +16,15 @@ import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from anton.core.datasources.data_vault import LocalDataVault
 from cowork.build_info import surface_kwarg
 from cowork.common.chat_session import build_chat_session, close_session_scratchpads
 from cowork.common.paths import cowork_home, pod_local_only
+
+if TYPE_CHECKING:
+    from cowork.services.providers import WebToolKwargs
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +89,7 @@ class CredentialProbe:
         form_spec: dict | None = None,
         skipped: list[str] | None = None,
         timeout_seconds: float = 90.0,
+        web_tool_kwargs: WebToolKwargs | None = None,
     ) -> None:
         self.engine = engine
         self.credentials = credentials
@@ -94,6 +98,9 @@ class CredentialProbe:
         self.form_spec = form_spec or {}
         self.skipped = list(skipped or [])
         self.timeout_seconds = timeout_seconds
+        # The caller captures this alongside llm_client. Never re-read settings
+        # here: the provider may have changed since the client was constructed.
+        self.web_tool_kwargs: WebToolKwargs = {**(web_tool_kwargs or {})}
         self._outcome = ProbeOutcome()
         self._pending: list[tuple[str, Any]] = []
 
@@ -317,13 +324,6 @@ class CredentialProbe:
         )
         from anton.core.tools.tool_defs import ToolDef
 
-        from cowork.common.settings.user_settings import get_user_settings
-        from cowork.services.providers import web_tool_kwargs_for
-
-        # Read before the credentials reach disk: a failure here must not
-        # leave the candidate credentials in a file nothing deletes.
-        web_tools = web_tool_kwargs_for(get_user_settings().resolved_planning_provider)
-
         env_path, var_names = self._write_credentials_env()
 
         SET_STATUS_TOOL = ToolDef(
@@ -487,7 +487,7 @@ class CredentialProbe:
             # The same planning role as a UI turn, so the same rule: hosted web
             # search stays off when COWORK_OPENAI_COMPATIBLE_API puts planning
             # on the Responses API.
-            **web_tools,
+            **self.web_tool_kwargs,
         )
 
         try:

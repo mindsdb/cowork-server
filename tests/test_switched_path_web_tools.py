@@ -53,7 +53,9 @@ def _settings(provider: Provider) -> UserSettings:
     )
 
 
-async def _session_config(monkeypatch, settings: UserSettings):
+async def _session_config(
+    monkeypatch, settings: UserSettings, *, changed_settings: UserSettings | None = None
+):
     """One turn's ChatSessionConfig, built by the real harness."""
     from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
     from cowork.db.session import get_open_session
@@ -62,6 +64,19 @@ async def _session_config(monkeypatch, settings: UserSettings):
     monkeypatch.setattr(
         "cowork.common.settings.user_settings.get_user_settings", lambda: settings
     )
+    if changed_settings is not None:
+        build_client = harness.AntonHarness._build_llm_client
+
+        def _build_after_settings_change(*args, **kwargs):
+            monkeypatch.setattr(
+                "cowork.common.settings.user_settings.get_user_settings",
+                lambda: changed_settings,
+            )
+            return build_client(*args, **kwargs)
+
+        monkeypatch.setattr(
+            harness.AntonHarness, "_build_llm_client", staticmethod(_build_after_settings_change)
+        )
     # Capture the config rather than a session: no scratchpad, no connectors.
     monkeypatch.setattr(harness, "build_chat_session", lambda config: config)
     monkeypatch.setattr("anton.core.datasources.data_vault.LocalDataVault", None)
@@ -151,8 +166,13 @@ async def test_web_tools_keep_their_defaults_off_the_switched_path(
     assert (config.web_search_enabled, config.web_fetch_enabled) == (True, True)
 
 
-async def _probe_session_config(monkeypatch, settings: UserSettings):
-    """The ChatSessionConfig a connector credential probe builds."""
+async def _probe_session_config(
+    monkeypatch, settings: UserSettings, *, changed_settings: UserSettings | None = None
+):
+    """Drive the real handler through client construction and its probe session."""
+    from unittest.mock import MagicMock
+
+    from cowork.handlers import probe as handler_module
     from cowork.services.connectors import probe as probe_module
 
     monkeypatch.setattr(
@@ -165,11 +185,29 @@ async def _probe_session_config(monkeypatch, settings: UserSettings):
         raise RuntimeError("config captured")
 
     monkeypatch.setattr(probe_module, "build_chat_session", _capture)
-    probe = probe_module.CredentialProbe(
-        engine="postgres", credentials={"password": "hunter2"}, llm_client=None, workspace=None
+    monkeypatch.setattr(
+        handler_module.store, "get", lambda _id: {"values": {"password": "hunter2"}}
     )
-    [event async for event in probe.run()]
+    monkeypatch.setattr(
+        handler_module.registry, "get_connector",
+        lambda _id: SimpleNamespace(form=SimpleNamespace(
+            form_id="probe-form", model_dump=lambda: {"form_id": "probe-form"}
+        )),
+    )
+    handler = handler_module.ProbeHandler(session=MagicMock())
+    async for event in handler.run(
+        submission_id="staged", connector_id="postgres", method=None,
+        name="test connection", conversation_id=None,
+    ):
+        if changed_settings is not None and "Starting probe" in event:
+            # The handler has built its client and yielded to the consumer.
+            # A settings write can complete before CredentialProbe.run starts.
+            monkeypatch.setattr(
+                "cowork.common.settings.user_settings.get_user_settings",
+                lambda *a, **k: changed_settings,
+            )
     (config,) = configs
+    await config.llm_client.aclose()
     return config
 
 
@@ -200,3 +238,52 @@ async def test_probe_session_keeps_web_tool_defaults_off_the_switched_path(
     config = await _probe_session_config(monkeypatch, _settings(provider))
 
     assert (config.web_search_enabled, config.web_fetch_enabled) == (True, True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        (Provider.OPENAI, Provider.OPENAI_COMPATIBLE),
+        (Provider.OPENAI_COMPATIBLE, Provider.OPENAI),
+    ],
+)
+async def test_harness_uses_one_settings_snapshot_for_client_and_web_policy(
+    monkeypatch, openai_compatible_api, anton_responses_ready, before, after
+):
+    openai_compatible_api("responses")
+    anton_responses_ready()
+    config = await _session_config(
+        monkeypatch, _settings(before), changed_settings=_settings(after)
+    )
+    try:
+        switched = before is Provider.OPENAI_COMPATIBLE
+        assert config.llm_client.planning_provider.native_web_tools() == (
+            {"web_search", "web_fetch"} if switched else set()
+        )
+        assert (config.web_search_enabled, config.web_fetch_enabled) == (not switched,) * 2
+    finally:
+        await config.llm_client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "before,after",
+    [
+        (Provider.OPENAI_COMPATIBLE, Provider.OPENAI),
+        (Provider.OPENAI, Provider.OPENAI_COMPATIBLE),
+    ],
+)
+async def test_probe_keeps_its_clients_web_policy_after_settings_change(
+    monkeypatch, openai_compatible_api, anton_responses_ready, before, after
+):
+    openai_compatible_api("responses")
+    anton_responses_ready()
+    config = await _probe_session_config(
+        monkeypatch, _settings(before), changed_settings=_settings(after)
+    )
+    switched = before is Provider.OPENAI_COMPATIBLE
+    assert config.llm_client.planning_provider.native_web_tools() == (
+        {"web_search", "web_fetch"} if switched else set()
+    )
+    assert (config.web_search_enabled, config.web_fetch_enabled) == (not switched,) * 2
