@@ -295,3 +295,12 @@ class TestUserSettingsIgnoresProcessEnvInOrgMode:
         s = UserSettings(_env_file=None)
         assert s.anthropic_api_key is not None
         assert s.anthropic_api_key.get_secret_value() == "sk-ant-local"
+
+    def test_local_mode_reads_router_reasoning_effort_env(self, monkeypatch, local_mode):
+        # Read by field name, like PLANNING_ and CODING_REASONING_EFFORT.
+        monkeypatch.setenv("ROUTER_REASONING_EFFORT", "none")
+        assert UserSettings(_env_file=None).router_reasoning_effort == "none"
+
+    def test_org_mode_ignores_router_reasoning_effort_env(self, monkeypatch, org_mode):
+        monkeypatch.setenv("ROUTER_REASONING_EFFORT", "none")
+        assert UserSettings(_env_file=None).router_reasoning_effort is None
