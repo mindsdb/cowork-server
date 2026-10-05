@@ -39,6 +39,7 @@ from cowork.common.paths import (
     dir_unlink,
 )
 from cowork.common.settings.app_settings import get_app_settings
+from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 
 if TYPE_CHECKING:
     from cowork.db.scoped import ScopedSession
@@ -151,13 +152,6 @@ BG_CYCLE = [
     "linear-gradient(135deg, var(--sage-50), #fff)",
     "linear-gradient(135deg, #fff, var(--stone-150))",
 ]
-
-# Files that aren't user content for the `modified` badge's mtime gate.
-# Keep in sync with anton.publisher._FULLSTACK_EXCLUDED — the running
-# backend's runtime log (`backend.log`) is excluded from the published
-# bundle there, so it must not count toward content mtime here either,
-# or it would constantly trip the gate and force a false badge.
-_HOUSEKEEPING_FILES = {"metadata.json", "README.md", "backend.log", ".published.json", ".revisions"}
 
 TEXT_EXTENSIONS = {
     ".html", ".md", ".txt", ".csv", ".json", ".py", ".js",
@@ -318,7 +312,8 @@ def _user_files_with_mtimes(folder: Path) -> list[tuple[Path, int]]:
                 continue
             for entry in entries:
                 entry_top = top if top is not None else entry.name
-                if entry_top in _HOUSEKEEPING_FILES:
+                # First path component only: `static/prd.md` is content.
+                if entry_top in NON_CONTENT_NAMES:
                     continue
                 try:
                     if entry.is_dir(follow_symlinks=False):
@@ -439,10 +434,9 @@ def _content_mtime(folder: Path) -> int:
     """Max mtime (int seconds) across an artifact's user content files.
 
     Disk-derived, so it reflects in-place edits the metadata.json mtime
-    misses. Housekeeping files (`metadata.json`, `README.md`,
-    `.published.json`) are excluded — they're not user content. Used both as
-    the renderer's cache-bust token and as the cheap "changed since publish"
-    gate for the `modified` badge.
+    misses. Names in anton's `NON_CONTENT_NAMES` are excluded — not user content.
+    Used both as the renderer's cache-bust token and as the cheap "changed
+    since publish" gate for the `modified` badge.
     """
     try:
         max_ns = max((ns for _, ns in _user_files_with_mtimes(folder)), default=0)
@@ -1155,6 +1149,7 @@ def _prepare_artifact_card(
     pinned_folder: PinnedDir | None,
     pinned_root: PinnedDir | None,
     artifacts_base: Path | None = None,
+    project_label: str = "",
 ) -> _PreparedArtifactCard | None:
     """Assemble the shared card shape without any filesystem mutation."""
     logical_folder = folder
@@ -1217,7 +1212,10 @@ def _prepare_artifact_card(
         "path": primary_path,
         "primary": meta.get("primary") or None,
         "projectId": project_id,
-        "projectName": project_name,
+        # What the card shows. The serve URL below carries `project_name`
+        # instead, because serve_artifact_file resolves that segment by name
+        # (_project_artifacts_base).
+        "projectName": project_label or project_name,
         # The conversation that produced the artifact, so a comment addressed
         # with the agent from the artifacts list resumes that chat instead of
         # opening a fresh one. Empty for artifacts written before provenance —
@@ -1291,6 +1289,7 @@ def card_for_folder(
     *,
     project_id: str | None = None,
     project_name: str = "",
+    project_label: str = "",
     _pinned_folder: PinnedDir | None = None,
     _pinned_root: PinnedDir | None = None,
     artifacts_base: Path | None = None,
@@ -1331,6 +1330,7 @@ def card_for_folder(
         pinned_folder=_pinned_folder,
         pinned_root=_pinned_root,
         artifacts_base=artifacts_base,
+        project_label=project_label,
     )
     if prepared is None:
         return None

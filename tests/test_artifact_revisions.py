@@ -1348,3 +1348,47 @@ def test_agent_repair_reports_conflict_when_base_moves_during_turn(artifact):
     assert detail["repair"]["status"] == "conflict"
     assert detail["repair"]["revisionId"] == agent_revision["id"]
     assert agent_revision["commentThreadIds"] == []
+
+
+def test_auto_pick_skips_store_housekeeping_files(tmp_path):
+    for name in ("README.md", "metadata.json", "index.html"):
+        (tmp_path / name).write_text("x", encoding="utf-8")
+
+    target, rel = revision_service.resolve_source(tmp_path, {})
+
+    assert rel == "index.html"
+    assert target == (tmp_path / "index.html").resolve()
+
+
+def test_auto_pick_skips_generation_inputs(tmp_path):
+    for name in ("prd.md", "report.md"):
+        (tmp_path / name).write_text("x", encoding="utf-8")
+
+    _, rel = revision_service.resolve_source(tmp_path, {})
+
+    assert rel == "report.md"
+
+
+def test_auto_pick_skips_nested_journal_files(tmp_path):
+    journal = tmp_path / "assets" / ".revisions"
+    journal.mkdir(parents=True)
+    (journal / "a.html").write_text("x", encoding="utf-8")
+    (tmp_path / "b.html").write_text("x", encoding="utf-8")
+
+    _, rel = revision_service.resolve_source(tmp_path, {})
+
+    assert rel == "b.html"
+
+
+def test_auto_pick_skips_a_symlinked_source(tmp_path):
+    folder = tmp_path / "linked"
+    folder.mkdir()
+    outside = tmp_path / "outside.md"
+    outside.write_text("secret\n", encoding="utf-8")
+    (folder / "a.md").symlink_to(outside)
+    (folder / "b.html").write_text("<p>ok</p>", encoding="utf-8")
+
+    target, rel = revision_service.resolve_source(folder, {})
+
+    assert rel == "b.html"
+    assert target.name == "b.html"
