@@ -1221,6 +1221,8 @@ class AntonHarness:
                 **account_kwargs(ChatSessionConfig),
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
+                web_search_enabled=anton_settings.web_search_enabled,
+                web_fetch_enabled=anton_settings.web_fetch_enabled,
                 # "Conversation started" stamp for the cache-stable prompt prefix
                 # (anton 2a). The live current time is rendered separately in the
                 # volatile tail, so resuming days later still reports the real "now".

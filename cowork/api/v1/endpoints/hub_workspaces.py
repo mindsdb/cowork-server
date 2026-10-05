@@ -45,9 +45,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlmodel import Session
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.common.settings.user_settings import UserSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
-from cowork.principal import hub_credential
+from cowork.principal import hub_credential, minds_hub_configured
 from cowork.schemas.hub_workspaces import (
     HubWorkspaceActivateRequest,
     HubWorkspaceRow,
@@ -70,19 +71,31 @@ ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 SETTING_KEY = "hub_workspace_id"
 
 
+def _hub_available(scope: TenantScope, settings: UserSettings) -> bool:
+    """Whether the selector may forward a MindsHub credential at all.
+
+    Org mode is unchanged: MindsHub is its exclusive provider. In local mode a
+    self-hosted install that was never signed in and has no key configured
+    must never send whatever the desktop attached to
+    ``X-MindsHub-Authorization`` onward.
+    """
+    return scope.org_mode or minds_hub_configured(settings)
+
+
 async def _build_view(
     request: Request, session: Session, scope: TenantScope
 ) -> HubWorkspaceView:
     """The selector's whole state: the caller's workspaces and which is active."""
-    bearer = hub_credential(request)
+    settings = SettingService(session, scope).load()
+    configured = _hub_available(scope, settings)
+    bearer = hub_credential(request) if configured else ""
     org_id = scope.org_id or ""
     user_id = scope.user_id or ""
     listing = await fetch_hub_workspaces(bearer_token=bearer, org_id=org_id, user_id=user_id)
-    stored = SettingService(session, scope).load().hub_workspace_id
-    active = resolve_active(listing.workspaces, stored)
+    active = resolve_active(listing.workspaces, settings.hub_workspace_id)
     active_id = active.id if active else None
     return HubWorkspaceView(
-        enabled=True,
+        enabled=configured,
         reachable=listing.reachable,
         workspaces=[
             HubWorkspaceRow.model_validate(workspace, from_attributes=True)
@@ -121,7 +134,18 @@ async def set_active_hub_workspace(
     missing from the listing is a grant the caller does not hold, and that is a
     403. A workspace in the listing but stamped archived is a 409, so the UI can
     say retrying will not help instead of offering a loop with no exit.
+
+    A third case sits ahead of both: a local install with no MindsHub key
+    configured. That is not "could not reach MindsHub" — no request was even
+    made — so it gets its own 409 naming the real reason, distinct from the
+    503 a genuinely unreachable MindsHub still gets below.
     """
+    settings = SettingService(session, scope).load()
+    if not _hub_available(scope, settings):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="MindsHub is not configured on this install",
+        )
     bearer = hub_credential(request)
     org_id = scope.org_id or ""
     user_id = scope.user_id or ""

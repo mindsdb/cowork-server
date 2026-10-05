@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from anton.config.settings import AntonSettings
 from anton.core.datasources.data_vault import LocalDataVault
 from cowork.build_info import surface_kwarg
 from cowork.common.chat_session import build_chat_session, close_session_scratchpads
@@ -437,8 +438,16 @@ class CredentialProbe:
             handler=self._request_extra_field,
         )
 
+        # Env-derived, same as the harness's own build: the probe is a real
+        # agent turn (it runs a `ChatSession`), so it must honor an operator's
+        # ANTON_WEB_SEARCH_ENABLED / ANTON_WEB_FETCH_ENABLED the same as a
+        # user turn, not silently default both to on.
+        anton_settings = AntonSettings()
+
         config = ChatSessionConfig(
             llm_client=self.llm_client,
+            web_search_enabled=anton_settings.web_search_enabled,
+            web_fetch_enabled=anton_settings.web_fetch_enabled,
             # An empty vault, so the manager derives an empty DS_* set and the
             # runtime strips the inherited ones: the probe tests the candidate
             # credentials it writes to its own env file, and must not be able

@@ -904,10 +904,17 @@ Environment variables fall into two namespaces:
 | Variable | Harness | Description |
 |----------|---------|-------------|
 | `ANTON_PUBLISH_URL` | Anton | Artifact publish endpoint. Pointed anywhere but MindsHub's service, it takes HTML and Markdown only: sharing a full-stack app is refused before anything is uploaded, because that upload carries the app's connection credentials |
+| `ANTON_PUBLISH_API_KEY` | Anton | Local mode only. Lets a self-hosted install publish artifacts with its own key instead of a MindsHub one, against the explicit publish URL only (`ANTON_PUBLISH_URL` or the `publish_url` setting) — no fallback to a MindsHub host. Refused without an explicit URL. Not a `UserSettings` field: an org admin cannot set it and hosted resolution never sees it |
+| `ANTON_WEB_FETCH_ENABLED` | Anton | Default `true`. Set `false` to keep the agent from fetching arbitrary URLs |
+| `ANTON_WEB_SEARCH_ENABLED` | Anton | Default `true`. Set `false` to keep the agent from searching the web |
 | `ANTON_SKILLS_ROOT_DIR` | Anton | Skill file storage |
 | `ANTON_GLOBAL_MEMORY_ROOT_DIR` | Anton | Global memory files |
+| `ANTON_ANALYTICS_ENABLED` | Anton | Default `true`. Anonymous usage events sent to a MindsDB collector — not a MindsHub host, but a self-hosted install that wants no outbound telemetry at all sets this `false` |
+| `ANTON_POSTHOG_KEY` | Anton | Defaults to MindsDB's own PostHog project token. Set to an empty string to stop PostHog reporting without touching `ANTON_ANALYTICS_ENABLED` |
 
 In Docker/Lightsail deployments, the container also receives `ANTON_MINDS_API_KEY`, `ANTON_OPENAI_API_KEY`, etc. — these are consumed by the Anton agent library directly (not by cowork-server settings), and are injected by the provisioning lambda via cloud-init user-data.
+
+**A local scratchpad subprocess inherits the server's environment** (only `DS_*` is stripped), so `ANTON_PUBLISH_API_KEY`, when set, is readable by agent-generated code in that subprocess — the same as every provider key already set in env today.
 
 ## Docs
 

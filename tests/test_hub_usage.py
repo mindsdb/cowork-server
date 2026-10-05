@@ -10,12 +10,16 @@ import asyncio
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlmodel import Session
 
 from cowork.api.v1.endpoints import hub_usage as ep
 from cowork.api.v1.router import api_router
-from cowork.db.scoped import TenantScope
+from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import LOCAL_SCOPE, TenantScope
+from cowork.db.session import get_engine
 from cowork.principal import HEADER_HUB_CREDENTIAL, Principal, get_principal
 from cowork.services import hub_usage as svc
+from cowork.services.settings import SettingService
 
 PATH = "/api/v1/hub/usage/"
 PRINCIPAL = Principal(user_id="user-a", org_id="org-a")
@@ -77,11 +81,29 @@ def _clean_cache():
 
 @pytest.fixture(autouse=True)
 def _reset_app_settings():
-    from cowork.common.settings.app_settings import get_app_settings
-
     get_app_settings.cache_clear()
     yield
     get_app_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _clean_minds_key():
+    """Drop the stored local-mode MindsHub key between tests.
+
+    Configured-in-local-mode tests seed it directly in the DB; left in place it
+    would silently configure every later local-mode test in this file.
+    """
+    yield
+    engine = get_engine(get_app_settings().database.uri)
+    with Session(engine) as s:
+        SettingService(s, LOCAL_SCOPE).delete_setting("minds_api_key")
+
+
+@pytest.fixture
+def session():
+    engine = get_engine(get_app_settings().database.uri)
+    with Session(engine) as s:
+        yield s
 
 
 @pytest.fixture
@@ -446,14 +468,55 @@ def test_credit_spend_falls_back_to_the_wallet_block(calls):
     assert spend.period_start == "2026-08-01"
 
 
-def test_the_route_answers_the_same_view_the_service_does(calls):
+def test_the_route_answers_the_same_view_the_service_does(session, calls):
     calls.answers[svc.ENTITLEMENTS_PATH] = ENTITLEMENTS
     calls.answers[svc.WALLET_PATH] = WALLET
 
-    view = asyncio.run(ep.get_hub_usage(FakeRequest(), _scope()))
+    view = asyncio.run(ep.get_hub_usage(FakeRequest(), session, _scope()))
 
     assert view.reachable is True
     assert view.balance.usd == 8.42
+
+
+def test_local_mode_with_no_minds_key_never_forwards_the_header(session, calls):
+    """A self-hosted install with no MindsHub key never asks auth for anything,
+    whatever the desktop attached to `X-MindsHub-Authorization`."""
+    view = asyncio.run(ep.get_hub_usage(FakeRequest(), session, TenantScope()))
+
+    assert view.reachable is False
+    assert calls.asked == []
+
+
+def test_local_mode_with_a_stored_minds_key_still_forwards(session, calls):
+    SettingService(session, LOCAL_SCOPE).upsert_setting("minds_api_key", "mdb_test")
+    calls.answers[svc.ENTITLEMENTS_PATH] = ENTITLEMENTS
+    calls.answers[svc.WALLET_PATH] = WALLET
+
+    view = asyncio.run(ep.get_hub_usage(FakeRequest(), session, TenantScope()))
+
+    assert view.reachable is True
+    assert view.balance.usd == 8.42
+
+
+def test_local_mode_with_the_desktop_runtime_credential_still_forwards(session, calls):
+    """The overlay a signed-in desktop hands over at runtime — never a stored
+    row — must configure the hub the same way a stored key does."""
+    from cowork.common.settings.runtime_credential import (
+        clear_minds_credential,
+        set_minds_credential,
+    )
+
+    set_minds_credential("mdb_runtime")
+    try:
+        calls.answers[svc.ENTITLEMENTS_PATH] = ENTITLEMENTS
+        calls.answers[svc.WALLET_PATH] = WALLET
+
+        view = asyncio.run(ep.get_hub_usage(FakeRequest(), session, TenantScope()))
+
+        assert view.reachable is True
+        assert view.balance.usd == 8.42
+    finally:
+        clear_minds_credential()
 
 
 # ── permission wiring (ENG-2094): the bare-function tests above never touch
@@ -485,13 +548,14 @@ def test_route_allows_an_authenticated_member_in_org_mode(monkeypatch):
     assert resp.json()["balance"]["usd"] == 8.42
 
 
-def test_the_wire_carries_the_camel_cased_percentage_the_desktop_reads(monkeypatch):
+def test_the_wire_carries_the_camel_cased_percentage_the_desktop_reads(session, monkeypatch):
     """The canonical field, pinned on the body rather than on the model.
 
     Every other allowance test reads the service's return value, where the field
     could be renamed, dropped from ``CamelResponse`` or never serialised and
     still pass. This is the name the desktop actually reads off the wire.
     """
+    SettingService(session, LOCAL_SCOPE).upsert_setting("minds_api_key", "mdb_test")
 
     async def _fake(path, bearer_token):
         return {svc.ENTITLEMENTS_PATH: ENTITLEMENTS, svc.WALLET_PATH: WALLET}.get(path)
@@ -509,8 +573,10 @@ def test_the_wire_carries_the_camel_cased_percentage_the_desktop_reads(monkeypat
     assert body["freeTokens"]["remaining"] == 12.4
 
 
-def test_route_is_unchanged_in_local_mode_with_no_principal(monkeypatch):
+def test_route_is_unchanged_in_local_mode_with_no_principal(session, monkeypatch):
     # tenancy_mode defaults to "local" — no COWORK_TENANCY_MODE set.
+    SettingService(session, LOCAL_SCOPE).upsert_setting("minds_api_key", "mdb_test")
+
     async def _fake(path, bearer_token):
         return {svc.ENTITLEMENTS_PATH: ENTITLEMENTS, svc.WALLET_PATH: WALLET}.get(path)
 
@@ -524,8 +590,9 @@ def test_route_is_unchanged_in_local_mode_with_no_principal(monkeypatch):
     assert resp.json()["balance"]["usd"] == 8.42
 
 
-def test_the_wire_sends_a_null_refill_time_for_an_ineligible_org(monkeypatch):
+def test_the_wire_sends_a_null_refill_time_for_an_ineligible_org(session, monkeypatch):
     """The body the desktop reads: ``freeTokens.resetsAt`` null, ``limit`` 0."""
+    SettingService(session, LOCAL_SCOPE).upsert_setting("minds_api_key", "mdb_test")
 
     async def _fake(path, bearer_token):
         return {

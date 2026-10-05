@@ -120,6 +120,10 @@ def _clean_state():
         # run, so leaving it there hands every later test a tenant-settable value
         # pointing off-site.
         SettingService(s, LOCAL_SCOPE).delete_setting("minds_url")
+        # The desktop-account-switch tests configure a MindsHub key so the
+        # selector forwards at all; left in place it would silently configure
+        # every later LOCAL_SCOPE test in this file.
+        SettingService(s, LOCAL_SCOPE).delete_setting("minds_api_key")
 
 
 @pytest.fixture
@@ -158,6 +162,36 @@ def test_no_bearer_reads_as_unreachable_without_asking(session, calls):
 
     assert view.enabled is True
     assert view.reachable is False
+    assert calls.asked == []
+
+
+def test_local_mode_with_no_minds_key_answers_disabled_without_asking(session, calls):
+    """A self-hosted install with no MindsHub key never forwards the header the
+    desktop attached, whatever it sent it as."""
+    view = _view(session, LOCAL_SCOPE, bearer="jwt-abc")
+
+    assert view.enabled is False
+    assert view.reachable is False
+    assert calls.asked == []
+
+
+def test_local_mode_with_the_desktop_runtime_credential_still_asks(session, calls):
+    SettingService(session, LOCAL_SCOPE).upsert_setting("minds_api_key", "mdb_test")
+    calls.answers[WORKSPACES] = _rows()
+
+    view = _view(session, LOCAL_SCOPE, bearer="jwt-abc")
+
+    assert view.enabled is True
+    assert view.reachable is True
+
+
+def test_local_mode_with_no_minds_key_refuses_the_switch_without_asking(session, calls):
+    """409, not 503: no request was made, so this isn't "could not reach
+    MindsHub" — MindsHub was never configured on this install."""
+    with pytest.raises(HTTPException) as caught:
+        _activate(session, LOCAL_SCOPE, WS_CLIENT_A, bearer="jwt-abc")
+
+    assert caught.value.status_code == 409
     assert calls.asked == []
 
 
@@ -343,6 +377,7 @@ def test_a_desktop_account_switch_does_not_reuse_the_previous_listing(session, c
     account's workspaces would be served for the rest of the TTL, with the grant
     check on `PUT /active` reading them.
     """
+    SettingService(session, LOCAL_SCOPE).upsert_setting("minds_api_key", "mdb_test")
     calls.answers[WORKSPACES] = _rows_for(WS_DEFAULT, WS_CLIENT_A)
     first = _view(session, LOCAL_SCOPE, bearer="jwt-first-account")
     assert [w.id for w in first.workspaces] == [WS_DEFAULT, WS_CLIENT_A]
@@ -356,6 +391,7 @@ def test_a_desktop_account_switch_does_not_reuse_the_previous_listing(session, c
 
 def test_a_desktop_account_switch_cannot_switch_on_the_previous_listing(session, calls):
     """Same key, but on the path where it authorizes rather than renders."""
+    SettingService(session, LOCAL_SCOPE).upsert_setting("minds_api_key", "mdb_test")
     calls.answers[WORKSPACES] = _rows_for(WS_DEFAULT, WS_CLIENT_A)
     _view(session, LOCAL_SCOPE, bearer="jwt-first-account")
 
@@ -420,6 +456,7 @@ def test_an_unreachable_listing_keeps_the_short_ttl(session, calls):
 
 def test_expired_entries_are_swept_rather_than_held_for_the_process_lifetime(session, calls):
     """Nothing re-reads a departed caller's key, so nothing would ever drop it."""
+    SettingService(session, LOCAL_SCOPE).upsert_setting("minds_api_key", "mdb_test")
     calls.answers[WORKSPACES] = _rows()
     _view(session, LOCAL_SCOPE, bearer="jwt-someone-who-leaves")
     assert len(svc._listing_cache) == 1
