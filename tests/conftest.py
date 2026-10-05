@@ -222,3 +222,44 @@ def adapter_unverified_datasources():
     branch that ships the flag the other way round.
     """
     yield from _set_datasource_adapter_flag(False)
+
+
+@pytest.fixture
+def openai_compatible_api(monkeypatch):
+    """Set COWORK_OPENAI_COMPATIBLE_API for one test, or unset it with None.
+
+    Read through the real AppSettings. get_app_settings() is cached for the
+    process, so the cache is cleared on both sides of the test.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+
+    def _set(value: str | None) -> None:
+        if value is None:
+            monkeypatch.delenv("COWORK_OPENAI_COMPATIBLE_API", raising=False)
+        else:
+            monkeypatch.setenv("COWORK_OPENAI_COMPATIBLE_API", value)
+        get_app_settings.cache_clear()
+
+    yield _set
+    get_app_settings.cache_clear()
+
+
+@pytest.fixture
+def anton_responses_ready(monkeypatch):
+    """Set whether the installed anton reports its Responses path ready.
+
+    Call it with True, the default, or with False for an anton that predates
+    RESPONSES_TRANSPORT_READY. Either way the test pins the flag itself, so it
+    holds whichever anton the lock installs. The name is resolved when the
+    returned callable runs, so a test that has swapped anton's OpenAIProvider
+    for a stand-in sets the flag on the stand-in.
+    """
+
+    def _set(ready: bool = True) -> None:
+        monkeypatch.setattr(
+            "anton.core.llm.openai.OpenAIProvider.RESPONSES_TRANSPORT_READY",
+            ready,
+            raising=False,
+        )
+
+    return _set
