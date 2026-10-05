@@ -28,7 +28,7 @@ from cowork.services.product_permissions import require_product_permission
 from cowork.turnqueue.auth_keys import list_active_connections, mint_turn_key
 from cowork.turnqueue.models import TurnJob, TurnReply
 from cowork.streaming.turn_index import record_turn
-from cowork.turnqueue.redis_client import cancel_flag_key, get_redis
+from cowork.turnqueue.redis_client import cancel_flag_key, get_redis, reply_stream_key
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host, get_app_settings
 
 logger = logging.getLogger(__name__)
@@ -239,6 +239,8 @@ def step_stream_events(data: dict) -> list:
     uses, so remote turns render steps/thinking identically to desktop."""
     from anton.core.llm.provider import (
         LLMResponse,
+        StreamAskUser,
+        StreamAskUserAnswered,
         StreamComplete,
         StreamContextCompacted,
         StreamTaskProgress,
@@ -248,6 +250,7 @@ def step_stream_events(data: dict) -> list:
         StreamToolUseStart,
         ToolCall,
     )
+    from anton.core.interaction.elicit import AskAnswer, AskOption, AskRequest
 
     step = data.get("step")
     if step == "tool_start":
@@ -286,6 +289,40 @@ def step_stream_events(data: dict) -> list:
         return [StreamComplete(response=LLMResponse(
             content="", tool_calls=calls, stop_reason=data.get("stop_reason"),
         ))]
+    if step in ("ask_user", "ask_user_answered"):
+        question_id = data.get("id")
+        if not isinstance(question_id, str) or not question_id:
+            return []
+        if step == "ask_user":
+            timeout_s = data.get("timeout_s")
+            options = tuple(
+                AskOption(
+                    value=str(option.get("value") or ""),
+                    label=str(option.get("label") or option.get("value") or ""),
+                    detail=str(option.get("detail") or ""),
+                )
+                for option in data.get("options") or []
+                if isinstance(option, dict)
+            )
+            return [StreamAskUser(id=question_id, request=AskRequest(
+                prompt=str(data.get("prompt") or ""),
+                kind="choice",
+                timeout_s=(
+                    timeout_s
+                    if isinstance(timeout_s, int) and not isinstance(timeout_s, bool)
+                    else None
+                ),
+                options=options,
+                select="many" if data.get("select") == "many" else "one",
+                allow_custom=data.get("allow_custom") is not False,
+            ))]
+        return [StreamAskUserAnswered(id=question_id, answer=AskAnswer(
+            status=str(data.get("status") or "error"),
+            values=tuple(v for v in data.get("values") or [] if isinstance(v, str)),
+            text=str(data.get("text") or ""),
+        ))]
+    # `ask_user_answer_rejected` is the pod's verdict on one answer; only
+    # /answer reads it (turnqueue/answers.py), nothing renders it.
     return []
 
 
@@ -300,14 +337,17 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 correlation_id: str | None = None,
                                 llm: dict | None = None,
                                 disabled: list[dict] | None = None,
-                                started_at: str | None = None):
+                                started_at: str | None = None,
+                                interactive: bool = False):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
 
     Yields turn_delta / turn_step / turn_memory in arrival order and ends with
     exactly one terminal — turn_completed, or turn_failed (classified with the
     same (code, message) the caller streams and persists; synthesized locally
     when the worker goes quiet past the idle timeout).
-    `correlation_id`/`llm` reuse a turn key the routing gate already minted."""
+    `correlation_id`/`llm` reuse a turn key the routing gate already minted.
+    `interactive` tells the pod it may ask `ask_user` questions (web UI turns;
+    channel turns never)."""
     settings = TurnQueueSettings()
     scope = TenantScope(org_mode=get_app_settings().tenancy_mode == "org" or bool(org_id), org_id=org_id, user_id=user_id)
     await require_product_permission(scope, "product.execute")
@@ -318,7 +358,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     corr = correlation_id or _new_correlation_id()
     # A flag left by an earlier turn would cancel this one on its first line.
     await r.delete(cancel_flag_key(corr))
-    reply_stream = f"scratchpad:reply:{conversation_id}"
+    reply_stream = reply_stream_key(conversation_id)
 
     # No client-picked model → the deployment's resolved default (org mode: the
     # free-bucket model). Resolved here so the model reaching the pod is always
@@ -372,6 +412,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     params = {"input": input_text, "workspace_path": workspace_rel_path.lstrip("/"),
               "workspace_mode": workspace_mode,
               "model": model, "history": history or [], "llm": llm_block,
+              # Web UI turns only: the pod then registers ask_user and takes
+              # answers on stdin, which /answer feeds through Redis.
+              "interactive": interactive,
               **({"memory": memory_block} if memory_block else {}),
               # Absent entirely (not an empty dict) when there's nothing to
               # offer — see _mint_oauth_block's docstring for why.
