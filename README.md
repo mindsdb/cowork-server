@@ -244,6 +244,8 @@ then reports a failure or the first recovery through the shared
 engineering-channel notifier. It is a standalone monitor and never gates a
 publish, release, or deployment.
 
+**The nightly runs staging's copy of the tests, not main's.** GitHub starts every scheduled run on the default branch, so the checkout would otherwise take `main`. `main` trails `staging` by every commit waiting for the weekly release. Any behavior change among those commits fails `main`'s tests against staging's pods, even though staging works as intended. So the job passes `ref: staging`, and `tests-integration.yml` hands that input to `actions/checkout`. The deploy callers leave `ref` empty and keep testing the commit they just deployed. [`test_nightly_integration_workflow.py`](tests/test_nightly_integration_workflow.py) fails if a scheduled caller's `ref` differs from its `deploy-env`.
+
 The suite may create and delete test conversations, schedules, files, and agent
 turns in staging. The fixed test tenant is reserved for the `cowork` suite, and
 the workflow sets `COWORK_REQUIRE_INTEGRATION=true` for staging so a missing
