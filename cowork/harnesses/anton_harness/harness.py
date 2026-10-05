@@ -1225,6 +1225,9 @@ class AntonHarness:
                 # MindsHub JWT only; {} when there is none or the pinned anton
                 # predates the fields.
                 **account_kwargs(ChatSessionConfig),
+                # This harness rebuilds the session every message, so the verifier
+                # latch has to outlive it or a persistent failure diagnoses each time.
+                **supported_kwargs(ChatSessionConfig, shared_verifier_latch=True),
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
                 # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
