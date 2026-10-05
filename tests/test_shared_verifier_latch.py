@@ -4,11 +4,14 @@ The harness builds a new ChatSession for every message, so a latch kept on the
 session never reaches its threshold and a verifier that always fails diagnoses
 on every message. The chat config asks anton to keep the latch per coding
 endpoint and model instead. An anton that predates the field gets no kwarg, so
-the turn still builds.
+the turn still builds. The connector probe keeps its own latch, so its verdicts
+never clear the chat's.
 """
 from __future__ import annotations
 
 import dataclasses
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from anton.core.session import ChatSessionConfig
@@ -17,7 +20,9 @@ from pydantic import SecretStr
 from cowork.common.settings.user_settings import Provider, UserSettings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.db.session import get_open_session
+from cowork.handlers import probe as probe_handler
 from cowork.harnesses.anton_harness import harness
+from cowork.services.connectors import probe as probe_service
 from cowork.services.conversations import ConversationService
 
 
@@ -71,6 +76,39 @@ async def _chat_session_config(monkeypatch):
     return config
 
 
+async def _probe_session_config(monkeypatch):
+    """The connector probe's ChatSessionConfig, built by the real probe handler."""
+    settings = _settings()
+    monkeypatch.setattr(
+        "cowork.common.settings.user_settings.get_user_settings", lambda *a, **k: settings
+    )
+    configs = []
+
+    def _capture(config):
+        configs.append(config)
+        raise RuntimeError("config captured")
+
+    monkeypatch.setattr(probe_service, "build_chat_session", _capture)
+    monkeypatch.setattr(
+        probe_handler.store, "get", lambda _id: {"values": {"password": "hunter2"}}
+    )
+    monkeypatch.setattr(
+        probe_handler.registry, "get_connector",
+        lambda _id: SimpleNamespace(form=SimpleNamespace(
+            form_id="probe-form", model_dump=lambda: {"form_id": "probe-form"}
+        )),
+    )
+    handler = probe_handler.ProbeHandler(session=MagicMock())
+    async for _event in handler.run(
+        submission_id="staged", connector_id="postgres", method=None,
+        name="test connection", conversation_id=None,
+    ):
+        pass
+    (config,) = configs
+    await config.llm_client.aclose()
+    return config
+
+
 @pytest.mark.asyncio
 async def test_a_chat_turn_shares_the_verifier_latch(monkeypatch):
     config = await _chat_session_config(monkeypatch)
@@ -88,3 +126,10 @@ async def test_an_anton_without_the_field_still_builds_the_turn(monkeypatch):
 
     assert not hasattr(config, "shared_verifier_latch")
     assert config.session_id
+
+
+@pytest.mark.asyncio
+async def test_the_connector_probe_keeps_its_own_latch(monkeypatch):
+    config = await _probe_session_config(monkeypatch)
+
+    assert config.shared_verifier_latch is False
