@@ -1219,7 +1219,8 @@ def _prepare_artifact_card(
         "primary": meta.get("primary") or None,
         "projectId": project_id,
         # What the card shows. The serve URL below carries `project_name`
-        # instead, because the serve route resolves the project by name.
+        # instead, because serve_artifact_file resolves that segment by name
+        # (_project_artifacts_base).
         "projectName": project_label or project_name,
         # The conversation that produced the artifact, so a comment addressed
         # with the agent from the artifacts list resumes that chat instead of
