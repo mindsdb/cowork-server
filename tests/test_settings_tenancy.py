@@ -63,7 +63,10 @@ def test_provider_config_is_org_scoped():
 
 
 def test_ui_and_model_choice_are_user_scoped():
-    for key in ("tone", "greeting", "planning_model", "coding_reasoning_effort", "auto_pin"):
+    for key in (
+        "tone", "greeting", "planning_model", "coding_reasoning_effort",
+        "router_reasoning_effort", "auto_pin",
+    ):
         assert setting_is_org_scoped(key) is False
 
 
