@@ -6,13 +6,19 @@ on every message. The chat config asks anton to keep the latch per coding
 endpoint and model instead. An anton that predates the field gets no kwarg, so
 the turn still builds.
 """
+from __future__ import annotations
+
 import dataclasses
 
 import pytest
+from anton.core.session import ChatSessionConfig
 from pydantic import SecretStr
 
 from cowork.common.settings.user_settings import Provider, UserSettings
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+from cowork.db.session import get_open_session
 from cowork.harnesses.anton_harness import harness
+from cowork.services.conversations import ConversationService
 
 
 def _settings() -> UserSettings:
@@ -30,8 +36,6 @@ def _settings() -> UserSettings:
 
 def _config_without_shared_latch():
     """A ChatSessionConfig class as an anton without the shared latch declares it."""
-    from anton.core.session import ChatSessionConfig
-
     fields = []
     for f in dataclasses.fields(ChatSessionConfig):
         if f.name == "shared_verifier_latch":
@@ -51,10 +55,6 @@ async def _chat_session_config(monkeypatch):
 
     Side effects: creates a conversation in the test database.
     """
-    from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
-    from cowork.db.session import get_open_session
-    from cowork.services.conversations import ConversationService
-
     settings = _settings()
     monkeypatch.setattr(
         "cowork.common.settings.user_settings.get_user_settings", lambda: settings
