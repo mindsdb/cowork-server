@@ -1155,6 +1155,173 @@ async def test_router_unavailable_keeps_model_attribution(monkeypatch):
     assert decision.model == "opus"
 
 
+# --- a failed gate call names its error in the log --------------------------
+
+
+def _router_on_an_endpoint_answering(monkeypatch, status: int, error: dict):
+    """A real anton router provider whose endpoint answers every request with
+    ``status`` and ``{"error": error}``. The answer comes through the openai
+    SDK's own HTTP layer, so the SDK builds the error the gate catches."""
+    import httpx
+    import openai
+    from anton.core.llm.openai import OpenAIProvider
+
+    real_client = openai.AsyncOpenAI
+
+    def _client(**kwargs):
+        transport = httpx.MockTransport(
+            lambda request: httpx.Response(status, json={"error": error})
+        )
+        return real_client(
+            http_client=httpx.AsyncClient(transport=transport), max_retries=0, **kwargs
+        )
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", _client)
+    return OpenAIProvider(api_key="sk-router-key", base_url="https://api.openai.com/v1")
+
+
+async def _route_on(provider):
+    return await decide_route(
+        history=[{"role": "user", "content": "Make an HTML artifact with a bar chart."}],
+        has_non_text_input=False,
+        has_attachments=False,
+        has_disabled_connections=False,
+        binding=RouterBinding(provider=provider, model="gpt-6-luna", label="openai_compatible"),
+    )
+
+
+def _gate_warnings(caplog):
+    import logging
+
+    return [
+        r for r in caplog.records
+        if r.name == "cowork.handlers.response_routing" and r.levelno == logging.WARNING
+    ]
+
+
+@pytest.mark.asyncio
+async def test_router_unavailable_logs_the_refusal_without_its_message(monkeypatch, caplog):
+    """OpenAI refuses the gate's function tool on chat completions when the
+    router model reasons. The [gate] line names that refusal by class, status,
+    type and param. It leaves the message out: provider text can quote the
+    request or echo a credential."""
+    import logging
+
+    from anton.core.llm import provider as anton_provider
+
+    echoed_key = "sk-test-a1b2c3d4e5f6"
+    message = (
+        "Function tools with reasoning_effort are not supported for gpt-6-luna in "
+        "/v1/chat/completions. To use function tools, use /v1/responses or set "
+        f"reasoning_effort to 'none'. Key: {echoed_key}"
+    )
+    provider = _router_on_an_endpoint_answering(monkeypatch, 400, {
+        "message": message,
+        "type": "invalid_request_error",
+        "param": "reasoning_effort",
+        "code": None,
+    })
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="cowork.handlers.response_routing"):
+            decision = await _route_on(provider)
+    finally:
+        await provider.aclose()
+
+    # Nothing about the error rides on the decision, which feeds trace metadata.
+    assert decision == RouteDecision(
+        route=DELEGATED_AGENTIC,
+        reason="router_unavailable",
+        provider="openai_compatible",
+        model="gpt-6-luna",
+        fallback=True,
+    )
+    (record,) = _gate_warnings(caplog)
+    line = record.getMessage()
+    assert line.startswith("[gate] reason=router_unavailable ")
+    expected_error = (
+        "RequestRefusedError" if hasattr(anton_provider, "RequestRefusedError") else "BadRequestError"
+    )
+    assert f"error={expected_error}" in line
+    assert "status=400" in line
+    assert "type=invalid_request_error" in line
+    assert "param=reasoning_effort" in line
+    assert echoed_key not in line
+    assert "Function tools" not in line
+    assert record.exc_info is None
+
+
+@pytest.mark.asyncio
+async def test_router_unavailable_keeps_sdk_fields_under_a_status_bearing_wrapper(monkeypatch, caplog):
+    """A typed anton wrapper can retain the HTTP status but normalize its code
+    and omit type/param. Exercise that contract even with an older anton lock."""
+    import logging
+
+    import httpx
+    import openai
+
+    from cowork.handlers import response_routing as routing
+
+    class RequestRefusedError(Exception):
+        status_code = 400
+        code = "parameter_refused"
+
+    secret = "sk-test-provider-message"
+    sdk_error = openai.BadRequestError(
+        f"Function tools with reasoning_effort are not supported. Key: {secret}",
+        response=httpx.Response(
+            400, request=httpx.Request("POST", "https://example.com/v1/chat/completions")
+        ),
+        body={
+            "type": "invalid_request_error",
+            "code": "unsupported_value",
+            "param": "reasoning_effort",
+        },
+    )
+
+    async def failed_gate(*args, **kwargs):
+        raise RequestRefusedError(f"Refused request: {secret}") from sdk_error
+
+    monkeypatch.setattr(routing, "_gate", failed_gate)
+    with caplog.at_level(logging.WARNING, logger="cowork.handlers.response_routing"):
+        decision = await _route_on(None)
+
+    assert decision.reason == "router_unavailable"
+    (record,) = _gate_warnings(caplog)
+    assert record.getMessage() == (
+        "[gate] reason=router_unavailable error=RequestRefusedError status=400 "
+        "type=invalid_request_error code=unsupported_value param=reasoning_effort"
+    )
+    assert secret not in record.getMessage()
+    assert record.exc_info is None
+
+
+@pytest.mark.asyncio
+async def test_router_unavailable_logs_the_status_under_antons_own_error(monkeypatch, caplog):
+    """anton raises its own error from the SDK's for the statuses it names, so
+    the line reads the status and the provider's code from that cause. Here,
+    an Azure deployment that doesn't exist."""
+    import logging
+
+    provider = _router_on_an_endpoint_answering(monkeypatch, 404, {
+        "code": "DeploymentNotFound",
+        "message": "The API deployment for this resource does not exist.",
+    })
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="cowork.handlers.response_routing"):
+            decision = await _route_on(provider)
+    finally:
+        await provider.aclose()
+
+    assert decision.reason == "router_unavailable"
+    (record,) = _gate_warnings(caplog)
+    line = record.getMessage()
+    assert "error=NotFoundError" not in line  # the class is anton's, not the SDK's
+    assert "status=404" in line
+    assert "code=DeploymentNotFound" in line
+    assert "does not exist" not in line
+
 
 # --- the streamed gate: budget the decision, not the answer (ENG-1851) -------
 
