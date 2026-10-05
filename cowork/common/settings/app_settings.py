@@ -542,6 +542,8 @@ class TurnQueueSettings(Settings):
             "protocol has no heartbeat, so a long tool run legitimately produces no reply "
             "for minutes — tighten it once the pod sends one. <= 0 disables the bound, "
             "which means an unresponsive worker leaves the turn spinning forever."
+            " An open ask_user question produces no reply either: keep this above the "
+            "pod's question timeout (ANTON_CLOUD_ASK_USER_TIMEOUT_SECONDS, 300 s)."
         ),
     )  # COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS
     auth_internal_base_url: str = Field(
@@ -554,7 +556,12 @@ class TurnQueueSettings(Settings):
     )  # COWORK_TURN_AUTH_INTERNAL_SECRET
     turn_key_ttl_seconds: int = Field(
         default=1200,
-        description="TTL, in seconds, of the minted per-turn MindsHub key (20 min; keep within auth's turn_key_max_ttl_seconds).",
+        description=(
+            "TTL, in seconds, of the minted per-turn MindsHub key (20 min; keep within "
+            "auth's turn_key_max_ttl_seconds). scratchpad-controller's "
+            "MAX_TURN_WALL_CLOCK_SECONDS (1080) is derived from it (TTL - 120); change "
+            "both together."
+        ),
     )  # COWORK_TURN_TURN_KEY_TTL_SECONDS
     minds_base_url: str = Field(
         default="",
@@ -620,6 +627,10 @@ class TurnQueueSettings(Settings):
             "runs and a captured connection stays pending."
         ),
     )  # COWORK_TURN_DATASOURCE_GATEWAY_BASE_URL
+
+
+# The OpenAI API an openai_compatible provider's planning and coding roles call.
+OpenAICompatibleAPI = Literal["chat_completions", "responses"]
 
 
 class AppSettings(Settings):
@@ -881,6 +892,25 @@ class AppSettings(Settings):
             "selection, which never applies to channels."
         ),
     )  # COWORK_CHANNELS_HARNESS
+
+    openai_compatible_api: OpenAICompatibleAPI = Field(
+        default="chat_completions",
+        validation_alias=AliasChoices("COWORK_OPENAI_COMPATIBLE_API"),
+        description=(
+            "The API the planning and coding roles call on an openai_compatible "
+            "provider. 'chat_completions' (default) calls {base}/chat/completions. "
+            "'responses' calls {base}/responses through anton's openai flavor, "
+            "where OpenAI and Azure accept function tools together with a "
+            "reasoning effort. It applies only when the installed anton reports "
+            "RESPONSES_TRANSPORT_READY; with an older anton both roles stay on "
+            "chat completions and one warning says so. On the Responses path the "
+            "agent loop runs without web tools, since OpenAI's hosted web_search "
+            "reads the web from the provider's side, outside the deployment's "
+            "egress controls. The router and Gemini stay on chat completions. "
+            "Deployment-wide; get_app_settings() is cached, so a change needs a "
+            "restart."
+        ),
+    )  # COWORK_OPENAI_COMPATIBLE_API
 
     # Deployment-level defaults for the per-user agent tool budgets. Users who
     # set the corresponding UserSettings override these; users who don't get

@@ -507,11 +507,15 @@ class AntonHarness:
         # end-of-turn finally must not depend on the session still being live.
         conv_id = conversation.id
         conv_project_id = conversation.project_id
-        # Same reason: the card carries the project name to the client, and reading
-        # the relation after the turn could hit an expired session.
-        # The artifact card's label, sent beside project_id which carries the
-        # identity - so this is a display value (ENG-1676).
-        conv_project_name = display_label(conversation.project)
+        # Same reason: reading the relation after the turn could hit an expired
+        # session, so both of the card's project values are read now. The label
+        # is what the card shows, beside project_id which carries the identity
+        # (ENG-1676). The name addresses the card's serve URL, because
+        # serve_artifact_file (GET /api/v1/artifacts/serve/{project_name}/...)
+        # resolves that segment by name, through
+        # services.artifacts._project_artifacts_base.
+        conv_project_label = display_label(conversation.project)
+        conv_project_name = conversation.project.name
         # Skill drafts surface as cards (never auto-saved). Anton has no
         # skill-draft tool (it runs anton-core's own registry), so routing is
         # prompt + dir-diff only — consistent with its artifact flow. The
@@ -623,6 +627,7 @@ class AntonHarness:
             scope=turn_scope,
             project_id=str(conv_project_id) if conv_project_id else None,
             project_name=conv_project_name,
+            project_label=conv_project_label,
         )
         for card in cards:
             yield ArtifactCreated(card)
@@ -868,6 +873,7 @@ class AntonHarness:
         # provider, model, memory flags, etc.) so the DB is the single
         # source of truth — no .env reload needed.
         from cowork.common.settings.user_settings import get_user_settings
+        from cowork.services.providers import web_tool_kwargs_for
         from pydantic import SecretStr
 
         anton_settings = AntonSettings()
@@ -946,7 +952,7 @@ class AntonHarness:
         for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir, project_memory_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
-        llm_client = self._build_llm_client(effort=reasoning_effort, model=model)
+        llm_client = self._build_llm_client(effort=reasoning_effort, model=model, settings=user)
         _apply_client_models(anton_settings, llm_client)
         self_awareness = SelfAwarenessContext(context_dir)
 
@@ -1221,6 +1227,10 @@ class AntonHarness:
                 **account_kwargs(ChatSessionConfig),
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
+                # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
+                # puts planning on the Responses API. The client above uses
+                # this same settings snapshot, even if settings change mid-build.
+                **web_tool_kwargs_for(user.resolved_planning_provider),
                 # "Conversation started" stamp for the cache-stable prompt prefix
                 # (anton 2a). The live current time is rendered separately in the
                 # volatile tail, so resuming days later still reports the real "now".
@@ -1269,6 +1279,6 @@ class AntonHarness:
             raise
 
     @staticmethod
-    def _build_llm_client(effort: str | None = None, *, model: str | None = None):
+    def _build_llm_client(effort: str | None = None, *, model: str | None = None, settings=None):
         from cowork.services.providers import build_llm_client
-        return build_llm_client(effort_override=effort, model_override=model)
+        return build_llm_client(effort_override=effort, model_override=model, settings=settings)
