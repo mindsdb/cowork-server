@@ -50,6 +50,20 @@ def wait_for_status(service: CodingService, session_id: str, status: SessionStat
     return session
 
 
+def wait_for_turn_thread(session_id: str) -> None:
+    """Wait for a task's turn thread to exit.
+
+    The thread reports the turn's end, then drains the task's queue
+    (``Turns._continue_queue``). A test that queues work as soon as it sees
+    ``completed`` races that drain for the task's reservation, so it waits
+    here first.
+    """
+    for thread in threading.enumerate():
+        if thread.name == f"coding-turn-{session_id[:8]}":
+            thread.join(timeout=3)
+            assert not thread.is_alive(), "the turn thread did not exit"
+
+
 def wait_for_workspace(service: CodingService, session_id: str) -> CodingSession:
     """Wait for a new task's background preparation to give it a workspace."""
     deadline = time.monotonic() + 3
