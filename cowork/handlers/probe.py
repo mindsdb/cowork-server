@@ -267,6 +267,7 @@ class ProbeHandler:
                 workspace=workspace,
                 form_spec=form_spec,
                 skipped=skipped,
+                usage_notes=registry.usage_notes_for([connector_id]).get(connector_id),
                 web_tool_kwargs=web_tools,
             )
             try:
