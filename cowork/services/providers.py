@@ -1510,12 +1510,17 @@ def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
 
 
 def build_llm_client(
-    effort_override: str | None = None, *, model_override: str | None = None
+    effort_override: str | None = None, *, model_override: str | None = None,
+    settings: UserSettings | None = None,
 ):
     """Build an Anton LLMClient from the current user settings.
 
     Shared by the main responses handler and the credential probe handler
     so provider construction logic stays in one place.
+
+    Callers that also derive session policy from settings pass their snapshot
+    here, so a concurrent settings update cannot separate that policy from
+    the providers it governs. Otherwise settings are loaded at call time.
 
     ``model_override`` is a per-turn composer selection from the planning
     provider's catalogue. Apply it to roles using that provider only; a role
@@ -1552,7 +1557,8 @@ def build_llm_client(
         provider_api_key,
     )
 
-    settings = get_user_settings()
+    if settings is None:
+        settings = get_user_settings()
     same_coding_provider = settings.resolved_coding_provider == settings.resolved_planning_provider
     planning_model = model_override or settings.resolved_planning_model
     coding_model = (

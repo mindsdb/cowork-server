@@ -952,7 +952,7 @@ class AntonHarness:
         for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir, project_memory_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
-        llm_client = self._build_llm_client(effort=reasoning_effort, model=model)
+        llm_client = self._build_llm_client(effort=reasoning_effort, model=model, settings=user)
         _apply_client_models(anton_settings, llm_client)
         self_awareness = SelfAwarenessContext(context_dir)
 
@@ -1228,7 +1228,8 @@ class AntonHarness:
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
                 # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
-                # puts planning on the Responses API; see web_tool_kwargs_for.
+                # puts planning on the Responses API. The client above uses
+                # this same settings snapshot, even if settings change mid-build.
                 **web_tool_kwargs_for(user.resolved_planning_provider),
                 # "Conversation started" stamp for the cache-stable prompt prefix
                 # (anton 2a). The live current time is rendered separately in the
@@ -1278,6 +1279,6 @@ class AntonHarness:
             raise
 
     @staticmethod
-    def _build_llm_client(effort: str | None = None, *, model: str | None = None):
+    def _build_llm_client(effort: str | None = None, *, model: str | None = None, settings=None):
         from cowork.services.providers import build_llm_client
-        return build_llm_client(effort_override=effort, model_override=model)
+        return build_llm_client(effort_override=effort, model_override=model, settings=settings)

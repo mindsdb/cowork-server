@@ -566,9 +566,10 @@ async def decide_route(
         # text can quote the request or echo a credential, and this gate runs
         # upstream of every scrubber. anton re-raises a 400 it cannot name as
         # the SDK's own error, and raises its typed errors from the SDK's, so
-        # those fields sit on the error or on its cause. WARNING, because the
-        # default LOG_LEVEL drops info lines.
-        provider_error = exc if getattr(exc, "status_code", None) is not None else exc.__cause__
+        # those fields sit on the error or on its cause. Prefer the cause even
+        # when anton retained status_code: its wrapper can normalize code and
+        # omit type/param. WARNING, because the default LOG_LEVEL drops info lines.
+        provider_error = exc.__cause__ if exc.__cause__ is not None else exc
         logger.warning(
             "[gate] reason=router_unavailable error=%s status=%s type=%s code=%s param=%s",
             type(exc).__name__,
