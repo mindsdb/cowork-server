@@ -355,3 +355,25 @@ def test_identity_enforce_audit_must_be_asked_for_by_name(monkeypatch):
     monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "off")
     with pytest.raises(ValidationError):
         AppSettings(_env_file=None)
+
+
+def test_openai_compatible_api_defaults_to_chat_completions(monkeypatch):
+    monkeypatch.delenv("COWORK_OPENAI_COMPATIBLE_API", raising=False)
+
+    assert AppSettings(_env_file=None).openai_compatible_api == "chat_completions"
+
+
+def test_openai_compatible_api_reads_its_cowork_variable(monkeypatch):
+    monkeypatch.setenv("COWORK_OPENAI_COMPATIBLE_API", "responses")
+
+    assert AppSettings(_env_file=None).openai_compatible_api == "responses"
+
+
+@pytest.mark.parametrize("value", ["", "Responses", "true"])
+def test_openai_compatible_api_rejects_any_other_value(monkeypatch, value):
+    # A typo stops the server at start instead of leaving the agent on chat
+    # completions while the deployment believes it switched.
+    monkeypatch.setenv("COWORK_OPENAI_COMPATIBLE_API", value)
+
+    with pytest.raises(ValidationError):
+        AppSettings(_env_file=None)
