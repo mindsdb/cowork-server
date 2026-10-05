@@ -16,10 +16,11 @@ from cowork.harnesses.base import ChannelContext
 
 DESKTOP_LEAD = (
     "The Anton CoWork desktop UI displays progress, tool usage, and actions "
-    "as separate structured activity rows. Keep assistant text focused on the "
-    "user-facing answer; do not narrate internal work with status phrases like "
-    "\"I'll check\", \"let me query\", or \"I have access\" unless that wording "
-    "is itself the final answer the user needs. "
+    "as separate structured activity rows, so do not narrate each step "
+    "(\"let me check\", \"now I'll query\"). When a request needs tool work, "
+    "open your reply with one short sentence telling the user what you are "
+    "about to do; after that, keep assistant text focused on the user-facing "
+    "answer. "
     "Files you create as artifacts appear automatically in the Live Artifacts "
     "panel beside the chat, where the user previews them and uses the Download "
     "control (and Open, on desktop). When a file is ready, tell the user it is "
@@ -37,6 +38,15 @@ DESKTOP_LEAD = (
 
 def test_desktop_lead_is_byte_stable():
     assert _turn_style_context(None) == DESKTOP_LEAD
+
+
+def test_desktop_lead_asks_for_an_opening_sentence_not_step_narration():
+    """The user sees text within seconds of asking, without a running commentary:
+    one sentence of intent before tool work, no "let me check" narration after it."""
+    text = _turn_style_context(None)
+    assert "open your reply with one short sentence" in text
+    assert "do not narrate each step" in text
+    assert "Keep assistant text focused" not in text  # the old line forbade the opening sentence too
 
 
 def test_desktop_lead_names_artifact_retrieval_path():
