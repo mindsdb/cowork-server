@@ -209,7 +209,7 @@ same change; a contract test fails if only one of the two happens.
 
 ### Logging
 
-Set `LOG_LEVEL` (default `INFO`) to control verbosity. Enable file logging with `ENABLE_FILE_LOGGING=true` (writes to `LOG_DIR`, defaults to `~/.cowork/logs/`).
+Set `LOG_LEVEL` (default `WARNING`) to control verbosity. Enable file logging with `ENABLE_FILE_LOGGING=true` (writes to `LOG_DIR`, defaults to `~/.cowork/logs/`).
 
 ## Releasing
 
@@ -241,6 +241,8 @@ same `tests-integration.yml` reusable workflow as a deployment on `mdb-dev`,
 then reports a failure or the first recovery through the shared
 engineering-channel notifier. It is a standalone monitor and never gates a
 publish, release, or deployment.
+
+**The nightly runs staging's copy of the tests, not main's.** GitHub starts every scheduled run on the default branch, so the checkout would otherwise take `main`. `main` trails `staging` by every commit waiting for the weekly release. Any behavior change among those commits fails `main`'s tests against staging's pods, even though staging works as intended. So the job passes `ref: staging`, and `tests-integration.yml` hands that input to `actions/checkout`. The deploy callers leave `ref` empty and keep testing the commit they just deployed. [`test_nightly_integration_workflow.py`](tests/test_nightly_integration_workflow.py) fails if a scheduled caller's `ref` differs from its `deploy-env`.
 
 The suite may create and delete test conversations, schedules, files, and agent
 turns in staging. The fixed test tenant is reserved for the `cowork` suite, and
@@ -879,7 +881,7 @@ roles remain assigned. No new customer or staff permission grants are introduced
 
 Configuration is read from the database (`UserSettings` table) and can be managed through the Settings UI in the desktop app or via `PUT /api/v1/settings/`.
 
-Environment variables fall into two namespaces:
+Environment variables fall into three groups:
 
 **Server-level** (`COWORK_*`) — control the cowork-server process itself:
 
@@ -896,6 +898,7 @@ Environment variables fall into two namespaces:
 | `COWORK_SKILLS_DIR` | `~/.cowork/skills` | Skills store root (local mode only) |
 | `COWORK_MEMORY_DIR` | `~/.cowork/memory` | Memory store root (local mode only) |
 | `COWORK_VAULT_DIR` | `~/.cowork/data-vault` | Connector credential vault |
+| `COWORK_OPENAI_COMPATIBLE_API` | `chat_completions` | The API an `openai_compatible` provider's planning and coding roles call. `responses` moves them to `{base}/responses` through anton's openai flavor, where OpenAI and Azure accept function tools together with a reasoning effort. It needs an anton that reports `RESPONSES_TRANSPORT_READY`; with an older anton both roles stay on chat completions, and Cowork logs one warning that says so. On the Responses path the agent loop runs without web tools, because OpenAI's hosted `web_search` reads the web from the provider's side, outside the deployment's egress controls. A Python cell's `web_search()` is separate and unchanged. The router and Gemini stay on chat completions. Read once at start. |
 
 **Harness-level** (`ANTON_*`) — configure a specific agent harness. These are read by the harness adapter, not by cowork-server core. They use the harness prefix because the upstream agent library (anton) defines them:
 
@@ -904,6 +907,12 @@ Environment variables fall into two namespaces:
 | `ANTON_PUBLISH_URL` | Anton | Artifact publish endpoint. Pointed anywhere but MindsHub's service, it takes HTML and Markdown only: sharing a full-stack app is refused before anything is uploaded, because that upload carries the app's connection credentials |
 | `ANTON_SKILLS_ROOT_DIR` | Anton | Skill file storage |
 | `ANTON_GLOBAL_MEMORY_ROOT_DIR` | Anton | Global memory files |
+
+**By field name** (local tenancy only): every `UserSettings` field also reads the environment variable named after it, and a stored row wins over the variable. The router's reasoning effort is set this way, beside `PLANNING_REASONING_EFFORT` and `CODING_REASONING_EFFORT`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ROUTER_REASONING_EFFORT` | unset | The router model's reasoning effort. The router's provider serves anton's history summaries and the route gate, so the effort reaches both. On `openai_compatible` the gate runs `ROUTER_MODEL`. On other providers the gate runs the provider's default router model, so the effort is sent only while `ROUTER_MODEL` is that default. Unset or empty sends no effort, which a model that doesn't reason needs, because it refuses any effort. On `openai_compatible`, a router model that reasons by default, such as `gpt-5.6-luna`, needs `none` to take the gate's function tool on chat completions. The composer's per-task effort never applies to the router. |
 
 In Docker/Lightsail deployments, the container also receives `ANTON_MINDS_API_KEY`, `ANTON_OPENAI_API_KEY`, etc. — these are consumed by the Anton agent library directly (not by cowork-server settings), and are injected by the provisioning lambda via cloud-init user-data.
 

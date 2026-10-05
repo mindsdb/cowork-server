@@ -228,7 +228,14 @@ class ProbeHandler:
 
             llm_client = None
             try:
-                llm_client = self._build_llm_client()
+                from cowork.common.settings.user_settings import get_user_settings
+                from cowork.services.providers import web_tool_kwargs_for
+
+                # Capture the client and its web policy together, before the
+                # yields below let a settings update run ahead of the probe.
+                settings = get_user_settings()
+                web_tools = web_tool_kwargs_for(settings.resolved_planning_provider)
+                llm_client = self._build_llm_client(settings=settings)
             except Exception:
                 logger.exception("Could not build LLM client for probe")
 
@@ -261,6 +268,7 @@ class ProbeHandler:
                 form_spec=form_spec,
                 skipped=skipped,
                 usage_notes=registry.usage_notes_for([connector_id]).get(connector_id),
+                web_tool_kwargs=web_tools,
             )
             try:
                 async for kind, payload in probe.run():
@@ -419,6 +427,6 @@ class ProbeHandler:
                 shutil.rmtree(_temp_workspace_dir, ignore_errors=True)
 
     @staticmethod
-    def _build_llm_client():
+    def _build_llm_client(settings=None):
         from cowork.services.providers import build_llm_client
-        return build_llm_client()
+        return build_llm_client(settings=settings)

@@ -16,12 +16,15 @@ import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from anton.core.datasources.data_vault import LocalDataVault
 from cowork.build_info import surface_kwarg
 from cowork.common.chat_session import build_chat_session, close_session_scratchpads
 from cowork.common.paths import cowork_home, pod_local_only
+
+if TYPE_CHECKING:
+    from cowork.services.providers import WebToolKwargs
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +90,7 @@ class CredentialProbe:
         skipped: list[str] | None = None,
         timeout_seconds: float = 90.0,
         usage_notes: str | None = None,
+        web_tool_kwargs: WebToolKwargs | None = None,
     ) -> None:
         self.engine = engine
         self.credentials = credentials
@@ -98,6 +102,9 @@ class CredentialProbe:
         # The prober makes the first real API call, so it needs the same API
         # traps the chat agent is told about.
         self.usage_notes = (usage_notes or "").strip()
+        # The caller captures this alongside llm_client. Never re-read settings
+        # here: the provider may have changed since the client was constructed.
+        self.web_tool_kwargs: WebToolKwargs = {**(web_tool_kwargs or {})}
         self._outcome = ProbeOutcome()
         self._pending: list[tuple[str, Any]] = []
 
@@ -486,6 +493,10 @@ class CredentialProbe:
                 REPORT_FAILURE_TOOL,
                 REQUEST_EXTRA_FIELD_TOOL,
             ],
+            # The same planning role as a UI turn, so the same rule: hosted web
+            # search stays off when COWORK_OPENAI_COMPATIBLE_API puts planning
+            # on the Responses API.
+            **self.web_tool_kwargs,
         )
 
         try:
