@@ -492,6 +492,7 @@ def cards_for_slugs(
     *,
     project_id: str | None = None,
     project_name: str = "",
+    project_label: str = "",
 ) -> list[dict]:
     """Inline-chat card payloads for the given slugs, order preserved.
 
@@ -503,6 +504,12 @@ def cards_for_slugs(
     how the client addresses an artifact in org mode (project + slug); a card
     without them would fall back to the path-based endpoints, which org mode
     fails closed. Best-effort per slug: an unreadable artifact is skipped.
+
+    `project_name` must be the project's `name`: the card's serve URL is built
+    from it, and the serve route resolves that segment by name
+    (`services.artifacts._project_artifacts_base`). `project_label` is what the
+    card shows instead, when the caller has one
+    (`services.projects.display_label`).
     """
     from cowork.services.artifacts import card_for_folder
 
@@ -513,6 +520,7 @@ def cards_for_slugs(
             card = card_for_folder(
                 base / slug, len(cards),
                 project_id=project_id, project_name=project_name,
+                project_label=project_label,
                 # Without this the inline card's serveUrl is rediscovered by
                 # scanning the projects root, which cannot find a project
                 # pointed at a folder the user chose: the artifacts panel
@@ -537,6 +545,7 @@ async def publish_and_card_turn_artifacts(
     scope,
     project_id: str | None = None,
     project_name: str = "",
+    project_label: str = "",
 ) -> list[dict]:
     """Reconcile publishes for this turn, then build the cards to emit.
 
@@ -576,7 +585,7 @@ async def publish_and_card_turn_artifacts(
         carded = set(touched_slugs)
     return cards_for_slugs(
         artifacts_base, sorted(carded),
-        project_id=project_id, project_name=project_name,
+        project_id=project_id, project_name=project_name, project_label=project_label,
     )
 
 
