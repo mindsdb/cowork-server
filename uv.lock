@@ -141,8 +141,8 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.9.27.1"
-source = { git = "https://github.com/mindsdb/anton.git?branch=main#6240f81afd3c113286dce8dc28e018ac65b0082c" }
+version = "2.26.10.4.1"
+source = { git = "https://github.com/mindsdb/anton.git?branch=main#2164014de8ab907e763944d1a36b9cdd23db54e0" }
 dependencies = [
     { name = "anthropic" },
     { name = "anyio" },
