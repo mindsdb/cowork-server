@@ -317,6 +317,13 @@ class CredentialProbe:
         )
         from anton.core.tools.tool_defs import ToolDef
 
+        from cowork.common.settings.user_settings import get_user_settings
+        from cowork.services.providers import web_tool_kwargs_for
+
+        # Read before the credentials reach disk: a failure here must not
+        # leave the candidate credentials in a file nothing deletes.
+        web_tools = web_tool_kwargs_for(get_user_settings().resolved_planning_provider)
+
         env_path, var_names = self._write_credentials_env()
 
         SET_STATUS_TOOL = ToolDef(
@@ -477,6 +484,10 @@ class CredentialProbe:
                 REPORT_FAILURE_TOOL,
                 REQUEST_EXTRA_FIELD_TOOL,
             ],
+            # The same planning role as a UI turn, so the same rule: hosted web
+            # search stays off when COWORK_OPENAI_COMPATIBLE_API puts planning
+            # on the Responses API.
+            **web_tools,
         )
 
         try:

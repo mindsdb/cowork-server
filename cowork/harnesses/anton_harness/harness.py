@@ -872,6 +872,7 @@ class AntonHarness:
         # provider, model, memory flags, etc.) so the DB is the single
         # source of truth — no .env reload needed.
         from cowork.common.settings.user_settings import get_user_settings
+        from cowork.services.providers import web_tool_kwargs_for
         from pydantic import SecretStr
 
         anton_settings = AntonSettings()
@@ -1225,6 +1226,9 @@ class AntonHarness:
                 **account_kwargs(ChatSessionConfig),
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
+                # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
+                # puts planning on the Responses API; see web_tool_kwargs_for.
+                **web_tool_kwargs_for(user.resolved_planning_provider),
                 # "Conversation started" stamp for the cache-stable prompt prefix
                 # (anton 2a). The live current time is rendered separately in the
                 # volatile tail, so resuming days later still reports the real "now".
