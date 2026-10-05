@@ -9,7 +9,7 @@ import re
 import time
 from collections import OrderedDict
 from collections.abc import Collection
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, TypedDict
 from urllib.parse import urlparse
 
 import httpx
@@ -21,7 +21,8 @@ from cowork.handlers.turn_errors import GatewayDenial, gateway_denial
 from cowork.services.hub_workspaces import sweep_cache
 
 if TYPE_CHECKING:
-    from cowork.common.settings.user_settings import UserSettings
+    from cowork.common.settings.app_settings import OpenAICompatibleAPI
+    from cowork.common.settings.user_settings import Provider, UserSettings
 
 logger = logging.getLogger(__name__)
 
@@ -1446,6 +1447,68 @@ async def validate_provider(provider: str, api_key: str,
     return {"ok": False, "error": "Unknown provider"}
 
 
+# True once openai_compatible_agent_api has logged its warning. Every client
+# build asks, and only a restart onto another anton changes the answer.
+_warned_responses_transport_missing = False
+
+
+def openai_compatible_agent_api() -> OpenAICompatibleAPI:
+    """The API the planning and coding roles call on an openai_compatible provider.
+
+    COWORK_OPENAI_COMPATIBLE_API asks for it. The Responses API is used only
+    when the installed anton reports its Responses path ready, because before
+    RESPONSES_TRANSPORT_READY that path dropped truncation recovery,
+    tool_result images and trace headers; a cowork-server deployed ahead of
+    its anton stays on chat completions, and logs that once. ``is True``: a
+    stand-in class must not opt in by accident.
+    """
+    global _warned_responses_transport_missing
+    from anton.core.llm.openai import OpenAIProvider
+
+    from cowork.common.settings.app_settings import get_app_settings
+
+    asked = get_app_settings().openai_compatible_api
+    if getattr(OpenAIProvider, "RESPONSES_TRANSPORT_READY", False) is True:
+        return asked
+    if asked == "responses" and not _warned_responses_transport_missing:
+        _warned_responses_transport_missing = True
+        logger.warning(
+            "Installed anton does not report RESPONSES_TRANSPORT_READY; "
+            "openai_compatible planning and coding stay on chat completions "
+            "although COWORK_OPENAI_COMPATIBLE_API=responses"
+        )
+    return "chat_completions"
+
+
+class WebToolKwargs(TypedDict, total=False):
+    """The ChatSessionConfig web-tool fields a session sets. A field left out
+    keeps anton's default."""
+
+    web_search_enabled: bool
+    web_fetch_enabled: bool
+
+
+def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
+    """ChatSessionConfig web-tool kwargs for a session that plans on ``planning_provider``.
+
+    On anton's Responses flavor either web flag becomes OpenAI's hosted
+    web_search tool, which reads the web from the provider's side, past the
+    deployment's egress gateway (on Azure it runs on Bing). So an
+    openai_compatible planning provider that COWORK_OPENAI_COMPATIBLE_API moves
+    onto that flavor runs with both off. Every other session keeps anton's
+    defaults: MindsHub keeps its native web tools, and direct OpenAI keeps
+    what its flavor provides.
+    """
+    from cowork.common.settings.user_settings import Provider
+
+    if (
+        planning_provider is Provider.OPENAI_COMPATIBLE
+        and openai_compatible_agent_api() == "responses"
+    ):
+        return WebToolKwargs(web_search_enabled=False, web_fetch_enabled=False)
+    return WebToolKwargs()
+
+
 def build_llm_client(
     effort_override: str | None = None, *, model_override: str | None = None
 ):
@@ -1464,7 +1527,12 @@ def build_llm_client(
     Settings UI beside each model dropdown, just like the model itself. Each
     level is forwarded in the provider's native shape (Anthropic
     ``output_config``, OpenAI ``reasoning`` / ``reasoning_effort``); None leaves
-    the model's own default.
+    the model's own default. The router role has its own,
+    ``router_reasoning_effort`` (``ROUTER_REASONING_EFFORT`` in local
+    tenancy). It reaches history summaries and the route gate, which share
+    the router's provider, so it is sent only while the gate runs the router
+    model too: always on openai_compatible, elsewhere only at the provider's
+    default router model.
 
     `effort_override`, when set, is the composer's per-task Effort pick — it
     takes precedence over the persisted per-role setting for BOTH planning and
@@ -1510,7 +1578,18 @@ def build_llm_client(
     supports_api_key_provider = "api_key_provider" in openai_provider_params
     warned_about_static_runtime_credential = False
 
-    def _make_provider(role: Provider, effort: str | None = None):
+    # Passed to the planning and coding builds only. The router stays on chat
+    # completions: the gate's first-event budget is sized for a model that
+    # doesn't reason, and a router model that reasons by default is held to
+    # that with router_reasoning_effort "none".
+    agent_api = openai_compatible_agent_api()
+
+    def _make_provider(
+        role: Provider,
+        effort: str | None = None,
+        *,
+        api: OpenAICompatibleAPI = "chat_completions",
+    ):
         nonlocal warned_about_static_runtime_credential
         # Only pass reasoning_effort when it's actually set. This keeps
         # build_llm_client compatible with anton builds whose provider __init__
@@ -1579,6 +1658,15 @@ def build_llm_client(
                 **effort_kw,
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
+            # anton's openai flavor sends complete() and stream() to the
+            # Responses API, where OpenAI and Azure accept function tools with
+            # a reasoning effort. Gemini shares this branch and stays on chat
+            # completions.
+            flavor_kw = (
+                {"flavor": OpenAIProvider.FLAVOR_OPENAI}
+                if api == "responses" and role == Provider.OPENAI_COMPATIBLE
+                else {}
+            )
             # A local endpoint authenticates by being reachable, so an
             # openai-compatible provider with a base URL and no key is a valid
             # config, not a broken one.
@@ -1592,7 +1680,7 @@ def build_llm_client(
             # on trust as "not really a credential".
             if key is None and role == Provider.OPENAI_COMPATIBLE and base:
                 return OpenAIProvider(
-                    api_key=f"{role.value}-no-auth", base_url=base, **effort_kw
+                    api_key=f"{role.value}-no-auth", base_url=base, **flavor_kw, **effort_kw
                 )
             if key is None:
                 raise ValueError(f"{role.label} API key is not configured")
@@ -1605,7 +1693,7 @@ def build_llm_client(
             if role == Provider.OPENAI_COMPATIBLE and not base:
                 raise ValueError("OpenAI-compatible base URL is not configured")
             return OpenAIProvider(
-                api_key=key.get_secret_value(), base_url=base, **effort_kw
+                api_key=key.get_secret_value(), base_url=base, **flavor_kw, **effort_kw
             )
         provider_map = {"anthropic": AnthropicProvider, "openai": OpenAIProvider}
         cls = provider_map.get(role.value)
@@ -1630,22 +1718,6 @@ def build_llm_client(
             return cls(api_key=key.get_secret_value(), base_url=base, **effort_kw)
         return cls(api_key=key.get_secret_value(), **effort_kw)
 
-    # Routing & summarization role: the cheap front-model that runs history
-    # summarization (and later gates turns). Only pass it when the installed
-    # anton's LLMClient accepts the kwargs — older builds predate ENG-648 and
-    # would TypeError, taking the whole agent down. When absent, anton falls
-    # back to the coding role internally, so behavior is preserved.
-    router_kw: dict = {}
-    try:
-        _params = inspect.signature(LLMClient.__init__).parameters
-        if "router_provider" in _params:
-            router_kw = {
-                "router_provider": _make_provider(settings.resolved_router_provider, None),
-                "router_model": router_model,
-            }
-    except (ValueError, TypeError):
-        router_kw = {}
-
     # A reasoning-effort level is chosen in the Settings UI for a specific
     # model. When resolution swaps the model out from under the stored choice
     # (provider switch, or a wallet-locked aux model falling back to an
@@ -1654,6 +1726,38 @@ def build_llm_client(
     # call. Same-model resolution keeps the effort.
     def _effort_for(stored: str | None, resolved: str | None, effort: str | None):
         return effort if effort and stored == resolved else None
+
+    # Routing & summarization role: the cheap front-model that runs history
+    # summarization (and later gates turns). Only pass it when the installed
+    # anton's LLMClient accepts the kwargs — older builds predate ENG-648 and
+    # would TypeError, taking the whole agent down. When absent, anton falls
+    # back to the coding role internally, so behavior is preserved.
+    #
+    # Its effort is its own: the composer's per-task pick is chosen for the
+    # chat model and never reaches the router. The router provider serves two
+    # models, though. Summaries run router_model, and the route gate runs
+    # resolved_gate_model on the same provider (response_routing's
+    # _settings_binding). Off openai_compatible the gate takes the provider's
+    # default router model, so the effort, chosen for router_model, rides on
+    # the provider only while the gate runs that model too. Anthropic's
+    # default, Haiku 4.5, takes no effort at all.
+    router_effort = (
+        _effort_for(settings.router_model, router_model, settings.router_reasoning_effort)
+        if settings.resolved_gate_model == router_model
+        else None
+    )
+    router_kw: dict = {}
+    try:
+        _params = inspect.signature(LLMClient.__init__).parameters
+        if "router_provider" in _params:
+            router_kw = {
+                "router_provider": _make_provider(
+                    settings.resolved_router_provider, router_effort
+                ),
+                "router_model": router_model,
+            }
+    except (ValueError, TypeError):
+        router_kw = {}
 
     planning_effort = effort_override or _effort_for(
         settings.planning_model,
@@ -1676,11 +1780,13 @@ def build_llm_client(
         planning_provider=_make_provider(
             settings.resolved_planning_provider,
             planning_effort,
+            api=agent_api,
         ),
         planning_model=planning_model,
         coding_provider=_make_provider(
             settings.resolved_coding_provider,
             coding_effort,
+            api=agent_api,
         ),
         coding_model=coding_model,
         **router_kw,
