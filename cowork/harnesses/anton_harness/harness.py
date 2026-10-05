@@ -511,7 +511,10 @@ class AntonHarness:
         # the relation after the turn could hit an expired session.
         # The artifact card's label, sent beside project_id which carries the
         # identity - so this is a display value (ENG-1676).
-        conv_project_name = display_label(conversation.project)
+        conv_project_label = display_label(conversation.project)
+        # The serve route resolves the project by this name, so the card's
+        # serve URL carries it and never the label.
+        conv_project_name = conversation.project.name
         # Skill drafts surface as cards (never auto-saved). Anton has no
         # skill-draft tool (it runs anton-core's own registry), so routing is
         # prompt + dir-diff only — consistent with its artifact flow. The
@@ -623,6 +626,7 @@ class AntonHarness:
             scope=turn_scope,
             project_id=str(conv_project_id) if conv_project_id else None,
             project_name=conv_project_name,
+            project_label=conv_project_label,
         )
         for card in cards:
             yield ArtifactCreated(card)
