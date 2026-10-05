@@ -507,13 +507,14 @@ class AntonHarness:
         # end-of-turn finally must not depend on the session still being live.
         conv_id = conversation.id
         conv_project_id = conversation.project_id
-        # Same reason: the card carries the project name to the client, and reading
-        # the relation after the turn could hit an expired session.
-        # The artifact card's label, sent beside project_id which carries the
-        # identity - so this is a display value (ENG-1676).
+        # Same reason: reading the relation after the turn could hit an expired
+        # session, so both of the card's project values are read now. The label
+        # is what the card shows, beside project_id which carries the identity
+        # (ENG-1676). The name addresses the card's serve URL, because
+        # serve_artifact_file (GET /api/v1/artifacts/serve/{project_name}/...)
+        # resolves that segment by name, through
+        # services.artifacts._project_artifacts_base.
         conv_project_label = display_label(conversation.project)
-        # The serve route resolves the project by this name, so the card's
-        # serve URL carries it and never the label.
         conv_project_name = conversation.project.name
         # Skill drafts surface as cards (never auto-saved). Anton has no
         # skill-draft tool (it runs anton-core's own registry), so routing is

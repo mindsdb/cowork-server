@@ -114,25 +114,32 @@ def _turn_cards(monkeypatch, conversation) -> list[dict]:
 
 
 @pytest.mark.usefixtures("cleanup_tmp_projects")
-@pytest.mark.parametrize("typed, chosen_folder", [
-    pytest.param("Sales Q3", None, id="space-becomes-hyphen"),
-    pytest.param("Звіт продажів", None, id="non-latin-becomes-untitled-project"),
+@pytest.mark.parametrize("typed, chosen_folder, taken", [
+    pytest.param("Sales Q3", None, None, id="space-becomes-hyphen"),
+    pytest.param("Звіт продажів", None, None, id="non-latin-becomes-untitled-project"),
     # The serve route finds a project in a folder the user chose by its row,
     # not by scanning the projects root.
-    pytest.param("My notes", "chosen/notes", id="a-folder-the-user-chose"),
+    pytest.param("My notes", "chosen/notes", None, id="a-folder-the-user-chose"),
+    # Another project already holds the sanitized name, so this one is stored
+    # as Sales-Q3-2 under the label "Sales Q3". Sanitizing the label again
+    # gives the other project's name, whose folder has no such artifact.
+    pytest.param("Sales Q3", None, "Sales-Q3", id="name-taken-by-another-project"),
 ])
 def test_a_turn_card_serves_from_a_project_whose_label_is_not_its_name(
-    api, monkeypatch, session, tmp_path, typed, chosen_folder
+    api, monkeypatch, session, tmp_path, typed, chosen_folder, taken
 ):
     """`serve_artifact_file` resolves its project segment by the project's
     `name`. The label is what the user typed, and the two differ whenever
     sanitizing or de-duplicating changed the name. A card whose serve URL
     carries the label answers 404 on Download and on "open in a browser tab"."""
+    projects = ProjectService(ScopedSession(session, LOCAL_SCOPE))
+    if taken:
+        projects.create_project(taken)
     path = None
     if chosen_folder:
         path = tmp_path / chosen_folder
         path.mkdir(parents=True)
-    project = ProjectService(ScopedSession(session, LOCAL_SCOPE)).create_project(typed, path=path)
+    project = projects.create_project(typed, path=path)
     assert project.display_name != project.name
     _make_artifact(
         Path(project.path) / ".anton" / "artifacts", "dash",
