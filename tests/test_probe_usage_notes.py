@@ -40,7 +40,7 @@ def test_handler_hands_the_resolved_notes_to_the_probe(monkeypatch):
             yield "verdict", ProbeOutcome(status="failure", error="stop here")
 
     monkeypatch.setattr(probe_handler, "CredentialProbe", RecordingProbe)
-    monkeypatch.setattr(probe_handler.ProbeHandler, "_build_llm_client", staticmethod(lambda: object()))
+    monkeypatch.setattr(probe_handler.ProbeHandler, "_build_llm_client", staticmethod(lambda settings=None: object()))
     monkeypatch.setattr(
         probe_handler.registry, "usage_notes_for",
         lambda engines: {e: f"NOTE-{e}" for e in engines},
