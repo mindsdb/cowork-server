@@ -11,6 +11,9 @@ _SENSITIVE_KEY = re.compile(_SENSITIVE_KEY_WORDS, re.IGNORECASE)
 _SENSITIVE_TEXT = re.compile(
     r"(?i)((?:authorization|api[_-]?key|(?:access[_-]?)?token|password|secret|cookie)\s*[:=]\s*(?:bearer\s+)?)([^\s,;&]+)"
 )
+# Usage reports count tokens (inputTokens, total_tokens, token_count). A count
+# is a number, never a credential, so it is kept even though "token" matches.
+_TOKEN_COUNT_KEY = re.compile(r"(?:tokens|token_?count)$", re.IGNORECASE)
 _SENSITIVE_JSON_TEXT = re.compile(
     rf'("[^"\\]*{_SENSITIVE_KEY_WORDS}[^"\\]*"\s*:\s*")(?:[^"\\]|\\.)*(")',
     re.IGNORECASE,
@@ -45,7 +48,8 @@ def _sanitize(value: object, depth: int, budget: list[int]) -> Any:
                 break
             safe_key = str(key)[:256]
             budget[0] -= len(safe_key)
-            output[safe_key] = REDACTED if _SENSITIVE_KEY.search(safe_key) else _sanitize(item, depth + 1, budget)
+            sensitive = _SENSITIVE_KEY.search(safe_key) and not _is_token_count(safe_key, item)
+            output[safe_key] = REDACTED if sensitive else _sanitize(item, depth + 1, budget)
         return output
     if isinstance(value, list):
         output = []
@@ -64,6 +68,14 @@ def _sanitize(value: object, depth: int, budget: list[int]) -> Any:
     safe = str(value)[: min(8_192, budget[0])]
     budget[0] -= len(safe)
     return safe
+
+
+def _is_token_count(key: str, value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and _TOKEN_COUNT_KEY.search(key) is not None
+    )
 
 
 def redact_secrets(value: object, secrets: tuple[str, ...]) -> Any:
