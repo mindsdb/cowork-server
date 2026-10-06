@@ -355,7 +355,7 @@ def _handler_with_raising_formatter(exc: Exception) -> ResponsesHandler:
 
     async def _stream_response(
         *, conversation, input, model=None, reasoning_effort=None, disabled_connections=None,
-        trace_tags=None, trace_metadata=None,
+        trace_tags=None, trace_metadata=None, tool_messages=False,
     ):
         if False:
             yield

@@ -340,6 +340,27 @@ async def format_responses_stream(
                 "tool_use_id": event.id,
             })
 
+        elif (
+            isinstance(event, StreamToolResult)
+            and getattr(event, "action", None) == "message"
+            # A scratchpad result carries the model's own `action`.
+            and getattr(event, "name", "") != "scratchpad"
+        ):
+            # A tool's message to the user (generate_artifact's brief when the
+            # agent acts first). Its own role rather than the scratchpad
+            # result's: a client that predates it ignores it instead of
+            # patching it into the last scratchpad cell. Not answer text, so
+            # it stays out of the persisted assistant message and the history.
+            seq += 1
+            yield _event("response.in_progress", {
+                "type": "response.in_progress",
+                "sequence_number": seq,
+                "thought_role": Role.thought_tool_call_message.value,
+                "content": event.content[:65536],
+                "tool_name": getattr(event, "name", "") or "",
+                "tool_use_id": getattr(event, "id", None) or "",
+            })
+
         elif isinstance(event, StreamToolResult):
             seq += 1
             yield _event("response.in_progress", {

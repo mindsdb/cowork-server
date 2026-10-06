@@ -1401,6 +1401,11 @@ class ResponsesHandler:
                     # Questions need someone to answer them: this path serves
                     # the web UI, which renders the card and posts /answer.
                     interactive=self.interactive and get_app_settings().ask_user_enabled,
+                    # This handler serves the cowork UI (scheduled turns show
+                    # there too), which renders a tool's message whether or
+                    # not it can answer questions. Channel turns build their
+                    # own request in turnqueue/remote_turn.py and leave it off.
+                    tool_messages=True,
                 ):
                     if kind == "progress" and data.get("phase") == "workspace_authorized":
                         artifact_writes_allowed = data.get("workspace_mode") == "persistent"
@@ -1786,6 +1791,9 @@ class ResponsesHandler:
                 conversation=conv, input=harness_input, model=model,
                 reasoning_effort=reasoning_effort, disabled_connections=disabled,
                 trace_tags=trace_tags, trace_metadata=trace_metadata,
+                # The cowork UI (scheduled turns show there too) renders a
+                # tool's message to the user, as on the remote path.
+                tool_messages=True,
             )
             event_count = 0
             async for sse_string in harness.formatter(stream, model, event_sink):
