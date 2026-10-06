@@ -51,3 +51,14 @@ async def test_a_scratchpad_dump_keeps_the_result_role():
     roles = [e.get("thought_role") for e in events if e.get("type") == "response.in_progress"]
     assert "thought.scratchpad.result" in roles
     assert "thought.tool_call.message" not in roles
+
+
+async def test_a_scratchpad_result_with_a_message_action_stays_a_cell_result():
+    """A discarded scratchpad call echoes the model's own `action`; it must
+    not be shown to the user as an agent message."""
+    events = await _format(
+        StreamToolResult(name="scratchpad", action="message", content="[error] exec failed", id="t1"),
+    )
+    roles = [e.get("thought_role") for e in events if e.get("type") == "response.in_progress"]
+    assert "thought.scratchpad.result" in roles
+    assert "thought.tool_call.message" not in roles

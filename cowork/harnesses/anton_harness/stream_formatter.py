@@ -340,7 +340,12 @@ async def format_responses_stream(
                 "tool_use_id": event.id,
             })
 
-        elif isinstance(event, StreamToolResult) and getattr(event, "action", None) == "message":
+        elif (
+            isinstance(event, StreamToolResult)
+            and getattr(event, "action", None) == "message"
+            # A scratchpad result carries the model's own `action`.
+            and getattr(event, "name", "") != "scratchpad"
+        ):
             # A tool's message to the user (generate_artifact's brief when the
             # agent acts first). Its own role rather than the scratchpad
             # result's: a client that predates it ignores it instead of

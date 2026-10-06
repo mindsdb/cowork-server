@@ -543,6 +543,8 @@ class ResponsesHandler:
                 disabled_connections=disabled,
                 trace_tags=request.trace_tags,
                 trace_metadata=trace_metadata,
+                # The caller gets only the collected answer text back.
+                renders_tool_messages=False,
             )
             return await self._collect(stream, conversation.id, request.model, original_content)
 
