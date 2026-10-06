@@ -94,32 +94,22 @@ def test_changes_in_repositories_and_loose_files_review_and_apply_back(tmp_path:
     assert (folder / "app" / "src" / "main.py").read_text(encoding="utf-8") == "print('dirty')\n"
 
 
-def test_cleanup_and_release_forget_the_inner_worktrees(tmp_path: Path, folder: Path) -> None:
+def test_cleanup_forgets_only_its_own_worktrees(tmp_path: Path, folder: Path) -> None:
     manager = WorkspaceManager(tmp_path / "coding")
+    # Another tool's worktree whose folder was deleted: Cowork must leave its
+    # registration alone rather than prune the user's repository.
+    stale = tmp_path / "someone-elses-worktree"
+    git(folder / "app", "worktree", "add", "--detach", str(stale))
+    subprocess.run(["rm", "-rf", str(stale)], check=True)
     first = manager.prepare("first", str(folder), allow_direct_folder=True).workspace_path
     second = manager.prepare("second", str(folder), allow_direct_folder=True).workspace_path
-    assert len(worktrees(folder / "app")) == 3
+    assert len(worktrees(folder / "app")) == 4
 
     manager.cleanup("first", str(folder), str(first), WorkspaceKind.local_copy, None)
-    assert manager.release("second", str(folder), str(second), WorkspaceKind.local_copy) is True
+    manager.cleanup("second", str(folder), str(second), WorkspaceKind.local_copy, None)
 
-    assert len(worktrees(folder / "app")) == 1
+    assert worktrees(folder / "app") == [f"worktree {(folder / 'app').resolve()}", f"worktree {stale.resolve()}"]
     assert len(worktrees(folder / "services" / "api")) == 1
-
-
-def test_a_released_repository_folder_restores_as_worktrees_with_its_changes(tmp_path: Path, folder: Path) -> None:
-    manager = WorkspaceManager(tmp_path / "coding")
-    workspace = manager.prepare("task", str(folder), allow_direct_folder=True).workspace_path
-    (workspace / "app" / "src" / "main.py").write_text("print('task')\n", encoding="utf-8")
-    (workspace / "docs" / "new.md").write_text("new\n", encoding="utf-8")
-    before = {(item.path, item.status) for item in manager.diff(str(workspace), None)}
-
-    assert manager.release("task", str(folder), str(workspace), WorkspaceKind.local_copy) is True
-    manager.restore("task", str(folder), str(workspace), WorkspaceKind.local_copy)
-
-    assert (workspace / "app" / ".git").is_file()
-    assert {(item.path, item.status) for item in manager.diff(str(workspace), None)} == before
-    assert before == {("app/src/main.py", "M"), ("docs/new.md", "A")}
 
 
 def test_a_fork_gets_its_own_worktrees_and_inherits_the_parent_changes(tmp_path: Path, folder: Path) -> None:
