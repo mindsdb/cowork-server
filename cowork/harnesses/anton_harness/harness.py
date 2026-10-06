@@ -1,9 +1,14 @@
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from functools import partial
 import inspect
 import os
 from pathlib import Path
 import shutil
 import tempfile
+from uuid import UUID
+
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.build_info import account_kwargs, supported_kwargs, surface_kwarg
 from cowork.common.chat_session import build_chat_session, close_session_scratchpads
@@ -11,9 +16,13 @@ from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.logger import get_logger
 from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.user_settings import current_settings_scope
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
+from cowork.db.units import run_db, unit_session
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
 from cowork.models.conversation import Conversation
+from cowork.models.message import Message
 from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
@@ -329,7 +338,84 @@ _ATTACHMENT_AFFORDANCE = (
 )
 
 
-def _conversation_attachment_context(conversation) -> str:
+def _units_scope() -> TenantScope:
+    """The scope a turn's own database units run under: the one its settings
+    resolve against (use_settings_scope). stream_response runs only in local
+    mode, where an unbound scope is LOCAL_SCOPE, as get_user_settings has it."""
+    return current_settings_scope() or LOCAL_SCOPE
+
+
+@dataclass(frozen=True)
+class _AttachedFile:
+    """An attachment's stored path and file name, as a database unit read them."""
+
+    path: str
+    filename: str
+
+
+def _attached_files(session: ScopedSession, *, conversation_id: UUID) -> list[_AttachedFile]:
+    from cowork.services.files import FileService, attachment_purpose
+
+    rows = FileService(session).list_file_rows(purpose=attachment_purpose(str(conversation_id)))
+    return [_AttachedFile(path=row.path or "", filename=row.filename) for row in rows]
+
+
+def _replay_messages(session: ScopedSession, *, conversation_id: UUID) -> list[Message]:
+    from cowork.services.conversations import ConversationService
+
+    return ConversationService(session).get_replay_messages(conversation_id)
+
+
+def _archived_messages(session: ScopedSession, *, conversation_id: UUID) -> list[dict]:
+    from cowork.services.conversations import ConversationService
+
+    return ConversationService(session).archived_messages(conversation_id)
+
+
+async def _read_attachments(conversation, *, scope: TenantScope | None) -> list[_AttachedFile] | None:
+    """The conversation's attachments, read in a database unit, or None when
+    they could not be looked up.
+
+    ``scope`` is the turn's bound scope (use_settings_scope), never one derived
+    from the row. No scope in org mode is an invariant violation, and so is a
+    conversation of another org: both log and list nothing. A failed read logs
+    too. A wait for a connection that runs out is the turn's failure, not a
+    missing listing, so it propagates.
+    """
+    try:
+        if scope is None:
+            if get_app_settings().tenancy_mode == "org":
+                logger.warning(
+                    "attachments: no tenant scope is bound in org mode; "
+                    "listing skipped (conversation %s)", conversation.id,
+                )
+                return None
+            scope = LOCAL_SCOPE
+        if scope.org_mode and conversation.org_id != scope.org_id:
+            logger.warning(
+                "attachments: conversation %s org %r does not match scope org %r — listing skipped",
+                conversation.id, conversation.org_id, scope.org_id,
+            )
+            return None
+        return await run_db(partial(_attached_files, conversation_id=conversation.id), scope=scope)
+    except PoolTimeoutError:
+        raise
+    except Exception:
+        # Never crash a turn over attachment context — but don't fail
+        # silently either. A swallowed error here is indistinguishable from
+        # "no attachments", which is exactly how the agent ends up telling
+        # the user no files were uploaded (the Cyberdeck bug this helper
+        # exists to fix). Log it so the failure is diagnosable.
+        logger.warning(
+            "Failed to build conversation attachment context for conversation %s; "
+            "the agent will not see attached files this turn",
+            getattr(conversation, "id", "<unknown>"),
+            exc_info=True,
+        )
+        return None
+
+
+async def _conversation_attachment_context(conversation, *, scope: TenantScope | None) -> str:
     """Prompt fragment telling the agent which files are attached to this
     conversation, and how the user can attach more.
 
@@ -345,94 +431,45 @@ def _conversation_attachment_context(conversation) -> str:
 
     * **Known-empty** (no rows, or none still on disk) — say so, and name
       attachment as the remedy.
-    * **Unknown** (detached session, no tenant scope, org mismatch, or a
-      swallowed exception) — emit the affordance ALONE. Asserting "no files
-      are attached" here would turn a failure to look into a confident false
-      negative, which is the Cyberdeck bug in the other direction: the user
-      attached a file and the agent flatly denies it exists.
+    * **Unknown** (no tenant scope in org mode, org mismatch, or a failed
+      read; see _read_attachments): emit the affordance ALONE. Asserting
+      "no files are attached" here would turn a failure to look into a
+      confident false negative, which is the Cyberdeck bug in the other
+      direction: the user attached a file and the agent flatly denies it
+      exists.
     """
-    try:
-        from sqlalchemy.orm import object_session
-        from cowork.common.settings.app_settings import get_app_settings
-        from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, scope_of_session
-        from cowork.services.files import FileService, attachment_purpose
-
-        db_session = object_session(conversation)
-        if db_session is None:
-            return _ATTACHMENT_AFFORDANCE
-        # Re-wrap with the ORIGINAL scope the conversation was loaded under —
-        # never derived from the row itself. No recorded scope in org mode is
-        # an invariant violation: log it and list nothing.
-        scope = scope_of_session(db_session)
-        if scope is None:
-            if get_app_settings().tenancy_mode == "org":
-                logger.warning(
-                    "attachments: session carries no tenant scope in org mode — "
-                    "listing skipped (conversation %s)", conversation.id,
-                )
-                return _ATTACHMENT_AFFORDANCE
-            scope = LOCAL_SCOPE
-        if scope.org_mode and conversation.org_id != scope.org_id:
-            logger.warning(
-                "attachments: conversation %s org %r does not match scope org %r — listing skipped",
-                conversation.id, conversation.org_id, scope.org_id,
-            )
-            return _ATTACHMENT_AFFORDANCE
-        rows = FileService(ScopedSession(db_session, scope)).list_file_rows(
-            purpose=attachment_purpose(str(conversation.id))
-        )
-        # Only list files that still exist on disk — a row whose file was
-        # deleted would otherwise hand the agent a dead path to chase.
-        # Resolve one row at a time: a single bad row (e.g. a path the OS
-        # rejects) must not abort the whole list and hide every OTHER
-        # attachment — skip the bad one and keep going.
-        attached: list[str] = []
-        for r in rows:
-            try:
-                path = getattr(r, "path", "")
-                if path and Path(path).exists():
-                    attached.append(f"  - {r.path}  ({r.filename})")
-            except Exception:
-                logger.warning(
-                    "Skipping unresolvable attachment row (file id=%s) while "
-                    "building context for conversation %s",
-                    getattr(r, "id", "<unknown>"),
-                    getattr(conversation, "id", "<unknown>"),
-                    exc_info=True,
-                )
-        if not attached:
-            return (
-                " No files are currently attached to this conversation."
-                + _ATTACHMENT_AFFORDANCE
-            )
-        return (
-            " The user has attached the following files to THIS conversation. "
-            "They live OUTSIDE the project directory, so a project-only scan will "
-            "miss them — read them directly from these absolute paths whenever the "
-            "user refers to uploaded or reference materials, and never report them "
-            "missing just because they aren't in the project folder:\n"
-            + "\n".join(attached)
-        )
-    except Exception:
-        # Never crash a turn over attachment context — but don't fail
-        # silently either. A swallowed error here is indistinguishable from
-        # "no attachments", which is exactly how the agent ends up telling
-        # the user no files were uploaded (the Cyberdeck bug this helper
-        # exists to fix). Log it so the failure is diagnosable; the agent
-        # still degrades gracefully to "".
-        try:
-            # A broken session state can make even attribute access raise —
-            # the log line must never re-crash the handler it protects.
-            conv_id = getattr(conversation, "id", "<unknown>")
-        except Exception:
-            conv_id = "<unknown>"
-        logger.warning(
-            "Failed to build conversation attachment context for conversation %s; "
-            "the agent will not see attached files this turn",
-            conv_id,
-            exc_info=True,
-        )
+    rows = await _read_attachments(conversation, scope=scope)
+    if rows is None:
         return _ATTACHMENT_AFFORDANCE
+    # Only list files that still exist on disk — a row whose file was
+    # deleted would otherwise hand the agent a dead path to chase.
+    # Resolve one row at a time: a single bad row (e.g. a path the OS
+    # rejects) must not abort the whole list and hide every OTHER
+    # attachment — skip the bad one and keep going.
+    attached: list[str] = []
+    for row in rows:
+        try:
+            if row.path and Path(row.path).exists():
+                attached.append(f"  - {row.path}  ({row.filename})")
+        except Exception:
+            logger.warning(
+                "Skipping unresolvable attachment %r while building context for conversation %s",
+                row.filename, getattr(conversation, "id", "<unknown>"),
+                exc_info=True,
+            )
+    if not attached:
+        return (
+            " No files are currently attached to this conversation."
+            + _ATTACHMENT_AFFORDANCE
+        )
+    return (
+        " The user has attached the following files to THIS conversation. "
+        "They live OUTSIDE the project directory, so a project-only scan will "
+        "miss them — read them directly from these absolute paths whenever the "
+        "user refers to uploaded or reference materials, and never report them "
+        "missing just because they aren't in the project folder:\n"
+        + "\n".join(attached)
+    )
 
 
 @register
@@ -728,12 +765,10 @@ class AntonHarness:
         """The archive-search tool for this turn, or None when there is nothing
         to search (ENG-735).
 
-        Withheld in three cases:
+        Withheld in two cases:
         - no summary saved yet — the whole history is still replayed, so the
           tool's description and prompt would be dead prompt weight
         - compaction switched off — nothing will ever be archived
-        - the conversation is detached from its DB session, so the archive
-          cannot be read at all
 
         The DB stays on this side of the boundary: the tool receives a callable
         that returns the archive, so its handler holds no session and the
@@ -744,22 +779,18 @@ class AntonHarness:
         if not conversation.history_summary_cutoff_id:
             return None
 
-        from sqlalchemy.orm import object_session
-
-        from cowork.db.scoped import adopt_scoped_session
-        from cowork.services.conversations import ConversationService
-
         from .tools import build_cowork_recall_history_tool
 
-        db_session = object_session(conversation)
-        if db_session is None:
-            return None
+        conversation_id = conversation.id
+        scope = _units_scope()
+
         # Read per call, not here: most turns never call the tool, and the
-        # archive only changes when a compaction lands at turn end.
-        service = ConversationService(adopt_scoped_session(db_session))
-        return build_cowork_recall_history_tool(
-            lambda: service.archived_messages(conversation.id)
-        )
+        # archive only changes when a compaction lands at turn end. Each call
+        # is its own unit, so no connection is held while the agent works.
+        async def load_archive() -> list[dict]:
+            return await run_db(partial(_archived_messages, conversation_id=conversation_id), scope=scope)
+
+        return build_cowork_recall_history_tool(load_archive)
 
     @staticmethod
     def compaction_cutoff_index(seed_info: dict, covered_through: int, total: int) -> int | None:
@@ -798,16 +829,16 @@ class AntonHarness:
         )
         if idx is None:
             return
-        from sqlalchemy.orm import object_session
-        from cowork.db.scoped import adopt_scoped_session
         from cowork.services.conversations import ConversationService
 
-        db_session = object_session(conversation)
-        if db_session is None:
-            return
-        ConversationService(adopt_scoped_session(db_session)).update_history_compaction(
-            conversation.id, compaction["summary"], ordered_messages[idx].id,
-        )
+        # Synchronous, on its own short session: this runs in stream_response's
+        # `finally`, where an `await` is skipped on cancellation. It is one of
+        # the two checkouts a turn makes on the event loop thread, bounded by
+        # the pool's own wait (POOL_TIMEOUT on Postgres).
+        with unit_session(scope=_units_scope()) as session:
+            ConversationService(session).update_history_compaction(
+                conversation.id, compaction["summary"], ordered_messages[idx].id,
+            )
 
     @staticmethod
     def _to_anton_input(input_blocks: list[dict]) -> str | list[dict]:
@@ -984,11 +1015,24 @@ class AntonHarness:
         # history_store = HistoryStore(episodes_dir)
         # initial_history = history_store.load(conversation_id)
 
+        # What the conversation has stored, each read in a database unit of its
+        # own, before anything below opens a connector: no pooled connection is
+        # held past these reads, and the conversation may be detached.
+        #
         # Conversation-attached uploads land in the files dir
         # (.cowork/files/<uuid>/<name>), OUTSIDE the project directory — so
         # the agent must be told their exact paths or it scans only the
         # project root and wrongly reports "no files uploaded" (Cyberdeck bug).
-        attachment_context = _conversation_attachment_context(conversation)
+        attachment_context = await _conversation_attachment_context(
+            conversation, scope=current_settings_scope(),
+        )
+        # Canonical order (ConversationService._MESSAGE_ORDER: seq, role, id);
+        # the bare `conversation.messages` relationship is unordered and would
+        # scramble a turn's tool_use/tool_result block-rows. Each message's
+        # events come loaded with it, for the scratchpad cells replayed below.
+        ordered_messages = await run_db(
+            partial(_replay_messages, conversation_id=conversation.id), scope=_units_scope(),
+        )
 
         project_context = (
             # Conversational only. The next line hands the agent the real path,
@@ -1155,26 +1199,6 @@ class AntonHarness:
                         "surfaces every file this app can legitimately see, Shared Drive items included."
                     )
 
-            # Canonical order (ConversationService._MESSAGE_ORDER: seq, role, id);
-            # the bare `conversation.messages`
-            # relationship is unordered and would scramble a turn's tool_use/tool_result
-            # block-rows. Ordering needs the DB session, so the conversation must be
-            # attached — callers always pass an attached instance; fail fast rather
-            # than silently fall back to a scrambled, replay-breaking history.
-            from sqlalchemy.orm import object_session
-            from cowork.db.scoped import adopt_scoped_session
-            from cowork.services.conversations import ConversationService
-
-            db_session = object_session(conversation)
-            if db_session is None:
-                raise RuntimeError(
-                    f"Conversation {conversation.id} is detached from its Session; "
-                    "cannot resolve ordered history for replay."
-                )
-            ordered_messages = ConversationService(
-                adopt_scoped_session(db_session)
-            ).get_ordered_messages(conversation.id)
-
             cells = extract_scratchpad_cells_from_message_events(ordered_messages)
             os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
 
@@ -1281,8 +1305,8 @@ class AntonHarness:
             # so a failure ANYWHERE below MCP discovery — not just
             # build_chat_session's own construction — would otherwise leak
             # every MCP transport this turn opened (found in review: the
-            # original narrower try/except here missed object_session()/
-            # _seed_history() raising before build_chat_session is ever called).
+            # original narrower try/except here missed _seed_history() raising
+            # before build_chat_session is ever called).
             # A non-empty mcp_sessions implies mcp_wiring resolved above, so
             # no second import and no second capability check is needed here.
             if mcp_sessions:

@@ -27,7 +27,7 @@ from cowork.common.settings.user_settings import (
     use_turn_settings,
 )
 from cowork.db.session import get_open_session
-from cowork.db.units import busy_retry_seconds, conversation_writes, run_db
+from cowork.db.units import busy_retry_seconds, conversation_writes, run_db, run_to_completion
 from cowork.harnesses.base import available_harness_ids, get_harness
 from cowork.handlers import jev_shadow
 from cowork.handlers.response_routing import (
@@ -41,6 +41,7 @@ from cowork.handlers.response_routing import (
     ineligible_reason,
 )
 from cowork.harnesses.anton_harness.stream_formatter import SkillCreated, format_responses_stream
+from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.streaming import StreamBuffer, TurnLifecycle, new_buffer, registry, sse_frame
 from cowork.streaming.answer_text import accumulate_answer_text
@@ -84,6 +85,7 @@ from cowork.handlers.turn_errors import (
     retry_after_seconds,
     retry_at_instant,
     response_failed_sse,
+    server_busy_message,
 )
 from cowork.db.scoped import (
     ScopedSession,
@@ -346,6 +348,113 @@ class _TurnStart:
     gate_rows: list[Message] | None
 
 
+@dataclass(frozen=True)
+class _StartedTurn:
+    """What a turn's first unit read and wrote: the conversation, detached with
+    the project the harness reads, and the id of the question it saved."""
+
+    conversation: Conversation
+    question_id: UUID
+
+
+@dataclass(frozen=True)
+class _SavedAnswer:
+    """What the turn-end unit did with the answer.
+
+    ``message_id`` names the assistant row it wrote, and ``failure`` is why the
+    save failed. Neither means there was nothing to save: an empty turn, a turn
+    whose question was never saved, or an answer this turn already saved.
+    """
+
+    message_id: UUID | None = None
+    failure: Exception | None = None
+
+    @property
+    def assistant_message_id(self) -> str | None:
+        """The row's id as the terminal frames carry it, or None."""
+        return str(self.message_id) if self.message_id is not None else None
+
+
+@dataclass(frozen=True)
+class _DirectTurn:
+    """The rows a direct answer saved."""
+
+    user_message_id: UUID
+    assistant_message_id: UUID | None
+
+
+def _conversation_for_harness(session: ScopedSession, *, conversation_id: UUID) -> Conversation:
+    """The conversation, with the project the harness reads loaded, so both
+    stay readable after the unit's session closes. The harness reads the
+    conversation's history and attachments in units of its own."""
+    conversation = ConversationService(session).get_conversation(conversation_id)
+    _ = conversation.project
+    return conversation
+
+
+def _start_turn(
+    session: ScopedSession, *, conversation_id: UUID, content, sent_at: datetime,
+) -> _StartedTurn:
+    """A streamed turn's first unit: load the conversation, then save the
+    question as pending (ENG-1231), so a refresh mid-turn shows it while
+    replayed history (get_ordered_messages) leaves it out."""
+    conversation = _conversation_for_harness(session, conversation_id=conversation_id)
+    question = ConversationService(session).save_user_message(
+        conversation_id, content, created_at=sent_at, pending=True,
+    )
+    return _StartedTurn(conversation=conversation, question_id=question.id)
+
+
+def _save_answer(
+    session: ScopedSession,
+    *,
+    lifecycle: TurnLifecycle,
+    conversation_id: UUID,
+    question_id: UUID,
+    text: str,
+    events: tuple[dict, ...],
+    tool_rows: tuple[dict, ...],
+    harness: str | None,
+) -> UUID | None:
+    """A streamed turn's last unit: the saved assistant row's id, or None when
+    it saved no answer (an empty turn, or a deleted one)."""
+    if lifecycle.discarded:
+        # The turn was deleted while this save waited for a connection. Its
+        # rows would land in the history the delete cut.
+        return None
+    service = ConversationService(session)
+    # Re-anchor before ANY write: the conversation may be gone (deleted
+    # mid-turn) or out of scope.
+    service.get_conversation(conversation_id)
+    # The services commit as they go, so the answer is saved before the
+    # question's pending flag is cleared: when the save fails, the question
+    # stays pending and out of replayed history rather than rejoining it with
+    # no answer after it.
+    message = service.save_assistant_turn(
+        conversation_id, text, list(events), harness=harness, tool_rows=list(tool_rows),
+    )
+    # Cleared even for an empty turn, which saves no row, so the question
+    # rejoins replayed history. Scoped to THIS turn's row, so a completing turn
+    # can't absorb into history a pending row stranded by an earlier crashed
+    # turn.
+    service.finalize_pending(conversation_id, question_id)
+    return message.id if message is not None else None
+
+
+def _failed_frame_for(exc: Exception, *, request_id: str | None = None) -> str:
+    """The response.failed frame for a turn failure that is the server's own:
+    no database connection freed in time (server_busy, carrying the wait as
+    rate_limited does, so a card can time its Retry), or anything else (the
+    generic error, which leaks no internals)."""
+    if isinstance(exc, PoolTimeoutError):
+        retry_after = busy_retry_seconds()
+        return response_failed_sse(
+            server_busy_message(retry_after), SERVER_BUSY_CODE,
+            retry_after=retry_after, retry_at=retry_at_instant(retry_after), request_id=request_id,
+        )
+    return response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)
+
+
 class ResponsesHandler:
     def __init__(self, *, principal: Principal | None = None, interactive: bool = True) -> None:
         self.principal = principal
@@ -508,25 +617,23 @@ class ResponsesHandler:
             # so the harness reads history WITHOUT the current turn — otherwise the
             # fresh-query history would replay it AND resend it as the live input.
             #
-            # The harness reads the conversation's project and history through
-            # the session the conversation is attached to, so it gets one for the
-            # length of the turn.
-            harness_session = ScopedSession(get_open_session(), self.scope)
-            try:
-                conversation = ConversationService(harness_session).get_conversation(start.conversation_id)
-                with use_settings_scope(self.scope):
-                    stream = harness.stream_response(
-                        conversation=conversation,
-                        input=start.harness_input,
-                        model=request.model,
-                        reasoning_effort=request.reasoning_effort,
-                        disabled_connections=disabled,
-                        trace_tags=request.trace_tags,
-                        trace_metadata=trace_metadata,
-                    )
-                    return await self._collect(stream, start.conversation_id, request.model, original_content)
-            finally:
-                harness_session.close()
+            # The harness gets the conversation detached, and reads its history
+            # in units of its own.
+            conversation = await run_db(
+                partial(_conversation_for_harness, conversation_id=start.conversation_id),
+                scope=self.scope,
+            )
+            with use_settings_scope(self.scope):
+                stream = harness.stream_response(
+                    conversation=conversation,
+                    input=start.harness_input,
+                    model=request.model,
+                    reasoning_effort=request.reasoning_effort,
+                    disabled_connections=disabled,
+                    trace_tags=request.trace_tags,
+                    trace_metadata=trace_metadata,
+                )
+                return await self._collect(stream, start.conversation_id, request.model, original_content)
 
     def _read_turn_start(
         self, session: ScopedSession, *, request: ResponsesRequest, has_disabled_connections: bool,
@@ -896,10 +1003,9 @@ class ResponsesHandler:
         The full answer exists up front — the gate does not return until its
         stream ends — so persistence happens before any frame is emitted: the
         client can never see a completed turn the DB does not have, and no
-        pending row is needed."""
-        producer_session = None
+        pending row is needed. Both rows are saved in one unit, under the
+        conversation's write lock."""
         try:
-            producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
             item_id = f"msg-{conv_id.hex[:12]}"
             delta = {
                 "type": "response.output_text.delta",
@@ -909,12 +1015,21 @@ class ResponsesHandler:
                 "response_route": route.route,
                 "response_route_reason": route.reason,
             }
-            svc = ConversationService(producer_session)
-            user_msg = svc.save_user_message(conv_id, original_content)
-            assistant_msg = svc.save_assistant_turn(
-                conv_id, route.text, [delta, {"type": "response.completed"}],
-                harness="cowork-direct",
-            )
+
+            def save_turn(session: ScopedSession) -> _DirectTurn:
+                service = ConversationService(session)
+                user_message = service.save_user_message(conv_id, original_content)
+                assistant_message = service.save_assistant_turn(
+                    conv_id, route.text, [delta, {"type": "response.completed"}],
+                    harness="cowork-direct",
+                )
+                return _DirectTurn(
+                    user_message_id=user_message.id,
+                    assistant_message_id=assistant_message.id if assistant_message is not None else None,
+                )
+
+            async with conversation_writes(conv_id):
+                saved = await run_db(save_turn, scope=scope_from_principal(self.principal))
 
             response = Response(status=ResponseStatus.created, model=route.model)
             # conversation_id/harness sit at the event root, like both
@@ -924,7 +1039,7 @@ class ResponsesHandler:
                 "sequence_number": 1,
                 "conversation_id": str(conv_id),
                 "harness": "cowork-direct",
-                "user_message_id": str(user_msg.id),
+                "user_message_id": str(saved.user_message_id),
                 "response": response.model_dump(),
             })})
             await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", delta)})
@@ -947,8 +1062,8 @@ class ResponsesHandler:
             # reordering is needed on this path. Omitted, not null, when
             # nothing was persisted — same convention every other producer
             # uses for this field.
-            if assistant_msg is not None:
-                completed_frame["assistant_message_id"] = str(assistant_msg.id)
+            if saved.assistant_message_id is not None:
+                completed_frame["assistant_message_id"] = str(saved.assistant_message_id)
             await buffer.append("sse", {"sse": sse_frame("response.completed", completed_frame)})
             await buffer.close("completed")
         except asyncio.CancelledError:
@@ -958,28 +1073,19 @@ class ResponsesHandler:
                 return
             await buffer.close("cancelled")
         except Exception as exc:
-            friendly = friendly_turn_error(exc)
-            if friendly is not None and friendly[0] == SERVER_BUSY_CODE:
-                # No database connection freed in time to save the answer. Say
-                # so with the wait, as a refused request's 503 does.
-                code, message = friendly
+            if isinstance(exc, PoolTimeoutError):
+                # No database connection freed in time to save the answer. The
+                # frame says so with the wait, as a refused request's 503 does.
                 logger.warning(
                     "[responses] direct turn for conversation %s found no free database connection",
                     conv_id,
                 )
-                retry_after = busy_retry_seconds()
-                frame = response_failed_sse(
-                    message, code, retry_after=retry_after, retry_at=retry_at_instant(retry_after),
-                )
             else:
                 logger.exception("[responses] direct turn failed for conversation %s", conv_id)
-                frame = response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)
-            await buffer.append("sse", {"sse": frame})
+            await buffer.append("sse", {"sse": _failed_frame_for(exc)})
             await buffer.close("error")
         finally:
             await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
-            if producer_session is not None:
-                producer_session.close()
 
     def _select_producer(
         self,
@@ -1827,24 +1933,26 @@ class ResponsesHandler:
     ) -> None:
         """Detached producer: run the turn and write events to the buffer.
 
-        Runs in its OWN DB session (it outlives the request). Persists the user
-        message (pending) as its first action so a mid-turn refresh shows the
-        question, reads history via get_ordered_messages (which excludes pending,
-        so the current input isn't double-fed), and on terminal finalizes the
-        pending flag + persists the assistant turn (ENG-1231). Never reaches the
-        HTTP response — readers tail the buffer.
+        Its database work runs as units (cowork.db.units), so it holds no
+        pooled connection while the model answers. The first unit saves the
+        question (pending) so a mid-turn refresh shows it, and loads the
+        conversation for the harness, which reads history (get_ordered_messages
+        leaves the pending row out, so the current input isn't double-fed) in
+        units of its own. The last unit finalizes the pending flag and saves
+        the assistant turn (ENG-1231). Both hold the conversation's write lock.
+        Never reaches the HTTP response: readers tail the buffer.
         """
         lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
-        # Fresh session (outlives the request), scoped from the immutable
-        # principal captured at handler construction — never request state.
-        producer_session = ScopedSession(get_open_session(), scope_from_principal(self.principal))
+        # Scoped from the immutable principal captured at handler
+        # construction, never from request state.
+        scope = scope_from_principal(self.principal)
         collected_text: list[str] = []
         collected_events: list[dict] = []
         turn_rows: list[dict] = []
         persisted = False
         # Send time captured before the turn
         sent_at = datetime.now(timezone.utc)
-        pending_message_id: UUID | None = None
+        question_id: UUID | None = None
         # The in-process twin of _produce_remote's correlation id. Minted up
         # front so the failure branch and the seal below attach the SAME id the
         # log line carries. This path has no pod and so no correlation id of its
@@ -1864,49 +1972,73 @@ class ResponsesHandler:
             collected_events.append(data)
             accumulate_answer_text(collected_text, event_type, data)
 
-        def persist() -> Message | None:
+        async def persist() -> _SavedAnswer:
+            """Save the answer as it stands, once per turn, in one unit.
+
+            The flag is set and the collected parts copied here, on the event
+            loop, before the unit starts: the loop goes on appending to the
+            lists while the unit's thread reads its copies, and a later call
+            must not save the turn again. A turn whose question was never
+            saved has nothing to answer, so it saves nothing.
+            """
             nonlocal persisted
-            if persisted:
-                return None  # already persisted this turn — no new row to report
+            if persisted or question_id is None:
+                return _SavedAnswer()
             persisted = True
+            save = partial(
+                _save_answer,
+                lifecycle=lifecycle,
+                conversation_id=conv_id,
+                question_id=question_id,
+                text="".join(collected_text),
+                events=tuple(collected_events),
+                tool_rows=tuple(turn_rows),
+                harness=harness_id,
+            )
             try:
-                # Re-anchor before ANY write: the conversation may be gone
-                # (deleted mid-turn) or out of scope on this fresh session.
-                svc = ConversationService(producer_session)
-                svc.get_conversation(conv_id)
-                # The user message was already persisted (pending) at turn start
-                # (ENG-1231). Clear the flag first — even if save_assistant_turn
-                # early-returns on an empty turn — so the question rejoins replayed
-                # history; then persist the assistant turn. Scope to THIS turn's
-                # row so a completing turn can't absorb a pending row stranded by
-                # an earlier crashed turn into history. If the pending persist
-                # never succeeded (id unset), this turn owns no row — skip
-                # finalize rather than fall back to clearing every pending row.
-                if pending_message_id is not None:
-                    svc.finalize_pending(conv_id, pending_message_id)
-                return svc.save_assistant_turn(
-                    conv_id, "".join(collected_text), collected_events, harness=harness_id,
-                    tool_rows=turn_rows,
+                async with conversation_writes(conv_id):
+                    return _SavedAnswer(message_id=await run_db(save, scope=scope))
+            except PoolTimeoutError as exc:
+                logger.warning(
+                    "[responses] no database connection freed in time to save the turn for conversation %s",
+                    conv_id, extra={"request_id": corr},
                 )
-            except Exception:
+                return _SavedAnswer(failure=exc)
+            except Exception as exc:
                 logger.exception(
                     "[responses] failed to persist turn for conversation %s", conv_id,
                     extra={"request_id": corr},
                 )
-                return None
+                return _SavedAnswer(failure=exc)
+
+        async def finish(completed_frame: str | None) -> None:
+            """Save the answer, then write the frame that reports it and the
+            terminal record: completed with the saved row's id, or failed when
+            the save failed, so the stream never says completed for an answer
+            the database does not hold."""
+            saved = await persist()
+            if lifecycle.discarded:
+                # Deleted while it saved: its buffer is gone, and writing a
+                # terminal record would recreate it for the next turn to tail.
+                return
+            if saved.failure is not None:
+                await buffer.append("sse", {"sse": _failed_frame_for(saved.failure, request_id=corr)})
+                await buffer.close("error")
+                return
+            if completed_frame is not None:
+                await buffer.append("sse", {"sse": self._inject_completion_id(completed_frame, saved.message_id)})
+            await buffer.close("completed")
 
         try:
-            conv = ConversationService(producer_session).get_conversation(conv_id)
-            # Persist the user message (pending) as the first thing this producer
-            # does (ENG-1231) — see the note in handle(). The harness reads history
-            # via get_ordered_messages, which excludes pending, so this write isn't
-            # replayed into the turn as duplicate context.
-            pending_message_id = ConversationService(producer_session).save_user_message(
-                conv_id, original_content, created_at=sent_at, pending=True,
-            ).id
+            async with conversation_writes(conv_id):
+                started = await run_db(
+                    partial(_start_turn, conversation_id=conv_id, content=original_content, sent_at=sent_at),
+                    scope=scope,
+                )
+            question_id = started.question_id
             harness = get_harness(harness_name)
             stream = harness.stream_response(
-                conversation=conv, input=harness_input, model=model,
+                conversation=started.conversation, input=harness_input, model=model,
                 reasoning_effort=reasoning_effort, disabled_connections=disabled,
                 trace_tags=trace_tags, trace_metadata=trace_metadata,
                 # The cowork UI (scheduled turns show there too) renders a
@@ -1914,23 +2046,22 @@ class ResponsesHandler:
                 tool_messages=True,
             )
             event_count = 0
+            completed_frame: str | None = None
             async for sse_string in harness.formatter(stream, model, event_sink):
                 event_count += 1
-                sse_string = self._inject_created(sse_string, conv_id, harness_id, pending_message_id)
+                sse_string = self._inject_created(sse_string, conv_id, harness_id, question_id)
                 if self._sse_event_type(sse_string) == "response.completed":
-                    # Persist now, same reasoning as _produce_remote:
-                    # the formatter only yields its terminal frame once its
+                    # The formatter yields its terminal frame last, once its
                     # source is exhausted, so event_sink has already seen
-                    # everything this turn produced. The unconditional
-                    # persist() below stays as a fallback and is a no-op here.
-                    assistant_msg = persist()
-                    sse_string = self._inject_completion_id(
-                        sse_string, assistant_msg.id if assistant_msg else None
-                    )
+                    # everything this turn produced. finish() sends it once
+                    # the answer is saved, carrying the saved row's id.
+                    completed_frame = sse_string
+                    continue
                 await buffer.append("sse", {"sse": sse_string})
             logger.info("[responses] turn %s finished — %d events", conv_id, event_count)
-            persist()
-            await buffer.close("completed")
+            # A Stop that lands here waits for the save and its frame, so the
+            # stream's terminal record always matches what the database holds.
+            await run_to_completion(finish(completed_frame))
         except asyncio.CancelledError:
             if lifecycle.discarded:
                 # This cancellation came from a turn delete (registry.discard),
@@ -1942,15 +2073,19 @@ class ResponsesHandler:
                 # truncation. So drop the turn entirely.
                 logger.info("[responses] discarded turn %s — not persisting", conv_id)
                 return
+            if buffer.is_closed:
+                # The cancel arrived while finish() saved the answer and wrote
+                # the terminal record, and waited for both. The turn is over.
+                return
             if lifecycle.shutting_down or lifecycle.timed_out:
                 collected_events.extend(cancelled_ask_user_retirements(collected_events))
                 collected_events.append(response_failed_payload(
                     INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
                 ))
-                assistant_msg = persist()
+                saved = await persist()
                 await buffer.append("sse", {"sse": response_failed_sse(
                     INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
-                    assistant_message_id=_message_id_str(assistant_msg),
+                    assistant_message_id=saved.assistant_message_id,
                 )})
                 await buffer.close("interrupted")
                 return
@@ -1961,7 +2096,7 @@ class ResponsesHandler:
             # so retire it here — otherwise the persisted log holds a published
             # question that nothing in it ever closes.
             collected_events.extend(cancelled_ask_user_retirements(collected_events))
-            persist()
+            await persist()
             await buffer.close("cancelled")
             return
         except Exception as exc:
@@ -1992,7 +2127,11 @@ class ResponsesHandler:
                 # lets a repair failure mask the turn's real outcome; the
                 # user-facing message above already went out either way.
                 try:
-                    repaired = ConversationService(producer_session).repair_image_content(conv_id)
+                    async with conversation_writes(conv_id):
+                        repaired = await run_db(
+                            lambda session: ConversationService(session).repair_image_content(conv_id),
+                            scope=scope,
+                        )
                     logger.warning(
                         "[responses] content validation error on conversation %s — "
                         "repaired %d message(s) with image content: %s",
@@ -2129,15 +2268,14 @@ class ResponsesHandler:
             # an id; only the append/persist order relative to the SSE frame
             # below actually changed.
             collected_events.append(failed)
-            assistant_msg = persist()
+            saved = await persist()
             await buffer.append("sse", {"sse": response_failed_sse(
                 message, code, **extra,
-                assistant_message_id=_message_id_str(assistant_msg),
+                assistant_message_id=saved.assistant_message_id,
             )})
             await buffer.close("error")
         finally:
             await _seal_unterminated_buffer(buffer, lifecycle, conv_id, request_id=corr)
-            producer_session.close()
 
     @staticmethod
     def _sse_event_type(sse_string: str) -> str | None:
@@ -2266,10 +2404,11 @@ class ResponsesHandler:
                     # rationale — repair the conversation's stored history
                     # once here rather than special-case every future replay.
                     try:
-                        repaired = await run_db(
-                            lambda session: ConversationService(session).repair_image_content(conversation_id),
-                            scope=self.scope,
-                        )
+                        async with conversation_writes(conversation_id):
+                            repaired = await run_db(
+                                lambda session: ConversationService(session).repair_image_content(conversation_id),
+                                scope=self.scope,
+                            )
                         logger.warning(
                             "[responses] content validation error on conversation %s — "
                             "repaired %d message(s) with image content: %s",

@@ -828,8 +828,10 @@ async def test_auth_reconnectable_keys_on_the_failing_role_not_planning():
 
     exc = ProviderAuthError("provider rejected the credential")
     exc.role = "coding"
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
@@ -854,8 +856,10 @@ async def test_auth_reconnectable_uses_planning_role_in_a_mixed_config():
     with patch(
         "cowork.handlers.responses.get_user_settings",
         return_value=_MixedSettings(),
-    ):
+    ) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     failed = next(f for f in frames if "response.failed" in f)
     payload = json.loads(failed.split("data: ", 1)[1].strip())
@@ -883,8 +887,10 @@ async def test_auth_without_a_role_does_not_name_a_provider_in_a_mixed_config():
     # LLMClient's confirmation wrappers set it.
     exc = ProviderAuthError("provider rejected the credential")
     assert exc.role is None
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_MixedSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_MixedSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
@@ -905,8 +911,10 @@ async def test_auth_without_a_role_still_names_an_unambiguous_provider():
         resolved_router_provider = Provider.OPENAI
 
     exc = ProviderAuthError("provider rejected the credential")
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_MindsSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_MindsSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
@@ -1895,8 +1903,10 @@ async def test_overloaded_reconnectable_keys_on_the_failing_model_not_planning()
         resolved_coding_provider = Provider.ANTHROPIC
 
     exc = _FakeOverloadedErr(_OVERLOAD_MSG, model="latest:haiku")  # the coding model
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
     )
@@ -1919,8 +1929,10 @@ async def test_overloaded_reconnectable_true_when_failing_model_is_managed():
         resolved_coding_provider = Provider.MINDS_CLOUD
 
     exc = _FakeOverloadedErr(_OVERLOAD_MSG, model="latest:sonnet")  # the planning model
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
     )
