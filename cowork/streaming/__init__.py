@@ -12,6 +12,7 @@ from cowork.streaming.sse import sse_frame
 from cowork.streaming.registry import (
     RunHandle,
     RunRegistry,
+    TurnInProgress,
     TurnLifecycle,
     discard_conversation,
     registry,
@@ -23,6 +24,7 @@ __all__ = [
     "TerminalReason",
     "RunRegistry",
     "RunHandle",
+    "TurnInProgress",
     "TurnLifecycle",
     "registry",
     "discard_conversation",

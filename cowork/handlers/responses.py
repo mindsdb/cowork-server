@@ -5,13 +5,14 @@ import base64
 import json
 import time
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
-from sqlmodel import Session
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.build_info import build_trace_metadata
 from cowork.common.chat_session import in_process_agent_allowed
@@ -19,11 +20,14 @@ from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings, get_app_settings
 from cowork.common.settings.user_settings import (
     Provider,
+    UserSettings,
     get_user_settings,
     provider_api_key,
     use_settings_scope,
+    use_turn_settings,
 )
 from cowork.db.session import get_open_session
+from cowork.db.units import busy_retry_seconds, conversation_writes, run_db
 from cowork.harnesses.base import available_harness_ids, get_harness
 from cowork.handlers import jev_shadow
 from cowork.handlers.response_routing import (
@@ -38,7 +42,7 @@ from cowork.handlers.response_routing import (
 )
 from cowork.harnesses.anton_harness.stream_formatter import SkillCreated, format_responses_stream
 from cowork.models.message import Message
-from cowork.streaming import TurnLifecycle, new_buffer, registry, sse_frame
+from cowork.streaming import StreamBuffer, TurnLifecycle, new_buffer, registry, sse_frame
 from cowork.streaming.answer_text import accumulate_answer_text
 from cowork.streaming.backend import get_backend
 from cowork.streaming.turn_index import record_turn
@@ -70,6 +74,7 @@ from cowork.handlers.turn_errors import (
     REMOTE_CANCEL_LITERAL,
     REMOTE_CANCEL_VIA_FAIL_JOB,
     RESET_AT_CODES,
+    SERVER_BUSY_CODE,
     auth_error_detail,
     friendly_turn_error,
     gate_reset_at,
@@ -80,7 +85,12 @@ from cowork.handlers.turn_errors import (
     retry_at_instant,
     response_failed_sse,
 )
-from cowork.db.scoped import ScopedSession, TenantScope, scope_from_principal
+from cowork.db.scoped import (
+    ScopedSession,
+    TenantScope,
+    scope_from_principal,
+    unsafe_unscoped_session,
+)
 from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService
@@ -90,6 +100,7 @@ from cowork.services.product_permissions import (
 )
 from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectService
+from cowork.services.settings import SettingService
 from cowork.services.skills import SkillService
 from cowork.services.task_objects import remote_skill_draft_result
 
@@ -320,18 +331,30 @@ def _message_id_str(message: Message | None) -> str | None:
     return str(message.id) if message is not None else None
 
 
+@dataclass(frozen=True)
+class _TurnStart:
+    """What a request reads, as one unit, before its gate runs."""
+
+    settings: UserSettings
+    harness_name: str
+    harness_input: list[dict]
+    conversation_id: UUID
+    turn_id: int
+    # The gate's history: user and assistant rows, oldest first, at most
+    # _MAX_HISTORY_MESSAGES. Empty when the turn's shape skips the gate, and
+    # None when the read failed, which sends the turn to the agent.
+    gate_rows: list[Message] | None
+
+
 class ResponsesHandler:
-    def __init__(
-        self, session: Session, principal: Principal | None = None, interactive: bool = True
-    ) -> None:
-        self.session = session
+    def __init__(self, *, principal: Principal | None = None, interactive: bool = True) -> None:
         self.principal = principal
         self.scope = scope_from_principal(principal)
-        self.scoped = ScopedSession(session, self.scope)
-        # Resolve the selected harness name now, but initialize Anton lazily only
-        # after Cowork delegates a turn. Direct context responses must never build
-        # the Anton harness.
-        self.harness_name = get_user_settings(self.scope).harness
+        # The harness this turn runs: the request's own pick or the stored
+        # setting, resolved by handle() from the settings its first unit reads.
+        # Anton itself is built lazily, only after Cowork delegates a turn:
+        # direct context responses must never build the Anton harness.
+        self.harness_name: str | None = None
         self.harness = None
         self.last_conversation_id: str | None = None
         # Whether a person is watching this turn and can answer ask_user cards.
@@ -347,28 +370,186 @@ class ResponsesHandler:
 
         await require_product_permission(self.scope, "product.execute")
 
-        # A per-conversation harness pick (Coding Mode's composer pill)
-        # overrides the account default for THIS call only — mirrors the
-        # per-conversation model override below. Ignored (not raised) when it
-        # doesn't name a currently-registered/available harness: a stale
-        # client cache (a harness removed since the picker last loaded)
-        # must never fail the turn, it just falls back to the
-        # account default. self.harness stays None either way — still lazy,
-        # only self.harness_name (which harness _get_harness() will build)
-        # changes here.
-        if request.harness and request.harness in available_harness_ids():
-            self.harness_name = request.harness
-
         # Identity + the running build into the run's trace metadata;
         # server-derived keys win. The build stamp (ENG-1279) is what lets a
         # metric be attributed to a release instead of to a date on which
         # several changes happened to ship together.
         trace_metadata = build_trace_metadata(identity_trace_metadata(self.principal, request.trace_metadata))
-
-        conversation_service = ConversationService(self.scoped)
-
-        harness_input = self._build_harness_input(request)
         original_content = self._extract_original_content(request)
+        disabled = (
+            [dc.model_dump() for dc in request.disabled_connections]
+            if request.disabled_connections else None
+        )
+
+        # Before the reads: the gate and the producer task both scrub history
+        # in this request's context, so the vault's secrets are registered
+        # first. It needs only the scope.
+        await register_vault_secrets(self.scope)
+
+        # The request's reads run as one unit in a worker thread, which holds a
+        # connection only while it reads: none is held across the gate's model
+        # call, and a wait for one never stalls the event loop.
+        start = await run_db(
+            partial(self._read_turn_start, request=request, has_disabled_connections=bool(disabled)),
+            scope=self.scope,
+        )
+        self.harness_name = start.harness_name
+        self.last_conversation_id = str(start.conversation_id)
+
+        # Every settings read for this turn, in the gate and in the producer
+        # task created below (create_task copies this context), is served from
+        # the snapshot the unit loaded.
+        with use_turn_settings(self.scope, start.settings):
+            route, turn_llm = await self._route_request(
+                conversation_id=start.conversation_id,
+                harness_input=start.harness_input,
+                gate_rows=start.gate_rows,
+                has_attachments=bool(request.attachment_ids),
+                has_disabled_connections=bool(disabled),
+                trace_metadata=trace_metadata,
+            )
+            trace_metadata = {
+                **trace_metadata,
+                "response_route": route.route,
+                "response_route_reason": route.reason,
+                **({"response_router_provider": route.provider} if route.provider else {}),
+                **({"response_router_model": route.model} if route.model else {}),
+                **({"response_route_fallback": "true"} if route.fallback else {}),
+            }
+            logger.info(
+                "[responses] route=%s reason=%s fallback=%s provider=%s model=%s conversation=%s",
+                route.route, route.reason, route.fallback, route.provider, route.model,
+                start.conversation_id,
+            )
+
+            if route.route == DIRECT_CONTEXT:
+                return await self._handle_direct_response(
+                    request=request,
+                    conversation_id=start.conversation_id,
+                    turn_id=start.turn_id,
+                    original_content=original_content,
+                    route=route,
+                )
+
+            harness = self._get_harness()
+
+            if request.stream:
+                # Detached + resumable. The agent run executes in a background
+                # task that writes events to a per-turn buffer; this request just
+                # tails the buffer. Closing the connection never reaches the
+                # producer — only an explicit /cancel does.
+                #
+                # The user message is persisted (pending) as the producer's FIRST
+                # action, not here (ENG-1231). registry.start() refuses a second
+                # turn for a conversation before it builds this turn's buffer or
+                # producer, so persisting here, before that check, would commit a
+                # pending row whose producer never runs and never finalizes,
+                # stranding it out of LLM history. Persisting inside the producer
+                # ties the write to the one coroutine that actually runs, so there
+                # is at most one pending row per conversation.
+                #
+                # Created here, before the coroutine, and handed to BOTH: it is
+                # the only channel by which a turn delete can tell this producer
+                # that the history it is writing into no longer exists (the handle
+                # it will be registered under does not exist yet).
+                lifecycle = TurnLifecycle()
+
+                def produce(buffer: StreamBuffer):
+                    return self._select_producer(
+                        lifecycle=lifecycle,
+                        conv_id=start.conversation_id,
+                        harness_input=start.harness_input,
+                        original_content=original_content,
+                        model=request.model,
+                        reasoning_effort=request.reasoning_effort,
+                        disabled=disabled,
+                        harness_name=self.harness_name,
+                        harness_id=getattr(harness, "id", None),
+                        buffer=buffer,
+                        turn_id=start.turn_id,
+                        trace_tags=request.trace_tags,
+                        trace_metadata=trace_metadata,
+                        turn_llm=turn_llm,
+                    )
+
+                handle = await registry.start(
+                    conversation_id=str(start.conversation_id),
+                    turn_id=start.turn_id,
+                    open_buffer=partial(new_buffer, str(start.conversation_id), start.turn_id),
+                    produce=produce,
+                    org_id=self.scope.org_id,
+                    user_id=self.scope.user_id,
+                    lifecycle=lifecycle,
+                )
+                return sse_from_buffer(handle.buffer, 0)
+
+            # Non-streaming (legacy/rare): run synchronously within the request.
+            # There is nowhere to run it in org mode. Only the streaming branch
+            # above has a remote producer (_select_producer dispatches the turn to
+            # a worker); this branch drives the harness in this process, and
+            # AntonHarness.stream_response refuses in org mode because doing so
+            # would execute agent-written code here. Without this check that
+            # refusal surfaces as an unhandled RuntimeError from _collect and the
+            # client sees an opaque 500. 501 with a concrete instruction instead:
+            # this deployment really does not implement a non-streaming turn, which
+            # is a statement about what the server can do. The org-mode tenancy
+            # guards answer 403 because they refuse a caller rather than admit a
+            # missing capability. `stream` defaults to False in ResponsesRequest, so
+            # a client can land here by simply omitting the field.
+            if not in_process_agent_allowed():
+                raise HTTPException(
+                    status_code=501,
+                    detail=(
+                        "This deployment only serves streaming turns. "
+                        'Retry the request with "stream": true.'
+                    ),
+                )
+            # The user message is persisted by _collect after the turn (deferred),
+            # so the harness reads history WITHOUT the current turn — otherwise the
+            # fresh-query history would replay it AND resend it as the live input.
+            #
+            # The harness reads the conversation's project and history through
+            # the session the conversation is attached to, so it gets one for the
+            # length of the turn.
+            harness_session = ScopedSession(get_open_session(), self.scope)
+            try:
+                conversation = ConversationService(harness_session).get_conversation(start.conversation_id)
+                with use_settings_scope(self.scope):
+                    stream = harness.stream_response(
+                        conversation=conversation,
+                        input=start.harness_input,
+                        model=request.model,
+                        reasoning_effort=request.reasoning_effort,
+                        disabled_connections=disabled,
+                        trace_tags=request.trace_tags,
+                        trace_metadata=trace_metadata,
+                    )
+                    return await self._collect(stream, start.conversation_id, request.model, original_content)
+            finally:
+                harness_session.close()
+
+    def _read_turn_start(
+        self, session: ScopedSession, *, request: ResponsesRequest, has_disabled_connections: bool,
+    ) -> _TurnStart:
+        """The request's database work, run as one unit: the turn's settings,
+        its attachments, the conversation (read, adopted or created), the turn
+        number and the gate's history."""
+        # SettingService routes each key to its global, org or user row itself,
+        # so it reads through the raw session with the scope passed explicitly.
+        settings = SettingService(unsafe_unscoped_session(session), session.scope).load()
+        # A per-conversation harness pick (Coding Mode's composer pill)
+        # overrides the account default for THIS call only — mirrors the
+        # per-conversation model override. Ignored (not raised) when it
+        # doesn't name a currently-registered/available harness: a stale
+        # client cache (a harness removed since the picker last loaded)
+        # must never fail the turn, it just falls back to the
+        # account default.
+        harness_name = settings.harness
+        if request.harness and request.harness in available_harness_ids():
+            harness_name = request.harness
+
+        harness_input = self._build_harness_input(request, session=session)
+        conversation_service = ConversationService(session)
 
         if request.conversation:
             try:
@@ -385,9 +566,9 @@ class ResponsesHandler:
                     # under an id no conversation ever gets (ENG-264).
                     conversation = conversation_service.create_conversation(
                         topic=self._prompt_text(harness_input)[:80],
-                        project_id=self._resolve_project_id(request),
+                        project_id=self._resolve_project_id(request, session=session),
                         conversation_id=conv_id,
-                        harness=self.harness_name,
+                        harness=harness_name,
                         model=request.model,
                         reasoning_effort=request.reasoning_effort,
                     )
@@ -398,164 +579,79 @@ class ResponsesHandler:
                 # attachments uploaded against the client's id (ENG-264).
                 conversation = conversation_service.create_conversation(
                     topic=self._prompt_text(harness_input)[:80],
-                    project_id=self._resolve_project_id(request),
-                    harness=self.harness_name,
+                    project_id=self._resolve_project_id(request, session=session),
+                    harness=harness_name,
                     model=request.model,
                     reasoning_effort=request.reasoning_effort,
                 )
-                self._relink_attachments(request.conversation, conversation)
+                self._relink_attachments(request.conversation, conversation, session=session)
         else:
             conversation = conversation_service.create_conversation(
                 topic=self._prompt_text(harness_input)[:80],
-                project_id=self._resolve_project_id(request),
-                harness=self.harness_name,
+                project_id=self._resolve_project_id(request, session=session),
+                harness=harness_name,
                 model=request.model,
                 reasoning_effort=request.reasoning_effort,
             )
 
-        self.last_conversation_id = str(conversation.id)
-
-        # Pre-load messages before adding the new user message so the ORM
-        # cache (and thus the harness's initial_history) doesn't include the
-        # current turn's input — it's passed separately via `input`.
-        _ = conversation.messages
+        conversation_id = conversation.id
         # turn_id: prior message count. The current user message is NOT
         # persisted yet (deferred to the producer for the streaming path), so
         # this is a stable per-conversation index for the buffer file.
         turn_id = len(conversation.messages)
 
-        # Before the gate: it and the producer task both scrub history in this
-        # request's context, and nothing registered the vault's secrets yet.
-        await register_vault_secrets(self.scope)
-
-        disabled = (
-            [dc.model_dump() for dc in request.disabled_connections]
-            if request.disabled_connections else None
-        )
-        route, turn_llm = await self._route_request(
-            conversation_id=conversation.id,
-            harness_input=harness_input,
+        # Shape checks first: a turn the gate cannot route skips the history
+        # read, as _route_request skips the gate.
+        has_non_text_input = any(block.get("type") != "text" for block in harness_input)
+        gate_rows: list[Message] | None = []
+        if ineligible_reason(
+            has_non_text_input=has_non_text_input,
             has_attachments=bool(request.attachment_ids),
-            has_disabled_connections=bool(disabled),
-            trace_metadata=trace_metadata,
-        )
-        trace_metadata = {
-            **trace_metadata,
-            "response_route": route.route,
-            "response_route_reason": route.reason,
-            **({"response_router_provider": route.provider} if route.provider else {}),
-            **({"response_router_model": route.model} if route.model else {}),
-            **({"response_route_fallback": "true"} if route.fallback else {}),
-        }
-        logger.info(
-            "[responses] route=%s reason=%s fallback=%s provider=%s model=%s conversation=%s",
-            route.route, route.reason, route.fallback, route.provider, route.model, conversation.id,
+            has_disabled_connections=has_disabled_connections,
+        ) is None:
+            gate_rows = self._read_gate_rows(session, conversation_id=conversation_id)
+
+        return _TurnStart(
+            settings=settings,
+            harness_name=harness_name,
+            harness_input=harness_input,
+            conversation_id=conversation_id,
+            turn_id=turn_id,
+            gate_rows=gate_rows,
         )
 
-        if route.route == DIRECT_CONTEXT:
-            return await self._handle_direct_response(
-                request=request,
-                conversation_id=conversation.id,
-                turn_id=turn_id,
-                original_content=original_content,
-                route=route,
-            )
-
-        harness = self._get_harness()
-
-        if request.stream:
-            # Detached + resumable. The agent run executes in a background
-            # task that writes events to a per-turn buffer; this request just
-            # tails the buffer. Closing the connection never reaches the
-            # producer — only an explicit /cancel does.
-            #
-            # The user message is persisted (pending) as the producer's FIRST
-            # action, not here (ENG-1231). registry.start() dedups a duplicate
-            # start for an already-in-flight conversation and discards the second
-            # producer coroutine unawaited — persisting here (before that dedup)
-            # would commit a pending row whose producer never runs and never
-            # finalizes, stranding it out of LLM history. Persisting inside the
-            # producer ties the write to the one coroutine that actually runs, so
-            # there is at most one pending row per conversation.
-            buffer = new_buffer(str(conversation.id), turn_id)
-            # Created here, before the coroutine, and handed to BOTH: it is the
-            # only channel by which a turn delete can tell this producer that
-            # the history it is writing into no longer exists (the handle it
-            # will be registered under does not exist yet).
-            lifecycle = TurnLifecycle()
-            producer_coro = self._select_producer(
-                lifecycle=lifecycle,
-                conv_id=conversation.id,
-                harness_input=harness_input,
-                original_content=original_content,
-                model=request.model,
-                reasoning_effort=request.reasoning_effort,
-                disabled=disabled,
-                harness_name=self.harness_name,
-                harness_id=getattr(harness, "id", None),
-                buffer=buffer,
-                turn_id=turn_id,
-                trace_tags=request.trace_tags,
-                trace_metadata=trace_metadata,
-                turn_llm=turn_llm,
-            )
-            await registry.start(
-                conversation_id=str(conversation.id),
-                turn_id=turn_id,
-                buffer=buffer,
-                org_id=self.scoped.scope.org_id,
-                user_id=self.scoped.scope.user_id,
-                producer_coro=producer_coro,
-                lifecycle=lifecycle,
-            )
-            return sse_from_buffer(buffer, 0)
-
-        # Non-streaming (legacy/rare): run synchronously within the request.
-        # There is nowhere to run it in org mode. Only the streaming branch
-        # above has a remote producer (_select_producer dispatches the turn to
-        # a worker); this branch drives the harness in this process, and
-        # AntonHarness.stream_response refuses in org mode because doing so
-        # would execute agent-written code here. Without this check that
-        # refusal surfaces as an unhandled RuntimeError from _collect and the
-        # client sees an opaque 500. 501 with a concrete instruction instead:
-        # this deployment really does not implement a non-streaming turn, which
-        # is a statement about what the server can do. The org-mode tenancy
-        # guards answer 403 because they refuse a caller rather than admit a
-        # missing capability. `stream` defaults to False in ResponsesRequest, so
-        # a client can land here by simply omitting the field.
-        if not in_process_agent_allowed():
-            raise HTTPException(
-                status_code=501,
-                detail=(
-                    "This deployment only serves streaming turns. "
-                    'Retry the request with "stream": true.'
-                ),
-            )
-        # The user message is persisted by _collect after the turn (deferred),
-        # so the harness reads history WITHOUT the current turn — otherwise the
-        # fresh-query history would replay it AND resend it as the live input.
-        with use_settings_scope(self.scope):
-            stream = harness.stream_response(
-                conversation=conversation,
-                input=harness_input,
-                model=request.model,
-                reasoning_effort=request.reasoning_effort,
-                disabled_connections=disabled,
-                trace_tags=request.trace_tags,
-                trace_metadata=trace_metadata,
-            )
-            return await self._collect(stream, conversation.id, request.model, original_content)
+    @staticmethod
+    def _read_gate_rows(session: ScopedSession, *, conversation_id: UUID) -> list[Message] | None:
+        """The rows decide_route can use: user and assistant messages, at most
+        _MAX_HISTORY_MESSAGES, so scrubbing never pays for the whole
+        conversation. None when the read fails: routing failures send the turn
+        to the agent rather than failing it."""
+        try:
+            rows = ConversationService(session).get_ordered_messages(conversation_id)
+        except PoolTimeoutError:
+            raise
+        except Exception:
+            logger.exception("[responses] could not read the gate's history; delegating")
+            # The failed read left its transaction unusable. Rolling it back
+            # loses nothing: creating or relinking above committed already.
+            session.rollback()
+            return None
+        return [m for m in rows if m.role in {"user", "assistant"}][-_MAX_HISTORY_MESSAGES:]
 
     async def _route_request(
         self,
         *,
         conversation_id: UUID,
         harness_input: list[dict],
+        gate_rows: list[Message] | None,
         has_attachments: bool,
         has_disabled_connections: bool,
         trace_metadata: dict[str, str] | None = None,
     ) -> tuple[RouteDecision, dict | None]:
         """Run Cowork's narrow pre-Anton gate with only safe text context.
+
+        `gate_rows` is the history handle()'s first unit read for the gate
+        (see _TurnStart).
 
         The composer's per-conversation model pick (`request.model`) is
         deliberately not passed down: it drives Anton's turn, not the gate
@@ -564,7 +660,7 @@ class ResponsesHandler:
         Returns the decision plus pre-minted turn credentials
         (`{"correlation_id", "llm"}`) for a delegated remote turn to reuse."""
         has_non_text_input = any(block.get("type") != "text" for block in harness_input)
-        # Shape checks first: ineligible turns skip the history query.
+        # Shape checks first: ineligible turns were never given history.
         reason = ineligible_reason(
             has_non_text_input=has_non_text_input,
             has_attachments=has_attachments,
@@ -572,18 +668,18 @@ class ResponsesHandler:
         )
         if reason:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
+        if gate_rows is None:
+            # The history read failed. Like any other gate failure, the turn
+            # goes to the agent rather than failing.
+            return RouteDecision(
+                route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
+            ), None
         try:
             # Scrub credentials: this history bypasses the normal turn's
             # _scrub_user_input/_stamp_message pass. Its DS_* values were
-            # registered by handle(), not _build_chat_session. Bounded to the rows
-            # decide_route can actually use (_text_history keeps at most
-            # _MAX_HISTORY_MESSAGES) so scrubbing doesn't pay for the whole
-            # conversation on every gated turn.
-            ordered = [
-                m for m in ConversationService(self.scoped).get_ordered_messages(conversation_id)
-                if m.role in {"user", "assistant"}
-            ][-_MAX_HISTORY_MESSAGES:]
-            history = [scrubbed_openai_dump(m) for m in ordered]
+            # registered by handle(), not _build_chat_session. Scrubbed here on
+            # the loop, after that registration, never inside the unit.
+            history = [scrubbed_openai_dump(m) for m in gate_rows]
             history.append({
                 "role": "user",
                 "content": scrub_credentials(self._prompt_text(harness_input)),
@@ -661,6 +757,10 @@ class ResponsesHandler:
             return decision, turn_llm
         except (ProductPermissionDenied, ProductPermissionUnavailable):
             raise
+        except PoolTimeoutError:
+            # No database connection freed in time. The agent would meet the
+            # same full pool, so the request is refused (503), not delegated.
+            raise
         except Exception:
             # Non-authorization routing failures may delegate to the agent.
             logger.exception("[responses] routing gate failed — delegating")
@@ -683,8 +783,8 @@ class ResponsesHandler:
 
         corr = str(uuid4())
         block = await _mint_llm_block(
-            org_id=self.scoped.scope.org_id,
-            user_id=self.scoped.scope.user_id,
+            org_id=self.scope.org_id,
+            user_id=self.scope.user_id,
             correlation_id=corr,
             settings=TurnQueueSettings(),
             workspace_id=getattr(settings, "hub_workspace_id", "") or None,
@@ -713,56 +813,59 @@ class ResponsesHandler:
         """Return the router model's direct answer without initializing Anton."""
         if not request.stream:
             text = route.text
-            user_message = ConversationService(self.scoped).save_user_message(
-                conversation_id, original_content,
-            )
             events = [{
                 "type": "response.output_text.delta",
                 "delta": text,
                 "response_route": route.route,
                 "response_route_reason": route.reason,
             }, {"type": "response.completed"}]
-            assistant_message = ConversationService(self.scoped).save_assistant_turn(
-                conversation_id, text, events, harness="cowork-direct",
-            )
+
+            def save_turn(session: ScopedSession) -> UUID:
+                service = ConversationService(session)
+                user_message = service.save_user_message(conversation_id, original_content)
+                assistant_message = service.save_assistant_turn(
+                    conversation_id, text, events, harness="cowork-direct",
+                )
+                return _turn_anchor_id(user_message, assistant_message)
+
+            async with conversation_writes(conversation_id):
+                anchor_id = await run_db(save_turn, scope=self.scope)
             return Response(
                 status=ResponseStatus.completed,
                 model=route.model,
-                output=[self._build_output(str(_turn_anchor_id(user_message, assistant_message)), text)],
+                output=[self._build_output(str(anchor_id), text)],
             )
 
         # turn_id comes from handle(): same numbering as the delegated path.
-        buffer = new_buffer(str(conversation_id), turn_id)
         lifecycle = TurnLifecycle()
         handle = await registry.start(
             conversation_id=str(conversation_id),
             turn_id=turn_id,
-            buffer=buffer,
-            org_id=self.scoped.scope.org_id,
-            user_id=self.scoped.scope.user_id,
-            producer_coro=self._produce_direct(
+            open_buffer=partial(new_buffer, str(conversation_id), turn_id),
+            produce=lambda buffer: self._produce_direct(
                 lifecycle=lifecycle,
                 conv_id=conversation_id,
                 original_content=original_content,
                 route=route,
                 buffer=buffer,
             ),
+            org_id=self.scope.org_id,
+            user_id=self.scope.user_id,
             lifecycle=lifecycle,
         )
         # A direct answer still uses the shared Redis buffer in a multi-replica
         # deployment. Register it just like a delegated turn so another replica
-        # can locate and replay that buffer. Do this only when start accepted our
-        # buffer: a duplicate send returns the existing handle and must not
-        # overwrite its index entry with the discarded turn.
-        if get_backend() == "redis" and handle.buffer is buffer:
+        # can locate and replay that buffer. start() refuses a duplicate send,
+        # so the handle is always this turn's own.
+        if get_backend() == "redis":
             await record_turn(
                 str(conversation_id),
                 turn_id=turn_id,
                 correlation_id=f"direct-{uuid4()}",
-                org_id=self.scoped.scope.org_id,
-                user_id=self.scoped.scope.user_id,
+                org_id=self.scope.org_id,
+                user_id=self.scope.user_id,
             )
-        return sse_from_buffer(buffer, 0)
+        return sse_from_buffer(handle.buffer, 0)
 
     async def _produce_direct(
         self,
@@ -839,9 +942,24 @@ class ResponsesHandler:
                 logger.info("[responses] discarded direct turn %s — not persisting", conv_id)
                 return
             await buffer.close("cancelled")
-        except Exception:
-            logger.exception("[responses] direct turn failed for conversation %s", conv_id)
-            await buffer.append("sse", {"sse": response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)})
+        except Exception as exc:
+            friendly = friendly_turn_error(exc)
+            if friendly is not None and friendly[0] == SERVER_BUSY_CODE:
+                # No database connection freed in time to save the answer. Say
+                # so with the wait, as a refused request's 503 does.
+                code, message = friendly
+                logger.warning(
+                    "[responses] direct turn for conversation %s found no free database connection",
+                    conv_id,
+                )
+                retry_after = busy_retry_seconds()
+                frame = response_failed_sse(
+                    message, code, retry_after=retry_after, retry_at=retry_at_instant(retry_after),
+                )
+            else:
+                logger.exception("[responses] direct turn failed for conversation %s", conv_id)
+                frame = response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE)
+            await buffer.append("sse", {"sse": frame})
             await buffer.close("error")
         finally:
             await _seal_unterminated_buffer(buffer, lifecycle, conv_id)
@@ -1365,13 +1483,13 @@ class ResponsesHandler:
             try:
                 async for kind, data in stream_remote_replies(
                     conversation_id=str(conv_id),
-                    org_id=self.scoped.scope.org_id,
-                    user_id=self.scoped.scope.user_id,
+                    org_id=self.scope.org_id,
+                    user_id=self.scope.user_id,
                     input_text=input_text,
                     model=model,
                     turn_id=turn_id,
-                    # Producer session, NOT self.scoped: this coroutine is detached
-                    # and the request session may be closed by the time it runs.
+                    # Read on the producer session: this coroutine is detached
+                    # from the request that started it.
                     history=seeded_history,
                     # Global memory and skills use read-only mounts. Project
                     # memory is outside the conversation workspace and therefore
@@ -1932,6 +2050,11 @@ class ResponsesHandler:
                         "[responses] could not resolve the retry hint",
                         extra={"request_id": corr},
                     )
+            elif code == SERVER_BUSY_CODE:
+                # No database connection freed in time. The same time-gated
+                # Retry as rate_limited, with the pool's wait as the interval.
+                retry_after = busy_retry_seconds()
+                extra = {"retry_after": retry_after, "retry_at": retry_at_instant(retry_after)}
             elif code == PROVIDER_OVERLOADED_CODE:
                 # Transient-incident timeout (ENG-673): give the card the failing
                 # model AND the active provider, and flag whether the user is
@@ -2095,6 +2218,10 @@ class ResponsesHandler:
         try:
             async for _ in self._get_harness().formatter(stream, model, event_sink):
                 pass
+        except PoolTimeoutError:
+            # No database connection freed in time: the app answers 503 with
+            # the wait, not a turn failure.
+            raise
         except Exception as exc:
             # Mirror the streaming path: a recognised failure (e.g. an
             # unsupported image) surfaces its curated message with a 400;
@@ -2115,7 +2242,10 @@ class ResponsesHandler:
                     # rationale — repair the conversation's stored history
                     # once here rather than special-case every future replay.
                     try:
-                        repaired = ConversationService(self.scoped).repair_image_content(conversation_id)
+                        repaired = await run_db(
+                            lambda session: ConversationService(session).repair_image_content(conversation_id),
+                            scope=self.scope,
+                        )
                         logger.warning(
                             "[responses] content validation error on conversation %s — "
                             "repaired %d message(s) with image content: %s",
@@ -2147,43 +2277,44 @@ class ResponsesHandler:
             )
 
         assistant_text = "".join(collected_text)
+        harness_id = getattr(self._get_harness(), "id", None)
+
         # Persist the user message now — after the harness has read history for
         # this turn — so it isn't replayed into the turn as duplicate context.
-        user_message = ConversationService(self.scoped).save_user_message(
-            conversation_id, original_content, created_at=sent_at,
-        )
-        assistant_message = self._save_assistant_turn(
-            conversation_id, assistant_text, collected_events, turn_rows
-        )
+        def save_turn(session: ScopedSession) -> UUID:
+            service = ConversationService(session)
+            user_message = service.save_user_message(
+                conversation_id, original_content, created_at=sent_at,
+            )
+            assistant_message = service.save_assistant_turn(
+                conversation_id, assistant_text, collected_events,
+                harness=harness_id, tool_rows=turn_rows,
+            )
+            return _turn_anchor_id(user_message, assistant_message)
+
+        async with conversation_writes(conversation_id):
+            anchor_id = await run_db(save_turn, scope=self.scope)
 
         return Response(
             status=ResponseStatus.completed,
             model=model,
-            output=[self._build_output(str(_turn_anchor_id(user_message, assistant_message)), assistant_text)],
+            output=[self._build_output(str(anchor_id), assistant_text)],
         )
 
-    def _save_assistant_turn(
-        self,
-        conversation_id: UUID,
-        text: str,
-        events: list[dict],
-        tool_rows: list[dict] | None = None,
-    ) -> Message | None:
-        harness_id = getattr(self._get_harness(), 'id', None)
-        return ConversationService(self.scoped).save_assistant_turn(
-            conversation_id, text, events, harness=harness_id, tool_rows=tool_rows,
-        )
-
-    def _build_harness_input(self, request: ResponsesRequest) -> list[dict]:
+    def _build_harness_input(self, request: ResponsesRequest, *, session: ScopedSession) -> list[dict]:
         blocks: list[dict] = []
 
         # Resolve attachment_ids to image/file blocks
         if request.attachment_ids:
-            file_svc = FileService(self.scoped)
+            file_svc = FileService(session)
             for aid in request.attachment_ids:
                 try:
                     content_type, filename, filepath = file_svc.get_file_content(UUID(aid))
-                except (ValueError, Exception):
+                except PoolTimeoutError:
+                    # A full pool is not a missing attachment: dropping it would
+                    # run the turn without the file the user sent.
+                    raise
+                except Exception:
                     continue
                 if content_type and content_type.startswith("image/"):
                     blocks.append(self._image_block(filepath, content_type))
@@ -2205,7 +2336,7 @@ class ResponsesHandler:
                                     blocks.append({"type": "text", "text": item.text})
                                 elif item.type == ContentType.file and item.file_id:
                                     try:
-                                        content_type, filename, filepath = FileService(self.scoped).get_file_content(UUID(item.file_id))
+                                        content_type, filename, filepath = FileService(session).get_file_content(UUID(item.file_id))
                                     except ValueError:
                                         raise HTTPException(status_code=404, detail=f"File {item.file_id!r} not found")
                                     if content_type and content_type.startswith("image/"):
@@ -2216,13 +2347,15 @@ class ResponsesHandler:
 
         return blocks or [{"type": "text", "text": ""}]
 
-    def _relink_attachments(self, client_session_id: str, conversation) -> None:
+    def _relink_attachments(
+        self, client_session_id: str, conversation, *, session: ScopedSession,
+    ) -> None:
         """Repoint attachments uploaded against a client-side session id to
         the conversation that actually got created, so the Task Uploads
         rail (which queries by the live conversation id) still finds them."""
         from cowork.services.files import attachment_purpose
 
-        moved = FileService(self.scoped).relink_purpose(
+        moved = FileService(session).relink_purpose(
             attachment_purpose(client_session_id),
             attachment_purpose(str(conversation.id)),
         )
@@ -2232,7 +2365,7 @@ class ResponsesHandler:
                 moved, client_session_id, conversation.id,
             )
 
-    def _resolve_project_id(self, request: ResponsesRequest) -> UUID:
+    def _resolve_project_id(self, request: ResponsesRequest, *, session: ScopedSession) -> UUID:
         """Project for a conversation being CREATED this turn.
 
         Only called on the creation paths: an existing conversation already
@@ -2240,7 +2373,7 @@ class ResponsesHandler:
         name it echoes can be stale after a project rename — resolving it
         eagerly used to 404 every later turn of the task (ENG-1028).
         """
-        service = ProjectService(self.scoped)
+        service = ProjectService(session)
         if request.project_id is not None:
             return request.project_id
         if request.project:

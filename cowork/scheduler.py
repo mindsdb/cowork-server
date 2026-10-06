@@ -243,15 +243,10 @@ async def execute_schedule(
             },
         )
         async def _drain_run() -> None:
-            # ResponsesHandler takes a RAW session (it wraps its own scope from
-            # the principal); hand it the underlying session, not our scoped one.
             # The schedule-derived principal is what lets the turn (and the
             # remote backend's per-tenant key mint) run in org mode with no
-            # request in flight.
-            from cowork.db.scoped import unsafe_unscoped_session
-            stream = await ResponsesHandler(
-                unsafe_unscoped_session(session), principal=principal, interactive=False
-            ).handle(request)
+            # request in flight. The handler opens its own short sessions.
+            stream = await ResponsesHandler(principal=principal, interactive=False).handle(request)
             async for _ in stream:
                 pass
 

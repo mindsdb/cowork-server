@@ -108,13 +108,13 @@ async def _start_blocked_turn(monkeypatch, saved, buffer):
     asked = asyncio.Event()
     handler = _blocked_handler(monkeypatch, saved, asked)
     lifecycle = TurnLifecycle()
-    coro = handler._run_turn(
-        conv_id=uuid4(), harness_input=[], original_content="hi", model="anton",
-        disabled=None, harness_name="anton", harness_id="anton", buffer=buffer,
-        lifecycle=lifecycle,
-    )
     handle = await registry.start(
-        conversation_id=CID, turn_id=0, buffer=buffer, producer_coro=coro,
+        conversation_id=CID, turn_id=0, open_buffer=lambda: buffer,
+        produce=lambda buffer: handler._run_turn(
+            conv_id=uuid4(), harness_input=[], original_content="hi", model="anton",
+            disabled=None, harness_name="anton", harness_id="anton", buffer=buffer,
+            lifecycle=lifecycle,
+        ),
         lifecycle=lifecycle,
     )
     await asyncio.wait_for(asked.wait(), timeout=5)

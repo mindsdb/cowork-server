@@ -218,7 +218,7 @@ def test_execute_schedule_stamps_trace_identity(monkeypatch):
     captured: list = []
 
     class FakeHandler:
-        def __init__(self, session, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True):
             pass
 
         async def handle(self, request):
@@ -296,7 +296,7 @@ def test_execute_schedule_resolves_default_sentinel_to_none(monkeypatch):
     captured: list = []
 
     class FakeHandler:
-        def __init__(self, session, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True):
             pass
 
         async def handle(self, request):
@@ -347,7 +347,7 @@ def test_execute_schedule_passes_pinned_model_through(monkeypatch):
     captured: list = []
 
     class FakeHandler:
-        def __init__(self, session, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True):
             pass
 
         async def handle(self, request):
@@ -410,7 +410,7 @@ def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch, grante
     captured: dict = {}
 
     class FakeHandler:
-        def __init__(self, session, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True):
             captured["principal"] = principal
             captured["interactive"] = interactive
 
@@ -606,8 +606,8 @@ def test_turn_terminal_reason_with_real_registry_cancel(tmp_path):
         handle = await registry.start(
             conversation_id=conversation_id,
             turn_id=0,
-            buffer=buf,
-            producer_coro=producer(),
+            open_buffer=lambda: buf,
+            produce=lambda _buffer: producer(),
         )
         await started.wait()
         await registry.cancel(conversation_id)
@@ -641,7 +641,7 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
     from cowork.services.schedules import ScheduleService
 
     class FakeHandler:
-        def __init__(self, session, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True):
             pass
 
         async def handle(self, request):
@@ -756,7 +756,7 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
     seen: dict = {}
 
     class FakeHandler:
-        def __init__(self, session, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True):
             pass
 
         async def handle(self, request):
@@ -835,7 +835,7 @@ def test_execute_schedule_derives_service_principal_in_org_mode(monkeypatch, gra
     seen: dict = {}
 
     class FakeHandler:
-        def __init__(self, session, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True):
             seen["principal"] = principal
 
         async def handle(self, request):
