@@ -733,10 +733,11 @@ class WorkspaceManager:
         with self._mutation_lock:
             if kind == WorkspaceKind.local_copy:
                 try:
-                    self.local_copies.cleanup(session_id, Path(workspace_path))
+                    self.local_copies.cleanup(
+                        session_id, Path(workspace_path), before_remove=self._remove_inner_worktrees,
+                    )
                 except LocalCopyError as exc:
                     raise WorkspaceError(str(exc)) from exc
-                self._prune_inner_worktrees(Path(source_path))
                 return
             if kind != WorkspaceKind.git_worktree:
                 return
@@ -779,12 +780,11 @@ class WorkspaceManager:
         with self._mutation_lock:
             if kind == WorkspaceKind.local_copy:
                 try:
-                    released = self.local_copies.release(key, Path(workspace_path))
+                    return self.local_copies.release(
+                        key, Path(workspace_path), before_remove=self._remove_inner_worktrees,
+                    )
                 except LocalCopyError as exc:
                     raise WorkspaceError(str(exc)) from exc
-                if released:
-                    self._prune_inner_worktrees(Path(source_path))
-                return released
             if kind != WorkspaceKind.git_worktree:
                 return False
             actual = self._managed_worktree(key, workspace_path)
@@ -1176,19 +1176,46 @@ class WorkspaceManager:
                 link.unlink()
 
     def _discard_repository_folder(self, source: Path, workspace: Path, baseline: Path) -> None:
+        if workspace.exists():
+            self._remove_inner_worktrees(workspace)
         _force_remove(workspace)
         _force_remove(baseline)
-        self._prune_inner_worktrees(source)
 
-    def _prune_inner_worktrees(self, source: Path) -> None:
-        """Forget worktrees of inner repositories whose task copy was removed."""
-        if not source.is_dir():
-            return
-        for repository in self._inner_repositories(source):
+    def _remove_inner_worktrees(self, workspace: Path) -> None:
+        """Unregister the worktrees checked out inside a task copy before it is deleted.
+
+        Only this copy's own worktrees are removed, so other worktrees in the
+        user's repositories, including stale ones, are left as they are.
+        """
+        for link in self._worktree_links(workspace):
+            checkout = link.parent
             try:
-                self.git.run(repository, "worktree", "prune", check=False)
-            except WorkspaceError:
-                return
+                common = self.git.run(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+                repository = Path(common).parent
+                self.git.run(repository, "worktree", "remove", "--force", str(checkout), check=False)
+            except WorkspaceError as exc:
+                logger.info("Could not unregister the task worktree %s: %s", checkout, exc)
+
+    @staticmethod
+    def _worktree_links(workspace: Path) -> list[Path]:
+        """``.git`` files marking the worktree checkouts inside a task copy."""
+        links: list[Path] = []
+        pending = [(workspace, 0)]
+        while pending:
+            directory, depth = pending.pop()
+            try:
+                entries = list(os.scandir(directory))
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.name in _DEPENDENCY_DIRS or entry.name == ".git" or not entry.is_dir(follow_symlinks=False):
+                    continue
+                link = Path(entry.path) / ".git"
+                if link.is_file():
+                    links.append(link)
+                elif depth + 1 < _REPOSITORY_SEARCH_DEPTH:
+                    pending.append((Path(entry.path), depth + 1))
+        return links
 
     @staticmethod
     def _resolve_existing(raw_path: str) -> Path | None:
