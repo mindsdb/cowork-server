@@ -222,3 +222,30 @@ def anton_responses_ready(monkeypatch):
         )
 
     return _set
+
+
+@pytest.fixture
+def one_connection_pool(monkeypatch):
+    """Point the app at a pool of one connection, and make POOL_TIMEOUT 2 s.
+
+    The test database is a SQLite file, so SQLAlchemy gives it a QueuePool with
+    the same wait-then-TimeoutError checkout Postgres gets. SQLite engines are
+    built with no pool settings (cowork.db.session), hence the engine built
+    here. POOL_TIMEOUT is set to the engine's own wait, so the refusal's
+    sentence, its Retry-After and the unit-slot wait all match it.
+    """
+    from sqlalchemy import create_engine
+
+    import cowork.db.session as db_session
+
+    uri = db_session.settings.database.uri
+    engine = create_engine(
+        uri, connect_args={"check_same_thread": False},
+        pool_size=1, max_overflow=0, pool_timeout=2,
+    )
+    monkeypatch.setitem(db_session._engines, uri, engine)
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", 2)
+    yield engine
+    # The cached sessionmaker would keep the disposed engine alive.
+    db_session._session_factories.pop(id(engine), None)
+    engine.dispose()

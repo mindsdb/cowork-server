@@ -1,6 +1,7 @@
 """Database connection and session management using SQLAlchemy"""
 
 from sqlalchemy import create_engine
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlmodel import Session as SQLModelSession
 
@@ -16,8 +17,11 @@ _session_factories = {}
 
 
 
-def _is_client_error(exc: BaseException) -> bool:
-    """True for HTTP exceptions answered as 4xx; those are expected outcomes."""
+def _is_expected_refusal(exc: BaseException) -> bool:
+    """True for an answer the request was meant to get: a 4xx, or the 503 for a
+    pool that freed no connection in time (cowork.server answers it)."""
+    if isinstance(exc, PoolTimeoutError):
+        return True
     status = getattr(exc, "status_code", None)
     return isinstance(status, int) and 400 <= status < 500
 
@@ -109,10 +113,11 @@ def get_session(db_uri: str = settings.database.uri):
         yield db
     except Exception as e:
         # A 4xx HTTPException is the endpoint's intended answer (a 409 for a
-        # steer during an approval, a 404 for a missing task); it still rolls
-        # the transaction back, but it is not an error worth a traceback.
-        if _is_client_error(e):
-            logger.debug(f"Session rolled back after a client error: {e}")
+        # steer during an approval, a 404 for a missing task), and so is the
+        # 503 for a full pool. Each still rolls the transaction back, but none
+        # is an error worth a traceback.
+        if _is_expected_refusal(e):
+            logger.debug(f"Session rolled back after an expected refusal: {e}")
         else:
             logger.exception(f"❌ Session error: {str(e)}")
         db.rollback()

@@ -21,8 +21,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 from cowork.streaming.buffer import StreamBuffer
 
@@ -68,13 +69,28 @@ _IDLE_POLL_SECONDS = 15
 TURN_SHUTDOWN_GRACE_SECONDS = 5
 
 
+class TurnInProgress(Exception):
+    """A conversation already has a turn answering, so a new question is refused.
+
+    The app answers it with 409 (cowork.server). ``status_code`` marks it as
+    an expected refusal for code that logs by status (cowork.db.session).
+    """
+
+    status_code = 409
+
+    def __init__(self, *, conversation_id: str, turn_id: int) -> None:
+        super().__init__(f"conversation {conversation_id} is still answering turn {turn_id}")
+        self.conversation_id = conversation_id
+        self.turn_id = turn_id
+
+
 @dataclass
 class TurnLifecycle:
     """One bit of shared state between a producer coroutine and its handle.
 
-    Exists because of an ordering problem: ``registry.start()`` is handed an
-    already-constructed producer coroutine, so the coroutine cannot reach the
-    ``RunHandle`` that will own it. The caller creates one of these, passes it
+    Exists because of an ordering problem: ``registry.start()`` builds the
+    producer coroutine before the ``RunHandle`` that will own it exists, so the
+    coroutine cannot reach its handle. The caller creates one of these, passes it
     into the producer AND into ``start()``, and both sides then look at the
     same object — no registry lookup, which would be ambiguous (a discarded
     handle and a handle replaced by the next turn are both "not the one I
@@ -123,6 +139,16 @@ class RunHandle:
     @property
     def is_running(self) -> bool:
         return not self.task.done()
+
+    @property
+    def is_answering(self) -> bool:
+        """Whether the turn can still write to its stream.
+
+        A producer that already wrote its terminal record is only finishing its
+        cleanup. The web UI sends a queued question the moment the stream
+        ends, so that turn must not refuse it.
+        """
+        return self.is_running and not self.buffer.is_closed
 
     async def cancel(self) -> bool:
         """Request cancellation of the producer task. Returns True if a
@@ -176,27 +202,36 @@ class RunRegistry:
         *,
         conversation_id: str,
         turn_id: int,
-        buffer: StreamBuffer,
-        producer_coro,
+        open_buffer: Callable[[], StreamBuffer],
+        produce: Callable[[StreamBuffer], Coroutine[Any, Any, None]],
         org_id: str | None = None,
         user_id: str | None = None,
         lifecycle: TurnLifecycle | None = None,
     ) -> RunHandle:
-        """Spawn the producer as a detached task and register it. A
-        duplicate start for an already-in-flight conversation returns the
-        existing handle (the renderer's queue should prevent dupes)."""
+        """Open the turn's buffer, spawn ``produce(buffer)`` as a detached task
+        and register it.
+
+        Raises TurnInProgress when the conversation already has a turn
+        answering. The check runs under the lock and before ``open_buffer``:
+        a buffer is named by conversation and turn number, and two requests
+        that read the history at the same moment compute the same turn number,
+        so opening one for a refused request would write into the running
+        turn's file or stream. A refused start creates no buffer and no
+        producer coroutine.
+        """
         loop = asyncio.get_running_loop()
         async with self._lock:
             existing = self._by_cid.get(conversation_id)
-            if existing is not None and existing.is_running:
+            if existing is not None and existing.is_answering:
                 logger.info(
-                    "Duplicate turn start for conversation %s; returning existing handle (turn %d).",
+                    "Refused a second turn for conversation %s; turn %d is still answering.",
                     conversation_id, existing.turn_id,
                 )
-                return existing
+                raise TurnInProgress(conversation_id=conversation_id, turn_id=existing.turn_id)
+            buffer = open_buffer()
             lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
             task = asyncio.create_task(
-                self._run_bounded(producer_coro, buffer, conversation_id, turn_id, lifecycle),
+                self._run_bounded(produce(buffer), buffer, conversation_id, turn_id, lifecycle),
                 name=f"turn[{conversation_id}/{turn_id}]",
             )
             handle = RunHandle(

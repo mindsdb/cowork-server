@@ -325,20 +325,28 @@ class DatabaseSettings(Settings):
         description="The database connection URI",
     )  # DATABASE_URI
 
-    # Connection pool configurations
+    # Connection pool configurations. These read their bare names: a
+    # DATABASE_ prefix is not honored for them. SQLite engines take none of
+    # them and keep SQLAlchemy's own pool (5 plus 10, a 30 s wait).
     max_overflow: int = Field(
         default=20, description="The maximum overflow size of the database connection pool"
-    )  # DATABASE_MAX_OVERFLOW
-    pool_pre_ping: bool = Field(default=True, description="Whether to enable pool pre-ping")  # DATABASE_POOL_PRE_PING
-    pool_recycle: int = Field(default=300, description="The pool recycle time in seconds")  # DATABASE_POOL_RECYCLE
-    pool_size: int = Field(default=20, description="The size of the database connection pool")  # DATABASE_POOL_SIZE
-    pool_timeout: int = Field(default=300, description="The pool timeout in seconds")  # DATABASE_POOL_TIMEOUT
+    )  # MAX_OVERFLOW
+    pool_pre_ping: bool = Field(default=True, description="Whether to enable pool pre-ping")  # POOL_PRE_PING
+    pool_recycle: int = Field(default=300, description="The pool recycle time in seconds")  # POOL_RECYCLE
+    pool_size: int = Field(default=20, description="The size of the database connection pool")  # POOL_SIZE
+    pool_timeout: int = Field(
+        default=5,
+        description=(
+            "Seconds a request waits for a pooled connection before it is refused "
+            "with 503. Short, so a full pool answers within seconds."
+        ),
+    )  # POOL_TIMEOUT
 
     # Query timeout configurations
-    query_timeout: int = Field(default=300, description="The query timeout in seconds")  # DATABASE_QUERY_TIMEOUT
+    query_timeout: int = Field(default=300, description="The query timeout in seconds")  # QUERY_TIMEOUT
     statement_timeout: int = Field(
         default=300000, description="The statement timeout in milliseconds"
-    )  # DATABASE_STATEMENT_TIMEOUT
+    )  # STATEMENT_TIMEOUT
 
 
 class ProjectSettings(Settings):
@@ -914,7 +922,7 @@ class AppSettings(Settings):
         description="Default for the per-user 'Max Tokens per Task' agent budget.",
     )  # COWORK_DEFAULT_MAX_TURN_TOKENS
 
-    database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_*
+    database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_URI; the other fields read their bare names
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*
     file: FileSettings = Field(default_factory=FileSettings)  # FILE_*
     storage: StorageSettings = Field(default_factory=StorageSettings)  # STORAGE_*

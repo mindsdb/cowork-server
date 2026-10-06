@@ -455,6 +455,36 @@ async def test_produce_pending_persist_failure_does_not_clear_all_pending():
         conv_svc.return_value.finalize_pending.assert_not_called()
 
 
+def test_a_full_pool_maps_to_server_busy():
+    """A pool that freed no connection in time is not a provider failure: it
+    gets its own code and a sentence that names the wait."""
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+    from cowork.db.units import DatabaseBusy
+
+    busy = (te.SERVER_BUSY_CODE, "Cowork is busy. Try again in about 5 seconds.")
+    assert te.friendly_turn_error(PoolTimeoutError("QueuePool limit of size 20 overflow 20 reached")) == busy
+    assert te.friendly_turn_error(DatabaseBusy("no database unit slot freed within POOL_TIMEOUT")) == busy
+
+
+async def test_stream_fails_a_turn_that_finds_the_pool_full_with_a_timed_retry():
+    """Inside a stream a full pool is one response.failed frame, carrying the
+    wait the way rate_limited does, so a card can gate its Retry on it."""
+    from cowork.db.units import DatabaseBusy
+
+    frames = await _collect_produce_sse(
+        _handler_with_raising_formatter(DatabaseBusy("no database connection freed within POOL_TIMEOUT"))
+    )
+
+    failed = [f for f in frames if "response.failed" in f]
+    assert len(failed) == 1
+    payload = json.loads(failed[0].split("data: ", 1)[1].strip())
+    assert payload["code"] == te.SERVER_BUSY_CODE
+    assert payload["error"] == "Cowork is busy. Try again in about 5 seconds."
+    assert payload["retry_after"] == 5
+    assert payload["retry_at"].endswith("Z")
+
+
 async def test_stream_redacts_generic_error():
     frames = await _collect_produce_sse(
         _handler_with_raising_formatter(Exception("psycopg2: password authentication failed for user 'admin'"))
@@ -629,11 +659,13 @@ def test_stream_does_not_repair_conversation_for_unrelated_errors():
 
 @pytest.mark.parametrize("make_exc", _REPAIR_FAMILIES)
 def test_collect_repairs_conversation_on_content_validation_error(make_exc):
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
+
+    from cowork.db.scoped import LOCAL_SCOPE
 
     exc = make_exc()
     handler = _handler_with_raising_formatter(exc)
-    handler.scoped = MagicMock()  # __init__ bypassed; _collect's repair path needs this
+    handler.scope = LOCAL_SCOPE  # __init__ bypassed; _collect's repair unit needs this
     conv_id = uuid4()
 
     with patch("cowork.handlers.responses.ConversationService") as conv_svc:
@@ -2230,6 +2262,11 @@ def test_wire_code_inventory_matches_the_renderer_contract():
         # another model is a way forward. The renderer branch lands in
         # mindsdb/cowork's ChatView.jsx + its turnFailureCards list.
         "model_restricted",
+        # No database connection freed within the pool timeout. A renderer
+        # without a branch for it shows the frame's `error` in its generic
+        # alert, and that sentence already names the wait, so the next step
+        # survives until the card lands in mindsdb/cowork's ChatView.jsx.
+        "server_busy",
         "anton_error",
     }
 

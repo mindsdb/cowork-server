@@ -15,6 +15,8 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal
 
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.services.providers import build_llm_client
 
@@ -506,6 +508,9 @@ async def decide_route(
     per-turn key); when None the binding comes from stored settings.
     Gate/provider failures intentionally fail open to Anton.  This boundary must
     never make a chat turn unavailable because the optional fast path is down.
+    A database pool that freed no connection in time is not a gate failure: it
+    propagates, and the request is refused rather than delegated into the same
+    wait.
     """
     reason = ineligible_reason(
         has_non_text_input=has_non_text_input,
@@ -560,6 +565,8 @@ async def decide_route(
             model=binding.model,
             text=text,
         )
+    except PoolTimeoutError:
+        raise
     except Exception as exc:
         # The failure is named in the log by class, HTTP status and the
         # provider error's type, code and param. Never its message: provider

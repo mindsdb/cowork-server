@@ -277,6 +277,10 @@ A **harness** adapts an external agent library (Anton today) to the cowork-serve
 
 Agent responses stream to clients via **Server-Sent Events** (SSE) on `POST /responses/`. The server tracks in-flight streams and supports cancellation (`/responses/cancel`) and late-join tailing (`/responses/tail`).
 
+`POST /responses/` reads what it needs (the turn's settings, its attachments, the conversation and the routing gate's history) as one short database unit in a worker thread (`run_db` in `cowork/db/units.py`). The request holds no pooled connection while the gate or the stream runs, and a wait for one never stalls the event loop. When no connection frees within `POOL_TIMEOUT` (5 s by default), the request is refused with `503`, a `Retry-After` header and `{"detail": "Cowork is busy. Try again in about 5 seconds.", "code": "server_busy"}`. An answer produced in this process that meets the same wait after its stream started ends with one `response.failed` frame with code `server_busy` and the `retry_after` and `retry_at` fields `rate_limited` carries.
+
+A question sent into a conversation whose turn is still answering is refused with `409` and `{"detail": "Another question is still being answered in this conversation. Wait for it to finish, then send yours again.", "code": "turn_in_progress"}`. It is refused before anything reads or saves it, and the running answer goes on. A turn whose stream has already ended counts as finished, so a question queued behind it is accepted. The check runs before any database read, and `RunRegistry.start` repeats it under its lock before it opens the new turn's buffer, so two questions racing through the gate never share one.
+
 A turn that fails ends with one `response.failed` frame carrying a stable `code` and the user-facing `error` (`cowork/handlers/turn_errors.py`), and the conversation's saved events keep the same payload, so a reload shows the same card. For `included_allowance_exhausted` and `free_serving_paused` the frame also carries `reset_at`, the instant the free way forward comes back. An in-process turn passes the gate's `X-MindsHub-Reset-At` header through as sent. A hosted turn takes it from the anton worker's `turn_failed` reply, which scratchpad-controller forwards beside `error`. The producer keeps it only for those two codes and only when it parses as an ISO-8601 instant with a UTC offset. An older worker sends none, and its frame has no `reset_at`.
 
 A background **scheduler** loop polls the database every 30 seconds for due schedules, supporting `once`, `hourly`, `daily`, and `weekly` cadences. Each run creates a conversation and is tracked in `schedule_runs`. Deleting that conversation does not delete the run: the run keeps its status, timings, and error as audit history, and only its link to the conversation is released. A channel binding pinned to the conversation is released the same way, so the external chat stays bound to its project and the next inbound message starts a fresh conversation.
@@ -881,7 +885,7 @@ roles remain assigned. No new customer or staff permission grants are introduced
 
 Configuration is read from the database (`UserSettings` table) and can be managed through the Settings UI in the desktop app or via `PUT /api/v1/settings/`.
 
-Environment variables fall into three groups:
+Environment variables fall into these groups:
 
 **Server-level** (`COWORK_*`) — control the cowork-server process itself:
 
@@ -899,6 +903,14 @@ Environment variables fall into three groups:
 | `COWORK_MEMORY_DIR` | `~/.cowork/memory` | Memory store root (local mode only) |
 | `COWORK_VAULT_DIR` | `~/.cowork/data-vault` | Connector credential vault |
 | `COWORK_OPENAI_COMPATIBLE_API` | `chat_completions` | The API an `openai_compatible` provider's planning and coding roles call. `responses` moves them to `{base}/responses` through anton's openai flavor, where OpenAI and Azure accept function tools together with a reasoning effort. It needs an anton that reports `RESPONSES_TRANSPORT_READY`; with an older anton both roles stay on chat completions, and Cowork logs one warning that says so. On the Responses path the agent loop runs without web tools, because OpenAI's hosted `web_search` reads the web from the provider's side, outside the deployment's egress controls. A Python cell's `web_search()` is separate and unchanged. The router and Gemini stay on chat completions. Read once at start. |
+
+**Database pool**: these read their bare names, with no `DATABASE_` prefix. A SQLite engine is built without them and waits SQLAlchemy's 30 s for a connection; its database units run one at a time, and `POOL_TIMEOUT` still bounds a unit's wait for that one slot.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `POOL_SIZE` | `20` | Connections the pool keeps open. |
+| `MAX_OVERFLOW` | `20` | Connections the pool may open beyond `POOL_SIZE` under load. Database units take one of `POOL_SIZE` plus `MAX_OVERFLOW` slots before they ask the pool. |
+| `POOL_TIMEOUT` | `5` | Seconds a request waits for a slot, and then for a connection, before it is refused with `503` and a `Retry-After` of the same number of seconds. |
 
 **Harness-level** (`ANTON_*`) — configure a specific agent harness. These are read by the harness adapter, not by cowork-server core. They use the harness prefix because the upstream agent library (anton) defines them:
 

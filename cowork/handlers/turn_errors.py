@@ -31,7 +31,10 @@ from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 from urllib.parse import urlparse
 
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
 from cowork.common.settings.app_settings import default_minds_url
+from cowork.db.units import busy_retry_seconds
 
 # Curated copy for the unsupported-image case. Surfaced verbatim.
 IMAGE_FORMAT_USER_MESSAGE = (
@@ -475,6 +478,18 @@ WORKER_UNRESPONSIVE_MESSAGE = (
     "The agent didn't start, so this turn never ran. That's a fault on our "
     "side rather than a problem with your request. Try again in a moment."
 )
+
+# Wire code for a request refused because no database connection freed within
+# POOL_TIMEOUT. Before a stream exists the sentence is a 503's `detail`
+# (cowork.server). Inside one it is a response.failed frame that carries
+# `retry_after` and `retry_at`, as rate_limited does. The web UI shows the
+# sentence as it is and ignores Retry-After, so the sentence names the wait.
+SERVER_BUSY_CODE = "server_busy"
+
+
+def server_busy_message(retry_after: int) -> str:
+    unit = "second" if retry_after == 1 else "seconds"
+    return f"Cowork is busy. Try again in about {retry_after} {unit}."
 
 
 def is_image_format_error(exc: Exception) -> bool:
@@ -1260,6 +1275,11 @@ def friendly_turn_error(
     (the streaming handler needs the rejected model for the card) pass it in so
     it isn't computed twice; omit it and it's resolved on demand.
     """
+    # The database had no connection to give within POOL_TIMEOUT. Matched
+    # first: it is not a provider failure, so nothing below applies to it.
+    if isinstance(exc, PoolTimeoutError):
+        return SERVER_BUSY_CODE, server_busy_message(busy_retry_seconds())
+
     status, reason, host = _http_error_context(exc)
 
     # The gateway's explicit reason header wins — it names the billing decision

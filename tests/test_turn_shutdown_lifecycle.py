@@ -94,13 +94,13 @@ async def _start_streaming_turn(monkeypatch, saved, buffer):
     started = asyncio.Event()
     handler = _streaming_handler(monkeypatch, saved, started)
     lifecycle = TurnLifecycle()
-    coro = handler._run_turn(
-        conv_id=uuid4(), harness_input=[], original_content="hi", model="anton",
-        disabled=None, harness_name="anton", harness_id="anton", buffer=buffer,
-        lifecycle=lifecycle,
-    )
     handle = await registry.start(
-        conversation_id=CID, turn_id=0, buffer=buffer, producer_coro=coro,
+        conversation_id=CID, turn_id=0, open_buffer=lambda: buffer,
+        produce=lambda buffer: handler._run_turn(
+            conv_id=uuid4(), harness_input=[], original_content="hi", model="anton",
+            disabled=None, harness_name="anton", harness_id="anton", buffer=buffer,
+            lifecycle=lifecycle,
+        ),
         lifecycle=lifecycle,
     )
     await asyncio.wait_for(started.wait(), timeout=5)
@@ -182,8 +182,8 @@ async def test_only_user_stop_emits_cancelled(monkeypatch, tmp_path, backend, ca
         monkeypatch.setattr(responses_mod, "stream_remote_replies", replies)
         lifecycle = TurnLifecycle()
         handle = await registry.start(
-            conversation_id=CID, turn_id=0, buffer=buffer, lifecycle=lifecycle,
-            producer_coro=handler._produce_remote(
+            conversation_id=CID, turn_id=0, open_buffer=lambda: buffer, lifecycle=lifecycle,
+            produce=lambda buffer: handler._produce_remote(
                 conv_id=uuid4(), input_text="hi", original_content="hi", model="anton",
                 harness_id="anton", buffer=buffer, lifecycle=lifecycle,
             ),

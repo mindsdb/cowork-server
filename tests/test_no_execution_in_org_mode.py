@@ -392,6 +392,9 @@ async def test_handle_refuses_non_streaming_turn_in_org_mode(org_mode, granted_p
         def get_conversation(self, conv_id):
             return _FakeConversation(conv_id)
 
+        def get_ordered_messages(self, conv_id):
+            return []
+
     import cowork.handlers.responses as responses_mod
     original = responses_mod.ConversationService
     responses_mod.ConversationService = _FakeConversationService
@@ -400,7 +403,6 @@ async def test_handle_refuses_non_streaming_turn_in_org_mode(org_mode, granted_p
         from cowork.db.scoped import TenantScope
         handler.scope = TenantScope(org_mode=True, org_id="org-fixture", user_id="user-fixture")
         handler.principal = None
-        handler.scoped = object()
 
         async def _fake_route_request(**kwargs):
             return RouteDecision(route=DELEGATED_AGENTIC, reason="test"), None

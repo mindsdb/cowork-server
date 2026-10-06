@@ -9,11 +9,11 @@ explicit POST /responses/cancel halts the producer.
 """
 import time
 from typing import Annotated, NamedTuple
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, StringConstraints
-from sqlmodel import Session
 from starlette.responses import JSONResponse
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
@@ -23,12 +23,12 @@ from cowork.db.scoped import (
     MissingTenantScopeError,
     TenantScope,
     get_tenant_scope,
+    scope_from_principal,
 )
-from cowork.db.session import get_session
 from cowork.handlers.responses import ResponsesHandler, sse_from_buffer
 from cowork.principal import Principal, get_principal
 from cowork.schemas.responses import ResponsesRequest
-from cowork.streaming import RunHandle, registry
+from cowork.streaming import RunHandle, TurnInProgress, registry
 from cowork.streaming.answers import SubmitResult, broker
 from cowork.streaming.backend import get_backend
 from cowork.streaming.buffer import RedisStreamBuffer
@@ -46,11 +46,10 @@ logger = setup_logging()
 # Principal for an OPTIONS request. Every route that carries
 # AuthenticatedInOrgMode below already fails closed on its own too
 # (_require_streaming_scope in this module raises MissingTenantScopeError ->
-# 401 exactly like ScopedSession, and POST / builds its own ScopedSession
+# 401 exactly like ScopedSession, and POST / scopes its own sessions
 # inside ResponsesHandler); declaring it makes that visible to the route
 # walker instead of only to someone reading those checks.
 router = APIRouter()
-SessionDep = Annotated[Session, Depends(get_session)]
 TenantScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
@@ -189,13 +188,38 @@ async def options_handler():
     )
 
 
+def _refuse_while_answering(*, conversation: str | None, scope: TenantScope) -> None:
+    """Refuse a question into a conversation whose turn is still answering.
+
+    Runs before any database read and before the routing gate, so the refusal
+    costs nothing. RunRegistry.start repeats the check under its lock for a
+    request that gets past this one while the running turn is still in its
+    own gate. In org mode only the caller's own turn counts, so the refusal
+    never reveals someone else's.
+    """
+    if not conversation:
+        return
+    try:
+        conversation_id = str(UUID(conversation))
+    except ValueError:
+        return  # not a conversation id: handle() starts a new conversation
+    _require_streaming_scope(scope)
+    handle = _authorized_handle(registry.get(conversation_id), scope)
+    if handle is not None and handle.is_answering:
+        raise TurnInProgress(conversation_id=conversation_id, turn_id=handle.turn_id)
+
+
 @router.post("/", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def responses(
     responses_request: ResponsesRequest,
-    session: SessionDep,
     principal: Principal | None = Depends(get_principal),
 ):
-    handler = ResponsesHandler(session, principal=principal)
+    # No request session: the handler runs its reads as short units, so no
+    # connection stays checked out for the stream this returns.
+    _refuse_while_answering(
+        conversation=responses_request.conversation, scope=scope_from_principal(principal)
+    )
+    handler = ResponsesHandler(principal=principal)
     result = await handler.handle(responses_request)
     if responses_request.stream:
         # `result` is sse_from_buffer(buffer, 0); the producer is already
