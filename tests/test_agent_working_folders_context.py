@@ -158,6 +158,10 @@ async def test_the_built_prompt_grants_each_folder(local_mode, monkeypatch, tmp_
 
     assert f"  - {docs}\n  - {reports}" in suffix
     assert "do not use select_path" in suffix
+    # A file named without its folder was searched for in one folder only, and
+    # the agent then answered about a different file.
+    assert "search the project and every working folder" in suffix
+    assert "never answer about a different file instead" in suffix
     assert "located outside the project is strictly forbidden" not in suffix
 
 
