@@ -244,16 +244,21 @@ def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_d
     return filtered
 
 
-def _tool_message_kwargs(config_cls, channel_context: ChannelContext | None) -> dict:
+def _tool_message_kwargs(
+    config_cls, channel_context: ChannelContext | None, renders_tool_messages: bool = True,
+) -> dict:
     """`tool_messages` for this turn's ChatSessionConfig, or {}.
 
     The cowork UI renders a tool's message to the user (generate_artifact's
-    brief when the agent acts first) as an agent message; a channel bot only
-    relays the answer text, so there the tool hands the content to the agent
-    instead. Through `supported_kwargs`: an anton without the field degrades
-    to that same fallback rather than failing every turn.
+    brief when the agent acts first) as an agent message; a channel bot or a
+    non-streaming API caller only gets the answer text, so there the tool
+    hands the content to the agent instead. Through `supported_kwargs`: an
+    anton without the field degrades to that same fallback rather than
+    failing every turn.
     """
-    return supported_kwargs(config_cls, tool_messages=channel_context is None)
+    return supported_kwargs(
+        config_cls, tool_messages=renders_tool_messages and channel_context is None,
+    )
 
 
 def _turn_style_context(channel: ChannelContext | None) -> str:
@@ -472,6 +477,7 @@ class AntonHarness:
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
         channel_context: ChannelContext | None = None,
+        renders_tool_messages: bool = True,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -550,6 +556,7 @@ class AntonHarness:
                 reasoning_effort=reasoning_effort,
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
+                renders_tool_messages=renders_tool_messages,
             )
             # Length of the seeded history — everything anton appends past this
             # index is this turn's block-messages (tool_use / tool_result / text).
@@ -842,6 +849,7 @@ class AntonHarness:
         reasoning_effort: str | None = None,
         disabled_connections: list[dict] | None = None,
         channel_context: ChannelContext | None = None,
+        renders_tool_messages: bool = True,
     ):
         """Build the same core runtime the Anton CLI uses, scoped to one project."""
         from anton.chat_session import build_runtime_context
@@ -1237,7 +1245,7 @@ class AntonHarness:
                 # MindsHub JWT only; {} when there is none or the pinned anton
                 # predates the fields.
                 **account_kwargs(ChatSessionConfig),
-                **_tool_message_kwargs(ChatSessionConfig, channel_context),
+                **_tool_message_kwargs(ChatSessionConfig, channel_context, renders_tool_messages),
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
                 # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API

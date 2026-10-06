@@ -63,6 +63,9 @@ class HarnessProvider(Protocol):
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
         channel_context: ChannelContext | None = None,
+        # False when the caller hands back only the final answer text (the
+        # non-streaming API): a tool's message to the user would reach nobody.
+        renders_tool_messages: bool = True,
     ) -> AsyncIterator[str]:
         ...
 

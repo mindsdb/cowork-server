@@ -66,7 +66,8 @@ def _drive(monkeypatch, compact: bool):
     session = _FakeSession(compact=compact)
 
     async def _fake_build(
-        self, conversation, model=None, reasoning_effort=None, disabled_connections=None, channel_context=None
+        self, conversation, model=None, reasoning_effort=None, disabled_connections=None, channel_context=None,
+        renders_tool_messages=True,
     ):
         return session, None, None
 
