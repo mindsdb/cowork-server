@@ -1,15 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import partial
 from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.common.datetime_utils import ensure_utc
 from cowork.common.logger import get_logger
-from cowork.db.session import get_open_session
+from cowork.db.scoped import (
+    SYSTEM_SCOPE,
+    MissingTenantScopeError,
+    ScopedSession,
+    scope_from_principal,
+    unsafe_unscoped_session,
+)
+from cowork.db.units import run_db
 from cowork.models.schedule import Schedule
 from cowork.schedule_timing import count_missed_occurrences, next_future_occurrence
 from cowork.schemas.schedules import Cadence, RunStatus, resolve_schedule_model
@@ -149,7 +159,7 @@ def _principal_for_schedule(schedule: Schedule) -> Principal | None:
     the org vs. local mode logic. The custom error message below wraps it with
     schedule-specific context.
     """
-    from cowork.db.scoped import MissingTenantScopeError, service_principal_for
+    from cowork.db.scoped import service_principal_for
 
     try:
         return service_principal_for(schedule.org_id, schedule.created_by)
@@ -160,67 +170,167 @@ def _principal_for_schedule(schedule: Schedule) -> Principal | None:
         )
 
 
+@dataclass(frozen=True)
+class _ScheduledTurn:
+    """What a run reads off its schedule before the turn starts."""
+
+    principal: Principal | None
+    title: str
+    prompt: str
+    model: str | None
+    project_id: UUID | None
+
+
+@dataclass(frozen=True)
+class _RunOutcome:
+    """How a finished turn is recorded on its run."""
+
+    status: RunStatus | None = None
+    error: str | None = None
+
+
+def _create_run(session: ScopedSession, *, schedule_id: UUID, is_manual: bool) -> UUID:
+    return ScheduleRunService(session).create_run(schedule_id, is_manual=is_manual).id
+
+
+def _read_schedule(session: ScopedSession, *, schedule_id: UUID) -> _ScheduledTurn:
+    schedule = ScheduleService(session).get_schedule(schedule_id)
+    # A scheduled run has no request, so it derives its tenant identity from
+    # the schedule row (see _principal_for_schedule). None in local mode.
+    try:
+        principal = _principal_for_schedule(schedule)
+    except MissingTenantScopeError:
+        # A corrupt row (NULL org in org mode) can never resolve an
+        # identity, so it can never run. Disable it, else the unadvanced
+        # next_run_at keeps the slot due and every poll re-fires the same
+        # failure. The re-raise records the run as failed.
+        schedule.enabled = False
+        session.add(schedule)
+        session.commit()
+        raise
+    return _ScheduledTurn(
+        principal=principal,
+        title=schedule.title,
+        prompt=schedule.prompt,
+        model=schedule.model,
+        project_id=schedule.project_id,
+    )
+
+
+def _link_conversation(
+    session: ScopedSession, *, run_id: UUID, scheduled: _ScheduledTurn, conversation_id: UUID | None,
+) -> UUID:
+    """The run's conversation, created first when the caller made none, and
+    recorded on the run before the turn starts."""
+    if conversation_id is None:
+        from cowork.services.conversations import ConversationService
+
+        # Conversation not pre-created by the caller (e.g. cron tick). Create
+        # it under the schedule's OWN scope so org mode stamps the owning
+        # org_id: the scheduler's SYSTEM_SCOPE is deliberately unscoped (it
+        # scans every org), so creating through `session` would write an
+        # invisible NULL-org row.
+        conv_session = ScopedSession(
+            unsafe_unscoped_session(session), scope_from_principal(scheduled.principal)
+        )
+        conversation_id = ConversationService(conv_session).create_conversation(
+            topic=scheduled.title,
+            project_id=scheduled.project_id,
+        ).id
+    ScheduleRunService(session).set_run_conversation(run_id, conversation_id)
+    return conversation_id
+
+
+def _record_turn_outcome(
+    session: ScopedSession, *, schedule_id: UUID, reason: str | None, is_manual: bool, conversation_id: UUID,
+) -> _RunOutcome:
+    schedule_service = ScheduleService(session)
+    run_service = ScheduleRunService(session)
+    # Read again: the schedule may have changed while the turn ran.
+    schedule = schedule_service.get_schedule(schedule_id)
+    outcome = _RunOutcome()
+    if reason == "cancelled":
+        outcome = _RunOutcome(status=RunStatus.cancelled)
+        logger.info(f"Schedule {schedule_id} run was cancelled")
+    elif reason is not None and reason != "completed":
+        outcome = _RunOutcome(
+            status=RunStatus.failed,
+            error="Run did not complete — open the run's task for details.",
+        )
+        schedule.last_error = outcome.error
+        session.add(schedule)
+    else:
+        _apply_success_write_back(schedule, run_service, conversation_id, session)
+
+    # Always consume the cron slot: the schedule stays due otherwise and
+    # the loop would immediately restart the run the user killed (a
+    # cancelled/failed run isn't a success, so the freshness guard
+    # wouldn't block the restart).
+    if not is_manual:
+        _advance_next_run_at(schedule, session)
+
+    try:
+        session.commit()
+    except IntegrityError:
+        # Only the success write-back stages a foreign-key write (the
+        # last_result pointer), so this is the user's delete landing
+        # between still_exists' read and this commit — the delete's
+        # release already nulled the column. Redo the write-back without
+        # the pointer so the bookkeeping and the consumed slot survive.
+        session.rollback()
+        schedule = schedule_service.get_schedule(schedule_id)
+        _apply_success_write_back(schedule, run_service, None, session)
+        if not is_manual:
+            _advance_next_run_at(schedule, session)
+        session.commit()
+    return outcome
+
+
+def _record_schedule_error(session: ScopedSession, *, schedule_id: UUID, error: str) -> None:
+    schedule = ScheduleService(session).get_schedule(schedule_id)
+    schedule.last_error = error
+    session.add(schedule)
+
+
+def _finish_run(
+    session: ScopedSession, *, run_id: UUID, conversation_id: UUID | None, error: str | None, status: RunStatus | None,
+) -> None:
+    ScheduleRunService(session).finish_run(
+        run_id, conversation_id=conversation_id, error=error, status=status
+    )
+
+
 async def execute_schedule(
     schedule_id: UUID,
     is_manual: bool = False,
     conversation_id: UUID | None = None,
 ) -> None:
+    """Run one schedule's turn and record how it went.
+
+    Each read and write is its own database unit, so the run holds no pooled
+    connection across the permission check or while its turn runs, and a
+    wait for a connection never stalls the event loop. A unit commits when
+    it ends, so a failure in one leaves the earlier ones written.
+    """
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
+    from cowork.services.product_permissions import require_product_permission
 
-    from cowork.db.scoped import MissingTenantScopeError, ScopedSession, SYSTEM_SCOPE
-    session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
-    run_service = ScheduleRunService(session)
-    schedule_service = ScheduleService(session)
-
-    run = run_service.create_run(schedule_id, is_manual=is_manual)
+    run_id = await run_db(
+        partial(_create_run, schedule_id=schedule_id, is_manual=is_manual), scope=SYSTEM_SCOPE,
+    )
 
     error: str | None = None
     final_status: RunStatus | None = None
     try:
-        schedule = schedule_service.get_schedule(schedule_id)
-        # A scheduled run has no request, so it derives its tenant identity from
-        # the schedule row (see _principal_for_schedule). None in local mode.
-        try:
-            principal = _principal_for_schedule(schedule)
-        except MissingTenantScopeError:
-            # A corrupt row (NULL org in org mode) can never resolve an
-            # identity, so it can never run. Disable it, else the unadvanced
-            # next_run_at keeps the slot due and every poll re-fires the same
-            # failure. The re-raise records the run as failed.
-            schedule.enabled = False
-            session.add(schedule)
-            session.commit()
-            raise
+        scheduled = await run_db(partial(_read_schedule, schedule_id=schedule_id), scope=SYSTEM_SCOPE)
 
-        from cowork.db.scoped import scope_from_principal
-        from cowork.services.product_permissions import require_product_permission
+        await require_product_permission(scope_from_principal(scheduled.principal), "product.execute")
 
-        await require_product_permission(scope_from_principal(principal), "product.execute")
-
-        if conversation_id is None:
-            from cowork.db.scoped import (
-                ScopedSession,
-                scope_from_principal,
-                unsafe_unscoped_session,
-            )
-            from cowork.services.conversations import ConversationService
-
-            # Conversation not pre-created by the caller (e.g. cron tick). Create
-            # it under the schedule's OWN scope so org mode stamps the owning
-            # org_id: the scheduler's SYSTEM_SCOPE is deliberately unscoped (it
-            # scans every org), so creating through `session` would write an
-            # invisible NULL-org row.
-            conv_session = ScopedSession(
-                unsafe_unscoped_session(session), scope_from_principal(principal)
-            )
-            conversation = ConversationService(conv_session).create_conversation(
-                topic=schedule.title,
-                project_id=schedule.project_id,
-            )
-            conversation_id = conversation.id
-
-        run_service.set_run_conversation(run.id, conversation_id)
+        conversation_id = await run_db(
+            partial(_link_conversation, run_id=run_id, scheduled=scheduled, conversation_id=conversation_id),
+            scope=SYSTEM_SCOPE,
+        )
 
         # Stamp the run's identity on the Langfuse trace (existing pass-through
         # seam) so incident forensics don't have to reconstruct which schedule/
@@ -231,14 +341,14 @@ async def execute_schedule(
             # creates, not a servable id. Resolve it to None so the harness
             # applies the account's configured default models instead of
             # overriding every role with the literal string (ENG-2353).
-            input=schedule.prompt,
-            model=resolve_schedule_model(schedule.model),
+            input=scheduled.prompt,
+            model=resolve_schedule_model(scheduled.model),
             stream=True,
             conversation=str(conversation_id),
             trace_tags=["scheduled_task", f"trigger:{trigger}"],
             trace_metadata={
                 "schedule_id": str(schedule_id),
-                "schedule_run_id": str(run.id),
+                "schedule_run_id": str(run_id),
                 "trigger_type": trigger,
             },
         )
@@ -246,7 +356,7 @@ async def execute_schedule(
             # The schedule-derived principal is what lets the turn (and the
             # remote backend's per-tenant key mint) run in org mode with no
             # request in flight. The handler opens its own short sessions.
-            stream = await ResponsesHandler(principal=principal, interactive=False).handle(request)
+            stream = await ResponsesHandler(principal=scheduled.principal, interactive=False).handle(request)
             async for _ in stream:
                 pass
 
@@ -263,68 +373,38 @@ async def execute_schedule(
         # buffer's terminal record is the only truthful signal of how the
         # turn ended — without it every run is recorded as success.
         reason = await _turn_terminal_reason(str(conversation_id))
-
-        # Refresh schedule in case it changed during execution
-        schedule = schedule_service.get_schedule(schedule_id)
-        if reason == "cancelled":
-            final_status = RunStatus.cancelled
-            logger.info(f"Schedule {schedule_id} run was cancelled")
-        elif reason is not None and reason != "completed":
-            final_status = RunStatus.failed
-            error = "Run did not complete — open the run's task for details."
-            schedule.last_error = error
-            session.add(schedule)
-        else:
-            _apply_success_write_back(schedule, run_service, conversation_id, session)
-
-        # Always consume the cron slot: the schedule stays due otherwise and
-        # the loop would immediately restart the run the user killed (a
-        # cancelled/failed run isn't a success, so the freshness guard
-        # wouldn't block the restart).
-        if not is_manual:
-            _advance_next_run_at(schedule, session)
-
-        try:
-            session.commit()
-        except IntegrityError:
-            # Only the success write-back stages a foreign-key write (the
-            # last_result pointer), so this is the user's delete landing
-            # between still_exists' read and this commit — the delete's
-            # release already nulled the column. Redo the write-back without
-            # the pointer so the bookkeeping and the consumed slot survive.
-            session.rollback()
-            schedule = schedule_service.get_schedule(schedule_id)
-            _apply_success_write_back(schedule, run_service, None, session)
-            if not is_manual:
-                _advance_next_run_at(schedule, session)
-            session.commit()
+        outcome = await run_db(
+            partial(
+                _record_turn_outcome, schedule_id=schedule_id, reason=reason,
+                is_manual=is_manual, conversation_id=conversation_id,
+            ),
+            scope=SYSTEM_SCOPE,
+        )
+        final_status, error = outcome.status, outcome.error
 
     except Exception as exc:
         error = str(exc)
         logger.exception(f"Schedule {schedule_id} run failed: {error}")
         try:
-            # The failed transaction blocks every later statement until it
-            # rolls back; without this the writes below die on
-            # PendingRollbackError and the error is never recorded.
-            session.rollback()
-            schedule = schedule_service.get_schedule(schedule_id)
-            schedule.last_error = error
-            session.add(schedule)
-            session.commit()
+            await run_db(
+                partial(_record_schedule_error, schedule_id=schedule_id, error=error), scope=SYSTEM_SCOPE,
+            )
         except Exception:
             pass
     finally:
         try:
-            # Same guard for the run record: a swallowed failure above can
-            # leave the session unusable, and this write must always land or
-            # the run strands at `running` and wedges the schedule.
-            session.rollback()
-            run_service.finish_run(
-                run.id, conversation_id=conversation_id, error=error, status=final_status
+            # This write must always land or the run strands at `running` and
+            # wedges the schedule. Its own unit starts clean, whatever failed
+            # above.
+            await run_db(
+                partial(
+                    _finish_run, run_id=run_id, conversation_id=conversation_id,
+                    error=error, status=final_status,
+                ),
+                scope=SYSTEM_SCOPE,
             )
         except Exception:
             logger.exception(f"Failed to finish run record for schedule {schedule_id}")
-        session.close()
 
 
 async def _turn_terminal_reason(conversation_id: str) -> str | None:
@@ -387,23 +467,30 @@ def _due_schedules(session, now: datetime) -> list[Schedule]:
     return due
 
 
+def _poll(session: ScopedSession) -> list[UUID]:
+    """One poll's unit: settle missed runs, then the ids of the schedules due now."""
+    _handle_missed_runs(session)
+    return [schedule.id for schedule in _due_schedules(session, datetime.now(timezone.utc))]
+
+
 async def _scheduler_loop() -> None:
     logger.info("Scheduler loop started")
     while True:
         await asyncio.sleep(_POLL_INTERVAL_SECONDS)
-        from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
-        session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
         try:
-            _handle_missed_runs(session)
-            due = _due_schedules(session, datetime.now(timezone.utc))
+            # A unit in a worker thread: when the pool has no connection to
+            # give, the poll is refused after POOL_TIMEOUT instead of stalling
+            # the event loop, and the next poll tries again.
+            due = await run_db(_poll, scope=SYSTEM_SCOPE)
+        except PoolTimeoutError:
+            logger.warning("Scheduler poll found no free database connection; the next poll retries")
+            due = []
         except Exception:
             logger.exception("Scheduler loop error during poll")
             due = []
-        finally:
-            session.close()
 
-        for schedule in due:
-            asyncio.create_task(execute_schedule(schedule.id, is_manual=False))
+        for schedule_id in due:
+            asyncio.create_task(execute_schedule(schedule_id, is_manual=False))
 
 
 def start_scheduler() -> None:

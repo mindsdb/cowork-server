@@ -24,6 +24,8 @@ import cowork.handlers.responses as responses_mod
 from cowork.common.logger import CustomFormatter, setup_console_handler
 from cowork.handlers.responses import ResponsesHandler
 
+from _fakes import inline_run_db
+
 
 class _RecBuffer:
     def __init__(self) -> None:
@@ -56,7 +58,7 @@ def _failing_handler(monkeypatch, saved: dict, exc: Exception):
             pass
 
         def get_conversation(self, conv_id):
-            return object()
+            return SimpleNamespace(project=None)
 
         def save_user_message(self, conv_id, content, *, created_at=None, pending=False):
             saved["user"] = content
@@ -83,8 +85,7 @@ def _failing_handler(monkeypatch, saved: dict, exc: Exception):
         yield  # pragma: no cover - makes this an async generator
 
     monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
-    monkeypatch.setattr(responses_mod, "ScopedSession", lambda s, scope: FakeSession())
-    monkeypatch.setattr(responses_mod, "get_open_session", lambda: None)
+    monkeypatch.setattr(responses_mod, "run_db", inline_run_db(FakeSession()))
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: None)
     monkeypatch.setattr(responses_mod, "get_harness", lambda name: SimpleNamespace(
         stream_response=lambda **kwargs: None, formatter=formatter,

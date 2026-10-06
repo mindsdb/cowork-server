@@ -6,14 +6,16 @@ unit runs. ``unit_session`` is that session for synchronous code. ``run_db``
 runs a unit in a worker thread for async code, so a wait for a connection
 never stalls the event loop.
 
-Every wait is bounded by POOL_TIMEOUT and ends in ``DatabaseBusy``, which the
-app answers with 503 (cowork.server).
+A unit's waits, first for a slot and then for a connection, share one
+POOL_TIMEOUT budget and end in ``DatabaseBusy``, which the app answers with 503
+(cowork.server).
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import math
+import threading
 from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from typing import Any, TypeVar
@@ -123,9 +125,75 @@ def unit_session(*, scope: TenantScope) -> Iterator[ScopedSession]:
             raw.close()
 
 
-def _run_unit(fn: Callable[[ScopedSession], T], scope: TenantScope) -> T:
+class _Abandoned(Exception):
+    """The unit's caller stopped waiting before the unit got a connection."""
+
+
+class _Handoff:
+    """Settles, once, whether a unit runs or its caller has stopped waiting.
+
+    The unit's thread calls ``admit`` once it holds a connection; the caller
+    calls ``give_up`` when its budget runs out, or when it is cancelled, before
+    that. The first of the two wins, under a lock: either the unit runs to its
+    end while its caller waits for it, or it never runs and its connection
+    goes straight back to the pool.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._admitted = False
+        self._given_up = False
+
+    @property
+    def given_up(self) -> bool:
+        with self._lock:
+            return self._given_up
+
+    def admit(self) -> bool:
+        """For the unit's thread: True when the unit may run."""
+        with self._lock:
+            if not self._given_up:
+                self._admitted = True
+            return self._admitted
+
+    def give_up(self) -> bool:
+        """For the caller: True when the unit will not run."""
+        with self._lock:
+            if not self._admitted:
+                self._given_up = True
+            return self._given_up
+
+
+def _run_unit(fn: Callable[[ScopedSession], T], scope: TenantScope, handoff: _Handoff) -> T:
     with unit_session(scope=scope) as session:
+        if not handoff.admit():
+            raise _Abandoned
         return fn(session)
+
+
+async def _unit_task(
+    fn: Callable[[ScopedSession], T], scope: TenantScope, handoff: _Handoff, deadline: float,
+) -> T:
+    """A unit's own task: take a slot by ``deadline``, then run the unit in a
+    worker thread, holding the slot until the thread ends."""
+    slots = _slots(_engine())
+    with anyio.CancelScope(deadline=deadline) as slot_wait:
+        await slots.acquire()
+    if slot_wait.cancelled_caught:
+        raise DatabaseBusy("no database unit slot freed within POOL_TIMEOUT")
+    try:
+        if handoff.given_up:
+            raise _Abandoned
+        return await anyio.to_thread.run_sync(_run_unit, fn, scope, handoff, limiter=_threads())
+    finally:
+        slots.release()
+
+
+def _retrieve_outcome(unit: asyncio.Future[Any]) -> None:
+    """Mark a unit's exception as seen. A unit whose caller stopped waiting
+    ends with nobody awaiting it, and that is expected."""
+    if not unit.cancelled():
+        unit.exception()
 
 
 async def run_db(fn: Callable[[ScopedSession], T], *, scope: TenantScope) -> T:
@@ -135,49 +203,71 @@ async def run_db(fn: Callable[[ScopedSession], T], *, scope: TenantScope) -> T:
     so it must be plain data, a pydantic model, or detached rows with every
     attribute the caller reads already loaded.
 
-    The wait for a slot and the wait for a connection are each bounded by
-    POOL_TIMEOUT and end in DatabaseBusy. Once the unit runs, a cancel of the
-    caller waits for it to finish before it propagates: the session belongs to
-    the thread, and unwinding the caller first would run its cleanup while the
-    unit is still writing.
+    The wait for a slot and the wait for a connection share one POOL_TIMEOUT
+    budget, so a caller is refused with DatabaseBusy about POOL_TIMEOUT after
+    it asked, however that time splits between the two. A caller that is
+    refused or cancelled before its unit has a connection leaves at once, and
+    the unit never runs. Once the unit runs, a cancel of the caller waits for
+    it to finish before it propagates: the session belongs to the thread, and
+    unwinding the caller first would run its cleanup while the unit is still
+    writing.
     """
-    slots = _slots(_engine())
-    with anyio.move_on_after(db_session.settings.database.pool_timeout) as admission:
-        await slots.acquire()
-    if admission.cancelled_caught:
-        raise DatabaseBusy("no database unit slot freed within POOL_TIMEOUT")
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + db_session.settings.database.pool_timeout
+    handoff = _Handoff()
+    unit = asyncio.ensure_future(_unit_task(fn, scope, handoff, deadline))
+    unit.add_done_callback(_retrieve_outcome)
     try:
-        return await _finish_even_if_cancelled(
-            anyio.to_thread.run_sync(_run_unit, fn, scope, limiter=_threads())
-        )
-    finally:
-        slots.release()
+        await asyncio.wait([unit], timeout=max(0.0, deadline - loop.time()))
+    except asyncio.CancelledError:
+        if not handoff.give_up():
+            await _drain(unit)
+        raise
+    if not unit.done() and handoff.give_up():
+        raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+    return await _finish_even_if_cancelled(unit)
 
 
-async def _finish_even_if_cancelled(work: Coroutine[Any, Any, T]) -> T:
-    """Await ``work`` in its own task, and make a cancel of this task wait for it.
+async def run_to_completion(work: Coroutine[Any, Any, T]) -> T:
+    """Run ``work`` in its own task. A cancel of the caller waits for it to end,
+    then propagates.
+
+    For a step a cancel must not split, such as saving an answer and writing
+    the frame that reports it: the step ends whole, and the cancel arrives
+    after it.
+    """
+    return await _finish_even_if_cancelled(asyncio.ensure_future(work))
+
+
+async def _finish_even_if_cancelled(task: asyncio.Future[T]) -> T:
+    """Await ``task``, and make a cancel of the caller wait for it.
 
     Every turn cancel in this server is a native ``Task.cancel()``: Stop, the
     idle watchdog, a turn delete and shutdown. anyio's shield around a worker
     thread holds off only anyio's own cancel scopes, so without this the
-    caller would unwind while its unit still runs. Repeated cancels are
+    caller would unwind while its work still runs. Repeated cancels are
     absorbed until the work ends, then the cancel is re-raised.
     """
-    task = asyncio.ensure_future(work)
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        while not task.done():
-            try:
-                await asyncio.wait([task])
-            except asyncio.CancelledError:
-                continue
-        if not task.cancelled() and task.exception() is not None:
-            logger.warning(
-                "a database unit failed after its caller was cancelled",
-                exc_info=task.exception(),
-            )
+        await _drain(task)
         raise
+
+
+async def _drain(task: asyncio.Future[Any]) -> None:
+    """Wait for ``task`` to end, absorbing cancels, and log a failure that its
+    cancelled caller will never see."""
+    while not task.done():
+        try:
+            await asyncio.wait([task])
+        except asyncio.CancelledError:
+            continue
+    if not task.cancelled() and task.exception() is not None:
+        logger.warning(
+            "work its caller waited for failed after the caller was cancelled",
+            exc_info=task.exception(),
+        )
 
 
 _writes_by_conversation: WeakValueDictionary[UUID, asyncio.Lock] = WeakValueDictionary()
