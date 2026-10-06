@@ -231,6 +231,7 @@ def test_status_keeps_the_published_pill_for_a_chosen_folder(projects_root, tmp_
 
     assert res.status_code == 200, res.text
     assert res.json()["publishedUrl"] == "https://4nton.ai/a/uuid-status"
+    assert res.json()["modified"] is True
 
 
 # -- publish, unpublish, delete ----------------------------------------------
