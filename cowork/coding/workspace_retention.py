@@ -5,7 +5,6 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
 
 from cowork.coding.contracts import CodingSession, SessionStatus, WorkspaceKind, utc_now
 from cowork.coding.project_workspaces import ProjectWorkspaceManager
@@ -126,7 +125,7 @@ class WorkspaceRetention:
                 except Exception as exc:
                     logger.info("Keeping the workspace for coding task %s: %s", session_id, exc)
                     try:
-                        self._restore_missing(items)
+                        self._restore_released(items)
                     except Exception:
                         # Still marked, so the next use retries the restore.
                         logger.exception("Could not restore the workspace of coding task %s after a failed release", session_id)
@@ -164,7 +163,7 @@ class WorkspaceRetention:
             session = self.store.load_session(session_id)
             if session.workspace_released_at is None:
                 return
-            self._restore_missing(self._items(session))
+            self._restore_released(self._items(session))
             self._mark_released(session_id, None)
         finally:
             if not reserved:
@@ -205,9 +204,11 @@ class WorkspaceRetention:
                 logger.exception("Could not release the workspace for coding task %s", session.id)
         return released
 
-    def _restore_missing(self, items: list[_Item]) -> None:
+    def _restore_released(self, items: list[_Item]) -> None:
+        # Saved state, not a missing folder, marks a released item: a removal
+        # that failed part-way leaves a folder that is present but incomplete.
         for item in items:
-            if not Path(item.workspace_path).exists():
+            if self.workspaces.is_released(item.key, item.kind):
                 self.workspaces.restore(item.key, item.source_path, item.workspace_path, item.kind)
 
     def _mark_released(self, session_id: str, released_at: datetime | None) -> None:

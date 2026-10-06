@@ -316,6 +316,12 @@ class LocalCopyManager:
         if workspace.resolve() != expected:
             raise LocalCopyError("Refusing to restore an unmanaged task copy")
         changed = list(json.loads(changes.read_text(encoding="utf-8"))["paths"])
+        # An interrupted release can leave part of the copy behind. The saved
+        # changes are complete, so the leftover is replaced.
+        for leftover in (workspace, self.baselines_root / relative):
+            _force_remove(leftover)
+            if leftover.exists():
+                raise LocalCopyError("Part of this task's old copy is still in use. Close programs using it and try again")
         prepared = self.prepare(key, source)
         try:
             self._replace_changed(prepared.baseline, release / "before", changed)
@@ -325,6 +331,9 @@ class LocalCopyManager:
             _force_remove(prepared.baseline)
             raise
         _force_remove(release)
+
+    def is_released(self, key: str) -> bool:
+        return (self._release_dir(managed_key(key)) / "changes.json").is_file()
 
     def discard_release(self, key: str) -> None:
         _force_remove(self._release_dir(managed_key(key)))
