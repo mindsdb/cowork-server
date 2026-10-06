@@ -1228,6 +1228,9 @@ class AntonHarness:
                 # MindsHub JWT only; {} when there is none or the pinned anton
                 # predates the fields.
                 **account_kwargs(ChatSessionConfig),
+                # This harness rebuilds the session every message, so the verifier
+                # latch has to outlive it or a persistent failure diagnoses each time.
+                **supported_kwargs(ChatSessionConfig, shared_verifier_latch=True),
                 # Whether the client renders a tool's message to the user (the
                 # brief when the agent acts first); without it the tool hands
                 # the content to the agent. Dropped by an anton without the field.
