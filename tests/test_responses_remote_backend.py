@@ -40,7 +40,7 @@ class _FakeBuffer:
 
 def _handler() -> ResponsesHandler:
     handler = object.__new__(ResponsesHandler)
-    handler.scoped = _FakeScoped()
+    handler.scope = _FakeScope()
     handler.interactive = True
     return handler
 
@@ -321,8 +321,8 @@ async def test_the_producer_task_scrubs_the_job_history_with_the_requests_regist
     run = await RunRegistry().start(
         conversation_id=str(conv_id),
         turn_id=0,
-        buffer=buffer,
-        producer_coro=handler._produce_remote(
+        open_buffer=lambda: buffer,
+        produce=lambda buffer: handler._produce_remote(
             conv_id=conv_id,
             input_text="hi",
             original_content="hi",

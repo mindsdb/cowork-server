@@ -75,8 +75,8 @@ async def test_hung_turn_is_bounded_and_sealed(monkeypatch):
             await buffer.close("cancelled")  # mirror every real producer
 
     handle = await registry.start(
-        conversation_id="conv-hung", turn_id=0, buffer=buffer,
-        producer_coro=_hung_producer(),
+        conversation_id="conv-hung", turn_id=0, open_buffer=lambda: buffer,
+        produce=lambda _buffer: _hung_producer(),
     )
     await asyncio.wait_for(started.wait(), timeout=5)
 
@@ -99,8 +99,8 @@ async def test_normal_turn_completes_without_the_bound_firing(monkeypatch):
         await buffer.close("completed")
 
     handle = await registry.start(
-        conversation_id="conv-quick", turn_id=0, buffer=buffer,
-        producer_coro=_quick_producer(),
+        conversation_id="conv-quick", turn_id=0, open_buffer=lambda: buffer,
+        produce=lambda _buffer: _quick_producer(),
     )
     await asyncio.wait_for(handle.task, timeout=5)
     assert buffer.closed == "completed"
@@ -124,8 +124,8 @@ async def test_a_progressing_turn_is_not_reaped_past_the_window(monkeypatch):
         await buffer.close("completed")
 
     handle = await registry.start(
-        conversation_id="conv-progress", turn_id=0, buffer=buffer,
-        producer_coro=_progressing_producer(),
+        conversation_id="conv-progress", turn_id=0, open_buffer=lambda: buffer,
+        produce=lambda _buffer: _progressing_producer(),
     )
     await asyncio.wait_for(handle.task, timeout=5)
     assert buffer.closed == "completed"  # completed on its own, not "cancelled"
@@ -146,8 +146,8 @@ async def test_external_cancel_still_propagates_through_the_bound(monkeypatch):
             await buffer.close("cancelled")
 
     handle = await registry.start(
-        conversation_id="conv-cancel", turn_id=0, buffer=buffer,
-        producer_coro=_producer(),
+        conversation_id="conv-cancel", turn_id=0, open_buffer=lambda: buffer,
+        produce=lambda _buffer: _producer(),
     )
     await asyncio.wait_for(started.wait(), timeout=5)
 

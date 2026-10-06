@@ -91,14 +91,14 @@ async def start():
         conversation_id = conversation.id
     finally:
         session.close()
-    buffer = new_buffer(str(conversation_id), 0)
     lifecycle = TurnLifecycle()
     handler = object.__new__(responses.ResponsesHandler)
     handler.principal = None  # local, single-process deployment
-    await registry.start(
-        conversation_id=str(conversation_id), turn_id=0, buffer=buffer,
+    handle = await registry.start(
+        conversation_id=str(conversation_id), turn_id=0,
+        open_buffer=lambda: new_buffer(str(conversation_id), 0),
         lifecycle=lifecycle,
-        producer_coro=handler._run_turn(
+        produce=lambda buffer: handler._run_turn(
             conv_id=conversation_id, harness_input=[], original_content="hello",
             model="anton", disabled=None, harness_name="anton", harness_id="anton",
             buffer=buffer, lifecycle=lifecycle,
@@ -106,7 +106,7 @@ async def start():
     )
 
     async def tail():
-        async for record in buffer.tail():
+        async for record in handle.buffer.tail():
             if record.type == "sse":
                 yield record.data["sse"]
 
