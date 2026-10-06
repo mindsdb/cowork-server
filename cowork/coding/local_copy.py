@@ -266,13 +266,21 @@ class LocalCopyManager:
         shutil.rmtree(workspace, ignore_errors=True)
         shutil.rmtree(baseline, ignore_errors=True)
 
-    def release(self, key: str, workspace: Path, before_remove: Callable[[Path], None] | None = None) -> bool:
+    def release(
+        self,
+        key: str,
+        workspace: Path,
+        before_remove: Callable[[Path], None] | None = None,
+        worktrees: frozenset[str] = frozenset(),
+    ) -> bool:
         """Remove a task copy and its baseline, keeping only the task's changes.
 
         The saved state is the pre-task and task versions of each changed path,
         so a restore can rebuild both trees from the then-current source and
         the task's diff and handoff checks behave as before. Returns False,
         leaving everything in place, when the copy cannot be released safely.
+        ``worktrees`` are the relative paths of worktree checkouts whose
+        commits the caller keeps.
         """
         relative = managed_key(key)
         actual = workspace.resolve()
@@ -280,7 +288,7 @@ class LocalCopyManager:
             raise LocalCopyError("Refusing to release an unmanaged task copy")
         # Repository metadata is not part of the saved changes, so commits made
         # in a copied or task-created repository would be lost.
-        if not actual.is_dir() or self._has_repository(actual):
+        if not actual.is_dir() or self._has_repository(actual, worktrees):
             return False
         baseline = self._baseline_for(actual)
         before, after = self._manifests(baseline, actual)
@@ -360,18 +368,21 @@ class LocalCopyManager:
         return self.recovery_root / relative / "local-release"
 
     @staticmethod
-    def _has_repository(root: Path) -> bool:
-        pending = [root]
+    def _has_repository(root: Path, worktrees: frozenset[str] = frozenset()) -> bool:
+        pending: list[tuple[str, str]] = [(str(root), "")]
         while pending:
+            directory, prefix = pending.pop()
             try:
-                entries = list(os.scandir(pending.pop()))
+                entries = list(os.scandir(directory))
             except OSError:
                 return True
             for entry in entries:
                 if entry.name == ".git":
+                    if prefix.rstrip("/") in worktrees and entry.is_file(follow_symlinks=False):
+                        continue
                     return True
                 if entry.is_dir(follow_symlinks=False):
-                    pending.append(Path(entry.path))
+                    pending.append((entry.path, prefix + entry.name + "/"))
         return False
 
     @staticmethod
