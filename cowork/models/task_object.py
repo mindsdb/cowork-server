@@ -10,14 +10,14 @@ class TaskObject(BaseSQLModel, table=True):
     artifacts and attached files — so a task can be moved to another
     project together with everything it produced.
 
-    The authoritative source for an artifact's owner is its on-disk
-    `metadata.json` provenance (written by the shared ArtifactStore for
-    every harness), and for a file it's `files.purpose`. This table is a
-    fast, durable index over those: populated when an artifact is claimed
-    via `create_artifact`, and reconciled from provenance at move time so
-    artifacts created by any harness (or before this table existed) are
-    still attributable. `project_id` is denormalized so a move can both
-    look up a task's objects and keep their project pointer correct.
+    This table indexes what a task CREATED so the task can be moved together
+    with its work. It is not an authorization record: in organization mode the
+    owner of an artifact is its `shared_resource_attributions` row (ENG-2961),
+    and legacy per-conversation roots derive it from the conversation. Rows are
+    written at the end of the turn that created the artifact; on the desktop
+    they are also reconciled from `metadata.json` provenance at move time.
+    `project_id` is denormalized so a move can both look up a task's objects
+    and keep their project pointer correct.
     """
 
     __tablename__ = "task_objects"

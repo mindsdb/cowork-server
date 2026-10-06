@@ -6,6 +6,7 @@ agent-produced artifacts.
 """
 from __future__ import annotations
 
+import logging
 import mimetypes
 import os
 import re
@@ -23,13 +24,16 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlmodel import Session
 
-from cowork.db.scoped import ScopedSession, ScopedSessionDep
+from cowork.services.product_permissions import require_product_permission
+from cowork.db.scoped import ScopedSession, ScopedSessionDep, get_scoped_session
 from cowork.db.session import get_session
-from cowork.api.v1.endpoints.guards import require_local_tenancy
+from cowork.principal import Principal, get_principal
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, OpenByDesign, require
 from cowork.api.v1.artifact_preview import (
     artifact_response_headers,
-    html_with_comment_layer,
+    html_preview_response,
     wants_comment_layer,
+    wants_html_preview,
 )
 from cowork.api.v1.artifact_scope import (
     artifact_sources_for_request,
@@ -55,6 +59,8 @@ from cowork.services.artifacts import (
     reveal_in_file_manager,
 )
 from cowork.services.projects import ProjectService
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -149,22 +155,26 @@ def _artifact_cards(session, sources) -> list[dict]:
     # cards use the same builder and would otherwise still carry the plaintext
     # password.
     cards = _list_artifacts(sources)
+    from cowork.services.artifact_ownership import resolve_artifact_owners
     from cowork.services.artifact_permissions import artifact_capabilities
 
-    # Capabilities are a property of the ROOT, not of the artifact: in org mode
-    # they come from the owning conversation, and every artifact under one root
-    # shares it. Derived once per root, so a project with 50 artifacts across 50
-    # conversations costs 50 conversation reads instead of 50 per card.
+    # Capabilities are a property of each ARTIFACT: in org mode a project root is
+    # shared by every member (ENG-2056), so each card's owner is resolved on its
+    # own. Owners are read in one query per root (the unfiltered listing spans
+    # every project of the organization, so one query per project root).
     by_base = {Path(source.base): source for source in sources}
-    capabilities_by_base: dict[Path, dict] = {}
+    cards_by_base: dict[Path, list[tuple[str, dict]]] = {}
     for card in cards:
-        base = Path(str(card.get("folder") or "")).parent
-        source = by_base.get(base)
-        if source is None:
-            continue
-        if base not in capabilities_by_base:
-            capabilities_by_base[base] = artifact_capabilities(session, source)
-        card["capabilities"] = capabilities_by_base[base]
+        folder = Path(str(card.get("folder") or ""))
+        if folder.parent in by_base:
+            cards_by_base.setdefault(folder.parent, []).append((folder.name, card))
+    for base, entries in cards_by_base.items():
+        source = by_base[base]
+        resolutions = resolve_artifact_owners(session, source, [slug for slug, _ in entries])
+        for slug, card in entries:
+            card["capabilities"] = artifact_capabilities(
+                session, source, slug, resolution=resolutions[slug]
+            )
     return cards
 
 
@@ -605,7 +615,10 @@ def _desktop_artifact_status_for_path(
     return dict(_BLANK_ARTIFACT_STATUS)
 
 
-@router.get("/")
+# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
+# whenever org mode has no org in scope.
+@router.get("/", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def list_artifacts(
     session: ScopedSessionDep,
     project_id: UUID | None = Query(default=None),
@@ -620,7 +633,7 @@ async def list_artifacts(
         # Local requests that carry both parameters have always preferred the
         # UUID. Do not let the ignored compatibility field enter resolution.
         if project_id is None:
-            catalog = _desktop_registered_path_catalog(session)
+            catalog = await run_in_threadpool(_desktop_registered_path_catalog, session)
             if not project_path or "\x00" in project_path:
                 return []
             requested = os.path.normpath(os.path.expanduser(project_path))
@@ -634,7 +647,7 @@ async def list_artifacts(
             source = _desktop_registered_source(catalog, requested, project_name)
             if source is None:
                 return []
-            return _artifact_cards(session, [source])
+            return await run_in_threadpool(_artifact_cards, session, [source])
     if project_id is not None:
         raw_project_ref = str(project_id)
         # Although FastAPI has already parsed this as UUID, make the recognized
@@ -645,23 +658,34 @@ async def list_artifacts(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Invalid project",
             )
-        return _scoped_project_cards(session, project_ref)
-    return _all_artifact_cards(session)
+        return await run_in_threadpool(_scoped_project_cards, session, project_ref)
+    return await run_in_threadpool(_all_artifact_cards, session)
 
 
 
-@router.delete("/{slug}", status_code=status.HTTP_204_NO_CONTENT)
+# AuthenticatedInOrgMode, declared explicitly: same ScopedSessionDep
+# fail-closed reasoning as list_artifacts above.
+@router.delete(
+    "/{slug}", status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
 async def delete_artifact_by_slug(
     slug: str,
-    session: ScopedSessionDep,
+    # Keep the dependency explicit: SAST treats the Annotated alias as an HTTP
+    # parameter, then incorrectly taints the server-owned artifact roots.
+    session: ScopedSession = Depends(get_scoped_session),
     project_id: UUID = Query(...),
+    # D7: an org admin may delete an artifact whose owner is unknown.
+    principal: Principal | None = Depends(get_principal),
 ):
     ref = _artifact_delete_ref(slug)
-    return await delete_artifact_for_request(session, ref, project_id=project_id)
+    return await delete_artifact_for_request(
+        session, ref, project_id=project_id, principal=principal
+    )
 
 
 async def delete_artifact_for_request(
-    session, slug: str | _ArtifactDeleteRef, *, project_id: UUID
+    session, slug: str | _ArtifactDeleteRef, *, project_id: UUID, principal: Principal | None = None
 ) -> None:
     """Delete one artifact of one project. Unpublishes first; a failed unpublish
     leaves the folder in place and surfaces the error."""
@@ -672,6 +696,8 @@ async def delete_artifact_for_request(
     # This helper is also called directly by internal/test code, so retain the
     # same concrete parsing boundary the HTTP adapter applies above. In
     # particular, no request-derived string can select a project path.
+    await require_product_permission(session.scope, "artifact.manage")
+
     project_id = UUID(str(project_id))
 
     # New clients address deletion by artifact id. Keep the slug fallback for
@@ -682,11 +708,11 @@ async def delete_artifact_for_request(
     source = None
     folder = None
     if ref.artifact_id is not None:
-        # `_artifact_delete_ref` already canonicalized this value, but carrying
-        # it through a dataclass hides that sanitizer from SAST dataflow. Parse
-        # again at the resolver boundary so the path-producing identity lookup
-        # receives a visibly canonical UUID, never the route string.
-        artifact_id = UUID(ref.artifact_id).hex
+        # Keep UUID validation and pass the basename output to the resolver:
+        # SAST does not recognize UUID parsing or dataclass fields as a path
+        # sanitizer. Parsing first rejects traversal instead of truncating it.
+        artifact_id = os.path.basename(UUID(ref.artifact_id).hex)
+        project_ref = os.path.basename(str(server_project_id))
         # Resolved through the review path so a reviewer who was granted access
         # to this draft is told they cannot delete it, instead of being told it
         # does not exist. Without a grant it still 404s — `require_artifact_owner`
@@ -694,7 +720,7 @@ async def delete_artifact_for_request(
         from cowork.api.v1.artifact_scope import review_artifact_for_request
 
         source, folder, _metadata, _is_own = review_artifact_for_request(
-            session, str(server_project_id), artifact_id
+            session, project_ref, artifact_id
         )
     else:
         # The legacy name is compared with entries discovered under each
@@ -706,9 +732,20 @@ async def delete_artifact_for_request(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
     folder_name = _artifact_folder_name(source, folder)
 
-    from cowork.services.artifact_permissions import require_artifact_owner
+    from cowork.services.artifact_ownership import resolve_artifact_owner
+    from cowork.services.artifact_permissions import (
+        may_delete_ownerless_artifact,
+        require_artifact_owner,
+    )
 
-    require_artifact_owner(session, source)
+    # One resolution for both decisions, so they cannot disagree.
+    resolution = resolve_artifact_owner(session, source, folder_name)
+    # D7: the only thing an unknown owner grants anyone is an org admin's delete.
+    admin_delete = may_delete_ownerless_artifact(
+        session, source, folder_name, principal, resolution=resolution
+    )
+    if not admin_delete:
+        require_artifact_owner(session, source, folder_name, resolution=resolution)
     expected_artifact_id = artifact_id if ref.artifact_id is not None else None
     publish_url, api_key = _resolve_publish_endpoint(get_user_settings())
     if _org_mode():
@@ -720,7 +757,11 @@ async def delete_artifact_for_request(
         # Unpublish acts on the viewer, and the viewer scopes by the token's owner,
         # so the credential has to be the acting user's - not a stored provider key
         # (org deployments have none).
-        api_key = await PublishKey(scope.user_id, scope.org_id, min_ttl_s=120.0).get()
+        from cowork.services.artifact_autopublish import _active_workspace_id
+
+        api_key = await PublishKey(
+            scope.user_id, scope.org_id, min_ttl_s=120.0, workspace_id=_active_workspace_id(scope)
+        ).get()
         if not api_key:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -740,12 +781,18 @@ async def delete_artifact_for_request(
                 existing_authorization_key,
                 expected_artifact_id,
                 scope,
-                owner_user_id=str(scope.user_id),
+                # The admin is not the identity's owner; passing their id would
+                # refuse the delete over an alias bound to the original creator.
+                owner_user_id=None if admin_delete else str(scope.user_id),
             )
             # A historical grant may predate the SQL alias. The auth delete
-            # checks its existing owner binding and never creates one.
-            authorization_id = canonical_key.split("/", 1)[1] if canonical_key else expected_artifact_id
-            await revoke_draft_review_access(authorization_id, scope)
+            # checks its existing owner binding and never creates one. An
+            # ownerless artifact without an alias never had a draft rule
+            # provisioned (provisioning needs an owner), so there is nothing
+            # to revoke on the admin path.
+            if canonical_key is not None or not admin_delete:
+                authorization_id = canonical_key.split("/", 1)[1] if canonical_key else expected_artifact_id
+                await revoke_draft_review_access(authorization_id, scope)
         except ArtifactAccessUnavailable as exc:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -783,8 +830,31 @@ async def delete_artifact_for_request(
     except Exception as e:
         raise HTTPException(status_code=500, detail="Could not delete artifact") from e
 
+    from cowork.services.artifact_ownership import forget_artifact_owner
 
-@router.get("/status", dependencies=[Depends(require_local_tenancy)])
+    # After the bytes are gone: a later artifact with the same slug starts with
+    # its own owner (a no-op outside org mode). Best-effort; a stale row is
+    # replaced on rekey and never grants anything to a folder that does not
+    # exist. Synchronous on purpose: it uses the request session, which must
+    # not cross threads, and it is one indexed lookup plus one delete.
+    try:
+        forget_artifact_owner(
+            session, source, folder_name, actor_id=str(session.scope.user_id)
+        )
+    except Exception:
+        logger.warning(
+            "Could not drop the owner of deleted artifact %s", folder_name, exc_info=True
+        )
+
+
+# The routes below (through delete_artifact_endpoint) are DesktopOnly, which
+# IS the require_local_tenancy guard: it 403s them outright in org mode, so they only
+# ever run on desktop, where there is no multi-tenant identity concept to
+# check in the first place. /proxy is the exception and says so at its own
+# definition. A comment covering a range of routes only holds while the range
+# does; each route carries the declaration itself, so inserting one here
+# cannot inherit this paragraph by accident.
+@router.get("/status", dependencies=[Depends(require(DesktopOnly))])
 async def artifact_status(
     session: ScopedSessionDep,
     path: str = Query(..., min_length=1, max_length=4096),
@@ -794,7 +864,7 @@ async def artifact_status(
     return _desktop_artifact_status_for_path(path, session)
 
 
-@router.get("/preview", dependencies=[Depends(require_local_tenancy)])
+@router.get("/preview", dependencies=[Depends(require(DesktopOnly))])
 async def preview_artifact(session: ScopedSessionDep, path: str = Query(...)):
     try:
         artifact = resolve_artifact_path(path, session=session)
@@ -815,13 +885,13 @@ class _ExportBody(BaseModel):
     format: str  # 'pdf' | 'docx' | 'html'
 
 
-@router.post("/export", dependencies=[Depends(require_local_tenancy)])
+@router.post("/export", dependencies=[Depends(require(DesktopOnly))])
 async def export_artifact_endpoint(req: _ExportBody, session: ScopedSessionDep):
     """Convert a document artifact (markdown/HTML) to PDF/Word/HTML, writing
     the result into the same artifact folder. Returns the new file's path so
     the client can open or download it.
 
-    The route-level `require_local_tenancy` is broader than the pdf/docx refusal
+    The route-level `DesktopOnly` is broader than the pdf/docx refusal
     inside: it takes `req.path`, an absolute server path, and nothing in an org
     deployment can say which organization that path belongs to. The inner check
     stays because it is the one the direct-call tests exercise, and because it
@@ -860,7 +930,7 @@ async def export_artifact_endpoint(req: _ExportBody, session: ScopedSessionDep):
     return {"path": str(out), "filename": out.name}
 
 
-@router.post("/preview-mount", dependencies=[Depends(require_local_tenancy)])
+@router.post("/preview-mount", dependencies=[Depends(require(DesktopOnly))])
 async def preview_mount_endpoint(
     req: _PathBody, request: Request, session: ScopedSessionDep
 ):
@@ -888,7 +958,7 @@ async def preview_mount_endpoint(
     return payload
 
 
-@router.get("/preview-asset/{token}/{rel_path:path}", dependencies=[Depends(require_local_tenancy)])
+@router.get("/preview-asset/{token}/{rel_path:path}", dependencies=[Depends(require(DesktopOnly))])
 async def preview_asset(token: str, rel_path: str, request: Request):
     parent = get_preview_mount(token)
     if parent is None:
@@ -904,16 +974,21 @@ async def preview_asset(token: str, rel_path: str, request: Request):
     if not target.is_file():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Asset not found")
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
-    if wants_comment_layer(media_type, request):
+    if wants_html_preview(media_type, request):
         # Offload the (potentially large) synchronous read so it doesn't stall
         # the event loop / other in-flight SSE streams — this endpoint is async.
-        resp = await run_in_threadpool(html_with_comment_layer, target)
+        resp = await run_in_threadpool(
+            html_preview_response, target, comments=wants_comment_layer(request)
+        )
         if resp is not None:
             return resp
     return FileResponse(target, media_type=media_type, headers=artifact_response_headers(media_type))
 
 
-@router.get("/serve/{project_name}/{file_path:path}", dependencies=[Depends(require_local_tenancy)])
+@router.get(
+    "/serve/{project_name}/{file_path:path}",
+    dependencies=[Depends(require(DesktopOnly))],
+)
 def serve_artifact_file(
     project_name: str,
     file_path: str,
@@ -936,14 +1011,14 @@ def serve_artifact_file(
     media_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
     # This endpoint is a sync `def`, so FastAPI already runs it in a threadpool
     # — the blocking read here doesn't touch the event loop.
-    if wants_comment_layer(media_type, request):
-        resp = html_with_comment_layer(target)
+    if wants_html_preview(media_type, request):
+        resp = html_preview_response(target, comments=wants_comment_layer(request))
         if resp is not None:
             return resp
     return FileResponse(target, media_type=media_type, headers=artifact_response_headers(media_type))
 
 
-@router.post("/open", dependencies=[Depends(require_local_tenancy)])
+@router.post("/open", dependencies=[Depends(require(DesktopOnly))])
 async def open_artifact(req: _PathBody, session: ScopedSessionDep):
     from cowork.services.artifacts import _org_mode, _NO_EXEC_DETAIL
     # In org mode this always refuses; see _org_mode's docstring in services/artifacts.py.
@@ -1004,7 +1079,7 @@ def _resolve_reveal_path(path: str, session: ScopedSession) -> Path:
     raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Path is not in a known project or artifact directory")
 
 
-@router.post("/reveal", dependencies=[Depends(require_local_tenancy)])
+@router.post("/reveal", dependencies=[Depends(require(DesktopOnly))])
 async def reveal_artifact(req: _PathBody, session: ScopedSessionDep):
     target = _resolve_reveal_path(req.path, session)
     try:
@@ -1024,6 +1099,7 @@ async def reveal_artifact(req: _PathBody, session: ScopedSessionDep):
 @router.api_route(
     "/proxy/{token}/{rel_path:path}",
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    dependencies=[Depends(require(OpenByDesign))],
 )
 async def proxy(token: str, rel_path: str, request: Request):
     """HTTP forwarder for fullstack-artifact previews.
@@ -1031,12 +1107,19 @@ async def proxy(token: str, rel_path: str, request: Request):
     Streams the request to the artifact's backend running on
     `127.0.0.1:<metadata.json port>`, injects CORS, strips hop-by-hop
     headers. See `cowork.services.preview_proxy` for the body.
+
+    OpenByDesign, not `DesktopOnly` like its siblings: the token is the
+    real guard here, not tenancy. `_PREVIEW_MOUNTS` (see
+    `cowork.services.artifacts.get_preview_mount`) is only ever populated by
+    `/preview-mount`, which IS `DesktopOnly` — so in org mode
+    this dict is permanently empty and any token 404s here regardless, by
+    construction rather than by a declared guard.
     """
     from cowork.services.preview_proxy import proxy_artifact_request
     return await proxy_artifact_request(token, rel_path, request)
 
 
-@router.delete("/", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require_local_tenancy)])
+@router.delete("/", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require(DesktopOnly))])
 def delete_artifact_endpoint(session: ScopedSessionDep, path: str = Query(...)):
     try:
         from cowork.services.publish import (

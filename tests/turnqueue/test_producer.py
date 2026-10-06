@@ -21,10 +21,14 @@ def _stub_llm_mint(monkeypatch):
 
 
 class FakeRedis:
-    def __init__(self, replies):
+    def __init__(self, replies, *, workspace_mode="persistent"):
         self.added = []
         self.registered = []
-        self._replies = replies
+        self._replies = list(replies)
+        if workspace_mode is not None:
+            self._replies.insert(0, ("scratchpad:reply:conv-1", _reply(
+                "progress", {"phase": "workspace_authorized", "workspace_mode": workspace_mode}
+            )))
 
     async def sadd(self, key, member):
         self.registered.append((key, member))
@@ -49,10 +53,36 @@ def _reply(kind, data):
     return {"payload": json.dumps({"correlation_id": "r", "kind": kind, "data": data})}
 
 
-async def _drain(gen):
+async def test_default_model_uses_the_verified_hosted_scope(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from cowork.common.settings import user_settings
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(prod, "get_app_settings", lambda: SimpleNamespace(tenancy_mode="org"))
+    monkeypatch.setattr(prod, "_mint_oauth_block", AsyncMock(return_value=None))
+
+    def current_settings(scope):
+        assert scope.org_mode is True
+        assert scope.org_id == "org-verified"
+        assert scope.user_id == "user-verified"
+        return SimpleNamespace(resolved_planning_model="minds-default")
+
+    monkeypatch.setattr(user_settings, "get_user_settings", current_settings)
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="org-verified", user_id="user-verified",
+        input_text="hi", model=None,
+    ))
+    job = json.loads(fake.added[0][1]["payload"])
+    assert job["params"]["model"] == "minds-default"
+
+
+async def _drain(gen, *, include_policy=False):
     """Exhaust the reply generator, returning its (kind, data) yields.
     Nothing happens (no mint, no XADD) before the first __anext__."""
-    return [item async for item in gen]
+    return [item async for item in gen if include_policy or item[0] != "progress"]
 
 
 @pytest.mark.asyncio
@@ -84,7 +114,8 @@ async def test_stream_remote_replies_yields_deltas_in_order(monkeypatch):
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi",
         model="m", history=[{"role": "user", "content": "prev"}]))
     job = json.loads(fake.added[0][1]["payload"])
-    assert job["op"] == "anton_turn"
+    assert job["op"] == "anton_turn_v2"
+    assert job["params"]["workspace_mode"] == "persistent"
     assert job["params"]["history"] == [{"role": "user", "content": "prev"}]
     assert items == [("turn_delta", {"text": "he"}),
                      ("turn_delta", {"text": "llo"}),
@@ -107,6 +138,95 @@ async def test_turn_failed_yields_classified_code_and_message(monkeypatch):
     assert data["code"] == "provider_overloaded"
     assert "momentarily overloaded" in data["message"]
     assert items == [items[-1]]  # terminal is the only yield, then the generator ends
+
+
+# What anton's worker sends, via scratchpad-controller, for a billing stop the
+# gate timed: `reset_at` beside `error` on the turn_failed reply.
+_FUSE_STOP = "FreeServingPausedError: Free serving for 'x' is paused until the daily budget resets."
+_ALLOWANCE_STOP = "AllowanceExhaustedError: Your included allowance for 'x' is exhausted."
+_WALLET_STOP = "WalletEmptyError: Your wallet has no balance to cover the model 'x'."
+_RESET_AT = "2026-09-26T00:00:00+00:00"
+
+
+async def _failed_turn(monkeypatch, data):
+    """The turn_failed data the producer yields for one worker reply."""
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_failed", data))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+    kind, failed = items[-1]
+    assert kind == "turn_failed"
+    return failed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected_code"),
+    [(_FUSE_STOP, te.FREE_SERVING_PAUSED_CODE), (_ALLOWANCE_STOP, te.ALLOWANCE_EXHAUSTED_CODE)],
+)
+async def test_turn_failed_keeps_the_workers_reset_at_for_a_timed_stop(
+    monkeypatch, error, expected_code
+):
+    # The hosted card needs the instant to say when the free way forward comes
+    # back, as the desktop card does from the gate's header.
+    data = await _failed_turn(monkeypatch, {"error": error, "reset_at": _RESET_AT})
+    assert data["code"] == expected_code
+    assert data["reset_at"] == _RESET_AT
+
+
+@pytest.mark.asyncio
+async def test_turn_failed_sends_reset_at_in_the_extended_iso_form(monkeypatch):
+    # Python parses compact and `Z` forms that a browser's Date may not, so the
+    # instant leaves in isoformat()'s extended form, offset unchanged.
+    data = await _failed_turn(
+        monkeypatch, {"error": _FUSE_STOP, "reset_at": "20260926T020000+0200"}
+    )
+    assert data["reset_at"] == "2026-09-26T02:00:00+02:00"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "reset_at",
+    [
+        pytest.param("2026-09-26T00:00:00", id="naive"),
+        pytest.param("tomorrow", id="junk"),
+        pytest.param("", id="empty"),
+        pytest.param(1790380800, id="epoch-number"),
+        pytest.param({"at": _RESET_AT}, id="object"),
+        pytest.param(None, id="null"),
+    ],
+)
+async def test_turn_failed_drops_a_reset_at_that_is_not_an_offset_aware_instant(
+    monkeypatch, reset_at
+):
+    # A naive time names a different moment in every timezone, and anything
+    # that is not an ISO instant would make every consumer re-validate it.
+    data = await _failed_turn(monkeypatch, {"error": _FUSE_STOP, "reset_at": reset_at})
+    assert data["code"] == te.FREE_SERVING_PAUSED_CODE
+    assert "reset_at" not in data
+
+
+@pytest.mark.asyncio
+async def test_turn_failed_never_carries_reset_at_outside_the_reset_codes(monkeypatch):
+    # The out-of-credits card offers no wait, so a reset instant on an empty
+    # wallet stop must not reach it.
+    assert te.TOKEN_LIMIT_CODE not in te.RESET_AT_CODES
+    data = await _failed_turn(monkeypatch, {"error": _WALLET_STOP, "reset_at": _RESET_AT})
+    assert data["code"] == te.TOKEN_LIMIT_CODE
+    assert "reset_at" not in data
+
+
+@pytest.mark.asyncio
+async def test_turn_failed_from_an_older_worker_is_unchanged(monkeypatch):
+    # An older worker sends no reset_at, and the reply keeps exactly the shape
+    # it had before the worker could send one.
+    data = await _failed_turn(monkeypatch, {"error": _FUSE_STOP})
+    assert data == {
+        "error": _FUSE_STOP,
+        "code": te.FREE_SERVING_PAUSED_CODE,
+        "message": te.FREE_SERVING_PAUSED_USER_MESSAGE,
+    }
 
 
 @pytest.mark.asyncio
@@ -199,6 +319,41 @@ async def test_oversized_request_sheds_whole_project_memory_first(monkeypatch):
     shedding = [warning for warning in warnings if "project memory" in warning]
     assert len(shedding) == 1
     assert "dropped project memory" in shedding[0]
+
+
+@pytest.mark.asyncio
+async def test_stream_remote_replies_forwards_started_at_only_when_known(monkeypatch):
+    # The pod renders this as the fixed "conversation started" date. Absent
+    # entirely when unknown so an older controller sees no new key.
+    fake = FakeRedis(replies=[
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+    ])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    async def fake_mint(**kw):
+        return "mdb_turnkey"
+
+    monkeypatch.setattr(prod, "mint_turn_key", fake_mint)
+
+    async def fake_list_active_connections(**kw):
+        return []
+
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        started_at="2026-09-01T08:15:00",
+    ))
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+
+    with_it = json.loads(fake.added[0][1]["payload"])["params"]
+    without = json.loads(fake.added[1][1]["payload"])["params"]
+    assert with_it["started_at"] == "2026-09-01T08:15:00"
+    assert "started_at" not in without
 
 
 @pytest.mark.asyncio
@@ -326,6 +481,67 @@ async def test_stream_remote_replies_mints_and_attaches_llm_block(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stream_remote_replies_forwards_the_active_hub_workspace(monkeypatch):
+    """cowork's own workspace selector (hub_workspaces.py) stores the caller's
+    pick as UserSettings.hub_workspace_id; the mint must forward it so the
+    key's spend lands in that workspace instead of always the org Default."""
+    from types import SimpleNamespace
+    from cowork.common.settings import user_settings
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(resolved_planning_model="m", hub_workspace_id="ws-1"),
+    )
+
+    captured = {}
+
+    async def _fake_mint(**kw):
+        captured.update(kw)
+        return "mdb_turnkey"
+
+    monkeypatch.setattr(prod, "mint_turn_key", _fake_mint)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
+        model="mindshub_air",
+    ))
+
+    assert captured["workspace_id"] == "ws-1"
+
+
+@pytest.mark.asyncio
+async def test_stream_remote_replies_omits_workspace_id_when_none_picked(monkeypatch):
+    from types import SimpleNamespace
+    from cowork.common.settings import user_settings
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(resolved_planning_model="m", hub_workspace_id=""),
+    )
+
+    captured = {}
+
+    async def _fake_mint(**kw):
+        captured.update(kw)
+        return "mdb_turnkey"
+
+    monkeypatch.setattr(prod, "mint_turn_key", _fake_mint)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
+        model="mindshub_air",
+    ))
+
+    assert captured["workspace_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_mint_llm_block_uses_minds_coding_default():
     # The pod runs on minds-cloud, so the coding model must be a minds alias.
     # Default = the free-bucket model (mindshub_air): a fresh org has no wallet
@@ -442,6 +658,10 @@ async def test_replies_refresh_the_idle_deadline(monkeypatch):
         async def xread(self, streams, count=None, block=None):
             self.reads += 1
             await asyncio.sleep(self._delay)
+            if self.reads == 1:
+                return [["scratchpad:reply:conv-1", [["1-0", _reply(
+                    "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+                )]]]]
             self._quiet = not self._quiet
             if self._quiet:
                 return None
@@ -527,6 +747,56 @@ def test_step_stream_events_unknown_step_yields_nothing():
     assert prod.step_stream_events({"step": "mystery"}) == []
 
 
+def test_step_stream_events_ask_user_becomes_a_question():
+    from anton.core.llm.provider import StreamAskUser
+
+    [event] = prod.step_stream_events({
+        "step": "ask_user", "id": "ask:1", "prompt": "Which database?",
+        "options": [{"value": "pg", "label": "postgres", "detail": "local"},
+                    {"value": "my"}],
+        "select": "many", "allow_custom": False, "timeout_s": 300,
+    })
+    assert isinstance(event, StreamAskUser)
+    assert event.id == "ask:1"
+    request = event.request
+    assert request.prompt == "Which database?"
+    assert request.kind == "choice"
+    assert [(o.value, o.label, o.detail) for o in request.options] == [
+        ("pg", "postgres", "local"), ("my", "my", "")]
+    assert (request.select, request.allow_custom, request.timeout_s) == ("many", False, 300)
+
+
+def test_step_stream_events_ask_user_defaults():
+    [event] = prod.step_stream_events({"step": "ask_user", "id": "ask:1", "prompt": "Q",
+                                       "options": [{"value": "a"}, {"value": "b"}],
+                                       "timeout_s": "soon"})
+    assert event.request.select == "one"
+    assert event.request.allow_custom is True
+    assert event.request.timeout_s is None
+
+
+def test_step_stream_events_ask_user_answered_retires_the_question():
+    from anton.core.llm.provider import StreamAskUserAnswered
+
+    [event] = prod.step_stream_events({
+        "step": "ask_user_answered", "id": "ask:1", "status": "answered",
+        "values": ["pg"], "text": "", "answer_id": "a1",
+    })
+    assert isinstance(event, StreamAskUserAnswered)
+    assert event.id == "ask:1"
+    assert (event.answer.status, event.answer.values, event.answer.text) == ("answered", ("pg",), "")
+
+
+def test_step_stream_events_rejection_is_not_rendered():
+    assert prod.step_stream_events({"step": "ask_user_answer_rejected", "id": "ask:1",
+                                    "answer_id": "a1", "reason": "invalid_option"}) == []
+
+
+def test_step_stream_events_question_without_an_id_is_dropped():
+    assert prod.step_stream_events({"step": "ask_user", "prompt": "Q", "options": []}) == []
+    assert prod.step_stream_events({"step": "ask_user_answered", "status": "answered"}) == []
+
+
 @pytest.mark.asyncio
 async def test_turn_skill_reaches_the_caller(monkeypatch):
     """The kind filter is a whitelist: a kind missing from it is dropped
@@ -564,3 +834,170 @@ async def test_turn_history_reaches_the_caller(monkeypatch):
     items = await _drain(prod.stream_remote_replies(
         conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
     assert items == [("turn_history", {"rows": rows}), ("turn_completed", {})]
+
+
+@pytest.mark.asyncio
+async def test_turn_compaction_reaches_the_caller(monkeypatch):
+    """Dropped by the same whitelist, the summary never reaches the handler
+    that saves it and every turn goes back to resending the whole conversation
+    for the pod to summarize again — invisible to the behavioural tests,
+    because the turn itself still succeeds."""
+    payload = {"summary": "## Goal\nship it", "covered_through": 12}
+    fake = FakeRedis(replies=[
+        ("scratchpad:reply:conv-1", _reply("turn_compaction", payload)),
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+    ])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+    assert items == [("turn_compaction", payload), ("turn_completed", {})]
+
+
+pytestmark = pytest.mark.usefixtures("granted_product_permissions")
+
+
+@pytest.mark.parametrize("can_manage,resolved_mode", [(True, "persistent"), (True, "ephemeral"), (False, "ephemeral")])
+async def test_workspace_authority_is_sent_and_acknowledged_before_turn_events(monkeypatch, can_manage, resolved_mode):
+    async def allowed(scope, permission):
+        return permission == "product.execute" or can_manage
+
+    monkeypatch.setattr(prod.product_permissions, "has_product_permission", allowed)
+    fake = FakeRedis([
+        ("scratchpad:reply:conv-1", _reply("turn_delta", {"text": "answer"})),
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+    ], workspace_mode=resolved_mode)
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"
+    ), include_policy=True)
+    job = json.loads(fake.added[0][1]["payload"])
+    assert job["op"] == "anton_turn_v2"
+    assert job["params"]["workspace_mode"] == ("persistent" if can_manage else "ephemeral")
+    assert items == [
+        ("progress", {"phase": "workspace_authorized", "workspace_mode": resolved_mode}),
+        ("turn_delta", {"text": "answer"}),
+        ("turn_completed", {}),
+    ]
+
+
+@pytest.mark.parametrize("reply", [
+    ("error", {"error": "unsupported op 'anton_turn_v2'"}),
+    ("turn_delta", {"text": "must not be shown"}),
+    ("turn_completed", {}),
+    ("turn_failed", {"code": "permission_unavailable", "error": "private authority detail"}),
+])
+async def test_worker_without_verified_storage_policy_fails_terminally(monkeypatch, reply):
+    fake = FakeRedis([("scratchpad:reply:conv-1", _reply(*reply))], workspace_mode=None)
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"
+    ), include_policy=True)
+    assert len(items) == 1
+    assert items[0][0] == "turn_failed"
+    assert items[0][1]["code"] == "permission_unavailable"
+    assert "private authority detail" not in items[0][1]["message"]
+
+
+@pytest.mark.parametrize("resolved_mode", [None, True, "unknown", "persistent"])
+async def test_worker_cannot_upgrade_or_malform_execution_only_policy(monkeypatch, resolved_mode):
+    async def allowed(scope, permission):
+        return permission == "product.execute"
+
+    monkeypatch.setattr(prod.product_permissions, "has_product_permission", allowed)
+    fake = FakeRedis([("scratchpad:reply:conv-1", _reply(
+        "progress", {"phase": "workspace_authorized", "workspace_mode": resolved_mode}
+    ))], workspace_mode=None)
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"
+    ), include_policy=True)
+    assert len(items) == 1
+    assert items[0][0] == "turn_failed"
+    assert items[0][1]["code"] == "permission_unavailable"
+
+
+async def test_worker_cannot_change_an_acknowledged_mount_policy(monkeypatch):
+    fake = FakeRedis([("scratchpad:reply:conv-1", _reply(
+        "progress", {"phase": "workspace_authorized", "workspace_mode": "ephemeral"}
+    ))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"
+    ), include_policy=True)
+    assert items[0] == ("progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"})
+    assert items[1][0] == "turn_failed"
+    assert items[1][1]["code"] == "permission_unavailable"
+
+
+async def test_artifact_authority_outage_stops_before_queue_side_effects(monkeypatch):
+    from unittest.mock import Mock
+
+    permissions = []
+
+    async def allowed(scope, permission):
+        permissions.append(permission)
+        if permission == "artifact.manage":
+            raise prod.product_permissions.ProductPermissionUnavailable()
+        return True
+
+    redis = Mock(side_effect=AssertionError("Authority outage must not reach Redis"))
+    monkeypatch.setattr(prod.product_permissions, "has_product_permission", allowed)
+    monkeypatch.setattr(prod, "get_redis", redis)
+    with pytest.raises(prod.product_permissions.ProductPermissionUnavailable):
+        await _drain(prod.stream_remote_replies(
+            conversation_id="conv-1", org_id="org", user_id="user", input_text="run",
+            model="m", llm={"api_key": "already-minted-key"},
+        ))
+    assert permissions == ["product.execute", "artifact.manage"]
+    redis.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interactive", [True, False])
+async def test_interactive_reaches_the_job_params(monkeypatch, interactive):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m", interactive=interactive))
+    job = json.loads(fake.added[0][1]["payload"])
+    assert job["params"]["interactive"] is interactive
+
+
+@pytest.mark.asyncio
+async def test_interactive_defaults_to_false(monkeypatch):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m"))
+    assert json.loads(fake.added[0][1]["payload"])["params"]["interactive"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_messages", [True, False])
+async def test_tool_messages_reaches_the_job_params(monkeypatch, tool_messages):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m", tool_messages=tool_messages))
+    job = json.loads(fake.added[0][1]["payload"])
+    assert job["params"]["tool_messages"] is tool_messages
+
+
+@pytest.mark.asyncio
+async def test_tool_messages_defaults_to_false(monkeypatch):
+    """Channel turns (turnqueue/remote_turn.py) never pass it: a bot cannot
+    render a tool's message, so the tool hands the content to the agent."""
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m"))
+    assert json.loads(fake.added[0][1]["payload"])["params"]["tool_messages"] is False

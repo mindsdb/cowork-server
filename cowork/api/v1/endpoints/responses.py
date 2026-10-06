@@ -16,7 +16,9 @@ from pydantic import BaseModel, Field, StringConstraints
 from sqlmodel import Session
 from starlette.responses import JSONResponse
 
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.common.logger import setup_logging
+from cowork.common.settings.app_settings import TurnQueueSettings
 from cowork.db.scoped import (
     MissingTenantScopeError,
     TenantScope,
@@ -31,11 +33,22 @@ from cowork.streaming.answers import SubmitResult, broker
 from cowork.streaming.backend import get_backend
 from cowork.streaming.buffer import RedisStreamBuffer
 from cowork.streaming.turn_index import get_turn, list_turns
+from cowork.turnqueue.answers import RemoteAnswerResult, submit_remote_answer
 from cowork.turnqueue.redis_client import cancel_flag_key, get_redis
 
 
 logger = setup_logging()
 
+# Declared per route, not on the router: options_handler below has to be
+# genuinely open, and a route-level dependency is ADDED to its router's rather
+# than substituted for it — a router-level AuthenticatedInOrgMode would still
+# run on the preflight and 401 it, because TrustedHeaderMiddleware builds no
+# Principal for an OPTIONS request. Every route that carries
+# AuthenticatedInOrgMode below already fails closed on its own too
+# (_require_streaming_scope in this module raises MissingTenantScopeError ->
+# 401 exactly like ScopedSession, and POST / builds its own ScopedSession
+# inside ResponsesHandler); declaring it makes that visible to the route
+# walker instead of only to someone reading those checks.
 router = APIRouter()
 SessionDep = Annotated[Session, Depends(get_session)]
 TenantScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
@@ -162,7 +175,9 @@ _SSE_HEADERS = {
 }
 
 
-@router.options("/")
+# OpenByDesign, standalone reason: hardcoded CORS-preflight response, no
+# identity or data involved.
+@router.options("/", dependencies=[Depends(require(OpenByDesign))])
 async def options_handler():
     return JSONResponse(
         content={"message": "OK"},
@@ -174,7 +189,7 @@ async def options_handler():
     )
 
 
-@router.post("/")
+@router.post("/", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def responses(
     responses_request: ResponsesRequest,
     session: SessionDep,
@@ -189,7 +204,7 @@ async def responses(
     return result
 
 
-@router.get("/in-flight-list")
+@router.get("/in-flight-list", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def in_flight_list(scope: TenantScopeDep):
     """Conversations with a turn running. The renderer uses it to sync stream
     state across clients/boots. Scoped to the caller's org so it can't
@@ -223,7 +238,7 @@ async def in_flight_list(scope: TenantScopeDep):
     return {"in_flight": out}
 
 
-@router.get("/in-flight")
+@router.get("/in-flight", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def in_flight(scope: TenantScopeDep, conversation_id: str | None = None):
     """Probe so the renderer can decide whether to open a /tail on mount.
 
@@ -258,7 +273,7 @@ class CancelRequest(BaseModel):
     conversation_id: str
 
 
-@router.post("/cancel")
+@router.post("/cancel", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def cancel_response(req: CancelRequest, scope: TenantScopeDep):
     """Halt the in-flight producer (Stop button). Fetch-abort / tab-close
     does NOT cancel — only this does.
@@ -315,7 +330,34 @@ class AnswerRequest(BaseModel):
     skipped: bool | None = None
 
 
-@router.post("/answer")
+# Response per answer outcome, shared by the in-process broker (SubmitResult)
+# and the remote pod path (RemoteAnswerResult); both enums use these values.
+_ANSWER_RESPONSES: dict[str, tuple[int, dict]] = {
+    "not_found": (404, {"status": "not_found"}),
+    "already_answered": (409, {"accepted": False, "status": "already_answered"}),
+    "invalid_option": (400, {"status": "invalid_option"}),
+    "too_large": (400, {"status": "answer_too_large"}),
+}
+
+
+def _answer_response(result: SubmitResult | RemoteAnswerResult):
+    # Exhaustive on purpose, with a raising default: callers settle
+    # authorization before this runs, so the cost of a fall-through is not an
+    # access-control hole but a desynchronised UI — a new result member
+    # answered as 200 {"accepted": true} while the
+    # future stayed unresolved, so the card would render as delivered and the
+    # turn would hang to its 300 s timeout. A 500 is the right direction for
+    # "the server does not understand its own state".
+    value = getattr(result, "value", None)
+    if value == "accepted":
+        return {"accepted": True}
+    if value not in _ANSWER_RESPONSES:
+        raise AssertionError(f"unhandled answer result: {result}")
+    status_code, content = _ANSWER_RESPONSES[value]
+    return JSONResponse(status_code=status_code, content=content)
+
+
+@router.post("/answer", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
     """Deliver the user's answer to a question a turn is blocked on.
 
@@ -323,11 +365,32 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
     question. 409 means somebody already answered — a second tab, or a
     double click. The client's source of truth for what was chosen is the
     response.ask_user_answered event, not its own click.
+
+    On the remote backend the question lives in a pod: the answer is queued
+    in Redis for the turn's controller and the status is the pod's own
+    verdict (turnqueue/answers.py).
     """
     _require_streaming_scope(scope)
-    handle = _authorized_handle(registry.get(req.conversation_id), scope)
-    if handle is None:
-        return JSONResponse(status_code=404, content={"status": "not_found"})
+    # Keyed off the backend setting rather than local-registry presence (the
+    # way /cancel and /tail check first): on the replica that owns this turn a
+    # registry handle exists, but the broker it would submit to never holds a
+    # pod's question — the pod is the source of truth on the remote backend —
+    # so a registry-first check here would 404 on the very replica that could
+    # otherwise serve the request. Remote mode also requires
+    # COWORK_STREAM_BACKEND=redis: _shared_turn (used below) returns None on
+    # any other stream backend, so a misconfigured deployment 404s instead of
+    # silently falling through to the in-process broker.
+    remote = TurnQueueSettings().is_remote
+    correlation_id = None
+    if remote:
+        found = await _shared_turn(req.conversation_id, scope)
+        if found is None or not found.in_flight:
+            return JSONResponse(status_code=404, content={"status": "not_found"})
+        correlation_id = found.index["correlation_id"]
+    else:
+        handle = _authorized_handle(registry.get(req.conversation_id), scope)
+        if handle is None:
+            return JSONResponse(status_code=404, content={"status": "not_found"})
 
     values = [v for v in (req.values or []) if v]
     text = (req.text or "").strip()
@@ -345,30 +408,19 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
     if skipped:
         payload["skipped"] = True
 
-    # Exhaustive on purpose, with a raising default: authorization is already
-    # settled by here (:_authorized_handle above), so the cost of a fall-through
-    # is not an access-control hole but a desynchronised UI — a new
-    # SubmitResult member would answer 200 {"accepted": true} while the
-    # future stayed unresolved, so the card would render as delivered and the
-    # turn would hang to its 300 s timeout. A 500 is the right direction for
-    # "the server does not understand its own state".
-    result = broker.submit(req.conversation_id, req.question_id, payload)
-    match result:
-        case SubmitResult.ACCEPTED:
-            return {"accepted": True}
-        case SubmitResult.NOT_FOUND:
-            return JSONResponse(status_code=404, content={"status": "not_found"})
-        case SubmitResult.ALREADY_ANSWERED:
-            return JSONResponse(
-                status_code=409, content={"accepted": False, "status": "already_answered"}
-            )
-        case SubmitResult.INVALID_OPTION:
-            return JSONResponse(status_code=400, content={"status": "invalid_option"})
-        case _:
-            raise AssertionError(f"unhandled SubmitResult: {result}")
+    if remote:
+        remote_result = await submit_remote_answer(
+            conversation_id=req.conversation_id,
+            correlation_id=correlation_id,
+            question_id=req.question_id,
+            payload=payload,
+        )
+        return _answer_response(remote_result)
+
+    return _answer_response(broker.submit(req.conversation_id, req.question_id, payload))
 
 
-@router.get("/tail")
+@router.get("/tail", dependencies=[Depends(require(AuthenticatedInOrgMode))])
 async def tail_response(
     scope: TenantScopeDep,
     conversation_id: str = Query(..., description="Conversation to tail."),

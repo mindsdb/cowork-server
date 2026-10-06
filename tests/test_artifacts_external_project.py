@@ -334,7 +334,9 @@ def test_the_artifacts_route_lists_an_adopted_folder(projects_root, tmp_path):
 
     served = client.get(card["serveUrl"])
     assert served.status_code == 200, served.text
-    assert served.text == "<html></html>"
+    # Every HTML preview now carries the storage shim (see preview_html.py);
+    # this route is not what's under test here, only that it resolves at all.
+    assert "anton-preview" in served.text
 
 
 def test_published_state_still_returns_the_blank_default_when_the_database_errors(

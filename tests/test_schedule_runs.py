@@ -218,7 +218,7 @@ def test_execute_schedule_stamps_trace_identity(monkeypatch):
     captured: list = []
 
     class FakeHandler:
-        def __init__(self, session, principal=None):
+        def __init__(self, session, principal=None, interactive=True):
             pass
 
         async def handle(self, request):
@@ -296,7 +296,7 @@ def test_execute_schedule_resolves_default_sentinel_to_none(monkeypatch):
     captured: list = []
 
     class FakeHandler:
-        def __init__(self, session, principal=None):
+        def __init__(self, session, principal=None, interactive=True):
             pass
 
         async def handle(self, request):
@@ -347,7 +347,7 @@ def test_execute_schedule_passes_pinned_model_through(monkeypatch):
     captured: list = []
 
     class FakeHandler:
-        def __init__(self, session, principal=None):
+        def __init__(self, session, principal=None, interactive=True):
             pass
 
         async def handle(self, request):
@@ -390,7 +390,7 @@ def test_execute_schedule_passes_pinned_model_through(monkeypatch):
 # the turn receives that principal so the remote backend can mint the org's key
 # headlessly.
 
-def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch):
+def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch, granted_product_permissions):
     import asyncio
 
     import cowork.handlers.responses as responses_mod
@@ -410,8 +410,9 @@ def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch):
     captured: dict = {}
 
     class FakeHandler:
-        def __init__(self, session, principal=None):
+        def __init__(self, session, principal=None, interactive=True):
             captured["principal"] = principal
+            captured["interactive"] = interactive
 
         async def handle(self, request):
             async def _gen():
@@ -450,6 +451,9 @@ def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch):
         assert principal is not None, "the turn must receive a service principal"
         assert principal.org_id == org_id
         assert principal.user_id == user_id
+        # Nobody is watching a scheduled run to answer an ask_user card, so the
+        # handler must be built non-interactive regardless of ask_user_enabled.
+        assert captured["interactive"] is False
 
         # The conversation was created under the owning org, not as an invisible
         # NULL-org row.
@@ -637,7 +641,7 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
     from cowork.services.schedules import ScheduleService
 
     class FakeHandler:
-        def __init__(self, session, principal=None):
+        def __init__(self, session, principal=None, interactive=True):
             pass
 
         async def handle(self, request):
@@ -752,7 +756,7 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
     seen: dict = {}
 
     class FakeHandler:
-        def __init__(self, session, principal=None):
+        def __init__(self, session, principal=None, interactive=True):
             pass
 
         async def handle(self, request):
@@ -781,7 +785,7 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
         s.close()
 
 
-def test_execute_schedule_derives_service_principal_in_org_mode(monkeypatch):
+def test_execute_schedule_derives_service_principal_in_org_mode(monkeypatch, granted_product_permissions):
     """A schedule's own org_id/created_by — stamped when a real user created it
     through the request-scoped path — is what fires the turn in org mode. No
     live request principal exists at cron time, so the schedule row is the only
@@ -831,7 +835,7 @@ def test_execute_schedule_derives_service_principal_in_org_mode(monkeypatch):
     seen: dict = {}
 
     class FakeHandler:
-        def __init__(self, session, principal=None):
+        def __init__(self, session, principal=None, interactive=True):
             seen["principal"] = principal
 
         async def handle(self, request):

@@ -133,7 +133,7 @@ class CodeOnlyRuntime:
         prepared = (
             self.workspaces.restore(lease.task.id, lease.project, lease.workspaces)
             if lease.run.workspace_resume_mode == "restore" and can_restore
-            else self.workspaces.prepare(lease.task.id, lease.project)
+            else self.workspaces.prepare(lease.task.id, lease.project, lease.task.repository_setup)
         )
         self.client.event(lease, "workspace", {
             "items": [item.model_dump(mode="json") for item in prepared.workspaces],
@@ -525,7 +525,11 @@ class CodeOnlyRuntime:
         result, error = operations.execute(command)
         self.client.acknowledge(lease, command, result, error)
 
-    def _approval(self, lease: RuntimeLease, method: str, params: dict[str, Any] | None) -> dict[str, str]:
+    def _approval(self, lease: RuntimeLease, method: str, params: dict[str, Any] | None) -> dict[str, Any]:
+        # Structured questions currently belong to local task control. Never
+        # misrepresent an unsupported question as a remote security approval.
+        if method == "item/tool/requestUserInput":
+            return {"answers": {}}
         approval_id = f"approval-{lease.run.id}-{uuid.uuid4()}"
         resolved = threading.Event()
         decision: dict[str, str] = {}

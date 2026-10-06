@@ -7,6 +7,7 @@ from pathlib import Path
 
 from cowork.coding.contracts import (
     CodingEvent,
+    CodingSession,
     EngineCapabilities,
     EngineCommand,
     EventType,
@@ -36,13 +37,44 @@ def repository(tmp_path: Path) -> Path:
     return repo
 
 
-def wait_for_status(service: CodingService, session_id: str, status: SessionStatus) -> None:
+def wait_for_status(service: CodingService, session_id: str, status: SessionStatus) -> CodingSession:
+    """Wait for a task to reach ``status`` and return it as it is then."""
     deadline = time.monotonic() + 3
     while time.monotonic() < deadline:
-        if service.get_session(session_id).status == status:
-            return
+        session = service.get_session(session_id)
+        if session.status == status:
+            return session
         time.sleep(0.01)
-    assert service.get_session(session_id).status == status
+    session = service.get_session(session_id)
+    assert session.status == status
+    return session
+
+
+def wait_for_turn_thread(session_id: str) -> None:
+    """Wait for a task's turn thread to exit.
+
+    The thread reports the turn's end, then drains the task's queue
+    (``Turns._continue_queue``). A test that queues work as soon as it sees
+    ``completed`` races that drain for the task's reservation, so it waits
+    here first.
+    """
+    for thread in threading.enumerate():
+        if thread.name == f"coding-turn-{session_id[:8]}":
+            thread.join(timeout=3)
+            assert not thread.is_alive(), "the turn thread did not exit"
+
+
+def wait_for_workspace(service: CodingService, session_id: str) -> CodingSession:
+    """Wait for a new task's background preparation to give it a workspace."""
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        session = service.get_session(session_id)
+        if session.workspace_path or session.status == SessionStatus.failed:
+            return session
+        time.sleep(0.01)
+    session = service.get_session(session_id)
+    assert session.workspace_path, "the task workspace was not prepared"
+    return session
 
 
 def wait_for_steers(engine: FakeEngine) -> None:

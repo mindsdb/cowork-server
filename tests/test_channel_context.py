@@ -99,7 +99,8 @@ def test_stream_response_forwards_channel_context(monkeypatch):
     received = {}
 
     async def _fake_build(
-        self, conversation, model=None, reasoning_effort=None, disabled_connections=None, channel_context=None
+        self, conversation, model=None, reasoning_effort=None, disabled_connections=None, channel_context=None,
+        tool_messages=False,
     ):
         received["channel_context"] = channel_context
         return _FakeSession(), None, None
@@ -124,8 +125,5 @@ def test_stream_response_forwards_channel_context(monkeypatch):
     assert received["channel_context"] is ctx
 
 
-def test_harness_signatures_accept_channel_context():
-    from cowork.harnesses.hermes_harness.harness import HermesHarness
-
+def test_harness_signature_accepts_channel_context():
     assert "channel_context" in inspect.signature(AntonHarness.stream_response).parameters
-    assert "channel_context" in inspect.signature(HermesHarness.stream_response).parameters

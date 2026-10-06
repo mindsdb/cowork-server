@@ -82,3 +82,25 @@ class TestSaveConnectionDirectReturnsUserLabel:
         second_result = save_connection_direct(second, LOCAL_SCOPE)
         assert first_result["name"] != second_result["name"]
         assert second_result["user_label"] == "Other Workspace"
+
+    def test_falls_back_to_account_email_when_account_name_is_empty(self, tmp_path, monkeypatch):
+        # None of the Google-family scopes (Drive/Calendar/Ads/Analytics/
+        # Gmail) include profile/openid, so Electron's oauth-identity.ts
+        # never resolves an account_name for them — without the
+        # account_email fallback, default_label fell back to None, and
+        # persist_connection defaulted the label to the bare engine id
+        # ("gmail"), de-duplicated with a trailing counter on a second
+        # account ("gmail 2"). That leaks into the tile subtitle next to the
+        # email. Mirrors oauth/google.py's callback() (the web flow) fix.
+        monkeypatch.setattr(
+            "cowork.api.v1.endpoints.connectors.connections.ConnectorSettings",
+            lambda: type("S", (), {"vault_dir": str(tmp_path / "vault")})(),
+        )
+        body = DirectSaveRequest(
+            connector_id="gmail",
+            method="browser_oauth_builtin",
+            name="",
+            values={"access_token": "tok", "account_email": "user@example.com", "account_name": ""},
+        )
+        result = save_connection_direct(body, LOCAL_SCOPE)
+        assert result["user_label"] == "user@example.com"

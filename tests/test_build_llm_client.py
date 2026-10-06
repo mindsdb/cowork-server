@@ -12,6 +12,7 @@ provider classes and capturing the constructor kwargs:
   - anthropic gets no base_url kwarg (its SDK has no such arg).
 """
 import inspect
+import logging
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
@@ -22,7 +23,9 @@ from anton.core.llm.provider import ProviderAuthError
 from pydantic import SecretStr
 
 from cowork.common.settings import runtime_credential
+from cowork.common.settings.app_settings import ROUTER_MODEL_DEFAULTS
 from cowork.common.settings.user_settings import Provider, UserSettings
+from cowork.services import providers
 from cowork.services.providers import GEMINI_BASE_URL
 
 
@@ -65,14 +68,14 @@ def build(monkeypatch):
         "anton.core.llm.anthropic.AnthropicProvider", _capture("anthropic")
     )
 
-    def _build(settings: UserSettings, effort_override=None):
+    def _build(settings: UserSettings, effort_override=None, model_override=None):
         monkeypatch.setattr(
             "cowork.common.settings.user_settings.get_user_settings",
             lambda: settings,
         )
         from cowork.services.providers import build_llm_client
 
-        client = build_llm_client(effort_override=effort_override)
+        client = build_llm_client(effort_override=effort_override, model_override=model_override)
         return client, calls
 
     return _build
@@ -141,7 +144,8 @@ def test_anthropic_gets_no_base_url_kwarg(build):
     assert "api_key_provider" not in kw
 
 
-def test_missing_key_error_names_the_actual_provider(build):
+@pytest.mark.parametrize("model", [None, "picked"])
+def test_missing_key_error_names_the_actual_provider(build, model):
     # gemini/openai-compatible go through the OpenAIProvider branch but the
     # "not configured" message must name the real provider, not "OpenAI".
     settings = UserSettings(
@@ -150,7 +154,7 @@ def test_missing_key_error_names_the_actual_provider(build):
         # no key anywhere → no fallback either
     )
     with pytest.raises(ValueError, match="Gemini API key is not configured"):
-        build(settings)
+        build(settings, model_override=model)
 
 
 def test_openai_compatible_without_base_raises(build):
@@ -457,3 +461,259 @@ def test_no_effort_override_falls_back_to_existing_behavior(build):
     )
     _client, calls = build(settings)  # no effort_override — default None
     assert calls["openai"][-1].get("reasoning_effort") == "high"
+
+
+@pytest.mark.parametrize(
+    "model,effort,expected_effort",
+    [
+        ("picked", None, None),
+        ("picked", "low", "low"),
+        ("old", None, "high"),
+        ("old", "low", "low"),
+    ],
+)
+def test_model_override_keeps_only_applicable_effort(build, model, effort, expected_effort):
+    settings = UserSettings(
+        planning_provider=Provider.OPENAI, coding_provider=Provider.OPENAI,
+        router_provider=Provider.OPENAI, openai_api_key=SecretStr("test-key"),
+        planning_model="old", coding_model="old", router_model="old",
+        planning_reasoning_effort="high", coding_reasoning_effort="high",
+        router_reasoning_effort="none",
+    )
+    client, calls = build(settings, model_override=model, effort_override=effort)
+    assert (client.planning_model, client.coding_model, client.router_model) == (model,) * 3
+    # The router never takes the composer's pick. Nor, here, its own effort:
+    # on direct OpenAI the gate runs gpt-5.5-mini on the router's provider,
+    # not "old" (see test_router_effort_is_sent_only_where_the_gate_runs_the_router_model).
+    assert [kw.get("reasoning_effort") for kw in calls["openai"]] == [
+        None, expected_effort, expected_effort
+    ]
+    assert (settings.planning_model, settings.coding_model, settings.router_model) == ("old",) * 3
+
+
+@pytest.mark.parametrize("effort", [None, "low"])
+def test_model_override_preserves_other_provider_roles_and_credentials(build, effort):
+    settings = UserSettings(
+        planning_provider=Provider.OPENAI, openai_api_key=SecretStr("openai-key"),
+        coding_provider=Provider.ANTHROPIC, router_provider=Provider.ANTHROPIC,
+        anthropic_api_key=SecretStr("anthropic-key"),
+        planning_model="old", coding_model="claude-coding", router_model="claude-router",
+        coding_reasoning_effort="high",
+    )
+    client, calls = build(settings, model_override="picked-openai", effort_override=effort)
+    assert client.planning_model == "picked-openai"
+    assert client.coding_model == "claude-coding"
+    assert client.router_model == "claude-router"
+    assert calls["openai"][0]["api_key"] == "openai-key"
+    assert all(kw["api_key"] == "anthropic-key" for kw in calls["anthropic"])
+    assert calls["anthropic"][-1]["reasoning_effort"] == "high"
+
+
+# ── The router's own reasoning effort ───────────────────────────────────
+
+def _openai_compatible(**kw) -> UserSettings:
+    """All three roles on one openai_compatible endpoint, each with its model."""
+    return UserSettings(
+        planning_provider=Provider.OPENAI_COMPATIBLE,
+        coding_provider=Provider.OPENAI_COMPATIBLE,
+        router_provider=Provider.OPENAI_COMPATIBLE,
+        planning_model="gpt-5.6-sol",
+        coding_model="gpt-5.6-luna",
+        router_model="gpt-5.6-luna",
+        openai_compatible_api_key=SecretStr("sk-compat"),
+        openai_base_url="https://example-resource.openai.azure.com/openai/v1",
+        **kw,
+    )
+
+
+def test_router_effort_reaches_the_router_and_only_the_router(build):
+    # A reasoning router sends "none" so the gate's one function tool is
+    # accepted on chat completions; planning and coding keep their own.
+    _client, calls = build(_openai_compatible(router_reasoning_effort="none"))
+    router, planning, coding = calls["openai"]
+    assert router["reasoning_effort"] == "none"
+    assert "reasoning_effort" not in planning
+    assert "reasoning_effort" not in coding
+
+
+@pytest.mark.parametrize("router_effort", [None, ""])
+def test_an_unset_or_empty_router_effort_is_omitted(build, router_effort):
+    # A model that doesn't reason refuses any reasoning_effort, so an unset
+    # value, or the empty one a deployment passes for an unset variable,
+    # sends no field at all.
+    _client, calls = build(_openai_compatible(router_reasoning_effort=router_effort))
+    assert "reasoning_effort" not in calls["openai"][0]
+
+
+def test_the_composer_effort_never_replaces_the_router_effort(build):
+    # The per-task pick is chosen for the chat model; the router keeps its own.
+    _client, calls = build(
+        _openai_compatible(router_reasoning_effort="none"), effort_override="high"
+    )
+    router, planning, coding = calls["openai"]
+    assert router["reasoning_effort"] == "none"
+    assert planning["reasoning_effort"] == coding["reasoning_effort"] == "high"
+
+
+@pytest.mark.parametrize(
+    ("provider", "router_model", "expected"),
+    [
+        # The gate runs claude-haiku-4-5, which takes no effort at all.
+        (Provider.ANTHROPIC, "claude-sonnet-4-6", None),
+        # The gate runs gpt-5.5-mini.
+        (Provider.OPENAI, "gpt-5.6-luna", None),
+        # The router pick is the provider's default, so the gate runs it too.
+        (Provider.OPENAI, ROUTER_MODEL_DEFAULTS["openai"], "low"),
+    ],
+)
+def test_router_effort_is_sent_only_where_the_gate_runs_the_router_model(
+    build, provider, router_model, expected
+):
+    # The route gate runs on the router's provider, but with
+    # resolved_gate_model: off openai_compatible, the provider's default router
+    # model. An effort chosen for another router pick must not reach it.
+    settings = UserSettings(
+        planning_provider=provider, coding_provider=provider, router_provider=provider,
+        anthropic_api_key=SecretStr("sk-ant"), openai_api_key=SecretStr("sk-openai"),
+        router_model=router_model, router_reasoning_effort="low",
+    )
+    assert (settings.resolved_gate_model == router_model) is (expected is not None)
+    _client, calls = build(settings)
+    assert calls[provider.value][0].get("reasoning_effort") == expected
+
+
+def test_router_effort_stays_with_the_model_it_was_chosen_for(build):
+    # No Anthropic key, so the router resolves onto OpenAI's default, which the
+    # gate runs too. The stored effort was chosen for the Anthropic pick, so
+    # the stale-model guard keeps it off.
+    settings = UserSettings(
+        _env_file=None,
+        planning_provider=Provider.OPENAI, coding_provider=Provider.OPENAI,
+        router_provider=Provider.ANTHROPIC, anthropic_api_key=None, minds_api_key=None,
+        openai_api_key=SecretStr("sk-openai"),
+        router_model="claude-sonnet-4-6", router_reasoning_effort="max",
+    )
+    assert settings.resolved_router_provider is Provider.OPENAI
+    assert settings.resolved_gate_model == settings.resolved_router_model
+    _client, calls = build(settings)
+    assert "reasoning_effort" not in calls["openai"][0]
+
+
+# ── COWORK_OPENAI_COMPATIBLE_API: planning and coding on the Responses API ──
+
+def test_switch_moves_planning_and_coding_to_the_responses_flavor(
+    build, openai_compatible_api, anton_responses_ready
+):
+    openai_compatible_api("responses")
+    anton_responses_ready()
+    client, calls = build(_openai_compatible())
+    router, planning, coding = calls["openai"]
+    assert planning["flavor"] == _RealOpenAIProvider.FLAVOR_OPENAI
+    assert coding["flavor"] == _RealOpenAIProvider.FLAVOR_OPENAI
+    # The router stays on chat completions, as a provider of its own. A router
+    # build error would hand the role to the coding provider, which is now on
+    # the Responses path, without logging anything.
+    assert "flavor" not in router
+    assert client.router_provider is not client.coding_provider
+
+
+def test_switch_covers_a_keyless_openai_compatible_endpoint(
+    build, openai_compatible_api, anton_responses_ready
+):
+    openai_compatible_api("responses")
+    anton_responses_ready()
+    settings = UserSettings(
+        planning_provider=Provider.OPENAI_COMPATIBLE,
+        coding_provider=Provider.OPENAI_COMPATIBLE,
+        router_provider=Provider.OPENAI_COMPATIBLE,
+        planning_model="m", coding_model="m", router_model="m",
+        openai_base_url="http://192.168.1.100:1234/v1",
+    )
+    _client, calls = build(settings)
+    router, planning, coding = calls["openai"]
+    assert planning["api_key"] == f"{Provider.OPENAI_COMPATIBLE.value}-no-auth"
+    assert planning["flavor"] == coding["flavor"] == _RealOpenAIProvider.FLAVOR_OPENAI
+    assert "flavor" not in router
+
+
+def test_switch_leaves_gemini_on_chat_completions(
+    build, openai_compatible_api, anton_responses_ready
+):
+    # Gemini shares the openai_compatible build branch; its endpoint is
+    # Google's, which the switch does not name.
+    openai_compatible_api("responses")
+    anton_responses_ready()
+    settings = UserSettings(
+        planning_provider=Provider.GEMINI,
+        coding_provider=Provider.GEMINI,
+        router_provider=Provider.GEMINI,
+        gemini_api_key=SecretStr("AIza-key"),
+    )
+    _client, calls = build(settings)
+    assert all("flavor" not in kw for kw in calls["openai"])
+
+
+def test_switch_waits_for_an_anton_whose_responses_path_is_ready(
+    build, openai_compatible_api, anton_responses_ready
+):
+    # An anton released before its Responses path was fixed reports no
+    # readiness. Pinned on the stand-in, so the lock's anton doesn't decide it.
+    openai_compatible_api("responses")
+    anton_responses_ready(False)
+    _client, calls = build(_openai_compatible())
+    assert all("flavor" not in kw for kw in calls["openai"])
+
+
+def _provider_warnings(caplog) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if r.name == "cowork.services.providers" and r.levelno == logging.WARNING
+    ]
+
+
+def test_a_switch_the_installed_anton_cannot_serve_is_logged_once(
+    build, openai_compatible_api, anton_responses_ready, monkeypatch, caplog
+):
+    # Planning and coding then stay on chat completions, where an effort other
+    # than none refuses every tool call. The line names the cause once per
+    # process, however many clients are built.
+    monkeypatch.setattr(providers, "_warned_responses_transport_missing", False, raising=False)
+    openai_compatible_api("responses")
+    anton_responses_ready(False)
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.providers"):
+        build(_openai_compatible())
+        _client, calls = build(_openai_compatible())
+
+    (line,) = _provider_warnings(caplog)
+    assert "COWORK_OPENAI_COMPATIBLE_API=responses" in line
+    assert "RESPONSES_TRANSPORT_READY" in line
+    assert "chat completions" in line
+    assert all("flavor" not in kw for kw in calls["openai"])
+
+
+@pytest.mark.parametrize(
+    ("api", "ready"),
+    [(None, False), ("chat_completions", False), ("responses", True)],
+)
+def test_nothing_is_logged_when_the_switch_is_off_or_served(
+    build, openai_compatible_api, anton_responses_ready, monkeypatch, caplog, api, ready
+):
+    monkeypatch.setattr(providers, "_warned_responses_transport_missing", False, raising=False)
+    openai_compatible_api(api)
+    anton_responses_ready(ready)
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.providers"):
+        build(_openai_compatible())
+
+    assert _provider_warnings(caplog) == []
+
+
+@pytest.mark.parametrize("api", [None, "chat_completions"])
+def test_openai_compatible_stays_on_chat_completions_unless_switched(
+    build, openai_compatible_api, anton_responses_ready, api
+):
+    openai_compatible_api(api)
+    anton_responses_ready()
+    _client, calls = build(_openai_compatible())
+    assert all("flavor" not in kw for kw in calls["openai"])

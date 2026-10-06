@@ -6,6 +6,8 @@ See also: the [Cowork Server API for Agents](https://docs.google.com/document/d/
 
 ## Architecture
 
+> Note (2026-09-10, ENG-2608): the Hermes harness described below was removed; Anton is the only shipped harness. Kept as historical rationale for the harness abstraction.
+
 The core idea: decouple the agent from the application. The server defines a harness-agnostic API contract, and each agent (Anton, Hermes, etc.) is a concrete `HarnessProvider` registered via a decorator. The server handles conversations, projects, settings, schedules, and pins as **app components**. The harness is responsible only for streaming responses, memory, and skills.
 
 `HarnessProvider` (`harnesses/base.py`) is a Protocol defining `stream_response()`, `sync_skills()`, `overwrite_memory()`, `retrieve_memory()`, `delete_memory()`, and `list_memory()`. Harnesses register with `@register` and are instantiated by name via `get_harness()`.

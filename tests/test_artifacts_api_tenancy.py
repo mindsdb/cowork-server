@@ -143,14 +143,17 @@ async def test_list_hides_other_org_artifacts(session, tmp_path, org_mode):
     assert "secret" not in slugs
 
 
-def test_list_hides_another_members_artifacts(session, tmp_path, org_mode):
-    """Same org, different chat. Live artifacts live inside a conversation, so
-    they inherit that conversation's privacy rather than the project's sharing.
+def test_list_hides_another_members_legacy_artifacts(session, tmp_path, org_mode):
+    """Same org, different chat, LEGACY layout. Artifacts written before
+    ENG-2056 live inside a conversation workspace, so they inherit that
+    conversation's privacy. New artifacts land in the shared project base and
+    are project-wide by decision — that case is pinned in
+    `test_artifact_roots.py::test_listing_shows_project_base_artifacts_to_every_member_and_keeps_legacy_ones`.
 
     Two projects here, because `_project_with_artifact` builds one per call. The
     one-project-two-owners case, which is what a narrowing of the filter to
     per-project granularity would slip past, is pinned at the resolver instead:
-    `test_artifact_roots.py::test_sources_for_project_skip_another_members_conversations`.
+    `test_artifact_roots.py::test_sources_for_project_skip_another_members_legacy_conversations`.
     """
     _project_with_artifact(
         session, tmp_path, name="shared", org_id=ORG_A, slug="theirs", owner=USER_A2
@@ -462,6 +465,80 @@ async def test_delete_by_slug_removes_the_folder(session, tmp_path, org_mode, pu
     assert not folder.exists()
 
 
+async def test_delete_threads_the_active_workspace_into_the_publish_key(
+    session, tmp_path, org_mode, monkeypatch
+):
+    """Unpublishing mints its own credential (the viewer's, not a stored provider
+    key), and that mint must carry the caller's picked workspace too — the same
+    binding the publish and autopublish paths already carry."""
+    from cowork.services.artifact_publish_key import PublishKey
+    import cowork.services.artifact_autopublish as autopublish
+
+    row, folder = _project_with_artifact(session, tmp_path, name="mine", org_id=ORG_A, slug="dash")
+    monkeypatch.setattr(autopublish, "_active_workspace_id", lambda scope: "ws-1")
+
+    captured = {}
+    real_init = PublishKey.__init__
+
+    def spy_init(self, *args, **kwargs):
+        captured.update(kwargs)
+        real_init(self, *args, **kwargs)
+
+    async def fake_get(self):
+        return "turnkey-1"
+
+    async def fake_revoke(self):
+        return None
+
+    monkeypatch.setattr(PublishKey, "__init__", spy_init)
+    monkeypatch.setattr(PublishKey, "get", fake_get)
+    monkeypatch.setattr(PublishKey, "revoke", fake_revoke)
+
+    await ep.delete_artifact_for_request(_scoped(session, ORG_A), "dash", project_id=row.id)
+
+    assert captured["workspace_id"] == "ws-1"
+
+
+@pytest.mark.parametrize("stage", ["mint", "unpublish"])
+@pytest.mark.parametrize("status", [403, 503])
+async def test_delete_preserves_authority_failures_and_keeps_artifact_files(
+    session, tmp_path, org_mode, monkeypatch, stage, status,
+):
+    import io
+    from urllib.error import HTTPError
+    from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
+
+    row, folder = _project_with_artifact(
+        session, tmp_path, name="publish-denied", org_id=ORG_A, slug="dash"
+    )
+    record = {"index.html": {"report_id": "rid", "published": True}}
+    (folder / ".published.json").write_text(json.dumps(record))
+    error_type = ProductPermissionDenied if status == 403 else ProductPermissionUnavailable
+
+    async def mint(**kwargs):
+        if stage == "mint":
+            raise error_type()
+        return "artifact-key"
+
+    async def revoke(*args, **kwargs):
+        return True
+
+    def unpublish(*args, **kwargs):
+        assert stage == "unpublish", "Mint denial must stop before unpublishing"
+        body = {"code": "permission_denied"} if status == 403 else {"error": "Auth unavailable"}
+        raise HTTPError("https://publish.example/delete/rid", status, "Rejected", {},
+                        io.BytesIO(json.dumps(body).encode()))
+
+    monkeypatch.setattr("cowork.services.artifact_publish_key.mint_turn_key", mint)
+    monkeypatch.setattr("cowork.services.artifact_access.revoke_draft_review_access", revoke)
+    monkeypatch.setattr("anton.publisher.unpublish", unpublish)
+    with pytest.raises(error_type) as error:
+        await ep.delete_artifact_for_request(_scoped(session, ORG_A), "dash", project_id=row.id)
+    assert error.value.status_code == status
+    assert (folder / "index.html").read_text() == "<html></html>"
+    assert json.loads((folder / ".published.json").read_text()) == record
+
+
 @pytest.mark.parametrize("by_id", [False, True])
 async def test_delete_revokes_with_the_verified_owner_and_tenant_before_removing_files(
     session, tmp_path, org_mode, publish_key, monkeypatch, by_id
@@ -765,3 +842,6 @@ async def test_desktop_project_path_that_matches_nothing_yields_nothing(
     )
 
     assert cards == []
+
+
+pytestmark = pytest.mark.usefixtures("granted_product_permissions")

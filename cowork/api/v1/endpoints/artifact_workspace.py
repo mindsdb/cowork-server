@@ -9,7 +9,7 @@ import os
 import stat
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import quote
 from uuid import UUID
 
@@ -17,23 +17,26 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 
-from cowork.api.v1.artifact_preview import wants_comment_layer
+from cowork.api.v1.artifact_preview import wants_comment_layer, wants_download
 from cowork.common.paths import (
     O_NOFOLLOW,
     dir_lstat,
     dir_open,
     dir_scandir,
     open_pinned_child,
+    read_bounded,
 )
 from cowork.api.v1.artifact_scope import review_artifact_for_request
-from cowork.db.scoped import ScopedSessionDep
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.db.scoped import ScopedSession, ScopedSessionDep, get_scoped_session
+from cowork.services.product_permissions import has_product_permission, require_product_permission
 from cowork.services.artifact_permissions import (
     artifact_capabilities,
-    artifact_owner_id,
     require_artifact_owner,
 )
-from cowork.services.comments_layer import inject_layer
+from cowork.services.preview_html import prepare_preview_html
 from cowork.services.artifact_identity import opened_artifact_folder
 from cowork.services.artifact_revisions import (
     JOURNAL_DIRNAME,
@@ -55,7 +58,12 @@ from cowork.services.artifact_revisions import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
+# whenever org mode has no org in scope. Declaring it too makes the
+# requirement visible to a route walker instead of something only
+# discoverable by reading scoped.py.
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 _DRAFT_RESPONSE_HEADERS = {
     "Cache-Control": "private, no-store",
@@ -63,13 +71,8 @@ _DRAFT_RESPONSE_HEADERS = {
 }
 _LIVE_PUBLISH_TIMEOUT_S = 60.0
 _LIVE_PUBLISH_LOCK_TTL_S = _LIVE_PUBLISH_TIMEOUT_S * 3
-_PRIVATE_DRAFT_ENTRIES = {
-    ".revisions",
-    ".published.json",
-    "metadata.json",
-    "README.md",
-    "backend.log",
-}
+# Matched against the first path component of a draft request.
+_PRIVATE_DRAFT_ENTRIES = NON_CONTENT_NAMES
 
 
 def _attachment_disposition(filename: str) -> str:
@@ -262,9 +265,9 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
         parts = _relative_file_parts(requested.strip())
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid artifact source path") from exc
-    # The journal only, matching the inner gate, and at any depth rather than
-    # just the first component. The private-listing set is a different
-    # question: it hides README.md, which is a source the service itself picks.
+    # Only the journal (any depth), like the inner gate: the private-listing
+    # set is not rejected because `metadata.primary` or an explicit path may
+    # legitimately name README.md or prd.md as the editable source.
     if JOURNAL_DIRNAME in parts:
         raise HTTPException(status_code=422, detail="Invalid artifact source path")
     folder_name = _artifact_folder_component(source, folder)
@@ -315,8 +318,8 @@ def _recorded_source_selector(source, folder: Path, metadata: dict) -> str | Non
         return None
 
 
-def _comment_layer_from_fd(fd: int) -> HTMLResponse | None:
-    """Build the review HTML from the already-authorized file descriptor."""
+def _preview_html_from_fd(fd: int, *, comments: bool) -> HTMLResponse | None:
+    """Build the preview HTML from the already-authorized file descriptor."""
     payload = bytearray()
     try:
         while chunk := os.read(fd, 1 << 16):
@@ -332,7 +335,9 @@ def _comment_layer_from_fd(fd: int) -> HTMLResponse | None:
             os.lseek(fd, 0, os.SEEK_SET)
         except OSError:
             pass
-    return HTMLResponse(inject_layer(html), headers=_DRAFT_RESPONSE_HEADERS)
+    return HTMLResponse(
+        prepare_preview_html(html, comments=comments), headers=_DRAFT_RESPONSE_HEADERS
+    )
 
 
 def _draft_stream(
@@ -343,11 +348,19 @@ def _draft_stream(
     *,
     extra_headers: dict[str, str] | None = None,
 ):
-    """Stream bytes from the pinned descriptor and close every held handle."""
+    """Stream at most *size* bytes from the pinned descriptor and close every
+    held handle.
+
+    No ``Content-Length``: the agent may still be writing the file, and a
+    length taken from ``fstat`` would then disagree with the bytes read, which
+    the browser reports as ``ERR_CONTENT_LENGTH_MISMATCH`` (ENG-2950). Chunked
+    transfer sends exactly what the descriptor yields. *size* (the ``fstat``
+    size at authorization) still bounds the body, so a file that keeps growing
+    cannot keep the response open.
+    """
     def chunks():
         try:
-            while chunk := os.read(fd, 1 << 16):
-                yield chunk
+            yield from read_bounded(fd, size)
         finally:
             resources.close()
 
@@ -355,11 +368,7 @@ def _draft_stream(
         chunks(),
         resources=resources,
         media_type=media_type,
-        headers={
-            **_DRAFT_RESPONSE_HEADERS,
-            **(extra_headers or {}),
-            "Content-Length": str(size),
-        },
+        headers={**_DRAFT_RESPONSE_HEADERS, **(extra_headers or {})},
     )
 
 
@@ -431,6 +440,10 @@ class _AgentRepairBody(BaseModel):
     selector: str | None = Field(default=None, max_length=2000)
     thread: list[_AgentRepairThreadEntry] = Field(min_length=1, max_length=501)
     conversationId: UUID
+    # Deliberately untyped. A typed model would answer 422 on the first odd
+    # entry, which would fail the repair over a diagnostic — the opposite of
+    # what diagnostics are for. create_agent_repair drops anything malformed.
+    previewErrors: Any = None
 
 
 class _RepairDecisionBody(BaseModel):
@@ -460,11 +473,13 @@ def _owner_workspace(session, project_ref: str, artifact_id: str):
     source, folder, metadata, _is_own = review_artifact_for_request(
         session, project_ref, artifact_id
     )
-    capabilities = require_artifact_owner(session, source)
+    capabilities = require_artifact_owner(session, source, folder.name)
     return source, folder, metadata, capabilities
 
 
-async def _sync_live_artifact(session, folder: Path) -> bool | None:
+async def _sync_live_artifact(
+    session, folder: Path, *, project_id: str | None = None
+) -> bool | None:
     """Re-publish a live artifact after an editor write.
 
     ``None`` means the artifact is only a draft, ``True`` means its stable URL
@@ -523,6 +538,7 @@ async def _sync_live_artifact(session, folder: Path) -> bool | None:
                     publish_url=publish_url,
                     access=access,
                     scope=scope,
+                    project_id=project_id,
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
@@ -563,11 +579,26 @@ async def _acquire_live_publish_lock(folder: Path) -> bool:
     return True
 
 
+async def _current_capabilities(session, capabilities: dict) -> dict:
+    if not capabilities["canEdit"]:
+        return capabilities
+    can_edit = await has_product_permission(session.scope, "artifact.manage")
+    can_execute = await has_product_permission(session.scope, "product.execute")
+    return {
+        **capabilities,
+        "canEdit": can_edit,
+        "canAddressWithAgent": capabilities["canAddressWithAgent"] and can_edit and can_execute,
+        "canResolveComments": capabilities["canResolveComments"] and can_edit,
+    }
+
+
 @router.get("/workspace/{project_ref}/{artifact_id}")
 async def artifact_source(
     project_ref: str,
     artifact_id: ArtifactIdDep,
-    session: ScopedSessionDep,
+    # Spell out the dependency so SAST does not treat the server-created
+    # session (and the artifact roots it discovers) as an HTTP parameter.
+    session: ScopedSession = Depends(get_scoped_session),
     path: str | None = Query(default=None, max_length=1000),
 ):
     """Authenticated source + revision token for Desktop and Cowork SaaS."""
@@ -584,6 +615,7 @@ async def artifact_source(
             current_workspace, folder, metadata, artifact_id, selected
         )
         repair = await run_in_threadpool(active_agent_repair, folder, result.get("path"))
+        capabilities = await _current_capabilities(session, capabilities)
         return {**result, "capabilities": capabilities, "repair": repair}
     except FileNotFoundError as exc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
@@ -599,6 +631,7 @@ async def update_artifact_source(
     session: ScopedSessionDep,
 ):
     """Optimistic, atomic manual edit. A stale tab receives 409, never overwrite."""
+    await require_product_permission(session.scope, "artifact.manage")
     source, folder, metadata, _capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
@@ -623,7 +656,7 @@ async def update_artifact_source(
             summary=body.summary,
         )
         if saved["revision"]["id"] != body.expectedRevisionId:
-            await _sync_live_artifact(session, folder)
+            await _sync_live_artifact(session, folder, project_id=source.project_id)
         return saved
     except RevisionConflict as exc:
         raise HTTPException(
@@ -653,7 +686,9 @@ async def artifact_revisions(
 async def artifact_review_entry(
     project_ref: str,
     artifact_id: ArtifactIdDep,
-    session: ScopedSessionDep,
+    # Spell out the dependency so SAST does not treat the server-created
+    # session (and the artifact roots it discovers) as an HTTP parameter.
+    session: ScopedSession = Depends(get_scoped_session),
 ):
     """What a reviewer needs to comment, and nothing that reveals the source.
 
@@ -668,7 +703,9 @@ async def artifact_review_entry(
     source, folder, metadata, _is_own = review_artifact_for_request(
         session, project_ref, artifact_id
     )
-    capabilities = artifact_capabilities(session, source)
+    capabilities = await _current_capabilities(
+        session, artifact_capabilities(session, source, folder.name)
+    )
     current_revision = None
     try:
         draft = await run_in_threadpool(current_source, folder, metadata, artifact_id)
@@ -705,14 +742,18 @@ def _owner_publish_context(session, folder: Path):
     which exists on an org deployment — which is why the whole `/publish` router
     is local-only.
     """
-    from cowork.services.artifact_autopublish import _publish_url
+    from cowork.services.artifact_autopublish import _active_workspace_id, _publish_url
     from cowork.services.artifact_publish_key import PublishKey
 
     scope = session.scope
     return (
         folder.parent,
         _publish_url(scope),
-        PublishKey(str(scope.user_id), str(scope.org_id), min_ttl_s=_LIVE_PUBLISH_TIMEOUT_S + 60.0),
+        PublishKey(
+            str(scope.user_id), str(scope.org_id),
+            min_ttl_s=_LIVE_PUBLISH_TIMEOUT_S + 60.0,
+            workspace_id=_active_workspace_id(scope),
+        ),
     )
 
 
@@ -762,10 +803,11 @@ async def set_artifact_access(
     shared URL survives the change. This is the same call autopublish makes on
     every turn, with the owner's selection in place of the first-publish default.
     """
+    await require_product_permission(session.scope, "artifact.manage")
     from cowork.services.publish import publish_artifact as _publish_bundle
     from cowork.services.artifact_access import ArtifactAccessUnavailable
 
-    _source, folder, metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
+    source, folder, metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
     if _artifact_primary(folder, metadata) is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -800,6 +842,7 @@ async def set_artifact_access(
                     publish_url=publish_url,
                     access=dict(body.access or {}),
                     scope=session.scope,
+                    project_id=source.project_id,
                 ),
                 timeout=_LIVE_PUBLISH_TIMEOUT_S,
             )
@@ -835,6 +878,7 @@ async def enable_artifact_comments(
     workspace to the organization, which is the owner's call to make. A
     reviewer's client calls the `review` GET above instead.
     """
+    await require_product_permission(session.scope, "artifact.manage")
     from cowork.services.artifact_access import (
         ArtifactAccessUnavailable,
         provision_draft_review_access,
@@ -844,18 +888,21 @@ async def enable_artifact_comments(
     from cowork.services.artifact_identity import artifact_key
 
     source, folder, metadata, capabilities = _owner_workspace(session, project_ref, artifact_id)
-    owner_user_id = artifact_owner_id(session, source)
+    capabilities = await _current_capabilities(session, capabilities)
+    # `_owner_workspace` already refused anyone but the owner, so the owner is
+    # the caller; resolving it again would only repeat that query.
+    owner_user_id = str(session.scope.user_id) if session.scope.user_id else None
     try:
         canonical_key = await run_in_threadpool(
             ensure_authorization_key,
             artifact_id,
             session.scope,
-            owner_user_id=str(owner_user_id) if owner_user_id else None,
+            owner_user_id=owner_user_id,
         )
         await provision_draft_review_access(
             canonical_key.split("/", 1)[1],
             session.scope,
-            owner_user_id=str(owner_user_id) if owner_user_id else None,
+            owner_user_id=owner_user_id,
         )
     except ArtifactAccessUnavailable as exc:
         raise HTTPException(
@@ -915,7 +962,8 @@ async def restore_artifact_revision(
     body: _RestoreBody,
     session: ScopedSessionDep,
 ):
-    _source, folder, metadata, _capabilities = _owner_workspace(
+    await require_product_permission(session.scope, "artifact.manage")
+    source, folder, metadata, _capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
     try:
@@ -935,7 +983,7 @@ async def restore_artifact_revision(
             summary=f"Restored revision {restored['number']}",
         )
         if saved["revision"]["id"] != body.expectedRevisionId:
-            await _sync_live_artifact(session, folder)
+            await _sync_live_artifact(session, folder, project_id=source.project_id)
         return saved
     except RevisionConflict as exc:
         raise HTTPException(
@@ -955,6 +1003,8 @@ async def request_agent_repair(
     body: _AgentRepairBody,
     session: ScopedSessionDep,
 ):
+    await require_product_permission(session.scope, "artifact.manage")
+    await require_product_permission(session.scope, "product.execute")
     _source, folder, metadata, _capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
@@ -969,6 +1019,7 @@ async def request_agent_repair(
             selector=body.selector,
             thread=[entry.model_dump() for entry in body.thread],
             conversation_id=str(body.conversationId),
+            preview_errors=body.previewErrors,
         )
     except RevisionConflict as exc:
         raise HTTPException(
@@ -1019,6 +1070,7 @@ async def release_agent_repairs_for_comment(
     the comments route forwards to inference in org mode and carries no tenant
     scope, so only here can one call serve both desktop and cloud.
     """
+    await require_product_permission(session.scope, "artifact.manage")
     _source, folder, _metadata, _capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
@@ -1042,6 +1094,7 @@ async def cancel_queued_agent_repair(
     body: _RepairCancelBody | None = None,
 ):
     """Release a queued repair, or discard a ready one the owner is done with."""
+    await require_product_permission(session.scope, "artifact.manage")
     _source, folder, _metadata, _capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
@@ -1066,6 +1119,7 @@ async def decide_agent_repair(
     body: _RepairDecisionBody,
     session: ScopedSessionDep,
 ):
+    await require_product_permission(session.scope, "artifact.manage")
     _source, folder, metadata, _capabilities = _owner_workspace(
         session, project_ref, artifact_id
     )
@@ -1099,7 +1153,9 @@ async def serve_private_draft(
     artifact_id: ArtifactIdDep,
     rel_path: str,
     request: Request,
-    session: ScopedSessionDep,
+    # Spell out the dependency so SAST does not treat the server-created
+    # session (and the artifact roots it discovers) as an HTTP parameter.
+    session: ScopedSession = Depends(get_scoped_session),
     download: Annotated[bool, Query()] = False,
 ):
     """Authenticated draft preview with project/org containment and relative assets.
@@ -1116,9 +1172,34 @@ async def serve_private_draft(
     header changes how the response is labelled, not who may read it.
     ``Annotated[..., Query()] = False`` rather than ``= Query(False)`` so a
     direct call (the tests') gets a real ``False``, not the ``Query`` object.
+    The effective flag below also folds in ``wants_download(request)``, the
+    same predicate `/serve` and `/preview-asset` use, so all three routes
+    agree on what a raw query string like ``?download=0`` means; a direct
+    call still controls the outcome through the keyword argument, since its
+    bare ``request`` carries no query string of its own.
     """
+    # Parse before taking basename so a path ending in a valid UUID is rejected,
+    # never silently accepted. Keep the recognized sanitizer at this filesystem
+    # boundary; SAST does not model the UUID dependency or catalog lookup.
+    if project_ref == "local":
+        project_selector = "local"
+    else:
+        try:
+            project_selector = os.path.basename(str(UUID(project_ref)))
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Invalid project",
+            ) from exc
+    try:
+        artifact_selector = os.path.basename(UUID(artifact_id).hex)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid artifact identity",
+        ) from exc
     source, folder, metadata, _is_own = review_artifact_for_request(
-        session, project_ref, artifact_id
+        session, project_selector, artifact_selector
     )
     try:
         parts = _relative_file_parts(rel_path)
@@ -1152,11 +1233,16 @@ async def serve_private_draft(
                 detail="Artifact file not found",
             )
 
+    download = download or wants_download(request)
     media_type = mimetypes.guess_type(parts[-1])[0] or "application/octet-stream"
     resources, fd, file_stat = _open_pinned_draft_file(source, folder, parts)
     try:
-        if not download and wants_comment_layer(media_type, request):
-            resp = await run_in_threadpool(_comment_layer_from_fd, fd)
+        if not download and media_type == "text/html":
+            resp = await run_in_threadpool(
+                _preview_html_from_fd,
+                fd,
+                comments=wants_comment_layer(request),
+            )
             if resp is not None:
                 resources.close()
                 return resp

@@ -7,6 +7,8 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
 
 from cowork.coding.redaction import redact_text, sanitize
+from cowork.coding.questions import PendingQuestion
+from cowork.coding.repository_setup_models import TaskRepositorySetup
 
 SCHEMA_VERSION = 1
 
@@ -45,6 +47,7 @@ class PermissionMode(str, Enum):
 ReasoningEffort = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_-]{0,31}$")]
 ServiceTier = Literal["standard", "priority"]
 Personality = Literal["none", "friendly", "pragmatic"]
+TaskMode = Literal["build", "plan"]
 
 
 class TaskCapability(str, Enum):
@@ -358,6 +361,7 @@ class CodingSession(BaseModel):
     engine_adapter_version: str
     model: str
     permission_mode: PermissionMode = PermissionMode.supervised
+    task_mode: TaskMode = "build"
     reasoning_effort: ReasoningEffort | None = None
     service_tier: ServiceTier = "standard"
     personality: Personality = "pragmatic"
@@ -416,6 +420,9 @@ class CodingSession(BaseModel):
     engine_session_id: str | None = None
     active_turn_id: str | None = None
     pending_approval: PendingApproval | None = None
+    pending_question: PendingQuestion | None = None
+    # Fingerprints only; raw command rules can contain secrets.
+    command_approval_grants: list[str] = Field(default_factory=list, max_length=256)
     queued_instructions: list[QueuedInstruction] = Field(default_factory=list)
     terminal_tabs: list[TerminalTab] = Field(default_factory=list, max_length=12)
     pinned: bool = False
@@ -508,11 +515,13 @@ class SessionCreateRequest(BaseModel):
     path: str | None = Field(default=None, min_length=1, max_length=32_768)
     project_id: str | None = Field(default=None, min_length=1, max_length=128)
     resource_ids: list[str] | None = Field(default=None, min_length=1, max_length=64)
+    repository_setup: TaskRepositorySetup | None = None
     computer_id: str | None = Field(default=None, min_length=1, max_length=128)
     prompt: str = Field(min_length=1, max_length=200_000)
     engine_id: str | None = Field(default=None, min_length=1, max_length=128)
     model: str | None = Field(default=None, min_length=1, max_length=256)
     permission_mode: PermissionMode = PermissionMode.supervised
+    task_mode: TaskMode = "build"
     reasoning_effort: ReasoningEffort | None = None
     service_tier: ServiceTier = "standard"
     personality: Personality = "pragmatic"
@@ -527,6 +536,8 @@ class SessionCreateRequest(BaseModel):
     def require_workspace_source(self) -> SessionCreateRequest:
         if bool(self.path) == bool(self.project_id):
             raise ValueError("Choose exactly one Code Project or folder")
+        if self.repository_setup is not None and not self.project_id:
+            raise ValueError("Repository choices require a Code Project")
         return self
 
     @field_validator("resource_ids")
@@ -554,6 +565,11 @@ class SessionRecoverRequest(BaseModel):
 class TurnRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=200_000)
     attachments: list[InputReference] = Field(default_factory=list, max_length=20)
+
+
+class ModeTurnRequest(TurnRequest):
+    task_mode: TaskMode
+    expected_event_count: int = Field(ge=0)
 
 
 class QueueRunRequest(BaseModel):

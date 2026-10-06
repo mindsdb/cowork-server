@@ -20,6 +20,12 @@ class Message(BaseSQLModel, table=True):
     # leading column the DB can seek to the max instead of scanning the group.
     __table_args__ = (
         Index("ix_messages_conversation_created", "conversation_id", "created_at"),
+        # Backs the keyset pagination in get_messages_page, which orders by
+        # seq. Declared here as well as in migration 3e4b5f7586d3 so tests
+        # (which build the schema through metadata.create_all) exercise the
+        # same index production has, and so autogenerate does not emit a DROP
+        # for an index the model never mentions.
+        Index("ix_messages_conversation_seq", "conversation_id", "seq"),
     )
 
     conversation_id: UUID = Field(
@@ -36,7 +42,7 @@ class Message(BaseSQLModel, table=True):
     )
     harness: str | None = Field(
         default=None,
-        description="Harness/agent that generated this message (e.g. 'anton', 'hermes')",
+        description="Harness/agent that generated this message (e.g. 'anton', 'claude-code')",
     )
     # Authorship only — tenancy is scoped via the conversation (roots-only rule).
     created_by: str | None = Field(default=None, max_length=36, description="User who authored the message; NULL on local/desktop rows")
@@ -48,7 +54,11 @@ class Message(BaseSQLModel, table=True):
             "(assistant tool_use, user tool_result, ...) can share one "
             "created_at (second precision); seq orders every message in the "
             "conversation deterministically, without depending on that "
-            "resolution. Assigned as max(seq)+1 on insert; 0 for legacy rows."
+            "resolution. Assigned as max(seq)+1 on insert. Rows written "
+            "before this column existed all defaulted to 0 and were "
+            "renumbered per conversation by migration 3e4b5f7586d3, so it "
+            "is a total order within a conversation and cursor pagination "
+            "can key on it alone."
         ),
     )
 

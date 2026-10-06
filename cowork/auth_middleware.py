@@ -1,13 +1,14 @@
-"""Optional bearer-token auth middleware for the Cowork server.
+"""Bearer-token auth middleware for the Cowork server.
 
-When COWORK_REQUIRE_AUTH=true the server validates every request (except
+When COWORK_REQUIRE_AUTH is true the server validates every request (except
 OPTIONS preflight and the /health endpoint) against a shared secret token
 stored in ~/.cowork/.env as COWORK_AUTH_TOKEN.  If no token is set, one is
 auto-generated at startup and written back to that file so the desktop app
 can read it.
 
-The feature is off by default — existing installs see no behaviour change
-unless they explicitly set COWORK_REQUIRE_AUTH=true.
+Defaults on in local/desktop tenancy (see AppSettings.require_auth) and stays
+off in org mode, where it isn't supported at all — see create_app()'s
+RuntimeError for why.
 """
 
 from __future__ import annotations
@@ -25,10 +26,15 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp
 
+from cowork.common.paths import open_fd
+
 logger = logging.getLogger(__name__)
 
 # Paths that are always accessible without a token (health probe + CORS preflight).
-_EXEMPT_PATHS = frozenset({"/api/v1/health", "/api/v1/health/"})
+_EXEMPT_PATHS = frozenset({
+    "/api/v1/health", "/api/v1/health/",
+    "/api/v1/health/live",
+})
 
 
 class BearerTokenMiddleware(BaseHTTPMiddleware):
@@ -121,7 +127,7 @@ def _write_token(env_path: Path, token: str) -> None:
     # from the start — never world-readable in the gap between write and chmod.
     # For a pre-existing file the mode arg is ignored, so still chmod to tighten
     # any looser permissions.
-    fd = os.open(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    fd = open_fd(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
         fh.write(new_text)
     try:
