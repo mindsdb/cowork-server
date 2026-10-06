@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import random
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable
+from contextlib import suppress
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -98,37 +100,74 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# Strong references for fire-and-forget probe tasks: asyncio holds only a weak
-# reference to a task once nothing else does, so a bare `create_task` result
-# that's dropped can be garbage-collected mid-flight. Discarded on completion
-# via the done-callback below.
-_jev_shadow_tasks: set[asyncio.Task] = set()
+# Strong references for Jev calls the gate beat: asyncio holds only a weak
+# reference to a task once nothing else does, so a dropped `create_task`
+# result can be garbage-collected mid-flight.
+_jev_tasks: set[asyncio.Task] = set()
 
 
-def _spawn_jev_shadow_probe(
-    *, conversation_id: UUID, correlation_id: str | None, messages: list[dict],
-    llm_block: dict | None, settings: TurnQueueSettings,
-) -> None:
-    """Runs `jev_shadow.probe` detached from the request path and logs its
-    own result. Never awaited by the caller, so a slow or hung probe cannot
-    delay the turn it's shadowing.
+# Starting values, not measured ones; revisit from the [jev-route] holdout rows.
+_JEV_MIN_P_NEEDS_AGENT = 0.9
+_JEV_HOLDOUT_RATE = 0.1
 
-    `create_task` copies the caller's context, so the probe runs under the
-    gate's anton TraceContext and `jev_shadow` attributes its Langfuse trace to
-    the same conversation and correlation_id."""
 
-    async def _run() -> None:
-        jev_result = await jev_shadow.probe(messages=messages, llm_block=llm_block, settings=settings)
-        if jev_result is None:
+def _jev_decides(result: dict | None) -> bool:
+    return (
+        result is not None
+        and result.get("jev_choice") == "needs_agent"
+        and result.get("jev_p_needs_agent", 0) >= _JEV_MIN_P_NEEDS_AGENT
+    )
+
+
+async def _route_with_jev(
+    gate: Awaitable[RouteDecision], *, conversation_id: UUID, correlation_id: str | None,
+    messages: list[dict], llm_block: dict, settings: TurnQueueSettings, provider_label: str | None,
+) -> RouteDecision:
+    """A confident Jev needs_agent delegates without waiting for the gate.
+
+    Jev returns a label, not an answer, so it can only skip the gate toward the
+    agent; every other outcome waits for the gate's own decision. A holdout
+    turn never skips, so the gate's call on turns Jev would have skipped stays
+    measurable."""
+    holdout = random.random() < _JEV_HOLDOUT_RATE
+    gate_task = asyncio.create_task(gate)
+    jev_task = asyncio.create_task(jev_shadow.probe(
+        messages=messages, llm_block=llm_block, settings=settings,
+    ))
+
+    def log(decided: bool) -> None:
+        if jev_task.cancelled() or jev_task.result() is None:
             return
-        fields = " ".join(f"{k}={v}" for k, v in jev_result.items())
+        fields = " ".join(f"{k}={v}" for k, v in jev_task.result().items())
         logger.warning(
-            "[jev-shadow] conversation=%s correlation_id=%s %s", conversation_id, correlation_id, fields,
+            "[jev-route] conversation=%s correlation_id=%s decided=%s holdout=%s %s",
+            conversation_id, correlation_id, str(decided).lower(), str(holdout).lower(), fields,
         )
 
-    task = asyncio.create_task(_run())
-    _jev_shadow_tasks.add(task)
-    task.add_done_callback(_jev_shadow_tasks.discard)
+    try:
+        await asyncio.wait({gate_task, jev_task}, return_when=asyncio.FIRST_COMPLETED)
+        if not gate_task.done() and not holdout and _jev_decides(jev_task.result()):
+            gate_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await gate_task
+            log(True)
+            return RouteDecision(
+                route=DELEGATED_AGENTIC,
+                reason="jev_needs_agent",
+                provider=provider_label,
+                model=jev_task.result().get("jev_model"),
+            )
+        if jev_task.done():
+            log(False)
+        else:
+            _jev_tasks.add(jev_task)
+            jev_task.add_done_callback(_jev_tasks.discard)
+            jev_task.add_done_callback(lambda _task: log(False))
+        return await gate_task
+    finally:
+        # Only reachable undone when this turn itself is cancelled.
+        if not gate_task.done():
+            gate_task.cancel()
 
 
 class _RemoteTurnFailed(Exception):
@@ -606,7 +645,7 @@ class ResponsesHandler:
                 with use_settings_scope(self.scope):
                     # Minted before the context goes in (it is an auth call, not
                     # an LLM call), so the context can carry the turn's
-                    # correlation_id: the gate's trace and the Jev shadow probe's
+                    # correlation_id: the gate's trace and the Jev call's
                     # (which inherits this context) share it, making gate
                     # decision <-> Jev answer an exact join. Never
                     # turn_id: the gateway renames harness+turn_id traces to
@@ -624,14 +663,27 @@ class ResponsesHandler:
                     ))
                     turn_queue_settings = TurnQueueSettings()
 
+                    llm_block = (turn_llm or {}).get("llm")
                     gate_started = time.monotonic()
-                    decision = await decide_route(
+                    gate = decide_route(
                         history=history,
                         has_non_text_input=has_non_text_input,
                         has_attachments=has_attachments,
                         has_disabled_connections=has_disabled_connections,
                         binding=binding,
                     )
+                    if turn_queue_settings.jev_enabled and llm_block:
+                        decision = await _route_with_jev(
+                            gate,
+                            conversation_id=conversation_id,
+                            correlation_id=correlation_id,
+                            messages=_text_history(history),
+                            llm_block=llm_block,
+                            settings=turn_queue_settings,
+                            provider_label=binding.label if binding else None,
+                        )
+                    else:
+                        decision = await gate
                     gate_ms = round((time.monotonic() - gate_started) * 1000)
                     # warning, not info: this deployment's LOG_LEVEL defaults to
                     # WARNING (app_settings.py's own default too), so an info-level
@@ -643,17 +695,6 @@ class ResponsesHandler:
                         "provider=%s model=%s gate_ms=%d",
                         conversation_id, correlation_id, decision.route, decision.reason,
                         decision.provider, decision.model, gate_ms,
-                    )
-                    # Detached on purpose: awaiting this (even via asyncio.gather)
-                    # would make a ready gate decision wait for Jev, exactly the
-                    # thing a *shadow* probe must never do. Logs on its own once
-                    # it finishes; never read by anything on the request path.
-                    _spawn_jev_shadow_probe(
-                        conversation_id=conversation_id,
-                        correlation_id=correlation_id,
-                        messages=_text_history(history),
-                        llm_block=(turn_llm or {}).get("llm"),
-                        settings=turn_queue_settings,
                     )
             finally:
                 if trace_token is not None:

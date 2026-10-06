@@ -571,28 +571,28 @@ class TurnQueueSettings(Settings):
             "per-PR / non-standard envs whose host the slug logic cannot derive. Empty = derive."
         ),
     )  # COWORK_TURN_MINDS_BASE_URL
-    jev_shadow_enabled: bool = Field(
+    jev_enabled: bool = Field(
         default=False,
         description=(
-            "Fire a Jev '/v1/decisions' call alongside the LLM gate on every remote turn, "
-            "purely for latency/agreement comparison. Never used to route; logged only. "
+            "Run a Jev '/v1/decisions' call alongside the LLM gate on every remote turn, and "
+            "delegate without waiting for the gate when Jev answers needs_agent with "
+            "P(needs_agent) at or above 0.9; every other Jev outcome waits for the gate. "
             "Requires a minted minds-cloud credential, so it's a no-op unless backend is "
             "'remote'. Off by default: the call runs on the turn's own minted key and "
             "sends the turn's text history as state. Jev is zero-priced, so it charges no "
-            "wallet, but on an unfunded org every turn draws that org's free Jev allowance "
-            "in the background, and a refused call shows up only as the "
-            "'jev_error=http_<status>' field of the '[jev-shadow]' warning that "
-            "responses._spawn_jev_shadow_probe logs."
+            "wallet, but on an unfunded org every turn draws that org's free Jev allowance, "
+            "and a refused call shows up only as the 'jev_error=http_<status>' field of "
+            "the '[jev-route]' warning."
         ),
-    )  # COWORK_TURN_JEV_SHADOW_ENABLED
+    )  # COWORK_TURN_JEV_ENABLED
     jev_shadow_model: str = Field(
         default="jev",
-        description="MindsHub catalog alias passed to the shadow '/v1/decisions' call.",
+        description="MindsHub catalog alias passed to the Jev '/v1/decisions' call.",
     )  # COWORK_TURN_JEV_SHADOW_MODEL
     jev_shadow_timeout_seconds: float = Field(
         default=3.0,
         gt=0,
-        description="Hard wall-clock timeout for the shadow Jev call (enforced via asyncio.timeout, not just httpx's own per-phase timeout). Independent of the gate's own budget, since a slow or hung probe must never hold up the turn it's shadowing.",
+        description="Hard wall-clock timeout for the Jev call (enforced via asyncio.timeout, not just httpx's own per-phase timeout). Independent of the gate's own budget: in either mode a slow or hung Jev call never holds up the gate's decision.",
     )  # COWORK_TURN_JEV_SHADOW_TIMEOUT_SECONDS
     minds_coding_model: str = Field(
         default="",
