@@ -117,9 +117,33 @@ async def _run_artifact_owner_backfill() -> None:
         logger.exception("artifact owner backfill failed (non-fatal)")
 
 
+# Imported lazily by the first agent turn otherwise, adding their import time to
+# that turn's time to first text.
+AGENT_RUNTIME_MODULES = (
+    "anton.core.llm.openai",
+    "anton.core.llm.anthropic",
+    "anton.minds_client",
+    "anton.core.session",
+    "anton.core.tools.tool_handlers",
+)
+
+
+def _warm_agent_runtime() -> None:
+    """Import the agent runtime at startup. A module that fails is left for the turn."""
+    import importlib
+
+    for name in AGENT_RUNTIME_MODULES:
+        try:
+            importlib.import_module(name)
+        except Exception:
+            logger.debug("agent runtime warm-up skipped %s", name, exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_dev_setup()
+    # Before the server reports ready, so the first turn does not pay for imports.
+    await asyncio.to_thread(_warm_agent_runtime)
     # History recovery also retries buffers sealed by an earlier failed sweep.
     try:
         from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE

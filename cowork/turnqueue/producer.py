@@ -485,7 +485,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 turn_key_id: str | None = None,
                                 disabled: list[dict] | None = None,
                                 started_at: str | None = None,
-                                interactive: bool = False):
+                                interactive: bool = False,
+                                tool_messages: bool = False):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
 
     Yields turn_delta / turn_step / turn_memory in arrival order and ends with
@@ -494,7 +495,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     when the worker goes quiet past the idle timeout).
     `correlation_id`/`llm` reuse a turn key the routing gate already minted.
     `interactive` tells the pod it may ask `ask_user` questions (web UI turns;
-    channel turns never)."""
+    channel turns never).
+    `tool_messages` tells the pod the client renders a tool's message to the
+    user (the cowork UI does; channel turns never)."""
     settings = TurnQueueSettings()
     scope = TenantScope(org_mode=get_app_settings().tenancy_mode == "org" or bool(org_id), org_id=org_id, user_id=user_id)
     await require_product_permission(scope, "product.execute")
@@ -590,6 +593,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # Web UI turns only: the pod then registers ask_user and takes
               # answers on stdin, which /answer feeds through Redis.
               "interactive": interactive,
+              # The cowork UI renders a tool's message to the user as an
+              # agent message; without this the pod hands it to the agent.
+              "tool_messages": tool_messages,
               **({"memory": memory_block} if memory_block else {}),
               # Absent entirely (not an empty dict) when there's nothing to
               # offer — see _mint_oauth_block's docstring for why.

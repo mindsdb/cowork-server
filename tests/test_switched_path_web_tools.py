@@ -6,8 +6,8 @@ outside the deployment's egress gateway (on Azure it runs on Bing). So when
 COWORK_OPENAI_COMPATIBLE_API puts an openai_compatible planning provider on
 that path, both sessions built on the planning role, a chat turn's and a
 connector credential probe's, turn both flags off. Every other session keeps
-anton's defaults: MindsHub keeps its native web tools, and direct OpenAI keeps
-what its flavor provides.
+anton's defaults: MindsHub keeps its native web tools, and direct OpenAI, now on
+the Responses flavor too, keeps the native web tools that flavor provides.
 """
 from types import SimpleNamespace
 
@@ -258,9 +258,11 @@ async def test_harness_uses_one_settings_snapshot_for_client_and_web_policy(
     )
     try:
         switched = before is Provider.OPENAI_COMPATIBLE
-        assert config.llm_client.planning_provider.native_web_tools() == (
-            {"web_search", "web_fetch"} if switched else set()
-        )
+        provider = config.llm_client.planning_provider
+        # Direct OpenAI and switched openai_compatible both run on anton's
+        # Responses flavor, so the endpoint tells the two snapshots apart.
+        assert provider.native_web_tools() == {"web_search", "web_fetch"}
+        assert (provider._base_url == _BASE_URL) is switched
         assert (config.web_search_enabled, config.web_fetch_enabled) == (not switched,) * 2
     finally:
         await config.llm_client.aclose()
@@ -283,7 +285,8 @@ async def test_probe_keeps_its_clients_web_policy_after_settings_change(
         monkeypatch, _settings(before), changed_settings=_settings(after)
     )
     switched = before is Provider.OPENAI_COMPATIBLE
-    assert config.llm_client.planning_provider.native_web_tools() == (
-        {"web_search", "web_fetch"} if switched else set()
-    )
+    provider = config.llm_client.planning_provider
+    # Both providers run on anton's Responses flavor; the endpoint tells them apart.
+    assert provider.native_web_tools() == {"web_search", "web_fetch"}
+    assert (provider._base_url == _BASE_URL) is switched
     assert (config.web_search_enabled, config.web_fetch_enabled) == (not switched,) * 2

@@ -29,6 +29,8 @@ class Role(str, Enum):
     thought_tool_call_start = "thought.tool_call.start"
     thought_tool_call_progress = "thought.tool_call.progress"
     thought_tool_call_end = "thought.tool_call.end"
+    # A tool's message to the user, rendered as an agent message between steps.
+    thought_tool_call_message = "thought.tool_call.message"
 
 
 class ContentType(str, Enum):
