@@ -297,3 +297,48 @@ def test_removing_a_folder_detaches_it(stores, user_folders, tmp_path):
         service.remove_folder(conversation.id, gone.id)
 
         assert [r.id for r in service.list_folders(conversation.id)[1]] == [kept.id]
+
+
+def test_the_legacy_anton_home_is_refused(stores, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    (home / ".anton").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    reason = "Choose a folder that does not hold Cowork's own data"
+
+    assert folder_refusal(str(home / ".anton"), None) == reason
+    assert folder_refusal(str(home), None) == reason
+
+
+@pytest.mark.parametrize(
+    "env, value_for",
+    [
+        ("MASTER_KEY_PATH", lambda f: str(f / ".master_key")),
+        ("DATABASE_URI", lambda f: f"sqlite:///{f / 'cowork.db'}"),
+    ],
+)
+def test_a_folder_holding_the_master_key_or_the_database_is_refused(
+    stores, tmp_path, monkeypatch, env, value_for
+):
+    holder = tmp_path / "user" / "secrets"
+    holder.mkdir(parents=True)
+    monkeypatch.setenv(env, value_for(holder))
+    get_app_settings.cache_clear()
+
+    assert folder_refusal(str(holder), None) == "Choose a folder that does not hold Cowork's own data"
+
+
+def test_a_store_root_that_cannot_resolve_still_refuses(stores, monkeypatch):
+    """Dropping a root that fails to resolve would accept folders inside it."""
+    vault = stores["COWORK_VAULT_DIR"]
+    inside = vault / "inside"
+    inside.mkdir()
+    real_resolve = Path.resolve
+
+    def _resolve(self, strict=False):
+        if self == vault:
+            raise RuntimeError("symlink loop")
+        return real_resolve(self, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", _resolve)
+
+    assert folder_refusal(str(inside), None) == "Choose a folder that does not hold Cowork's own data"

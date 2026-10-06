@@ -14,14 +14,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import UUID
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError, IntegrityError
 
+from cowork.common.logger import get_logger
 from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
 from cowork.db.scoped import ScopedSession
 from cowork.models.conversation import Conversation
 from cowork.models.conversation_folder import ConversationFolder
 from cowork.services.conversations import ConversationService
+
+logger = get_logger(__name__)
 
 MAX_FOLDERS_PER_CONVERSATION = 16
 _MAX_PATH_LENGTH = 1024
@@ -64,14 +68,41 @@ def _overlaps(a: Path, b: Path) -> bool:
     return a == b or b in a.parents or a in b.parents
 
 
+def _comparable_location(raw: str | Path) -> Path:
+    """`raw` resolved for comparison, or as configured when it cannot resolve.
+
+    Falling back rather than dropping the location keeps a check that cannot
+    resolve its root failing closed; the failure is logged.
+    """
+    path = Path(raw).expanduser()
+    try:
+        return _comparable(path.resolve(strict=False))
+    except (OSError, RuntimeError):
+        logger.warning("Could not resolve %s; comparing it as configured", path, exc_info=True)
+        return _comparable(path.absolute())
+
+
+def _sqlite_file(uri: str) -> str | None:
+    """The database file a SQLite URI names, or None for any other database."""
+    try:
+        url = make_url(uri)
+    except ArgumentError:
+        return None
+    if not url.drivername.startswith("sqlite") or not url.database or url.database == ":memory:":
+        return None
+    return url.database
+
+
 def _store_roots() -> list[Path]:
-    """Every directory Cowork keeps its own state in, resolved.
+    """Every location Cowork keeps its own state or credentials in.
 
     Each store can be moved on its own, so `COWORK_HOME` alone does not cover
-    the vault or the projects root.
+    the vault or the projects root. The database and master key files count
+    too, so a folder holding either is refused, as does the legacy `~/.anton`
+    home whose `.env` the server still reads on a default install.
     """
     settings = get_app_settings()
-    raw = [
+    raw: list[str | Path] = [
         cowork_home(),
         settings.project.root_dir,
         settings.file.root_dir,
@@ -79,14 +110,13 @@ def _store_roots() -> list[Path]:
         settings.connector.vault_dir,
         settings.memory.root_dir,
         settings.coding.root_dir,
+        settings.master_key_path,
+        Path.home() / ".anton",
     ]
-    roots: list[Path] = []
-    for item in raw:
-        try:
-            roots.append(_comparable(Path(item).expanduser().resolve(strict=False)))
-        except (OSError, RuntimeError):
-            continue
-    return roots
+    database = _sqlite_file(settings.database.uri)
+    if database is not None:
+        raw.append(database)
+    return [_comparable_location(item) for item in raw]
 
 
 def _unavailable_reason() -> str | None:
@@ -123,11 +153,8 @@ def resolve_folder(raw_path: str, project_path: str | None) -> Path:
     if any(_overlaps(candidate, root) for root in _store_roots()):
         raise FolderRefused(_APP_DATA)
     if project_path:
-        try:
-            project = _comparable(Path(project_path).resolve(strict=False))
-        except (OSError, RuntimeError):
-            project = None
-        if project is not None and (candidate == project or project in candidate.parents):
+        project = _comparable_location(project_path)
+        if candidate == project or project in candidate.parents:
             raise FolderRefused(_IN_PROJECT)
     return resolved
 
