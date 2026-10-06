@@ -25,6 +25,8 @@ from cowork.handlers.responses import ResponsesHandler
 from cowork.streaming.answers import SubmitResult, broker
 from cowork.streaming.registry import RunHandle, TurnLifecycle, discard_conversation, registry
 
+from _fakes import inline_run_db
+
 CID = "conv-discard-test"
 QID = "ask:1"
 _REQUEST = AskRequest(prompt="Which database?", options=(AskOption(value="pg", label="postgres"),))
@@ -53,6 +55,10 @@ class _FakeBuffer:
     async def close(self, reason, extra=None):
         self.closed = reason
 
+    @property
+    def is_closed(self) -> bool:
+        return self.closed is not None
+
 
 def _blocked_handler(monkeypatch, saved: dict, asked: asyncio.Event):
     """A handler whose turn publishes a question and blocks on the broker."""
@@ -64,7 +70,7 @@ def _blocked_handler(monkeypatch, saved: dict, asked: asyncio.Event):
             pass
 
         def get_conversation(self, conv_id):
-            return object()
+            return SimpleNamespace(project=None)
 
         def save_user_message(self, conv_id, content, *, created_at=None, pending=False):
             saved["user"] = content
@@ -94,8 +100,7 @@ def _blocked_handler(monkeypatch, saved: dict, asked: asyncio.Event):
         yield "event: response.completed\ndata: {}\n\n"
 
     monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
-    monkeypatch.setattr(responses_mod, "ScopedSession", lambda s, scope: FakeSession())
-    monkeypatch.setattr(responses_mod, "get_open_session", lambda: None)
+    monkeypatch.setattr(responses_mod, "run_db", inline_run_db(FakeSession()))
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: None)
     monkeypatch.setattr(responses_mod, "get_harness", lambda name: SimpleNamespace(
         stream_response=lambda **kwargs: None, formatter=formatter,

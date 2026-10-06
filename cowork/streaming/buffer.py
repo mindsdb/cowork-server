@@ -96,6 +96,23 @@ def turn_buffer_path(streams_dir: Path, conversation_id: str, turn_id: int) -> P
     return conversation_dir(streams_dir, conversation_id) / f"turn_{int(turn_id):06d}.jsonl"
 
 
+def _parse_record(line: str | bytes) -> TurnRecord | None:
+    """One JSONL line as a record, or None for a blank or half-written line."""
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None  # half-written record from a crash
+    return TurnRecord(
+        seq=int(obj.get("seq", -1)),
+        ts=str(obj.get("ts", "")),
+        type=str(obj.get("type", "")),
+        data=dict(obj.get("data") or {}),
+    )
+
+
 def read_records(path: Path, from_seq: int = 0) -> Iterator[TurnRecord]:
     """Read JSONL records with ``seq >= from_seq``. Tolerates a partial
     last line (producer crash mid-write) — skipped, not raised."""
@@ -104,24 +121,41 @@ def read_records(path: Path, from_seq: int = 0) -> Iterator[TurnRecord]:
     try:
         with path.open("r", encoding="utf-8") as f:
             for line in f:
-                line = line.rstrip("\n")
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue  # half-written record from a crash
-                seq = int(obj.get("seq", -1))
-                if seq < from_seq:
-                    continue
-                yield TurnRecord(
-                    seq=seq,
-                    ts=str(obj.get("ts", "")),
-                    type=str(obj.get("type", "")),
-                    data=dict(obj.get("data") or {}),
-                )
+                record = _parse_record(line)
+                if record is not None and record.seq >= from_seq:
+                    yield record
     except OSError as exc:
         logger.warning("Could not read turn buffer at %s: %s", path, exc)
+
+
+class _NewRecords:
+    """Reads a turn file a little at a time: each call parses only the
+    complete lines written since the last one.
+
+    A reader that re-read the whole file on every wake would parse a turn of
+    N records about N * N / 2 times, on the event loop. This one keeps the
+    byte offset it has read up to, and holds back a last line that has no
+    newline yet until the rest of it is written.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._offset = 0
+        self._partial = b""
+
+    def read(self) -> list[TurnRecord]:
+        try:
+            with self._path.open("rb") as f:
+                f.seek(self._offset)
+                chunk = f.read()
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            logger.warning("Could not read turn buffer at %s: %s", self._path, exc)
+            return []
+        self._offset += len(chunk)
+        *lines, self._partial = (self._partial + chunk).split(b"\n")
+        return [record for record in map(_parse_record, lines) if record is not None]
 
 
 class FileStreamBuffer(StreamBuffer):
@@ -187,15 +221,16 @@ class FileStreamBuffer(StreamBuffer):
         old.set()
 
     async def tail(self, from_seq: int = 0) -> AsyncIterator[TurnRecord]:
-        seen = from_seq - 1
+        new_records = _NewRecords(self._path)
         while True:
             # Snapshot the event BEFORE reading so an append between the
             # read and the wait can't be lost (it either shows on re-read
             # or fires the snapshot we're about to await).
             waiter = self._new_data
             emitted_terminal = False
-            for rec in read_records(self._path, from_seq=seen + 1):
-                seen = rec.seq
+            for rec in new_records.read():
+                if rec.seq < from_seq:
+                    continue
                 yield rec
                 if rec.is_terminal:
                     emitted_terminal = True

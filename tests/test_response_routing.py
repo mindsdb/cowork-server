@@ -972,8 +972,6 @@ async def test_produce_direct_answers_a_full_pool_with_a_timed_retry(monkeypatch
     from cowork.db.units import DatabaseBusy
 
     handler = _routing_handler(monkeypatch)
-    monkeypatch.setattr(responses, "get_open_session", lambda: SimpleNamespace(close=lambda: None))
-    monkeypatch.setattr(responses, "ScopedSession", lambda session, scope: SimpleNamespace(close=lambda: None))
 
     def no_free_connection(*args, **kwargs):
         raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
