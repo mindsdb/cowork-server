@@ -118,6 +118,50 @@ def test_a_worktree_with_a_task_created_repository_is_kept(tmp_path: Path) -> No
     assert not ref_exists(repo, "refs/cowork/released/task-4")
 
 
+def test_a_repository_initialized_inside_a_tracked_directory_is_kept(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    manager = WorkspaceManager(tmp_path / "coding")
+    worktree = manager.prepare("task-6", str(repo), allow_direct_folder=False).workspace_path
+    (worktree / "src").mkdir()
+    (worktree / "src" / "lib.py").write_text("tracked\n", encoding="utf-8")
+    git(worktree, "add", "src/lib.py")
+    git(worktree, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "src")
+    # The parent still sees src/lib.py as tracked and clean.
+    git(worktree / "src", "init", "-q")
+    git(worktree / "src", "add", "lib.py")
+    git(worktree / "src", "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "private")
+
+    assert manager.release("task-6", str(repo), str(worktree), WorkspaceKind.git_worktree) is False
+    assert (worktree / "src" / ".git").is_dir()
+
+
+@pytest.mark.parametrize("kind", [WorkspaceKind.git_worktree, WorkspaceKind.local_copy])
+def test_restore_replaces_a_folder_left_partly_removed_by_a_release(tmp_path: Path, kind: WorkspaceKind) -> None:
+    if kind == WorkspaceKind.git_worktree:
+        source = repository(tmp_path)
+        edited = "README.md"
+    else:
+        source = tmp_path / "folder"
+        source.mkdir()
+        (source / "edit.txt").write_text("before\n", encoding="utf-8")
+        edited = "edit.txt"
+    manager = WorkspaceManager(tmp_path / "coding")
+    workspace = manager.prepare("task-7", str(source), allow_direct_folder=kind == WorkspaceKind.local_copy).workspace_path
+    (workspace / edited).write_text("task change\n", encoding="utf-8")
+    (workspace / "locked.txt").write_text("locked\n", encoding="utf-8")
+    assert manager.release("task-7", str(source), str(workspace), kind) is True
+    # A file held open during removal survives while the task's edit is gone.
+    workspace.mkdir(parents=True)
+    (workspace / "locked.txt").write_text("locked\n", encoding="utf-8")
+    assert manager.is_released("task-7", kind)
+
+    manager.restore("task-7", str(source), str(workspace), kind)
+
+    assert (workspace / edited).read_text(encoding="utf-8") == "task change\n"
+    assert (workspace / "locked.txt").read_text(encoding="utf-8") == "locked\n"
+    assert not manager.is_released("task-7", kind)
+
+
 def test_a_local_copy_containing_a_repository_is_kept(tmp_path: Path) -> None:
     source = tmp_path / "folder"
     (source / "app").mkdir(parents=True)

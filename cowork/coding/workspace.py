@@ -816,8 +816,14 @@ class WorkspaceManager:
             if not source.is_dir():
                 raise WorkspaceError("The task's source folder is unavailable, so its workspace cannot be restored")
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            # An interrupted release can leave part of the folder behind. The
+            # saved state is complete, so the leftover is replaced.
             if actual.exists():
-                raise WorkspaceError("A managed worktree already exists for this task")
+                self.git.run(source, "worktree", "remove", "--force", str(actual), check=False)
+                shutil.rmtree(actual, ignore_errors=True)
+            if actual.exists():
+                raise WorkspaceError("Part of this task's old workspace is still in use. Close programs using it and try again")
+            self.git.run(source, "worktree", "prune", check=False)
             actual.parent.mkdir(parents=True, exist_ok=True)
             self.git.run(source, "worktree", "add", "--detach", str(actual), str(metadata["head"]))
             try:
@@ -830,6 +836,12 @@ class WorkspaceManager:
             self.git.run(source, "update-ref", "-d", self._release_ref(key), check=False)
             metadata_path.unlink()
             (release_dir / _RELEASE_PATCH).unlink(missing_ok=True)
+
+    def is_released(self, key: str, kind: WorkspaceKind) -> bool:
+        """Whether saved state exists to rebuild this workspace from."""
+        if kind == WorkspaceKind.local_copy:
+            return self.local_copies.is_released(key)
+        return (self.snapshots_root / managed_key(key) / _RELEASE_METADATA).is_file()
 
     def discard_release(self, key: str, source_path: str) -> None:
         """Forget a released workspace's saved state once its task is deleted."""
@@ -845,13 +857,18 @@ class WorkspaceManager:
     def _has_nested_repository(self, worktree: Path) -> bool:
         """Whether a repository inside the worktree holds history a patch cannot carry.
 
-        Git records a nested repository as a single untracked entry or gitlink,
-        so its files and commits would be lost when the worktree is removed.
+        A nested repository's files and commits would be lost when the worktree
+        is removed. One can sit anywhere, including in a tracked directory the
+        parent still sees as clean, so every directory Git lists is checked.
+        Ignored directories are not, as their contents are never saved.
         """
         untracked = [path for status, path in self._status_entries(worktree) if status == "??"]
-        staged = self.git.run(worktree, "ls-files", "--stage", "-z").stdout.split("\0")
-        gitlinks = [entry.split("\t", 1)[1] for entry in staged if entry.startswith("160000 ")]
-        return any((worktree / path / ".git").exists() for path in (*untracked, *gitlinks))
+        tracked = [path for path in self.git.run(worktree, "ls-files", "-z").stdout.split("\0") if path]
+        directories = {PurePosixPath(path) for path in untracked}
+        for path in (*untracked, *tracked):
+            directories.update(PurePosixPath(path).parents)
+        directories.discard(PurePosixPath("."))
+        return any((worktree / directory / ".git").exists() for directory in directories)
 
     def _managed_worktree(self, key: str, workspace_path: str) -> Path:
         relative = managed_key(key)
