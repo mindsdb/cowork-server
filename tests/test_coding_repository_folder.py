@@ -94,16 +94,21 @@ def test_changes_in_repositories_and_loose_files_review_and_apply_back(tmp_path:
     assert (folder / "app" / "src" / "main.py").read_text(encoding="utf-8") == "print('dirty')\n"
 
 
-def test_cleanup_and_release_forget_the_inner_worktrees(tmp_path: Path, folder: Path) -> None:
+def test_cleanup_and_release_forget_only_their_own_worktrees(tmp_path: Path, folder: Path) -> None:
     manager = WorkspaceManager(tmp_path / "coding")
+    # Another tool's worktree whose folder was deleted: Cowork must leave its
+    # registration alone rather than prune the user's repository.
+    stale = tmp_path / "someone-elses-worktree"
+    git(folder / "app", "worktree", "add", "--detach", str(stale))
+    subprocess.run(["rm", "-rf", str(stale)], check=True)
     first = manager.prepare("first", str(folder), allow_direct_folder=True).workspace_path
     second = manager.prepare("second", str(folder), allow_direct_folder=True).workspace_path
-    assert len(worktrees(folder / "app")) == 3
+    assert len(worktrees(folder / "app")) == 4
 
     manager.cleanup("first", str(folder), str(first), WorkspaceKind.local_copy, None)
     assert manager.release("second", str(folder), str(second), WorkspaceKind.local_copy) is True
 
-    assert len(worktrees(folder / "app")) == 1
+    assert worktrees(folder / "app") == [f"worktree {(folder / 'app').resolve()}", f"worktree {stale.resolve()}"]
     assert len(worktrees(folder / "services" / "api")) == 1
 
 

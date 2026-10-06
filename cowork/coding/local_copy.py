@@ -245,7 +245,7 @@ class LocalCopyManager:
                 shutil.copy2(desired_path, temp)
                 os.replace(temp, target)
 
-    def cleanup(self, key: str, workspace: Path) -> None:
+    def cleanup(self, key: str, workspace: Path, before_remove: Callable[[Path], None] | None = None) -> None:
         relative = managed_key(key)
         actual = workspace.resolve()
         expected_roots = (self.copies_root, self.legacy_copies_root)
@@ -261,10 +261,12 @@ class LocalCopyManager:
                 self._copy_tree(workspace, recovery)
             except OSError as exc:
                 raise self._copy_failure("The task copy could not be saved for recovery", exc) from exc
+        if before_remove is not None and workspace.exists():
+            before_remove(workspace)
         shutil.rmtree(workspace, ignore_errors=True)
         shutil.rmtree(baseline, ignore_errors=True)
 
-    def release(self, key: str, workspace: Path) -> bool:
+    def release(self, key: str, workspace: Path, before_remove: Callable[[Path], None] | None = None) -> bool:
         """Remove a task copy and its baseline, keeping only the task's changes.
 
         The saved state is the pre-task and task versions of each changed path,
@@ -301,6 +303,8 @@ class LocalCopyManager:
             raise self._copy_failure("The task changes could not be saved before releasing the copy", exc) from exc
         _force_remove(release)
         os.replace(staging, release)
+        if before_remove is not None:
+            before_remove(actual)
         _force_remove(actual)
         _force_remove(baseline)
         return True
