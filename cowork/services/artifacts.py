@@ -835,9 +835,7 @@ def serve_url_for(
     return ""
 
 
-def _candidate_relative_artifacts(
-    raw_path: str, *, session: "ScopedSession | None" = None
-) -> list[Path]:
+def _candidate_relative_artifacts(raw_path: str, artifact_dirs: list[Path]) -> list[Path]:
     text = (raw_path or "").strip().replace("\\", "/")
     while text.startswith("./"):
         text = text[2:]
@@ -847,7 +845,7 @@ def _candidate_relative_artifacts(
     if text.startswith("artifacts/"):
         text = text[len("artifacts/"):]
     matches: dict[str, Path] = {}
-    for art_root in _artifact_dirs_for_scope(session):
+    for art_root in artifact_dirs:
         try:
             target = (art_root / text).resolve()
             target.relative_to(art_root.resolve())
@@ -863,6 +861,7 @@ def resolve_artifact_path(
     *,
     allow_dir: bool = False,
     session: "ScopedSession | None" = None,
+    artifact_dirs: list[Path] | None = None,
 ) -> Path | None:
     """Turn an artifact request path into an absolute path on disk.
 
@@ -874,6 +873,9 @@ def resolve_artifact_path(
     by publish/unpublish so a folder-based artifact can be addressed by its
     folder. The relative-path branch stays file-only (the client always
     sends absolute folder paths).
+
+    `artifact_dirs` lets a caller that already resolved the roots for
+    `session` pass them in, so resolution does not read the database again.
     """
     if "\x00" in raw_path:
         raise ValueError("Invalid artifact path")
@@ -884,9 +886,11 @@ def resolve_artifact_path(
     if not str(target).strip():
         raise ValueError("Invalid artifact path")
 
+    if artifact_dirs is None:
+        artifact_dirs = _artifact_dirs_for_scope(session)
     if target.is_absolute():
         resolved = target.resolve()
-        for art_root in _artifact_dirs_for_scope(session):
+        for art_root in artifact_dirs:
             try:
                 resolved.relative_to(art_root.resolve())
             except ValueError:
@@ -897,7 +901,7 @@ def resolve_artifact_path(
                 return resolved
         raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
-    matches = _candidate_relative_artifacts(raw_path, session=session)
+    matches = _candidate_relative_artifacts(raw_path, artifact_dirs)
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:

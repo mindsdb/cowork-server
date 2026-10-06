@@ -6,6 +6,7 @@ folder and they then disappear from the artifact list and do not serve.
 """
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -383,6 +384,38 @@ def test_published_state_still_returns_the_blank_default_when_the_database_error
         "Could not resolve artifact roots for %s"
     ) == 2
     assert all("database is locked" in r.exc_text for r in caplog.records)
+
+
+def test_published_state_reads_the_artifact_roots_once(engine, tmp_path, monkeypatch):
+    """Path resolution reuses the roots already read. A second read is a second
+    database round trip, and one failing there was swallowed with no log as an
+    artifact that is simply not published."""
+    from cowork.services import artifacts as artifacts_service
+    from cowork.services.publish import published_owner_state, published_state
+
+    folder = tmp_path / "Documents" / "notes"
+    folder.mkdir(parents=True)
+    artifact = _artifacts_dir(folder) / "dash"
+    artifact.mkdir()
+    primary = artifact / "index.html"
+    primary.write_text("<html></html>")
+    (artifact / "metadata.json").write_text("{}")
+    entry = {"report_id": "uuid-once", "url": "https://4nton.ai/a/uuid-once", "published": True}
+    (artifact / ".published.json").write_text(json.dumps({"index.html": entry}))
+    ProjectService(_scoped(engine)).create_project("notes", path=folder)
+
+    def _second_read(_session=None):
+        raise RuntimeError("database is locked")
+
+    # Only the binding `resolve_artifact_path` would use; `publish` keeps its own.
+    monkeypatch.setattr(artifacts_service, "_artifact_dirs_for_scope", _second_read)
+
+    assert published_state(str(primary), _scoped(engine)) == {
+        "report_id": "uuid-once",
+        "url": "https://4nton.ai/a/uuid-once",
+        "published": True,
+    }
+    assert published_owner_state(str(primary), _scoped(engine)) == entry
 
 
 def test_a_relative_path_in_two_roots_is_reported_as_ambiguous(engine, tmp_path):
