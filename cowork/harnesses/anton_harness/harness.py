@@ -460,6 +460,7 @@ class AntonHarness:
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
         channel_context: ChannelContext | None = None,
+        tool_messages: bool = False,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -538,6 +539,7 @@ class AntonHarness:
                 reasoning_effort=reasoning_effort,
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
+                tool_messages=tool_messages,
             )
             # Length of the seeded history — everything anton appends past this
             # index is this turn's block-messages (tool_use / tool_result / text).
@@ -830,6 +832,7 @@ class AntonHarness:
         reasoning_effort: str | None = None,
         disabled_connections: list[dict] | None = None,
         channel_context: ChannelContext | None = None,
+        tool_messages: bool = False,
     ):
         """Build the same core runtime the Anton CLI uses, scoped to one project."""
         from anton.chat_session import build_runtime_context
@@ -1228,6 +1231,10 @@ class AntonHarness:
                 # This harness rebuilds the session every message, so the verifier
                 # latch has to outlive it or a persistent failure diagnoses each time.
                 **supported_kwargs(ChatSessionConfig, shared_verifier_latch=True),
+                # Whether the client renders a tool's message to the user (the
+                # brief when the agent acts first); without it the tool hands
+                # the content to the agent. Dropped by an anton without the field.
+                **supported_kwargs(ChatSessionConfig, tool_messages=tool_messages),
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
                 # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API

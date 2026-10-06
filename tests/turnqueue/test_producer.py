@@ -977,3 +977,27 @@ async def test_interactive_defaults_to_false(monkeypatch):
     await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
                                             input_text="hi", model="m"))
     assert json.loads(fake.added[0][1]["payload"])["params"]["interactive"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_messages", [True, False])
+async def test_tool_messages_reaches_the_job_params(monkeypatch, tool_messages):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m", tool_messages=tool_messages))
+    job = json.loads(fake.added[0][1]["payload"])
+    assert job["params"]["tool_messages"] is tool_messages
+
+
+@pytest.mark.asyncio
+async def test_tool_messages_defaults_to_false(monkeypatch):
+    """Channel turns (turnqueue/remote_turn.py) never pass it: a bot cannot
+    render a tool's message, so the tool hands the content to the agent."""
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m"))
+    assert json.loads(fake.added[0][1]["payload"])["params"]["tool_messages"] is False
