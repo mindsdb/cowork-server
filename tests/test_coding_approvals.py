@@ -26,7 +26,7 @@ def wait_for_opened(opened: list) -> None:
 def test_approval_blocks_until_explicit_one_time_decision() -> None:
     opened = []
     closed = []
-    broker = ApprovalBroker(lambda session_id, pending: opened.append((session_id, pending)), lambda *args: closed.append(args))
+    broker = ApprovalBroker(lambda session_id, pending: opened.append((session_id, pending)), lambda *args: closed.append(args), lambda _: [])
     thread, result = request_in_thread(broker, "item/commandExecution/requestApproval", {"command": "git status"})
     wait_for_opened(opened)
     assert len(opened) == 1 and thread.is_alive()
@@ -44,23 +44,23 @@ def test_approval_blocks_until_explicit_one_time_decision() -> None:
 
 def test_session_approval_is_only_offered_for_narrow_policy_amendment() -> None:
     opened = []
-    broker = ApprovalBroker(lambda _session, pending: opened.append(pending), lambda *_args: None)
+    broker = ApprovalBroker(lambda _session, pending: opened.append(pending), lambda *_args: None, lambda _: [])
     thread, result = request_in_thread(
         broker,
         "item/commandExecution/requestApproval",
-        {"command": "npm test", "proposedExecPolicyAmendment": {"prefix": ["npm", "test"]}},
+        {"command": "/bin/zsh -lc 'npm test'", "cwd": "/repo", "proposedExecpolicyAmendment": ["npm", "test"]},
     )
     wait_for_opened(opened)
     pending = opened[0]
     assert pending.allow_session is True
     broker.resolve("session-1", pending.id, ApprovalDecision.approve_session)
     thread.join(timeout=1)
-    assert result == [{"decision": "acceptForSession"}]
+    assert result == [{"decision": "accept"}]
 
 
 def test_cancel_and_wrong_session_fail_closed() -> None:
     opened = []
-    broker = ApprovalBroker(lambda _session, pending: opened.append(pending), lambda *_args: None)
+    broker = ApprovalBroker(lambda _session, pending: opened.append(pending), lambda *_args: None, lambda _: [])
     thread, result = request_in_thread(broker, "permission/request", {"reason": "network"})
     wait_for_opened(opened)
     pending = opened[0]
@@ -87,7 +87,7 @@ def test_persistence_failure_turns_an_approval_into_a_denial() -> None:
     def fail_close(*_args) -> None:
         raise OSError("disk unavailable")
 
-    broker = ApprovalBroker(lambda _session, pending: opened.append(pending), fail_close)
+    broker = ApprovalBroker(lambda _session, pending: opened.append(pending), fail_close, lambda _: [])
     thread, result = request_in_thread(broker, "item/commandExecution/requestApproval", {"command": "npm test"})
     wait_for_opened(opened)
 
@@ -102,6 +102,7 @@ def test_open_persistence_failure_does_not_leave_a_resolvable_waiter() -> None:
     broker = ApprovalBroker(
         lambda *_args: (_ for _ in ()).throw(OSError("disk unavailable")),
         lambda *_args: None,
+        lambda _: [],
     )
 
     with pytest.raises(OSError, match="disk unavailable"):
@@ -112,7 +113,7 @@ def test_open_persistence_failure_does_not_leave_a_resolvable_waiter() -> None:
 
 def test_concurrent_approval_for_one_task_is_denied_instead_of_hiding_the_visible_request() -> None:
     opened = []
-    broker = ApprovalBroker(lambda _session, pending: opened.append(pending), lambda *_args: None)
+    broker = ApprovalBroker(lambda _session, pending: opened.append(pending), lambda *_args: None, lambda _: [])
     first_thread, first_result = request_in_thread(broker, "permission/request", {"reason": "network"})
     wait_for_opened(opened)
 

@@ -13,10 +13,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.datastructures import MutableHeaders
 
+from cowork.api.v1.route_walker import contradictory_routes, route_key, undeclared_routes
 from cowork.api.v1.router import api_router as v1_router
 from starlette.responses import JSONResponse
 
 from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token, sync_auth_token
+from cowork.coding.inference_proxy import INFERENCE_PATHS
 from cowork.db.scoped import MissingTenantScopeError
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.common.logger import setup_logging
@@ -93,9 +95,44 @@ async def _warm_model_map_on_boot() -> bool:
         warm_session.close()
 
 
+async def _cancel_and_wait(task: asyncio.Task | None) -> None:
+    """Stop one background task at shutdown and wait for it to finish."""
+    if task is None:
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def _run_artifact_owner_backfill() -> None:
+    """Background, one-time owner backfill (ENG-2961). Never affects startup."""
+    try:
+        from cowork.services.artifact_owner_backfill import run_artifact_owner_backfill
+
+        await asyncio.to_thread(run_artifact_owner_backfill)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("artifact owner backfill failed (non-fatal)")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_dev_setup()
+    # History recovery also retries buffers sealed by an earlier failed sweep.
+    try:
+        from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
+        from cowork.db.session import get_open_session
+        from cowork.streaming import get_streams_dir
+        from cowork.streaming.recovery import seal_orphan_turns_in_history
+
+        history_session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
+        try:
+            seal_orphan_turns_in_history(history_session, get_streams_dir())
+        finally:
+            history_session.close()
+    except Exception:
+        logger.exception("turn-history boot recovery failed (non-fatal)")
     # Seal any turn buffers left open by a previous process (crash/restart)
     # so reconnecting clients get a clean Interrupted end-of-stream rather
     # than hanging. GC of old buffers happens lazily; cheap no-op when none.
@@ -147,34 +184,50 @@ async def lifespan(app: FastAPI):
     start_scheduler()
     await _start_channels(app)
     app.state.channel_ingress_reconciler = None
+    app.state.artifact_owner_backfill = None
     if get_app_settings().tenancy_mode == "org":
         from cowork.channels.ingress import start_reconciler
 
         app.state.channel_ingress_reconciler = start_reconciler(
             app.state.channel_ingress, app.state.channel_adapters
         )
+        # Background so the port binds without waiting for an EFS walk.
+        app.state.artifact_owner_backfill = asyncio.create_task(
+            _run_artifact_owner_backfill()
+        )
     try:
         yield
     finally:
         from cowork.channels.webhooks import drain_background_tasks
+        from cowork.common.chat_session import drain_scratchpad_closes
         from cowork.common.http_client import close_proxy_client
+        from cowork.coding.inference_proxy import close_inference_client
         from cowork.services.artifacts import shutdown_launched_backends
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
         from cowork.coding.service import get_coding_service
+        from cowork.streaming.registry import registry
 
-        reconciler = getattr(app.state, "channel_ingress_reconciler", None)
-        if reconciler is not None:
-            reconciler.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await reconciler
+        # Uvicorn's request drain is bounded by the image command. Persist
+        # interrupted turns before their database and runtime resources close.
+        cancelled = await registry.shutdown()
+        if cancelled:
+            logger.warning("Cancelled %d in-flight turn(s) for shutdown", cancelled)
+
+        await _cancel_and_wait(getattr(app.state, "channel_ingress_reconciler", None))
+        await _cancel_and_wait(getattr(app.state, "artifact_owner_backfill", None))
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
+        # After both turn drains above: each turn they unwound has queued the
+        # close of its scratchpad processes, and those must finish before the
+        # event loop stops.
+        await drain_scratchpad_closes()
         await app.state.channel_adapters.shutdown()
         get_coding_service().close_all()
         shutdown_launched_backends()
         await close_scratchpads()
         await close_proxy_client()
+        await close_inference_client()
 
 
 class _NoStoreMiddleware:
@@ -226,10 +279,10 @@ def create_app() -> FastAPI:
     async def _missing_tenant_scope(request, exc):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
-    # Optional bearer-token auth.  Off by default; enabled when
-    # COWORK_REQUIRE_AUTH=true.  Token is auto-generated on first startup
-    # when COWORK_AUTH_TOKEN is not set, then persisted to <cowork_home>/.env
-    # so the desktop app and subsequent server runs share the same secret.
+    # Bearer-token auth. On by default in local mode (see AppSettings.
+    # require_auth). Token is auto-generated on first startup when
+    # COWORK_AUTH_TOKEN is not set, then persisted to <cowork_home>/.env so
+    # the desktop app and subsequent server runs share the same secret.
     #
     # Registered BEFORE CORS so CORS ends up the outer layer (Starlette applies
     # the last-added middleware outermost): a 401 from the auth layer still
@@ -249,13 +302,11 @@ def create_app() -> FastAPI:
             TrustedHeaderMiddleware,
             exempt_paths=channel_webhook_paths,
             enforce=enforce,
-            organization_boundary_mode=settings.organization_boundary_mode,
         )
         logger.info(
             "auth: org tenancy mode — principal middleware enabled "
-            "(identity=%s, organization-boundary=%s)",
+            "(identity=%s)",
             settings.identity_enforce,
-            settings.organization_boundary_mode,
         )
         # No explicit shared root → org data sits on the ephemeral pod FS.
         # Warn, don't fail: dev deployments predate the mount. model_fields_set
@@ -285,6 +336,13 @@ def create_app() -> FastAPI:
         env_path = cowork_home() / ".env"
         token = settings.auth_token or ensure_auth_token(env_path)
         sync_auth_token(env_path, token)
+        # Codex has a separate, process-local inference credential, not the
+        # desktop's API token. These exact routes retain their own constant-time
+        # credential check and LoopbackDesktopOnly guard. Do not exempt the
+        # coding prefix: that would expose task/filesystem APIs to the agent.
+        channel_webhook_paths.update(
+            f"/api/v1/coding/inference/{path}" for path in INFERENCE_PATHS
+        )
         app.add_middleware(
             BearerTokenMiddleware, token=token, exempt_paths=channel_webhook_paths
         )
@@ -323,8 +381,70 @@ def create_app() -> FastAPI:
 
     _install_channels(app, channel_webhook_paths)
 
+    # ENG-2094: every route must declare a Permission (require(...)) so a
+    # walker can tell "open on purpose" from "someone forgot the line" — see
+    # route_walker.py and its docstring. Boot-time, not just CI, so a gap
+    # can't reach any environment undetected.
+    gaps = undeclared_routes(app)
+    if gaps:
+        # route_key, not route.methods: APIWebSocketRoute has no .methods, so
+        # reading it here would raise AttributeError over the top of the
+        # message that names the offending route.
+        names = ", ".join(f"{list(methods)} {path}" for path, methods in map(route_key, gaps))
+        raise RuntimeError(f"routes with no declared Permission (ENG-2094): {names}")
+
+    contradictions = contradictory_routes(app)
+    if contradictions:
+        names = ", ".join(f"{list(methods)} {path}" for path, methods in map(route_key, contradictions))
+        raise RuntimeError(
+            "routes declaring OpenByDesign alongside an identity Permission (ENG-2094): "
+            f"{names} — a route-level dependency is ADDED to its router's, never substituted for it, "
+            "so the stricter check still runs and the route is not open"
+        )
+
+    _warn_if_the_front_door_outranks_the_identity_layer(app)
+
     logger.info("Cowork application created successfully")
     return app
+
+
+def _warn_if_the_front_door_outranks_the_identity_layer(app: FastAPI) -> None:
+    """Say out loud when the audit rollback lever has stopped covering things.
+
+    ``identity_enforce=audit`` tells TrustedHeaderMiddleware to log a missing
+    principal and let the request through. The ENG-2094 permission classes do
+    not read that flag — deliberately, see AuthenticatedInOrgMode's docstring
+    — so in org mode they still 401 every route that requires identity. That
+    is the right layering and the wrong surprise: an operator who reaches for
+    audit to unblock traffic would get a 401 storm from a layer the flag never
+    named. Naming the count at boot is what turns that into a decision instead
+    of an incident.
+
+    A warning rather than a refusal: no deployment runs this state, and a boot
+    failure over a combination nothing uses buys less than it costs.
+    """
+    settings = get_app_settings()
+    if settings.tenancy_mode != "org" or settings.identity_enforce == "enforce":
+        return
+
+    from fastapi.routing import APIRoute, APIWebSocketRoute
+
+    from cowork.api.v1.permissions import Authenticated
+    from cowork.api.v1.route_walker import declared_permissions
+
+    still_enforcing = sum(
+        1
+        for route in app.routes
+        if isinstance(route, (APIRoute, APIWebSocketRoute))
+        and any(issubclass(cls, Authenticated) for cls in declared_permissions(route))
+    )
+    logger.warning(
+        "identity_enforce=%s applies to TrustedHeaderMiddleware only. %d route(s) "
+        "declare a Permission that requires identity and will still answer 401 "
+        "without it (ENG-2094). Audit mode is not a full rollback in org tenancy.",
+        settings.identity_enforce,
+        still_enforcing,
+    )
 
 
 def _install_channels(app: FastAPI, webhook_paths: set[str]) -> None:

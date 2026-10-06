@@ -22,6 +22,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator
@@ -38,6 +39,7 @@ from cowork.common.paths import (
     dir_unlink,
 )
 from cowork.common.settings.app_settings import get_app_settings
+from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 
 if TYPE_CHECKING:
     from cowork.db.scoped import ScopedSession
@@ -150,13 +152,6 @@ BG_CYCLE = [
     "linear-gradient(135deg, var(--sage-50), #fff)",
     "linear-gradient(135deg, #fff, var(--stone-150))",
 ]
-
-# Files that aren't user content for the `modified` badge's mtime gate.
-# Keep in sync with anton.publisher._FULLSTACK_EXCLUDED — the running
-# backend's runtime log (`backend.log`) is excluded from the published
-# bundle there, so it must not count toward content mtime here either,
-# or it would constantly trip the gate and force a false badge.
-_HOUSEKEEPING_FILES = {"metadata.json", "README.md", "backend.log", ".published.json", ".revisions"}
 
 TEXT_EXTENSIONS = {
     ".html", ".md", ".txt", ".csv", ".json", ".py", ".js",
@@ -344,25 +339,53 @@ def origin_conversation_id(meta: dict | None) -> str:
     return str(first.get("conversation") or "")
 
 
+def _user_files_with_mtimes(folder: Path) -> list[tuple[Path, int]]:
+    """All non-housekeeping files inside an artifact folder, paired with their
+    mtime in nanoseconds, sorted by mtime desc.
+
+    One `os.scandir` pass: `DirEntry.is_file(follow_symlinks=False)` and
+    `DirEntry.stat(follow_symlinks=False)` are served from the entry the
+    kernel already returned, so each file is stat'd once instead of the
+    two-to-four times separate `rglob`/`is_file`/`is_symlink`/`stat` calls cost.
+    """
+    out: list[tuple[Path, int]] = []
+
+    def _walk(start: Path, start_top: str | None) -> None:
+        # Explicit stack, not recursion: a folder deep enough to exhaust the
+        # call stack raises RecursionError, which is not an OSError and would
+        # otherwise escape every handler in the card builder above this.
+        stack: list[tuple[Path, str | None]] = [(start, start_top)]
+        while stack:
+            dir_path, top = stack.pop()
+            try:
+                with os.scandir(dir_path) as it:
+                    entries = list(it)
+            except OSError:
+                continue
+            for entry in entries:
+                entry_top = top if top is not None else entry.name
+                # First path component only: `static/prd.md` is content.
+                if entry_top in NON_CONTENT_NAMES:
+                    continue
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append((Path(entry.path), entry_top))
+                        continue
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    mtime_ns = entry.stat(follow_symlinks=False).st_mtime_ns
+                except OSError:
+                    continue
+                out.append((Path(entry.path), mtime_ns))
+
+    _walk(folder, None)
+    out.sort(key=lambda item: item[1], reverse=True)
+    return out
+
+
 def _user_files(folder: Path) -> list[Path]:
     """All non-housekeeping files inside an artifact folder, sorted by mtime desc."""
-    out: list[Path] = []
-    try:
-        for p in folder.rglob("*"):
-            if not p.is_file() or p.is_symlink():
-                continue
-            rel = p.relative_to(folder)
-            top = rel.parts[0] if rel.parts else ""
-            if top in _HOUSEKEEPING_FILES:
-                continue
-            out.append(p)
-    except OSError:
-        return []
-    try:
-        out.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    except OSError:
-        pass
-    return out
+    return [p for p, _ in _user_files_with_mtimes(folder)]
 
 
 def _pick_primary(
@@ -463,13 +486,13 @@ def _content_mtime(folder: Path) -> int:
     """Max mtime (int seconds) across an artifact's user content files.
 
     Disk-derived, so it reflects in-place edits the metadata.json mtime
-    misses. Housekeeping files (`metadata.json`, `README.md`,
-    `.published.json`) are excluded — they're not user content. Used both as
-    the renderer's cache-bust token and as the cheap "changed since publish"
-    gate for the `modified` badge.
+    misses. Names in anton's `NON_CONTENT_NAMES` are excluded — not user content.
+    Used both as the renderer's cache-bust token and as the cheap "changed
+    since publish" gate for the `modified` badge.
     """
     try:
-        return int(max((p.stat().st_mtime for p in _user_files(folder)), default=0.0))
+        max_ns = max((ns for _, ns in _user_files_with_mtimes(folder)), default=0)
+        return max_ns // 1_000_000_000
     except OSError:
         return 0
 
@@ -489,7 +512,7 @@ def content_mtime_ns(folder: Path) -> int:
     to notice two edits that landed in the same second.
     """
     try:
-        return max((p.stat().st_mtime_ns for p in _user_files(folder)), default=0)
+        return max((ns for _, ns in _user_files_with_mtimes(folder)), default=0)
     except OSError:
         return 0
 
@@ -998,6 +1021,9 @@ def _unpublish_identifier(
             ssl_verify=ssl_verify,
         )
     except Exception as exc:
+        from cowork.services.publish import raise_publish_permission_error
+
+        raise_publish_permission_error(exc)
         message = str(exc) or "Unpublishing failed."
         if "404" in message or "not found" in message.lower():
             logger.warning(
@@ -1218,6 +1244,7 @@ def _prepare_artifact_card(
     pinned_folder: PinnedDir | None,
     pinned_root: PinnedDir | None,
     artifacts_base: Path | None = None,
+    project_label: str = "",
 ) -> _PreparedArtifactCard | None:
     """Assemble the shared card shape without any filesystem mutation."""
     logical_folder = folder
@@ -1225,7 +1252,8 @@ def _prepare_artifact_card(
     io_root = _pinned_directory_path(pinned_root) if pinned_root else None
     if io_folder is None or (pinned_root is not None and io_root is None):
         return None
-    files = _user_files(io_folder)
+    files_with_mtimes = _user_files_with_mtimes(io_folder)
+    files = [p for p, _ in files_with_mtimes]
     primary = _pick_primary(
         io_folder,
         files,
@@ -1244,17 +1272,16 @@ def _prepare_artifact_card(
     kind = KIND_BY_TYPE.get(artifact_type) or KIND_BY_EXT.get(primary_ext, "File")
     is_live = False
     if primary is not None:
-        try:
-            is_live = (time.time() - primary.stat().st_mtime) < 300
-        except OSError:
-            is_live = False
+        # `primary_hint` can point at a file `_user_files` skipped (e.g. a
+        # housekeeping name); fall back to not-live rather than re-stat'ing.
+        primary_mtime_ns = next((ns for p, ns in files_with_mtimes if p == primary), None)
+        if primary_mtime_ns is not None:
+            is_live = (time.time() - primary_mtime_ns / 1_000_000_000) < 300
 
-    # Max mtime across the artifact's content files — a precise
-    # "content changed" signal for the renderer's preview viewer to
-    # cache-bust/reload on (ENG-375), and the cheap gate for `modified`.
-    # Named `mtime_seconds` so it does not shadow the module-level
-    # `content_mtime` alias other services import.
-    mtime_seconds = _content_mtime(io_folder)
+    # `mtime_seconds` (not `content_mtime`, which shadows the module alias) is
+    # the cache-bust/`modified`-gate signal, taken from the single walk above
+    # — already sorted mtime desc, so this is its first entry.
+    mtime_seconds = (files_with_mtimes[0][1] // 1_000_000_000) if files_with_mtimes else 0
 
     card = {
         # The one identity: drafts, published versions, revisions, comments
@@ -1280,7 +1307,10 @@ def _prepare_artifact_card(
         "path": primary_path,
         "primary": meta.get("primary") or None,
         "projectId": project_id,
-        "projectName": project_name,
+        # What the card shows. The serve URL below carries `project_name`
+        # instead, because serve_artifact_file resolves that segment by name
+        # (_project_artifacts_base).
+        "projectName": project_label or project_name,
         # The conversation that produced the artifact, so a comment addressed
         # with the agent from the artifacts list resumes that chat instead of
         # opening a fresh one. Empty for artifacts written before provenance —
@@ -1354,6 +1384,7 @@ def card_for_folder(
     *,
     project_id: str | None = None,
     project_name: str = "",
+    project_label: str = "",
     _pinned_folder: PinnedDir | None = None,
     _pinned_root: PinnedDir | None = None,
     artifacts_base: Path | None = None,
@@ -1394,6 +1425,7 @@ def card_for_folder(
         pinned_folder=_pinned_folder,
         pinned_root=_pinned_root,
         artifacts_base=artifacts_base,
+        project_label=project_label,
     )
     if prepared is None:
         return None
@@ -1547,14 +1579,19 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
     never discovers them, because a filesystem scan cannot tell which tenant is
     asking. The 80-item cap is pre-existing but matters more in org mode, where
     `sources` spans every project of the organization instead of one tree.
+
+    Two passes so the cap is applied before card work, not after: a collect
+    pass opens each artifact once and reads only its `metadata.json` mtime (no
+    card built), then a build pass walks the sorted candidates and stops once
+    80 cards have been produced.
     """
-    cards: list[dict] = []
     from cowork.services.artifact_identity import (
         _opened_child_directory,
         opened_artifact_root,
     )
 
-    for source in sources:
+    candidates: list[tuple[float, int, str, ProjectArtifacts]] = []
+    for source_idx, source in enumerate(sources):
         try:
             with opened_artifact_root(source) as root:
                 with dir_scandir(root) as entries:
@@ -1580,36 +1617,60 @@ def list_artifacts(sources: list[ProjectArtifacts]) -> list[dict]:
                 for child_name in sorted(child_names):
                     try:
                         with _opened_child_directory(root, child_name) as pinned_folder:
-                            folder = root.path / child_name
-                            card = _listed_card_for_pinned_folder(
-                                folder,
-                                len(cards),
-                                project_id=source.project_id,
-                                project_name=source.project_name,
-                                pinned_folder=pinned_folder,
-                                pinned_root=root,
-                                artifacts_base=(
-                                    source.base if source.external else None
-                                ),
-                            )
-                            if card is None:
-                                continue
                             try:
-                                card["_sortTs"] = dir_stat(
-                                    pinned_folder, "metadata.json"
-                                ).st_mtime
+                                mtime = dir_stat(pinned_folder, "metadata.json").st_mtime
                             except OSError:
-                                card["_sortTs"] = 0.0
-                            cards.append(card)
+                                mtime = 0.0
+                            candidates.append((mtime, source_idx, child_name, source))
                     except (OSError, ValueError):
                         continue
         except (OSError, ValueError):
             continue
 
-    cards.sort(key=lambda c: c["_sortTs"], reverse=True)
-    for c in cards:
-        c.pop("_sortTs", None)
-    return cards[:80]
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+
+    cards: list[dict] = []
+    # One root open per source, not per surviving candidate: opening a root
+    # costs an openat+stat per path component, so re-opening it per card
+    # would undo what capping the candidates before this pass just saved.
+    with ExitStack() as build_roots:
+        opened_roots: dict[int, PinnedDir | None] = {}
+
+        def _root_for(source_idx: int, source: ProjectArtifacts) -> PinnedDir | None:
+            if source_idx not in opened_roots:
+                try:
+                    opened_roots[source_idx] = build_roots.enter_context(
+                        opened_artifact_root(source)
+                    )
+                except (OSError, ValueError):
+                    opened_roots[source_idx] = None
+            return opened_roots[source_idx]
+
+        for _mtime, source_idx, child_name, source in candidates:
+            if len(cards) >= 80:
+                break
+            root = _root_for(source_idx, source)
+            if root is None:
+                continue
+            try:
+                with _opened_child_directory(root, child_name) as pinned_folder:
+                    folder = root.path / child_name
+                    card = _listed_card_for_pinned_folder(
+                        folder,
+                        len(cards),
+                        project_id=source.project_id,
+                        project_name=source.project_name,
+                        pinned_folder=pinned_folder,
+                        pinned_root=root,
+                        artifacts_base=(source.base if source.external else None),
+                    )
+                    if card is None:
+                        continue
+                    cards.append(card)
+            except (OSError, ValueError):
+                continue
+
+    return cards
 
 
 def preview_artifact(path: Path) -> dict:

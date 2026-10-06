@@ -3,6 +3,7 @@ This module defines the memory stores for canonical slot files on disk.
 """
 
 import os
+import re
 import stat
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -30,6 +31,21 @@ PROJECT_SLOTS = (MemorySlot.RULES, MemorySlot.LESSONS)
 # this closed set (and rejects any separator) so the value reaching os.open /
 # os.unlink is provably one of a handful of constants, never attacker-shaped.
 _KNOWN_SLOT_FILENAMES = frozenset(spec.filename for spec in SLOT_REGISTRY.values())
+
+
+def _undo_text_mode_double_cr(text: str) -> str:
+    """Collapse the ``\\r\\r\\n`` that Windows slots got before ENG-2950.
+
+    Slot descriptors were opened in CRT text mode then: the text layer wrote
+    CRLF and the CRT added another CR. The old text-mode read hid the extra
+    CR; binary descriptors expose it, and universal newlines would read every
+    line break as two. The sequence is never written on purpose, so reading it
+    back as CRLF restores what the old read returned.
+    """
+    return text.replace("\r\r\n", "\r\n")
+
+
+_LINE_BREAK = re.compile(r"\r\r\n|\r\n|\r")
 
 
 @dataclass(frozen=True)
@@ -110,8 +126,11 @@ class MemoryStore:
         try:
             with self._root_fd(create=False) as root:
                 sfd = dir_open(root, name, os.O_RDONLY | O_NOFOLLOW)
-                with open(sfd, encoding="utf-8") as f:
-                    return f.read()
+                with open(sfd, encoding="utf-8", newline="") as f:
+                    raw = f.read()
+            # Universal newlines, as ``newline=None`` would have applied, with
+            # the legacy \r\r\n read as one break (see _undo_text_mode_double_cr).
+            return _LINE_BREAK.sub("\n", raw)
         except OSError:
             # Missing dir/file, or a symlink squatting the slot (O_NOFOLLOW ->
             # ELOOP): no readable slot content.
@@ -132,7 +151,7 @@ class MemoryStore:
                 # compensation snapshot. ``newline=None`` would translate
                 # CRLF to LF before ``restore_exact`` can put it back.
                 with open(sfd, encoding="utf-8", newline="") as f:
-                    return True, f.read()
+                    return True, _undo_text_mode_double_cr(f.read())
         except FileNotFoundError:
             return False, ""
 

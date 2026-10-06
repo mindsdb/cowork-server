@@ -11,7 +11,10 @@ from cowork.db.scoped import LOCAL_SCOPE
 from _fakes import FakeRequest
 
 
-def _listing(ids, efforts=None, enabled=None, labels=None, providers=None, families=None, role_defaults=None):
+def _listing(
+    ids, efforts=None, enabled=None, labels=None, providers=None, families=None, role_defaults=None,
+    disabled_reasons=None,
+):
     """A MindsModelListing with everything a test doesn't care about left empty.
 
     Keeps a stub to the fields under test while still returning the real named
@@ -28,6 +31,7 @@ def _listing(ids, efforts=None, enabled=None, labels=None, providers=None, famil
         providers or {},
         families or {},
         role_defaults or {},
+        disabled_reasons or {},
     )
 
 
@@ -588,7 +592,8 @@ def test_recommended_models_write_preserves_map_order(monkeypatch):
 
 def test_org_mode_uses_operator_catalog_with_caller_bearer(monkeypatch):
     """Org mode: the catalog comes from fetch_org_model_catalog (operator URL +
-    caller bearer, per-org), NOT the stored key or the tenant-settable s.minds_url."""
+    caller bearer, per org and caller), NOT the stored key or the
+    tenant-settable s.minds_url."""
     from cowork.api.v1.endpoints import settings as ep
     from cowork.db.scoped import TenantScope
     from cowork.db.session import get_open_session
@@ -599,8 +604,9 @@ def test_org_mode_uses_operator_catalog_with_caller_bearer(monkeypatch):
 
     seen = {}
 
-    async def fake_org_catalog(*, org_id, bearer_token, refresh=False):
+    async def fake_org_catalog(*, org_id, user_id, bearer_token, refresh=False):
         seen["org_id"] = org_id
+        seen["user_id"] = user_id
         seen["token"] = bearer_token
         return _listing(["mindshub_air", "sonnet"], enabled={"mindshub_air": True, "sonnet": False})
 
@@ -616,7 +622,8 @@ def test_org_mode_uses_operator_catalog_with_caller_bearer(monkeypatch):
     org = TenantScope(org_mode=True, org_id="org-1", user_id="u-1")
     result = asyncio.run(ep.recommended_models(Req(), get_open_session(), org))
 
-    assert seen == {"org_id": "org-1", "token": "jwt-abc"}   # per-org, forwarded bearer
+    # per org and caller, forwarded bearer
+    assert seen == {"org_id": "org-1", "user_id": "u-1", "token": "jwt-abc"}
     assert result["recommendedModels"]["minds-cloud"] == ["mindshub_air", "sonnet"]
     assert result["modelEnabled"]["sonnet"] is False          # wallet-lock surfaced
 
@@ -658,3 +665,144 @@ def test_providers_cache_is_scoped_by_tenant(monkeypatch):
     assert len(calls) == 2                       # A cached, B cached, A re-served from cache
     keys = {k[1] for k in pv._minds_models_cache}
     assert keys == {"org-A", "org-B"}            # one entry per tenant
+
+
+def test_org_catalog_cache_is_scoped_by_caller_within_one_org(monkeypatch):
+    """Two members of one org each get their own org catalog.
+
+    Auth resolves each row's `enabled` and `disabled_reason` for the caller
+    (model rules per org, workspace and team), so an admin and a member of the
+    same org can get different rows. A cache keyed by the org alone serves
+    whichever listing was fetched first to every member for the whole TTL.
+    The entry follows the user id, not the bearer: a rotated token for the same
+    member is served from that member's entry instead of adding one.
+    """
+    from cowork.services import providers as pv
+
+    calls = []
+
+    async def fake_get(url, headers=None, **kw):
+        calls.append(headers.get("Authorization"))
+        restricted = headers["Authorization"].startswith("Bearer tok-member")
+
+        class R:
+            status_code = 200
+
+            def json(self):
+                sonnet = {"id": "sonnet", "enabled": not restricted}
+                if restricted:
+                    sonnet["disabled_reason"] = "model_restricted"
+                return {"data": [{"id": "mindshub_air", "enabled": True}, sonnet]}
+
+        return R()
+
+    class FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        get = staticmethod(fake_get)
+
+    monkeypatch.setattr(pv.httpx, "AsyncClient", lambda *a, **k: FakeClient())
+    pv._minds_models_cache.clear()
+
+    def fetch(user_id, token):
+        return asyncio.run(
+            pv.fetch_org_model_catalog(org_id="org-1", user_id=user_id, bearer_token=token)
+        )
+
+    try:
+        admin = fetch("u-admin", "tok-admin")
+        member = fetch("u-member", "tok-member")
+        admin_again = fetch("u-admin", "tok-admin")
+        member_rotated = fetch("u-member", "tok-member-rotated")
+    finally:
+        pv._minds_models_cache.clear()
+
+    assert admin.enabled["sonnet"] is True
+    assert admin.disabled_reasons == {}
+    assert member.enabled["sonnet"] is False
+    assert member.disabled_reasons == {"sonnet": "model_restricted"}
+    assert admin_again == admin
+    assert member_rotated == member
+    # One fetch per member; the repeat and the rotated token hit the cache.
+    assert calls == ["Bearer tok-admin", "Bearer tok-member"]
+
+
+def test_recommended_models_relays_why_a_minds_model_is_locked(monkeypatch):
+    """The picker must tell an admin restriction from a billing lock.
+
+    Both arrive as enabled:false. Without the reason the picker tags the
+    restricted row "Needs credits" and offers an Add credits button that
+    cannot unlock it.
+    """
+    from cowork.api.v1.endpoints import settings as settings_endpoint
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+        return _listing(
+            ["mindshub_air", "opus", "gpt"],
+            enabled={"mindshub_air": True, "opus": False, "gpt": False},
+            disabled_reasons={"opus": "model_restricted", "gpt": "wallet_empty"},
+        )
+
+    monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
+
+    session = get_open_session()
+    try:
+        _set_settings(session, minds_api_key="mdb_free", minds_url="https://api.mindshub.ai")
+        _delete_settings(session, "providers_json")
+
+        result = asyncio.run(recommended_models(FakeRequest(), session, LOCAL_SCOPE))
+
+        assert result["modelDisabledReasons"] == {"opus": "model_restricted", "gpt": "wallet_empty"}
+        assert result["modelEnabled"] == {"mindshub_air": True, "opus": False, "gpt": False}
+    finally:
+        _delete_settings(session, "minds_api_key", "minds_url", "minds_model_enabled")
+        session.close()
+
+
+def test_a_custom_endpoint_cannot_label_a_model_admin_restricted(monkeypatch):
+    """Only MindsHub may say an admin restricted a model.
+
+    A BYO openai-compatible endpoint controls its whole /models body. Merged
+    like the other id-keyed maps, its `disabled_reason` would put "An admin in
+    your organization restricted this model" on a model nobody restricted,
+    including an id MindsHub never listed.
+    """
+    from cowork.api.v1.endpoints import settings as settings_endpoint
+    from cowork.api.v1.endpoints.settings import recommended_models
+    from cowork.db.session import get_open_session
+
+    async def fake_fetch(base_url, api_key, force_refresh=False, tenant_key=None):
+        if "mindshub" in base_url:
+            return _listing(["sonnet"], enabled={"sonnet": True})
+        return _listing(
+            ["sonnet", "local-llama"],
+            enabled={"sonnet": False, "local-llama": False},
+            disabled_reasons={"sonnet": "model_restricted", "local-llama": "model_restricted"},
+        )
+
+    monkeypatch.setattr(settings_endpoint, "fetch_minds_models", fake_fetch)
+
+    session = get_open_session()
+    try:
+        _set_settings(
+            session,
+            minds_api_key="mdb_test",
+            minds_url="https://api.mindshub.ai",
+            providers_json=json.dumps(
+                [{"type": "openai-compatible", "baseUrl": "https://llm.local/v1", "apiKey": "***"}]
+            ),
+            openai_api_key="sk-test",
+        )
+
+        result = asyncio.run(recommended_models(FakeRequest(), session, LOCAL_SCOPE))
+
+        assert result["modelDisabledReasons"] == {}
+        # The custom endpoint still fills the enabled map for its own ids, as before.
+        assert result["modelEnabled"]["local-llama"] is False
+    finally:
+        _delete_settings(
+            session, "minds_api_key", "minds_url", "providers_json", "openai_api_key", "minds_model_enabled"
+        )
+        session.close()

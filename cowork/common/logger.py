@@ -35,33 +35,50 @@ class EventLoopClosedFilter(logging.Filter):
 
 
 class CustomFormatter(logging.Formatter):
-    """Custom formatter with enhanced formatting"""
+    """Formatter that renders the optional ``user_id`` / ``request_id`` a call
+    site may attach via ``extra=``.
+
+    Both render as an empty string when absent, which is what lets a format
+    string reference ``%(request_context)s`` unconditionally — the vast
+    majority of records carry neither. An explicitly ``None`` value counts as
+    absent.
+    """
 
     def format(self, record):
-        # Add extra context to the record
-        if hasattr(record, "user_id"):
-            record.user_context = f"[User:{record.user_id}]"
-        else:
-            record.user_context = ""
+        # None is absent, not a value: a producer with no id to offer still
+        # passes the key, and ``[Req:None]`` is worse than no prefix at all.
+        user_id = getattr(record, "user_id", None)
+        record.user_context = f"[User:{user_id}]" if user_id is not None else ""
 
-        if hasattr(record, "request_id"):
-            record.request_context = f"[Req:{record.request_id}]"
-        else:
-            record.request_context = ""
+        request_id = getattr(record, "request_id", None)
+        record.request_context = f"[Req:{request_id}]" if request_id is not None else ""
 
         return super().format(record)
 
 
 def get_colored_formatter():
-    """Get a colored formatter if colorlog is available"""
+    """The console handler's formatter, colored when colorlog is installed.
+
+    Both branches derive from CustomFormatter because both reference
+    ``%(request_context)s``, and only a CustomFormatter defines it — a plain
+    Formatter raises per record, which logging swallows into a dropped line.
+    The console is the stream the desktop captures into the log tail it offers
+    to copy, so an id rendered only on a file handler reaches nobody: file
+    logging is off unless ENABLE_FILE_LOGGING is exported, which nothing in
+    the stack does.
+    """
     if not HAS_COLORLOG:
-        return logging.Formatter(
-            "%(asctime)s [%(levelname)0s] %(name)s: %(message)s",
+        return CustomFormatter(
+            "%(asctime)s [%(levelname)0s] %(name)s%(request_context)s: %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
 
-    return colorlog.ColoredFormatter(
-        "%(log_color)s%(asctime)s [%(levelname)0s] %(name)s: %(message)s%(reset)s",
+    class _ColoredCustomFormatter(CustomFormatter, colorlog.ColoredFormatter):
+        """Inherits the context injection so the two branches cannot drift."""
+
+    return _ColoredCustomFormatter(
+        "%(log_color)s%(asctime)s [%(levelname)0s] %(name)s%(request_context)s: "
+        "%(message)s%(reset)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         log_colors={
             "DEBUG": "cyan",
@@ -94,9 +111,14 @@ def setup_file_logging(log_dir: str = "logs", max_bytes: int = 10485760, backup_
     all_logs_handler = logging.handlers.RotatingFileHandler(
         log_path / "minds.log", maxBytes=max_bytes, backupCount=backup_count
     )
+    # CustomFormatter, not logging.Formatter: it is what defines
+    # %(request_context)s, and it renders an empty string for the records that
+    # carry no request_id — which is most of them. A plain Formatter would
+    # raise ValueError on every such line.
     all_logs_handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s [%(levelname)8s] %(name)s [%(filename)s:%(lineno)d] %(message)s",
+        CustomFormatter(
+            "%(asctime)s [%(levelname)8s] %(name)s%(request_context)s "
+            "[%(filename)s:%(lineno)d] %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
     )
@@ -108,8 +130,9 @@ def setup_file_logging(log_dir: str = "logs", max_bytes: int = 10485760, backup_
     )
     error_handler.setLevel(logging.ERROR)
     error_handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s [%(levelname)8s] %(name)s [%(filename)s:%(lineno)d] %(message)s\n%(stack_info)s",
+        CustomFormatter(
+            "%(asctime)s [%(levelname)8s] %(name)s%(request_context)s "
+            "[%(filename)s:%(lineno)d] %(message)s\n%(stack_info)s",
             datefmt="%Y-%m-%d %H:%M:%S",
         )
     )
@@ -129,7 +152,11 @@ def setup_console_handler():
             rich_tracebacks=True,
             tracebacks_show_locals=True,
         )
-        handler.setFormatter(logging.Formatter("[%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        # CustomFormatter for the same reason the other branch uses one: this
+        # is a console stream too, and the desktop tails it.
+        handler.setFormatter(CustomFormatter(
+            "[%(name)s]%(request_context)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S",
+        ))
     else:
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(get_colored_formatter())

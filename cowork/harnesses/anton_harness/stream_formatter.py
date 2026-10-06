@@ -5,6 +5,8 @@ Emits typed events:
     response.created            (with conversation_id)
     response.in_progress        (thought/tool activity, carries thought_role)
     response.output_text.delta  (assistant text deltas)
+    response.answer_reset       (drop the answer so far; the next delta replaces it)
+    response.answer_restore     (a hand-back gives back the answer a reset dropped)
     response.completed          (final response object)
     response.failed             (error)
 """
@@ -79,6 +81,12 @@ PHASE_LABELS = {
     # A skill draft the pod reported was rejected, or trimmed a sibling file —
     # see `remote_skill_draft_result` (cowork/services/task_objects.py).
     "skill_draft_dropped": "Skill draft",
+    # The completion verifier forced a continuation; the text after this
+    # replaces the answer streamed before it.
+    "continuation": "Continuing",
+    # The turn is handing back with an explanation instead of continuing, so
+    # the text after it adds to the answer rather than replacing it.
+    "handback": "Wrapping up",
 }
 
 PROGRESS_THROTTLE = 0.25  # seconds
@@ -181,6 +189,15 @@ async def format_responses_stream(
     round_break = False
     round_had_text = False
     text_tail = ""
+    # anton's completion verifier can force a continuation, whose text replaces
+    # the answer streamed before it instead of continuing it. Latched when that
+    # boundary arrives and spent on the next text delta — never at the boundary
+    # itself, because a continuation that never speaks (stopped, failed, or all
+    # tool calls) must leave the answer the user already read standing.
+    superseded_pending = False
+    # What the last spent boundary set aside, returned if the turn hands back
+    # instead of delivering the replacement it promised.
+    superseded_stash = ""
 
     def _event(event_type: str, data: dict) -> str:
         # Wall-clock millisecond stamp on every event. The renderer
@@ -220,6 +237,29 @@ async def format_responses_stream(
 
     async for event in event_stream:
         if isinstance(event, StreamTextDelta):
+            # `.strip()`, not truthiness: a lone newline is text enough to
+            # satisfy the latch and not enough to be an answer, so spending it
+            # there leaves a blank message where the user had read a real one.
+            if superseded_pending and event.text.strip():
+                superseded_pending = False
+                # Held, not dropped. A continuation normally narrates before its
+                # first tool call, so this text is not always the standalone
+                # answer it promised; if it hands back instead, the answer that
+                # was already read has to come back rather than be lost from the
+                # transcript and from the history the next turn is rebuilt from.
+                superseded_stash = "".join(collected_text)
+                collected_text.clear()
+                # The armed paragraph break belongs between two rounds of the
+                # answer being discarded, not in front of its replacement.
+                round_break = False
+                round_had_text = False
+                text_tail = ""
+                seq += 1
+                yield _event("response.answer_reset", {
+                    "type": "response.answer_reset",
+                    "sequence_number": seq,
+                    "item_id": msg_id,
+                })
             text = event.text
             if round_break:
                 if text_tail and not text_tail.endswith("\n\n"):
@@ -300,6 +340,27 @@ async def format_responses_stream(
                 "tool_use_id": event.id,
             })
 
+        elif (
+            isinstance(event, StreamToolResult)
+            and getattr(event, "action", None) == "message"
+            # A scratchpad result carries the model's own `action`.
+            and getattr(event, "name", "") != "scratchpad"
+        ):
+            # A tool's message to the user (generate_artifact's brief when the
+            # agent acts first). Its own role rather than the scratchpad
+            # result's: a client that predates it ignores it instead of
+            # patching it into the last scratchpad cell. Not answer text, so
+            # it stays out of the persisted assistant message and the history.
+            seq += 1
+            yield _event("response.in_progress", {
+                "type": "response.in_progress",
+                "sequence_number": seq,
+                "thought_role": Role.thought_tool_call_message.value,
+                "content": event.content[:65536],
+                "tool_name": getattr(event, "name", "") or "",
+                "tool_use_id": getattr(event, "id", None) or "",
+            })
+
         elif isinstance(event, StreamToolResult):
             seq += 1
             yield _event("response.in_progress", {
@@ -324,6 +385,28 @@ async def format_responses_stream(
             # under PROGRESS_THROTTLE — dropping a scratchpad_done
             # would leave the cell stuck in_progress in the UI.
             phase_str = event.phase or ""
+            # Latched ahead of the throttling below: this notice is
+            # rate-limited like any other, but the reset it implies is not.
+            if phase_str == "continuation":
+                superseded_pending = True
+            # anton gave up and is explaining instead of continuing. Its
+            # diagnosis is an extra message, not a replacement, so an unspent
+            # boundary is dropped and a spent one gives its text back — the
+            # answer the continuation failed to improve on is still the only
+            # real content the turn produced, and the next turn's history is
+            # rebuilt from it.
+            elif phase_str == "handback":
+                superseded_pending = False
+                if superseded_stash:
+                    collected_text.insert(0, superseded_stash)
+                    seq += 1
+                    yield _event("response.answer_restore", {
+                        "type": "response.answer_restore",
+                        "sequence_number": seq,
+                        "item_id": msg_id,
+                        "text": superseded_stash,
+                    })
+                    superseded_stash = ""
             is_scratchpad_phase = phase_str in ("scratchpad_start", "scratchpad_done")
             # ENG-1537: the rate-limit notice must never be throttled away. It
             # fires once per wait and is the ONLY thing distinguishing a
@@ -344,13 +427,20 @@ async def format_responses_stream(
                 # on nothing.
                 pass
             else:
-                # First tool_progress for a given id must never be dropped
-                # by throttling — losing it would mean the lazily-created
-                # step in the renderer is never created, and a later
-                # tool_done for the same id would then have nothing to
-                # close (thought.tool_call.end on the frontend is a no-op
-                # when there's no matching step).
-                is_first_progress_for_id = is_tool_progress and event.id not in progress_tool_ids
+                # Every tool_progress line is a step announcement and is
+                # never throttled (ENG-2981): reasoning_start from a tool's
+                # own LLM calls lands in the same window, and dropping the
+                # line loses a pipeline step from the chat. Losing the FIRST
+                # line would also leave the renderer's lazily-created tool
+                # step missing, so a later tool_done would close nothing.
+                #
+                # Invariant: a tool emits a handful of these per run (today
+                # only anton's generate_artifact, one line per pipeline
+                # step). A tool that streams many lines must not use
+                # tool_progress — the live tail has its own tool_peek phase,
+                # relayed only to hosts that set live_tool_peek (this server
+                # does not). If that ever changes, revisit this exemption,
+                # e.g. drop only a repeat of the same line for the same id.
                 if is_tool_progress:
                     progress_tool_ids.add(event.id)
 
@@ -361,7 +451,7 @@ async def format_responses_stream(
                 never_throttle = (
                     is_scratchpad_phase
                     or is_tool_done
-                    or is_first_progress_for_id
+                    or is_tool_progress
                     or is_rate_limited_notice
                     or is_skill_draft_notice
                 )
@@ -421,10 +511,10 @@ async def format_responses_stream(
 
         elif isinstance(event, StreamReasoningDelta):
             # The model's own reasoning text — NOT part of the final answer.
-            # Shape matches hermes_harness's existing thought.progress +
-            # subtype convention exactly, so the frontend's ephemeral
-            # "current thought" handling (responseStreamAdapter.js) picks
-            # this up identically without any client-side change.
+            # Shape follows the thought.progress + subtype convention the
+            # frontend's ephemeral "current thought" handling
+            # (responseStreamAdapter.js) already understands, so no
+            # client-side change is needed.
             seq += 1
             yield _event("response.in_progress", {
                 "type": "response.in_progress",

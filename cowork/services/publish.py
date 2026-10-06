@@ -26,7 +26,7 @@ from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings  # noqa: F401
 
 from cowork.services.connectors.persist import vault_for_scope
-from cowork.services.providers import publish_url_for_endpoint
+from cowork.services.providers import is_mindshub_publish_url, publish_url_for_endpoint
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
 from anton.minds_client import describe_minds_connection_error
 from anton.publish_access import access_from_owner_side
@@ -59,6 +59,25 @@ class PublisherUnavailable(RuntimeError):
     this replaced, which broke once upstream error text could itself contain
     that word (e.g. an HTTP 503 reason phrase or a timeout advice string).
     """
+
+
+def raise_publish_permission_error(exc: Exception) -> None:
+    """Preserve the artifact consumer's explicit authority result through wrappers."""
+    from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
+
+    if isinstance(exc, (ProductPermissionDenied, ProductPermissionUnavailable)):
+        raise exc
+    if not isinstance(exc, urllib.error.HTTPError):
+        return
+    if exc.code == 503:
+        raise ProductPermissionUnavailable() from exc
+    if exc.code == 403:
+        try:
+            body = json.loads(exc.read(65_536))
+        except (OSError, ValueError):
+            return
+        if isinstance(body, dict) and body.get("code") == "permission_denied":
+            raise ProductPermissionDenied() from exc
 
 
 def _cowork_state_dir() -> Path:
@@ -265,6 +284,13 @@ def list_publishable(session: "ScopedSession | None" = None) -> dict:
 # publish their directory regardless of the primary file's suffix.
 PUBLISHABLE_STATIC_SUFFIXES = (".html", ".md")
 
+# What Share and the agent's publish tool report for a full-stack artifact when
+# the publish URL is not MindsHub's service (`is_mindshub_publish_url`).
+FULLSTACK_PUBLISH_UNSUPPORTED = (
+    "Full-stack apps can't be shared from this deployment. Its publishing "
+    "service accepts HTML and Markdown artifacts only."
+)
+
 # Self-contained page wrapper for rendered Markdown. No external assets so
 # the published bundle is a single index.html the viewer serves standalone.
 # Styled to match Anton's dashboards (GitHub-dark palette + system fonts —
@@ -340,11 +366,8 @@ def _render_markdown_to_html(md_path: Path, out_dir: Path) -> Path:
     web page). The original ``.md`` is never modified — the registry and
     publish history still key off it, not this temp file.
     """
-    # `markdown` ships transitively via hermes-agent (a pinned core
-    # dependency), so it's always present in the resolved environment. The
-    # guard stays defensive in case that ever changes; promote markdown to a
-    # direct dependency in pyproject.toml when the lockfile is next
-    # regenerated with the canonical uv version.
+    # `markdown` is a direct dependency (pyproject.toml); the guard stays
+    # defensive so a broken install reports a clear error.
     try:
         import markdown
     except Exception as exc:  # pragma: no cover - dependency guard
@@ -371,6 +394,7 @@ def publish_artifact(
     password: str | None = None,
     access: dict | None = None,
     scope: TenantScope | None = None,
+    project_id: str | None = None,
 ) -> dict:
     """Zip an artifact and upload it, returning its public URL.
 
@@ -391,7 +415,12 @@ def publish_artifact(
     datasources at all, and because `vault_for_scope` fail-closes on an org
     deployment when it is missing - a caller that forgets it gets an error, not
     another org's secrets.
+
+    `project_id` is the artifact's project; required in organization mode,
+    where the owner lookup is keyed by it.
     """
+    if scope is not None and scope.org_mode and project_id is None:
+        raise ValueError("publish_artifact requires project_id in organization mode")
     if not api_key:
         raise ValueError("Publishing requires an API key")
 
@@ -400,6 +429,12 @@ def publish_artifact(
     )
     if not is_fullstack and publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
         raise ValueError("Only HTML and Markdown artifacts can be published")
+    # Refuse before anything is built: `anton.publisher.publish` puts the
+    # artifact's datasource credentials, in plaintext, in the body of a
+    # full-stack upload, and a service that can't run the app would receive
+    # them only to answer 400.
+    if is_fullstack and not is_mindshub_publish_url(publish_url):
+        raise ValueError(FULLSTACK_PUBLISH_UNSUPPORTED)
 
     try:
         from anton.publisher import publish
@@ -431,7 +466,9 @@ def publish_artifact(
         if scope is not None and scope.org_mode:
             from cowork.services.artifact_authorization_identity import publish_authorization_key
 
-            canonical_artifact_key = publish_authorization_key(artifact_id, artifacts_base, scope)
+            canonical_artifact_key = publish_authorization_key(
+                artifact_id, artifacts_base, published_dir.name, project_id, scope
+            )
         else:
             canonical_artifact_key = artifact_key(artifact_id)
 
@@ -466,6 +503,7 @@ def publish_artifact(
             vault=vault_for_scope(scope),
         )
     except Exception as exc:
+        raise_publish_permission_error(exc)
         logger.exception("Publishing failed")
         # Only network/HTTP failures get the "Connection failed" framing — a
         # gateway timeout (e.g. a fullstack artifact whose deps take too long
@@ -633,6 +671,7 @@ def unpublish_artifact(
             ssl_verify=ssl_verify,
         )
     except Exception as exc:
+        raise_publish_permission_error(exc)
         msg = str(exc) or "Unpublishing failed."
         if "404" in msg or "not found" in msg.lower():
             # Already gone upstream, OR still alive under another owner's prefix

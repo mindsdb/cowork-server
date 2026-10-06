@@ -16,7 +16,7 @@ from cowork.coding.engines.base import (
 from cowork.coding.engines.registry import CodingEngineRegistry
 from cowork.coding.terminal import TerminalBuffer
 
-ApprovalRequest = Callable[[str, str, dict[str, Any] | None], dict[str, str]]
+ApprovalRequest = Callable[[str, str, dict[str, Any] | None], dict[str, Any]]
 
 
 def engine_workspace_path(session: CodingSession) -> str:
@@ -81,6 +81,7 @@ class RuntimeManager:
             config=EngineSessionConfig(
                 model=session.model,
                 permission_mode=session.permission_mode,
+                task_mode=session.task_mode,
                 reasoning_effort=session.reasoning_effort,
                 service_tier=None if session.service_tier == "standard" else session.service_tier,
                 personality=session.personality,
@@ -92,6 +93,7 @@ class RuntimeManager:
                 environment=tuple(session.environment.items()),
                 session_id=session.id,
                 cowork_root=str(self._root),
+                project_linked=bool(session.project_id),
                 workspace_label=session.project_name or Path(session.source_path).name or "Workspace",
             ),
             credentials=credentials,
