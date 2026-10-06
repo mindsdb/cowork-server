@@ -1,0 +1,177 @@
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, Path, Request, status
+
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.db.scoped import ScopedSessionDep
+from cowork.models.comparison import Comparison
+from cowork.principal import hub_credential
+from cowork.schemas.comparisons import (
+    ComparisonContinueRequest,
+    ComparisonCreateRequest,
+    ComparisonResponse,
+    ComparisonVerdictRequest,
+    ComparisonUsageResponse,
+)
+from cowork.services.comparisons import (
+    ComparisonConflictError,
+    ComparisonNotFoundError,
+    ComparisonService,
+    ProjectTooLargeToCopyError,
+    SideSpec,
+)
+from cowork.services.comparison_usage import comparison_usage
+from cowork.services.projects import ProjectNameLockBusyError, ProjectNotFoundError
+
+# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
+# whenever org mode has no org in scope. Declaring it too makes the
+# requirement visible to a route walker instead of something only
+# discoverable by reading scoped.py.
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
+
+_SIDE_LABEL = r"^[ab]$"
+
+
+def _response(service: ComparisonService, comparison: Comparison, continued: dict | None = None) -> dict:
+    """`continued`: `service.continued_sides` for a page that holds this
+    comparison, so a list reads it once rather than per comparison."""
+    if continued is None:
+        continued = service.continued_sides([comparison])
+    verdicts = sorted(comparison.verdicts, key=lambda v: v.turn_index)
+    return ComparisonResponse.serialize({
+        "id": comparison.id,
+        "title": comparison.title,
+        "created_at": comparison.created_at,
+        "source_project_id": comparison.source_project_id,
+        "source_project_label": comparison.source_project_label,
+        "sides": [
+            {
+                "label": side.label,
+                "model": side.model,
+                "reasoning_effort": side.reasoning_effort,
+                "project_id": side.project_id,
+                "conversation_id": side.conversation_id,
+                "turn_count": service.turn_count(side),
+                "continued_at": side.continued_at,
+                "continued_turn_count": side.continued_turn_count,
+                "carry_incomplete": continued[side.id].carry_incomplete if side.id in continued else False,
+                "continued_project_id": continued[side.id].project_id if side.id in continued else None,
+                "usage": side.usage_snapshot,
+            }
+            for side in sorted(comparison.sides, key=lambda s: s.label)
+        ],
+        "verdicts": verdicts,
+        "verdict": verdicts[-1].winner if verdicts else None,
+    })
+
+
+def _get(service: ComparisonService, comparison_id: UUID) -> Comparison:
+    try:
+        return service.get_comparison(comparison_id)
+    except ComparisonNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+
+@router.get("/")
+def list_comparisons(scoped: ScopedSessionDep, limit: int = 50, offset: int = 0):
+    service = ComparisonService(scoped)
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    # One past the page says whether there is another, without a count.
+    page = service.list_comparisons(limit=limit + 1, offset=offset)
+    shown = page[:limit]
+    continued = service.continued_sides(shown)
+    return {
+        "comparisons": [_response(service, c, continued) for c in shown],
+        "hasMore": len(page) > limit,
+    }
+
+
+@router.post("/", status_code=status.HTTP_201_CREATED)
+def create_comparison(body: ComparisonCreateRequest, scoped: ScopedSessionDep):
+    service = ComparisonService(scoped)
+    try:
+        comparison = service.create_comparison(
+            title=body.title,
+            sides=[SideSpec(model=s.model, reasoning_effort=s.reasoning_effort) for s in body.sides],
+            source_project_id=body.source_project_id,
+        )
+    except ProjectNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ProjectTooLargeToCopyError as e:
+        raise HTTPException(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail=str(e))
+    except ProjectNameLockBusyError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return _response(service, comparison)
+
+
+@router.get("/{comparison_id}")
+def get_comparison(comparison_id: UUID, scoped: ScopedSessionDep):
+    service = ComparisonService(scoped)
+    return _response(service, _get(service, comparison_id))
+
+
+@router.get("/{comparison_id}/usage")
+async def get_comparison_usage(comparison_id: UUID, request: Request, scoped: ScopedSessionDep):
+    """Tokens and list-price cost per turn for each side, read from the gateway as the caller."""
+    service = ComparisonService(scoped)
+    comparison = _get(service, comparison_id)
+    sides = [
+        (side.label, str(side.conversation_id), service.turn_starts(side), side.continued_turn_count)
+        for side in sorted(comparison.sides, key=lambda s: s.label)
+    ]
+    usage = await comparison_usage(sides, bearer_token=hub_credential(request))
+    service.record_usage(comparison, usage.sides)
+    return usage.model_dump(by_alias=True)
+
+
+@router.delete("/{comparison_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_comparison(comparison_id: UUID, scoped: ScopedSessionDep):
+    service = ComparisonService(scoped)
+    try:
+        service.delete_comparison(comparison_id)
+    except ComparisonNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ComparisonConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+
+
+@router.put("/{comparison_id}/verdicts/{turn_index}")
+def record_verdict(comparison_id: UUID, turn_index: int, body: ComparisonVerdictRequest, scoped: ScopedSessionDep):
+    service = ComparisonService(scoped)
+    try:
+        service.record_verdict(comparison_id, turn_index=turn_index, winner=body.winner)
+    except ComparisonNotFoundError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return _response(service, _get(service, comparison_id))
+
+
+@router.post("/{comparison_id}/sides/{label}/continue")
+def continue_side(
+    comparison_id: UUID,
+    body: ComparisonContinueRequest,
+    scoped: ScopedSessionDep,
+    label: str = Path(pattern=_SIDE_LABEL),
+):
+    service = ComparisonService(scoped)
+    try:
+        continued = service.continue_side(comparison_id, label, body.project_id, model_label=body.model_label)
+    except (ComparisonNotFoundError, ProjectNotFoundError) as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except ComparisonConflictError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    conversation = continued.conversation
+    # carriedAll false: some of the side's work stayed in the comparison;
+    # continuing again into the same project carries the rest.
+    return {
+        "conversationId": str(conversation.id),
+        "projectId": str(conversation.project_id),
+        "carriedAll": continued.carried_all,
+    }

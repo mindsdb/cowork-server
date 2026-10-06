@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import logging
 import os
 import re
+import secrets
 import threading
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -35,6 +36,32 @@ logger = logging.getLogger(__name__)
 
 GENERAL_PROJECT = "general"
 GENERAL_PROJECT_ID = UUID("00000000-0000-0000-0000-000000000001")
+
+# Name prefix of the hidden project each side of a model comparison runs in.
+# Reserved by construction: `_sanitize_name` strips leading `-._`, so no
+# project a person names can start with it, and only
+# `create_comparison_sandbox` bypasses the sanitizer. The prefix is the whole
+# marker -- no column -- because every reader that must tell a sandbox apart
+# (the filesystem artifact scan, the publish path) sees a directory name, not
+# a row.
+COMPARISON_SANDBOX_PREFIX = "_comparison-"
+
+
+def is_comparison_sandbox(name: str | None) -> bool:
+    """Whether a project name belongs to a model-comparison side."""
+    return bool(name) and name.startswith(COMPARISON_SANDBOX_PREFIX)
+
+
+def path_in_comparison_sandbox(path: Path | str) -> bool:
+    """Whether any component of `path` is a comparison sandbox's directory.
+
+    Any component rather than a fixed depth: artifacts sit at
+    `<project>/.anton/artifacts` for a project and deeper for a legacy
+    conversation workspace, and callers hand in either. A folder the user chose
+    that happens to be named like a sandbox reads as one, which only ever
+    refuses something (publishing); it never grants anything.
+    """
+    return any(part.startswith(COMPARISON_SANDBOX_PREFIX) for part in Path(path).parts)
 
 # The local deployment's project-name namespace, mirroring the distributed
 # lock an org create takes on `SKILL_PROJECT_REFERENCES`. `projects.name` has
@@ -536,7 +563,53 @@ class ProjectService:
         return cleaned
 
     def list_projects(self) -> list[Project]:
+        """Every project in scope, comparison sandboxes included.
+
+        Lookups and filesystem inventories need the sandboxes. Anything that
+        shows projects to a person uses `list_visible_projects`.
+        """
         return list(self.session.exec(self.session.select(Project)).all())
+
+    def list_visible_projects(self) -> list[Project]:
+        """The projects a person sees in lists: everything but comparison sandboxes."""
+        return [p for p in self.list_projects() if not is_comparison_sandbox(p.name)]
+
+    def create_comparison_sandbox(self, label: str) -> Project:
+        """A hidden project for one side of a model comparison.
+
+        Named `_comparison-<hex>` so the name is collision-free without the
+        name-allocation lock and reads as a sandbox wherever only the
+        directory is visible. `label` is what the Compare screen shows.
+        """
+        name = f"{COMPARISON_SANDBOX_PREFIX}{secrets.token_hex(12)}"
+        path = self._project_path(name)
+        self._mkdir_in_root(path)
+        project = Project(
+            name=name,
+            display_name=(label.strip() or name)[:_DISPLAY_NAME_MAX_LEN],
+            path=str(path),
+            is_active=False,
+        )
+        self.session.add(project)
+        try:
+            self.session.commit()
+        except Exception:
+            self.session.rollback()
+            self._rmtree_in_root(path)
+            raise
+        # A side works with the same skills as any project, so it gets the
+        # same desktop links `create_project` makes.
+        if not self.session.scope.org_mode:
+            try:
+                from cowork.services.skill_links import reconcile_project
+                from cowork.services.skills import SkillService
+
+                reconcile_project(
+                    path, SkillService(self.session.scope).list_skills(), project_name=name
+                )
+            except Exception:
+                logger.exception("Could not reconcile desktop skill links for comparison sandbox %s", project.id)
+        return project
 
     def get_project(self, project_id: UUID) -> Project:
         project = self.session.get(Project, project_id)

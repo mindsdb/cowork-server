@@ -249,7 +249,7 @@ def list_projects(
     # the first listing (no-op in local mode / once claimed).
     service.ensure_general_for_scope()
     access = SharedResourceAccess(session, principal)
-    return [_project_response(project, access) for project in service.list_projects()]
+    return [_project_response(project, access) for project in service.list_visible_projects()]
 
 
 def _is_loopback_address(host: str | None) -> bool:
