@@ -37,7 +37,7 @@ on:
         type: string
         required: true
       build-runner:
-        description: "Runner label for the build and scan"
+        description: "Runner label for deploy and integration; build stays on mdb-dev"
         type: string
         default: mdb-dev
       pr-environment:
@@ -150,6 +150,7 @@ jobs:
     uses: ./.github/workflows/tests-integration.yml
     with:
       deploy-env: pr-cowork-server-${{ github.event.pull_request.number }}
+      runner: ${{ inputs.build-runner }}
     secrets: inherit
 
   deploy:
@@ -212,4 +213,5 @@ jobs:
     uses: ./.github/workflows/tests-integration.yml
     with:
       deploy-env: ${{ inputs.build-environment == 'production' && 'prod' || 'staging' }}
+      runner: ${{ inputs.build-runner }}
     secrets: inherit

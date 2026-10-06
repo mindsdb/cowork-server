@@ -62,6 +62,7 @@ class ProbeHandler:
         seq = 0
         body_parts: list[str] = []
         recorded_events: list[dict] = []
+        persisted = False
 
         def _sse(event_type: str, data: dict) -> str:
             return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
@@ -72,6 +73,40 @@ class ProbeHandler:
             payload = {**data, "sequence_number": seq}
             recorded_events.append(payload)
             return _sse(event_type, payload)
+
+        def _persist_once(conversation_id: UUID | None):
+            # Idempotent — every response.completed below calls this so the
+            # turn's real assistant message id can ride the SAME
+            # frame the client's SSE reader stops at; a probe turn legitimately
+            # persists nothing when there's no conversation or no body text.
+            nonlocal persisted
+            if persisted:
+                return None
+            persisted = True
+            if not conversation_id or not "".join(body_parts):
+                return None
+            return ConversationService(self.session).save_assistant_turn(
+                conversation_id, "".join(body_parts), recorded_events
+            )
+
+        def _completed(conversation_id: UUID | None, response_fields: dict) -> str:
+            # _push records the (id-less) event and bumps seq first, exactly
+            # like every other event — persistence must see this completion
+            # event in recorded_events, matching the ordering this replaced,
+            # where _save_assistant_turn always ran after this push.
+            wire = _push(
+                "response.completed",
+                {"type": "response.completed", "response": {"id": response_id, **response_fields}},
+            )
+            msg = _persist_once(conversation_id)
+            if msg is None:
+                return wire
+            # Same recorded payload, republished with the id added — the
+            # persisted copy in recorded_events is deliberately left without
+            # it, matching how response_failed_payload's persisted copy
+            # doesn't carry it either.
+            wire_payload = {**recorded_events[-1], "assistant_message_id": str(msg.id)}
+            return _sse("response.completed", wire_payload)
 
         def _delta(text: str) -> str:
             body_parts.append(text)
@@ -123,11 +158,7 @@ class ProbeHandler:
                     "The form submission expired before I could process it. "
                     "Please re-submit the form."
                 )
-                yield _push("response.completed", {
-                    "type": "response.completed",
-                    "response": {"id": response_id, "status": "failed"},
-                })
-                self._save_assistant_turn(db_conversation_id, "".join(body_parts), recorded_events)
+                yield _completed(db_conversation_id, {"status": "failed"})
                 return
 
             values = submission.get("values", {}) or {}
@@ -168,11 +199,7 @@ class ProbeHandler:
                     saved_user_label = str(saved_record.get("fields", {}).get("_user_label", "")).strip() or None
                 except Exception as exc:
                     yield _delta(f"Could not save: `{exc}`.")
-                    yield _push("response.completed", {
-                        "type": "response.completed",
-                        "response": {"id": response_id, "status": "failed"},
-                    })
-                    self._save_assistant_turn(db_conversation_id, "".join(body_parts), recorded_events)
+                    yield _completed(db_conversation_id, {"status": "failed"})
                     return
                 reason = "connector is not in the registry"
                 yield _delta(f"Saved as `{slug}` (no live probe — {reason}).\n\n")
@@ -185,11 +212,7 @@ class ProbeHandler:
                     "_is_success": True,
                     "actions": [{"id": "dismiss", "label": "Close", "kind": "cancel"}],
                 })
-                yield _push("response.completed", {
-                    "type": "response.completed",
-                    "response": {"id": response_id, "status": "success", "user_label": saved_user_label},
-                })
-                self._save_assistant_turn(db_conversation_id, "".join(body_parts), recorded_events)
+                yield _completed(db_conversation_id, {"status": "success", "user_label": saved_user_label})
                 return
 
             # Probe path: build workspace + LLM client
@@ -205,7 +228,14 @@ class ProbeHandler:
 
             llm_client = None
             try:
-                llm_client = self._build_llm_client()
+                from cowork.common.settings.user_settings import get_user_settings
+                from cowork.services.providers import web_tool_kwargs_for
+
+                # Capture the client and its web policy together, before the
+                # yields below let a settings update run ahead of the probe.
+                settings = get_user_settings()
+                web_tools = web_tool_kwargs_for(settings.resolved_planning_provider)
+                llm_client = self._build_llm_client(settings=settings)
             except Exception:
                 logger.exception("Could not build LLM client for probe")
 
@@ -214,11 +244,7 @@ class ProbeHandler:
                 err = "Could not initialize the probe (workspace or LLM client unavailable)."
                 yield _delta(err)
                 yield _patch_delta({"form_id": form_id, "form_error": err})
-                yield _push("response.completed", {
-                    "type": "response.completed",
-                    "response": {"id": response_id, "status": "failed"},
-                })
-                self._save_assistant_turn(db_conversation_id, "".join(body_parts), recorded_events)
+                yield _completed(db_conversation_id, {"status": "failed"})
                 return
 
             # Intro + initial probing patch
@@ -241,6 +267,7 @@ class ProbeHandler:
                 workspace=workspace,
                 form_spec=form_spec,
                 skipped=skipped,
+                web_tool_kwargs=web_tools,
             )
             try:
                 async for kind, payload in probe.run():
@@ -345,10 +372,7 @@ class ProbeHandler:
                     "_is_probing": False,
                     "_is_success": True,
                 })
-                yield _push("response.completed", {
-                    "type": "response.completed",
-                    "response": {"id": response_id, "status": "success", "user_label": saved_user_label},
-                })
+                yield _completed(db_conversation_id, {"status": "success", "user_label": saved_user_label})
             elif final_outcome.status == "needs_input":
                 reason = final_outcome.follow_up or "We need a few more details before we can connect."
                 yield _delta(f"\n\nI need a bit more info before I can finish: {reason}\n")
@@ -382,10 +406,7 @@ class ProbeHandler:
                         "form_error": None,
                         "fields": extra,
                     })
-                yield _push("response.completed", {
-                    "type": "response.completed",
-                    "response": {"id": response_id, "status": "needs_input"},
-                })
+                yield _completed(db_conversation_id, {"status": "needs_input"})
             else:
                 err = final_outcome.error or "Connection failed."
                 hint = final_outcome.follow_up or "Update the form and try again."
@@ -398,28 +419,13 @@ class ProbeHandler:
                     "form_error": err,
                     "_is_success": False,
                 })
-                yield _push("response.completed", {
-                    "type": "response.completed",
-                    "response": {"id": response_id, "status": "retry"},
-                })
-
-            self._save_assistant_turn(db_conversation_id, "".join(body_parts), recorded_events)
+                yield _completed(db_conversation_id, {"status": "retry"})
 
         finally:
             if _temp_workspace_dir:
                 shutil.rmtree(_temp_workspace_dir, ignore_errors=True)
 
     @staticmethod
-    def _build_llm_client():
+    def _build_llm_client(settings=None):
         from cowork.services.providers import build_llm_client
-        return build_llm_client()
-
-    def _save_assistant_turn(
-        self,
-        conversation_id: UUID | None,
-        text: str,
-        events: list[dict],
-    ) -> None:
-        if not conversation_id or not text:
-            return
-        ConversationService(self.session).save_assistant_turn(conversation_id, text, events)
+        return build_llm_client(settings=settings)

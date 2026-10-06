@@ -28,6 +28,7 @@ from cowork.coding.runtime_protocol import (
     RuntimeLease,
 )
 from cowork.coding.shells import shell_inventory
+from cowork.common.paths import open_fd
 
 
 _EVENT_DELIVERY_ATTEMPTS = 3
@@ -251,7 +252,7 @@ def atomic_write(target: Path, contents: str, mode: int = 0o666) -> None:
 
     temporary = target.parent / f".{target.name}.{uuid.uuid4().hex}.tmp"
     try:
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+        descriptor = open_fd(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(contents)
         os.replace(temporary, target)

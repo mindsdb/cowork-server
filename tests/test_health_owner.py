@@ -268,3 +268,132 @@ def test_health_serves_a_real_looking_id_unchanged():
 
     with patch.object(anton.analytics, "get_installation_id", return_value="a1b2c3d4e5f60718"):
         assert health._anton_install_id() == "a1b2c3d4e5f60718"
+
+
+# ─── /live: liveness that can't be taken down by a dependency ──────
+
+
+def test_live_survives_a_database_outage():
+    """The liveness probe must answer even when Postgres is unreachable — the
+    2026-09-09 incident was `/health` (which opens a DB session) wired to both
+    liveness and readiness, so a DB outage got read as "the process is dead"
+    and Kubernetes killed both replicas.
+    """
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from cowork.api.v1.endpoints import health
+
+    app = FastAPI()
+    app.include_router(health.router, prefix="/api/v1/health")
+    client = TestClient(app)
+
+    def _raise():
+        raise RuntimeError("database unreachable")
+
+    with patch.object(health, "get_user_settings", side_effect=_raise):
+        res = client.get("/api/v1/health/live")
+
+    assert res.status_code == 200
+    assert res.json() == {"status": "ok"}
+
+
+# ─── /live must stay reachable without identity (ENG-2436 follow-up) ─────────
+#
+# The identity middleware exempts paths by exact string match, not prefix, so
+# a new health route is invisible to it unless added by name in both places
+# (cowork/principal.py and cowork/auth_middleware.py). Missed once already:
+# org deployments 401ed the kubelet's liveness probe and got CrashLoopBackOff'd
+# while readiness (which *was* exempt) kept them taking traffic until killed.
+
+
+def test_every_health_route_is_reachable_without_identity():
+    """Derived from the router, not hardcoded — so the next health route added
+    without updating both exempt-path sets fails this instead of prod."""
+    from cowork.api.v1.endpoints import health
+    from cowork.principal import _EXEMPT_PATHS as PRINCIPAL_EXEMPT
+    from cowork.auth_middleware import _EXEMPT_PATHS as BEARER_EXEMPT
+
+    paths = {
+        f"/api/v1/health{r.path}".rstrip("/") or "/api/v1/health"
+        for r in health.router.routes
+    }
+    for base in paths:
+        for spelling in {base, base + "/"}:
+            assert spelling in PRINCIPAL_EXEMPT or spelling.rstrip("/") in PRINCIPAL_EXEMPT
+            assert spelling in BEARER_EXEMPT or spelling.rstrip("/") in BEARER_EXEMPT
+
+
+def test_live_reachable_without_identity_in_org_mode_end_to_end(monkeypatch):
+    """End-to-end: an org deployment with identity enforcement on must still
+    answer the liveness probe with no identity headers at all — the exact
+    setup that 401ed before the exempt-path fix.
+    """
+    from fastapi.testclient import TestClient
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.server import create_app
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "enforce")
+    get_app_settings.cache_clear()
+    try:
+        client = TestClient(create_app())
+        res = client.get("/api/v1/health/live")
+    finally:
+        get_app_settings.cache_clear()
+
+    assert res.status_code == 200
+    assert res.json() == {"status": "ok"}
+
+
+def test_live_answers_even_when_the_threadpool_is_saturated():
+    """`live()` must be `async def`: a sync endpoint runs through anyio's
+    default thread limiter, the same pool `run_in_threadpool` now feeds slow
+    artifact scans into. Saturate that pool with two long "scans" and confirm
+    the probe still answers immediately instead of queuing behind them
+    (ENG-2436: 40 concurrent slow scans would otherwise reproduce the
+    2026-09-09 outage through a different door).
+    """
+    import asyncio
+    import contextlib
+    import time
+
+    import anyio
+    import httpx
+    from fastapi import FastAPI
+
+    from cowork.api.v1.endpoints import health
+
+    app = FastAPI()
+    app.include_router(health.router, prefix="/api/v1/health")
+
+    async def flow():
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        original_tokens = limiter.total_tokens
+        limiter.total_tokens = 2
+        occupiers = []
+        try:
+            async def occupy():
+                await anyio.to_thread.run_sync(time.sleep, 2)
+
+            occupiers = [asyncio.create_task(occupy()) for _ in range(2)]
+            await asyncio.sleep(0.1)  # let both actually acquire a limiter token
+
+            transport = httpx.ASGITransport(app=app)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                start = time.monotonic()
+                res = await client.get("/api/v1/health/live")
+                elapsed = time.monotonic() - start
+
+            assert res.status_code == 200
+            assert elapsed < 1.0, f"took {elapsed:.3f}s — queued behind the saturated pool"
+        finally:
+            limiter.total_tokens = original_tokens
+            for task in occupiers:
+                task.cancel()
+            for task in occupiers:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+    asyncio.run(flow())

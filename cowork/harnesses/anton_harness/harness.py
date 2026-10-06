@@ -5,8 +5,9 @@ from pathlib import Path
 import shutil
 import tempfile
 
-from cowork.build_info import supported_kwargs, surface_kwarg
-from cowork.common.chat_session import build_chat_session
+from cowork.build_info import account_kwargs, supported_kwargs, surface_kwarg
+from cowork.common.chat_session import build_chat_session, close_session_scratchpads
+from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.logger import get_logger
 from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
@@ -21,6 +22,32 @@ from cowork.services.projects import display_label
 
 
 logger = get_logger(__name__)
+
+
+def _anton_mcp_wiring():
+    """anton's MCP wiring module, or ``None`` when the installed anton predates it.
+
+    cowork-server pins anton from a git branch, but its *published* floor
+    (``anton-agent>=2.26.8.23.1``) still resolves builds with no
+    ``anton.core.mcp`` package — the MCP client (ENG-1816) reaches anton's
+    ``main`` on its own release cadence, so there is a real window where a
+    perfectly valid dependency lacks it.
+
+    Importing it unconditionally turns that window into an ImportError on the
+    session-construction path, i.e. every turn fails, not just the MCP ones.
+    Same reasoning and same shape as ``services/providers.py``'s
+    ``router_provider`` gate and ``handlers/turn_errors.py``'s deliberate
+    refusal to import a type this repo can be deployed ahead of.
+    """
+    try:
+        from anton.core.mcp import wiring
+    except ImportError:
+        logger.info(
+            "Installed anton has no anton.core.mcp — MCP-based connectors are "
+            "inactive for this build; every other connector is unaffected."
+        )
+        return None
+    return wiring
 
 
 def _vault_scratch_dir() -> Path:
@@ -94,27 +121,15 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     return applied
 
 
-def _apply_model_override(anton_settings, model: str | None) -> list[str]:
-    """A per-conversation model pick (the composer's dropdown) overrides
-    planning/coding/router for THIS call only — the account-wide
-    planning_model/coding_model/router_model settings applied by
-    ``_overlay_user_settings`` above are left untouched for every other
-    conversation. Provider is deliberately NOT overridden: the composer's
-    model list is itself scoped to whichever provider is already configured,
-    so the existing planning/coding/router providers stay correct for the
-    picked model.
+def _apply_client_models(anton_settings, llm_client) -> list[str]:
+    """Keep runtime context consistent with the models the client will use.
 
-    No-op (returns []) when ``model`` is falsy, so the account-wide defaults
-    keep governing conversations with no per-conversation pick.
-
-    Same hasattr skew guard as ``_overlay_user_settings`` — see its docstring.
+    Guard both sides for older Anton versions without the router role.
     """
-    if not model:
-        return []
     applied: list[str] = []
     for attr in ("planning_model", "coding_model", "router_model"):
-        if hasattr(anton_settings, attr):
-            setattr(anton_settings, attr, model)
+        if hasattr(anton_settings, attr) and hasattr(llm_client, attr):
+            setattr(anton_settings, attr, getattr(llm_client, attr))
             applied.append(attr)
     return applied
 
@@ -244,10 +259,11 @@ def _turn_style_context(channel: ChannelContext | None) -> str:
     if channel is None:
         return (
             "The Anton CoWork desktop UI displays progress, tool usage, and actions "
-            "as separate structured activity rows. Keep assistant text focused on the "
-            "user-facing answer; do not narrate internal work with status phrases like "
-            "\"I'll check\", \"let me query\", or \"I have access\" unless that wording "
-            "is itself the final answer the user needs. "
+            "as separate structured activity rows, so do not narrate each step "
+            "(\"let me check\", \"now I'll query\"). When a request needs tool work, "
+            "open your reply with one short sentence telling the user what you are "
+            "about to do; after that, keep assistant text focused on the user-facing "
+            "answer. "
             "Files you create as artifacts appear automatically in the Live Artifacts "
             "panel beside the chat, where the user previews them and uses the Download "
             "control (and Open, on desktop). When a file is ready, tell the user it is "
@@ -431,7 +447,7 @@ class AntonHarness:
         conversation: Conversation,
         input: list[TextInputBlock | FileInputBlock],
         # Per-conversation model pick (the composer's dropdown) — overrides
-        # planning/coding/router for this call only; see _build_chat_session.
+        # roles on the planning provider for this call only; see _build_chat_session.
         model: str | None = None,
         # Per-task reasoning-effort pick (the composer's Effort sub-picker) —
         # overrides planning/coding effort for this call only; see
@@ -445,6 +461,7 @@ class AntonHarness:
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
         channel_context: ChannelContext | None = None,
+        tool_messages: bool = False,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -492,11 +509,15 @@ class AntonHarness:
         # end-of-turn finally must not depend on the session still being live.
         conv_id = conversation.id
         conv_project_id = conversation.project_id
-        # Same reason: the card carries the project name to the client, and reading
-        # the relation after the turn could hit an expired session.
-        # The artifact card's label, sent beside project_id which carries the
-        # identity - so this is a display value (ENG-1676).
-        conv_project_name = display_label(conversation.project)
+        # Same reason: reading the relation after the turn could hit an expired
+        # session, so both of the card's project values are read now. The label
+        # is what the card shows, beside project_id which carries the identity
+        # (ENG-1676). The name addresses the card's serve URL, because
+        # serve_artifact_file (GET /api/v1/artifacts/serve/{project_name}/...)
+        # resolves that segment by name, through
+        # services.artifacts._project_artifacts_base.
+        conv_project_label = display_label(conversation.project)
+        conv_project_name = conversation.project.name
         # Skill drafts surface as cards (never auto-saved). Anton has no
         # skill-draft tool (it runs anton-core's own registry), so routing is
         # prompt + dir-diff only — consistent with its artifact flow. The
@@ -519,6 +540,7 @@ class AntonHarness:
                 reasoning_effort=reasoning_effort,
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
+                tool_messages=tool_messages,
             )
             # Length of the seeded history — everything anton appends past this
             # index is this turn's block-messages (tool_use / tool_result / text).
@@ -563,6 +585,10 @@ class AntonHarness:
         finally:
             if temp_vault_dir:
                 shutil.rmtree(temp_vault_dir, ignore_errors=True)
+            if session is not None:
+                # Before the steps below, so none of them raising can skip it.
+                # Scheduled rather than awaited; see close_session_scratchpads.
+                close_session_scratchpads(session, owner=f"conversation {conv_id}")
             if session is not None and seed_info is not None:
                 # Best-effort — must never mask the turn's real outcome.
                 try:
@@ -604,6 +630,7 @@ class AntonHarness:
             scope=turn_scope,
             project_id=str(conv_project_id) if conv_project_id else None,
             project_name=conv_project_name,
+            project_label=conv_project_label,
         )
         for card in cards:
             yield ArtifactCreated(card)
@@ -628,25 +655,19 @@ class AntonHarness:
         output — most visible on short turns like "hi"/"who are you?" with
         little else to anchor generation.
 
-        Also scrubs plain-text content before replay: anton only scrubs a
-        user turn's OWN input as it arrives, not history read back from
-        storage, so a credential typed in an earlier turn would otherwise
-        reappear unmasked here on every later turn (ENG-1849). Vault
-        secrets for the whole conversation are already registered by the
-        time this runs (`restore_namespaced_env` above, in
+        Also scrubs content before replay via `scrubbed_openai_dump`: anton
+        only scrubs a user turn's OWN input as it arrives, not history read
+        back from storage, so a credential typed in an earlier turn would
+        otherwise reappear unmasked here on every later turn (ENG-1849).
+        Vault secrets for the whole conversation are already registered by
+        the time this runs (`restore_namespaced_env` above, in
         `_build_chat_session`), so this catches anything vaulted since the
-        message was first persisted, not just what was known at persist
-        time. List-shaped content (tool_use/tool_result blocks) is left
-        alone — that's already scrubbed at generation time.
+        message was first persisted, not just what was known at persist time.
 
         Extracted (not an inline closure) so this can be unit-tested
         directly against fake messages, same reasoning as _seed_history.
         """
-        from anton.utils.datasources import scrub_credentials
-
-        om = m.to_openai_message().model_dump()
-        if isinstance(om.get("content"), str) and om["content"]:
-            om["content"] = scrub_credentials(om["content"])
+        om = scrubbed_openai_dump(m)
         ts = m.created_at.strftime("%Y-%m-%d %H:%M") if getattr(m, "created_at", None) else None
         if m.role == "user" and ts and isinstance(om.get("content"), str) and om["content"]:
             om["content"] = f"[{ts}] {om['content']}"
@@ -678,8 +699,6 @@ class AntonHarness:
 
         tail = [stamp(m) for m in ordered_messages[tail_start:]]
         if history_summary:
-            from anton.utils.datasources import scrub_credentials
-
             summary_msg = {"role": "user", "content": scrub_credentials(history_summary)}
             if tail and tail[0].get("role") == "user":
                 # Same fix anton's own _summarize_history applies: two
@@ -705,15 +724,66 @@ class AntonHarness:
         return initial_history, seed_info
 
     @staticmethod
+    def _recall_history_tool(conversation: Conversation, user):
+        """The archive-search tool for this turn, or None when there is nothing
+        to search (ENG-735).
+
+        Withheld in three cases:
+        - no summary saved yet — the whole history is still replayed, so the
+          tool's description and prompt would be dead prompt weight
+        - compaction switched off — nothing will ever be archived
+        - the conversation is detached from its DB session, so the archive
+          cannot be read at all
+
+        The DB stays on this side of the boundary: the tool receives a callable
+        that returns the archive, so its handler holds no session and the
+        hosted path can hand it the same data read off the shared mount.
+        """
+        if not user.history_compaction_enabled:
+            return None
+        if not conversation.history_summary_cutoff_id:
+            return None
+
+        from sqlalchemy.orm import object_session
+
+        from cowork.db.scoped import adopt_scoped_session
+        from cowork.services.conversations import ConversationService
+
+        from .tools import build_cowork_recall_history_tool
+
+        db_session = object_session(conversation)
+        if db_session is None:
+            return None
+        # Read per call, not here: most turns never call the tool, and the
+        # archive only changes when a compaction lands at turn end.
+        service = ConversationService(adopt_scoped_session(db_session))
+        return build_cowork_recall_history_tool(
+            lambda: service.archived_messages(conversation.id)
+        )
+
+    @staticmethod
+    def compaction_cutoff_index(seed_info: dict, covered_through: int, total: int) -> int | None:
+        """Index of the last seeded message a compaction covers, or None.
+
+        `covered_through` counts entries of the `initial_history` that was
+        seeded, which starts with `synthetic_prefix_len` non-real entries (the
+        summary, plus an assistant separator when one was needed) — so they
+        come off before the count maps onto real messages.
+
+        Returns None when the compaction covers nothing real or lands outside
+        the list: both mean "don't save a cutoff", not an error. The hosted
+        path shares this because `covered_through` arrives from the pod there,
+        where an out-of-range value is untrusted input rather than a bug.
+        """
+        covered = covered_through - seed_info["synthetic_prefix_len"]
+        if covered <= 0:
+            return None
+        idx = seed_info["tail_start"] + covered - 1
+        return idx if 0 <= idx < total else None
+
+    @staticmethod
     def _persist_history_compaction(conversation: Conversation, session, seed_info: dict) -> None:
         """Save anton's compacted summary + cutoff if it compacted this turn.
-
-        `seed_info["ordered_messages"]`/`["tail_start"]` are what this turn's
-        `initial_history` was built from; `["synthetic_prefix_len"]` is how
-        many non-real entries (summary, plus an assistant separator if one was
-        needed) were prepended ahead of them — `covered_through` from
-        `session.last_compaction` counts those too, so they must be subtracted
-        before mapping onto `ordered_messages`.
 
         `getattr` (not `session.last_compaction` directly): an anton build
         predating this property must no-op here, not raise — cowork-server and
@@ -722,13 +792,11 @@ class AntonHarness:
         compaction = getattr(session, "last_compaction", None)
         if compaction is None:
             return
-        offset = seed_info["synthetic_prefix_len"]
-        covered = compaction["covered_through"] - offset
-        if covered <= 0:
-            return
         ordered_messages = seed_info["ordered_messages"]
-        idx = seed_info["tail_start"] + covered - 1
-        if not (0 <= idx < len(ordered_messages)):
+        idx = AntonHarness.compaction_cutoff_index(
+            seed_info, compaction["covered_through"], len(ordered_messages),
+        )
+        if idx is None:
             return
         from sqlalchemy.orm import object_session
         from cowork.db.scoped import adopt_scoped_session
@@ -765,6 +833,7 @@ class AntonHarness:
         reasoning_effort: str | None = None,
         disabled_connections: list[dict] | None = None,
         channel_context: ChannelContext | None = None,
+        tool_messages: bool = False,
     ):
         """Build the same core runtime the Anton CLI uses, scoped to one project."""
         from anton.chat_session import build_runtime_context
@@ -808,6 +877,7 @@ class AntonHarness:
         # provider, model, memory flags, etc.) so the DB is the single
         # source of truth — no .env reload needed.
         from cowork.common.settings.user_settings import get_user_settings
+        from cowork.services.providers import web_tool_kwargs_for
         from pydantic import SecretStr
 
         anton_settings = AntonSettings()
@@ -826,6 +896,8 @@ class AntonHarness:
 
         user = get_user_settings()
         _overlay_user_settings(anton_settings, user)
+
+        RECALL_HISTORY_TOOL = self._recall_history_tool(conversation, user)
 
         # API keys: UserSettings stores SecretStr, AntonSettings uses plain str
         for attr in ("anthropic_api_key", "openai_api_key", "minds_api_key"):
@@ -854,8 +926,6 @@ class AntonHarness:
         router_model = getattr(user, "router_model", None)
         if router_model is not None and hasattr(anton_settings, "router_model"):
             anton_settings.router_model = router_model
-
-        _apply_model_override(anton_settings, model)
 
         workspace = Workspace(base)
         workspace.initialize()
@@ -886,7 +956,8 @@ class AntonHarness:
         for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir, project_memory_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
-        llm_client = self._build_llm_client(effort=reasoning_effort)
+        llm_client = self._build_llm_client(effort=reasoning_effort, model=model, settings=user)
+        _apply_client_models(anton_settings, llm_client)
         self_awareness = SelfAwarenessContext(context_dir)
 
         from cowork.common.settings.app_settings import get_app_settings
@@ -932,6 +1003,11 @@ class AntonHarness:
             "Access to any files not attached to the conversation or located outside the project is strictly forbidden."
             "ALWAYS use the scratchpad to interact with files."
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
+            # Each turn's scratchpad processes are killed when the turn ends
+            # (close_session_scratchpads), with their whole process group.
+            " Processes and threads a scratchpad cell starts are stopped when your reply ends: "
+            "variables carry over to the next turn, running servers do not. "
+            "For a service that must keep running, build a full-stack artifact and start it with `launch_backend`."
             + attachment_context
         )
         output_context = (
@@ -992,164 +1068,228 @@ class AntonHarness:
 
             restore_namespaced_env(data_vault)
 
-        # TODO: Add guidance for integrations
-
-        # Google Drive's google_drive connector uses the drive.file OAuth
-        # scope, which only covers files the app created itself, plus files
-        # the user explicitly granted access to via the Google Picker
-        # (persisted as a `_picked_files` vault field — see
-        # cowork/services/connectors/connections.py). A plain
-        # files.list()/files.search() call does NOT return the latter, so
-        # without calling them out by name here the agent has no way to
-        # know they're reachable at all — the scratchpad's env carries only the
-        # raw JSON, which isn't enough for the agent to notice or act on.
+        # HubSpot's MCP connector (ENG-487) and any future MCP-based one:
+        # discover tools BEFORE ChatSessionConfig/ChatSession exist — see
+        # anton/core/mcp/wiring.py's module docstring for why this can't
+        # happen after construction. Uses whichever data_vault was resolved
+        # above (filtered or source), so a connection disabled for this turn
+        # via `disabled_connections` is excluded here the same way its env
+        # vars already are. discover_mcp_tools_async itself skips every
+        # connection whose `_method` isn't "mcp" — safe to pass the full,
+        # unfiltered connection list for every other connector.
         #
-        # Parsing `_picked_files` and applying the project-scoping rule is
-        # connector logic, not agent logic, so it lives in
-        # ConnectionsService.picked_files_by_project().
-        integration_guidance = ""
-        picked_by_connection: dict[str, list[dict]] = {}
-        if data_vault is not None:
-            picked_by_connection = service.picked_files_by_project(data_vault, conversation.project.name)
+        # Capability-gated on the installed anton, the same way
+        # services/providers.py gates ENG-648's router kwargs: this repo's
+        # published floor (anton-agent>=2.26.8.23.1) still resolves builds
+        # that predate the MCP client, and promoting it to anton's `main` is
+        # a separate release step (ENG-1816). An unguarded import would turn
+        # that window into a failure on EVERY turn, not just MCP ones.
+        mcp_tool_defs: list = []
+        mcp_sessions: list = []
+        mcp_wiring = _anton_mcp_wiring() if data_vault is not None else None
+        if mcp_wiring is not None:
+            mcp_tool_defs, mcp_sessions = await mcp_wiring.discover_mcp_tools_async(
+                data_vault, data_vault.list_connections()
+            )
 
-            if picked_by_connection:
-                def _describe(f: dict, conn_name: str) -> str:
-                    line = f"- {f.get('name', 'untitled')} (id: {f.get('id')}, connection: {conn_name}"
-                    resource_key = f.get("resourceKey") or f.get("resource_key")
-                    if resource_key:
-                        line += f", resourceKey: {resource_key}"
-                    return line + ")"
+        try:
+            # TODO: Add guidance for integrations
 
-                picked_lines = [
-                    _describe(f, conn_name)
-                    for conn_name, files in picked_by_connection.items()
-                    for f in files
-                ]
-                integration_guidance = (
-                    "\n\nIMPORTANT — additional Google Drive files the user has explicitly granted "
-                    "access to via the Google Picker, which a plain files.list()/files.search() call "
-                    "will NOT return (the google_drive connector's scope only covers files this app "
-                    "created itself, plus these specifically granted ones):\n"
-                    + "\n".join(picked_lines)
-                    + "\nWhenever you list, search, or enumerate Drive files for the user, you MUST "
-                    "include every file above IN ADDITION to whatever files.list()/files.search() "
-                    "returns — do not report only the API call's results. To read one of these "
-                    "files' content, call files.get(fileId=...) directly with its id above; do not "
-                    "expect it to appear in a files.list() response first. If a file above has a "
-                    "resourceKey listed, you MUST send it or the call will fail with a 404 notFound "
-                    "even though access was actually granted — either add header "
-                    "'X-Goog-Drive-Resource-Keys: <id>/<resourceKey>' to the request, or pass "
-                    "resourceKey=<resourceKey> as a query parameter. Some of these files may live in "
-                    "a Shared Drive rather than the user's My Drive — Drive API calls silently return "
-                    "404 notFound for Shared Drive items unless you pass supportsAllDrives=true (and, "
-                    "for files.list()/files.search(), also includeItemsFromAllDrives=true). Always "
-                    "include both params on any Drive API call touching these files; they're no-ops "
-                    "for regular files, so there's no downside to always sending them. CRITICAL: when "
-                    "calling files.list()/files.search(), do NOT pass corpora='allDrives' — unlike "
-                    "supportsAllDrives/includeItemsFromAllDrives, that parameter is NOT properly scoped "
-                    "by this connector's restricted OAuth grant and will return files across the user's "
-                    "entire Google account that this app was never actually given access to. Omit "
-                    "corpora entirely (or use corpora='user') — combined with "
-                    "includeItemsFromAllDrives=true and supportsAllDrives=true, that already correctly "
-                    "surfaces every file this app can legitimately see, Shared Drive items included."
+            # Google Drive's google_drive connector uses the drive.file OAuth
+            # scope, which only covers files the app created itself, plus files
+            # the user explicitly granted access to via the Google Picker
+            # (persisted as a `_picked_files` vault field — see
+            # cowork/services/connectors/connections.py). A plain
+            # files.list()/files.search() call does NOT return the latter, so
+            # without calling them out by name here the agent has no way to
+            # know they're reachable at all — the scratchpad's env carries only the
+            # raw JSON, which isn't enough for the agent to notice or act on.
+            #
+            # Parsing `_picked_files` and applying the project-scoping rule is
+            # connector logic, not agent logic, so it lives in
+            # ConnectionsService.picked_files_by_project().
+            integration_guidance = ""
+            picked_by_connection: dict[str, list[dict]] = {}
+            if data_vault is not None:
+                picked_by_connection = service.picked_files_by_project(data_vault, conversation.project.name)
+
+                if picked_by_connection:
+                    def _describe(f: dict, conn_name: str) -> str:
+                        line = f"- {f.get('name', 'untitled')} (id: {f.get('id')}, connection: {conn_name}"
+                        resource_key = f.get("resourceKey") or f.get("resource_key")
+                        if resource_key:
+                            line += f", resourceKey: {resource_key}"
+                        return line + ")"
+
+                    picked_lines = [
+                        _describe(f, conn_name)
+                        for conn_name, files in picked_by_connection.items()
+                        for f in files
+                    ]
+                    integration_guidance = (
+                        "\n\nIMPORTANT — additional Google Drive files the user has explicitly granted "
+                        "access to via the Google Picker, which a plain files.list()/files.search() call "
+                        "will NOT return (the google_drive connector's scope only covers files this app "
+                        "created itself, plus these specifically granted ones):\n"
+                        + "\n".join(picked_lines)
+                        + "\nWhenever you list, search, or enumerate Drive files for the user, you MUST "
+                        "include every file above IN ADDITION to whatever files.list()/files.search() "
+                        "returns — do not report only the API call's results. To read one of these "
+                        "files' content, call files.get(fileId=...) directly with its id above; do not "
+                        "expect it to appear in a files.list() response first. If a file above has a "
+                        "resourceKey listed, you MUST send it or the call will fail with a 404 notFound "
+                        "even though access was actually granted — either add header "
+                        "'X-Goog-Drive-Resource-Keys: <id>/<resourceKey>' to the request, or pass "
+                        "resourceKey=<resourceKey> as a query parameter. Some of these files may live in "
+                        "a Shared Drive rather than the user's My Drive — Drive API calls silently return "
+                        "404 notFound for Shared Drive items unless you pass supportsAllDrives=true (and, "
+                        "for files.list()/files.search(), also includeItemsFromAllDrives=true). Always "
+                        "include both params on any Drive API call touching these files; they're no-ops "
+                        "for regular files, so there's no downside to always sending them. CRITICAL: when "
+                        "calling files.list()/files.search(), do NOT pass corpora='allDrives' — unlike "
+                        "supportsAllDrives/includeItemsFromAllDrives, that parameter is NOT properly scoped "
+                        "by this connector's restricted OAuth grant and will return files across the user's "
+                        "entire Google account that this app was never actually given access to. Omit "
+                        "corpora entirely (or use corpora='user') — combined with "
+                        "includeItemsFromAllDrives=true and supportsAllDrives=true, that already correctly "
+                        "surfaces every file this app can legitimately see, Shared Drive items included."
+                    )
+
+            # Canonical order (ConversationService._MESSAGE_ORDER: seq, role, id);
+            # the bare `conversation.messages`
+            # relationship is unordered and would scramble a turn's tool_use/tool_result
+            # block-rows. Ordering needs the DB session, so the conversation must be
+            # attached — callers always pass an attached instance; fail fast rather
+            # than silently fall back to a scrambled, replay-breaking history.
+            from sqlalchemy.orm import object_session
+            from cowork.db.scoped import adopt_scoped_session
+            from cowork.services.conversations import ConversationService
+
+            db_session = object_session(conversation)
+            if db_session is None:
+                raise RuntimeError(
+                    f"Conversation {conversation.id} is detached from its Session; "
+                    "cannot resolve ordered history for replay."
                 )
+            ordered_messages = ConversationService(
+                adopt_scoped_session(db_session)
+            ).get_ordered_messages(conversation.id)
 
-        # Canonical order (created_at, seq, ...); the bare `conversation.messages`
-        # relationship is unordered and would scramble a turn's tool_use/tool_result
-        # block-rows. Ordering needs the DB session, so the conversation must be
-        # attached — callers always pass an attached instance; fail fast rather
-        # than silently fall back to a scrambled, replay-breaking history.
-        from sqlalchemy.orm import object_session
-        from cowork.db.scoped import adopt_scoped_session
-        from cowork.services.conversations import ConversationService
+            cells = extract_scratchpad_cells_from_message_events(ordered_messages)
+            os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
 
-        db_session = object_session(conversation)
-        if db_session is None:
-            raise RuntimeError(
-                f"Conversation {conversation.id} is detached from its Session; "
-                "cannot resolve ordered history for replay."
-            )
-        ordered_messages = ConversationService(
-            adopt_scoped_session(db_session)
-        ).get_ordered_messages(conversation.id)
+            replayable = [m for m in ordered_messages if m.role in {"user", "assistant"}]
+            # Replay [summary] + [messages after cutoff] instead of full history
+            # when a saved compaction is still valid (ENG-664). Disabled → plain
+            # full history and `seed_info = None`, which skips persistence too.
+            if user.history_compaction_enabled:
+                initial_history, seed_info = self._seed_history(
+                    replayable,
+                    conversation.history_summary,
+                    conversation.history_summary_cutoff_id,
+                    self._stamp_message,
+                )
+            else:
+                initial_history = [self._stamp_message(m) for m in replayable]
+                seed_info = None
 
-        cells = extract_scratchpad_cells_from_message_events(ordered_messages)
-        os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
-
-        replayable = [m for m in ordered_messages if m.role in {"user", "assistant"}]
-        # Replay [summary] + [messages after cutoff] instead of full history
-        # when a saved compaction is still valid (ENG-664). Disabled → plain
-        # full history and `seed_info = None`, which skips persistence too.
-        if user.history_compaction_enabled:
-            initial_history, seed_info = self._seed_history(
-                replayable,
-                conversation.history_summary,
-                conversation.history_summary_cutoff_id,
-                self._stamp_message,
-            )
-        else:
-            initial_history = [self._stamp_message(m) for m in replayable]
-            seed_info = None
-
-        config = ChatSessionConfig(
-            llm_client=llm_client,
-            settings=anton_settings,
-            self_awareness=self_awareness,
-            cortex=cortex,
-            # episodic=episodic,
-            system_prompt_context=SystemPromptContext(
-                runtime_context=build_runtime_context(anton_settings),
-                suffix=(
-                    _turn_style_context(channel_context)
-                    + f"{project_context}"
-                    + f"{output_context}"
-                    + f"{skill_output_context}"
-                    + f"{integration_guidance}"
+            config = ChatSessionConfig(
+                llm_client=llm_client,
+                settings=anton_settings,
+                self_awareness=self_awareness,
+                cortex=cortex,
+                # episodic=episodic,
+                system_prompt_context=SystemPromptContext(
+                    runtime_context=build_runtime_context(anton_settings),
+                    suffix=(
+                        _turn_style_context(channel_context)
+                        + f"{project_context}"
+                        + f"{output_context}"
+                        + f"{skill_output_context}"
+                        + f"{integration_guidance}"
+                    ),
                 ),
-            ),
-            workspace=workspace,
-            data_vault=data_vault,
-            **overlay_kwargs,
-            initial_history=initial_history,
-            # history_store=history_store,
-            session_id=str(conversation.id),
-            elicitor=build_elicitor(str(conversation.id)),
-            # Surfaced on langfuse traces (Langfuse-Tags / metadata) so calls
-            # are attributed to the active harness. self.id == "anton".
-            harness=self.id,
-            # WHERE the user is, which `harness` cannot say: this one server
-            # serves both the desktop sidecar and the multi-tenant web build,
-            # and both report harness="anton" (ENG-1459). Only the deployment
-            # knows which, so it is resolved here rather than by anton.
-            **surface_kwarg(ChatSessionConfig),
-            proactive_dashboards=anton_settings.proactive_dashboards,
-            act_first=anton_settings.act_first,
-            # "Conversation started" stamp for the cache-stable prompt prefix
-            # (anton 2a). The live current time is rendered separately in the
-            # volatile tail, so resuming days later still reports the real "now".
-            started_at=conversation.created_at,
-            tools=[
-                CONNECT_DATASOURCE_TOOL,
-                PUBLISH_TOOL,
-                LOOKUP_CONNECTOR_TOOL,
-                REQUEST_CREDENTIALS_TOOL,
-                LABEL_CONNECTION_TOOL,
-                CREATE_SKILL_DRAFT_TOOL,
-                # FETCH_SUBMISSION_TOOL,
-                # UPDATE_FORM_TOOL,
-            ],
-            cells=cells
-        )
-        # Not `ChatSession(config)` directly: every construction of anton's
-        # executor inside cowork-server goes through build_chat_session, which
-        # refuses in org mode. stream_response already refuses earlier on this
-        # path, so this is the second of two gates rather than the only one,
-        # but keeping the construction uniform is what lets the static test
-        # (tests/test_no_subprocess_static.py) treat any other ChatSession(...)
-        # call under cowork/ as a new, unreviewed execution site.
-        return build_chat_session(config), temp_vault_dir, seed_info
+                workspace=workspace,
+                data_vault=data_vault,
+                **overlay_kwargs,
+                initial_history=initial_history,
+                # history_store=history_store,
+                session_id=str(conversation.id),
+                elicitor=build_elicitor(str(conversation.id)),
+                # Surfaced on langfuse traces (Langfuse-Tags / metadata) so calls
+                # are attributed to the active harness. self.id == "anton".
+                harness=self.id,
+                # WHERE the user is, which `harness` cannot say: this one server
+                # serves both the desktop sidecar and the multi-tenant web build,
+                # and both report harness="anton" (ENG-1459). Only the deployment
+                # knows which, so it is resolved here rather than by anton.
+                **surface_kwarg(ChatSessionConfig),
+                # WHO the user is, so anton keys `turn_completed` on the account
+                # rather than the machine (ENG-2121). Opaque ids from the held
+                # MindsHub JWT only; {} when there is none or the pinned anton
+                # predates the fields.
+                **account_kwargs(ChatSessionConfig),
+                # This harness rebuilds the session every message, so the verifier
+                # latch has to outlive it or a persistent failure diagnoses each time.
+                **supported_kwargs(ChatSessionConfig, shared_verifier_latch=True),
+                # Whether the client renders a tool's message to the user (the
+                # brief when the agent acts first); without it the tool hands
+                # the content to the agent. Dropped by an anton without the field.
+                **supported_kwargs(ChatSessionConfig, tool_messages=tool_messages),
+                proactive_dashboards=anton_settings.proactive_dashboards,
+                act_first=anton_settings.act_first,
+                # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
+                # puts planning on the Responses API. The client above uses
+                # this same settings snapshot, even if settings change mid-build.
+                **web_tool_kwargs_for(user.resolved_planning_provider),
+                # "Conversation started" stamp for the cache-stable prompt prefix
+                # (anton 2a). The live current time is rendered separately in the
+                # volatile tail, so resuming days later still reports the real "now".
+                started_at=conversation.created_at,
+                tools=[
+                    CONNECT_DATASOURCE_TOOL,
+                    PUBLISH_TOOL,
+                    LOOKUP_CONNECTOR_TOOL,
+                    REQUEST_CREDENTIALS_TOOL,
+                    LABEL_CONNECTION_TOOL,
+                    CREATE_SKILL_DRAFT_TOOL,
+                    # FETCH_SUBMISSION_TOOL,
+                    # UPDATE_FORM_TOOL,
+                    *([RECALL_HISTORY_TOOL] if RECALL_HISTORY_TOOL else []),
+                    *mcp_tool_defs,
+                ],
+                # Same gate as the discovery call above, not a second one:
+                # `ChatSessionConfig.mcp_sessions` and `anton.core.mcp` ship
+                # together (anton#478), so an anton without the wiring module
+                # also rejects this kwarg — passing it there is a TypeError
+                # that takes down every turn.
+                **({"mcp_sessions": mcp_sessions} if mcp_wiring is not None else {}),
+                cells=cells
+            )
+            # Not `ChatSession(config)` directly: every construction of anton's
+            # executor inside cowork-server goes through build_chat_session, which
+            # refuses in org mode. stream_response already refuses earlier on this
+            # path, so this is the second of two gates rather than the only one,
+            # but keeping the construction uniform is what lets the static test
+            # (tests/test_no_subprocess_static.py) treat any other ChatSession(...)
+            # call under cowork/ as a new, unreviewed execution site.
+            session = build_chat_session(config)
+            return session, temp_vault_dir, seed_info
+        except Exception:
+            # Mirrors anton's own build_cloud_chat_session fix (ENG-1816
+            # code review): ChatSession.close() is what closes mcp_sessions,
+            # so a failure ANYWHERE below MCP discovery — not just
+            # build_chat_session's own construction — would otherwise leak
+            # every MCP transport this turn opened (found in review: the
+            # original narrower try/except here missed object_session()/
+            # _seed_history() raising before build_chat_session is ever called).
+            # A non-empty mcp_sessions implies mcp_wiring resolved above, so
+            # no second import and no second capability check is needed here.
+            if mcp_sessions:
+                await mcp_wiring.close_mcp_sessions(mcp_sessions)
+            raise
 
     @staticmethod
-    def _build_llm_client(effort: str | None = None):
+    def _build_llm_client(effort: str | None = None, *, model: str | None = None, settings=None):
         from cowork.services.providers import build_llm_client
-        return build_llm_client(effort_override=effort)
+        return build_llm_client(effort_override=effort, model_override=model, settings=settings)

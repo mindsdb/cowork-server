@@ -4,7 +4,6 @@ import asyncio
 import base64
 import contextlib
 import logging
-import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -13,7 +12,10 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
+import re2
+
 from anton.core.dispatch import OutboundMessage
+from cowork.handlers._turn_history import reject_unreplayable_tool_rows
 from cowork.build_info import build_trace_metadata
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.db.scoped import LOCAL_SCOPE, SYSTEM_SCOPE, ScopedSession, TenantScope, scope_for_background_context, scope_for_org
@@ -33,6 +35,7 @@ from cowork.services.channels import ChannelConfigService, resolve_installation_
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.skills import SkillService
+from cowork.streaming.answer_text import accumulate_answer_text
 from cowork.turnqueue.remote_turn import RemoteTurnFailed, remote_turn_events
 
 log = logging.getLogger(__name__)
@@ -68,6 +71,13 @@ def is_new_command(text: str, *, is_mention: bool | None = None) -> bool:
 TYPING_REFRESH_S = 4.0
 
 MAX_TURN_ATTACHMENTS = 3
+
+# re2 logs pattern-compile/search errors to the process's raw stderr by
+# default (before absl::InitializeLog() — bypasses Python logging entirely),
+# which would misrepresent an org-controlled trigger_pattern mistake as a
+# server error in production logs.
+_QUIET_REGEX_OPTIONS = re2.Options()
+_QUIET_REGEX_OPTIONS.log_errors = False
 
 
 def artifacts_since(project_path: str, conversation_id: UUID, since: float) -> list[tuple[str, str]]:
@@ -295,7 +305,7 @@ class AntonChannelRuntime:
                 "channel %s: binding %s → project %s (trigger=%s)",
                 channel_type, binding.id, binding.anton_project_id, binding.trigger_rule,
             )
-            if not self._should_respond(binding, event):
+            if not await self._should_respond(binding, event):
                 log.info("channel %s: trigger rule %r skipped a message", channel_type, binding.trigger_rule)
                 return
             if is_new_command(self._event_text(event), is_mention=event.message.is_mention):
@@ -390,7 +400,7 @@ class AntonChannelRuntime:
         return binding
 
     @staticmethod
-    def _should_respond(binding: ChannelBinding, event: Any) -> bool:
+    async def _should_respond(binding: ChannelBinding, event: Any) -> bool:
         rule = binding.trigger_rule
         if rule == "always":
             return True
@@ -400,9 +410,19 @@ class AntonChannelRuntime:
             pattern = binding.trigger_pattern
             if not pattern:
                 return False
+            content = str(event.message.content)
+            # `trigger_pattern` is org-controlled (ChannelBindingService only
+            # checks it parses, not that it's cheap to run) and is matched
+            # against every inbound message, so a backtracking engine here
+            # would be a ReDoS. re2 guarantees linear-time matching — no
+            # pattern can make this hang — so no timeout is needed; still
+            # off the event loop so a very large message can't stall other
+            # channels/requests while it matches.
             try:
-                return re.search(pattern, str(event.message.content)) is not None
-            except re.error:
+                return await asyncio.to_thread(
+                    lambda: re2.search(pattern, content, options=_QUIET_REGEX_OPTIONS) is not None
+                )
+            except re2.error:
                 return False
         return True
 
@@ -526,11 +546,11 @@ class AntonChannelRuntime:
             # Tool block-rows are for LLM-history persistence, not UI replay —
             # keep them out of the events log (mirrors handlers/responses.py).
             if event_type == "response.turn_history":
-                turn_rows[:] = data.get("rows") or []
+                # Id-checked even in-process; see handlers/responses.py (ENG-2420).
+                turn_rows[:] = reject_unreplayable_tool_rows(data.get("rows") or [])
                 return
             events.append(data)
-            if event_type == "response.output_text.delta":
-                collected.append(data.get("delta", ""))
+            accumulate_answer_text(collected, event_type, data)
 
         stream = await self._turn_stream(
             harness, harness_id, scoped, conversation, blocks, text, channel_context, turn_rows,

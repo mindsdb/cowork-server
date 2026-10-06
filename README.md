@@ -10,6 +10,7 @@ Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 
 ```sh
 # Install and run
+
 uv tool install cowork-server
 cowork-server
 ```
@@ -29,6 +30,8 @@ uv run cowork-server
 
 When running alongside the Electron app in dev mode, the app spawns the server automatically — no manual start needed. The Electron app looks for a sibling `cowork-server/` directory by convention (override with `COWORK_SERVER_DIR`).
 
+cowork-server imports anton's artifact folder constants (`anton.core.artifacts.internal_files`) at startup, with no fallback. A local editable anton older than the `anton-agent` floor in `pyproject.toml` makes the server fail to start with `ImportError`.
+
 ### Dev setup helper
 
 ```sh
@@ -45,9 +48,170 @@ uv run pytest
 
 Tests use an isolated in-memory database and temporary directories — no side effects on your local `~/.cowork/` data.
 
+Post-deploy integration runs use the target cluster's self-hosted runner. Dev
+and staging obtain the fixed `cowork` test suite through auth's cluster-only
+service URL. Production must not mutate that shared `@emailsink.dev` identity
+while the fixed password remains committed. The production test path therefore
+accepts a dedicated `COWORK_TEST_API_KEY` secret, a reviewed
+`COWORK_TEST_USER_EMAIL` variable on the non-staff `@mindshub.ai` domain, and
+the immutable dedicated organization id in `COWORK_TEST_ORG_ID`. The suite
+resolves and matches that principal and organization through production auth,
+and refuses an employee-classified or Hub-admin identity before testing. A
+missing or mismatched identity fails the required prod run instead of falling
+back to provisioning or reporting skipped tests. Standing-identity mode also
+requires the test target to be exactly `https://cowork.mindshub.ai` before the
+first network call, so a changed environment file or workflow cannot send the
+production key to another origin.
+
+Do not store or use `COWORK_TEST_API_KEY` yet, or configure its paired email and
+organization id for a production run. The live `prod` GitHub Environment has no
+protection rules or deployment-branch policy. Although `publish.yml` refuses to
+enter its production build/deploy job from a non-main ref, a manually selected
+branch runs that branch's workflow text and can remove the check. Workflow code
+is therefore defense in depth, not the authority that protects an Environment
+secret.
+
+Before `COWORK_TEST_API_KEY` is stored or used, or any production evidence run
+starts, the `prod` Environment must have a nonempty required-reviewer rule with
+`prevent_self_review: true`, `can_admins_bypass: false`, and a selected-branches
+deployment policy whose only entry is the `main` branch, created as an exact
+Branch rule (no tag, wildcard, or second branch rule). Verify the live settings
+without reading any secret value:
+
+```sh
+gh api repos/mindsdb/cowork-server/environments/prod \
+  --jq '
+    [.protection_rules[]?
+      | select(.type == "required_reviewers")
+      | {
+          prevent_self_review,
+          reviewers: [.reviewers[]?
+            | {type, name: (.reviewer.login // .reviewer.slug)}]
+        }] as $required_reviewers
+    | {
+        can_admins_bypass,
+        required_reviewers: $required_reviewers,
+        deployment_branch_policy
+      }
+  '
+gh api 'repos/mindsdb/cowork-server/environments/prod/deployment-branch-policies?per_page=100' \
+  --jq '[.branch_policies[] | {name, type}]'
+```
+
+The first command must show exactly one required-reviewer rule with at least one
+named reviewer and `prevent_self_review: true`, plus `can_admins_bypass: false`,
+`protected_branches: false`, and `custom_branch_policies: true`. The second must
+print exactly `[{"name":"main","type":"branch"}]`. Only after both checks pass
+may an operator store `COWORK_TEST_API_KEY`, `COWORK_TEST_USER_EMAIL`, and
+`COWORK_TEST_ORG_ID` on that Environment. Evidence must come from a fresh
+main-branch run started after the
+protection was active, with `run_attempt: 1`; an eligible reviewer other than the
+run's `actor` and `triggering_actor` must approve its `prod` Environment gate. A
+rerun of an attempt that began before protection does not count. Keeping the
+values at Environment scope prevents non-prod jobs from receiving them, but that
+scope is safe only when these Environment controls are active.
+
+#### Nightly production read-only smoke
+
+The production nightly reads production on `mdb-prod` at `43 7 * * *` once its
+schedule is live. It is held today; the Environment prerequisites below say what
+turns it on. It uses the same guarded standing identity, but selects only
+`tests/integration/test_production_read_only.py`. That selection is GET-only:
+it reads health, conversations, schedules, files, and pins. It never
+provisions an identity and does not create conversations, schedules, files,
+artifacts, or model turns. The broad integration target excludes the
+`production_read_only` marker, so release and staging callers cannot include
+this production-only selection by accident.
+
+Failures and the next recovery use the shared engineering-channel notifier.
+The nightly is an alert, not a release gate. Review any new endpoint in
+`READ_ONLY_ENDPOINTS` together with
+`tests/test_production_read_only_workflow.py`, which rejects mutating HTTP calls
+and pins the complete request list.
+
+The unattended nightly cannot reference the existing `prod` Environment.
+That Environment must retain its required-reviewer gate for production deploys,
+and GitHub pauses every job that references such an Environment until a reviewer
+approves it. The monitor instead uses a dedicated `prod-read-only` Environment
+with unique `COWORK_PROD_READ_ONLY_API_KEY`,
+`COWORK_PROD_READ_ONLY_USER_EMAIL`, and
+`COWORK_PROD_READ_ONLY_ORG_ID` inputs. Unique names prevent a missing
+Environment value from falling back to a repository or organization credential.
+
+Before promoting this workflow to `main`, an operator must create
+`prod-read-only` with no required-reviewer or wait-timer rule and a custom
+deployment policy whose only entry is the exact `main` branch. The repository's
+`main` protection must continue to require a pull-request approval, resolve
+review conversations, and apply to administrators. These controls let the
+scheduled job start without weakening the separately protected `prod`
+Environment:
+
+```bash
+gh api --method PUT repos/mindsdb/cowork-server/environments/prod-read-only \
+  --input - <<'JSON'
+{
+  "wait_timer": 0,
+  "prevent_self_review": false,
+  "reviewers": [],
+  "deployment_branch_policy": {
+    "protected_branches": false,
+    "custom_branch_policies": true
+  }
+}
+JSON
+gh api --method POST \
+  repos/mindsdb/cowork-server/environments/prod-read-only/deployment-branch-policies \
+  -f name=main -f type=branch
+```
+
+Only after those controls exist may the operator copy the already reviewed
+standing identity into the dedicated names. The commands prompt for the secret
+and variable values and do not print them:
+
+```bash
+gh secret set COWORK_PROD_READ_ONLY_API_KEY \
+  --repo mindsdb/cowork-server --env prod-read-only
+gh variable set COWORK_PROD_READ_ONLY_USER_EMAIL \
+  --repo mindsdb/cowork-server --env prod-read-only
+gh variable set COWORK_PROD_READ_ONLY_ORG_ID \
+  --repo mindsdb/cowork-server --env prod-read-only
+```
+
+Verify policy and names without reading credential values:
+
+```bash
+gh api repos/mindsdb/cowork-server/environments/prod-read-only \
+  --jq '{protection_rules, deployment_branch_policy}'
+gh api \
+  'repos/mindsdb/cowork-server/environments/prod-read-only/deployment-branch-policies?per_page=100' \
+  --jq '[.branch_policies[] | {name, type}]'
+gh api repos/mindsdb/cowork-server/branches/main/protection \
+  --jq '{required_pull_request_reviews, enforce_admins, required_conversation_resolution}'
+gh secret list --repo mindsdb/cowork-server --env prod-read-only \
+  | rg '^COWORK_PROD_READ_ONLY_API_KEY\b'
+gh variable list --repo mindsdb/cowork-server --env prod-read-only \
+  | rg '^COWORK_PROD_READ_ONLY_(USER_EMAIL|ORG_ID)\b'
+```
+
+The Environment response must have no `required_reviewers` or `wait_timer`
+entry and must enable only custom branch policies. The branch-policy response
+must be exactly `[{"name":"main","type":"branch"}]`. The branch-protection
+response must show at least one required approval, administrator enforcement,
+and required conversation resolution. Do not dispatch until every check passes
+and the cowork-server#472 prerequisite has landed.
+
+The nightly schedule is held out of the workflow until those checks pass.
+GitHub arms a `schedule:` trigger as soon as the file reaches the default
+branch, so shipping one before the Environment exists does not buy a monitor, it
+buys a nightly page that reports a missing credential in the same shape as a
+production outage. `workflow_dispatch` is the only trigger until an operator has
+provisioned `prod-read-only` and watched one dispatched run go green. Restore the
+`schedule:` block with `- cron: "43 7 * * *"` and delete this paragraph in the
+same change; a contract test fails if only one of the two happens.
+
 ### Logging
 
-Set `LOG_LEVEL` (default `INFO`) to control verbosity. Enable file logging with `ENABLE_FILE_LOGGING=true` (writes to `LOG_DIR`, defaults to `~/.cowork/logs/`).
+Set `LOG_LEVEL` (default `WARNING`) to control verbosity. Enable file logging with `ENABLE_FILE_LOGGING=true` (writes to `LOG_DIR`, defaults to `~/.cowork/logs/`).
 
 ## Releasing
 
@@ -70,6 +234,24 @@ reusable in [mindsdb/github-actions](https://github.com/mindsdb/github-actions)
 workflows: PyPI trusted publishing matches the OIDC claim on the workflow
 filename and does not support reusable workflows.
 
+### Nightly staging integration
+
+The cowork-server maintainers own the deployed integration signal and its
+staging prerequisites. [`nightly-staging-integration.yml`](.github/workflows/nightly-staging-integration.yml)
+runs every day at 06:41 UTC and can also be dispatched by hand. It calls the
+same `tests-integration.yml` reusable workflow as a deployment on `mdb-dev`,
+then reports a failure or the first recovery through the shared
+engineering-channel notifier. It is a standalone monitor and never gates a
+publish, release, or deployment.
+
+**The nightly runs staging's copy of the tests, not main's.** GitHub starts every scheduled run on the default branch, so the checkout would otherwise take `main`. `main` trails `staging` by every commit waiting for the weekly release. Any behavior change among those commits fails `main`'s tests against staging's pods, even though staging works as intended. So the job passes `ref: staging`, and `tests-integration.yml` hands that input to `actions/checkout`. The deploy callers leave `ref` empty and keep testing the commit they just deployed. [`test_nightly_integration_workflow.py`](tests/test_nightly_integration_workflow.py) fails if a scheduled caller's `ref` differs from its `deploy-env`.
+
+The suite may create and delete test conversations, schedules, files, and agent
+turns in staging. The fixed test tenant is reserved for the `cowork` suite, and
+the workflow sets `COWORK_REQUIRE_INTEGRATION=true` for staging so a missing
+target, identity source, replica, or port-forward fails instead of becoming a
+green skip.
+
 In the packaged Electron app, a background updater checks PyPI on every launch and upgrades automatically (with rollback on failure). See [`server-updater.ts`](https://github.com/mindsdb/cowork/blob/main/src/main/server-updater.ts) in the frontend repo.
 
 ## Architecture
@@ -82,24 +264,30 @@ cowork/
   schemas/            # Pydantic request/response schemas
   db/                 # Database session and migrations
   common/             # Shared utilities, settings
-  harnesses/          # Agent adapters (Anton, Hermes, etc.)
+  harnesses/          # Agent adapters (Anton)
 ```
 
 The server is designed to be **agent-agnostic** — core features (projects, conversations, files) are shared across agents, while agent-specific behavior lives in harness adapters. See [docs/DESIGN.md](docs/DESIGN.md) for the full architectural rationale.
 
 ### Harness system
 
-A **harness** adapts an external agent library (Anton, Hermes, etc.) to the cowork-server interface. All harnesses implement the `HarnessProvider` protocol (`harnesses/base.py`), which exposes streaming responses, skill sync, and memory operations. The active harness is selected via the `harness` user setting. To add a new agent, implement the protocol and register it with the `@register` decorator.
+A **harness** adapts an external agent library (Anton today) to the cowork-server interface. All harnesses implement the `HarnessProvider` protocol (`harnesses/base.py`), which exposes streaming responses, skill sync, and memory operations. The active harness is selected via the `harness` user setting. To add a new agent, implement the protocol and register it with the `@register` decorator.
+
+**Each turn's scratchpads exit when the turn ends.** The Anton harness builds a fresh `ChatSession` for every turn, and each scratchpad that session starts is a child process of the server. When the turn completes, fails or is stopped, `close_session_scratchpads` (`cowork/common/chat_session.py`) kills those processes. A Stop pressed while a cell is running does not end the turn yet: anton kills that cell's scratchpad and the turn carries on until it ends by itself, which ENG-3078 tracks. The next turn starts a new process, which reloads the variables the old one saved to the conversation's namespace snapshot after every cell. Only the scratchpads close: full-stack backends the agent launched keep running. Anything a cell starts in the scratchpad's process group, such as a default `subprocess.Popen` child or a thread, dies with it, so a long-lived service belongs in `launch_backend`. A child started with `start_new_session=True` or `setsid` escapes: it keeps running and holds two of the server's pipe descriptors until it exits. The connector probe closes its scratchpads the same way, and shutdown waits up to 5 seconds for closes still running. A scratchpad runs as `python <tmp>/anton_scratchpad_<random>.py`, so `pgrep -f anton_scratchpad_` counts the live ones; it should drop to 0 once no turn is running.
 
 ### Streaming & scheduling
 
 Agent responses stream to clients via **Server-Sent Events** (SSE) on `POST /responses/`. The server tracks in-flight streams and supports cancellation (`/responses/cancel`) and late-join tailing (`/responses/tail`).
+
+A turn that fails ends with one `response.failed` frame carrying a stable `code` and the user-facing `error` (`cowork/handlers/turn_errors.py`), and the conversation's saved events keep the same payload, so a reload shows the same card. For `included_allowance_exhausted` and `free_serving_paused` the frame also carries `reset_at`, the instant the free way forward comes back. An in-process turn passes the gate's `X-MindsHub-Reset-At` header through as sent. A hosted turn takes it from the anton worker's `turn_failed` reply, which scratchpad-controller forwards beside `error`. The producer keeps it only for those two codes and only when it parses as an ISO-8601 instant with a UTC offset. An older worker sends none, and its frame has no `reset_at`.
 
 A background **scheduler** loop polls the database every 30 seconds for due schedules, supporting `once`, `hourly`, `daily`, and `weekly` cadences. Each run creates a conversation and is tracked in `schedule_runs`. Deleting that conversation does not delete the run: the run keeps its status, timings, and error as audit history, and only its link to the conversation is released. A channel binding pinned to the conversation is released the same way, so the external chat stays bound to its project and the next inbound message starts a fresh conversation.
 
 ## Data Layer
 
 Data lives in two places: a **SQLite database** for structured records and the **filesystem** for project files and agent workspaces. Understanding both is essential.
+
+> The `~/.cowork` paths below are the default (prod) home. The desktop app runs one of several build channels, each with its own isolated home (`~/.cowork-dev`, `~/.cowork-stable`, etc.) selected via `COWORK_HOME`. See the [Cowork frontend README → Build Channels](https://github.com/mindsdb/cowork#build-channels) for the full mapping.
 
 ### SQLite database
 
@@ -184,9 +372,9 @@ gateway 401 that looked like a dead account. `build_llm_client` now passes an
 reads the current in-memory value. Two limits are deliberate. Static
 organization-mode and user-supplied keys keep their construction-time value,
 because nothing rotates them. And the **scratchpad subprocess keeps the token it
-was started with** — `export_connection_info()` hands it a string once and it
-has no supplier, so a pad-side model call still runs on that value. Refreshing
-it needs a pad IPC contract, which ENG-2116 scoped out.
+was started with** for the rest of its turn: `export_connection_info()` hands it
+a string once and it has no supplier, so a pad-side model call still runs on
+that value. Refreshing it needs a pad IPC contract, which ENG-2116 scoped out.
 
 `build_llm_client` capability-gates the kwarg on `inspect.signature`, so an
 older Anton keeps the static key and logs the degradation rather than failing
@@ -212,16 +400,57 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/settings` | User preferences and API keys |
 | `/runtime-credential` | Desktop hand-over of the MindsHub credential (write-only, loopback, local mode) |
 | `/hub/workspaces` | Which MindsHub workspace this person is working in |
+| `/hub/usage` | The caller's free Air allowance (as a proportion), balance, auto top up and credit spend, for the desktop's usage warnings. An organization with no free grant reads `freeTokens.limit` 0 and `freeTokens.resetsAt` null, since nothing refills |
+
+### Declaring who may call a route
+
+Every route declares its permission at its own definition, and `create_app()`
+refuses to start if one does not (ENG-2094). Adding a route means picking the
+class that names the credential the route actually takes:
+
+| Declaration | The credential is |
+|-------------|-------------------|
+| `OpenByDesign` | nothing at all. Pinned route by route, with a written reason, in `tests/test_open_by_design_pin.py` |
+| `LoopbackOnly` | the caller being on this machine (`require_local`) |
+| `DesktopOnly` | not org mode (`require_local_tenancy` 403s the route there) |
+| `LoopbackDesktopOnly` | both of the above |
+| `PlatformSignature` | the calling platform's HMAC over the body (channel webhooks) |
+| `Authenticated` | a verified `Principal` |
+| `AuthenticatedInOrgMode` | a verified `Principal`, in org mode only; a no-op on desktop |
+| `AuthenticatedOrgAdmin` | ... plus org-admin standing |
+
+```python
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+
+@router.get("/thing", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+```
+
+Declare it on the `APIRouter` when every route on it takes the same
+credential, with one exception: never declare `OpenByDesign` on a router.
+FastAPI *adds* a route-level `dependencies=[...]` to its router's rather than
+replacing it, so a router carrying the open marker hands it to every route
+added later, and the walker cannot tell that apart from a deliberate choice.
+Every other class refuses, so inheriting one is safe.
+
+`COWORK_TENANCY_MODE=org python -m scripts.dump_routes` prints the current
+surface with each route's declaration.
 
 ### The MindsHub workspace selector
 
-`/api/v1/hub/workspaces` backs the workspace selector at the top of the desktop
-app's sidebar. A **MindsHub Workspace** is an org-internal container that owns hub
+`/api/v1/hub/workspaces` backs the workspace selector at the bottom of Cowork's
+sidebar, which Cowork draws only when the listing carries two or more
+workspaces: one workspace means nowhere to move to. A **MindsHub Workspace** is an org-internal container that owns hub
 resources (API keys, artifacts, model entitlements) and lives in the auth
 service. It has nothing to do with the filesystem directories this repo calls
 workspaces, which is why the stored key is `hub_workspace_id`.
 
-Five things about it are worth knowing before changing it.
+The selector used to be switched by auth's `authorization_ui` Statsig gate,
+read out of the entitlements payload: no local Statsig client, one gate
+governing the console and Cowork alike. It was retired once its surfaces had
+been live in production long enough to trust (ENG-2043), so the selector is
+unconditionally on now and this service no longer calls entitlements at all.
+
+Four things about it are worth knowing before changing it.
 
 **The sidecar makes the call, not the renderer.** Auth's ingress allows three
 console origins per environment and no Cowork host, and a per-PR Cowork host
@@ -244,32 +473,22 @@ scopes to the loopback origin. `hub_credential` reads both, and it is
 deliberately a different function from `caller_bearer` so a client cannot steer
 the credential on the org model-catalog fetch by setting a header.
 
-**The switch is auth's Statsig gate, not a local setting.** Auth declares
-`authorization_ui` in its `configs/statsig_gates.json`, evaluates it with its
-server SDK, and reports the verdict in the entitlements payload; this service
-reads it from there. One gate governs the console and Cowork rather than two that
-can disagree, and Cowork holds no Statsig client and no SDK key. Every answer
-short of a definite yes reads as off: no bearer, auth unreachable, a version of
-auth with no gates field, or the gate off. `COWORK_HUB_WORKSPACES_FORCE_ON` is an
-ON-only development override for walking the surface where no rule targets you;
-it cannot switch the surface off, so it cannot escape the kill switch.
-
-**Both caches are keyed on the credential, not just the caller.** Auth answers
-the listing and the gate per caller: an owner or admin sees every workspace in
-the organization, a member only the ones they hold a grant on, and
-`authorization_ui` declares `idType: userID`. So an organization-keyed cache
-served one admin's menu to every member for the whole TTL, and the grant check on
-`PUT /active` reads the same entry. The key is
+**The listing cache is keyed on the credential, not just the caller.** Auth
+answers the listing per caller: an owner or admin sees every workspace in the
+organization, a member only the ones they hold a grant on. So an
+organization-keyed cache served one admin's menu to every member for the whole
+TTL, and the grant check on `PUT /active` reads the same entry. The key is
 `(auth host, organization, user, credential digest)`. The digest is not
 belt-and-braces: `user_id` comes from the gateway-set principal and is `None` on
 every desktop request, because `scope_from_principal` returns `LOCAL_SCOPE`
 outside org mode, so identity alone collapses to one shared entry and a
 sign-out/sign-in as another account would be served the previous one's
 workspaces. A new session means a new token means a new entry. Entries are swept
-on write, since nothing re-reads a departed caller's key and the dicts would
+on write, since nothing re-reads a departed caller's key and the dict would
 otherwise grow for the process lifetime. The TTL follows whether **auth
-answered**, not what it said: a gate auth evaluated as off is a real answer and
-keeps the long TTL, which matters because off is the state this ships in.
+answered**, not what it said: a reachable listing keeps the long TTL, and an
+unreachable one the short failure budget, so a degraded auth does not add a
+round trip to every menu open without also going stale for a long stretch.
 
 **Two refusals on `PUT /active`, and neither may read the stored pick.** A
 workspace missing from the caller's listing is a 403; one in the listing but
@@ -325,30 +544,45 @@ runs. It applies only to Keycloak-shaped bearer JWTs. MindsDB API keys, opaque
 service credentials, requests without a bearer, CORS preflights, health checks,
 and channel webhooks keep their existing behavior.
 
-`COWORK_ORGANIZATION_BOUNDARY_MODE=audit` logs a missing, malformed, or changed
-expected organization and lets the request continue. In `enforce` mode, a
-missing header returns 426 and a malformed or changed value returns 409. Both
-responses carry `X-Cowork-Organization-Reload: required`, a JSON `code` and
-`detail`, and `Cache-Control: no-store`. The browser reloads instead of letting
-an old document continue under a new Keycloak organization. A request already
-inside a route keeps the `Principal` created at its start, so a concurrent
-session change cannot retarget that in-flight operation.
+The boundary always refuses. A missing header returns 426 and a malformed or
+changed value returns 409. Both responses carry
+`X-Cowork-Organization-Reload: required`, a JSON `code` and `detail`, and
+`Cache-Control: no-store`. The browser reloads instead of letting an old
+document continue under a new Keycloak organization. A request already inside a
+route keeps the `Principal` created at its start, so a concurrent session change
+cannot retarget that in-flight operation.
+
+There is no setting that relaxes this. The boundary once had an `audit` position
+that logged a violation and served the request anyway; it and the staged rollout
+it existed for are gone. An environment that still carries the retired
+`COWORK_ORGANIZATION_BOUNDARY_MODE` key boots normally and ignores it. Deleting
+the field is what makes it unreadable: `AppSettings` sets no `env_prefix` and
+gives every field an explicit `validation_alias`, so the environment source only
+looks up names a field still claims. `extra="ignore"` only decides what happens
+to an unknown key arriving in a `.env` file, which is not how the overlays
+deliver this one. Both halves are pinned, the settings half by
+`tests/test_app_settings.py::test_stale_organization_boundary_mode_env_var_is_inert`
+and the request half by
+`tests/test_principal.py::test_no_environment_variable_reopens_the_organization_boundary`.
 
 `GET /api/v1/capabilities/organization-switch` is authenticated and returns
-protocol version 1. It reports `expectedOrganizationEnforced: true` only when
-both identity and expected-organization enforcement are active. It reports
-`enabled: true` only when those boundaries are active and
+protocol version 1. It reports `expectedOrganizationEnforced: true` when org
+tenancy and identity enforcement are both active. Identity enforcement is in
+that answer because the picker should stay hidden while identity is only
+audited, not because it gates the boundary: `TrustedHeaderMiddleware` runs the
+boundary for every browser JWT request it builds a `Principal` for, under org
+tenancy alone. It reports `enabled: true` when those hold and
 `COWORK_ORGANIZATION_SWITCH_ENABLED=true`.
 
-Roll this out in four separate steps:
+`COWORK_ORGANIZATION_SWITCH_ENABLED` is the product enable for the picker, not a
+safety switch, and it is the lever to reach for to hide the picker without a
+code change. `COWORK_IDENTITY_ENFORCE=audit` hides it too, by dropping
+`expectedOrganizationEnforced`, but it reopens the no-principal path and leaves
+the boundary refusing anyway.
 
-1. Deploy the capability-aware Cowork client. The picker stays hidden.
-2. Deploy cowork-server with the organization boundary in `audit` and switching
-   disabled.
-3. Set the boundary to `enforce` on every replica while switching remains
-   disabled, then verify the capability still reports `enabled: false`.
-4. Enable switching separately and verify the capability reports all three
-   required values.
+Backing enforcement out needs the code and values from before cowork-server#524.
+[deployment/cowork-server/README.md](deployment/cowork-server/README.md#back-out-enforcement)
+records the procedure and why a Helm rollback cannot do it.
 
 Inside one organization, two different rules apply, and which one you get
 depends on the resource:
@@ -411,8 +645,25 @@ answer 403 instead, because to a client already looking at the draft a 404 would
 read as deleted. The artifacts list is unaffected either way: a co-member's
 artifact never appears in it, so review starts from the link the owner shares.
 
-Both of those decide from a resolved path and the route then opens that path, so
-the decision is carried to the open rather than trusted afterwards: every
+Org-mode artifact authorization uses a separate server-owned identity. An agent
+can edit `metadata.json`, so its local UUID cannot reserve a global comment key.
+The `artifact_identities` SQL table binds each `(organization, local UUID)` to
+its immutable owner and an auth-issued canonical key. Draft grants, publishing,
+and policy deletion use that key; the comments REST/SSE proxy translates the
+unchanged local UI key through the same table. Read requests never allocate.
+Existing identities are adopted only when auth confirms a matching durable
+owner and organization binding. New issuance uses a persisted random request ID
+so concurrent calls and lost replies cannot allocate different identities.
+
+This requires auth's internal `artifact-access/claim/` and `allocate/` endpoints
+and the matching services publisher ownership checks. Apply auth's ownership
+history migration before enabling new policy writes, then deploy these clients
+with the coordinated ENG-2262 changes. Authorization failures preserve files
+and stop sharing. SQL aliases survive artifact deletion and schema downgrades;
+they are ownership history, not a cache that can be cleared during rollback.
+
+Filesystem authorization decisions start with a resolved path. The route carries
+that decision through opening the file: every
 component below the project directory is opened `O_NOFOLLOW`, and a symlink
 planted anywhere in the chain is refused. A pod mounts its own workspace
 read-write, so without that a swapped directory component between the check and
@@ -446,7 +697,7 @@ Every minds-cloud role defaults to `mindshub_air`, for all three roles: planning
 coding and router. **MindsHub's catalog declares it**, in the
 `mindshub_model_policy_v1` config that already owns the alias registry, and the
 declaration arrives as a `default_for` list on each `/v1/models` row. So moving a
-default is a config edit plus an apply, not a release. MindsHub Air's usage draws the monthly included allowance, so a user who has
+default is a config edit plus an apply, not a release. MindsHub Air's usage draws the included allowance, so a user who has
 picked no model can finish a whole turn without the wallet being charged for any
 part of it.
 
@@ -478,6 +729,12 @@ Two cases share that path and should not be confused. A pin the map flags
 `false` is a real MindsHub model that is merely unaffordable right now. A pin
 **absent** from a non-empty map is foreign or retired, so it would 404 on every
 turn rather than 402, and it is healed the same way with no route back.
+
+`enabled: false` has one more cause: an admin in the organization restricted the model. `/v1/models` names the lock on each disabled row in `disabled_reason` (`model_restricted`, `wallet_empty` or `included_allowance_exhausted`), and `GET /settings/recommended-models` relays it as `modelDisabledReasons`, so the picker shows a restricted model as restricted and offers no credits for it. The map comes from the MindsHub listing only. A custom openai-compatible endpoint's `disabled_reason` is dropped, because a BYO endpoint must not be able to claim an admin restricted a model. Resolution treats a restricted pin like any other `false` one and swaps it, for the members the rule restricts and no one else. A turn that still reaches the gateway on a restricted model fails with the `model_restricted` code: the gateway keeps the 403's `permission_denied` reason and names the rule on its `X-MindsHub-Deny-Detail` header and in the body's `error.deny_detail`, trusted by the same origin rules as the reason.
+
+A restriction belongs to one member, so it is stored per member. Auth applies the model rules for each caller's org, workspace and team, so two members of one org get different listings, and `fetch_org_model_catalog` caches one listing per org and member. `minds_model_enabled` is an org row that every member's resolution reads. So in org mode `recommended_models` leaves the caller's `model_restricted` models out of it: each keeps the flag the org map already held for it, or `true` when it held none. The caller's restricted ids go to their own `minds_model_restricted` row instead, an untagged setting that `SettingService` files at the caller's user scope, and `UserSettings._minds_enabled_map` reads them as `false` over the org map. One member's restriction therefore never swaps another member off a model, and another member's load never lifts it. A member's restrictions reach resolution when that member's own settings load writes them. A listing that publishes no `enabled` flags leaves the stored list alone, the same evidence rule the org map follows. A desktop install has one member, so it keeps restrictions in `minds_model_enabled`.
+
+The listing cache (`_minds_models_cache` in `cowork/services/providers.py`) drops expired entries on every write and holds at most `_MINDS_MODELS_CACHE_MAX` listings, evicting the least recently used, so keeping one entry per member does not grow it for the life of the pod. An entry with no organization in its key, which includes every desktop fetch, is keyed by the credential it was fetched with, held as a pydantic `SecretStr` so it prints as asterisks in any repr or log, so an account switch in the running app is never served the previous account's restricted or locked rows. Nothing is hashed from it.
 
 The desktop closes the loop at the other end: a model the map locks is not
 offered in either picker, so a swap only ever applies to a pin that was
@@ -517,7 +774,7 @@ when the gateway published defaults, the cached one when it did not.
 Why a probe sends a model at all: MindsHub bills per model, so a model the wallet
 cannot pay for is denied, and that denial is indistinguishable from a bad key.
 Probing a paid model tells an account with an empty wallet that its working key is
-invalid. `MINDS_PROBE_MODEL` (`mindshub_air`) draws the monthly included allowance
+invalid. `MINDS_PROBE_MODEL` (`mindshub_air`) draws the included allowance
 instead of the wallet, so the result reports reachability and key validity, which
 is what these endpoints are for.
 
@@ -541,6 +798,26 @@ listing probe, so a MindsHub host configured through that card is health-checked
 against a route MindsHub does not deploy everywhere; those routes answer 404 or 401
 even for a valid key, which is the reason the `minds-cloud` type does not use one.
 
+An `apiKey` of `""` or `"***"` on that route means "use the stored one", which is
+how the Settings UI re-tests a provider it only ever received masked. A stored key
+only goes to a host this deployment saved: the provider cards in `providers_json`,
+the scalar `openai_base_url`/`minds_url`, and the vendor host an omitted `mindsUrl`
+already reaches. The comparison is on origin (`scheme://host[:port]`), not the whole
+URL, because the question is which party receives the key; that also means a stored
+URL carrying a path still matches a body sending the host alone. A URL the guard
+cannot parse names no origin, so it is refused rather than raising. Omitting the URL
+stays legal: a `minds-cloud` probe then goes to the vendor host, and an
+`openai-compatible` one answers `missing base URL`, which is what it did before this
+guard. A key the caller supplied may go anywhere, since nothing stored is at risk.
+
+A refused provider comes back `fail` with its reason and is never pinged, rather
+than failing the whole request. Callers send every configured provider in one call,
+so refusing the request would blank the other providers' dots over one bad URL.
+
+Each card in the body is a `ProviderProbeCard` (`cowork/schemas/settings.py`), which declares the four fields the ping reads, `type`, `apiKey`, `baseUrl` and `mindsUrl`, as strings. A card whose `type` or URL is not a string fails the whole request with a 422 before any key is resolved. The Settings UI does not hit this: it sends the cards it saved itself, with `type` normalized to a string by `backfillProviders` in cowork's `settingsTransform.js`. Every other field the UI holds on a card, such as `isDefault` or `name`, is ignored, so a renderer that adds one keeps getting its status dots.
+
+When the MindsHub gateway refuses a `minds-cloud` probe with a named reason, the response carries it in `providerStatusReasons`, keyed by provider type: `{"minds-cloud": {"code": "free_air_daily_spend_fuse_exceeded", "resetAt": "<ISO instant or null>"}}`. The code is the gateway's own `X-MindsHub-Reason` word, one of `wallet_empty`, `included_allowance_exhausted`, `free_air_daily_spend_fuse_exceeded`, `rate_limited` and `policy_unavailable`, so the Settings notice can tell a velocity limit or the free-Air fuse from an empty wallet instead of matching on `HTTP 429` in the detail string. When a proxy strips that header, the probe reads the same word from the body `code`, which the gateway sets to match. `resetAt` carries the gate's `X-MindsHub-Reset-At`, which it sends on the allowance and fuse denials. The body `code` counts only when the probe's response came from the configured `minds_url` host. The header counts unless the response provably came from another host. These are the origin rules the turn-failure mapping applies (`gateway_denial` in `cowork/handlers/turn_errors.py`), so a probe aimed at any other host names no reason. A refused provider was never pinged, so it has no entry. `providerStatus` and `providerStatusDetails` keep their shape.
+
 Every MindsHub-bound chat probe caps the completion at `max_tokens: 20`, not 1:
 some models refuse a 1-token budget and fail the probe for a perfectly good key
 (see `_chat_probe`). The cap is not sent to a non-MindsHub endpoint, because
@@ -555,11 +832,58 @@ key, so main's `validateMinds` has no live caller today, and it is the
 openai-compatible and anthropic validators there that a packaged build actually
 runs.
 
+### Organization permission enforcement
+
+Hosted turn admission checks `product.execute` through auth's internal
+`POST /internal/permissions/authorize/` endpoint. This applies to free and paid
+models, stored provider credentials, direct responses, remote queue submission
+and scheduled runs. Schedules resolve the acting identity from the stored owner
+and check it before creating a conversation. Queue submission rechecks current
+access even when reusing a previously minted credential.
+
+The request contains the server-resolved user and organization IDs and one
+permission. It uses the existing `COWORK_TURN_AUTH_INTERNAL_BASE_URL` and
+`COWORK_TURN_AUTH_INTERNAL_SECRET`; customer headers cannot choose that host or
+credential. A confirmed denial returns `403` with `permission_denied`. Missing
+configuration, malformed replies, transport errors and service authentication
+failures return `503` with `permission_unavailable`. Authorization failures never
+fall through to another model or delegated execution. Local desktop mode retains
+its single-user behavior.
+
+Artifact source edits, publishing/access changes, deletion, revision restoration
+and repair management require `artifact.manage` as well as existing artifact
+ownership. Starting an agent repair also requires `product.execute`. Capability
+responses reflect these current grants. Generic project-file writes and deletes
+apply the artifact grant to artifact storage paths too. Writes atomically replace
+the selected directory entry, preserving the existing file mode where descriptor
+chmod is available. This detaches a pre-existing hardlink so editing an ordinary
+file cannot modify protected artifact bytes through the same inode. Failed writes
+leave the original file intact and remove the temporary file.
+
+Remote turns use the `anton_turn_v2` controller operation and declare their
+workspace authority. The controller checks `artifact.manage` again when it
+dequeues the turn. Without that grant, it mounts saved conversation files read
+only and runs the agent in a temporary copy. All workspace edits in that turn
+are temporary, including ordinary files; nothing is copied back or published.
+The controller replaces warm workers when their storage authority is unsuitable.
+Cowork requires the controller's verified workspace acknowledgement before
+accepting worker output, and indexes artifacts only for persistent workspaces.
+Deploy the companion scratchpad-controller change before enabling this producer;
+older controllers fail these turns with `permission_unavailable`.
+
+Publishing uses a separate `artifact_publish` mint purpose. It requires artifact
+management without granting model execution. Execution mints retain their own
+purpose and credential type; the publisher uses a fresh instance ID and never
+hands its credential to an inference client. Deploy auth's decision/purpose APIs
+and the publisher's artifact-only authentication path before this server change.
+Keep these admission checks in place during rollback while restrictive custom
+roles remain assigned. No new customer or staff permission grants are introduced.
+
 ## Configuration
 
 Configuration is read from the database (`UserSettings` table) and can be managed through the Settings UI in the desktop app or via `PUT /api/v1/settings/`.
 
-Environment variables fall into two namespaces:
+Environment variables fall into three groups:
 
 **Server-level** (`COWORK_*`) — control the cowork-server process itself:
 
@@ -569,24 +893,28 @@ Environment variables fall into two namespaces:
 | `COWORK_SERVER_HOST` | `127.0.0.1` | Bind address |
 | `COWORK_TENANCY_MODE` | `local` | `local` is the desktop sidecar: one user, no organization, no identity headers. `org` is the cloud deployment and turns on everything in "Who can read what in org mode" above. |
 | `COWORK_IDENTITY_ENFORCE` | `enforce` | Org mode only. `enforce` answers 401 to a request carrying no valid identity headers. `audit` logs it and lets it through, which is the rollout mode the org cutover used; it now has to be asked for. |
-| `COWORK_ORGANIZATION_BOUNDARY_MODE` | `enforce` | Canonical web only. `enforce` requires a browser JWT request to name the trusted organization it expects. `audit` logs violations and accepts them for a staged rollout. Long-lived Helm environments explicitly start in `audit`. |
-| `COWORK_ORGANIZATION_SWITCH_ENABLED` | `false` | Enables the version 1 organization-switch capability only while identity and expected-organization enforcement are both active. |
+| `COWORK_ORGANIZATION_SWITCH_ENABLED` | `false` | Shows the canonical-web organization picker. Requires org tenancy and identity enforcement. The product enable, not a safety switch: the expected-organization boundary refuses a mismatched tab whatever this says. Long-lived Helm environments set `true`. |
 | `COWORK_SHARED_DIR` | `~/.cowork` | **Org mode only.** Root of the org-keyed tree: `<shared>/<org_id>/{skills,memory,projects,files}`. In cloud, point it at the durable mount — on the default the data is ephemeral (boot warning). |
 | `COWORK_PROJECTS_DIR` | `~/.cowork/projects` | Project storage root (local mode only) |
 | `COWORK_FILES_DIR` | `~/.cowork/files` | Uploaded files root (local mode only) |
 | `COWORK_SKILLS_DIR` | `~/.cowork/skills` | Skills store root (local mode only) |
 | `COWORK_MEMORY_DIR` | `~/.cowork/memory` | Memory store root (local mode only) |
 | `COWORK_VAULT_DIR` | `~/.cowork/data-vault` | Connector credential vault |
-| `COWORK_HUB_WORKSPACES_FORCE_ON` | `false` | Development override that turns the MindsHub workspace surfaces on where no Statsig rule targets you. ON only, so it can never switch them off and never escape the kill switch. The switch itself is auth's `authorization_ui` gate; see "The MindsHub workspace selector" above. Never set in a deployed environment. |
+| `COWORK_OPENAI_COMPATIBLE_API` | `chat_completions` | The API an `openai_compatible` provider's planning and coding roles call. `responses` moves them to `{base}/responses` through anton's openai flavor, where OpenAI and Azure accept function tools together with a reasoning effort. It needs an anton that reports `RESPONSES_TRANSPORT_READY`; with an older anton both roles stay on chat completions, and Cowork logs one warning that says so. On the Responses path the agent loop runs without web tools, because OpenAI's hosted `web_search` reads the web from the provider's side, outside the deployment's egress controls. A Python cell's `web_search()` is separate and unchanged. The router and Gemini stay on chat completions. Read once at start. |
 
-**Harness-level** (`ANTON_*`, `HERMES_*`) — configure a specific agent harness. These are read by the harness adapter, not by cowork-server core. They use the harness prefix because the upstream agent libraries (anton, hermes-agent) define them:
+**Harness-level** (`ANTON_*`) — configure a specific agent harness. These are read by the harness adapter, not by cowork-server core. They use the harness prefix because the upstream agent library (anton) defines them:
 
 | Variable | Harness | Description |
 |----------|---------|-------------|
-| `ANTON_PUBLISH_URL` | Anton | Artifact publish endpoint |
+| `ANTON_PUBLISH_URL` | Anton | Artifact publish endpoint. Pointed anywhere but MindsHub's service, it takes HTML and Markdown only: sharing a full-stack app is refused before anything is uploaded, because that upload carries the app's connection credentials |
 | `ANTON_SKILLS_ROOT_DIR` | Anton | Skill file storage |
 | `ANTON_GLOBAL_MEMORY_ROOT_DIR` | Anton | Global memory files |
-| `HERMES_HOME` / `HERMES_ROOT_DIR` | Hermes | Hermes data root |
+
+**By field name** (local tenancy only): every `UserSettings` field also reads the environment variable named after it, and a stored row wins over the variable. The router's reasoning effort is set this way, beside `PLANNING_REASONING_EFFORT` and `CODING_REASONING_EFFORT`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ROUTER_REASONING_EFFORT` | unset | The router model's reasoning effort. The router's provider serves anton's history summaries and the route gate, so the effort reaches both. On `openai_compatible` the gate runs `ROUTER_MODEL`. On other providers the gate runs the provider's default router model, so the effort is sent only while `ROUTER_MODEL` is that default. Unset or empty sends no effort, which a model that doesn't reason needs, because it refuses any effort. On `openai_compatible`, a router model that reasons by default, such as `gpt-5.6-luna`, needs `none` to take the gate's function tool on chat completions. The composer's per-task effort never applies to the router. |
 
 In Docker/Lightsail deployments, the container also receives `ANTON_MINDS_API_KEY`, `ANTON_OPENAI_API_KEY`, etc. — these are consumed by the Anton agent library directly (not by cowork-server settings), and are injected by the provisioning lambda via cloud-init user-data.
 

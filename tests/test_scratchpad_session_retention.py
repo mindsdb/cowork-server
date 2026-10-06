@@ -221,7 +221,9 @@ def test_delete_turn_invalidates_the_snapshot(session):
     folder = _seed_snapshot(session, conv.id)
     assert folder.is_dir(), "precondition"
 
-    svc.delete_turn(conv.id, 0)
+    # delete_turn is anchored by message id, not a position.
+    assistant_msg = next(m for m in svc.get_ordered_messages(conv.id) if m.role.value == "assistant")
+    svc.delete_turn(conv.id, assistant_msg.id)
 
     assert not folder.exists(), "snapshot must not outlive the turns that produced it"
 

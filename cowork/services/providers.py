@@ -7,16 +7,22 @@ import json
 import logging
 import re
 import time
-from typing import TYPE_CHECKING, Any, NamedTuple, Optional
+from collections import OrderedDict
+from collections.abc import Collection
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, TypedDict
 from urllib.parse import urlparse
 
 import httpx
+from pydantic import SecretStr
 
 from cowork.common.settings import runtime_credential
 from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
+from cowork.handlers.turn_errors import GatewayDenial, gateway_denial
+from cowork.services.hub_workspaces import sweep_cache
 
 if TYPE_CHECKING:
-    from cowork.common.settings.user_settings import UserSettings
+    from cowork.common.settings.app_settings import OpenAICompatibleAPI
+    from cowork.common.settings.user_settings import Provider, UserSettings
 
 logger = logging.getLogger(__name__)
 
@@ -24,11 +30,20 @@ logger = logging.getLogger(__name__)
 # validation). MUST be universally callable: MindsHub bills per model (a model
 # the org's wallet can't pay for is denied), so probing a paid model would fail
 # for an out-of-credits account even though the key is valid. mindshub_air is
-# the free included model (drawn from the monthly allowance), so it resolves
+# the free included model (drawn from the included allowance), so it resolves
 # without depending on wallet balance — the probe then reflects reachability +
 # key validity only, not billing availability. Probing a paid model here caused
 # ENG-576 ("MindsHub failed its last test" / "Invalid API key" false-negatives).
 MINDS_PROBE_MODEL = "mindshub_air"
+
+# Marks a request as our own background call on the user's key, not activity
+# they asked for, so the customer's Traces list hides it by default: the
+# connectivity/health-check pings below and the Jev shadow probe
+# (cowork/handlers/jev_shadow.py). Read by mindshub_inference; it is
+# our own header and means nothing to a non-Minds endpoint, so it is only ever
+# sent to a Minds host.
+MINDS_REQUEST_KIND_HEADER = "X-Minds-Request-Kind"
+MINDS_REQUEST_KIND_PROBE = "probe"
 
 
 def minds_chat_base_url(minds_url: str) -> str:
@@ -108,6 +123,27 @@ def publish_url_for_endpoint(endpoint_url: str | None) -> str:
     if host.startswith("api.") and host.endswith(".mindshub.ai") and host != "api.mindshub.ai":
         return f"https://{host}"
     return PUBLISH_FAILSAFE_URL
+
+
+def is_mindshub_publish_url(publish_url: str | None) -> bool:
+    """True when `publish_url` is MindsHub's own publishing service.
+
+    Only MindsHub's service can run a full-stack artifact. A service an operator
+    points `ANTON_PUBLISH_URL` or the `publish_url` setting at, such as one a
+    customer built from the publishing specification, stores static bundles
+    only. Matches the hosts `publish_url_for_endpoint` can return: the MindsHub
+    api hosts (via `is_minds_host`) and the legacy `4nton.ai` host.
+    """
+    if is_minds_host(publish_url):
+        return True
+    try:
+        host = (urlparse(publish_url or "").hostname or "").lower()
+    except ValueError:
+        # `.hostname` raises on an unbalanced bracket; see `is_minds_host`.
+        return False
+    return host == urlparse(PUBLISH_FAILSAFE_URL).hostname
+
+
 # Gemini speaks OpenAI-compatible at Google's endpoint — NOT api.openai.com.
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
@@ -193,6 +229,15 @@ def provider_base_url(
 # that isn't deployed yet doesn't add a round-trip to every load.
 _MINDS_MODELS_TTL = 300.0       # successful fetch
 _MINDS_MODELS_FAIL_TTL = 30.0   # negative result (down / not deployed)
+# Expired entries are dropped on every write, and past this many the least
+# recently used goes too. Org mode holds one listing per org member, so without
+# a bound the cache grows with every member a pod has ever served. Meant to sit
+# well above the members one pod serves within one TTL, since only their entries
+# are still fresh, so eviction normally takes an entry nobody is about to read.
+_MINDS_MODELS_CACHE_MAX = 512
+# Derived from the TTLs rather than restated, so raising one cannot start
+# dropping entries that are still fresh.
+_MINDS_MODELS_MAX_TTL_S = max(_MINDS_MODELS_TTL, _MINDS_MODELS_FAIL_TTL)
 # Hard TOTAL budget for one /v1/models fetch. httpx.Timeout is per-operation, so
 # `follow_redirects` chains and trickled responses (each chunk under the per-op
 # read timeout) can otherwise run far past it — minutes, unbounded. This fetch
@@ -242,6 +287,14 @@ class MindsModelListing(NamedTuple):
     # hazard ``_empty_listing`` is a factory to avoid; a default would reintroduce
     # it for the sake of not touching three test fakes.
     role_defaults: dict[str, str]
+    # Why a model the ``enabled`` map marks false is unavailable, in the
+    # gateway's own reason words: "model_restricted" (an admin in the org
+    # restricted it), "wallet_empty" or "included_allowance_exhausted". Keyed
+    # only by ids that ``enabled`` marks false, so the two maps cannot
+    # disagree. Empty whenever the gateway publishes no reasons, which includes
+    # every MindsHub that predates the field and every plain OpenAI-compatible
+    # endpoint. Required for the same reason as ``role_defaults``.
+    disabled_reasons: dict[str, str]
 
 
 def _empty_listing() -> MindsModelListing:
@@ -253,12 +306,64 @@ def _empty_listing() -> MindsModelListing:
     objects means one in-place write downstream would corrupt the cached failure
     of every gateway at once. Nothing mutates them today.
     """
-    return MindsModelListing(None, {}, {}, {}, {}, {}, {})
+    return MindsModelListing(None, {}, {}, {}, {}, {}, {}, {})
 
 
-# Keyed by (base_url, tenant): tenant is the org id for an org-scoped catalog
-# (the `enabled` map is wallet-specific) and None for a single-user/BYOK fetch.
-_minds_models_cache: dict[tuple[str, str | None], tuple[float, MindsModelListing]] = {}
+# The listing's ``disabled_reason`` for a model an admin's model rule restricts
+# for the caller. Unlike the billing reasons, it is true for the caller alone
+# (see ``persist_org_model_availability``).
+_MODEL_RESTRICTED_REASON = "model_restricted"
+
+
+class _ListingCacheKey(NamedTuple):
+    """Whose ``/v1/models`` answer one ``_minds_models_cache`` entry holds."""
+
+    base_url: str
+    # The org id for an org-scoped catalog (the `enabled` map is
+    # wallet-specific), None for a single-user/BYOK fetch.
+    tenant_key: str | None
+    # The caller's user id when the gateway answers per caller, None when the
+    # answer depends on the credential alone. The org catalog is per caller:
+    # auth resolves each row's `enabled` and `disabled_reason` from the model
+    # rules for the caller's org, workspace and team, so two members of one org
+    # can get different rows. The user id rather than the bearer, because the
+    # bearer rotates and every rotation would add an entry.
+    user_id: str | None
+    # The credential the listing was fetched with, when no tenant scopes the
+    # entry, else None. A desktop install has no tenant and no user id, so
+    # without it an account switch in the running process is served the
+    # previous account's rows (its Restricted and Needs-credits locks) for the
+    # TTL, and recommended_models persists them. Held as a SecretStr, which
+    # compares and hashes by value but prints as asterisks, so a repr or log of
+    # the key never shows it. Nothing is derived from it: the key is the same
+    # value the settings object already holds in memory.
+    credential: SecretStr | None
+
+
+def _listing_cache_key(
+    *, base_url: str, api_key: str, tenant_key: str | None, user_id: str | None
+) -> _ListingCacheKey:
+    """The entry a fetch writes and a cached read looks up, built in one place."""
+    credential = SecretStr(api_key) if tenant_key is None else None
+    return _ListingCacheKey(base_url, tenant_key, user_id, credential)
+
+
+# Least recently used first, so the cap in `_store_listing` evicts from the front.
+_minds_models_cache: OrderedDict[_ListingCacheKey, tuple[float, MindsModelListing]] = OrderedDict()
+
+
+def _store_listing(key: _ListingCacheKey, listing: MindsModelListing) -> None:
+    """Cache ``listing`` under ``key``: expired entries go first, then any past the cap.
+
+    Swept on write, the one place the cache grows, with the hub workspace
+    caches' ``sweep_cache``. A departed caller's entry is never read or
+    overwritten again, so nothing else would drop it.
+    """
+    sweep_cache(_minds_models_cache, max_ttl_s=_MINDS_MODELS_MAX_TTL_S)
+    _minds_models_cache[key] = (time.monotonic(), listing)
+    _minds_models_cache.move_to_end(key)
+    while len(_minds_models_cache) > _MINDS_MODELS_CACHE_MAX:
+        _minds_models_cache.popitem(last=False)
 
 
 # Substrings that identify an embeddings model by id, used only for endpoints
@@ -284,25 +389,50 @@ def _is_embedding_row(row: dict, model_id: str) -> bool:
     return any(hint in lowered for hint in _EMBEDDING_ID_HINTS)
 
 
-def cached_minds_models(minds_url: str, tenant_key: str | None = None) -> MindsModelListing | None:
-    """The last successful ``/v1/models`` listing for this gateway, however old.
+def cached_minds_models(
+    minds_url: str,
+    tenant_key: str | None = None,
+    *,
+    user_id: str | None = None,
+    api_key: str = "",
+) -> MindsModelListing | None:
+    """The last successful ``/v1/models`` listing for this gateway, even past its TTL.
 
     A synchronous read for callers that cannot await the fetch (the coding
     endpoints run in a threadpool) and need only what the gateway advertises per
     model, which changes on the gateway's release cadence rather than the cache
     TTL's. None until something has fetched the listing since the process
-    started, and None for a negatively cached failure.
+    started, and None for a negatively cached failure. An expired entry is read
+    until the next write drops it (``_store_listing``). ``tenant_key``,
+    ``user_id`` and ``api_key`` pick the entry the same way they do in
+    ``fetch_minds_models``: with no ``tenant_key``, the entry is the one fetched
+    with this ``api_key``.
+
+    Not a use for the least-recently-used order: this runs in a threadpool, and
+    reordering the cache from there would race the event loop's writes.
     """
     if not minds_url:
         return None
-    cached = _minds_models_cache.get((minds_chat_base_url(minds_url), tenant_key))
+    cached = _minds_models_cache.get(
+        _listing_cache_key(
+            base_url=minds_chat_base_url(minds_url),
+            api_key=api_key,
+            tenant_key=tenant_key,
+            user_id=user_id,
+        )
+    )
     if not cached or not cached[1].ids:
         return None
     return cached[1]
 
 
 async def fetch_minds_models(
-    minds_url: str, api_key: str, *, force_refresh: bool = False, tenant_key: str | None = None
+    minds_url: str,
+    api_key: str,
+    *,
+    force_refresh: bool = False,
+    tenant_key: str | None = None,
+    user_id: str | None = None,
 ) -> MindsModelListing:
     """Fetch supported models from MindsHub's OpenAI-compatible `/v1/models`.
 
@@ -316,11 +446,14 @@ async def fetch_minds_models(
     to. MindsHub marks a model the org's wallet can't currently pay for / whose
     free allowance is spent as ``"enabled": false`` so the picker can show it as
     locked with an "add credits" affordance; a model missing from ``enabled`` is
-    treated as available. ``labels`` is purely a display aid for the picker — the
+    treated as available. It also marks a model an admin in the org restricted
+    as ``"enabled": false``, and ``disabled_reasons`` carries the row's
+    ``disabled_reason`` so the picker can tell that lock from a billing one.
+    ``labels`` is purely a display aid for the picker — the
     model id remains the value used everywhere else (selection, storage,
     resolution); a model missing from ``labels`` falls back to the client's
-    id-derived label. Embeddings models are dropped entirely — they share this
-    listing but aren't chat/completion models (see ``_is_embedding_row``).
+    id-derived label. Embedding and decision models are dropped entirely — they
+    share this listing but cannot serve planning/coding roles.
 
     ``force_refresh`` skips the cache *read* for a cached success (a fresh
     result is still cached for subsequent calls) — used when the caller knows
@@ -332,6 +465,11 @@ async def fetch_minds_models(
     the picker opens on demand, so bypassing it would make every open pay the
     fetch budget for as long as the outage lasts.
 
+    ``tenant_key`` and ``user_id`` scope the cache entry (see
+    ``_ListingCacheKey``): pass the org id for an org-scoped catalog, and the
+    caller's user id too when the gateway answers per caller. With no
+    ``tenant_key`` the entry is scoped by ``api_key`` itself, held as a ``SecretStr``.
+
     Never raises and never runs longer than ``_MINDS_MODELS_TIMEOUT_S`` — a
     slow/degraded gateway (hang, redirect loop, trickled body) returns an empty
     listing that is negatively cached, so callers on the boot path can't hang.
@@ -339,7 +477,9 @@ async def fetch_minds_models(
     if not minds_url or not api_key:
         return _empty_listing()
     base = minds_chat_base_url(minds_url)
-    cache_key = (base, tenant_key)
+    cache_key = _listing_cache_key(
+        base_url=base, api_key=api_key, tenant_key=tenant_key, user_id=user_id
+    )
 
     now = time.monotonic()
     cached = _minds_models_cache.get(cache_key)
@@ -349,10 +489,11 @@ async def fetch_minds_models(
         # force_refresh only overrides the success TTL — see the negative-cache
         # note above.
         if (now - ts) < ttl and not (force_refresh and val.ids):
+            _minds_models_cache.move_to_end(cache_key)
             return val
 
     def _remember(val: MindsModelListing) -> MindsModelListing:
-        _minds_models_cache[cache_key] = (time.monotonic(), val)
+        _store_listing(cache_key, val)
         return val
 
     async def _fetch() -> httpx.Response:
@@ -405,6 +546,7 @@ async def fetch_minds_models(
     providers: dict[str, str] = {}
     families: dict[str, str] = {}
     role_defaults: dict[str, str] = {}
+    disabled_reasons: dict[str, str] = {}
 
     def _text(row: dict, key: str) -> Optional[str]:
         """A non-empty string field, or None. Anything else is treated as absent.
@@ -425,18 +567,24 @@ async def fetch_minds_models(
         model_id = str(row.get("id")).strip()
         if not model_id:
             continue
-        # Embedding models share this listing but aren't chat/completion
+        # Embedding and decision models share this listing but aren't chat/completion
         # models — chosen for planning/coding roles they'd error every turn.
         # Filtered here, the single place every row is parsed, so neither the
         # picker nor default-resolution ever sees them.
-        if _is_embedding_row(row, model_id):
+        if row.get("kind") == "decision" or _is_embedding_row(row, model_id):
             continue
         ids.append(model_id)
         # A model the org's wallet can't currently pay for (or whose free
-        # allowance is spent) is listed with enabled=false so the picker can
-        # show it as locked with an "add credits" affordance. Missing → available.
+        # allowance is spent, or that an admin restricted) is listed with
+        # enabled=false so the picker can show it as locked. Missing → available.
         if "enabled" in row:
             enabled[model_id] = bool(row.get("enabled"))
+        # Why it is locked, when the gateway says: an admin rule is not
+        # something credits can lift, so the picker must not offer them for it.
+        # Read only for a row the map marks false, so no reason outlives the
+        # lock it explains.
+        if enabled.get(model_id) is False and (reason := _text(row, "disabled_reason")):
+            disabled_reasons[model_id] = reason
         levels = row.get("reasoning_efforts")
         if isinstance(levels, list) and levels:
             entry: dict = {"efforts": [str(x) for x in levels]}
@@ -478,28 +626,36 @@ async def fetch_minds_models(
                 role_defaults.setdefault(role, model_id)
     return _remember(
         MindsModelListing(
-            (ids or None), efforts, enabled, labels, providers, families, role_defaults
+            (ids or None), efforts, enabled, labels, providers, families, role_defaults,
+            disabled_reasons,
         )
     )
 
 
 async def fetch_org_model_catalog(
-    *, org_id: str, bearer_token: str, refresh: bool = False
+    *, org_id: str, user_id: str, bearer_token: str, refresh: bool = False
 ) -> MindsModelListing:
-    """MindsHub catalog for an org, cached per org.
+    """MindsHub catalog for an org member, cached per org and caller.
 
     Uses the OPERATOR endpoint (env/namespace-derived), never a tenant-settable
     URL, and the caller's own bearer — so a member's JWT can't be forwarded to an
     admin-chosen host. `org_id` is required; the `enabled` map is wallet-specific.
+    `user_id` is required too: auth resolves each row's `enabled` and
+    `disabled_reason` for the caller, so an entry keyed by the org alone would
+    serve one member's listing to every member of the org for the TTL.
     """
     if not org_id:
         raise ValueError("org catalog requires an organization id")
+    if not user_id:
+        raise ValueError("org catalog requires the caller's user id")
     from cowork.common.settings.app_settings import (
         TurnQueueSettings,
         default_turn_minds_api_host,
     )
     url = TurnQueueSettings().minds_base_url or f"{default_turn_minds_api_host()}/v1"
-    return await fetch_minds_models(url, bearer_token, force_refresh=refresh, tenant_key=org_id)
+    return await fetch_minds_models(
+        url, bearer_token, force_refresh=refresh, tenant_key=org_id, user_id=user_id
+    )
 
 
 # ── Model-value validation on write (ENG-1358) ───────────────────────
@@ -548,8 +704,9 @@ async def fetch_org_model_catalog(
 #     3. POST /api/v1/settings/raw    → SettingService.bulk_upsert
 #     4. cowork/migrations.py (first-boot .env→DB seed)
 #     5. cowork/main/minds-auth.ts (login / token refresh) — excludes models
-#   Two more write settings but only their own fixed key: channels.py
-#   (`channels_harness`) and the `minds_model_enabled` refresh in settings.py.
+#   Two more write settings but only their own fixed keys: channels.py
+#   (`channels_harness`) and the `minds_model_enabled` / `minds_model_restricted`
+#   refresh in settings.py.
 #
 #   OUT OF REACH of this gate: the standalone `anton` CLI reads models from
 #   ~/.anton/.env directly and never touches this DB (ENG-1140 covers its
@@ -578,6 +735,7 @@ async def model_value_rejection(
     value: str,
     *,
     org_id: str | None = None,
+    user_id: str | None = None,
     bearer_token: str = "",
 ) -> str | None:
     """Why ``value`` is not a servable model for ``key``, or None to allow it.
@@ -592,9 +750,9 @@ async def model_value_rejection(
 
     In org (hosted) tenancy no MindsHub key is stored at all (a per-turn key is
     minted, ``user_settings._has_key``), so the catalog comes from the operator
-    endpoint keyed by ``org_id`` + the caller's own bearer, exactly as
-    ``recommended_models`` does. Without those the org path has no evidence and
-    allows the write.
+    endpoint keyed by ``org_id`` + ``user_id`` + the caller's own bearer,
+    exactly as ``recommended_models`` does. Without those the org path has no
+    evidence and allows the write.
 
     **Soft-fail is the whole contract.** This returns None — allow the write —
     for every case except "we hold a real catalog and this id is definitively
@@ -639,9 +797,9 @@ async def model_value_rejection(
         return None
 
     try:
-        if org_id and bearer_token:
+        if org_id and user_id and bearer_token:
             listing = await fetch_org_model_catalog(
-                org_id=org_id, bearer_token=bearer_token
+                org_id=org_id, user_id=user_id, bearer_token=bearer_token
             )
         elif api_key and settings.minds_url:
             listing = await fetch_minds_models(settings.minds_url, api_key)
@@ -673,7 +831,13 @@ async def model_value_rejection(
 
 
 def persist_enabled_model_map(
-    session, scope, prior_json: str | None, live_enabled: dict, live_ids: list[str] | None = None
+    session,
+    scope,
+    prior_json: str | None,
+    live_enabled: dict,
+    live_ids: list[str] | None = None,
+    *,
+    member_restricted: Collection[str] = (),
 ) -> bool:
     """Guarded write of the `minds_model_enabled` availability map.
 
@@ -717,6 +881,10 @@ def persist_enabled_model_map(
       gateway re-ranking also refreshes): ``upsert_setting`` commits a row and
       invalidates the settings cache, so an unconditional write churns every
       ``UserSettings`` reader.
+    - Never record ``member_restricted`` as a lock. Those are the ids the
+      caller's own model rules restrict (``persist_org_model_availability``),
+      and the org-mode map is read by every member, so each keeps the flag the
+      map already held for it, or ``True`` when it held none.
 
     Returns True iff the stored map was updated.
     """
@@ -735,6 +903,9 @@ def persist_enabled_model_map(
         # with the flag it published, unflagged rows defaulting to available
         # (missing = available), in the gateway's own /v1/models order.
         live_enabled = {mid: live_enabled.get(mid, True) for mid in (live_ids or live_enabled)}
+        for mid in member_restricted:
+            if mid in live_enabled:
+                live_enabled[mid] = prior.get(mid, True)
     elif live_ids:
         # A real catalogue that published NO enabled flags (gateway version
         # skew / a plain OpenAI-compatible endpoint). We can't re-derive which
@@ -754,6 +925,50 @@ def persist_enabled_model_map(
         return False
     SettingService(session, scope).upsert_setting("minds_model_enabled", desired)
     return True
+
+
+def persist_org_model_availability(
+    session, scope, *, prior: UserSettings, listing: MindsModelListing
+) -> bool:
+    """Write one org member's listing: shared facts to the org, rule locks to the member.
+
+    Auth resolves each row's ``enabled`` and ``disabled_reason`` from the model
+    rules for the caller's org, workspace and team, so a ``model_restricted`` row
+    is true for this member and may be false for the next one. The availability
+    map is an org row that every member's model resolution reads, so a
+    restriction written there swaps every member off the model, and the next
+    unrestricted member's load lifts it for the member it applies to. So the
+    restricted ids go to the map with the flag it already held for them
+    (``persist_enabled_model_map``'s ``member_restricted``), and to this member's
+    own ``minds_model_restricted`` row, which ``UserSettings._minds_enabled_map``
+    lays over the map as ``False``.
+
+    ``scope`` must name the caller: ``minds_model_restricted`` is a personal
+    setting. ``prior`` is the caller's loaded settings. The restriction list
+    follows the map's evidence rule: a listing that publishes no ``enabled``
+    flags says nothing about locks, so it leaves the stored list alone. One that
+    does is the whole answer, and an empty restriction set clears the list.
+    Stored sorted and written only on a change, like ``persist_role_defaults_map``.
+
+    Returns True iff either row was updated.
+    """
+    from cowork.services.settings import SettingService
+
+    restricted = sorted(
+        mid for mid, reason in listing.disabled_reasons.items() if reason == _MODEL_RESTRICTED_REASON
+    )
+    changed = persist_enabled_model_map(
+        session, scope, prior.minds_model_enabled, listing.enabled, listing.ids,
+        member_restricted=restricted,
+    )
+    if not listing.enabled:
+        return changed
+    if restricted == sorted(prior._minds_restricted_ids()):
+        return changed
+    SettingService(session, scope).upsert_setting("minds_model_restricted", json.dumps(restricted))
+    return True
+
+
 def persist_role_defaults_map(session, scope, prior_json: str | None, live_role_defaults: dict) -> bool:
     """Guarded write of the `minds_role_defaults` map the catalogue declares.
 
@@ -901,24 +1116,90 @@ def _is_auth_error(status_code: int, msg: Optional[str]) -> bool:
     return bool(msg and _AUTH_SHAPED_RE.search(msg))
 
 
-async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
-    """Ping a single provider and return (status, detail)."""
+class ProviderPing(NamedTuple):
+    """One provider's health-probe result."""
+
+    # "ok" or "fail".
+    status: str
+    # Shown in the Settings dot's tooltip, e.g. "HTTP 429: <gateway message>".
+    detail: str
+    # The denial the MindsHub gateway named when it refused the probe. Only a
+    # minds-cloud probe answered by the configured gateway carries one.
+    denial: GatewayDenial | None = None
+
+
+class ProviderPingResults(NamedTuple):
+    """Every probed provider's result, each map keyed by provider type."""
+
+    statuses: dict[str, str]
+    details: dict[str, str]
+    # Only the types whose probe carries a denial.
+    denials: dict[str, GatewayDenial]
+
+
+class _ProbeStatusError(httpx.HTTPStatusError):
+    """A failed probe response, carried the way the SDKs' status errors carry one.
+
+    The OpenAI and Anthropic SDK errors hold ``status_code`` and the parsed JSON
+    ``body`` beside ``response``, and turn_errors reads all three. httpx's own
+    error holds only ``response``. The body rung of ``gateway_denial`` reads the
+    ``code`` from ``body`` and its host from the ``response`` beside it, so
+    without ``body`` that rung never fires. The status-keyed rules read
+    ``status_code``.
+    """
+
+    def __init__(self, *, response: httpx.Response) -> None:
+        super().__init__(
+            f"HTTP {response.status_code}", request=response.request, response=response
+        )
+        self.status_code = response.status_code
+        # None for a body that is not JSON (an HTML error page from a proxy),
+        # so the header rung still classifies it.
+        self.body: object = None
+        try:
+            self.body = response.json()
+        except ValueError:
+            pass
+
+
+def _probe_denial(*, response: httpx.Response) -> GatewayDenial | None:
+    """The denial the gateway named on a failed MindsHub probe, or None.
+
+    Wraps the response in an ``httpx.HTTPStatusError`` shaped like the SDK
+    errors (``_ProbeStatusError``), so turn_errors' origin-checked readers apply
+    unchanged: a reason header from a host other than the configured
+    ``minds_url`` host counts for nothing, and a body ``code`` counts only from
+    that host. The wrap is guarded because a response with no request attached
+    (or a test double) has no host to check, and a probe result must never
+    raise.
+    """
+    try:
+        return gateway_denial(exc=_ProbeStatusError(response=response))
+    except Exception:
+        return None
+
+
+async def ping_provider(p: dict[str, Any]) -> ProviderPing:
+    """Ping a single provider and return its :class:`ProviderPing`."""
     ptype = p.get("type")
     key = (p.get("apiKey") or "").strip()
     timeout = httpx.Timeout(12.0)
 
-    async def _check(url: str, headers: dict[str, str]) -> tuple[str, str]:
+    async def _check(url: str, headers: dict[str, str]) -> ProviderPing:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.get(url, headers=headers)
         if r.status_code < 400:
-            return ("ok", f"HTTP {r.status_code}")
+            return ProviderPing(status="ok", detail=f"HTTP {r.status_code}")
         # Include the provider's own message in the fail detail so the Settings
         # dot tooltip distinguishes a bad key from a real outage — Gemini returns
         # 400 "Please pass a valid API key", not 401 (ENG-1145).
         msg = _provider_error_message(r)
-        return ("fail", f"HTTP {r.status_code}: {msg}" if msg else f"HTTP {r.status_code}")
+        return ProviderPing(
+            status="fail",
+            detail=f"HTTP {r.status_code}: {msg}" if msg else f"HTTP {r.status_code}",
+        )
 
-    async def _chat_probe(url: str, headers: dict[str, str], model: str) -> tuple[str, str]:
+    async def _chat_probe(url: str, headers: dict[str, str], model: str) -> ProviderPing:
         """Exercise the actual inference path with a tiny completion.
 
         This is the only route guaranteed to behave the same as a real
@@ -935,40 +1216,47 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.post(url, headers=headers, json=payload)
         if r.status_code < 400:
-            return ("ok", f"HTTP {r.status_code}")
+            return ProviderPing(status="ok", detail=f"HTTP {r.status_code}")
         # Same as _check: surface the gateway's own message so minds-cloud's
         # Settings dot carries the actionable reason (wallet/allowance/model)
         # instead of a bare "HTTP 502"/"HTTP 429". _chat_probe exercises real
         # chat completions, so its failures carry exactly that (ENG-1145 review,
         # ENG-576). Body read after close is safe — non-streaming POST.
         msg = _provider_error_message(r)
-        return ("fail", f"HTTP {r.status_code}: {msg}" if msg else f"HTTP {r.status_code}")
+        # The message is prose. The denial is the gateway's reason word, so the
+        # Settings notice can tell a velocity limit or the free-Air fuse from
+        # an empty wallet without matching on "HTTP 429".
+        return ProviderPing(
+            status="fail",
+            detail=f"HTTP {r.status_code}: {msg}" if msg else f"HTTP {r.status_code}",
+            denial=_probe_denial(response=r),
+        )
 
     try:
         if ptype == "anthropic":
             if not key:
-                return "fail", "missing API key"
+                return ProviderPing(status="fail", detail="missing API key")
             return await _check("https://api.anthropic.com/v1/models",
                                 {"x-api-key": key, "anthropic-version": "2023-06-01"})
         if ptype == "openai":
             if not key:
-                return "fail", "missing API key"
+                return ProviderPing(status="fail", detail="missing API key")
             return await _check("https://api.openai.com/v1/models",
                                 {"Authorization": f"Bearer {key}"})
         if ptype == "gemini":
             if not key:
-                return "fail", "missing API key"
+                return ProviderPing(status="fail", detail="missing API key")
             return await _check("https://generativelanguage.googleapis.com/v1beta/openai/models",
                                 {"Authorization": f"Bearer {key}"})
         if ptype == "openai-compatible":
             base = (p.get("baseUrl") or "").rstrip("/")
             if not base:
-                return "fail", "missing base URL"
+                return ProviderPing(status="fail", detail="missing base URL")
             headers = {"Authorization": f"Bearer {key}"} if key else {}
             return await _check(f"{base}/models", headers)
         if ptype == "minds-cloud":
             if not key:
-                return "fail", "missing API key"
+                return ProviderPing(status="fail", detail="missing API key")
             base = (p.get("mindsUrl") or default_minds_api_host()).rstrip("/")
             chat_url = minds_chat_base_url(base)
             # Probe with a UNIVERSALLY-CALLABLE model, never the configured/
@@ -978,36 +1266,51 @@ async def ping_provider(p: dict[str, Any]) -> tuple[str, str]:
             # CODING_MODEL_DEFAULTS["minds_cloud"] = "haiku" (paid), so every
             # out-of-credits account saw "MindsHub failed its last test" even
             # though chat worked on mindshub_air (ENG-576). mindshub_air is the
-            # free included model (drawn from the monthly allowance), so it
+            # free included model (drawn from the included allowance), so it
             # resolves without depending on wallet balance — the dot then
             # reflects reachability/key validity only. (Testing the user's role
             # model was also rejected in the ENG-577 review for adding
             # false-negatives + token cost.)
             return await _chat_probe(
                 f"{chat_url}/chat/completions",
-                {"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                {
+                    "Authorization": f"Bearer {key}",
+                    "Content-Type": "application/json",
+                    MINDS_REQUEST_KIND_HEADER: MINDS_REQUEST_KIND_PROBE,
+                },
                 MINDS_PROBE_MODEL,
             )
     except httpx.HTTPError as e:
-        return "fail", f"{type(e).__name__}: {e}"
+        return ProviderPing(status="fail", detail=f"{type(e).__name__}: {e}")
     except Exception as e:
         logger.warning("Provider %s ping error: %s", ptype, e)
-        return "fail", f"{type(e).__name__}: {e}"
-    return "fail", "unknown provider type"
+        return ProviderPing(status="fail", detail=f"{type(e).__name__}: {e}")
+    return ProviderPing(status="fail", detail="unknown provider type")
 
 
-async def ping_providers(providers: list[dict[str, Any]]) -> tuple[dict[str, str], dict[str, str]]:
-    """Ping multiple providers in parallel. Returns (statuses, details) dicts keyed by type."""
+async def ping_providers(providers: list[dict[str, Any]]) -> ProviderPingResults:
+    """Ping multiple providers in parallel. Returns their results keyed by type."""
     results = await asyncio.gather(*[ping_provider(p) for p in providers], return_exceptions=True)
     statuses: dict[str, str] = {}
     details: dict[str, str] = {}
+    denials: dict[str, GatewayDenial] = {}
     for p, r in zip(providers, results):
+        ptype = p["type"]
         if isinstance(r, Exception):
-            statuses[p["type"]] = "fail"
-            details[p["type"]] = f"{type(r).__name__}: {r}"
+            statuses[ptype] = "fail"
+            details[ptype] = f"{type(r).__name__}: {r}"
+            denial = None
         else:
-            statuses[p["type"]], details[p["type"]] = r
-    return statuses, details
+            statuses[ptype], details[ptype] = r.status, r.detail
+            denial = r.denial
+        # Two cards of one type share one slot, and the last card's status
+        # wins it. Its denial has to win too, or an earlier card's reason would
+        # sit beside a later card's status.
+        if denial is None:
+            denials.pop(ptype, None)
+        else:
+            denials[ptype] = denial
+    return ProviderPingResults(statuses=statuses, details=details, denials=denials)
 
 
 # ── Provider credential validation ───────────────────────────────────
@@ -1041,7 +1344,11 @@ async def validate_minds(api_key: str, base_url: str = "") -> dict[str, Any]:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.post(
                 f"{chat_base}/chat/completions",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    MINDS_REQUEST_KIND_HEADER: MINDS_REQUEST_KIND_PROBE,
+                },
                 json={"model": MINDS_PROBE_MODEL, "max_tokens": 20,
                       "messages": [{"role": "user", "content": "ping"}]},
             )
@@ -1082,12 +1389,15 @@ async def validate_openai_compatible(api_key: str, base_url: str = "https://api.
                                    "messages": [{"role": "user", "content": "ping"}]}
         if max_tokens is not None:
             payload["max_tokens"] = max_tokens
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        # Stamp the connectivity-probe marker on the MindsHub fallback only — the
+        # same host-gated reasoning as the token cap above. It is our own header,
+        # meaningless to an arbitrary endpoint, and only MindsHub reads it to hide
+        # the probe from the Traces list.
+        if is_minds_host(normalized):
+            headers[MINDS_REQUEST_KIND_HEADER] = MINDS_REQUEST_KIND_PROBE
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            r = await client.post(
-                chat_url,
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json=payload,
-            )
+            r = await client.post(chat_url, headers=headers, json=payload)
             if r.status_code in (200, 201):
                 return {"ok": True}
             msg = _provider_error_message(r)
@@ -1137,25 +1447,105 @@ async def validate_provider(provider: str, api_key: str,
     return {"ok": False, "error": "Unknown provider"}
 
 
-def build_llm_client(effort_override: str | None = None):
+# True once openai_compatible_agent_api has logged its warning. Every client
+# build asks, and only a restart onto another anton changes the answer.
+_warned_responses_transport_missing = False
+
+
+def openai_compatible_agent_api() -> OpenAICompatibleAPI:
+    """The API the planning and coding roles call on an openai_compatible provider.
+
+    COWORK_OPENAI_COMPATIBLE_API asks for it. The Responses API is used only
+    when the installed anton reports its Responses path ready, because before
+    RESPONSES_TRANSPORT_READY that path dropped truncation recovery,
+    tool_result images and trace headers; a cowork-server deployed ahead of
+    its anton stays on chat completions, and logs that once. ``is True``: a
+    stand-in class must not opt in by accident.
+    """
+    global _warned_responses_transport_missing
+    from anton.core.llm.openai import OpenAIProvider
+
+    from cowork.common.settings.app_settings import get_app_settings
+
+    asked = get_app_settings().openai_compatible_api
+    if getattr(OpenAIProvider, "RESPONSES_TRANSPORT_READY", False) is True:
+        return asked
+    if asked == "responses" and not _warned_responses_transport_missing:
+        _warned_responses_transport_missing = True
+        logger.warning(
+            "Installed anton does not report RESPONSES_TRANSPORT_READY; "
+            "openai_compatible planning and coding stay on chat completions "
+            "although COWORK_OPENAI_COMPATIBLE_API=responses"
+        )
+    return "chat_completions"
+
+
+class WebToolKwargs(TypedDict, total=False):
+    """The ChatSessionConfig web-tool fields a session sets. A field left out
+    keeps anton's default."""
+
+    web_search_enabled: bool
+    web_fetch_enabled: bool
+
+
+def web_tool_kwargs_for(planning_provider: Provider) -> WebToolKwargs:
+    """ChatSessionConfig web-tool kwargs for a session that plans on ``planning_provider``.
+
+    On anton's Responses flavor either web flag becomes OpenAI's hosted
+    web_search tool, which reads the web from the provider's side, past the
+    deployment's egress gateway (on Azure it runs on Bing). So an
+    openai_compatible planning provider that COWORK_OPENAI_COMPATIBLE_API moves
+    onto that flavor runs with both off. Every other session keeps anton's
+    defaults: MindsHub keeps its native web tools, and direct OpenAI keeps
+    what its flavor provides.
+    """
+    from cowork.common.settings.user_settings import Provider
+
+    if (
+        planning_provider is Provider.OPENAI_COMPATIBLE
+        and openai_compatible_agent_api() == "responses"
+    ):
+        return WebToolKwargs(web_search_enabled=False, web_fetch_enabled=False)
+    return WebToolKwargs()
+
+
+def build_llm_client(
+    effort_override: str | None = None, *, model_override: str | None = None,
+    settings: UserSettings | None = None,
+):
     """Build an Anton LLMClient from the current user settings.
 
     Shared by the main responses handler and the credential probe handler
     so provider construction logic stays in one place.
+
+    Callers that also derive session policy from settings pass their snapshot
+    here, so a concurrent settings update cannot separate that policy from
+    the providers it governs. Otherwise settings are loaded at call time.
+
+    ``model_override`` is a per-turn composer selection from the planning
+    provider's catalogue. Apply it to roles using that provider only; a role
+    configured on a different provider must keep its own compatible model.
+    Persisted settings are never modified.
 
     Reasoning effort is a persisted per-role setting
     (``planning_reasoning_effort`` / ``coding_reasoning_effort``) — chosen in the
     Settings UI beside each model dropdown, just like the model itself. Each
     level is forwarded in the provider's native shape (Anthropic
     ``output_config``, OpenAI ``reasoning`` / ``reasoning_effort``); None leaves
-    the model's own default.
+    the model's own default. The router role has its own,
+    ``router_reasoning_effort`` (``ROUTER_REASONING_EFFORT`` in local
+    tenancy). It reaches history summaries and the route gate, which share
+    the router's provider, so it is sent only while the gate runs the router
+    model too: always on openai_compatible, elsewhere only at the provider's
+    default router model.
 
     `effort_override`, when set, is the composer's per-task Effort pick — it
     takes precedence over the persisted per-role setting for BOTH planning and
     coding roles for this call, bypassing the stored-vs-resolved staleness
     guard below (an explicit per-task pick is inherently valid for the model
     actually in use this turn, unlike a stale persisted choice that may have
-    been made for a different model).
+    been made for a different model). With a model override, a coding role
+    on a different provider retains its own model and effort.
     """
     from anton.core.llm.anthropic import AnthropicProvider
     from anton.core.llm.client import LLMClient
@@ -1167,7 +1557,20 @@ def build_llm_client(effort_override: str | None = None):
         provider_api_key,
     )
 
-    settings = get_user_settings()
+    if settings is None:
+        settings = get_user_settings()
+    same_coding_provider = settings.resolved_coding_provider == settings.resolved_planning_provider
+    planning_model = model_override or settings.resolved_planning_model
+    coding_model = (
+        model_override
+        if model_override and same_coding_provider
+        else settings.resolved_coding_model
+    )
+    router_model = (
+        model_override
+        if model_override and settings.resolved_router_provider == settings.resolved_planning_provider
+        else settings.resolved_router_model
+    )
 
     # The published package still permits Anton releases from before ENG-2116.
     # Inspect the constructor once per client build so those versions keep
@@ -1181,7 +1584,18 @@ def build_llm_client(effort_override: str | None = None):
     supports_api_key_provider = "api_key_provider" in openai_provider_params
     warned_about_static_runtime_credential = False
 
-    def _make_provider(role: Provider, effort: str | None = None):
+    # Passed to the planning and coding builds only. The router stays on chat
+    # completions: the gate's first-event budget is sized for a model that
+    # doesn't reason, and a router model that reasons by default is held to
+    # that with router_reasoning_effort "none".
+    agent_api = openai_compatible_agent_api()
+
+    def _make_provider(
+        role: Provider,
+        effort: str | None = None,
+        *,
+        api: OpenAICompatibleAPI = "chat_completions",
+    ):
         nonlocal warned_about_static_runtime_credential
         # Only pass reasoning_effort when it's actually set. This keeps
         # build_llm_client compatible with anton builds whose provider __init__
@@ -1250,6 +1664,15 @@ def build_llm_client(effort_override: str | None = None):
                 **effort_kw,
             )
         if role in (Provider.OPENAI_COMPATIBLE, Provider.GEMINI):
+            # anton's openai flavor sends complete() and stream() to the
+            # Responses API, where OpenAI and Azure accept function tools with
+            # a reasoning effort. Gemini shares this branch and stays on chat
+            # completions.
+            flavor_kw = (
+                {"flavor": OpenAIProvider.FLAVOR_OPENAI}
+                if api == "responses" and role == Provider.OPENAI_COMPATIBLE
+                else {}
+            )
             # A local endpoint authenticates by being reachable, so an
             # openai-compatible provider with a base URL and no key is a valid
             # config, not a broken one.
@@ -1263,7 +1686,7 @@ def build_llm_client(effort_override: str | None = None):
             # on trust as "not really a credential".
             if key is None and role == Provider.OPENAI_COMPATIBLE and base:
                 return OpenAIProvider(
-                    api_key=f"{role.value}-no-auth", base_url=base, **effort_kw
+                    api_key=f"{role.value}-no-auth", base_url=base, **flavor_kw, **effort_kw
                 )
             if key is None:
                 raise ValueError(f"{role.label} API key is not configured")
@@ -1276,7 +1699,7 @@ def build_llm_client(effort_override: str | None = None):
             if role == Provider.OPENAI_COMPATIBLE and not base:
                 raise ValueError("OpenAI-compatible base URL is not configured")
             return OpenAIProvider(
-                api_key=key.get_secret_value(), base_url=base, **effort_kw
+                api_key=key.get_secret_value(), base_url=base, **flavor_kw, **effort_kw
             )
         provider_map = {"anthropic": AnthropicProvider, "openai": OpenAIProvider}
         cls = provider_map.get(role.value)
@@ -1287,35 +1710,24 @@ def build_llm_client(effort_override: str | None = None):
         # base is None for anthropic/openai → SDK default host (OpenAIProvider
         # accepts base_url=None; AnthropicProvider takes no base_url kwarg).
         #
-        # Direct OpenAI deliberately keeps the default (generic) flavor. The
-        # flavor that would enable OpenAI's native web tools, FLAVOR_OPENAI,
-        # also switches the whole transport from chat.completions to the
-        # Responses API, whose path in anton does not yet:
-        # - report truncation (no `response.incomplete` handler, so
-        #   stop_reason and token usage stay unset and truncation recovery
-        #   never fires),
-        # - forward images returned inside a tool_result,
-        # - attach Langfuse trace headers.
-        # Native web search here waits on those gaps being closed in anton.
+        # Direct OpenAI uses its own transport, the Responses API
+        # (FLAVOR_OPENAI), which also enables OpenAI's native web tools and is
+        # the only transport on which some models (gpt-6.1-sol) accept tools
+        # with a reasoning effort. Gated on the installed anton (pinned to a
+        # branch): before RESPONSES_TRANSPORT_READY its Responses path did not
+        # report truncation, forward tool_result images or attach Langfuse
+        # trace headers, so an older anton keeps the generic chat.completions
+        # flavor. `is True`: a stand-in class must not opt in by accident.
         if cls is OpenAIProvider:
-            return cls(api_key=key.get_secret_value(), base_url=base, **effort_kw)
+            flavor_kw = (
+                {"flavor": cls.FLAVOR_OPENAI}
+                if getattr(cls, "RESPONSES_TRANSPORT_READY", False) is True
+                else {}
+            )
+            return cls(
+                api_key=key.get_secret_value(), base_url=base, **flavor_kw, **effort_kw
+            )
         return cls(api_key=key.get_secret_value(), **effort_kw)
-
-    # Routing & summarization role: the cheap front-model that runs history
-    # summarization (and later gates turns). Only pass it when the installed
-    # anton's LLMClient accepts the kwargs — older builds predate ENG-648 and
-    # would TypeError, taking the whole agent down. When absent, anton falls
-    # back to the coding role internally, so behavior is preserved.
-    router_kw: dict = {}
-    try:
-        _params = inspect.signature(LLMClient.__init__).parameters
-        if "router_provider" in _params:
-            router_kw = {
-                "router_provider": _make_provider(settings.resolved_router_provider, None),
-                "router_model": settings.resolved_router_model,
-            }
-    except (ValueError, TypeError):
-        router_kw = {}
 
     # A reasoning-effort level is chosen in the Settings UI for a specific
     # model. When resolution swaps the model out from under the stored choice
@@ -1326,14 +1738,48 @@ def build_llm_client(effort_override: str | None = None):
     def _effort_for(stored: str | None, resolved: str | None, effort: str | None):
         return effort if effort and stored == resolved else None
 
+    # Routing & summarization role: the cheap front-model that runs history
+    # summarization (and later gates turns). Only pass it when the installed
+    # anton's LLMClient accepts the kwargs — older builds predate ENG-648 and
+    # would TypeError, taking the whole agent down. When absent, anton falls
+    # back to the coding role internally, so behavior is preserved.
+    #
+    # Its effort is its own: the composer's per-task pick is chosen for the
+    # chat model and never reaches the router. The router provider serves two
+    # models, though. Summaries run router_model, and the route gate runs
+    # resolved_gate_model on the same provider (response_routing's
+    # _settings_binding). Off openai_compatible the gate takes the provider's
+    # default router model, so the effort, chosen for router_model, rides on
+    # the provider only while the gate runs that model too. Anthropic's
+    # default, Haiku 4.5, takes no effort at all.
+    router_effort = (
+        _effort_for(settings.router_model, router_model, settings.router_reasoning_effort)
+        if settings.resolved_gate_model == router_model
+        else None
+    )
+    router_kw: dict = {}
+    try:
+        _params = inspect.signature(LLMClient.__init__).parameters
+        if "router_provider" in _params:
+            router_kw = {
+                "router_provider": _make_provider(
+                    settings.resolved_router_provider, router_effort
+                ),
+                "router_model": router_model,
+            }
+    except (ValueError, TypeError):
+        router_kw = {}
+
     planning_effort = effort_override or _effort_for(
         settings.planning_model,
-        settings.resolved_planning_model,
+        planning_model,
         settings.planning_reasoning_effort,
     )
-    coding_effort = effort_override or _effort_for(
+    coding_effort = (
+        effort_override if not model_override or same_coding_provider else None
+    ) or _effort_for(
         settings.coding_model,
-        settings.resolved_coding_model,
+        coding_model,
         settings.coding_reasoning_effort,
     )
 
@@ -1345,13 +1791,15 @@ def build_llm_client(effort_override: str | None = None):
         planning_provider=_make_provider(
             settings.resolved_planning_provider,
             planning_effort,
+            api=agent_api,
         ),
-        planning_model=settings.resolved_planning_model,
+        planning_model=planning_model,
         coding_provider=_make_provider(
             settings.resolved_coding_provider,
             coding_effort,
+            api=agent_api,
         ),
-        coding_model=settings.resolved_coding_model,
+        coding_model=coding_model,
         **router_kw,
     )
 

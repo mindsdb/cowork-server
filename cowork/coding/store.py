@@ -236,3 +236,4 @@ class CodingStore:
         session.status = SessionStatus.interrupted
         session.active_turn_id = None
         session.pending_approval = None
+        session.pending_question = None

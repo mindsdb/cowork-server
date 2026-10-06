@@ -28,20 +28,28 @@ class DeveloperWorkDiscovery:
         connection_name: str,
     ) -> WorkItemPage:
         search = f"{query.strip()} is:open" if query.strip() else "is:open assignee:@me"
-        response = self._request(
-            "GET",
-            f"{api}/search/issues",
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
-            params={"q": search, "sort": "updated", "order": "desc", "per_page": limit},
-        ).json()
-        items = response.get("items") if isinstance(response, dict) else []
+        items: dict[str, WorkItemSummary] = {}
+        incomplete = False
+        # GitHub app tokens reject mixed issue/PR searches. Keep the user's
+        # qualifiers last so an explicit type filter still takes precedence.
+        for kind in ("issue", "pull-request"):
+            response = self._request(
+                "GET",
+                f"{api}/search/issues",
+                headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+                params={"q": f"is:{kind} {search}", "sort": "updated", "order": "desc", "per_page": limit},
+            ).json()
+            if not isinstance(response, dict):
+                continue
+            incomplete |= bool(response.get("incomplete_results"))
+            page_items = response.get("items")
+            for item in (page_items if isinstance(page_items, list) else [])[:limit]:
+                if isinstance(item, dict) and item.get("html_url"):
+                    summary = self._github_item(item, connection_name)
+                    items[summary.url] = summary
         return WorkItemPage(
-            items=[
-                self._github_item(item, connection_name)
-                for item in (items if isinstance(items, list) else [])[:limit]
-                if isinstance(item, dict) and item.get("html_url")
-            ],
-            incomplete=bool(response.get("incomplete_results")) if isinstance(response, dict) else False,
+            items=sorted(items.values(), key=lambda item: item.updated_at, reverse=True)[:limit],
+            incomplete=incomplete,
         )
 
     def linear(

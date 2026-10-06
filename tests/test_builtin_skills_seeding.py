@@ -7,6 +7,7 @@ marker: when it blocks a re-seed, and when it must NOT block one.
 
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ from cowork.services.skills import (
     CODE_BUILTIN_SKILLS_VERSION,
     CODE_ONLY_BUILTIN_SKILL_NAMES,
     CodeSkillService,
+    SkillImmutableError,
     SkillService,
     build_turn_skills,
 )
@@ -110,10 +112,34 @@ def test_code_builtins_repair_an_empty_directory_after_seeding(skills_root):
 def test_deleted_code_builtin_stays_deleted(skills_root):
     code_skills = CodeSkillService(LOCAL_SCOPE)
     assert code_skills.ensure_builtin_skills() is True
-    assert code_skills.delete_skill("thermo-nuclear-code-quality-review") is True
+    # A deletion by an older release/on disk must still not be resurrected.
+    shutil.rmtree(code_skills.root / "thermo-nuclear-code-quality-review")
 
     assert code_skills.ensure_builtin_skills() is False
     assert code_skills.list_skills() == []
+
+
+@pytest.mark.parametrize("scope", [None, LOCAL_SCOPE, _org()], ids=["unscoped", "local", "org"])
+@pytest.mark.parametrize("operation", ["create", "update", "rename", "import", "delete", "stage-delete"])
+def test_code_store_itself_protects_builtins(skills_root, scope, operation):
+    store = CodeSkillService(scope)
+    store.ensure_builtin_skills()
+    slug = "thermo-nuclear-code-quality-review"
+    path = store.root / slug / "SKILL.md"
+    before = path.read_bytes()
+    personal = store.create_skill("personal-review", "Keep this editable.")
+    actions = {
+        "create": lambda: store.create_skill(slug, "Changed"),
+        "update": lambda: store.update_skill(slug, instructions="Changed"),
+        "rename": lambda: store.update_skill(personal.name, label=slug),
+        "import": lambda: store.import_skill(before, "SKILL.md"),
+        "delete": lambda: store.delete_skill(slug),
+        "stage-delete": lambda: store.stage_delete(slug),
+    }
+    with pytest.raises(SkillImmutableError, match="immutable"):
+        actions[operation]()
+    assert path.read_bytes() == before
+    assert store.get_skill(personal.name).instructions == "Keep this editable."
 
 
 def test_seeding_is_per_org(skills_root):

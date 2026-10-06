@@ -101,3 +101,6 @@ async def test_a_leading_slash_is_stripped_rather_than_shipped(captured):
     one on the wire, because the pod would join it under its own root."""
     await _enqueue(workspace_rel_path="/projects/general")
     assert captured["payload"]["params"]["workspace_path"] == "projects/general"
+
+
+pytestmark = pytest.mark.usefixtures("granted_product_permissions")
