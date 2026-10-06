@@ -265,6 +265,7 @@ def _project_dirs_for_scope(session: "ScopedSession | None" = None) -> list[Path
     dirs = _registered_project_dirs()
     if session is None or _org_mode():
         return dirs
+    # Imported here for the `artifact_roots` cycle; see `_artifact_dirs_for_scope`.
     from cowork.services.artifact_roots import _sources_outside_the_projects_root
 
     known = {str(d) for d in dirs}
@@ -773,6 +774,7 @@ def _external_source_for_path(
     """
     if session is None or _org_mode():
         return None
+    # Imported here for the `artifact_roots` cycle; see `_artifact_dirs_for_scope`.
     from cowork.services.artifact_roots import _sources_outside_the_projects_root
 
     try:

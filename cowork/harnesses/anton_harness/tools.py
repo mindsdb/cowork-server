@@ -28,6 +28,10 @@ from pathlib import Path
 from typing import Any
 import uuid
 
+from cowork.common.settings.app_settings import get_app_settings
+from cowork.db import session as db_session
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+
 logger = logging.getLogger(__name__)
 
 
@@ -44,16 +48,11 @@ def _desktop_scope():
     only be adopted on a local deployment, so there is nothing there to find.
     The same refusal guards the sibling reader in services/skill_links.py.
     """
-    from cowork.common.settings.app_settings import get_app_settings
-
     if get_app_settings().tenancy_mode == "org":
         yield None
         return
 
-    from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
-    from cowork.db.session import get_open_session
-
-    with get_open_session() as raw:
+    with db_session.get_open_session() as raw:
         yield ScopedSession(raw, LOCAL_SCOPE)
 
 
