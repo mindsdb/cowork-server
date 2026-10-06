@@ -10,6 +10,7 @@ import asyncio
 import importlib
 import os
 import pkgutil
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -96,7 +97,7 @@ async def start():
     handler.principal = None  # local, single-process deployment
     handle = await registry.start(
         conversation_id=str(conversation_id), turn_id=0,
-        open_buffer=lambda: new_buffer(str(conversation_id), 0),
+        open_buffer=partial(new_buffer, str(conversation_id), 0),
         lifecycle=lifecycle,
         produce=lambda buffer: handler._run_turn(
             conv_id=conversation_id, harness_input=[], original_content="hello",

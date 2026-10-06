@@ -19,7 +19,7 @@ from cowork.handlers.responses import ResponsesHandler
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, INTERRUPTED_TURN_MESSAGE
 from cowork.streaming.registry import RunHandle, TurnLifecycle, registry
 
-from _fakes import inline_run_db
+from _fakes import inline_run_db, opens
 
 CID = "conv-shutdown-test"
 
@@ -68,8 +68,9 @@ def _streaming_handler(monkeypatch, saved: dict, started: asyncio.Event):
             saved["user"] = content
             return SimpleNamespace(id=uuid4())
 
-        def finalize_pending(self, conv_id, message_id=None):
+        def clear_pending(self, conv_id, *, message_id=None):
             saved["finalized"] = True
+            return True
 
         def save_assistant_turn(self, conv_id, text, events, harness=None, tool_rows=None):
             saved["assistant"] = text
@@ -100,7 +101,7 @@ async def _start_streaming_turn(monkeypatch, saved, buffer):
     handler = _streaming_handler(monkeypatch, saved, started)
     lifecycle = TurnLifecycle()
     handle = await registry.start(
-        conversation_id=CID, turn_id=0, open_buffer=lambda: buffer,
+        conversation_id=CID, turn_id=0, open_buffer=opens(buffer),
         produce=lambda buffer: handler._run_turn(
             conv_id=uuid4(), harness_input=[], original_content="hi", model="anton",
             disabled=None, harness_name="anton", harness_id="anton", buffer=buffer,
@@ -187,7 +188,7 @@ async def test_only_user_stop_emits_cancelled(monkeypatch, tmp_path, backend, ca
         monkeypatch.setattr(responses_mod, "stream_remote_replies", replies)
         lifecycle = TurnLifecycle()
         handle = await registry.start(
-            conversation_id=CID, turn_id=0, open_buffer=lambda: buffer, lifecycle=lifecycle,
+            conversation_id=CID, turn_id=0, open_buffer=opens(buffer), lifecycle=lifecycle,
             produce=lambda buffer: handler._produce_remote(
                 conv_id=uuid4(), input_text="hi", original_content="hi", model="anton",
                 harness_id="anton", buffer=buffer, lifecycle=lifecycle,

@@ -24,6 +24,7 @@ from cowork.common.settings.app_settings import (
     default_minds_url,
     get_app_settings,
 )
+from cowork.common.settings.runtime_credential import get_minds_credential
 
 
 class Provider(str, Enum):
@@ -1422,6 +1423,11 @@ def use_turn_settings(scope: "TenantScope", settings: UserSettings):
     worker threads it starts read the same snapshot. Bind it on the loop: a
     worker thread runs in a copy of the context, so whatever it binds is gone
     when it returns.
+
+    The one value not frozen is the MindsHub credential the desktop app hands
+    over at runtime: it is a short-lived token the desktop refreshes while a
+    turn runs, so each read overlays the current one, as a load does
+    (SettingService._raw_data).
     """
     token = _turn_settings.set(_TurnSettings(scope=scope, settings=settings))
     try:
@@ -1443,7 +1449,11 @@ def get_user_settings(scope: "TenantScope | None" = None) -> UserSettings:
     if turn is not None and turn.scope == scope:
         # A copy, as a fresh load would be: a caller that changes the object
         # it gets must not change what the next caller reads.
-        return turn.settings.model_copy()
+        settings = turn.settings.model_copy()
+        live_minds_key = get_minds_credential()
+        if live_minds_key:
+            settings.minds_api_key = SecretStr(live_minds_key)
+        return settings
     return _load_from_db(scope)
 
 

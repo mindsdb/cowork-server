@@ -172,7 +172,16 @@ class FileStreamBuffer(StreamBuffer):
     def __init__(self, path: Path) -> None:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        # A new turn starts with an empty file. The path is named by the turn
+        # number, which is the conversation's message count, so a turn that
+        # saved no message leaves its file where the next turn writes; its
+        # records would be replayed to the next turn's readers, which stop at
+        # its terminal record. Only this process writes these files, and the
+        # registry opens one only once no turn of the conversation is
+        # answering, so whatever the file held had already ended. Opened to
+        # append, so every record still lands at the file's end.
         self._writer = self._path.open("a", encoding="utf-8")
+        self._writer.truncate(0)
         self._seq = 0
         self._new_data = asyncio.Event()
         self._done = asyncio.Event()
@@ -359,6 +368,19 @@ class RedisStreamBuffer(StreamBuffer):
                     yield rec
                     if rec.is_terminal:
                         return
+
+    async def clear_if_ended(self) -> None:
+        """Delete this turn's stream when the turn that wrote it has ended.
+
+        A new turn writes here when the turn before it at the same number
+        saved no message, and its readers would replay that turn's records and
+        stop at its terminal record. A stream with no terminal record may
+        still be live on another replica, so it is left alone.
+        """
+        r = get_redis()
+        entries = await r.xrevrange(self.key, count=1)
+        if entries and self._record(entries[0][1]).is_terminal:
+            await r.delete(self.key)
 
     async def refresh(self) -> None:
         """Load latest_seq and is_closed from Redis.

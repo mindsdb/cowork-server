@@ -1,12 +1,14 @@
 """Database units: one pooled connection per unit, held from its first
-statement to its end; one POOL_TIMEOUT budget for a unit's waits; and a
-caller that is cancelled waits for a unit that has started."""
+statement to its end; one POOL_TIMEOUT budget for a unit's waits; threads
+apart from the ones sync routes share; and a caller that is cancelled waits
+for a unit that has started."""
 from __future__ import annotations
 
 import asyncio
 import threading
 from uuid import uuid4
 
+import anyio
 import pytest
 from sqlalchemy import event
 
@@ -114,7 +116,9 @@ async def test_the_slot_wait_and_the_connection_wait_share_one_pool_timeout(one_
     finally:
         held_elsewhere.close()
 
-    assert elapsed <= 1.2 * budget, f"refused {elapsed:.2f}s after the call; POOL_TIMEOUT is {budget}s"
+    assert 0.8 * budget <= elapsed <= 1.2 * budget, (
+        f"refused {elapsed:.2f}s after the call; POOL_TIMEOUT is {budget}s"
+    )
     await _until(lambda: slots.borrowed_tokens == 0 and one_connection_pool.pool.checkedout() == 0)
     assert ran == []
 
@@ -143,3 +147,21 @@ async def test_a_caller_cancelled_while_its_unit_waits_for_a_connection_leaves_a
     assert left_at_once
     await _until(lambda: units._slots(one_connection_pool).borrowed_tokens == 0)
     assert ran == []
+
+
+async def test_units_never_wait_for_the_threads_sync_routes_share():
+    """Sync routes run on anyio's default thread limiter. With every one of
+    its threads busy, a unit still runs at once: units have threads of their
+    own."""
+    default = anyio.to_thread.current_default_thread_limiter()
+    total = default.total_tokens
+    default.total_tokens = 1
+    release = threading.Event()
+    sync_route = asyncio.create_task(anyio.to_thread.run_sync(release.wait, 10))
+    await asyncio.sleep(0.1)
+    try:
+        assert await asyncio.wait_for(run_db(lambda session: 42, scope=LOCAL_SCOPE), timeout=2) == 42
+    finally:
+        release.set()
+        await sync_route
+        default.total_tokens = total
