@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
-import inspect
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 from sqlmodel import Session
 
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.session import get_engine
+from cowork.common.settings.user_settings import Provider, UserSettings
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
+from cowork.db.session import get_engine, get_open_session
 from cowork.harnesses.anton_harness import harness
 from cowork.harnesses.anton_harness.harness import (
     _file_access_rules,
@@ -21,6 +23,8 @@ from cowork.harnesses.base import ChannelContext
 from cowork.models.conversation import Conversation
 from cowork.models.conversation_folder import ConversationFolder
 from cowork.models.project import Project
+from cowork.services.conversation_folders import ConversationFolderService
+from cowork.services.conversations import ConversationService
 
 
 @pytest.fixture()
@@ -109,8 +113,73 @@ def test_a_folder_that_is_gone_is_left_out(local_mode, tmp_path):
         assert _working_folder_paths(conversation, None) == [str(docs)]
 
 
-def test_the_session_builder_passes_the_channel_and_appends_the_context():
-    source = inspect.getsource(harness.AntonHarness._build_chat_session)
-    assert "_working_folder_paths(conversation, channel_context)" in source
-    assert "+ _file_access_rules(folder_paths)" in source
-    assert "+ _working_folders_context(folder_paths)" in source
+async def _suffix(monkeypatch, conversation_id, channel_context=None) -> str:
+    """The system prompt suffix one turn of this chat is built with, by the real harness."""
+    settings = UserSettings(
+        _env_file=None,
+        planning_provider=Provider.MINDS_CLOUD,
+        coding_provider=Provider.MINDS_CLOUD,
+        router_provider=Provider.MINDS_CLOUD,
+        episodic_memory=False,
+        minds_api_key=SecretStr("mdb-key"),
+        minds_url="https://api.mindshub.ai",
+    )
+    monkeypatch.setattr("cowork.common.settings.user_settings.get_user_settings", lambda: settings)
+    # Capture the config rather than a session: no scratchpad, no connectors.
+    monkeypatch.setattr(harness, "build_chat_session", lambda config: config)
+    monkeypatch.setattr("anton.core.datasources.data_vault.LocalDataVault", None)
+    monkeypatch.setenv("ANTON_SCRATCHPAD_PERSIST_SESSION", "false")
+    with get_open_session() as db:
+        conversation = ConversationService(ScopedSession(db, LOCAL_SCOPE)).get_conversation(
+            conversation_id
+        )
+        config, _, _ = await harness.AntonHarness()._build_chat_session(
+            conversation, channel_context=channel_context
+        )
+    return config.system_prompt_context.suffix
+
+
+def _chat_in_general(tmp_path: Path, folders: list[Path]):
+    with get_open_session() as db:
+        scoped = ScopedSession(db, LOCAL_SCOPE)
+        conversation = ConversationService(scoped).create_conversation(topic="folders prompt")
+        for folder in folders:
+            ConversationFolderService(scoped).add_folder(conversation.id, str(folder))
+        return conversation.id
+
+
+@pytest.mark.asyncio
+async def test_the_built_prompt_grants_each_folder(local_mode, monkeypatch, tmp_path):
+    docs = _folder(tmp_path, "docs")
+    reports = _folder(tmp_path, "reports")
+    chat = _chat_in_general(tmp_path, [docs, reports])
+
+    suffix = await _suffix(monkeypatch, chat)
+
+    assert f"  - {docs}\n  - {reports}" in suffix
+    assert "do not use select_path" in suffix
+    assert "located outside the project is strictly forbidden" not in suffix
+
+
+@pytest.mark.asyncio
+async def test_without_folders_the_built_prompt_is_unchanged(local_mode, monkeypatch, tmp_path):
+    chat = _chat_in_general(tmp_path, [])
+
+    suffix = await _suffix(monkeypatch, chat)
+    monkeypatch.setattr(harness, "_working_folder_paths", lambda *_a, **_k: [])
+    without_lookup = await _suffix(monkeypatch, chat)
+
+    assert suffix == without_lookup
+    assert "located outside the project is strictly forbidden" in suffix
+    assert "working folder" not in suffix
+
+
+@pytest.mark.asyncio
+async def test_a_channel_turn_prompt_carries_no_folders(local_mode, monkeypatch, tmp_path):
+    docs = _folder(tmp_path, "docs")
+    chat = _chat_in_general(tmp_path, [docs])
+
+    suffix = await _suffix(monkeypatch, chat, ChannelContext(channel_type="slack"))
+
+    assert str(docs) not in suffix
+    assert "working folder" not in suffix
