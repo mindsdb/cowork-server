@@ -41,6 +41,16 @@ class PausedHarness:
         yield sse_frame("response.completed", {"type": "response.completed", "response": {"output": []}})
 
 
+def opens(buffer):
+    """An ``open_buffer`` factory for RunRegistry.start that hands back
+    ``buffer``."""
+
+    async def open_buffer():
+        return buffer
+
+    return open_buffer
+
+
 def inline_run_db(session):
     """A run_db stand-in for producer tests whose services are fakes: it runs
     each unit on the event loop with ``session``, so nothing reaches a

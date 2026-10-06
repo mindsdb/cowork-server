@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 import cowork.common.settings.user_settings as user_settings
+from cowork.common.settings import runtime_credential
 import cowork.handlers.responses as responses_mod
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.handlers.response_routing import DELEGATED_AGENTIC, RouteDecision
@@ -89,3 +90,23 @@ def test_the_turn_snapshot_answers_only_for_its_own_scope(monkeypatch):
 
     assert served_again.harness == "anton"
     assert loaded == [other_org, LOCAL_SCOPE]
+
+
+def test_the_turn_snapshot_serves_the_desktops_current_minds_credential(monkeypatch):
+    """The desktop app hands over a short-lived MindsHub token and refreshes
+    it while a turn runs. The snapshot keeps every other setting the turn
+    started with, but serves the current token, as a fresh load would."""
+    monkeypatch.setattr(
+        user_settings, "_load_from_db", lambda scope: pytest.fail("the snapshot's scope loaded again"),
+    )
+    runtime_credential.set_minds_credential("token-at-turn-start")
+    try:
+        snapshot = user_settings.UserSettings(harness="anton", minds_api_key="token-at-turn-start")
+        with user_settings.use_turn_settings(LOCAL_SCOPE, snapshot):
+            runtime_credential.set_minds_credential("token-after-refresh")
+            served = user_settings.get_user_settings()
+    finally:
+        runtime_credential.clear_minds_credential()
+
+    assert served.minds_api_key.get_secret_value() == "token-after-refresh"
+    assert served.harness == "anton"

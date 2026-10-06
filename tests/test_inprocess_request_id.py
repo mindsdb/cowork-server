@@ -64,8 +64,9 @@ def _failing_handler(monkeypatch, saved: dict, exc: Exception):
             saved["user"] = content
             return SimpleNamespace(id=uuid4())
 
-        def finalize_pending(self, conv_id, message_id=None):
+        def clear_pending(self, conv_id, *, message_id=None):
             saved["finalized"] = True
+            return True
 
         def save_assistant_turn(self, conv_id, text, events, harness=None, tool_rows=None):
             saved["events"] = events

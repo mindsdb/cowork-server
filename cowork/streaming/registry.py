@@ -21,7 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -66,6 +66,11 @@ _IDLE_POLL_SECONDS = 15
 # Bound on RunRegistry.shutdown()'s wait for in-flight turns to persist their
 # partial answer before the process exits. The container's stop deadline must
 # cover Uvicorn's earlier request-drain budget (2s), this wait, and teardown.
+#
+# A turn's end-of-turn save waits for a database connection only when the pool
+# is exhausted. If that happens during shutdown, the save can wait up to
+# POOL_TIMEOUT (5 s by default) and so use this whole grace; a turn still
+# saving when the grace runs out is left for the next boot's recovery.
 TURN_SHUTDOWN_GRACE_SECONDS = 5
 
 
@@ -202,7 +207,7 @@ class RunRegistry:
         *,
         conversation_id: str,
         turn_id: int,
-        open_buffer: Callable[[], StreamBuffer],
+        open_buffer: Callable[[], Awaitable[StreamBuffer]],
         produce: Callable[[StreamBuffer], Coroutine[Any, Any, None]],
         org_id: str | None = None,
         user_id: str | None = None,
@@ -217,7 +222,8 @@ class RunRegistry:
         that read the history at the same moment compute the same turn number,
         so opening one for a refused request would write into the running
         turn's file or stream. A refused start creates no buffer and no
-        producer coroutine.
+        producer coroutine. An accepted one opens its buffer clear of the
+        records of an earlier turn at the same number (backend.new_buffer).
         """
         loop = asyncio.get_running_loop()
         async with self._lock:
@@ -228,7 +234,7 @@ class RunRegistry:
                     conversation_id, existing.turn_id,
                 )
                 raise TurnInProgress(conversation_id=conversation_id, turn_id=existing.turn_id)
-            buffer = open_buffer()
+            buffer = await open_buffer()
             lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
             task = asyncio.create_task(
                 self._run_bounded(produce(buffer), buffer, conversation_id, turn_id, lifecycle),

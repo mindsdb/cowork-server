@@ -4,7 +4,7 @@ import asyncio
 import base64
 import json
 import time
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
@@ -12,6 +12,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.build_info import build_trace_metadata
@@ -46,6 +47,7 @@ from cowork.models.message import Message
 from cowork.streaming import StreamBuffer, TurnLifecycle, new_buffer, registry, sse_frame
 from cowork.streaming.answer_text import accumulate_answer_text
 from cowork.streaming.backend import get_backend
+from cowork.streaming.records import TerminalReason
 from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
 from cowork.turnqueue.redis_client import cancel_flag_key, get_redis
@@ -426,18 +428,17 @@ def _save_answer(
     # Re-anchor before ANY write: the conversation may be gone (deleted
     # mid-turn) or out of scope.
     service.get_conversation(conversation_id)
-    # The services commit as they go, so the answer is saved before the
-    # question's pending flag is cleared: when the save fails, the question
-    # stays pending and out of replayed history rather than rejoining it with
-    # no answer after it.
+    # The question's pending flag is cleared in the commit that saves the
+    # answer, so the two land together or not at all: a failed save leaves the
+    # question pending and out of replayed history, never an answer whose
+    # question stays pending. Scoped to THIS turn's row, so a completing turn
+    # can't absorb into history a pending row stranded by an earlier crashed
+    # turn. An empty turn saves no row and commits nothing itself; the unit's
+    # own commit lands the flag, so the question rejoins replayed history.
+    service.clear_pending(conversation_id, message_id=question_id)
     message = service.save_assistant_turn(
         conversation_id, text, list(events), harness=harness, tool_rows=list(tool_rows),
     )
-    # Cleared even for an empty turn, which saves no row, so the question
-    # rejoins replayed history. Scoped to THIS turn's row, so a completing turn
-    # can't absorb into history a pending row stranded by an earlier crashed
-    # turn.
-    service.finalize_pending(conversation_id, question_id)
     return message.id if message is not None else None
 
 
@@ -671,14 +672,23 @@ class ResponsesHandler:
                     # up front so attachments can be uploaded against it before
                     # the first stream. Adopt it, otherwise those uploads strand
                     # under an id no conversation ever gets (ENG-264).
-                    conversation = conversation_service.create_conversation(
-                        topic=self._prompt_text(harness_input)[:80],
-                        project_id=self._resolve_project_id(request, session=session),
-                        conversation_id=conv_id,
-                        harness=harness_name,
-                        model=request.model,
-                        reasoning_effort=request.reasoning_effort,
-                    )
+                    try:
+                        conversation = conversation_service.create_conversation(
+                            topic=self._prompt_text(harness_input)[:80],
+                            project_id=self._resolve_project_id(request, session=session),
+                            conversation_id=conv_id,
+                            harness=harness_name,
+                            model=request.model,
+                            reasoning_effort=request.reasoning_effort,
+                        )
+                    except IntegrityError:
+                        # A second first send for this new conversation (a
+                        # double click, a client retry) inserted it between
+                        # the read above and this insert. Go on with that row:
+                        # the registry refuses whichever question comes
+                        # second, as it does any duplicate send.
+                        session.rollback()
+                        conversation = conversation_service.get_conversation(conv_id)
             else:
                 # Client sent a non-UUID id (e.g. the legacy timestamp
                 # allocator, or a name-based format) — it can't become the
@@ -989,33 +999,45 @@ class ResponsesHandler:
         stream ends — so persistence happens before any frame is emitted: the
         client can never see a completed turn the DB does not have, and no
         pending row is needed. Both rows are saved in one unit, under the
-        conversation's write lock."""
-        try:
-            item_id = f"msg-{conv_id.hex[:12]}"
-            delta = {
-                "type": "response.output_text.delta",
-                "sequence_number": 2,
-                "item_id": item_id,
-                "delta": route.text,
-                "response_route": route.route,
-                "response_route_reason": route.reason,
-            }
+        conversation's write lock.
 
-            def save_turn(session: ScopedSession) -> _DirectTurn:
-                service = ConversationService(session)
-                user_message = service.save_user_message(conv_id, original_content)
-                assistant_message = service.save_assistant_turn(
-                    conv_id, route.text, [delta, {"type": "response.completed"}],
-                    harness="cowork-direct",
-                )
-                return _DirectTurn(
-                    user_message_id=user_message.id,
-                    assistant_message_id=assistant_message.id if assistant_message is not None else None,
-                )
+        The save, the frames that report it and the terminal record are one
+        step a Stop cannot split: a Stop that lands during the save waits for
+        it, so the stream ends with what the database holds."""
+        item_id = f"msg-{conv_id.hex[:12]}"
+        delta = {
+            "type": "response.output_text.delta",
+            "sequence_number": 2,
+            "item_id": item_id,
+            "delta": route.text,
+            "response_route": route.route,
+            "response_route_reason": route.reason,
+        }
 
+        def save_turn(session: ScopedSession) -> _DirectTurn | None:
+            if lifecycle.discarded:
+                # The turn was deleted while this save waited for a
+                # connection. Its rows would land in the history the delete
+                # cut.
+                return None
+            service = ConversationService(session)
+            user_message = service.save_user_message(conv_id, original_content)
+            assistant_message = service.save_assistant_turn(
+                conv_id, route.text, [delta, {"type": "response.completed"}],
+                harness="cowork-direct",
+            )
+            return _DirectTurn(
+                user_message_id=user_message.id,
+                assistant_message_id=assistant_message.id if assistant_message is not None else None,
+            )
+
+        async def answer() -> None:
             async with conversation_writes(conv_id):
                 saved = await run_db(save_turn, scope=scope_from_principal(self.principal))
-
+            if saved is None or lifecycle.discarded:
+                # Deleted while it saved: its buffer is gone, and writing a
+                # terminal record would recreate it for the next turn to tail.
+                return
             response = Response(status=ResponseStatus.created, model=route.model)
             # conversation_id/harness sit at the event root, like both
             # delegated paths — the GUI reads them there.
@@ -1051,6 +1073,9 @@ class ResponsesHandler:
                 completed_frame["assistant_message_id"] = str(saved.assistant_message_id)
             await buffer.append("sse", {"sse": sse_frame("response.completed", completed_frame)})
             await buffer.close("completed")
+
+        try:
+            await run_to_completion(answer())
         except asyncio.CancelledError:
             if lifecycle.discarded:
                 # Same reasoning as _produce_remote's discarded branch.
@@ -1917,8 +1942,9 @@ class ResponsesHandler:
         question (pending) so a mid-turn refresh shows it, and loads the
         conversation for the harness, which reads history (get_ordered_messages
         leaves the pending row out, so the current input isn't double-fed) in
-        units of its own. The last unit finalizes the pending flag and saves
-        the assistant turn (ENG-1231). Both hold the conversation's write lock.
+        units of its own. The last unit saves the assistant turn and clears
+        the question's pending flag in one commit (ENG-1231). Both hold the
+        conversation's write lock.
         Never reaches the HTTP response: readers tail the buffer.
         """
         lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
@@ -2008,16 +2034,41 @@ class ResponsesHandler:
                 await buffer.append("sse", {"sse": self._inject_completion_id(completed_frame, saved.message_id)})
             await buffer.close("completed")
 
-        try:
+        async def end_turn(
+            reason: TerminalReason, failed_frame: Callable[[str | None], str] | None = None,
+        ) -> None:
+            """Save the answer as it stands, then write the failure frame, if
+            any, carrying the saved row's id, and the terminal record. The
+            cancel and error branches below run it under run_to_completion, so
+            a second Stop or a shutdown that lands during the save waits for
+            it, and the stream still ends the way this turn did."""
+            saved = await persist()
+            if lifecycle.discarded:
+                # Deleted while it saved: see finish().
+                return
+            if failed_frame is not None:
+                await buffer.append("sse", {"sse": failed_frame(saved.assistant_message_id)})
+            await buffer.close(reason)
+
+        async def start() -> Conversation:
+            """The turn's first unit, under the conversation's write lock.
+            Run under run_to_completion: a cancel that lands while the unit
+            writes waits for it, so the branches below know the question it
+            saved and finalize it instead of leaving it pending."""
+            nonlocal question_id
             async with conversation_writes(conv_id):
                 started = await run_db(
                     partial(_start_turn, conversation_id=conv_id, content=original_content, sent_at=sent_at),
                     scope=scope,
                 )
             question_id = started.question_id
+            return started.conversation
+
+        try:
+            conversation = await run_to_completion(start())
             harness = get_harness(harness_name)
             stream = harness.stream_response(
-                conversation=started.conversation, input=harness_input, model=model,
+                conversation=conversation, input=harness_input, model=model,
                 reasoning_effort=reasoning_effort, disabled_connections=disabled,
                 trace_tags=trace_tags, trace_metadata=trace_metadata,
             )
@@ -2058,12 +2109,10 @@ class ResponsesHandler:
                 collected_events.append(response_failed_payload(
                     INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
                 ))
-                saved = await persist()
-                await buffer.append("sse", {"sse": response_failed_sse(
+                await run_to_completion(end_turn("interrupted", lambda message_id: response_failed_sse(
                     INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
-                    assistant_message_id=saved.assistant_message_id,
-                )})
-                await buffer.close("interrupted")
+                    assistant_message_id=message_id,
+                )))
                 return
             # Nothing special is emitted on cancellation.
             # The partial text and events generated before cancellation are persisted.
@@ -2072,8 +2121,7 @@ class ResponsesHandler:
             # so retire it here — otherwise the persisted log holds a published
             # question that nothing in it ever closes.
             collected_events.extend(cancelled_ask_user_retirements(collected_events))
-            await persist()
-            await buffer.close("cancelled")
+            await run_to_completion(end_turn("cancelled"))
             return
         except Exception as exc:
             # Resolve the model-403 info once and hand it to friendly_turn_error
@@ -2244,12 +2292,9 @@ class ResponsesHandler:
             # an id; only the append/persist order relative to the SSE frame
             # below actually changed.
             collected_events.append(failed)
-            saved = await persist()
-            await buffer.append("sse", {"sse": response_failed_sse(
-                message, code, **extra,
-                assistant_message_id=saved.assistant_message_id,
-            )})
-            await buffer.close("error")
+            await run_to_completion(end_turn("error", lambda message_id: response_failed_sse(
+                message, code, **extra, assistant_message_id=message_id,
+            )))
         finally:
             await _seal_unterminated_buffer(buffer, lifecycle, conv_id, request_id=corr)
 

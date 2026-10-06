@@ -587,6 +587,8 @@ def test_turn_terminal_reason_with_real_registry_cancel(tmp_path):
     from cowork.streaming.buffer import FileStreamBuffer
     from cowork.streaming.registry import registry
 
+    from _fakes import opens
+
     buf = FileStreamBuffer(tmp_path / "turn.jsonl")
     conversation_id = "eng688-real-cancel-test"
 
@@ -606,7 +608,7 @@ def test_turn_terminal_reason_with_real_registry_cancel(tmp_path):
         handle = await registry.start(
             conversation_id=conversation_id,
             turn_id=0,
-            open_buffer=lambda: buf,
+            open_buffer=opens(buf),
             produce=lambda _buffer: producer(),
         )
         await started.wait()
