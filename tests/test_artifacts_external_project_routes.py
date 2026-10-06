@@ -424,6 +424,48 @@ def test_comments_resolve_an_artifact_in_a_chosen_folder(projects_root, tmp_path
     assert (artifact / ".revisions").is_dir()
 
 
+def test_comments_on_a_restricted_publication_in_a_chosen_folder_go_to_the_cloud(
+    projects_root, tmp_path, monkeypatch
+):
+    """The publication record decides the route. Read without the session, a
+    chosen folder's record comes back empty and its threads silently land in the
+    local journal instead of the cloud thread the published page shows."""
+    from fastapi.responses import JSONResponse
+
+    from cowork.api.v1.endpoints import comments as comments_endpoint
+
+    client = _client()
+    comment_artifact_id = "cccccccc-cccc-4ccc-8ccc-cccccccccc04"
+    _project, _folder, artifact = _adopted(
+        client, tmp_path, "routes-comments-cloud", slug="notes", artifact_id=comment_artifact_id
+    )
+    (artifact / ".published.json").write_text(
+        json.dumps(
+            {
+                "index.html": {
+                    "report_id": "c675003f",
+                    "url": "https://view.dev.mindshub.ai/view/b9996ebec/c675003f",
+                    "published": True,
+                    "mode": "restricted",
+                }
+            }
+        )
+    )
+    forwarded: list[tuple[str, str, str]] = []
+
+    async def _forward(request, user_dir, report_id, subpath):
+        forwarded.append((user_dir, report_id, subpath))
+        return JSONResponse([])
+
+    monkeypatch.setattr(comments_endpoint, "forward_comments_rest", _forward)
+
+    res = client.get(f"/api/v1/artifact-comments/artifact/{comment_artifact_id}/threads")
+
+    assert res.status_code == 200, res.text
+    assert forwarded == [("b9996ebec", "c675003f", "threads")]
+    assert not (artifact / ".revisions").exists()
+
+
 def test_a_fullstack_backend_can_launch_from_a_chosen_folder(
     projects_root, tmp_path, monkeypatch
 ):
