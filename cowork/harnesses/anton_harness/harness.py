@@ -5,12 +5,15 @@ from pathlib import Path
 import shutil
 import tempfile
 
+from sqlalchemy.orm import object_session
+
 from cowork.build_info import account_kwargs, supported_kwargs, surface_kwarg
 from cowork.common.chat_session import build_chat_session, close_session_scratchpads
 from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.logger import get_logger
 from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, scope_of_session
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
 from cowork.models.conversation import Conversation
@@ -18,6 +21,7 @@ from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
+from cowork.services.conversation_folders import ConversationFolderService, folder_refusal
 from cowork.services.projects import display_label
 
 
@@ -433,6 +437,71 @@ def _conversation_attachment_context(conversation) -> str:
             exc_info=True,
         )
         return _ATTACHMENT_AFFORDANCE
+
+
+def _working_folder_paths(conversation, channel_context: ChannelContext | None) -> list[str]:
+    """The chat's working folders the agent may use this turn, as absolute paths.
+
+    Empty for a channel turn: the people in a Slack or Telegram chat are not the
+    desktop user who added the folders. Each folder is checked again, so one
+    that vanished or now resolves into Cowork's own data is left out. Fails
+    closed: an error offers no folders and is logged.
+    """
+    if channel_context is not None:
+        return []
+    try:
+        db_session = object_session(conversation)
+        if db_session is None:
+            return []
+        scope = scope_of_session(db_session) or LOCAL_SCOPE
+        if scope.org_mode:
+            return []
+        _conversation, rows = ConversationFolderService(
+            ScopedSession(db_session, scope)
+        ).list_folders(conversation.id)
+        project_path = conversation.project.path if conversation.project else None
+        return [row.path for row in rows if folder_refusal(row.path, project_path) is None]
+    except Exception:
+        logger.warning(
+            "Failed to load working folders for conversation %s; none are offered this turn",
+            getattr(conversation, "id", "<unknown>"),
+            exc_info=True,
+        )
+        return []
+
+
+def _file_access_rules(folder_paths: list[str]) -> str:
+    """The prompt sentences that say which files outside the project are allowed.
+
+    Without working folders this is exactly the text every turn carried before
+    them, so a chat that never adds one sends an unchanged prompt.
+    """
+    if folder_paths:
+        return (
+            "The only other files that you are allowed to access are any items that are attached to the conversation and the files in the working folders below."
+            "Access to any files not attached to the conversation and located outside both the project and the working folders is strictly forbidden."
+        )
+    return (
+        "The only other files that you are allowed to access are any items that are attached to the conversation."
+        "Access to any files not attached to the conversation or located outside the project is strictly forbidden."
+    )
+
+
+def _working_folders_context(paths: list[str]) -> str:
+    """Prompt fragment granting the agent the chat's working folders, or "" for none."""
+    if not paths:
+        return ""
+    listed = "\n".join(f"  - {path}" for path in paths)
+    return (
+        " The user has also added these working folders to THIS conversation:\n"
+        + listed
+        + "\nYou may read and write files in them through the scratchpad, using these absolute paths."
+        " Before you change, move or delete any file in a working folder, ask the user for permission first."
+        " Keep creating artifacts in the project as usual."
+        " Leave any .anton/ directory inside a working folder alone."
+        " To find a file in a working folder, list or search the folder in the scratchpad;"
+        " do not use select_path for it, because select_path only sees the project."
+    )
 
 
 @register
@@ -989,6 +1058,7 @@ class AntonHarness:
         # the agent must be told their exact paths or it scans only the
         # project root and wrongly reports "no files uploaded" (Cyberdeck bug).
         attachment_context = _conversation_attachment_context(conversation)
+        folder_paths = _working_folder_paths(conversation, channel_context)
 
         project_context = (
             # Conversational only. The next line hands the agent the real path,
@@ -999,9 +1069,8 @@ class AntonHarness:
             "You can perform operations on these files via the scratchpad."
             "You can freely read any of these project files."
             "If you need to perform any actions on these files, ask the user for permission first."
-            "The only other files that you are allowed to access are any items that are attached to the conversation."
-            "Access to any files not attached to the conversation or located outside the project is strictly forbidden."
-            "ALWAYS use the scratchpad to interact with files."
+            + _file_access_rules(folder_paths)
+            + "ALWAYS use the scratchpad to interact with files."
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
             # Each turn's scratchpad processes are killed when the turn ends
             # (close_session_scratchpads), with their whole process group.
@@ -1009,6 +1078,7 @@ class AntonHarness:
             "variables carry over to the next turn, running servers do not. "
             "For a service that must keep running, build a full-stack artifact and start it with `launch_backend`."
             + attachment_context
+            + _working_folders_context(folder_paths)
         )
         output_context = (
             # Artifacts now live in their own visible folder at the
