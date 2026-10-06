@@ -2279,6 +2279,35 @@ async def test_produce_remote_stays_noninteractive_when_the_handler_is_built_tha
     assert captured["interactive"] is False
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ask_user_flag,interactive", [("false", True), ("true", False)])
+async def test_produce_remote_always_renders_tool_messages(monkeypatch, ask_user_flag, interactive):
+    """The UI renders a tool's message whether or not it can answer
+    questions: neither the ask_user kill switch nor a scheduled turn
+    (interactive=False) may turn the brief back into a relayed summary."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_ASK_USER_ENABLED", ask_user_flag)
+    get_app_settings.cache_clear()
+    saved, captured = {}, {}
+    handler = _remote_handler(monkeypatch, saved)
+    handler.interactive = interactive
+
+    async def fake_replies(**kwargs):
+        captured.update(kwargs)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    try:
+        await handler._produce_remote(
+            conv_id=uuid4(), input_text="hi", original_content="hi",
+            model="anton", harness_id="anton", buffer=_RecBuffer(),
+        )
+    finally:
+        get_app_settings.cache_clear()
+    assert captured["tool_messages"] is True
+
+
 _ASK_STEP = {"step": "ask_user", "id": "ask:1", "prompt": "Which database?",
              "options": [{"value": "pg"}, {"value": "my"}], "select": "one",
              "allow_custom": True, "timeout_s": 300}
