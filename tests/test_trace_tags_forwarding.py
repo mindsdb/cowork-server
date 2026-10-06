@@ -48,7 +48,7 @@ def _run_harness(monkeypatch, session):
 
     async def _fake_build(
         self, conversation, model=None, reasoning_effort=None, disabled_connections=None, channel_context=None,
-        renders_tool_messages=True,
+        tool_messages=False,
     ):
         return session, None, None
 

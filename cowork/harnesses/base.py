@@ -63,9 +63,10 @@ class HarnessProvider(Protocol):
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
         channel_context: ChannelContext | None = None,
-        # False when the caller hands back only the final answer text (the
-        # non-streaming API): a tool's message to the user would reach nobody.
-        renders_tool_messages: bool = True,
+        # True only for a client that renders a tool's message to the user
+        # as an agent message (the cowork UI). A channel bot or the
+        # non-streaming API gets only the answer text.
+        tool_messages: bool = False,
     ) -> AsyncIterator[str]:
         ...
 
