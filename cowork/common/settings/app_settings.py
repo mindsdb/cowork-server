@@ -618,6 +618,15 @@ class TurnQueueSettings(Settings):
         repr=False,
         description="Secret for the dedicated datasource producer service role.",
     )  # COWORK_TURN_DATASOURCE_PRODUCER_KEY
+    datasource_gateway_base_url: str = Field(
+        default="",
+        description=(
+            "In-cluster base URL of the datasource gateway, used to validate a captured "
+            "connection. The Service name, as auth is addressed (http://mindshub-inference): "
+            "the public datasource ingress admits execution alone. Empty means no validation "
+            "runs and a captured connection stays pending."
+        ),
+    )  # COWORK_TURN_DATASOURCE_GATEWAY_BASE_URL
 
 
 # The OpenAI API an openai_compatible provider's planning and coding roles call.
@@ -680,6 +689,20 @@ class AppSettings(Settings):
                 f"http://127.0.0.1:{self.renderer_port}",
             ]
         return self
+
+    # Which connector methods this deployment may run as a cloud datasource:
+    # `{"manifest_version": 1, "enabled": ["postgres:host-port"]}`. A string,
+    # not a dict: pydantic-settings parses a dict field from the environment
+    # while the settings object is built, so malformed JSON would raise before
+    # any policy code runs and crash the process at import. Parsed, and failed
+    # closed, in services/connectors/datasource_capabilities.py instead.
+    # One spelling only: a second alias would also become an unprefixed
+    # environment name for a policy that decides what this deployment stores.
+    datasource_capabilities: str = Field(
+        default="",
+        validation_alias=AliasChoices("COWORK_DATASOURCE_CAPABILITIES"),
+        description="Versioned datasource capability manifest as JSON; empty means nothing is enabled.",
+    )
 
     require_auth: bool = Field(
         default=False,

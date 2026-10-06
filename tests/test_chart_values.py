@@ -41,6 +41,11 @@ CAPABILITIES = "COWORK_DATASOURCE_CAPABILITIES"
 # until it does; the gate's own change adds the environment here and sets
 # both deployment scalars in its values file.
 ENABLED_ENVIRONMENTS: frozenset[str] = frozenset()
+# TEST ENABLEMENT, integration branch only, never merged or cherry-picked. The
+# base values switch both on so a pull request environment offers them; the
+# released expectations are "false" and "".
+_BASE_TURNS_ENABLED = "true"
+_BASE_CAPABILITIES = '{"manifest_version": 1, "enabled": ["postgres:host-port", "mysql:host-password"]}'
 
 
 @dataclass(frozen=True)
@@ -90,7 +95,7 @@ def base() -> list[_Env]:
 
 
 def test_datasource_grants_are_off_in_the_base_and_on_only_where_the_gate_passed(base):
-    assert _deployment(BASE)["datasourceTurnsEnabled"] == "false"
+    assert _deployment(BASE)["datasourceTurnsEnabled"] == _BASE_TURNS_ENABLED
     assert _entry(base, FLAG).value == "{{ $.Values.datasourceTurnsEnabled }}"
     for env_values in ENVIRONMENTS:
         environment = env_values.stem.removeprefix("values-")
@@ -104,7 +109,7 @@ def test_datasource_grants_are_off_in_the_base_and_on_only_where_the_gate_passed
 def test_no_datasource_method_is_offered_in_the_released_values(base):
     """The list of methods a deployment may run, empty until a gate says
     otherwise, and set only where grants are on."""
-    assert _deployment(BASE)["datasourceCapabilities"] == ""
+    assert _deployment(BASE)["datasourceCapabilities"] == _BASE_CAPABILITIES
     assert _entry(base, CAPABILITIES).value == "{{ $.Values.datasourceCapabilities }}"
     for env_values in ENVIRONMENTS:
         environment = env_values.stem.removeprefix("values-")

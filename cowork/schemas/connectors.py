@@ -1,5 +1,6 @@
 import re
-from typing import Any
+from datetime import datetime
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -324,3 +325,87 @@ class OAuthStartResponse(BaseModel):
 class DisabledConnection(BaseModel):
     engine: str
     name: str
+
+
+class DatasourceTls(BaseModel):
+    """Transport security for a cloud datasource connection.
+
+    `system` and `custom_ca` verify the chain and the hostname and differ only
+    in which authorities they trust. `encrypted` encrypts without checking who
+    answered, `disabled` does neither, and `prefer` takes encryption where the
+    server offers it. The default is `prefer`, because a self-hosted server
+    usually has the certificate its installer generated for it, or none, and
+    the form no longer asks.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Literal["system", "custom_ca", "encrypted", "disabled", "prefer"] = "prefer"
+    ca_pem: str | None = None
+
+
+class DatasourceCreateRequest(BaseModel):
+    """A cloud datasource connection as the client submits it.
+
+    Either structured fields or a DSN, never both; the normalizer in
+    services/connectors/datasources.py turns it into auth's payload.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    connector_id: str
+    method: str
+    name: str = Field(min_length=1, max_length=128)
+    input_mode: Literal["structured", "dsn"] = "structured"
+    dsn: str | None = None
+    host: str | None = None
+    port: int | None = None
+    database: str | None = None
+    # `schema` on the wire, since that is what the engine calls it; the field
+    # is renamed here only because the name shadows an attribute of BaseModel.
+    db_schema: str | None = Field(default=None, alias="schema")
+    username: str | None = None
+    password: str | None = None
+    tls: DatasourceTls | None = None
+
+
+class DatasourceEditRequest(DatasourceCreateRequest):
+    """An edit, guarded by the connection revision the client read.
+
+    Auth moves the revision on every edit, a rename included, so an edit made
+    from a stale read is refused; the credential version is not the guard.
+    """
+
+    expected_revision: int = Field(ge=1)
+
+
+class DatasourceConnectionResponse(BaseModel):
+    """Auth's connection metadata, allowlisted.
+
+    extra="ignore" so a field auth adds later is dropped here rather than
+    forwarded to a client this server never vetted it for.
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: int
+    connector_id: str
+    method: str
+    name: str
+    status: str
+    credential_version: int
+    revision: int
+    host_masked: str
+    port: int | None = None
+    database: str
+    db_schema: str | None = Field(default=None, alias="schema")
+    username: str
+    tls_mode: str
+    validation_error: str | None = None
+    # The gateway's own word for a refusal, on the three routes that run a
+    # validation attempt. Auth stores a verdict and not a cause, so without
+    # this a failed connection can say nothing a caller could act on. Absent
+    # everywhere no attempt was made.
+    validation_code: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None

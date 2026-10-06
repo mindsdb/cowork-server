@@ -1,5 +1,6 @@
 """Database connection and session management using SQLAlchemy"""
 
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlmodel import Session as SQLModelSession
@@ -17,9 +18,28 @@ _session_factories = {}
 
 
 def _is_client_error(exc: BaseException) -> bool:
-    """True for HTTP exceptions answered as 4xx; those are expected outcomes."""
+    """True for exceptions answered as 4xx; those are expected outcomes.
+
+    RequestValidationError carries the offending request body, so logging it
+    with a traceback would put a submitted password or DSN in the log.
+    """
+    if isinstance(exc, RequestValidationError):
+        return True
     status = getattr(exc, "status_code", None)
     return isinstance(status, int) and 400 <= status < 500
+
+
+def _client_error_summary(exc: BaseException) -> str:
+    """Describe a client error without repeating what the caller submitted.
+
+    RequestValidationError's str() embeds the offending request body, which on
+    a connector submission is a password or a DSN, so it is reduced to the
+    locations that failed.
+    """
+    if isinstance(exc, RequestValidationError):
+        locations = [error.get("loc") for error in exc.errors()]
+        return f"invalid request data at {locations}"
+    return str(exc)
 
 def _create_engine(db_uri: str):
     is_sqlite = db_uri.startswith("sqlite")
@@ -112,7 +132,7 @@ def get_session(db_uri: str = settings.database.uri):
         # steer during an approval, a 404 for a missing task); it still rolls
         # the transaction back, but it is not an error worth a traceback.
         if _is_client_error(e):
-            logger.debug(f"Session rolled back after a client error: {e}")
+            logger.debug(f"Session rolled back after a client error: {_client_error_summary(e)}")
         else:
             logger.exception(f"❌ Session error: {str(e)}")
         db.rollback()

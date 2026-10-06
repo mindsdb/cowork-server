@@ -132,10 +132,12 @@ deployment:
   # The two switches for cloud datasource turns, templated into
   # COWORK_TURN_DATASOURCE_ENABLED and COWORK_DATASOURCE_CAPABILITIES below. The
   # release gate replaces these scalars in values-<env>.yaml, since an extraEnvs
-  # entry would render a second copy of the variable. Off in the base, so a PR
-  # environment, which renders this file alone, stays off.
-  datasourceTurnsEnabled: "false"
-  datasourceCapabilities: ""
+  # entry would render a second copy of the variable.
+  # TEST ENABLEMENT, integration branch only, never merged or cherry-picked:
+  # a pull request environment renders the base alone, so both switches are
+  # on here. On `staging` they are "false" and "", and the guard expects that.
+  datasourceTurnsEnabled: "true"
+  datasourceCapabilities: '{"manifest_version": 1, "enabled": ["postgres:host-port", "mysql:host-password"]}'
 
   image:
     # The build-push-ecr action derives the ECR repo name from the GitHub repo
