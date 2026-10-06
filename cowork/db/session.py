@@ -80,12 +80,15 @@ def get_session_factory(engine):
     return _session_factories[engine_id]
 
 
-def get_session(db_uri: str = settings.database.uri):
+def get_session():
     """
     FastAPI dependency that provides a database session with automatic cleanup.
 
     This is a generator-based dependency that ensures sessions are always closed
     after the request completes, preventing database connection leaks.
+
+    It takes no parameters: FastAPI reads a dependency's parameters from the
+    request, so the database URI comes from settings only.
 
     Usage:
         @router.get("/example")
@@ -93,14 +96,11 @@ def get_session(db_uri: str = settings.database.uri):
             # Session will be automatically closed after this function completes
             pass
 
-    Args:
-         db_uri: Database connection URI (defaults to settings value)
-
     Yields:
         SQLModelSession: Database session that will be automatically closed
     """
 
-    engine = get_engine(db_uri=db_uri)
+    engine = get_engine(db_uri=settings.database.uri)
     session_factory = get_session_factory(engine)
 
     db = session_factory()

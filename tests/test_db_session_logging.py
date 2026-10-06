@@ -16,7 +16,7 @@ def _drive(monkeypatch: pytest.MonkeyPatch, exc: BaseException) -> tuple[mock.Mo
     logger = mock.Mock()
     monkeypatch.setattr(db_session, "logger", logger)
 
-    generator = db_session.get_session(db_uri="sqlite://")
+    generator = db_session.get_session()
     next(generator)
     with pytest.raises(type(exc)):
         generator.throw(exc)
