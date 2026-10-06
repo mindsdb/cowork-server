@@ -10,7 +10,7 @@ import os
 import shutil
 import stat
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -262,6 +262,11 @@ class LocalCopyManager:
                 raise self._copy_failure("The task copy could not be saved for recovery", exc) from exc
         shutil.rmtree(workspace, ignore_errors=True)
         shutil.rmtree(baseline, ignore_errors=True)
+
+    def match(self, target: Path, desired: Path) -> None:
+        """Make ``target``'s reviewable content identical to ``desired``'s."""
+        current, wanted = self._manifests(target, desired)
+        self._replace_changed(target, desired, self._changed(target, current, desired, wanted))
 
     def _baseline_for(self, workspace: Path) -> Path:
         actual = workspace.resolve()
