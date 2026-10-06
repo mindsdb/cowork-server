@@ -76,7 +76,6 @@ class WorkspaceRetention:
         self.is_remote = is_remote
         # Run status lives in the control plane; the stored session can lag it.
         self.control_view = control_view
-        self._restore_locks: dict[str, threading.Lock] = {}
 
     def releasable(self, session: CodingSession, *, reserved: bool = False) -> bool:
         """Whether releasing this task's workspace can disturb nothing in use.
@@ -116,21 +115,24 @@ class WorkspaceRetention:
                 # An idle engine process or terminal can hold the folder open,
                 # which stops it being removed on Windows.
                 self.runtimes.close_locked(session_id)
-                released: list[_Item] = []
+                # Marked first, so a failed write leaves the folders in place
+                # and a crash part-way leaves a task that restores on next use.
+                self._mark_released(session_id, utc_now())
+                items = self._items(session)
                 try:
-                    for item in self._items(session):
+                    for item in items:
                         if not self.workspaces.release(item.key, item.source_path, item.workspace_path, item.kind):
                             raise WorkspaceError(f"{item.workspace_path} cannot be released safely")
-                        released.append(item)
                 except Exception as exc:
                     logger.info("Keeping the workspace for coding task %s: %s", session_id, exc)
-                    self._restore_items(released)
+                    try:
+                        self._restore_missing(items)
+                    except Exception:
+                        # Still marked, so the next use retries the restore.
+                        logger.exception("Could not restore the workspace of coding task %s after a failed release", session_id)
+                    else:
+                        self._mark_released(session_id, None)
                     return False
-            self.store.update_session(
-                session_id,
-                lambda current: setattr(current, "workspace_released_at", utc_now()),
-                touch_updated_at=False,
-            )
             return True
         finally:
             self._unreserve(session_id)
@@ -144,8 +146,10 @@ class WorkspaceRetention:
         if self.store.load_session(session_id).workspace_released_at is None:
             return
         # Opening a task requests several views at once; the first rebuilds
-        # the workspace and the others wait for it rather than fail.
-        with self._restore_lock(session_id):
+        # the workspace and the others wait for it rather than fail. This is
+        # the runtime lock so terminal calls, which already hold it, cannot
+        # take the two locks in the opposite order.
+        with self.runtimes.session_lock(session_id):
             self._restore(session_id, reserved=reserved)
 
     def _restore(self, session_id: str, *, reserved: bool) -> None:
@@ -160,16 +164,8 @@ class WorkspaceRetention:
             session = self.store.load_session(session_id)
             if session.workspace_released_at is None:
                 return
-            with self.runtimes.session_lock(session_id):
-                self._restore_items(
-                    [item for item in self._items(session) if not Path(item.workspace_path).exists()],
-                    strict=True,
-                )
-            self.store.update_session(
-                session_id,
-                lambda current: setattr(current, "workspace_released_at", None),
-                touch_updated_at=False,
-            )
+            self._restore_missing(self._items(session))
+            self._mark_released(session_id, None)
         finally:
             if not reserved:
                 self._unreserve(session_id)
@@ -209,18 +205,17 @@ class WorkspaceRetention:
                 logger.exception("Could not release the workspace for coding task %s", session.id)
         return released
 
-    def _restore_items(self, items: list[_Item], *, strict: bool = False) -> None:
+    def _restore_missing(self, items: list[_Item]) -> None:
         for item in items:
-            try:
+            if not Path(item.workspace_path).exists():
                 self.workspaces.restore(item.key, item.source_path, item.workspace_path, item.kind)
-            except Exception:
-                if strict:
-                    raise
-                logger.exception("Could not restore the workspace %s after a failed release", item.key)
 
-    def _restore_lock(self, session_id: str) -> threading.Lock:
-        with self.lock:
-            return self._restore_locks.setdefault(session_id, threading.Lock())
+    def _mark_released(self, session_id: str, released_at: datetime | None) -> None:
+        self.store.update_session(
+            session_id,
+            lambda current: setattr(current, "workspace_released_at", released_at),
+            touch_updated_at=False,
+        )
 
     def _reserve(self, session_id: str) -> bool:
         with self.lock:
