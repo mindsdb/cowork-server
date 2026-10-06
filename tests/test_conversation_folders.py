@@ -244,6 +244,17 @@ def test_the_same_folder_twice_is_a_duplicate(stores, user_folders, tmp_path):
             service.add_folder(conversation.id, str(docs / ".." / "docs"))
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="case-insensitive volume")
+def test_a_case_variant_of_an_attached_folder_is_a_duplicate_on_macos(stores, user_folders, tmp_path):
+    docs, _ = user_folders
+    with Session(_fk_enforcing_engine(), expire_on_commit=False) as session:
+        service, conversation, _ = _service_chat(session, tmp_path, "svc-case")
+        service.add_folder(conversation.id, str(docs))
+
+        with pytest.raises(FolderAlreadyAttached):
+            service.add_folder(conversation.id, str(docs.parent / docs.name.upper()))
+
+
 def test_a_seventeenth_folder_is_refused(stores, tmp_path):
     with Session(_fk_enforcing_engine(), expire_on_commit=False) as session:
         service, conversation, _ = _service_chat(session, tmp_path, "svc-cap")

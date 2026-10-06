@@ -186,3 +186,23 @@ def test_org_mode_refuses_every_folder_route_for_an_authenticated_member(
     ]
 
     assert [r.status_code for r in responses] == [403] * 4, [r.text for r in responses]
+
+
+def test_a_folder_swapped_into_app_data_after_attaching_is_no_longer_served(local_mode, tmp_path):
+    """Checked again on every use, not only when it was attached."""
+    client = _client()
+    chat = _chat(client)
+    folder = _folder(tmp_path, "swapped")
+    folder_id = _attach(client, chat, folder).json()["id"]
+
+    for child in folder.iterdir():
+        child.unlink()
+    folder.rmdir()
+    folder.symlink_to(get_app_settings().connector.vault_dir, target_is_directory=True)
+    Path(get_app_settings().connector.vault_dir).mkdir(parents=True, exist_ok=True)
+
+    listed = client.get(f"/api/v1/conversations/{chat}/folders", headers=_LOOPBACK_HOST)
+    files = client.get(f"/api/v1/conversations/{chat}/folders/{folder_id}/files", headers=_LOOPBACK_HOST)
+
+    assert [f["available"] for f in listed.json()["folders"]] == [False]
+    assert files.status_code == 404, files.text
