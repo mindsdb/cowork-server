@@ -501,6 +501,8 @@ def _working_folders_context(paths: list[str]) -> str:
         " Leave any .anton/ directory inside a working folder alone."
         " To find a file in a working folder, list or search the folder in the scratchpad;"
         " do not use select_path for it, because select_path only sees the project."
+        " When the user names a file without saying which folder, search the project and every working folder"
+        " before saying it is missing. If it is not found, say so and ask; never answer about a different file instead."
     )
 
 
