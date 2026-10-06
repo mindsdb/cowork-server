@@ -11,7 +11,7 @@ import os
 import shutil
 import stat
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -305,8 +305,17 @@ class LocalCopyManager:
         _force_remove(baseline)
         return True
 
-    def restore(self, key: str, source: Path, workspace: Path) -> None:
-        """Rebuild a released copy from the current source plus its saved changes."""
+    def restore(
+        self,
+        key: str,
+        source: Path,
+        workspace: Path,
+        prepare: Callable[[str, Path], PreparedLocalCopy] | None = None,
+    ) -> None:
+        """Rebuild a released copy from the current source plus its saved changes.
+
+        ``prepare`` builds the fresh copy; it defaults to a plain folder copy.
+        """
         relative = managed_key(key)
         release = self._release_dir(relative)
         changes = release / "changes.json"
@@ -322,7 +331,7 @@ class LocalCopyManager:
             _force_remove(leftover)
             if leftover.exists():
                 raise LocalCopyError("Part of this task's old copy is still in use. Close programs using it and try again")
-        prepared = self.prepare(key, source)
+        prepared = (prepare or self.prepare)(key, source)
         try:
             self._replace_changed(prepared.baseline, release / "before", changed)
             self._replace_changed(prepared.workspace, release / "after", changed)
@@ -334,6 +343,11 @@ class LocalCopyManager:
 
     def is_released(self, key: str) -> bool:
         return (self._release_dir(managed_key(key)) / "changes.json").is_file()
+
+    def match(self, target: Path, desired: Path) -> None:
+        """Make ``target``'s reviewable content identical to ``desired``'s."""
+        current, wanted = self._manifests(target, desired)
+        self._replace_changed(target, desired, self._changed(target, current, desired, wanted))
 
     def discard_release(self, key: str) -> None:
         _force_remove(self._release_dir(managed_key(key)))
