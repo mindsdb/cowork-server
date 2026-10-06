@@ -779,12 +779,7 @@ class WorkspaceManager:
         """
         with self._mutation_lock:
             if kind == WorkspaceKind.local_copy:
-                try:
-                    return self.local_copies.release(
-                        key, Path(workspace_path), before_remove=self._remove_inner_worktrees,
-                    )
-                except LocalCopyError as exc:
-                    raise WorkspaceError(str(exc)) from exc
+                return self._release_folder_copy(key, Path(source_path), Path(workspace_path))
             if kind != WorkspaceKind.git_worktree:
                 return False
             actual = self._managed_worktree(key, workspace_path)
@@ -819,12 +814,15 @@ class WorkspaceManager:
         """Recreate a released workspace at its original path with its changes."""
         with self._mutation_lock:
             if kind == WorkspaceKind.local_copy:
+                source = Path(source_path)
                 try:
                     self.local_copies.restore(
-                        key, Path(source_path), Path(workspace_path), prepare=self._prepare_folder_copy,
+                        key, source, Path(workspace_path), prepare=self._prepare_released_folder_copy,
                     )
                 except LocalCopyError as exc:
                     raise WorkspaceError(str(exc)) from exc
+                for repository, ref, _head in self._pinned_inner_heads(key, source):
+                    self.git.run(repository, "update-ref", "-d", ref, check=False)
                 return
             if kind != WorkspaceKind.git_worktree:
                 return
@@ -873,6 +871,9 @@ class WorkspaceManager:
             source = Path(source_path)
             if source.is_dir() and self._git_root(source) is not None:
                 self.git.run(source, "update-ref", "-d", self._release_ref(key), check=False)
+            if source.is_dir():
+                for repository, ref, _head in self._pinned_inner_heads(key, source):
+                    self.git.run(repository, "update-ref", "-d", ref, check=False)
             self.local_copies.discard_release(key)
 
     def _has_nested_repository(self, worktree: Path) -> bool:
@@ -908,6 +909,68 @@ class WorkspaceManager:
     @staticmethod
     def _release_ref(key: str) -> str:
         return "refs/cowork/released/" + managed_key(key).as_posix()
+
+    @staticmethod
+    def _inner_release_ref(key: str, relative: str) -> str:
+        return f"refs/cowork/released-inner/{managed_key(key).as_posix()}/{relative}"
+
+    def _release_folder_copy(self, key: str, source: Path, workspace: Path) -> bool:
+        """Release a folder copy, keeping the commits made in its inner worktrees.
+
+        The saved file changes carry each checkout's content but not its
+        history, so every inner worktree's HEAD is pinned by a ref in its
+        repository until the copy is restored.
+        """
+        checkouts = [link.parent for link in self._worktree_links(workspace)] if workspace.is_dir() else []
+        pins: list[tuple[Path, str, str]] = []
+        for checkout in checkouts:
+            relative = checkout.relative_to(workspace).as_posix()
+            repository = source / relative
+            head = self._head_revision(checkout)
+            if head is None or not (repository / ".git").exists() or self._has_nested_repository(checkout):
+                return False
+            pins.append((repository, self._inner_release_ref(key, relative), head))
+        released = False
+        try:
+            for repository, ref, head in pins:
+                self.git.run(repository, "update-ref", ref, head)
+            released = self.local_copies.release(
+                key,
+                workspace,
+                before_remove=self._remove_inner_worktrees,
+                worktrees=frozenset(checkout.relative_to(workspace).as_posix() for checkout in checkouts),
+            )
+        except LocalCopyError as exc:
+            raise WorkspaceError(str(exc)) from exc
+        finally:
+            if not released:
+                for repository, ref, _head in pins:
+                    self.git.run(repository, "update-ref", "-d", ref, check=False)
+        return released
+
+    def _prepare_released_folder_copy(self, key: str, source: Path) -> PreparedLocalCopy:
+        """Rebuild a folder copy with each inner worktree back on its pinned commit.
+
+        A mixed reset moves HEAD and the index but leaves the files, which the
+        restore then overlays with the task's saved changes.
+        """
+        prepared = self._prepare_folder_copy(key, source)
+        try:
+            for repository, _ref, head in self._pinned_inner_heads(key, source):
+                self.git.run(prepared.workspace / repository.relative_to(source), "reset", "-q", "--mixed", head)
+        except Exception:
+            self._discard_repository_folder(source, prepared.workspace, prepared.baseline)
+            raise
+        return prepared
+
+    def _pinned_inner_heads(self, key: str, source: Path) -> list[tuple[Path, str, str]]:
+        pins: list[tuple[Path, str, str]] = []
+        for repository in self._inner_repositories(source):
+            ref = self._inner_release_ref(key, repository.relative_to(source).as_posix())
+            result = self.git.run(repository, "rev-parse", "--verify", "-q", ref, check=False)
+            if result.returncode == 0:
+                pins.append((repository, ref, result.stdout.strip()))
+        return pins
 
     def prune_task_root(self, session_id: str) -> None:
         """Remove an empty project-task parent without discarding task files."""

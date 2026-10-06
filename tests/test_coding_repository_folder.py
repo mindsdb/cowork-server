@@ -127,6 +127,48 @@ def test_a_released_repository_folder_restores_as_worktrees_with_its_changes(tmp
     assert before == {("app/src/main.py", "M"), ("docs/new.md", "A")}
 
 
+def test_commits_in_an_inner_worktree_survive_release_and_restore(tmp_path: Path, folder: Path) -> None:
+    manager = WorkspaceManager(tmp_path / "coding")
+    workspace = manager.prepare("task", str(folder), allow_direct_folder=True).workspace_path
+    api = workspace / "services" / "api"
+    (api / "server.py").write_text("serve(port=8080)\n", encoding="utf-8")
+    git(api, "commit", "-qam", "task commit")
+    head = git(api, "rev-parse", "HEAD")
+    ref = "refs/cowork/released-inner/task/services/api"
+
+    assert manager.release("task", str(folder), str(workspace), WorkspaceKind.local_copy) is True
+    assert git(folder / "services" / "api", "rev-parse", ref) == head
+
+    manager.restore("task", str(folder), str(workspace), WorkspaceKind.local_copy)
+
+    assert git(api, "rev-parse", "HEAD") == head
+    assert git(api, "status", "--porcelain") == ""
+    assert {item.path for item in manager.diff(str(workspace), None)} == {"services/api/server.py"}
+    assert git(folder / "services" / "api", "for-each-ref", "refs/cowork") == ""
+
+
+def test_deleting_a_released_repository_folder_forgets_its_pinned_commits(tmp_path: Path, folder: Path) -> None:
+    manager = WorkspaceManager(tmp_path / "coding")
+    workspace = manager.prepare("task", str(folder), allow_direct_folder=True).workspace_path
+    assert manager.release("task", str(folder), str(workspace), WorkspaceKind.local_copy) is True
+    assert git(folder / "app", "for-each-ref", "refs/cowork")
+
+    manager.discard_release("task", str(folder))
+
+    assert git(folder / "app", "for-each-ref", "refs/cowork") == ""
+    assert git(folder / "services" / "api", "for-each-ref", "refs/cowork") == ""
+
+
+def test_a_repository_folder_is_kept_when_a_checkout_holds_a_nested_repository(tmp_path: Path, folder: Path) -> None:
+    manager = WorkspaceManager(tmp_path / "coding")
+    workspace = manager.prepare("task", str(folder), allow_direct_folder=True).workspace_path
+    git(workspace / "app" / "src", "init", "-q")
+
+    assert manager.release("task", str(folder), str(workspace), WorkspaceKind.local_copy) is False
+    assert (workspace / "app" / "src" / ".git").is_dir()
+    assert git(folder / "app", "for-each-ref", "refs/cowork") == ""
+
+
 def test_a_fork_gets_its_own_worktrees_and_inherits_the_parent_changes(tmp_path: Path, folder: Path) -> None:
     manager = WorkspaceManager(tmp_path / "coding")
     parent = manager.prepare("parent", str(folder), allow_direct_folder=True).workspace_path
@@ -173,3 +215,18 @@ def test_without_git_a_repository_folder_is_copied_as_before(
 
     assert (workspace / "app" / ".git").is_dir()
     assert (workspace / "node_modules").is_dir()
+
+
+def test_a_repository_folder_with_a_copied_repository_is_kept(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, folder: Path
+) -> None:
+    def refuse(*_args, **_kwargs) -> None:
+        raise WorkspaceError("Local changes are too large to copy safely")
+
+    monkeypatch.setattr(source_changes, "copy_source_changes", refuse)
+    manager = WorkspaceManager(tmp_path / "coding")
+    workspace = manager.prepare("task", str(folder), allow_direct_folder=True).workspace_path
+    assert (workspace / "app" / ".git").is_dir()
+
+    assert manager.release("task", str(folder), str(workspace), WorkspaceKind.local_copy) is False
+    assert workspace.is_dir()
