@@ -1,4 +1,3 @@
-import ipaddress
 from contextlib import ExitStack
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -17,7 +16,7 @@ from cowork.schemas.projects import (
     ProjectUpdateRequest,
 )
 from cowork.schemas.shared_resources import ProjectCapabilities
-from cowork.api.v1.endpoints.guards import require_local
+from cowork.api.v1.endpoints.guards import ensure_loopback_socket
 from cowork.services.projects import (
     GENERAL_PROJECT,
     ProjectNameLockBusyError,
@@ -252,17 +251,6 @@ def list_projects(
     return [_project_response(project, access) for project in service.list_projects()]
 
 
-def _is_loopback_address(host: str | None) -> bool:
-    """Whether an address literal names the loopback interface."""
-    value = (host or "").strip().strip("[]").casefold()
-    if value == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(value).is_loopback
-    except ValueError:
-        return False
-
-
 def require_local_for_chosen_folder(
     body: ProjectCreateRequest, request: Request
 ) -> None:
@@ -270,31 +258,13 @@ def require_local_for_chosen_folder(
 
     A chosen path plus the project-file endpoints is read and write anywhere
     the server user can reach, so this has to hold on a deployment that is
-    local-mode but not local-only.
-
-    Neither of the obvious signals can carry it. The peer address is forgeable:
-    the image runs uvicorn with ``--forwarded-allow-ips "*"``, so
-    ``X-Forwarded-For`` rewrites ``request.client``. The configured host is
-    blind: that same CMD passes ``--host 0.0.0.0`` on argv and sets no
-    ``COWORK_SERVER_HOST``, so ``AppSettings.host`` still reads its loopback
-    default inside the container.
-
-    ``scope["server"]`` is the local address of the accepted socket. The proxy
-    middleware rewrites only ``client`` and ``scheme``, and a caller cannot
-    choose which interface their connection lands on, so a request that
-    arrived over loopback really did. The desktop sidecar binds 127.0.0.1, so
-    nothing legitimate is refused. ``require_local`` stays as a second layer
-    and the service refuses org deployments outright as a third.
+    local-mode but not local-only. See `ensure_loopback_socket` for why the
+    socket address is the signal; the service refuses org deployments outright
+    as a further layer.
     """
     if body.path is None:
         return
-    require_local(request)
-    server = request.scope.get("server") or ()
-    if not _is_loopback_address(server[0] if server else None):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="a chosen project folder needs a request over loopback",
-        )
+    ensure_loopback_socket(request, "a chosen project folder needs a request over loopback")
 
 
 @router.post(

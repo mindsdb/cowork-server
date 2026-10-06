@@ -32,6 +32,11 @@ class ConversationMoveRequest(CamelRequest):
     move_objects: bool = True
 
 
+class ConversationFolderAddRequest(CamelRequest):
+    """A local folder to attach to a chat as a working folder."""
+    path: str = Field(min_length=1, max_length=4096)
+
+
 class ConversationListItem(CamelResponse):
     id: UUID
     title: str

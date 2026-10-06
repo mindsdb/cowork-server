@@ -97,3 +97,40 @@ def require_local_tenancy() -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail="not available in org deployments",
         )
+
+
+def _is_loopback_address(host: str | None) -> bool:
+    """Whether an address literal names the loopback interface."""
+    value = (host or "").strip().strip("[]").casefold()
+    if value == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def ensure_loopback_socket(request: Request, detail: str) -> None:
+    """Refuse with 403 and `detail` unless the request arrived over loopback.
+
+    For routes that take a local folder path from the caller, which is read and
+    write anywhere the server user can reach, so this has to hold on a
+    deployment that is local-mode but not local-only.
+
+    Neither of the obvious signals can carry it. The peer address is forgeable:
+    the image runs uvicorn with ``--forwarded-allow-ips "*"``, so
+    ``X-Forwarded-For`` rewrites ``request.client``. The configured host is
+    blind: that same CMD passes ``--host 0.0.0.0`` on argv and sets no
+    ``COWORK_SERVER_HOST``, so ``AppSettings.host`` still reads its loopback
+    default inside the container.
+
+    ``scope["server"]`` is the local address of the accepted socket. The proxy
+    middleware rewrites only ``client`` and ``scheme``, and a caller cannot
+    choose which interface their connection lands on, so a request that
+    arrived over loopback really did. The desktop sidecar binds 127.0.0.1, so
+    nothing legitimate is refused. ``require_local`` stays as a second layer.
+    """
+    require_local(request)
+    server = request.scope.get("server") or ()
+    if not _is_loopback_address(server[0] if server else None):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
