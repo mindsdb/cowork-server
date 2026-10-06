@@ -427,10 +427,13 @@ def test_a_fullstack_backend_can_launch_from_a_chosen_folder(
     projects_root, tmp_path, monkeypatch
 ):
     """Auto-launch answers 200 with a launchError rather than an error status,
-    so the failure surfaced as a preview that silently never came up. The launch
-    itself is stubbed; what is under test is that the artifact's owning project
-    is found at all."""
+    so the failure surfaced as a preview that silently never came up. The spawn
+    is stubbed; what is under test is that the chosen folder reaches it as the
+    project root, and that the preview then reports the backend running."""
+    import anton.core.artifacts.backend_launcher as backend_launcher
+
     from cowork.services import artifacts as artifacts_service
+    from cowork.services import scratchpad_runtime
 
     client = _client()
     folder = tmp_path / "Documents" / "routes-fullstack"
@@ -454,6 +457,22 @@ def test_a_fullstack_backend_can_launch_from_a_chosen_folder(
 
     monkeypatch.setattr(artifacts_service, "_probe_port", lambda port, **kw: False)
 
+    pool_roots: list[str] = []
+    launched: list[Path] = []
+
+    class _Pool:
+        def __init__(self, root: str) -> None:
+            pool_roots.append(root)
+
+    async def _launch(
+        *, slug, artifact_folder, scratchpad_pool, tracked_backends, ds_env, health_timeout
+    ):
+        launched.append(artifact_folder)
+        return {"port": 51999, "pid": 1}
+
+    monkeypatch.setattr(scratchpad_runtime, "WorkspaceScopedPool", _Pool)
+    monkeypatch.setattr(backend_launcher, "launch_artifact_backend", _launch)
+
     res = client.post(
         "/api/v1/artifacts/preview-mount", json={"path": str(artifact / "index.html")}
     )
@@ -461,13 +480,10 @@ def test_a_fullstack_backend_can_launch_from_a_chosen_folder(
     assert res.status_code == 200, res.text
     payload = res.json()
     assert payload["kind"] == "proxy"
-    # The real launcher runs and may well fail for want of a scratchpad venv.
-    # What must not come back is the refusal that means the project was never
-    # found, which is all an adopted folder could ever get before.
-    assert payload.get("launchError") != "Artifact is not in a registered project."
-    # It fails at the backend script instead, which is a stage past resolution.
-    assert "backend script not found" in (payload.get("launchError") or "")
-    assert artifacts_service._resolve_project_root(artifact) is None
+    assert payload["launchError"] == ""
+    assert payload["backendRunning"] is True
+    assert [Path(r).resolve() for r in pool_roots] == [folder.resolve()]
+    assert [p.resolve() for p in launched] == [artifact.resolve()]
 
 
 # -- the agent's own publish tool --------------------------------------------
