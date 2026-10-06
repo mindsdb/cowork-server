@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import threading
+import time
 from datetime import timedelta
 from pathlib import Path
 
@@ -99,6 +100,34 @@ def test_released_local_copy_restores_its_changes_onto_the_current_source(tmp_pa
     assert (copy / "keep.txt").read_text(encoding="utf-8") == "changed outside the task\n"
     assert (copy / "edit.txt").read_text(encoding="utf-8") == "after\n"
     assert not (copy / "remove.txt").exists()
+
+
+def test_a_worktree_with_a_task_created_repository_is_kept(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    manager = WorkspaceManager(tmp_path / "coding")
+    worktree = manager.prepare("task-4", str(repo), allow_direct_folder=False).workspace_path
+    nested = worktree / "vendor" / "lib"
+    nested.mkdir(parents=True)
+    git(nested, "init", "-q")
+    (nested / "lib.py").write_text("private\n", encoding="utf-8")
+    git(nested, "add", "lib.py")
+    git(nested, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "private")
+
+    assert manager.release("task-4", str(repo), str(worktree), WorkspaceKind.git_worktree) is False
+    assert (nested / "lib.py").read_text(encoding="utf-8") == "private\n"
+    assert not ref_exists(repo, "refs/cowork/released/task-4")
+
+
+def test_a_local_copy_containing_a_repository_is_kept(tmp_path: Path) -> None:
+    source = tmp_path / "folder"
+    (source / "app").mkdir(parents=True)
+    git(source / "app", "init", "-q")
+    (source / "notes.txt").write_text("notes\n", encoding="utf-8")
+    manager = WorkspaceManager(tmp_path / "coding")
+    copy = manager.prepare("task-5", str(source), allow_direct_folder=True).workspace_path
+
+    assert manager.release("task-5", str(source), str(copy), WorkspaceKind.local_copy) is False
+    assert (copy / "app" / ".git").is_dir()
 
 
 def test_restoring_without_a_saved_release_fails_without_touching_disk(tmp_path: Path) -> None:
@@ -226,3 +255,80 @@ def test_concurrent_views_of_a_released_task_share_one_restore(tmp_path: Path) -
 
     assert errors == []
     assert service.get_session(session_id).workspace_released_at is None
+
+
+def test_a_terminal_and_a_view_restoring_together_do_not_deadlock(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    session_id = completed_task(service, repo)
+    assert service.retention.release(session_id) is True
+    errors: list[BaseException] = []
+
+    def run(call) -> None:
+        try:
+            call()
+        except BaseException as exc:  # noqa: BLE001 - surfaced by the assertion below.
+            errors.append(exc)
+
+    view = threading.Thread(target=run, args=(lambda: service.diff(session_id),), daemon=True)
+
+    def terminal() -> None:
+        # Terminal operations reach the restore while holding the runtime lock.
+        with service.runtimes.session_lock(session_id):
+            view.start()
+            time.sleep(0.2)
+            service.ensure_workspace(session_id)
+
+    holder = threading.Thread(target=run, args=(terminal,), daemon=True)
+    holder.start()
+    holder.join(timeout=10)
+    view.join(timeout=10)
+
+    assert not holder.is_alive() and not view.is_alive()
+    assert errors == []
+    assert service.get_session(session_id).workspace_released_at is None
+
+
+def test_a_failed_release_marker_write_keeps_the_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    session_id = completed_task(service, repo)
+    workspace = Path(service.get_session(session_id).workspace_path)
+
+    def fail(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(service.store, "update_session", fail)
+    with pytest.raises(OSError):
+        service.retention.release(session_id)
+
+    assert workspace.is_dir()
+    assert not ref_exists(repo, f"refs/cowork/released/{session_id}")
+
+
+def test_a_release_that_cannot_be_rolled_back_restores_on_next_use(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    session_id = completed_task(service, repo)
+    workspace = Path(service.get_session(session_id).workspace_path)
+    (workspace / "README.md").write_text("task change\n", encoding="utf-8")
+    release, restore = service.workspaces.release, service.workspaces.restore
+
+    def release_then_fail(*args):
+        release(*args)
+        raise OSError("interrupted")
+
+    def fail(*_args):
+        raise OSError("still interrupted")
+
+    monkeypatch.setattr(service.workspaces, "release", release_then_fail)
+    monkeypatch.setattr(service.workspaces, "restore", fail)
+    assert service.retention.release(session_id) is False
+    assert not workspace.exists()
+    assert service.get_session(session_id).workspace_released_at is not None
+
+    monkeypatch.setattr(service.workspaces, "restore", restore)
+    assert [item.path for item in service.diff(session_id)] == ["README.md"]
+    assert (workspace / "README.md").read_text(encoding="utf-8") == "task change\n"

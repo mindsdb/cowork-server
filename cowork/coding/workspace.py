@@ -773,7 +773,7 @@ class WorkspaceManager:
             if not actual.exists() or not source.is_dir():
                 return False
             head = self._head_revision(actual)
-            if head is None:
+            if head is None or self._has_nested_repository(actual):
                 return False
             release_dir = self.snapshots_root / managed_key(key)
             release_dir.mkdir(parents=True, exist_ok=True)
@@ -841,6 +841,17 @@ class WorkspaceManager:
             if source.is_dir() and self._git_root(source) is not None:
                 self.git.run(source, "update-ref", "-d", self._release_ref(key), check=False)
             self.local_copies.discard_release(key)
+
+    def _has_nested_repository(self, worktree: Path) -> bool:
+        """Whether a repository inside the worktree holds history a patch cannot carry.
+
+        Git records a nested repository as a single untracked entry or gitlink,
+        so its files and commits would be lost when the worktree is removed.
+        """
+        untracked = [path for status, path in self._status_entries(worktree) if status == "??"]
+        staged = self.git.run(worktree, "ls-files", "--stage", "-z").stdout.split("\0")
+        gitlinks = [entry.split("\t", 1)[1] for entry in staged if entry.startswith("160000 ")]
+        return any((worktree / path / ".git").exists() for path in (*untracked, *gitlinks))
 
     def _managed_worktree(self, key: str, workspace_path: str) -> Path:
         relative = managed_key(key)
