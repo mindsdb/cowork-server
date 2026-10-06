@@ -183,12 +183,14 @@ class ConversationFolderService:
         self.session = session
 
     def _conversation(self, conversation_id: UUID) -> Conversation:
+        """The caller's own chat. Raises `FolderNotFound` for any other id."""
         try:
             return ConversationService(self.session).get_conversation(conversation_id)
         except ValueError as exc:
             raise FolderNotFound("Conversation not found") from exc
 
     def _rows(self, conversation_id: UUID) -> list[ConversationFolder]:
+        """The chat's folder rows, oldest first. The caller has checked ownership."""
         return list(
             self.session.exec(
                 self.session.select(ConversationFolder)
