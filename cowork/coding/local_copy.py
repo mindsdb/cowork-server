@@ -276,7 +276,9 @@ class LocalCopyManager:
         actual = workspace.resolve()
         if actual not in {(root / relative).resolve() for root in (self.copies_root, self.legacy_copies_root)}:
             raise LocalCopyError("Refusing to release an unmanaged task copy")
-        if not actual.is_dir():
+        # Repository metadata is not part of the saved changes, so commits made
+        # in a copied or task-created repository would be lost.
+        if not actual.is_dir() or self._has_repository(actual):
             return False
         baseline = self._baseline_for(actual)
         before, after = self._manifests(baseline, actual)
@@ -329,6 +331,21 @@ class LocalCopyManager:
 
     def _release_dir(self, relative: Path) -> Path:
         return self.recovery_root / relative / "local-release"
+
+    @staticmethod
+    def _has_repository(root: Path) -> bool:
+        pending = [root]
+        while pending:
+            try:
+                entries = list(os.scandir(pending.pop()))
+            except OSError:
+                return True
+            for entry in entries:
+                if entry.name == ".git":
+                    return True
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+        return False
 
     @staticmethod
     def _copy_entry(source: Path, target: Path) -> None:
