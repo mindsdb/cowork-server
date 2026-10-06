@@ -344,6 +344,13 @@ class ConversationService:
 
         Idempotent: a no-op when nothing matches.
         """
+        if self.clear_pending(conversation_id, message_id=message_id):
+            self.session.commit()
+
+    def clear_pending(self, conversation_id: UUID, *, message_id: UUID | None = None) -> bool:
+        """finalize_pending without the commit: the flags are cleared in the
+        session, and the caller's next commit lands them with whatever else it
+        writes. Whether any row matched."""
         stmt = (
             self.session.select(Message)
             .where(Message.conversation_id == conversation_id)
@@ -352,12 +359,10 @@ class ConversationService:
         if message_id is not None:
             stmt = stmt.where(Message.id == message_id)
         pending_rows = self.session.exec(stmt).all()
-        if not pending_rows:
-            return
         for message in pending_rows:
             message.pending = False
             self.session.add(message)
-        self.session.commit()
+        return bool(pending_rows)
 
     def repair_image_content(self, conversation_id: UUID) -> list[UUID]:
         """Strip image content blocks from every stored message in a

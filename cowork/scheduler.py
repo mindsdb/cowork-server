@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 from uuid import UUID
 
 from sqlalchemy.exc import IntegrityError
@@ -31,11 +32,21 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 
+T = TypeVar("T")
+
 _POLL_INTERVAL_SECONDS = 30
 # Upper bound on a single run. A hung agent (stuck tool call, wedged stream)
 # must not keep its ScheduleRun in `running` forever — that would block the
 # schedule from ever firing again. On timeout the run is recorded as failed.
 _MAX_RUN_DURATION_SECONDS = 600
+# How long a run's last writes, its outcome and its finish, keep asking for a
+# database connection while the pool is full. They must land: a run left at
+# `running` stops its schedule firing until a restart, and an outcome never
+# recorded leaves its slot due, so the slot would run a second time. Each try
+# already waits POOL_TIMEOUT for a connection; the pause between tries only
+# keeps a misconfigured zero wait from spinning.
+_BOOKKEEPING_DEADLINE_SECONDS = _MAX_RUN_DURATION_SECONDS
+_BOOKKEEPING_RETRY_PAUSE_SECONDS = 1.0
 _scheduler_task: asyncio.Task | None = None
 
 _RECURRING_CADENCES = {Cadence.hourly, Cadence.daily, Cadence.weekly, Cadence.weekdays}
@@ -300,6 +311,27 @@ def _finish_run(
     )
 
 
+async def _until_it_lands(unit: Callable[[ScopedSession], T], *, schedule_id: UUID) -> T:
+    """Run one of a run's last bookkeeping units, trying again while no
+    database connection frees, for up to _BOOKKEEPING_DEADLINE_SECONDS.
+
+    A unit refused for a full pool never ran (cowork.db.units.run_db), so
+    trying again cannot write anything twice.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _BOOKKEEPING_DEADLINE_SECONDS
+    while True:
+        try:
+            return await run_db(unit, scope=SYSTEM_SCOPE)
+        except PoolTimeoutError:
+            if loop.time() >= deadline:
+                raise
+            logger.warning(
+                f"Schedule {schedule_id}: no database connection freed to record its run; trying again"
+            )
+            await asyncio.sleep(_BOOKKEEPING_RETRY_PAUSE_SECONDS)
+
+
 async def execute_schedule(
     schedule_id: UUID,
     is_manual: bool = False,
@@ -310,15 +342,25 @@ async def execute_schedule(
     Each read and write is its own database unit, so the run holds no pooled
     connection across the permission check or while its turn runs, and a
     wait for a connection never stalls the event loop. A unit commits when
-    it ends, so a failure in one leaves the earlier ones written.
+    it ends, so a failure in one leaves the earlier ones written. The last
+    two, the turn's outcome and the run's finish, try again while the pool is
+    full (_until_it_lands).
     """
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
     from cowork.services.product_permissions import require_product_permission
 
-    run_id = await run_db(
-        partial(_create_run, schedule_id=schedule_id, is_manual=is_manual), scope=SYSTEM_SCOPE,
-    )
+    try:
+        run_id = await run_db(
+            partial(_create_run, schedule_id=schedule_id, is_manual=is_manual), scope=SYSTEM_SCOPE,
+        )
+    except PoolTimeoutError:
+        # Nothing was written, so nothing is left at `running`: a cron slot
+        # stays due and the next poll starts it.
+        logger.warning(
+            f"Schedule {schedule_id}: no database connection freed to start its run; it did not run"
+        )
+        return
 
     error: str | None = None
     final_status: RunStatus | None = None
@@ -373,12 +415,12 @@ async def execute_schedule(
         # buffer's terminal record is the only truthful signal of how the
         # turn ended — without it every run is recorded as success.
         reason = await _turn_terminal_reason(str(conversation_id))
-        outcome = await run_db(
+        outcome = await _until_it_lands(
             partial(
                 _record_turn_outcome, schedule_id=schedule_id, reason=reason,
                 is_manual=is_manual, conversation_id=conversation_id,
             ),
-            scope=SYSTEM_SCOPE,
+            schedule_id=schedule_id,
         )
         final_status, error = outcome.status, outcome.error
 
@@ -396,12 +438,12 @@ async def execute_schedule(
             # This write must always land or the run strands at `running` and
             # wedges the schedule. Its own unit starts clean, whatever failed
             # above.
-            await run_db(
+            await _until_it_lands(
                 partial(
                     _finish_run, run_id=run_id, conversation_id=conversation_id,
                     error=error, status=final_status,
                 ),
-                scope=SYSTEM_SCOPE,
+                schedule_id=schedule_id,
             )
         except Exception:
             logger.exception(f"Failed to finish run record for schedule {schedule_id}")

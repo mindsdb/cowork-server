@@ -17,7 +17,7 @@ from cowork.server import create_app
 from cowork.streaming import RunRegistry, TurnInProgress, get_streams_dir, registry
 from cowork.streaming.buffer import FileStreamBuffer, read_records, turn_buffer_path
 
-from _fakes import PausedHarness
+from _fakes import PausedHarness, opens
 
 REFUSAL = {
     "detail": (
@@ -105,8 +105,8 @@ async def test_a_second_question_is_refused_at_once_and_the_running_answer_goes_
             gate.release.set()
             answered = await asyncio.wait_for(first, timeout=10)
             items = await _items(client, conversation_id)
-            # Sent the moment the first stream ends, as the web UI sends a
-            # queued question.
+            # Sent once the first turn has ended. The moment its stream ends,
+            # while its producer still unwinds, has a test of its own below.
             follow_up = await asyncio.wait_for(_ask(client, conversation_id, "three"), timeout=10)
         gc.collect()
 
@@ -121,6 +121,49 @@ async def test_a_second_question_is_refused_at_once_and_the_running_answer_goes_
     assert follow_up.status_code == 200, follow_up.text
     assert _frame_types(follow_up.text)[-1] == "response.completed"
     assert _never_awaited(caught) == []
+
+
+async def test_a_question_sent_the_moment_a_stream_ends_is_accepted_while_its_producer_unwinds(
+    monkeypatch,
+):
+    """The web UI sends a queued question the moment the stream it waited on
+    ends. The producer behind that stream may still be unwinding, but it has
+    written its terminal record, so the question is accepted, by the early
+    check and by the registry's."""
+    gate = PausedHarness()
+    gate.release.set()
+    monkeypatch.setattr(responses_mod, "get_harness", lambda name: gate)
+
+    async def decide(**_kwargs):
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses_mod, "decide_route", decide)
+    unwinding, finish_unwinding = asyncio.Event(), asyncio.Event()
+    seal = responses_mod._seal_unterminated_buffer
+
+    async def held_after_the_terminal_record(buffer, *args, **kwargs):
+        if buffer.is_closed and not unwinding.is_set():
+            unwinding.set()
+            await finish_unwinding.wait()
+        return await seal(buffer, *args, **kwargs)
+
+    monkeypatch.setattr(responses_mod, "_seal_unterminated_buffer", held_after_the_terminal_record)
+    conversation_id = str(uuid4())
+
+    async with _client() as client:
+        first = await asyncio.wait_for(_ask(client, conversation_id, "one"), timeout=10)
+        await asyncio.wait_for(unwinding.wait(), timeout=10)
+        running = registry.get(conversation_id)
+        still_unwinding = running.is_running and running.buffer.is_closed
+        try:
+            follow_up = await asyncio.wait_for(_ask(client, conversation_id, "two"), timeout=10)
+        finally:
+            finish_unwinding.set()
+
+    assert still_unwinding
+    assert _frame_types(first.text)[-1] == "response.completed"
+    assert follow_up.status_code == 200, follow_up.text
+    assert _frame_types(follow_up.text)[-1] == "response.completed"
 
 
 @pytest.mark.parametrize("second_route", [DELEGATED_AGENTIC, DIRECT_CONTEXT])
@@ -210,15 +253,19 @@ async def test_the_registry_refuses_a_second_turn_before_opening_its_buffer(tmp_
         await buffer.close("completed")
 
     first = await runs.start(
-        conversation_id="c", turn_id=3, open_buffer=lambda: FileStreamBuffer(path), produce=answer,
+        conversation_id="c", turn_id=3, open_buffer=opens(FileStreamBuffer(path)), produce=answer,
     )
     opened, produced = [], []
+
+    async def open_again():
+        opened.append(path)
+        return FileStreamBuffer(path)
 
     with pytest.raises(TurnInProgress) as refused:
         await runs.start(
             conversation_id="c",
             turn_id=3,
-            open_buffer=lambda: opened.append(path) or FileStreamBuffer(path),
+            open_buffer=open_again,
             produce=lambda buffer: produced.append(buffer) or answer(buffer),
         )
 
@@ -246,7 +293,7 @@ async def test_a_turn_that_wrote_its_terminal_record_does_not_refuse_the_next(tm
     first = await runs.start(
         conversation_id="c",
         turn_id=0,
-        open_buffer=lambda: FileStreamBuffer(tmp_path / "turn_000000.jsonl"),
+        open_buffer=opens(FileStreamBuffer(tmp_path / "turn_000000.jsonl")),
         produce=answer_then_unwind,
     )
     await asyncio.wait_for(wrote_terminal.wait(), timeout=5)
@@ -258,7 +305,7 @@ async def test_a_turn_that_wrote_its_terminal_record_does_not_refuse_the_next(tm
     second = await runs.start(
         conversation_id="c",
         turn_id=2,
-        open_buffer=lambda: FileStreamBuffer(tmp_path / "turn_000002.jsonl"),
+        open_buffer=opens(FileStreamBuffer(tmp_path / "turn_000002.jsonl")),
         produce=answer,
     )
 

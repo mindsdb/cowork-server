@@ -20,6 +20,8 @@ import cowork.handlers.responses as responses_mod
 from cowork.handlers.responses import ResponsesHandler
 from cowork.streaming.registry import TurnLifecycle
 
+from _fakes import opens
+
 
 class _FakeScope:
     org_id = "org-123"
@@ -321,7 +323,7 @@ async def test_the_producer_task_scrubs_the_job_history_with_the_requests_regist
     run = await RunRegistry().start(
         conversation_id=str(conv_id),
         turn_id=0,
-        open_buffer=lambda: buffer,
+        open_buffer=opens(buffer),
         produce=lambda buffer: handler._produce_remote(
             conv_id=conv_id,
             input_text="hi",

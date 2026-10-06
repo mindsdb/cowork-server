@@ -99,8 +99,9 @@ def _cancellable_handler(monkeypatch, saved, published: asyncio.Event):
             saved["user_id"] = msg.id
             return msg
 
-        def finalize_pending(self, conv_id, message_id=None):
+        def clear_pending(self, conv_id, *, message_id=None):
             saved["finalized"] = True
+            return True
 
         def save_assistant_turn(self, conv_id, text, events, harness=None, tool_rows=None):
             saved["events"] = events
