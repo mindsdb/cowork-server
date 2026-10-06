@@ -18,12 +18,12 @@ import pytest
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
-import cowork.api.v1.endpoints.project_files as pf
-from cowork.api.v1.endpoints.project_files import (
-    _MAX_EXAMINED_ENTRIES,
-    _MAX_LISTED_FILES,
-    _iter_project_files,
-    _WalkBudget,
+import cowork.services.folder_listing as listing
+from cowork.services.folder_listing import (
+    MAX_EXAMINED_ENTRIES,
+    MAX_LISTED_FILES,
+    WalkBudget,
+    iter_folder_files,
 )
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.models.project import Project
@@ -37,7 +37,7 @@ from cowork.services.projects import (
 def _names(base: Path) -> list[str]:
     return sorted(
         p.relative_to(base).as_posix()
-        for p in _iter_project_files(base, _WalkBudget())
+        for p in iter_folder_files(base, WalkBudget())
     )
 
 
@@ -100,7 +100,7 @@ def test_a_skills_symlink_does_not_consume_the_budget(tmp_path):
     was discarded after the cap had been paid."""
     linked = tmp_path / "canonical-skill"
     linked.mkdir()
-    for i in range(_MAX_LISTED_FILES + 10):
+    for i in range(MAX_LISTED_FILES + 10):
         (linked / f"s{i:05d}.md").write_text("x")
     base = tmp_path / "base"
     (base / "skills").mkdir(parents=True)
@@ -130,12 +130,12 @@ def test_the_examined_ceiling_stops_the_walk_and_says_so(tmp_path, monkeypatch):
     """A stopped walk must not report a complete listing. Only the file cap
     used to set the flag, so hitting this ceiling looked like "that is all
     the files there are"."""
-    monkeypatch.setattr(pf, "_MAX_EXAMINED_ENTRIES", 10)
+    monkeypatch.setattr(listing, "MAX_EXAMINED_ENTRIES", 10)
     for i in range(40):
         (tmp_path / f"f{i:03d}.txt").write_text("x")
 
-    budget = _WalkBudget()
-    found = list(_iter_project_files(tmp_path, budget))
+    budget = WalkBudget()
+    found = list(iter_folder_files(tmp_path, budget))
 
     assert budget.exhausted is True
     assert len(found) <= 10
@@ -144,8 +144,8 @@ def test_the_examined_ceiling_stops_the_walk_and_says_so(tmp_path, monkeypatch):
 def test_a_completed_walk_does_not_report_exhaustion(tmp_path):
     (tmp_path / "a.txt").write_text("x")
 
-    budget = _WalkBudget()
-    list(_iter_project_files(tmp_path, budget))
+    budget = WalkBudget()
+    list(iter_folder_files(tmp_path, budget))
 
     assert budget.exhausted is False
 
@@ -222,7 +222,7 @@ def test_an_untruncated_response_carries_no_truncated_key(engine, projects_root)
 def test_a_truncated_response_says_so(engine, projects_root):
     svc = ProjectService(ScopedSession(Session(engine), LOCAL_SCOPE))
     project = svc.create_project("notes")
-    for i in range(_MAX_LISTED_FILES + 5):
+    for i in range(MAX_LISTED_FILES + 5):
         (Path(project.path) / f"f{i:05d}.txt").write_text("x")
 
     response = _list_files(engine, project.name)
@@ -230,4 +230,4 @@ def test_a_truncated_response_says_so(engine, projects_root):
     assert response["truncated"] is True
     # The synthetic instructions row is inserted after the walk, so it is not
     # one of the capped entries.
-    assert len(response["files"]) == _MAX_LISTED_FILES + 1
+    assert len(response["files"]) == MAX_LISTED_FILES + 1
