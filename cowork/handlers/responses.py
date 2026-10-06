@@ -543,8 +543,6 @@ class ResponsesHandler:
                 disabled_connections=disabled,
                 trace_tags=request.trace_tags,
                 trace_metadata=trace_metadata,
-                # The caller gets only the collected answer text back.
-                renders_tool_messages=False,
             )
             return await self._collect(stream, conversation.id, request.model, original_content)
 
@@ -1777,6 +1775,9 @@ class ResponsesHandler:
                 conversation=conv, input=harness_input, model=model,
                 reasoning_effort=reasoning_effort, disabled_connections=disabled,
                 trace_tags=trace_tags, trace_metadata=trace_metadata,
+                # The cowork UI (scheduled turns show there too) renders a
+                # tool's message to the user, as on the remote path.
+                tool_messages=True,
             )
             event_count = 0
             async for sse_string in harness.formatter(stream, model, event_sink):
