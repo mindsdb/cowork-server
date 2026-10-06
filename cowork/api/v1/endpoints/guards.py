@@ -1,4 +1,4 @@
-"""Request guards shared by endpoints that return unmasked secrets."""
+"""Request guards for endpoints that return unmasked secrets or take local folder paths."""
 
 from __future__ import annotations
 

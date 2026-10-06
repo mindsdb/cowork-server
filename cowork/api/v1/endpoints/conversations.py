@@ -224,10 +224,12 @@ _FOLDER_ROUTE_GUARDS = [Depends(require(DesktopOnly)), Depends(_require_loopback
 
 
 def _project_path(conversation: Conversation) -> str | None:
+    """The chat's project folder, which a working folder may not sit inside."""
     return conversation.project.path if conversation.project else None
 
 
 def _serialize_folder(folder: ConversationFolder, *, available: bool) -> dict[str, Any]:
+    """One folder as the desktop app reads it; `available` is decided by the caller."""
     return {
         "id": folder.id,
         "path": folder.path,
