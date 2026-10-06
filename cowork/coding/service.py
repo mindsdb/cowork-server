@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
+from datetime import timedelta
 from functools import lru_cache
 from pathlib import Path
 
@@ -67,7 +69,8 @@ from cowork.coding.store import CodingStore
 from cowork.coding.task_delivery import TaskDeliveryService
 from cowork.coding.terminal_service import TaskTerminalService
 from cowork.coding.turns import RunningTurn, TurnExecutor, fail_turn
-from cowork.coding.workspace import WorkspaceError, WorkspaceManager
+from cowork.coding.workspace import WorkspaceError, WorkspaceManager, _org_mode
+from cowork.coding.workspace_retention import RetentionPolicy, WorkspaceRetention
 from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
@@ -82,6 +85,7 @@ class CodingService(
     CodingTurnOperations,
 ):
     EXPIRY_INTERVAL_SECONDS = 5.0
+    RETENTION_INTERVAL_SECONDS = 3600.0
 
     def __init__(
         self,
@@ -126,6 +130,16 @@ class CodingService(
         )
         self.questions = QuestionBroker(self._question_opened, self._question_closed)
         self.runtimes = RuntimeManager(root, self.registry, self._engine_request)
+        self.retention = WorkspaceRetention(
+            store=self.store,
+            workspaces=self.workspaces,
+            runtimes=self.runtimes,
+            lock=self._lock,
+            running=self._running,
+            maintenance=self._maintenance,
+            is_remote=self._is_remote,
+            control_view=self._control_view,
+        )
         self.lifecycle = SessionLifecycleOperations(
             maintenance_session=self._maintenance_session,
             emit=self._emit,
@@ -228,6 +242,8 @@ class CodingService(
                 self.store.save_session(session, touch_updated_at=False)
             self.project_workspaces.restore_ports(session.id, session.allocated_ports)
         self._expiry_stop = threading.Event()
+        # The first retention pass waits one expiry interval so startup is not delayed.
+        self._next_retention_at = time.monotonic()
         self._expiry_thread = threading.Thread(
             target=self._expire_periodically,
             args=(expiry_interval_seconds,),
@@ -247,6 +263,27 @@ class CodingService(
                 self.expire_stale_state()
             except Exception:
                 logger.exception("Could not expire stale coding control-plane state")
+            if time.monotonic() >= self._next_retention_at:
+                self._next_retention_at = time.monotonic() + self.RETENTION_INTERVAL_SECONDS
+                try:
+                    self.run_workspace_retention()
+                except Exception:
+                    logger.exception("Could not release idle coding task workspaces")
+
+    def run_workspace_retention(self) -> list[str]:
+        """Release workspaces of archived and long-idle tasks to reclaim disk."""
+        if _org_mode():
+            return []
+        settings = get_app_settings().coding
+        return self.retention.run_policy(RetentionPolicy(
+            enabled=settings.workspace_retention_enabled,
+            keep_count=settings.workspace_keep_count,
+            min_idle=timedelta(hours=settings.workspace_min_idle_hours),
+        ))
+
+    def ensure_workspace(self, session_id: str, *, reserved: bool = False) -> None:
+        """Rebuild a task's released workspace, with its changes, before use."""
+        self.retention.ensure_restored(session_id, reserved=reserved)
 
     def capabilities(self) -> list[EngineCapabilities]:
         return self.registry.capabilities()
@@ -267,6 +304,7 @@ class CodingService(
 
     def _prepared_session(self, session_id: str) -> CodingSession:
         """Return a task whose workspace exists, refusing one still preparing."""
+        self.ensure_workspace(session_id)
         session = self.get_session(session_id)
         if not session.workspace_path and not self._is_remote(session):
             raise RuntimeError("The task workspace is still being prepared")
@@ -350,6 +388,7 @@ class CodingService(
                 self.control.delete_task(session.run_id)
             return
         self.lifecycle.delete_session(session_id)
+        self.retention.discard(session)
         if session.run_id:
             self.control.delete_task(session.run_id)
 
@@ -360,7 +399,16 @@ class CodingService(
         session = self.get_session(session_id)
         if archived and self._is_remote(session):
             self.remote.release_workspace(session)
-        return self.lifecycle.set_archived(session_id, archived)
+        updated = self.lifecycle.set_archived(session_id, archived)
+        if archived and not self._is_remote(session) and not _org_mode():
+            # Archiving is an explicit "done for now", so its disk is reclaimed
+            # straight away. The workspace comes back if the task is reopened.
+            try:
+                if self.retention.release(session_id):
+                    updated = self.get_session(session_id)
+            except Exception:
+                logger.exception("Could not release the workspace of archived coding task %s", session_id)
+        return updated
 
     def set_pinned(self, session_id: str, pinned: bool) -> CodingSession:
         return self.lifecycle.set_pinned(session_id, pinned)
@@ -415,18 +463,21 @@ class CodingService(
         session = self.get_session(session_id)
         if self._is_remote(session):
             return self.remote.operation(session, "git_state")
+        self.ensure_workspace(session_id)
         return self.project_tasks.git_state(session_id)
 
     def git_states(self, session_id: str):
         session = self.get_session(session_id)
         if self._is_remote(session):
             return list(self.remote.operation(session, "git_states").get("items") or [])
+        self.ensure_workspace(session_id)
         return self.project_tasks.git_states(session_id)
 
     def diff(self, session_id: str):
         session = self.get_session(session_id)
         if self._is_remote(session):
             return list(self.remote.operation(session, "diff").get("files") or [])
+        self.ensure_workspace(session_id)
         return self.project_tasks.diff(session_id)
 
     def review_file_action(self, session_id: str, folder_id: str | None, path: str, action: str):
@@ -438,6 +489,7 @@ class CodingService(
                 "path": path,
                 "action": action,
             }).get("files") or [])
+        self.ensure_workspace(session_id)
         return self.project_tasks.review_file_action(session_id, folder_id, path, action)
 
     def create_branch(self, session_id: str, name: str):
@@ -445,6 +497,7 @@ class CodingService(
         if self._is_remote(session):
             self.remote.require_idle(session, "changing task branches")
             return self.remote.operation(session, "branch", {"name": name})
+        self.ensure_workspace(session_id)
         return self.project_tasks.create_branch(session_id, name)
 
     def commit(self, session_id: str, message: str):
@@ -452,12 +505,14 @@ class CodingService(
         if self._is_remote(session):
             self.remote.require_idle(session, "committing task changes")
             return self.remote.operation(session, "commit", {"message": message})
+        self.ensure_workspace(session_id)
         return self.project_tasks.commit(session_id, message)
 
     def apply_to_source(self, session_id: str) -> dict[str, str | None]:
         session = self.get_session(session_id)
         if self._is_remote(session):
             raise RuntimeError("Publish remote task changes with a branch or pull request")
+        self.ensure_workspace(session_id)
         return self.project_tasks.apply_to_source(session_id)
 
     def validate_project(self, session_id: str) -> list[dict]:
@@ -465,6 +520,7 @@ class CodingService(
         if self._is_remote(session):
             self.remote.require_idle(session, "running project validation")
             return list(self.remote.operation(session, "validate", timeout=610).get("items") or [])
+        self.ensure_workspace(session_id)
         return self.project_tasks.validate_project(session_id)
 
     def discover_models(self, engine_id: str, credentials: EngineCredentials) -> list[str]:
@@ -513,6 +569,7 @@ class CodingService(
         request: ProjectActionRunRequest,
         credentials: EngineCredentials,
     ) -> ProjectActionRunResponse:
+        self.ensure_workspace(session_id)
         return self.project_actions.run(session_id, request, credentials)
 
     def project_action_page(self, session_id: str) -> ProjectActionPage:

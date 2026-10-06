@@ -371,6 +371,27 @@ class CodingSettings(Settings):
             "so it is not partitioned per organization there."
         ),
     )  # COWORK_CODING_DIR
+    workspace_retention_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("COWORK_CODING_WORKSPACE_RETENTION"),
+        description=(
+            "Release the workspaces of idle, finished coding tasks to reclaim "
+            "disk. A released workspace is rebuilt with its changes when the "
+            "task is next opened. Archiving a task releases it regardless."
+        ),
+    )  # COWORK_CODING_WORKSPACE_RETENTION
+    workspace_keep_count: int = Field(
+        default=10,
+        ge=0,
+        validation_alias=AliasChoices("COWORK_CODING_WORKSPACE_KEEP_COUNT"),
+        description="Most recently active task workspaces that are never released automatically.",
+    )  # COWORK_CODING_WORKSPACE_KEEP_COUNT
+    workspace_min_idle_hours: float = Field(
+        default=24,
+        ge=0,
+        validation_alias=AliasChoices("COWORK_CODING_WORKSPACE_MIN_IDLE_HOURS"),
+        description="How long a task must be idle before its workspace can be released automatically.",
+    )  # COWORK_CODING_WORKSPACE_MIN_IDLE_HOURS
 
 
 class StorageSettings(Settings):
