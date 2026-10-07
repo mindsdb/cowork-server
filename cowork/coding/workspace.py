@@ -859,13 +859,16 @@ class WorkspaceManager:
 
         A nested repository's files and commits would be lost when the worktree
         is removed. One can sit anywhere, including in a tracked directory the
-        parent still sees as clean, so every directory Git lists is checked.
-        Ignored directories are not, as their contents are never saved.
+        parent still sees as clean, so every path Git lists and its parents are
+        checked. A staged or committed nested repository is listed as a single
+        gitlink path. Ignored directories are not checked, as their contents
+        are never saved.
         """
         untracked = [path for status, path in self._status_entries(worktree) if status == "??"]
         tracked = [path for path in self.git.run(worktree, "ls-files", "-z").stdout.split("\0") if path]
-        directories = {PurePosixPath(path) for path in untracked}
+        directories: set[PurePosixPath] = set()
         for path in (*untracked, *tracked):
+            directories.add(PurePosixPath(path))
             directories.update(PurePosixPath(path).parents)
         directories.discard(PurePosixPath("."))
         return any((worktree / directory / ".git").exists() for directory in directories)
