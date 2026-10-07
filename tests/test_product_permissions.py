@@ -113,21 +113,23 @@ async def test_missing_internal_configuration_fails_closed(monkeypatch):
 async def test_response_denial_precedes_router_harness_and_persistence(
     monkeypatch, stream
 ):
+    import cowork.handlers.responses as responses
     from cowork.handlers.responses import ResponsesHandler
     from cowork.schemas.responses import ResponsesRequest
 
     authority(monkeypatch, body={"allowed": False})
+    run_db = AsyncMock(side_effect=AssertionError("No database work"))
+    monkeypatch.setattr(responses, "run_db", run_db)
     handler = object.__new__(ResponsesHandler)
     handler.scope = ORG
     handler._router_binding = AsyncMock(
         side_effect=AssertionError("Router must not run")
     )
-    handler.session = Mock()
     with pytest.raises(permissions.ProductPermissionDenied) as error:
         await handler.handle(ResponsesRequest(input="Run the model", stream=stream))
     assert error.value.status_code == 403
     handler._router_binding.assert_not_called()
-    handler.session.assert_not_called()
+    run_db.assert_not_called()
 
 
 async def test_queued_reuse_denial_precedes_redis_even_with_an_existing_key(
@@ -252,19 +254,15 @@ async def test_routing_gate_does_not_delegate_authorization_failures(
     import cowork.handlers.responses as responses
 
     handler = object.__new__(responses.ResponsesHandler)
-    handler.scope, handler.scoped, handler.harness_name = ORG, Mock(), "anton"
+    handler.scope, handler.harness_name = ORG, "anton"
     handler._router_binding = AsyncMock(side_effect=error_type())
     route = AsyncMock(side_effect=AssertionError("No fallback model"))
     monkeypatch.setattr(responses, "decide_route", route)
-    monkeypatch.setattr(
-        responses,
-        "ConversationService",
-        lambda session: SimpleNamespace(get_ordered_messages=lambda cid: []),
-    )
     with pytest.raises(error_type):
         await handler._route_request(
             conversation_id=None,
             harness_input=[{"type": "text", "text": "Run"}],
+            gate_rows=[],
             has_attachments=False,
             has_disabled_connections=False,
         )

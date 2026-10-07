@@ -13,6 +13,7 @@ from uuid import UUID
 
 from sqlalchemy import case, func, tuple_
 from sqlalchemy import select as sa_select
+from sqlalchemy.orm import selectinload
 
 from cowork.common.paths import (
     dir_lstat,
@@ -343,6 +344,13 @@ class ConversationService:
 
         Idempotent: a no-op when nothing matches.
         """
+        if self.clear_pending(conversation_id, message_id=message_id):
+            self.session.commit()
+
+    def clear_pending(self, conversation_id: UUID, *, message_id: UUID | None = None) -> bool:
+        """finalize_pending without the commit: the flags are cleared in the
+        session, and the caller's next commit lands them with whatever else it
+        writes. Whether any row matched."""
         stmt = (
             self.session.select(Message)
             .where(Message.conversation_id == conversation_id)
@@ -351,12 +359,10 @@ class ConversationService:
         if message_id is not None:
             stmt = stmt.where(Message.id == message_id)
         pending_rows = self.session.exec(stmt).all()
-        if not pending_rows:
-            return
         for message in pending_rows:
             message.pending = False
             self.session.add(message)
-        self.session.commit()
+        return bool(pending_rows)
 
     def repair_image_content(self, conversation_id: UUID) -> list[UUID]:
         """Strip image content blocks from every stored message in a
@@ -1024,6 +1030,21 @@ class ConversationService:
         the LLM-history read, and the current turn's input arrives separately, so
         replaying it here would double-feed it. Pass include_pending=True only if a
         caller genuinely needs the not-yet-finalized row."""
+        stmt = self._ordered_messages(conversation_id, include_pending=include_pending)
+        return list(self.session.exec(stmt).all())
+
+    def get_replay_messages(self, conversation_id: UUID) -> list[Message]:
+        """The history get_ordered_messages returns, with each message's
+        events loaded in one more query.
+
+        For a reader that replays the history after its session has closed,
+        as the harness does with what its database unit read: the rows and
+        their events stay readable, and a long conversation costs two queries
+        rather than one per message."""
+        stmt = self._ordered_messages(conversation_id, include_pending=False)
+        return list(self.session.exec(stmt.options(selectinload(Message.message_events))).all())
+
+    def _ordered_messages(self, conversation_id: UUID, *, include_pending: bool):
         # Anchor the parent: Message has no org_id, so tenancy comes from
         # resolving the conversation through the scoped session — a foreign
         # id must answer like a nonexistent one, not leak another org's
@@ -1034,7 +1055,7 @@ class ConversationService:
         )
         if not include_pending:
             stmt = stmt.where(Message.pending == False)  # noqa: E712 — SQL boolean column, not Python identity
-        return list(self.session.exec(stmt.order_by(*_MESSAGE_ORDER)).all())
+        return stmt.order_by(*_MESSAGE_ORDER)
 
     def _hydrate_message_items(self, messages: Iterable[Message]) -> list[dict]:
         """Turn ordered Message rows into the UI-facing item-dict shape,

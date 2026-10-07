@@ -31,6 +31,8 @@ from cowork.streaming import buffer as buffer_mod
 from cowork.streaming.buffer import FileStreamBuffer, RedisStreamBuffer, read_records, turn_buffer_path
 from cowork.streaming.registry import TurnLifecycle, registry
 
+from _fakes import inline_run_db, opens
+
 # Imported softly so that, on a build without the ticker, the turn-level tests
 # below fail on what the turn does rather than on this import.
 try:
@@ -137,13 +139,13 @@ def _handler(monkeypatch, saved: dict, harness: _Harness):
             pass
 
         def get_conversation(self, conv_id):
-            return object()
+            return SimpleNamespace(project=None)
 
         def save_user_message(self, conv_id, content, *, created_at=None, pending=False):
             return SimpleNamespace(id=uuid4())
 
-        def finalize_pending(self, conv_id, message_id=None):
-            pass
+        def clear_pending(self, conv_id, *, message_id=None):
+            return True
 
         def save_assistant_turn(self, conv_id, text, events, harness=None, tool_rows=None):
             saved["assistant"] = text
@@ -154,8 +156,7 @@ def _handler(monkeypatch, saved: dict, harness: _Harness):
             pass
 
     monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
-    monkeypatch.setattr(responses_mod, "ScopedSession", lambda s, scope: FakeSession())
-    monkeypatch.setattr(responses_mod, "get_open_session", lambda: None)
+    monkeypatch.setattr(responses_mod, "run_db", inline_run_db(FakeSession()))
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: None)
     monkeypatch.setattr(responses_mod, "get_harness", lambda name: harness)
     return handler
@@ -165,8 +166,8 @@ async def _run(monkeypatch, buffer, harness: _Harness, saved: dict):
     handler = _handler(monkeypatch, saved, harness)
     lifecycle = TurnLifecycle()
     handle = await registry.start(
-        conversation_id=CID, turn_id=0, buffer=buffer, lifecycle=lifecycle,
-        producer_coro=handler._run_turn(
+        conversation_id=CID, turn_id=0, open_buffer=opens(buffer), lifecycle=lifecycle,
+        produce=lambda buffer: handler._run_turn(
             conv_id=uuid4(), harness_input=[], original_content="hi", model="anton",
             disabled=None, harness_name="anton", harness_id="anton", buffer=buffer,
             lifecycle=lifecycle,
