@@ -153,3 +153,37 @@ async def test_stopping_a_turn_persists_a_retirement_for_the_open_question(monke
         "values": [],
         "text": "",
     }
+
+
+async def test_a_stall_retires_the_open_question_before_its_failure(monkeypatch):
+    """The UI gave up on a turn whose question was still open. The saved log
+    retires the question, then ends on the stall, so a reload shows no open
+    card that nothing can answer above the stall card."""
+    from cowork.streaming.registry import TurnLifecycle
+
+    saved: dict = {}
+    published = asyncio.Event()
+    handler = _cancellable_handler(monkeypatch, saved, published)
+    buffer = _FakeBuffer()
+
+    task = asyncio.create_task(handler._run_turn(
+        conv_id=uuid4(), harness_input=[], original_content="hi", model="anton",
+        disabled=None, harness_name="anton", harness_id="anton", buffer=buffer,
+        lifecycle=TurnLifecycle(stalled=True),
+    ))
+    await asyncio.wait_for(published.wait(), timeout=5)
+    task.cancel()
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+
+    assert buffer.closed == "interrupted"
+    events = saved["events"]
+    assert events[0]["type"] == "response.ask_user"
+    assert events[-2] == {
+        "type": "response.ask_user_answered",
+        "question_id": "ask:1",
+        "status": "cancelled",
+        "values": [],
+        "text": "",
+    }
+    assert events[-1]["type"] == "response.failed"
+    assert events[-1]["code"] == "stalled"

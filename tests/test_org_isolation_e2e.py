@@ -502,11 +502,14 @@ class _LiveHandle:
         latest_seq = 3
 
     def __init__(self, conversation_id: str, org_id: str, user_id: str) -> None:
+        from cowork.streaming.registry import TurnLifecycle
+
         self.conversation_id = conversation_id
         self.org_id = org_id
         self.user_id = user_id
         self.turn_id = 1
         self.buffer = self._Buffer()
+        self.lifecycle = TurnLifecycle()
         self.cancelled = False
 
     @property

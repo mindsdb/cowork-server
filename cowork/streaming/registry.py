@@ -111,6 +111,11 @@ class TurnLifecycle:
     Set BEFORE the cancel, same ordering as ``discarded``: a producer's
     ``CancelledError`` handler checks it to persist an interrupted turn.
 
+    ``stalled`` means "the UI heard nothing for its idle window and gave up",
+    not the user's own Stop. Set BEFORE the cancel, same ordering again: the
+    producer's ``CancelledError`` handler checks it to persist a stall record.
+    ``shutting_down`` and ``timed_out`` win over it.
+
     ``saved_question`` means "this turn's question is in the conversation".
     The producer sets it once its first unit saves the question. From then on
     a request that reads the history counts that row, so only a request that
@@ -123,6 +128,7 @@ class TurnLifecycle:
     # Watchdog expiry is an interruption, separate from deliberate user Stop.
     timed_out: bool = False
     saved_question: bool = False
+    stalled: bool = False
 
 
 @dataclass

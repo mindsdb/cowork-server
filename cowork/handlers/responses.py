@@ -46,10 +46,16 @@ from cowork.models.message import Message
 from cowork.streaming import StreamBuffer, TurnLifecycle, new_buffer, registry, sse_frame
 from cowork.streaming.answer_text import accumulate_answer_text
 from cowork.streaming.backend import get_backend
+from cowork.streaming.liveness import ModelWaitTicker
 from cowork.streaming.records import TerminalReason
 from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
-from cowork.turnqueue.redis_client import cancel_flag_key, get_redis
+from cowork.turnqueue.redis_client import (
+    STALLED_CANCEL_REASON,
+    cancel_cause_key,
+    cancel_flag_key,
+    get_redis,
+)
 from cowork.schemas.responses import (
     Content,
     ContentType,
@@ -77,6 +83,8 @@ from cowork.handlers.turn_errors import (
     REMOTE_CANCEL_VIA_FAIL_JOB,
     RESET_AT_CODES,
     SERVER_BUSY_CODE,
+    STALLED_CODE,
+    STALLED_TURN_MESSAGE,
     auth_error_detail,
     friendly_turn_error,
     gate_reset_at,
@@ -229,6 +237,28 @@ async def _remote_cancel_confirmed(error: str | None, correlation_id: str) -> bo
         logger.exception(
             "[responses] could not read the cancel flag for correlation_id=%s; "
             "treating the turn as failed", correlation_id,
+        )
+        return False
+
+
+async def _remote_cancel_stalled(correlation_id: str) -> bool:
+    """Whether a confirmed remote cancel was the UI giving up on a stall.
+
+    A ``/cancel`` that lands on a replica which does not own the turn can only
+    leave Redis keys behind, and scratchpad-controller's ``_clear_cancel`` may
+    already have deleted the flag when this replica hears of the cancel. The
+    cause key outlives it, so it is what tells a stall from a Stop here.
+    """
+    try:
+        return await get_redis().get(cancel_cause_key(correlation_id)) == STALLED_CANCEL_REASON
+    except Exception:
+        # Read as a Stop, the outcome of any cancel with no cause: reading it
+        # as a stall would put a failure row under a real Stop, the more
+        # common cancel. The partial answer is kept either way; only the
+        # stall card is lost. ERROR, like _remote_cancel_confirmed's fallback.
+        logger.exception(
+            "[responses] could not read the cancel cause for correlation_id=%s; "
+            "saving the turn as a Stop", correlation_id,
         )
         return False
 
@@ -1931,6 +1961,8 @@ class ResponsesHandler:
                     break
                 elif kind == "turn_failed":
                     if await _remote_cancel_confirmed(data.get("error"), corr):
+                        if await _remote_cancel_stalled(corr):
+                            lifecycle.stalled = True
                         # A /cancel that reached a replica which doesn't
                         # own the producer sets the Redis flag only, so
                         # the controller is what discards the pod and it
@@ -2067,14 +2099,17 @@ class ResponsesHandler:
                 # The cancel arrived while finish() saved the answer and wrote
                 # the terminal record, and waited for both. The turn is over.
                 return
-            if lifecycle.shutting_down or lifecycle.timed_out:
+            interrupted = lifecycle.shutting_down or lifecycle.timed_out
+            if interrupted or lifecycle.stalled:
+                # Same split as _run_turn's branch; see there.
+                message, code = (
+                    (INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE) if interrupted
+                    else (STALLED_TURN_MESSAGE, STALLED_CODE)
+                )
                 collected_events.extend(cancelled_ask_user_retirements(collected_events))
-                collected_events.append(response_failed_payload(
-                    INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
-                ))
+                collected_events.append(response_failed_payload(message, code, request_id=corr))
                 await run_to_completion(end_turn("interrupted", lambda message_id: response_failed_sse(
-                    INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
-                    assistant_message_id=message_id,
+                    message, code, request_id=corr, assistant_message_id=message_id,
                 )))
                 return
             # Partial text generated before cancellation is persisted, with
@@ -2280,6 +2315,10 @@ class ResponsesHandler:
             if conversation is None:
                 return
             harness = get_harness(harness_name)
+            # Keeps the turn alive while anton waits on a quiet model call. An
+            # installed anton without the tracker gives the ticker nothing to
+            # read, so it writes no frames (ModelWaitTicker._snapshot).
+            model_wait = ModelWaitTicker()
             stream = harness.stream_response(
                 conversation=conversation, input=harness_input, model=model,
                 reasoning_effort=reasoning_effort, disabled_connections=disabled,
@@ -2287,20 +2326,24 @@ class ResponsesHandler:
                 # The cowork UI (scheduled turns show there too) renders a
                 # tool's message to the user, as on the remote path.
                 tool_messages=True,
+                model_wait=model_wait,
             )
             event_count = 0
             completed_frame: str | None = None
-            async for sse_string in harness.formatter(stream, model, event_sink):
-                event_count += 1
-                sse_string = self._inject_created(sse_string, conv_id, harness_id, question_id)
-                if self._sse_event_type(sse_string) == "response.completed":
-                    # The formatter yields its terminal frame last, once its
-                    # source is exhausted, so event_sink has already seen
-                    # everything this turn produced. finish() sends it once
-                    # the answer is saved, carrying the saved row's id.
-                    completed_frame = sse_string
-                    continue
-                await buffer.append("sse", {"sse": sse_string})
+            # The ticker stops before finish() or any branch below closes the
+            # buffer, so it can never write after the terminal record.
+            async with model_wait.running(buffer=buffer):
+                async for sse_string in harness.formatter(stream, model, event_sink):
+                    event_count += 1
+                    sse_string = self._inject_created(sse_string, conv_id, harness_id, question_id)
+                    if self._sse_event_type(sse_string) == "response.completed":
+                        # The formatter yields its terminal frame last, once its
+                        # source is exhausted, so event_sink has already seen
+                        # everything this turn produced. finish() sends it once
+                        # the answer is saved, carrying the saved row's id.
+                        completed_frame = sse_string
+                        continue
+                    await buffer.append("sse", {"sse": sse_string})
             logger.info("[responses] turn %s finished — %d events", conv_id, event_count)
             # A Stop that lands here waits for the save and its frame, so the
             # stream's terminal record always matches what the database holds.
@@ -2320,14 +2363,21 @@ class ResponsesHandler:
                 # The cancel arrived while finish() saved the answer and wrote
                 # the terminal record, and waited for both. The turn is over.
                 return
-            if lifecycle.shutting_down or lifecycle.timed_out:
+            # Shutdown and the watchdog win over a stall: the server ended the
+            # turn on its own, whatever the UI decided. A stall is saved as a
+            # failure with its own code, so a reload shows the stall card
+            # rather than a partial answer that reads like a Stop. Both pass
+            # their own frame to end_turn, so a failed save keeps that frame.
+            interrupted = lifecycle.shutting_down or lifecycle.timed_out
+            if interrupted or lifecycle.stalled:
+                message, code = (
+                    (INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE) if interrupted
+                    else (STALLED_TURN_MESSAGE, STALLED_CODE)
+                )
                 collected_events.extend(cancelled_ask_user_retirements(collected_events))
-                collected_events.append(response_failed_payload(
-                    INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
-                ))
+                collected_events.append(response_failed_payload(message, code, request_id=corr))
                 await run_to_completion(end_turn("interrupted", lambda message_id: response_failed_sse(
-                    INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
-                    assistant_message_id=message_id,
+                    message, code, request_id=corr, assistant_message_id=message_id,
                 )))
                 return
             # Nothing special is emitted on cancellation.
@@ -2487,11 +2537,13 @@ class ResponsesHandler:
             # below actually changed.
             collected_events.append(failed)
 
-            async def fail() -> None:
+            async def fail(*, error: BaseException) -> None:
                 """Repair the stored history when the turn's error asks for
                 it, then save the answer and write its frame. One step under
                 run_to_completion, so a Stop that lands during the repair
-                waits for both and the turn still ends with its own error."""
+                waits for both and the turn still ends with its own error.
+                `error` is passed in because Python unbinds `exc` when the
+                except block ends."""
                 if code in CONTENT_REPAIR_CODES:
                     # ENG-1992: the provider permanently rejected an image block in
                     # this conversation's stored history — repair the DATA once,
@@ -2507,7 +2559,7 @@ class ResponsesHandler:
                         logger.warning(
                             "[responses] content validation error on conversation %s — "
                             "repaired %d message(s) with image content: %s",
-                            conv_id, len(repaired), exc, extra={"request_id": corr},
+                            conv_id, len(repaired), error, extra={"request_id": corr},
                         )
                     except Exception:
                         logger.exception(
@@ -2518,7 +2570,7 @@ class ResponsesHandler:
                     message, code, **extra, assistant_message_id=message_id,
                 ))
 
-            await run_to_completion(fail())
+            await run_to_completion(fail(error=exc))
         finally:
             await _seal_unterminated_buffer(buffer, lifecycle, conv_id, request_id=corr)
 

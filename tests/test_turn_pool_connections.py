@@ -41,7 +41,13 @@ from cowork.db import units
 from cowork.db.scoped import LOCAL_SCOPE, SYSTEM_SCOPE
 from cowork.db.units import DatabaseBusy, conversation_writes, unit_session
 from cowork.handlers.response_routing import DELEGATED_AGENTIC, DIRECT_CONTEXT, RouteDecision
-from cowork.handlers.turn_errors import INTERRUPTED_TURN_MESSAGE, SERVER_BUSY_CODE, server_busy_message
+from cowork.handlers.turn_errors import (
+    INTERRUPTED_TURN_MESSAGE,
+    SERVER_BUSY_CODE,
+    STALLED_CODE,
+    STALLED_TURN_MESSAGE,
+    server_busy_message,
+)
 from cowork.harnesses.anton_harness import harness as harness_mod
 from cowork.models.message import Message
 from cowork.models.schedule import Schedule, ScheduleRun
@@ -870,11 +876,14 @@ async def test_a_stop_whose_final_save_fails_reports_failure(monkeypatch):
     assert _rows(conversation_id) == [_Row(role="user", pending=True, seq=0)]
 
 
-@pytest.mark.parametrize("how", ["shutdown", "watchdog"])
+@pytest.mark.parametrize("how", ["shutdown", "watchdog", "ui_stall"])
 async def test_an_interrupted_turn_whose_save_fails_is_left_for_boot_recovery(monkeypatch, tmp_path, how):
-    """A restart's shutdown, or the idle watchdog, stops a turn whose save
-    then fails. The turn still ends interrupted, with the interruption frame,
-    so the next boot's recovery seals its question and answer into history."""
+    """A restart's shutdown, the idle watchdog, or the UI's stall cancel stops
+    a turn whose save then fails. The turn still ends interrupted, with its
+    own frame (the stall keeps code ``stalled``), so the next boot's recovery
+    seals its question and answer into history."""
+    from cowork.api.v1.endpoints.responses import CancelRequest, cancel_response
+
     conversation_id = uuid4()
     model = PausedModel()
     monkeypatch.setattr(harness_mod, "build_chat_session", model.build)
@@ -890,6 +899,10 @@ async def test_an_interrupted_turn_whose_save_fails_is_left_for_boot_recovery(mo
         handle = registry.get(str(conversation_id))
         if how == "shutdown":
             await registry.shutdown(timeout_seconds=5)
+        elif how == "ui_stall":
+            await cancel_response(
+                CancelRequest(conversation_id=str(conversation_id), reason="stalled"), LOCAL_SCOPE,
+            )
         else:
             handle.lifecycle.timed_out = True
             handle.task.cancel()
@@ -899,7 +912,10 @@ async def test_an_interrupted_turn_whose_save_fails_is_left_for_boot_recovery(mo
 
     last_kind, last = _frames(answered.text)[-1]
     assert last_kind == "response.failed"
-    assert last["error"] == INTERRUPTED_TURN_MESSAGE, last
+    if how == "ui_stall":
+        assert (last["code"], last["error"]) == (STALLED_CODE, STALLED_TURN_MESSAGE), last
+    else:
+        assert last["error"] == INTERRUPTED_TURN_MESSAGE, last
     assert _terminal(conversation_id) == "Interrupted"
     assert _rows(conversation_id) == [_Row(role="user", pending=True, seq=0)]
     # Boot recovery over this turn's buffer alone.
