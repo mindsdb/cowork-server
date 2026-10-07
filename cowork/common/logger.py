@@ -5,10 +5,14 @@ import logging.handlers
 import os
 import re
 import sys
+from collections.abc import Iterator
 from copy import deepcopy
 from pathlib import Path
 from sqlite3 import Error as SQLiteError
 
+from anthropic import APIError as AnthropicAPIError
+from anton.core.llm.provider import CURATED_PROVIDER_ERRORS
+from openai import APIError as OpenAIAPIError
 from psycopg import Error as PsycopgError
 from psycopg2 import Error as Psycopg2Error
 from sqlalchemy.exc import SQLAlchemyError, StatementError
@@ -85,14 +89,81 @@ class DatabaseErrorFilter(logging.Filter):
         return True
 
 
+def _exception_chain(exc: BaseException) -> Iterator[BaseException]:
+    """Walk causes, implicit contexts and groups without following cycles."""
+    pending = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+
+
+def exception_http_status(exc: BaseException) -> int | None:
+    """Return an actual HTTP status, never a provider body field coerced to text."""
+    for error in _exception_chain(exc):
+        status = getattr(error, "status_code", None)
+        if type(status) is int and 100 <= status <= 599:
+            return status
+    return None
+
+
+_PROVIDER_ERROR_TYPES = (OpenAIAPIError, AnthropicAPIError, *CURATED_PROVIDER_ERRORS)
+
+
+class ProviderErrorFilter(logging.Filter):
+    """Keep SDK bodies and typed provider error text out of owned log handlers.
+
+    A provider may echo prompts or credentials in its message, body or request.
+    Replace the entire record, including already interpolated wrapper messages,
+    while leaving the original exception and client response unchanged.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        candidates: list[BaseException] = []
+        if record.exc_info is not None and record.exc_info[1] is not None:
+            candidates.append(record.exc_info[1])
+        if isinstance(record.msg, BaseException):
+            candidates.append(record.msg)
+        args = record.args.values() if isinstance(record.args, dict) else (record.args or ())
+        candidates.extend(arg for arg in args if isinstance(arg, BaseException))
+        for exc in candidates:
+            error = next((
+                error for error in _exception_chain(exc)
+                if isinstance(error, _PROVIDER_ERROR_TYPES)
+            ), None)
+            if error is None:
+                continue
+            status = exception_http_status(exc)
+            record.msg = "Provider operation failed: error_type=%s status=%s"
+            record.args = (type(error).__name__, status if status is not None else "unknown")
+            record.message = record.getMessage()
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
+            break
+        return True
+
+
 def uvicorn_logging_config() -> dict[str, object]:
-    """Keep Uvicorn's handlers from bypassing the database exception filter."""
+    """Keep Uvicorn's handlers from bypassing the exception privacy filters."""
     from uvicorn.config import LOGGING_CONFIG
 
     config = deepcopy(LOGGING_CONFIG)
-    config["filters"] = {"database_errors": {"()": DatabaseErrorFilter}}
+    config["filters"] = {
+        "database_errors": {"()": DatabaseErrorFilter},
+        "provider_errors": {"()": ProviderErrorFilter},
+    }
     for handler in config["handlers"].values():
-        handler["filters"] = ["database_errors"]
+        handler["filters"] = ["database_errors", "provider_errors"]
     return config
 
 
@@ -197,6 +268,7 @@ def setup_file_logging(log_dir: str = "logs", max_bytes: int = 10485760, backup_
         )
     )
     all_logs_handler.addFilter(DatabaseErrorFilter())
+    all_logs_handler.addFilter(ProviderErrorFilter())
     handlers.append(all_logs_handler)
 
     # Error logs file
@@ -212,6 +284,7 @@ def setup_file_logging(log_dir: str = "logs", max_bytes: int = 10485760, backup_
         )
     )
     error_handler.addFilter(DatabaseErrorFilter())
+    error_handler.addFilter(ProviderErrorFilter())
     handlers.append(error_handler)
 
     return handlers
@@ -238,6 +311,7 @@ def setup_console_handler():
         handler.setFormatter(get_colored_formatter())
 
     handler.addFilter(DatabaseErrorFilter())
+    handler.addFilter(ProviderErrorFilter())
     return handler
 
 
@@ -313,8 +387,10 @@ def setup_logging():
     third_party_loggers = [
         "httpcore.http11",
         "openai._base_client",
+        "anthropic._base_client",
         "httpcore.connection",
         "httpx",
+        "httpx2",
         "urllib3",
         "faiss",
         "asyncio",

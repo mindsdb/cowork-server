@@ -215,7 +215,9 @@ Set `LOG_LEVEL` (default `WARNING`) to control verbosity. Enable file logging wi
 
 Database exception records in the owned console/file handlers and the CLI-configured Uvicorn error handlers omit SQL, parameter values, driver details and tracebacks. Session logs retain error types and client HTTP status; the shared handler filter also retains valid driver SQLSTATE codes. Exceptions and HTTP errors returned to callers stay unchanged.
 
-SQLAlchemy query and connection diagnostics stay at `WARNING`, even when application logging is set to `DEBUG`.
+OpenAI/Anthropic SDK errors and Anton's typed provider errors are filtered through their causes, contexts and exception groups in the same handlers. Provider logs retain only error class and validated numeric HTTP status; request IDs remain available. Provider messages, bodies, requests and tracebacks are omitted. Routing failure warnings also omit body-derived type, code and parameter fields. Original exceptions, probe verdicts and client HTTP/SSE errors stay unchanged.
+
+SQLAlchemy query and connection diagnostics stay at `WARNING`, even when application logging is set to `DEBUG`. SDK request diagnostics and HTTP client logging remain suppressed, including Anthropic and `httpx2`, because they can include request bodies or URLs before an exception is raised.
 
 ## Releasing
 

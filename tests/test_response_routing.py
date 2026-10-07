@@ -1244,9 +1244,8 @@ def _gate_warnings(caplog):
 @pytest.mark.asyncio
 async def test_router_unavailable_logs_the_refusal_without_its_message(monkeypatch, caplog):
     """OpenAI refuses the gate's function tool on chat completions when the
-    router model reasons. The [gate] line names that refusal by class, status,
-    type and param. It leaves the message out: provider text can quote the
-    request or echo a credential."""
+    router model reasons. The [gate] line names that refusal by class and
+    status. Provider text can quote the request or echo a credential."""
     import logging
 
     from anton.core.llm import provider as anton_provider
@@ -1286,17 +1285,17 @@ async def test_router_unavailable_logs_the_refusal_without_its_message(monkeypat
     )
     assert f"error={expected_error}" in line
     assert "status=400" in line
-    assert "type=invalid_request_error" in line
-    assert "param=reasoning_effort" in line
+    assert "type=" not in line
+    assert "param=" not in line
+    assert "code=" not in line
     assert echoed_key not in line
     assert "Function tools" not in line
     assert record.exc_info is None
 
 
 @pytest.mark.asyncio
-async def test_router_unavailable_keeps_sdk_fields_under_a_status_bearing_wrapper(monkeypatch, caplog):
-    """A typed anton wrapper can retain the HTTP status but normalize its code
-    and omit type/param. Exercise that contract even with an older anton lock."""
+async def test_router_unavailable_keeps_only_status_under_a_status_bearing_wrapper(monkeypatch, caplog):
+    """A wrapper can retain HTTP status while its cause holds private body fields."""
     import logging
 
     import httpx
@@ -1315,9 +1314,9 @@ async def test_router_unavailable_keeps_sdk_fields_under_a_status_bearing_wrappe
             400, request=httpx.Request("POST", "https://example.com/v1/chat/completions")
         ),
         body={
-            "type": "invalid_request_error",
-            "code": "unsupported_value",
-            "param": "reasoning_effort",
+            "type": secret + "-type",
+            "code": secret + "-code",
+            "param": secret + "-param",
         },
     )
 
@@ -1331,17 +1330,54 @@ async def test_router_unavailable_keeps_sdk_fields_under_a_status_bearing_wrappe
     assert decision.reason == "router_unavailable"
     (record,) = _gate_warnings(caplog)
     assert record.getMessage() == (
-        "[gate] reason=router_unavailable error=RequestRefusedError status=400 "
-        "type=invalid_request_error code=unsupported_value param=reasoning_effort"
+        "[gate] reason=router_unavailable error=RequestRefusedError status=400"
     )
-    assert secret not in record.getMessage()
+    assert secret not in repr(record.__dict__)
+    assert record.args == ("RequestRefusedError", 400)
     assert record.exc_info is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [True, 99, 600, "400", "private_status_marker", None])
+async def test_router_unavailable_drops_arbitrary_status_and_provider_body_fields(monkeypatch, caplog, status):
+    import logging
+
+    import httpx
+    import openai
+
+    from cowork.handlers import response_routing as routing
+
+    private = "router_private_request_marker"
+    error = openai.BadRequestError(
+        private,
+        response=httpx.Response(400, request=httpx.Request("POST", "https://example.com/" + private)),
+        body={"type": private, "code": private, "param": private},
+    )
+    error.status_code = status
+
+    async def failed_gate(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(routing, "_gate", failed_gate)
+    with caplog.at_level(logging.WARNING, logger=routing.__name__):
+        decision = await _route_on(None)
+
+    assert decision.reason == "router_unavailable"
+    assert decision.fallback is True
+    (record,) = _gate_warnings(caplog)
+    assert record.getMessage() == "[gate] reason=router_unavailable error=BadRequestError status=None"
+    assert record.args == ("BadRequestError", None)
+    assert record.exc_info is None
+    assert private not in repr(record.__dict__)
+    assert "private_status_marker" not in repr(record.__dict__)
+    assert error.status_code == status
+    assert error.body == {"type": private, "code": private, "param": private}
 
 
 @pytest.mark.asyncio
 async def test_router_unavailable_logs_the_status_under_antons_own_error(monkeypatch, caplog):
     """anton raises its own error from the SDK's for the statuses it names, so
-    the line reads the status and the provider's code from that cause. Here,
+    the line reads only the status from that cause. Here,
     an Azure deployment that doesn't exist."""
     import logging
 
@@ -1361,7 +1397,7 @@ async def test_router_unavailable_logs_the_status_under_antons_own_error(monkeyp
     line = record.getMessage()
     assert "error=NotFoundError" not in line  # the class is anton's, not the SDK's
     assert "status=404" in line
-    assert "code=DeploymentNotFound" in line
+    assert "code=" not in line
     assert "does not exist" not in line
 
 
