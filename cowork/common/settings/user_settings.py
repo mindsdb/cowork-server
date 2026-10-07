@@ -500,6 +500,10 @@ def normalize_provider_value(val: str, *, minds_key_present: bool) -> str:
 
 
 class UserSettings(Settings):
+    # A runtime token must disappear from a turn snapshot when the desktop
+    # clears it. Stored keys keep their normal snapshot semantics.
+    _runtime_minds_credential: bool = PrivateAttr(default=False)
+    _stored_minds_api_key: SecretStr | None = PrivateAttr(default=None)
     # The recommended-model catalog and per-provider model defaults are
     # global, application-level config and live in app_settings
     # (RECOMMENDED_MODELS / RECOMMENDED_PAIR / *_MODEL_DEFAULTS).
@@ -1453,6 +1457,8 @@ def get_user_settings(scope: "TenantScope | None" = None) -> UserSettings:
         live_minds_key = get_minds_credential()
         if live_minds_key:
             settings.minds_api_key = SecretStr(live_minds_key)
+        elif turn.settings._runtime_minds_credential:
+            settings.minds_api_key = turn.settings._stored_minds_api_key
         return settings
     return _load_from_db(scope)
 

@@ -395,11 +395,13 @@ def _conversation_for_harness(session: ScopedSession, *, conversation_id: UUID) 
 
 
 def _start_turn(
-    session: ScopedSession, *, conversation_id: UUID, content, sent_at: datetime,
-) -> _StartedTurn:
+    session: ScopedSession, *, lifecycle: TurnLifecycle, conversation_id: UUID, content, sent_at: datetime,
+) -> _StartedTurn | None:
     """A streamed turn's first unit: load the conversation, then save the
     question as pending (ENG-1231), so a refresh mid-turn shows it while
     replayed history (get_ordered_messages) leaves it out."""
+    if lifecycle.discarded:
+        return None
     conversation = _conversation_for_harness(session, conversation_id=conversation_id)
     question = ConversationService(session).save_user_message(
         conversation_id, content, created_at=sent_at, pending=True,
@@ -2067,11 +2069,15 @@ class ResponsesHandler:
             if lifecycle.discarded:
                 # Deleted while it saved: see finish().
                 return
+            if saved.failure is not None:
+                await buffer.append("sse", {"sse": _failed_frame_for(saved.failure, request_id=corr)})
+                await buffer.close("error")
+                return
             if failed_frame is not None:
                 await buffer.append("sse", {"sse": failed_frame(saved.assistant_message_id)})
             await buffer.close(reason)
 
-        async def start() -> Conversation:
+        async def start() -> Conversation | None:
             """The turn's first unit, under the conversation's write lock.
             Run under run_to_completion: a cancel that lands while the unit
             writes waits for it, so the branches below know the question it
@@ -2079,14 +2085,21 @@ class ResponsesHandler:
             nonlocal question_id
             async with conversation_writes(conv_id):
                 started = await run_db(
-                    partial(_start_turn, conversation_id=conv_id, content=original_content, sent_at=sent_at),
+                    partial(
+                        _start_turn, lifecycle=lifecycle, conversation_id=conv_id,
+                        content=original_content, sent_at=sent_at,
+                    ),
                     scope=scope,
                 )
+            if started is None:
+                return None
             question_id = started.question_id
             return started.conversation
 
         try:
             conversation = await run_to_completion(start())
+            if conversation is None:
+                return
             harness = get_harness(harness_name)
             stream = harness.stream_response(
                 conversation=conversation, input=harness_input, model=model,

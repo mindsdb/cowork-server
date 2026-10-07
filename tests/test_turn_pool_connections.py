@@ -255,9 +255,7 @@ class _Checkout:
     sites: frozenset[str]
 
 
-# The harness's end-of-turn writes run in its generator's `finally`, where an
-# await is skipped on cancellation, so they stay synchronous on short sessions.
-_LOOP_CHECKOUTS_ALLOWED = frozenset({"_persist_history_compaction", "_index_new_slugs"})
+_LOOP_CHECKOUTS_ALLOWED = frozenset()
 
 
 @dataclass
@@ -306,9 +304,8 @@ def _logging_checkouts(engine) -> Iterator[_CheckoutLog]:
 
 
 async def test_a_turn_checks_out_off_the_event_loop_one_connection_per_thread(monkeypatch, tmp_path):
-    """A full turn, with a compaction and a new artifact so that both of the
-    harness's end-of-turn writes run: only those two check out on the event
-    loop's thread, and no thread ever holds two connections at once."""
+    """A full turn, with compaction and a new artifact: every checkout runs
+    off the loop, and no thread holds two connections at once."""
     engine = _app_engine()
     conversation_id = _conversation(turns=[("q1", "a1"), ("q2", "a2")])
     with unit_session(scope=LOCAL_SCOPE) as session:
@@ -339,8 +336,13 @@ async def test_a_turn_checks_out_off_the_event_loop_one_connection_per_thread(mo
     unexpected = log.unexpected_on_the_loop
     assert unexpected == [], f"{len(unexpected)} other checkout(s) on the event loop's thread"
     assert max(log.most_at_once.values()) == 1, log.most_at_once
-    allowed_sites = sorted(site for c in log.on_the_loop for site in c.sites & _LOOP_CHECKOUTS_ALLOWED)
-    assert allowed_sites == sorted(_LOOP_CHECKOUTS_ALLOWED), "both end-of-turn writes should have run"
+    with unit_session(scope=LOCAL_SCOPE) as session:
+        conversation = ConversationService(session).get_conversation(conversation_id)
+        assert conversation.history_summary == "SUMMARY"
+        from cowork.models.task_object import TaskObject
+        assert session.exec(session.select(TaskObject).where(
+            TaskObject.conversation_id == conversation_id, TaskObject.ref == slug,
+        )).first() is not None
 
 
 # ── T5: a failed save ends the stream as failed ──────────────────────────────
@@ -776,6 +778,105 @@ async def test_a_turn_deleted_while_its_save_waits_saves_nothing(one_connection_
 
     assert [(r.role, r.pending) for r in _rows(conversation_id)] == [("user", True)]
     assert not handle.buffer.path.exists()
+
+
+async def test_a_turn_deleted_before_its_start_writes_does_not_restore_the_question(monkeypatch):
+    conversation_id = _conversation(turns=[("old question", "old answer")])
+    with unit_session(scope=LOCAL_SCOPE) as session:
+        messages = ConversationService(session).get_ordered_messages(conversation_id)
+        anchor = messages[-1].id
+    entered, proceed = threading.Event(), threading.Event()
+    start_turn = responses_mod._start_turn
+
+    def paused_start(session, **kwargs):
+        entered.set()
+        assert proceed.wait(timeout=10)
+        return start_turn(session, **kwargs)
+
+    def delete_history():
+        with unit_session(scope=LOCAL_SCOPE) as session:
+            ConversationService(session).delete_turn(conversation_id, anchor)
+
+    monkeypatch.setattr(responses_mod, "_start_turn", paused_start)
+    model = PausedModel()
+    monkeypatch.setattr(harness_mod, "build_chat_session", model.build)
+    async with _client() as client:
+        answer = asyncio.create_task(_ask(client, conversation_id, "deleted question"))
+        try:
+            await _until(entered.is_set)
+            handle = registry.get(str(conversation_id))
+            await asyncio.to_thread(delete_history)
+        finally:
+            proceed.set()
+        await asyncio.wait_for(asyncio.gather(handle.task, return_exceptions=True), timeout=10)
+        answer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await answer
+
+    assert _rows(conversation_id) == []
+    assert model.turns == 0
+    assert not handle.buffer.path.exists()
+
+
+async def test_a_stop_whose_final_save_fails_reports_failure(monkeypatch):
+    conversation_id = uuid4()
+    model = PausedModel()
+    monkeypatch.setattr(harness_mod, "build_chat_session", model.build)
+
+    def failed_save(*_args, **_kwargs):
+        raise RuntimeError("disk full")
+
+    async with _client() as client:
+        answer = asyncio.create_task(_ask(client, conversation_id, "hi"))
+        await asyncio.wait_for(model.answering.wait(), timeout=10)
+        monkeypatch.setattr(ConversationService, "save_assistant_turn", failed_save)
+        assert await registry.cancel(str(conversation_id)) is True
+        answered = await asyncio.wait_for(answer, timeout=10)
+
+    assert _frames(answered.text)[-1][0] == "response.failed"
+    assert _terminal(conversation_id) == "Error"
+    assert _rows(conversation_id) == [_Row(role="user", pending=True, seq=0)]
+
+
+async def test_stop_waits_for_artifact_cleanup_without_blocking_the_loop(one_connection_pool, monkeypatch):
+    conversation_id = _conversation()
+    with unit_session(scope=LOCAL_SCOPE) as session:
+        project_path = Path(ConversationService(session).get_conversation(conversation_id).project.path)
+    slug = f"cleanup-stop-{uuid4().hex[:8]}"
+    artifact = project_path / ".anton" / "artifacts" / slug
+
+    async def make_artifact(session):
+        artifact.mkdir(parents=True)
+        (artifact / "index.html").write_text("<html></html>")
+        (artifact / "metadata.json").write_text(json.dumps({"slug": slug, "name": slug, "type": "html-app"}))
+        session.artifacts_touched = {slug}
+
+    model = PausedModel(before_answer=make_artifact)
+    monkeypatch.setattr(harness_mod, "build_chat_session", model.build)
+    slots = units._slots(one_connection_pool)
+    try:
+        async with _client() as client:
+            answer = asyncio.create_task(_ask(client, conversation_id, "make an artifact"))
+            await asyncio.wait_for(model.answering.wait(), timeout=10)
+            held = await _take_the_only_connection(one_connection_pool)
+            try:
+                model.release.set()
+                await _until(lambda: slots.borrowed_tokens == 1)
+                stopping = asyncio.create_task(registry.cancel(str(conversation_id)))
+                await asyncio.sleep(0.1)
+                assert not stopping.done()
+            finally:
+                held.close()
+            assert await asyncio.wait_for(stopping, timeout=10) is True
+            await asyncio.wait_for(answer, timeout=10)
+        from cowork.models.task_object import TaskObject
+        with unit_session(scope=LOCAL_SCOPE) as session:
+            assert session.exec(session.select(TaskObject).where(
+                TaskObject.conversation_id == conversation_id, TaskObject.ref == slug,
+            )).first() is not None
+        assert _terminal(conversation_id) == "Cancelled"
+    finally:
+        shutil.rmtree(artifact, ignore_errors=True)
 
 
 # ── A refused turn, and a question sent twice ────────────────────────────────

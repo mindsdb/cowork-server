@@ -18,7 +18,7 @@ from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import current_settings_scope
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
-from cowork.db.units import run_db, unit_session
+from cowork.db.units import run_db, run_to_completion, unit_session
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
 from cowork.models.conversation import Conversation
@@ -531,7 +531,8 @@ class AntonHarness:
         # still taken, to tell CREATED from EDITED within that set.
         from cowork.services.task_objects import (
             finalize_turn_skill_drafts,
-            index_turn_artifacts,
+            record_new_artifacts,
+            turn_artifact_changes,
             publish_and_card_turn_artifacts,
             snapshot_artifact_state,
             snapshot_skill_drafts,
@@ -570,6 +571,48 @@ class AntonHarness:
         turn_rows: list[dict] | None = None
         session = None
         seed_info: dict | None = None
+
+        async def record_turn_cleanup():
+            nonlocal new_slugs, touched_slugs, turn_scope, skill_drafts
+            if session is not None and seed_info is not None and getattr(session, "last_compaction", None) is not None:
+                # Best-effort: a missing compaction does not lose the answer.
+                try:
+                    await run_db(
+                        lambda db: self._persist_history_compaction(
+                            conversation, session, seed_info, database_session=db,
+                        ),
+                        scope=_units_scope(),
+                    )
+                except Exception:
+                    logger.exception(
+                        "[anton_harness] failed to persist history compaction for conversation %s",
+                        conv_id,
+                    )
+            try:
+                changes = turn_artifact_changes(
+                    conversation_id=conv_id,
+                    artifacts_base=artifacts_base,
+                    before=before_slugs,
+                    before_mtimes=before_mtimes,
+                    tracked_new=getattr(session, "artifacts_touched", None),
+                    tracked_edits=getattr(session, "artifacts_touched", None),
+                )
+                new_slugs, touched_slugs, turn_scope = changes.created, changes.touched, _units_scope()
+                if new_slugs:
+                    await run_db(
+                        partial(
+                            record_new_artifacts,
+                            conversation_id=conv_id,
+                            project_id=conv_project_id,
+                            slugs=new_slugs,
+                            creator=getattr(conversation, "created_by", None),
+                        ),
+                        scope=turn_scope,
+                    )
+            except Exception:
+                logger.warning("Could not index artifacts created this turn", exc_info=True)
+            skill_drafts = finalize_turn_skill_drafts(project_path, before_drafts, before_strays)
+
         try:
             session, temp_vault_dir, seed_info = await self._build_chat_session(
                 conversation,
@@ -626,35 +669,9 @@ class AntonHarness:
                 # Before the steps below, so none of them raising can skip it.
                 # Scheduled rather than awaited; see close_session_scratchpads.
                 close_session_scratchpads(session, owner=f"conversation {conv_id}")
-            if session is not None and seed_info is not None:
-                # Best-effort — must never mask the turn's real outcome.
-                try:
-                    self._persist_history_compaction(conversation, session, seed_info)
-                except Exception:
-                    logger.exception(
-                        "[anton_harness] failed to persist history compaction for conversation %s",
-                        conv_id,
-                    )
-            # One dir diff → index the new artifacts and work out what this turn
-            # touched. Runs on every exit (success, error, cancel), so an artifact
-            # is always indexed. Synchronous by design: an `await` here would be
-            # skipped on cancellation, so anything awaited would silently not run.
-            new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
-                conversation, conv_id, conv_project_id, artifacts_base,
-                before_slugs, before_mtimes,
-                # Anton reports both: `create_artifact` and `open_artifact`
-                # (the only way to get a path to write into) both record, so
-                # the same set bounds created AND edited. Read defensively —
-                # on an early failure `session` is None, and an anton build
-                # predating the field has no `artifacts_touched`; both degrade
-                # to the pre-existing diff-only behaviour rather than dropping
-                # the turn's cards entirely.
-                tracked_new=getattr(session, "artifacts_touched", None),
-                tracked_edits=getattr(session, "artifacts_touched", None),
-            )
-            skill_drafts = finalize_turn_skill_drafts(
-                project_path, before_drafts, before_strays,
-            )
+            # Every exit records its artifacts. Repeated Stop/shutdown cancels
+            # wait for this step, while each database wait runs off the loop.
+            await run_to_completion(record_turn_cleanup())
         # Autopublish and cards live in the normal-completion path, matching what
         # cards already did: on Stop/cancel neither runs, and the next turn in this
         # project heals it (if there is one — an abandoned conversation never does).
@@ -813,7 +830,10 @@ class AntonHarness:
         return idx if 0 <= idx < total else None
 
     @staticmethod
-    def _persist_history_compaction(conversation: Conversation, session, seed_info: dict) -> None:
+    def _persist_history_compaction(
+        conversation: Conversation, session, seed_info: dict,
+        *, database_session: ScopedSession | None = None,
+    ) -> None:
         """Save anton's compacted summary + cutoff if it compacted this turn.
 
         `getattr` (not `session.last_compaction` directly): an anton build
@@ -831,10 +851,11 @@ class AntonHarness:
             return
         from cowork.services.conversations import ConversationService
 
-        # Synchronous, on its own short session: this runs in stream_response's
-        # `finally`, where an `await` is skipped on cancellation. It is one of
-        # the two checkouts a turn makes on the event loop thread, bounded by
-        # the pool's own wait (POOL_TIMEOUT on Postgres).
+        if database_session is not None:
+            ConversationService(database_session).update_history_compaction(
+                conversation.id, compaction["summary"], ordered_messages[idx].id,
+            )
+            return
         with unit_session(scope=_units_scope()) as session:
             ConversationService(session).update_history_compaction(
                 conversation.id, compaction["summary"], ordered_messages[idx].id,

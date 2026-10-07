@@ -24,6 +24,7 @@ import os
 from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from weakref import WeakValueDictionary
 
 from cowork.streaming.buffer import StreamBuffer
 
@@ -149,11 +150,14 @@ class RunHandle:
     def is_answering(self) -> bool:
         """Whether the turn can still write to its stream.
 
-        A producer that already wrote its terminal record is only finishing its
-        cleanup. The web UI sends a queued question the moment the stream
-        ends, so that turn must not refuse it.
+        The web UI sends a queued question on its final client frame. Once
+        that frame starts writing, start() waits for the internal terminal
+        record instead of refusing the question.
         """
-        return self.is_running and not self.buffer.is_closed
+        return (
+            self.is_running and not self.buffer.is_closed
+            and not getattr(self.buffer, "is_finishing", False)
+        )
 
     async def cancel(self) -> bool:
         """Request cancellation of the producer task. Returns True if a
@@ -201,6 +205,7 @@ class RunRegistry:
     def __init__(self) -> None:
         self._by_cid: dict[str, RunHandle] = {}
         self._lock = asyncio.Lock()
+        self._start_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
     async def start(
         self,
@@ -226,7 +231,11 @@ class RunRegistry:
         records of an earlier turn at the same number (backend.new_buffer).
         """
         loop = asyncio.get_running_loop()
-        async with self._lock:
+        lock = self._start_locks.get(conversation_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._start_locks[conversation_id] = lock
+        async with lock:
             existing = self._by_cid.get(conversation_id)
             if existing is not None and existing.is_answering:
                 logger.info(
@@ -234,6 +243,12 @@ class RunRegistry:
                     conversation_id, existing.turn_id,
                 )
                 raise TurnInProgress(conversation_id=conversation_id, turn_id=existing.turn_id)
+            if existing is not None and existing.is_running and not existing.buffer.is_closed:
+                # A final client frame is being written. Its reader can send
+                # the next question before the separate terminal record lands.
+                # Wait rather than refuse, and keep the old terminal out of a
+                # successor's buffer when a refused turn reused its number.
+                await asyncio.shield(asyncio.gather(existing.task, return_exceptions=True))
             buffer = await open_buffer()
             lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
             task = asyncio.create_task(

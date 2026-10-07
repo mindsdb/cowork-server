@@ -110,3 +110,56 @@ def test_the_turn_snapshot_serves_the_desktops_current_minds_credential(monkeypa
 
     assert served.minds_api_key.get_secret_value() == "token-after-refresh"
     assert served.harness == "anton"
+
+
+def test_the_turn_snapshot_drops_a_runtime_token_that_is_cleared():
+    runtime_credential.set_minds_credential("runtime-token")
+    try:
+        snapshot = SettingService._load([])
+        with user_settings.use_turn_settings(LOCAL_SCOPE, snapshot):
+            runtime_credential.clear_minds_credential()
+            assert user_settings.get_user_settings().minds_api_key is None
+    finally:
+        runtime_credential.clear_minds_credential()
+
+
+def test_the_turn_snapshot_preserves_a_stored_key_without_a_runtime_token():
+    runtime_credential.clear_minds_credential()
+    snapshot = user_settings.UserSettings(minds_api_key="stored-key")
+    with user_settings.use_turn_settings(LOCAL_SCOPE, snapshot):
+        assert user_settings.get_user_settings().minds_api_key.get_secret_value() == "stored-key"
+
+
+def test_clearing_a_runtime_token_restores_the_stored_snapshot_key():
+    from cowork.common.encryption import encrypt
+    from cowork.models.setting import Setting
+
+    runtime_credential.set_minds_credential("runtime-token")
+    try:
+        snapshot = SettingService._load([Setting(key="minds_api_key", value=encrypt("stored-key"))])
+        with user_settings.use_turn_settings(LOCAL_SCOPE, snapshot):
+            assert user_settings.get_user_settings().minds_api_key.get_secret_value() == "runtime-token"
+            runtime_credential.clear_minds_credential()
+            assert user_settings.get_user_settings().minds_api_key.get_secret_value() == "stored-key"
+    finally:
+        runtime_credential.clear_minds_credential()
+
+
+def test_settings_validation_sees_the_runtime_token(monkeypatch):
+    runtime_credential.set_minds_credential("runtime-token")
+    enabled_map = user_settings.UserSettings._minds_enabled_map
+    validated = []
+
+    def check_runtime(self):
+        assert self.minds_api_key is not None
+        assert self.minds_api_key.get_secret_value() == "runtime-token"
+        validated.append(True)
+        return enabled_map(self)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(user_settings.UserSettings, "_minds_enabled_map", check_runtime)
+            SettingService._load([])
+        assert validated
+    finally:
+        runtime_credential.clear_minds_credential()

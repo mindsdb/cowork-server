@@ -10,16 +10,13 @@ in every other test.
 
 Both must satisfy the same two properties:
 
-  * indexing runs in the `finally`, so an artifact is recorded on every exit —
-    and therefore the finally must contain no `await`, because an await there is
-    skipped on cancellation;
+  * indexing runs on every exit. The in-process harness waits for its cleanup
+    through run_to_completion, so cancellation cannot abandon its database unit;
   * publishing and carding run AFTER the finally, in the normal-completion path.
 
-Neither property has an observable form (their whole point is what happens when
-a turn is cancelled), which is why these tests inspect the source rather than
-behavior. Assertions are normalized (whitespace collapsed) and check the smallest
-distinctive fragment, so an equivalent-but-differently-spaced implementation stays
-green.
+The database and cancellation behavior also have dynamic coverage in
+test_turn_pool_connections. These assertions check the wiring and order, with
+whitespace normalized so formatting does not change their result.
 """
 from __future__ import annotations
 
@@ -77,21 +74,22 @@ def test_publish_is_called_outside_the_finally_block(producer):
 
 
 @pytest.mark.parametrize("producer", PRODUCERS)
-def test_finally_block_contains_no_await(producer):
+def test_finally_cleanup_is_protected_from_cancellation(producer):
     src = _norm(producer)
     # Slice from the finally to the publish call's own `await`, which is the
-    # first post-finally statement on both paths. `rindex` for the await so the
-    # slice stops at the token immediately preceding the call rather than at
-    # some earlier one inside the finally — of which there must be none anyway,
-    # which is exactly what this asserts.
+    # first post-finally statement on both paths.
     finally_body = src[src.index("finally:"):src.rindex("await publish_and_card_turn_artifacts(")]
-    assert "await " not in finally_body
+    if producer is h.AntonHarness.stream_response:
+        assert "await run_to_completion(record_turn_cleanup())" in finally_body
+    else:
+        assert "await " not in finally_body
 
 
 @pytest.mark.parametrize("producer", PRODUCERS)
 def test_indexing_runs_in_the_finally(producer):
     src = _norm(producer)
-    assert src.index("finally:") < src.index("index_turn_artifacts(")
+    cleanup = "record_turn_cleanup())" if producer is h.AntonHarness.stream_response else "index_turn_artifacts("
+    assert src.index("finally:") < src.index(cleanup)
 
 
 @pytest.mark.parametrize("producer", PRODUCERS)
