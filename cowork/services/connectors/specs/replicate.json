@@ -2,13 +2,8 @@
   "id": "replicate",
   "label": "Replicate",
   "aliases": [
-    "replicate ai",
-    "replicate com",
     "image generation",
     "image generator",
-    "generate image",
-    "generate images",
-    "text to image",
     "picture generator"
   ],
   "keywords": [
@@ -20,11 +15,8 @@
     "photo",
     "drawing",
     "artwork",
-    "logo",
-    "generate",
     "generation",
     "generator",
-    "text to image",
     "flux",
     "stable diffusion"
   ],
@@ -42,9 +34,9 @@
       {
         "id": "api-token",
         "label": "API Token",
-        "description": "We check the token against your Replicate account; no model is run and nothing is billed. Verify it with GET https://api.replicate.com/v1/account only, never by creating a prediction.",
+        "description": "The token is checked by reading your Replicate account (GET https://api.replicate.com/v1/account), not by running a model.",
         "recommended": true,
-        "how_to": "## Get your Replicate API token\n\n1. Go to [replicate.com](https://replicate.com) and sign in (or create an account).\n2. Open **Account → API tokens**.\n3. Click **Create token**, name it (e.g. `Cowork`), and copy it. Tokens start with `r8_`.\n4. Paste the token into the **API Token** field below.\n\n## Cost\n\n- Replicate is a paid service. Each generated image is billed to your account; small image models cost a fraction of a cent per image.\n- New accounts use prepaid credit: buy a small amount (a few dollars) under **Account → Billing**. Work stops when the balance reaches zero, so the credit you buy is your spending cap.\n- Turn on billing email alerts in the same page to see when credit runs low.\n\n## Notes\n\n- Keep the token private; anyone with it can spend your credit. Delete it under **Account → API tokens** if it is exposed.\n",
+        "how_to": "## Get your Replicate API token\n\n1. Go to [replicate.com](https://replicate.com) and sign in (or create an account).\n2. Open **Account → API tokens**.\n3. Click **Create token**, name it (e.g. `Cowork`), and copy it. Tokens start with `r8_`.\n4. Paste the token into the **API Token** field below.\n\n## Cost\n\n- Replicate is a paid service. Each generated image is billed to your account; small image models cost a fraction of a cent per image.\n- Bound what it can spend under **Account → Billing**: accounts on prepaid credit stop when the balance reaches zero, so buy only a small amount (a few dollars). If your account is billed to a card instead, check the limits and alerts offered on that page before you connect.\n- Turn on billing email alerts in the same page to see when spend grows.\n\n## Notes\n\n- Keep the token private; anyone with it can spend your credit. Delete it under **Account → API tokens** if it is exposed.\n",
         "help_url": "https://replicate.com/account/api-tokens",
         "fields": [
           {

@@ -10,9 +10,7 @@ from cowork.services.connectors.specs._registry import registry
 IMAGE_QUERIES = [
     "generate an image",
     "create a skill for image generation",
-    "a skill that generates images",
     "make me a picture of a cat",
-    "text to image",
 ]
 
 
@@ -43,8 +41,21 @@ def test_probe_is_told_to_check_the_account_without_running_a_model():
     # The probe reads the method description; a generation call would bill the user.
     (method,) = registry.get_connector("replicate").form.methods
     assert "https://api.replicate.com/v1/account" in method.description
-    assert "never by creating a prediction" in method.description
+    assert "not by running a model" in method.description
 
 
 def test_tile_says_the_service_is_paid():
     assert "Paid service" in registry.get_connector("replicate").notice
+
+
+def test_other_connectors_lookup_by_name_is_unchanged():
+    # Alias words score per token, so a generic word here ("to", "ai") would pull
+    # Replicate into every "connect to <X>" lookup and make it ambiguous.
+    leaked = []
+    for cid, spec in registry.get_connectors().items():
+        if cid == "replicate":
+            continue
+        for query in (f"connect to {spec['label']}", f"connect my {spec['label']}"):
+            if "replicate" in [c.id for c in registry.match_connector(query).candidates]:
+                leaked.append(query)
+    assert not leaked
