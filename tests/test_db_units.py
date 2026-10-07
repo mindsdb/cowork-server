@@ -5,13 +5,17 @@ for a unit that has started."""
 from __future__ import annotations
 
 import asyncio
+import math
 import threading
+from types import SimpleNamespace
 from uuid import uuid4
 
 import anyio
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import event
 
+from cowork.common.settings.app_settings import DatabaseSettings
 from cowork.db.scoped import LOCAL_SCOPE
 from cowork.db import units
 from cowork.db.units import DatabaseBusy, run_db, unit_session
@@ -165,3 +169,52 @@ async def test_units_never_wait_for_the_threads_sync_routes_share():
         release.set()
         await sync_route
         default.total_tokens = total
+
+
+async def test_a_cancel_from_an_anyio_scope_waits_for_the_work_without_spinning(monkeypatch):
+    """Routes behind a BaseHTTPMiddleware run under an anyio cancel scope, and
+    a cancelled scope cancels its task again on every pass of the event loop.
+    The caller still waits for its work, with one wait rather than one per
+    pass, and the scope's cancel arrives once the work ends."""
+    waits = 0
+    wait = asyncio.wait
+
+    async def counted_wait(*args, **kwargs):
+        nonlocal waits
+        waits += 1
+        return await wait(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "wait", counted_wait)
+    finished = []
+
+    async def work() -> None:
+        await asyncio.sleep(0.3)
+        finished.append(True)
+
+    with anyio.move_on_after(0.05) as scope:
+        await units.run_to_completion(work())
+
+    assert scope.cancelled_caught
+    assert finished == [True]
+    assert waits < 10, f"{waits} waits while the work ran"
+
+
+async def test_a_negative_max_overflow_leaves_units_without_a_slot_limit(monkeypatch):
+    """SQLAlchemy reads a negative MAX_OVERFLOW as no overflow limit, so the
+    units in front of that pool get no slot limit either."""
+    monkeypatch.setattr(units.db_session.settings.database, "pool_size", 1)
+    monkeypatch.setattr(units.db_session.settings.database, "max_overflow", -1)
+    postgres = SimpleNamespace(dialect=SimpleNamespace(name="postgresql"))
+
+    assert units._slots(postgres).total_tokens == math.inf
+
+
+def test_a_pool_timeout_under_one_second_is_rejected(monkeypatch):
+    """run_db stops waiting once POOL_TIMEOUT passes, so a zero wait would
+    refuse every unit, even on an idle pool."""
+    monkeypatch.setenv("POOL_TIMEOUT", "1")
+    assert DatabaseSettings(_env_file=None).pool_timeout == 1
+
+    monkeypatch.setenv("POOL_TIMEOUT", "0")
+    with pytest.raises(ValidationError):
+        DatabaseSettings(_env_file=None)

@@ -95,7 +95,7 @@ def owned_slugs(monkeypatch):
     """
 
     async def all_owned(*, artifacts_base, scope, project_id, slugs):
-        return list(slugs), 0, 0
+        return ap.OwnedSlugs(owned=list(slugs), not_owner=0, owner_unknown=0)
 
     monkeypatch.setattr(ap, "_owned_slugs", all_owned)
 
@@ -569,7 +569,7 @@ async def test_not_owned_slugs_are_dropped_and_logged(
           meta={"slug": "theirs", "type": "html-app"})
 
     async def fake_owned(*, artifacts_base, scope, project_id, slugs):
-        return ([s for s in slugs if s == "mine"], 1, 0)
+        return ap.OwnedSlugs(owned=[s for s in slugs if s == "mine"], not_owner=1, owner_unknown=0)
 
     monkeypatch.setattr(ap, "_owned_slugs", fake_owned)
 

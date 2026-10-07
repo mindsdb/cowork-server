@@ -1307,8 +1307,9 @@ class ResponsesHandler:
         remote producer, _read_remote_turn_inputs) the creator are read here,
         while it is unambiguously attached, rather than after the turn.
 
-        None on any failure: no artifact card and no autopublish is a recoverable
-        outcome (the next turn in this project reconciles), a failed turn is not.
+        None on any failure: no artifact card and no autopublish is better than
+        a failed turn. Outside org mode the next turn in this project
+        reconciles them; in org mode nothing does.
         """
         from cowork.services.artifact_roots import project_artifacts_base
 
@@ -1663,7 +1664,8 @@ class ResponsesHandler:
             changes, for a clean finish to publish and card; None when the
             turn may not keep what the pod wrote (its workspace was not
             persistent), when it recorded them already, or when the diff
-            failed, which the next turn in the project heals."""
+            failed. Outside org mode the next turn in the project reconciles
+            them; in org mode nothing does."""
             from cowork.services.task_objects import record_new_artifacts, turn_artifact_changes
 
             if turn_artifacts is None or not turn_artifacts.writes_allowed or turn_artifacts.recorded:
@@ -1704,11 +1706,13 @@ class ResponsesHandler:
                         scope=scope,
                     ))
                 except Exception:
-                    # Indexing is recoverable: the next turn in the project
-                    # reconciles it. A busy pool lands here too.
-                    logger.warning(
-                        "[responses] could not index the artifacts remote turn %s created", conv_id,
-                        exc_info=True, extra={"request_id": corr},
+                    # A busy pool lands here too. In org mode nothing records
+                    # these folders later: reconcile_conversation skips org
+                    # roots and the owner backfill runs once, at startup, so
+                    # they keep no index row and their owner stays unknown.
+                    logger.error(
+                        "[responses] could not record the artifacts remote turn %s created: %s",
+                        conv_id, changes.created, exc_info=True, extra={"request_id": corr},
                     )
             return changes
 
@@ -1787,12 +1791,16 @@ class ResponsesHandler:
             if lifecycle.discarded:
                 # Deleted while it saved: see finish().
                 return
-            if saved.failure is not None:
-                await buffer.append("sse", {"sse": _failed_frame_for(saved.failure, request_id=corr)})
-                await buffer.close("error")
-                return
             if failed_frame is not None:
+                # Interrupted and error endings keep their own frame and
+                # terminal even when the save fails: an error keeps its own
+                # code and reset_at, and boot recovery seals an `interrupted`
+                # turn.
                 await buffer.append("sse", {"sse": failed_frame(saved.assistant_message_id)})
+            elif saved.failure is not None:
+                # A Stop whose save failed says so, as finish() does.
+                await buffer.append("sse", {"sse": _failed_frame_for(saved.failure, request_id=corr)})
+                reason = "error"
             await buffer.close(reason)
 
         async def start() -> None:
@@ -1925,8 +1933,8 @@ class ResponsesHandler:
 
             # The reply stream ended without a raise. Every other exit records
             # the artifacts in end_turn, with no publish and no cards, matching
-            # the in-process path, where Stop/error produce no cards and the
-            # next turn in the project heals the publish.
+            # the in-process path, where Stop/error produce no cards. Outside
+            # org mode the next turn in the project reconciles the publish.
             changes = await record_artifacts(completed_cleanly=completed_cleanly)
             if changes is not None:
                 for card in await publish_and_card_turn_artifacts(
@@ -2222,12 +2230,15 @@ class ResponsesHandler:
             if lifecycle.discarded:
                 # Deleted while it saved: see finish().
                 return
-            if saved.failure is not None:
-                await buffer.append("sse", {"sse": _failed_frame_for(saved.failure, request_id=corr)})
-                await buffer.close("error")
-                return
             if failed_frame is not None:
+                # Interrupted and error endings keep their own frame and
+                # terminal even when the save fails: boot recovery seals an
+                # `interrupted` turn, and an error keeps its own code.
                 await buffer.append("sse", {"sse": failed_frame(saved.assistant_message_id)})
+            elif saved.failure is not None:
+                # A Stop whose save failed says so, as finish() does.
+                await buffer.append("sse", {"sse": _failed_frame_for(saved.failure, request_id=corr)})
+                reason = "error"
             await buffer.close(reason)
 
         async def start() -> Conversation | None:
@@ -2334,28 +2345,6 @@ class ResponsesHandler:
                     "[responses] turn failed for conversation %s correlation_id=%s",
                     conv_id, corr, extra={"request_id": corr},
                 )
-            if code in CONTENT_REPAIR_CODES:
-                # ENG-1992: the provider permanently rejected an image block in
-                # this conversation's stored history — repair the DATA once,
-                # here, rather than special-case every future replay. Never
-                # lets a repair failure mask the turn's real outcome; the
-                # user-facing message above already went out either way.
-                try:
-                    async with conversation_writes(conv_id):
-                        repaired = await run_db(
-                            lambda session: ConversationService(session).repair_image_content(conv_id),
-                            scope=scope,
-                        )
-                    logger.warning(
-                        "[responses] content validation error on conversation %s — "
-                        "repaired %d message(s) with image content: %s",
-                        conv_id, len(repaired), exc, extra={"request_id": corr},
-                    )
-                except Exception:
-                    logger.exception(
-                        "[responses] failed to repair conversation %s after content validation error",
-                        conv_id, extra={"request_id": corr},
-                    )
             # For an auth failure, tell the client which provider failed so it
             # offers the right action: "Reconnect" only for MindsHub (we can
             # re-provision the key in place), "Open Settings" for a BYOK key the
@@ -2482,9 +2471,39 @@ class ResponsesHandler:
             # an id; only the append/persist order relative to the SSE frame
             # below actually changed.
             collected_events.append(failed)
-            await run_to_completion(end_turn("error", lambda message_id: response_failed_sse(
-                message, code, **extra, assistant_message_id=message_id,
-            )))
+
+            async def fail() -> None:
+                """Repair the stored history when the turn's error asks for
+                it, then save the answer and write its frame. One step under
+                run_to_completion, so a Stop that lands during the repair
+                waits for both and the turn still ends with its own error."""
+                if code in CONTENT_REPAIR_CODES:
+                    # ENG-1992: the provider permanently rejected an image block in
+                    # this conversation's stored history — repair the DATA once,
+                    # here, rather than special-case every future replay. Never
+                    # lets a repair failure mask the turn's real outcome; the
+                    # terminal frame below goes out either way.
+                    try:
+                        async with conversation_writes(conv_id):
+                            repaired = await run_db(
+                                lambda session: ConversationService(session).repair_image_content(conv_id),
+                                scope=scope,
+                            )
+                        logger.warning(
+                            "[responses] content validation error on conversation %s — "
+                            "repaired %d message(s) with image content: %s",
+                            conv_id, len(repaired), exc, extra={"request_id": corr},
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[responses] failed to repair conversation %s after content validation error",
+                            conv_id, extra={"request_id": corr},
+                        )
+                await end_turn("error", lambda message_id: response_failed_sse(
+                    message, code, **extra, assistant_message_id=message_id,
+                ))
+
+            await run_to_completion(fail())
         finally:
             await _seal_unterminated_buffer(buffer, lifecycle, conv_id, request_id=corr)
 

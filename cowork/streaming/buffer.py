@@ -255,6 +255,9 @@ class FileStreamBuffer(StreamBuffer):
             # read and the wait can't be lost (it either shows on re-read
             # or fires the snapshot we're about to await).
             waiter = self._new_data
+            # Taken before the read: a close that lands while this batch is
+            # yielded is followed by one more read, which holds its records.
+            closed = self._closed
             emitted_terminal = False
             for rec in new_records.read():
                 if rec.seq < from_seq:
@@ -262,7 +265,7 @@ class FileStreamBuffer(StreamBuffer):
                 yield rec
                 if rec.is_terminal:
                     emitted_terminal = True
-            if emitted_terminal or self._closed:
+            if emitted_terminal or closed:
                 return
             done_waiter = asyncio.create_task(self._done.wait())
             data_waiter = asyncio.create_task(waiter.wait())

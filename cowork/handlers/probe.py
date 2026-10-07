@@ -150,6 +150,12 @@ class ProbeHandler:
                     conversation_id,
                 )
                 return None
+            except Exception:
+                # Same outcome as a refused save: the form keeps the probe's
+                # result, and only its narrative is missing from the
+                # conversation.
+                logger.exception("Could not save the probe turn for conversation %s", conversation_id)
+                return None
 
         async def _completed(conversation_id: UUID | None, response_fields: dict) -> str:
             # _push records the (id-less) event and bumps seq first, exactly
@@ -197,6 +203,7 @@ class ProbeHandler:
             db_conversation_id: UUID | None = None
             workspace = None
             workspace_path: Path | None = None
+            conversation_busy = False
 
             if conversation_id:
                 try:
@@ -207,9 +214,10 @@ class ProbeHandler:
                     db_conversation_id = conversation.id
                     workspace_path = conversation.workspace_path
                 except PoolTimeoutError:
+                    conversation_busy = True
                     logger.warning(
                         "No database connection freed in time to read conversation %s; "
-                        "the probe runs without it", conversation_id,
+                        "the form is told Cowork is busy", conversation_id,
                     )
                 except Exception:
                     logger.warning("Could not resolve conversation %s", conversation_id)
@@ -254,6 +262,17 @@ class ProbeHandler:
                 form_id = form_spec.get("form_id") or f"{connector_id}-connector"
             if method:
                 form_spec["selected_method"] = method
+
+            if conversation_busy:
+                # Without its conversation the probe would run in a temp
+                # workspace and its turn would never be saved, so the form
+                # says Cowork is busy, with the wait, as a refused settings
+                # read does.
+                busy = server_busy_message(busy_retry_seconds())
+                yield _delta(busy)
+                yield _patch_delta({"form_id": form_id, "form_error": busy})
+                yield await _completed(None, {"status": "failed"})
+                return
 
             # Save without probe only when there is no registry spec —
             # there is no engine to verify a handcrafted connector against.

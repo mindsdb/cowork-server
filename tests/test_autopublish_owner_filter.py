@@ -48,14 +48,12 @@ async def test_owned_slugs_splits_mine_theirs_and_unknown(tmp_path):
         ownership.record_artifact_owner(session, project.id, "theirs", theirs, action="create")
 
     scope = TenantScope(org_mode=True, org_id=org_id, user_id=mine)
-    owned, not_owner, owner_unknown = await ap._owned_slugs(
+    owners = await ap._owned_slugs(
         artifacts_base=source.base, scope=scope, project_id=str(project.id),
         slugs=["mine", "theirs", "orphan"],
     )
 
-    assert owned == ["mine"]
-    assert not_owner == 1
-    assert owner_unknown == 1
+    assert owners == ap.OwnedSlugs(owned=["mine"], not_owner=1, owner_unknown=1)
 
 
 async def test_owned_slugs_does_not_rediscover_roots_for_the_project_root(tmp_path, monkeypatch):
@@ -78,7 +76,7 @@ async def test_owned_slugs_does_not_rediscover_roots_for_the_project_root(tmp_pa
     scope = TenantScope(org_mode=True, org_id=org_id, user_id=mine)
     assert await ap._owned_slugs(
         artifacts_base=source.base, scope=scope, project_id=str(project.id), slugs=["mine"],
-    ) == (["mine"], 0, 0)
+    ) == ap.OwnedSlugs(owned=["mine"], not_owner=0, owner_unknown=0)
 
 
 async def test_owned_slugs_fails_closed_for_a_project_outside_the_scope(tmp_path):
@@ -93,7 +91,7 @@ async def test_owned_slugs_fails_closed_for_a_project_outside_the_scope(tmp_path
     other_org = TenantScope(org_mode=True, org_id=str(uuid4()), user_id=mine)
     assert await ap._owned_slugs(
         artifacts_base=source.base, scope=other_org, project_id=str(project.id), slugs=["mine"],
-    ) == ([], 0, 1)
+    ) == ap.OwnedSlugs(owned=[], not_owner=0, owner_unknown=1)
 
 
 @pytest.fixture

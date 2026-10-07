@@ -209,9 +209,20 @@ def _artifact_owners(
     return resolve_artifact_owners(session, source, slugs)
 
 
+@dataclass(frozen=True)
+class OwnedSlugs:
+    """What the owner filter kept, and how many slugs it dropped and why."""
+
+    owned: list[str]
+    # Slugs another member owns.
+    not_owner: int
+    # Slugs with no recorded owner, or every slug when the lookup failed.
+    owner_unknown: int
+
+
 async def _owned_slugs(
     *, artifacts_base: Path, scope, project_id: str, slugs: list[str]
-) -> tuple[list[str], int, int]:
+) -> OwnedSlugs:
     """Filter ``slugs`` down to the ones this scope's user owns.
 
     The project root is shared by every member (ENG-2056), so `_candidate_slugs`
@@ -225,8 +236,6 @@ async def _owned_slugs(
     connection never stalls the event loop. Fails closed: if the source cannot
     be found or anything raises, a full pool included, nothing is treated as
     owned rather than risking a publish attempt on someone else's artifact.
-
-    Returns (owned, not_owner_count, owner_unknown_count).
     """
     from cowork.db.units import run_db
 
@@ -240,13 +249,13 @@ async def _owned_slugs(
         )
     except Exception:
         logger.warning("artifact_autopublish owner filter failed", exc_info=True)
-        return [], 0, len(slugs)
+        return OwnedSlugs(owned=[], not_owner=0, owner_unknown=len(slugs))
     if resolutions is None:
         logger.warning(
             "artifact_autopublish owner filter: root not found for project=%s base=%s",
             project_id, artifacts_base,
         )
-        return [], 0, len(slugs)
+        return OwnedSlugs(owned=[], not_owner=0, owner_unknown=len(slugs))
 
     owned: list[str] = []
     not_owner = 0
@@ -259,7 +268,7 @@ async def _owned_slugs(
             owned.append(slug)
         else:
             not_owner += 1
-    return owned, not_owner, owner_unknown
+    return OwnedSlugs(owned=owned, not_owner=not_owner, owner_unknown=owner_unknown)
 
 
 def _candidate_slugs(artifacts_base: Path) -> list[str]:
@@ -408,11 +417,12 @@ async def autopublish_project_artifacts(
 
     base = Path(artifacts_base)
     all_slugs = _candidate_slugs(base)
-    all_slugs, not_owner, owner_unknown = await _owned_slugs(
+    owners = await _owned_slugs(
         artifacts_base=base, scope=scope, project_id=project_id, slugs=all_slugs,
     )
-    if not_owner or owner_unknown:
-        _record("skipped", not_owner=not_owner or None, owner_unknown=owner_unknown or None)
+    all_slugs = owners.owned
+    if owners.not_owner or owners.owner_unknown:
+        _record("skipped", not_owner=owners.not_owner or None, owner_unknown=owners.owner_unknown or None)
     phase_one = [s for s in all_slugs if s in touched]
     phase_two = [s for s in all_slugs if s not in touched]
 

@@ -418,7 +418,7 @@ async def test_stream_emits_friendly_failed_event_for_image_error():
 async def test_produce_pending_persist_failure_does_not_clear_all_pending():
     # ENG-1231 hardening (in-process _produce, mirror of the _produce_remote test):
     # if the pending user persist raises before its id is captured, this turn owns
-    # no pending row — persist() must NOT fall back to finalize_pending(conv, None),
+    # no pending row — persist() must NOT fall back to clear_pending(conv, message_id=None),
     # which would clear a pending row stranded by an earlier crashed turn.
     from unittest.mock import MagicMock, patch
 
@@ -447,9 +447,9 @@ async def test_produce_pending_persist_failure_does_not_clear_all_pending():
             harness_id="anton",
             buffer=_Buffer(),
         )
-        # No row was persisted for this turn → finalize must not have run at all,
+        # No row was persisted for this turn → clearing must not have run at all,
         # in particular never the clear-all (message_id=None) form.
-        conv_svc.return_value.finalize_pending.assert_not_called()
+        conv_svc.return_value.clear_pending.assert_not_called()
 
 
 def test_a_full_pool_maps_to_server_busy():

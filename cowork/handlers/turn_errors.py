@@ -482,8 +482,9 @@ WORKER_UNRESPONSIVE_MESSAGE = (
 # Wire code for a request refused because no database connection freed within
 # POOL_TIMEOUT. Before a stream exists the sentence is a 503's `detail`
 # (cowork.server). Inside one it is a response.failed frame that carries
-# `retry_after` and `retry_at`, as rate_limited does. The web UI shows the
-# sentence as it is and ignores Retry-After, so the sentence names the wait.
+# `retry_after` and `retry_at`, as rate_limited does. The web UI waits for
+# Retry-After, or the frame's `retry_at`, before it offers a retry, and the
+# sentence names the wait for clients that read neither.
 SERVER_BUSY_CODE = "server_busy"
 
 

@@ -114,6 +114,9 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
         topic=schedule.title,
         project_id=schedule.project_id,
     )
+    # FastAPI closes this session only after the background run ends, which
+    # can take minutes. Give the request's connection back before it starts.
+    scoped.close()
 
     background_tasks.add_task(
         execute_schedule, schedule_id, is_manual=True,
