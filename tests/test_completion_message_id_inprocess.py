@@ -58,7 +58,6 @@ async def _run(handler, *, assistant_message_id, user_message_id=None) -> _Buffe
     buffer = _Buffer()
     conv_id = uuid4()
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -150,7 +149,6 @@ async def test_run_turn_ignores_a_delta_frame_whose_text_quotes_a_frame_type_nam
     buffer = _Buffer()
     conv_id = uuid4()
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -199,7 +197,6 @@ async def _run_direct(*, assistant_message_id, route_text="ok", user_message_id=
     route = RouteDecision(route="direct_context", text=route_text, model="anton", reason="test")
 
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
     ):
         conv_svc.return_value.save_user_message.return_value = SimpleNamespace(
@@ -245,6 +242,7 @@ async def test_produce_direct_completed_frame_omits_the_id_when_nothing_persiste
 # building the full probe harness.
 
 async def _run_probe_expired_submission(*, conversation_id, assistant_message_id):
+    from cowork.db.scoped import LOCAL_SCOPE
     from cowork.handlers.probe import ProbeHandler
 
     with (
@@ -258,7 +256,7 @@ async def _run_probe_expired_submission(*, conversation_id, assistant_message_id
         conv_svc.return_value.save_assistant_turn.return_value = (
             SimpleNamespace(id=assistant_message_id) if assistant_message_id else None
         )
-        handler = ProbeHandler(session=MagicMock())
+        handler = ProbeHandler(scope=LOCAL_SCOPE)
         frames = [chunk async for chunk in handler.run(
             submission_id="sub-1", connector_id="postgres", method=None,
             name="my-db", conversation_id=str(conversation_id),

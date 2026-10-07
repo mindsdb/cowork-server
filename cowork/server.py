@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.datastructures import MutableHeaders
 
 from cowork.api.v1.route_walker import contradictory_routes, route_key, undeclared_routes
@@ -20,7 +21,11 @@ from starlette.responses import JSONResponse
 from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token, sync_auth_token
 from cowork.coding.inference_proxy import INFERENCE_PATHS
 from cowork.db.scoped import MissingTenantScopeError
+from cowork.db.units import DatabaseBusy, busy_retry_seconds
+from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
 from cowork.principal import TrustedHeaderMiddleware
+from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
+from cowork.streaming import TurnInProgress
 from cowork.common.logger import setup_logging
 from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import get_app_settings
@@ -302,6 +307,28 @@ def create_app() -> FastAPI:
     @app.exception_handler(MissingTenantScopeError)
     async def _missing_tenant_scope(request, exc):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+
+    # No database connection freed within POOL_TIMEOUT. DatabaseBusy, a unit
+    # that waited for its slot or its connection, subclasses the pool timeout,
+    # so this answers both. The web UI waits for Retry-After before it offers
+    # a retry, and the sentence names the wait for clients that don't read it.
+    @app.exception_handler(PoolTimeoutError)
+    async def _database_busy(request, exc):
+        retry_after = busy_retry_seconds()
+        logger.warning(
+            "%s %s refused with 503: no database connection freed in time",
+            request.method, request.url.path,
+        )
+        return JSONResponse(
+            Refusal(detail=server_busy_message(retry_after), code=SERVER_BUSY_CODE).model_dump(),
+            status_code=DatabaseBusy.status_code,
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    # A second question into a conversation whose turn is still answering.
+    @app.exception_handler(TurnInProgress)
+    async def _turn_in_progress(request, exc):
+        return JSONResponse(TURN_IN_PROGRESS.model_dump(), status_code=exc.status_code)
 
     # Bearer-token auth. On by default in local mode (see AppSettings.
     # require_auth). Token is auto-generated on first startup when

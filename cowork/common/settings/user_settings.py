@@ -1,6 +1,7 @@
 import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 import json
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -23,6 +24,7 @@ from cowork.common.settings.app_settings import (
     default_minds_url,
     get_app_settings,
 )
+from cowork.common.settings.runtime_credential import get_minds_credential
 
 
 class Provider(str, Enum):
@@ -498,6 +500,10 @@ def normalize_provider_value(val: str, *, minds_key_present: bool) -> str:
 
 
 class UserSettings(Settings):
+    # A runtime token must disappear from a turn snapshot when the desktop
+    # clears it. Stored keys keep their normal snapshot semantics.
+    _runtime_minds_credential: bool = PrivateAttr(default=False)
+    _stored_minds_api_key: SecretStr | None = PrivateAttr(default=None)
     # The recommended-model catalog and per-provider model defaults are
     # global, application-level config and live in app_settings
     # (RECOMMENDED_MODELS / RECOMMENDED_PAIR / *_MODEL_DEFAULTS).
@@ -1399,13 +1405,61 @@ def current_settings_scope() -> "TenantScope | None":
     return _current_scope.get()
 
 
+@dataclass(frozen=True)
+class _TurnSettings:
+    """The settings a turn loaded once, and the scope they were loaded for."""
+
+    scope: "TenantScope"
+    settings: UserSettings
+
+
+_turn_settings: ContextVar["_TurnSettings | None"] = ContextVar("turn_settings", default=None)
+
+
+@contextmanager
+def use_turn_settings(scope: "TenantScope", settings: UserSettings):
+    """Serve ``settings`` to get_user_settings() calls for ``scope`` made in
+    this context, instead of reading the database again.
+
+    A turn loads its settings once, in its first database unit, and binds them
+    on the event loop around its gate and its producer's creation.
+    asyncio.create_task copies the context, so the producer task and the
+    worker threads it starts read the same snapshot. Bind it on the loop: a
+    worker thread runs in a copy of the context, so whatever it binds is gone
+    when it returns.
+
+    The one value not frozen is the MindsHub credential the desktop app hands
+    over at runtime: it is a short-lived token the desktop refreshes while a
+    turn runs, so each read overlays the current one, as a load does
+    (SettingService._raw_data).
+    """
+    token = _turn_settings.set(_TurnSettings(scope=scope, settings=settings))
+    try:
+        yield
+    finally:
+        _turn_settings.reset(token)
+
+
 def get_user_settings(scope: "TenantScope | None" = None) -> UserSettings:
     """Resolved settings for a scope: explicit arg, else ambient
     (use_settings_scope), else LOCAL_SCOPE. Unscoped resolves global rows only,
-    never another org's data. Loads fresh every call — no process-global cache."""
+    never another org's data. Loads fresh every call, except inside
+    use_turn_settings, which answers for its own scope with a copy of the
+    turn's snapshot. There is no process-global cache."""
     from cowork.db.scoped import LOCAL_SCOPE
 
     scope = scope or _current_scope.get() or LOCAL_SCOPE
+    turn = _turn_settings.get()
+    if turn is not None and turn.scope == scope:
+        # A copy, as a fresh load would be: a caller that changes the object
+        # it gets must not change what the next caller reads.
+        settings = turn.settings.model_copy()
+        live_minds_key = get_minds_credential()
+        if live_minds_key:
+            settings.minds_api_key = SecretStr(live_minds_key)
+        elif turn.settings._runtime_minds_credential:
+            settings.minds_api_key = turn.settings._stored_minds_api_key
+        return settings
     return _load_from_db(scope)
 
 
