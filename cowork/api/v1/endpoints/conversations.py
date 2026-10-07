@@ -1,18 +1,32 @@
-from typing import Annotated
+from pathlib import Path
+from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlmodel import Session
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.endpoints.guards import ensure_loopback_socket
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, DesktopOnly, require
 from cowork.db.scoped import ScopedSessionDep
 from cowork.db.session import get_session
+from cowork.models.conversation import Conversation
+from cowork.models.conversation_folder import ConversationFolder
 from cowork.models.project import Project
 from cowork.schemas.conversations import (
     ConversationCreateRequest,
+    ConversationFolderAddRequest,
     ConversationListItem,
     ConversationMoveRequest,
     ConversationUpdateRequest,
+)
+from cowork.services import folder_listing
+from cowork.services.conversation_folders import (
+    ConversationFolderService,
+    FolderAlreadyAttached,
+    FolderLimitReached,
+    FolderNotFound,
+    FolderRefused,
+    folder_refusal,
 )
 from cowork.services.conversations import ConversationService, InvalidPaginationParams
 from cowork.services.task_objects import TaskObjectService
@@ -199,3 +213,113 @@ def delete_conversation_turn(conversation_id: UUID, message_id: UUID, scoped: Sc
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     return {"ok": True, "deleted": deleted}
+
+
+def _require_loopback_for_folders(request: Request) -> None:
+    """Working folder routes name local paths, so they only answer over loopback."""
+    ensure_loopback_socket(request, "working folders need a request over loopback")
+
+
+_FOLDER_ROUTE_GUARDS = [Depends(require(DesktopOnly)), Depends(_require_loopback_for_folders)]
+
+
+def _project_path(conversation: Conversation) -> str | None:
+    """The chat's project folder, which a working folder may not sit inside."""
+    return conversation.project.path if conversation.project else None
+
+
+def _serialize_folder(folder: ConversationFolder, *, available: bool) -> dict[str, Any]:
+    """One folder as the desktop app reads it; `available` is decided by the caller."""
+    return {
+        "id": folder.id,
+        "path": folder.path,
+        "name": Path(folder.path).name,
+        "available": available,
+    }
+
+
+@router.get("/{conversation_id}/folders", dependencies=_FOLDER_ROUTE_GUARDS)
+def list_conversation_folders(conversation_id: UUID, scoped: ScopedSessionDep):
+    """The chat's working folders, oldest first, each marked available or not."""
+    try:
+        conversation, folders = ConversationFolderService(scoped).list_folders(conversation_id)
+    except FolderNotFound as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    project_path = _project_path(conversation)
+    return {
+        "folders": [
+            _serialize_folder(f, available=folder_refusal(f.path, project_path) is None)
+            for f in folders
+        ]
+    }
+
+
+@router.post(
+    "/{conversation_id}/folders",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=_FOLDER_ROUTE_GUARDS,
+)
+def add_conversation_folder(
+    conversation_id: UUID, body: ConversationFolderAddRequest, scoped: ScopedSessionDep
+):
+    """Attach a local folder to the chat. The refusal text is meant for the user."""
+    try:
+        folder = ConversationFolderService(scoped).add_folder(conversation_id, body.path)
+    except FolderNotFound as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except FolderRefused as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except FolderAlreadyAttached as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except FolderLimitReached as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
+    return _serialize_folder(folder, available=True)
+
+
+@router.delete(
+    "/{conversation_id}/folders/{folder_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=_FOLDER_ROUTE_GUARDS,
+)
+def remove_conversation_folder(conversation_id: UUID, folder_id: UUID, scoped: ScopedSessionDep):
+    """Detach one working folder from the chat. Nothing on disk changes."""
+    try:
+        ConversationFolderService(scoped).remove_folder(conversation_id, folder_id)
+    except FolderNotFound as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+
+
+@router.get("/{conversation_id}/folders/{folder_id}/files", dependencies=_FOLDER_ROUTE_GUARDS)
+def list_conversation_folder_files(
+    conversation_id: UUID, folder_id: UUID, scoped: ScopedSessionDep
+):
+    """Files under one working folder, bounded like the project file listing.
+
+    The path comes from the stored row, never from the request, and is checked
+    again here in case the folder changed since it was attached.
+    """
+    try:
+        conversation, folder = ConversationFolderService(scoped).get_folder(
+            conversation_id, folder_id
+        )
+    except FolderNotFound as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    if folder_refusal(folder.path, _project_path(conversation)) is not None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Folder not available")
+    base = Path(folder.path)
+    budget = folder_listing.WalkBudget()
+    files: list[dict[str, Any]] = []
+    truncated = False
+    for p in folder_listing.iter_folder_files(base, budget):
+        meta = folder_listing.file_meta(p, base)
+        if meta is None:
+            continue
+        if len(files) >= folder_listing.MAX_LISTED_FILES:
+            truncated = True
+            break
+        files.append(meta)
+    files.sort(key=lambda f: f["path"])
+    response: dict[str, Any] = {"files": files}
+    if truncated or budget.exhausted:
+        response["truncated"] = True
+    return response

@@ -410,6 +410,9 @@ _ACCOUNT_LEVEL_COWORK_HOME_CALLS = Counter(
             "_probe_tmp_dir",
             "pod_local_only(cowork_home() / 'tmp', 'tmp')",
         ),
+        # A refusal root, not a store: no working folder may overlap any of
+        # Cowork's data, whichever organization's stores sit under it.
+        ("cowork/services/conversation_folders.py", "_store_roots.raw", "cowork_home()"),
         # These are read-only sources for a one-time legacy import.
         *(
             ("cowork/harnesses/memory/migration.py", "_MIGRATION_SOURCES", f"cowork_home() / '{path}'")
