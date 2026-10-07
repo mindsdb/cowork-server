@@ -1236,6 +1236,10 @@ class AntonHarness:
                 # brief when the agent acts first); without it the tool hands
                 # the content to the agent. Dropped by an anton without the field.
                 **supported_kwargs(ChatSessionConfig, tool_messages=tool_messages),
+                # The user's MindsHub browser, when they turned it on (ENG-3298):
+                # anton registers its `browser` tool only then. None, or dropped
+                # by an anton without the field, means no browser this turn.
+                **supported_kwargs(ChatSessionConfig, browser=_browser_config(user)),
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
                 # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
@@ -1293,3 +1297,15 @@ class AntonHarness:
     def _build_llm_client(effort: str | None = None, *, model: str | None = None, settings=None):
         from cowork.services.providers import build_llm_client
         return build_llm_client(effort_override=effort, model_override=model, settings=settings)
+
+
+def _browser_config(user):
+    """anton's BrowserConfig for this user, or None (ENG-3298). Never raises:
+    a turn must not fail over the browser."""
+    try:
+        from cowork.services.browser import anton_browser_config
+
+        return anton_browser_config(user)
+    except Exception:  # pragma: no cover - defensive
+        logger.warning("could not resolve the browser for this turn", exc_info=True)
+        return None

@@ -241,12 +241,3 @@ def cancel_scratchpad():
     return {"ok": True}
 
 
-# ── Browse ───────────────────────────────────────────────────────────
-
-browse_router = APIRouter()
-
-
-# OpenByDesign, standalone reason: hardcoded stub response, nothing to expose.
-@browse_router.get("/status", dependencies=[Depends(require(OpenByDesign))])
-def browse_status():
-    return {"available": False}

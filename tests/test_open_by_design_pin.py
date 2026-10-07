@@ -81,7 +81,6 @@ OPEN_BY_DESIGN_REASONS: dict[tuple[str, tuple[str, ...]], str] = {
         "a hardcoded stub that ignores its input and answers 'not yet available'"
     ),
     ("/api/v1/scratchpad/cancel", ("POST",)): "a hardcoded stub",
-    ("/api/v1/browse/status", ("GET",)): "a hardcoded stub reporting the feature is off",
 }
 
 
