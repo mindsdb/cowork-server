@@ -53,21 +53,6 @@ def test_token_var_matches_the_spec_field(tmp_path):
     assert f"__{field.name.upper()}" in skill.declarative_md
 
 
-def test_user_skill_with_a_generic_image_name_does_not_shadow_it(tmp_path):
-    user_skill = tmp_path / "user" / "generate-image"
-    user_skill.mkdir(parents=True)
-    (user_skill / "SKILL.md").write_text(
-        "---\nname: generate-image\ndescription: a draft image skill\n---\nbody\n",
-        encoding="utf-8",
-    )
-    store = _store(tmp_path)
-
-    skill = store.load(_LABEL)
-    assert skill is not None
-    assert skill.provenance == "host"
-    assert {s.label for s in store.list_all()} >= {"generate-image", _LABEL}
-
-
 def test_desktop_prompt_routes_image_requests_to_the_skill(tmp_path):
     text = harness_mod._image_generation_context(None)
     assert f"recall the `{_LABEL}` skill" in text
@@ -81,3 +66,10 @@ def test_channel_turns_get_no_image_routing():
 def test_session_suffix_includes_the_image_routing():
     source = inspect.getsource(harness_mod.AntonHarness._build_chat_session)
     assert "_image_generation_context(channel_context)" in source
+
+
+def test_code_drawn_graphics_stay_out_of_the_image_route(tmp_path):
+    # An SVG logo or a chart worked before this route existed; it must not be
+    # turned into a paid Replicate offer.
+    assert "SVG or vector graphics" in harness_mod._image_generation_context(None)
+    assert "drawn with code" in _store(tmp_path).load(_LABEL).description

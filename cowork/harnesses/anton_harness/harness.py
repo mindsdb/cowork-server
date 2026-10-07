@@ -321,13 +321,14 @@ def _image_generation_context(channel: ChannelContext | None) -> str:
     if channel is not None:
         return ""
     return (
-        "\n\nIMAGE GENERATION: there is no built-in image model. Before generating an image "
-        "(photo, picture, illustration, logo, artwork), or building or testing a skill that "
-        "does, recall the `connected-image-generation` skill and follow it. A missing "
-        "capability is not a failure to work around: never fake an image with hand-drawn SVG, "
-        "matplotlib, or HTML/CSS, and never try public or keyless image APIs. When the user "
-        "asks for a skill that makes images, build it on top of `connected-image-generation` "
-        "rather than refusing or copying API code."
+        "\n\nIMAGE GENERATION: there is no built-in image model. Before generating a photo, "
+        "picture or illustration, or building or testing a skill that does, recall the "
+        "`connected-image-generation` skill and follow it. A missing capability is not a "
+        "failure to work around: never fake such an image with hand-drawn SVG, matplotlib, or "
+        "HTML/CSS, and never try public or keyless image APIs. SVG or vector graphics, icons, "
+        "diagrams and charts the user asks for are drawn with code as usual. When the user "
+        "asks for a skill that makes generated images, build it on top of "
+        "`connected-image-generation` rather than refusing or copying API code."
     )
 
 
