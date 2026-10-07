@@ -40,6 +40,10 @@ def _fetch_models(endpoint: str, token: str, client_version: str) -> object:
     return json.loads(body)
 
 
+def _is_served(row: dict) -> bool:
+    return row.get("visibility") == "list" or "context_window" in row
+
+
 @contextmanager
 def model_catalog(
     endpoint: str,
@@ -50,8 +54,8 @@ def model_catalog(
     """Load native metadata through the scoped proxy for one app-server lifetime.
 
     Yields None when the selected model has no usable row, so Codex starts on
-    its bundled fallback metadata as it did before the catalog existed. MindsHub
-    lists only moving aliases, and pinned versions must keep working.
+    its bundled fallback metadata as it did before the catalog existed. Older
+    gateways list only moving aliases, and pinned versions must keep working.
     """
     try:
         payload = _fetch_models(endpoint, token, client_version)
@@ -67,10 +71,11 @@ def model_catalog(
         logger.warning("MindsHub returned no native Codex model catalog; using fallback metadata for %s", model)
         yield None
         return
-    # Hidden rows override bundled models MindsHub does not serve, so they
-    # carry no metadata worth running on.
-    if not any(row["slug"] == model and row.get("visibility") == "list" for row in models):
-        logger.warning("Codex model catalog has no listed row for %s; using fallback metadata", model)
+    # A hidden row is either a pinned version, kept out of the picker but
+    # served, or an override for a bundled model MindsHub does not serve. Only
+    # the served kind carries a context window.
+    if not any(row["slug"] == model and _is_served(row) for row in models):
+        logger.warning("Codex model catalog has no served row for %s; using fallback metadata", model)
         yield None
         return
     for row in models:

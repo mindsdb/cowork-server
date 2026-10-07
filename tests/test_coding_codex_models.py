@@ -73,10 +73,18 @@ def test_catalog_preserves_explicit_parallel_tool_support(monkeypatch, catalog):
     {"models": [{"slug": "fable", "visibility": "hide"}]},
     {"models": [{"slug": "fable"}]},
 ])
-def test_catalog_falls_back_without_a_listed_row(monkeypatch, payload):
+def test_catalog_falls_back_without_a_served_row(monkeypatch, payload):
     mock_catalog(monkeypatch, payload)
     with codex_models.model_catalog("http://proxy", "token", "0.147.0", "fable") as path:
         assert path is None
+
+
+def test_catalog_runs_a_pinned_version_from_its_hidden_row(monkeypatch, catalog):
+    # Pins stay out of the picker but are served, so their row has a window.
+    catalog["models"][0].update(slug="fable-5-1", visibility="hide")
+    mock_catalog(monkeypatch, catalog)
+    with codex_models.model_catalog("http://proxy", "token", "0.147.0", "fable-5-1") as path:
+        assert path is not None
 
 
 @pytest.mark.parametrize("status", [401, 403, 500])
