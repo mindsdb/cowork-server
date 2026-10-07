@@ -135,6 +135,27 @@ def test_a_repository_initialized_inside_a_tracked_directory_is_kept(tmp_path: P
     assert (worktree / "src" / ".git").is_dir()
 
 
+@pytest.mark.parametrize("commit_in_parent", [False, True])
+def test_a_task_created_repository_staged_in_the_parent_is_kept(tmp_path: Path, commit_in_parent: bool) -> None:
+    repo = repository(tmp_path)
+    manager = WorkspaceManager(tmp_path / "coding")
+    worktree = manager.prepare("task-8", str(repo), allow_direct_folder=False).workspace_path
+    private = worktree / "private"
+    private.mkdir()
+    git(private, "init", "-q")
+    (private / "secret").write_text("secret\n", encoding="utf-8")
+    git(private, "add", "secret")
+    git(private, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "private")
+    # Staged or committed in the parent, the repository is a single gitlink path.
+    git(worktree, "add", "private")
+    if commit_in_parent:
+        git(worktree, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "embed")
+
+    assert manager.release("task-8", str(repo), str(worktree), WorkspaceKind.git_worktree) is False
+    assert (private / "secret").read_text(encoding="utf-8") == "secret\n"
+    assert (private / ".git").is_dir()
+
+
 @pytest.mark.parametrize("kind", [WorkspaceKind.git_worktree, WorkspaceKind.local_copy])
 def test_restore_replaces_a_folder_left_partly_removed_by_a_release(tmp_path: Path, kind: WorkspaceKind) -> None:
     if kind == WorkspaceKind.git_worktree:
