@@ -7,6 +7,7 @@ Emits typed events:
     response.output_text.delta  (assistant text deltas)
     response.answer_reset       (drop the answer so far; the next delta replaces it)
     response.answer_restore     (a hand-back gives back the answer a reset dropped)
+    response.browser_session_opened (the agent opened the user's browser; show its viewer)
     response.completed          (final response object)
     response.failed             (error)
 """
@@ -173,6 +174,14 @@ async def format_responses_stream(
     except ImportError:
         class StreamReasoningDelta:  # type: ignore[no-redef]
             """Placeholder for pre-ENG-1109 anton; never instantiated."""
+
+    # Same guard, same reason: the browser tool (ENG-3298) is newer than the
+    # anton this server may be paired with.
+    try:
+        from anton.core.llm.provider import StreamBrowserSession
+    except ImportError:
+        class StreamBrowserSession:  # type: ignore[no-redef]
+            """Placeholder for an anton without the browser tool; never instantiated."""
 
     resp_id = f"resp-{uuid.uuid4().hex[:12]}"
     msg_id = f"msg-{uuid.uuid4().hex[:12]}"
@@ -531,6 +540,20 @@ async def format_responses_stream(
                 "sequence_number": seq,
                 "thought_role": Role.thought_context_compacted.value,
                 "content": event.message,
+            })
+
+        elif isinstance(event, StreamBrowserSession):
+            # The agent opened the user's browser: the renderer splits the chat
+            # and shows the live viewer beside it. Persisted like every event,
+            # so a reload reopens the pane (re-minting the expired URL through
+            # POST /browse/embed).
+            seq += 1
+            yield _event("response.browser_session_opened", {
+                "type": "response.browser_session_opened",
+                "sequence_number": seq,
+                "session_id": event.session_id,
+                "view_url": event.view_url,
+                "expires_at": event.expires_at,
             })
 
         elif isinstance(event, ArtifactCreated):

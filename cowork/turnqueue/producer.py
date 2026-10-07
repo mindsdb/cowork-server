@@ -428,6 +428,22 @@ def step_stream_events(data: dict) -> list:
         )]
     if step == "compacted":
         return [StreamContextCompacted(message=data.get("message") or "")]
+    if step == "browser":
+        # The agent opened the user's browser (ENG-3298). Guarded: an anton
+        # without the browser tool has no such event and never sends one.
+        try:
+            from anton.core.llm.provider import StreamBrowserSession
+        except ImportError:
+            return []
+        view_url = data.get("view_url")
+        if not isinstance(view_url, str) or not view_url.startswith("https://"):
+            return []
+        expires_at = data.get("expires_at")
+        return [StreamBrowserSession(
+            session_id=str(data.get("session_id") or ""),
+            view_url=view_url,
+            expires_at=expires_at if isinstance(expires_at, int) and not isinstance(expires_at, bool) else 0,
+        )]
     if step == "round_end":
         # Only stop_reason and tool_calls truthiness drive the formatter's
         # round-break decision; a placeholder call carries the truthiness.
@@ -581,6 +597,16 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # outside the conversation-scoped workspace mount, so send only that tier on
     # the wire. Filtering here as well as in ResponsesHandler keeps a future
     # caller from accidentally serializing private global memory into the job.
+    from cowork.common.settings.user_settings import get_user_settings
+    from cowork.services.browser import turn_block
+
+    try:
+        browser_block = turn_block(get_user_settings(scope))
+    except Exception:
+        # A turn must not fail over the browser; it just runs without one.
+        logger.warning("[producer] could not resolve the browser block", exc_info=True)
+        browser_block = None
+
     project_memory = memory.get("project") if isinstance(memory, dict) else None
     memory_block = (
         {"project": project_memory}
@@ -605,6 +631,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # turn and would otherwise stamp today's date into the system
               # prompt, changing the cached prefix at midnight.
               **({"started_at": started_at} if started_at else {}),
+              # The user's MindsHub browser, when they turned it on (ENG-3298).
+              # No credential: the pod reaches it with the `llm` turn key.
+              **({"browser": browser_block} if browser_block else {}),
               # Trace attribution for the pod (ENG-1459). The remote turn runs in
               # a scratchpad pod that has no cowork-server installed, so nothing
               # there can derive the surface, this server's version, or its
