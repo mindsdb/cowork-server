@@ -106,6 +106,13 @@ def test_a_staging_endpoint_keeps_its_api_host(monkeypatch):
     assert url == "https://api.staging.mindshub.ai"
 
 
-@pytest.mark.parametrize("url", ["https://view.mindshub.ai", "https://4nton.ai"])
+@pytest.mark.parametrize("url", ["https://view.mindshub.ai", "https://4nton.ai", "https://4nton.ai."])
 def test_both_publish_hosts_count_as_mindshub(url):
     assert is_mindshub_publish_url(url) is True
+
+
+@pytest.mark.parametrize(
+    "url", ["http://publisher-api:8081", "https://cw-abc.4nton.ai", "https://4nton.ai.customer.example", "", None]
+)
+def test_other_publishers_do_not_count_as_mindshub(url):
+    assert is_mindshub_publish_url(url) is False
