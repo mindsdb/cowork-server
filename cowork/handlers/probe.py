@@ -317,6 +317,7 @@ class ProbeHandler:
 
             llm_client = None
             init_error = "Could not initialize the probe (workspace or LLM client unavailable)."
+            settings_busy = False
             try:
                 from cowork.services.providers import web_tool_kwargs_for
 
@@ -329,6 +330,7 @@ class ProbeHandler:
                 # The form says so, with the wait, so the user submits it
                 # again rather than checking a model key that is fine.
                 init_error = server_busy_message(busy_retry_seconds())
+                settings_busy = True
                 logger.warning("No database connection freed in time to read the probe's settings")
             except Exception:
                 logger.exception("Could not build LLM client for probe")
@@ -337,7 +339,10 @@ class ProbeHandler:
             if workspace is None or llm_client is None:
                 yield _delta(init_error)
                 yield _patch_delta({"form_id": form_id, "form_error": init_error})
-                yield await _completed(db_conversation_id, {"status": "failed"})
+                # A refused settings read ends here without saving, as a
+                # refused conversation read does: the save would wait for
+                # another unit, and the busy text is not part of the turn.
+                yield await _completed(None if settings_busy else db_conversation_id, {"status": "failed"})
                 return
 
             # Intro + initial probing patch

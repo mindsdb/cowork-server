@@ -338,6 +338,11 @@ def record_new_artifacts(
     root is shared by every member and the owner has to be written down when
     the turn ends rather than read from the path later. A missed owner write
     leaves the artifact `unknown`, never fails the turn.
+
+    Each slug's write is tried on its own and rolled back when it fails, so
+    one failure does not drop the slugs after it. A failure is logged at
+    ERROR with the conversation, the project and the slug, since the caller
+    never sees it.
     """
     org_mode = bool(getattr(session.scope, "org_mode", False))
     if org_mode and not creator:
@@ -347,12 +352,15 @@ def record_new_artifacts(
     svc = TaskObjectService(session)
     # Independent of the owner writes below: a failed index row must not
     # leave the artifact ownerless as well.
-    try:
-        for slug in slugs:
+    for slug in slugs:
+        try:
             svc.index_artifact(conversation_id, project_id, slug)
-    except Exception:
-        session.rollback()
-        logger.warning("Could not index artifacts created this turn", exc_info=True)
+        except Exception:
+            session.rollback()
+            logger.error(
+                "Could not index artifact %r for conversation %s in project %s",
+                slug, conversation_id, project_id, exc_info=True,
+            )
     if org_mode and creator and project_id:
         from cowork.services.artifact_ownership import record_artifact_owner
 
@@ -360,8 +368,10 @@ def record_new_artifacts(
             try:
                 record_artifact_owner(session, project_id, slug, creator, action="create")
             except Exception:
-                logger.warning(
-                    "Could not record the owner of artifact %r", slug, exc_info=True
+                session.rollback()
+                logger.error(
+                    "Could not record the owner of artifact %r for conversation %s in project %s",
+                    slug, conversation_id, project_id, exc_info=True,
                 )
 
 

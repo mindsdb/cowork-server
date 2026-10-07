@@ -733,8 +733,10 @@ class ResponsesHandler:
                         # A second first send for this new conversation (a
                         # double click, a client retry) inserted it between
                         # the read above and this insert. Go on with that row:
-                        # the registry refuses whichever question comes
-                        # second, as it does any duplicate send.
+                        # both requests compute the same turn number, and the
+                        # registry refuses whichever reaches it second, while
+                        # the first turn answers or after it has ended, since
+                        # that turn saved its question.
                         session.rollback()
                         conversation = conversation_service.get_conversation(conv_id)
             else:
@@ -1097,6 +1099,8 @@ class ResponsesHandler:
         async def answer() -> None:
             async with conversation_writes(conv_id):
                 saved = await run_db(save_turn, scope=scope_from_principal(self.principal))
+            if saved is not None:
+                lifecycle.saved_question = True
             if saved is None or lifecycle.discarded:
                 # Deleted while it saved: its buffer is gone, and writing a
                 # terminal record would recreate it for the next turn to tail.
@@ -1690,30 +1694,38 @@ class ResponsesHandler:
                 )
                 return None
             if changes.created:
-                try:
-                    # The turn is marked recorded before this unit, so its
-                    # cancel branches never record again. A Stop that lands
-                    # while the unit waits for a slot or a connection waits
-                    # for it, rather than abandoning the rows.
-                    await run_to_completion(run_db(
-                        partial(
-                            record_new_artifacts,
-                            conversation_id=conv_id,
-                            project_id=UUID(directory.project_id) if directory.project_id else None,
-                            slugs=changes.created,
-                            creator=directory.creator,
-                        ),
-                        scope=scope,
-                    ))
-                except Exception:
-                    # A busy pool lands here too. In org mode nothing records
-                    # these folders later: reconcile_conversation skips org
-                    # roots and the owner backfill runs once, at startup, so
-                    # they keep no index row and their owner stays unknown.
-                    logger.error(
-                        "[responses] could not record the artifacts remote turn %s created: %s",
-                        conv_id, changes.created, exc_info=True, extra={"request_id": corr},
-                    )
+
+                async def record() -> None:
+                    try:
+                        await run_db(
+                            partial(
+                                record_new_artifacts,
+                                conversation_id=conv_id,
+                                project_id=UUID(directory.project_id) if directory.project_id else None,
+                                slugs=changes.created,
+                                creator=directory.creator,
+                            ),
+                            scope=scope,
+                        )
+                    except Exception:
+                        # record_new_artifacts logs each slug whose index or
+                        # owner write fails itself; this covers the unit's own
+                        # refusal (a busy pool) or a failed commit. In org mode
+                        # nothing records these folders later:
+                        # reconcile_conversation skips org roots and the owner
+                        # backfill runs once, at startup, so they keep no
+                        # index row and their owner stays unknown.
+                        logger.error(
+                            "[responses] could not record the artifacts remote turn %s created: %s",
+                            conv_id, changes.created, exc_info=True, extra={"request_id": corr},
+                        )
+
+                # The turn is marked recorded before this unit, so its cancel
+                # branches never record again. A Stop that lands while the
+                # unit waits for a slot or a connection waits for the unit and
+                # its error log, so a refusal still names the slugs it left
+                # unrecorded.
+                await run_to_completion(record())
             return changes
 
         async def persist(*, clean: bool) -> _SavedAnswer:
@@ -1817,6 +1829,8 @@ class ResponsesHandler:
                     ),
                     scope=scope,
                 )
+            if question_id is not None:
+                lifecycle.saved_question = True
 
         async def replies_as_stream_events():
             nonlocal turn_artifacts
@@ -2258,6 +2272,7 @@ class ResponsesHandler:
             if started is None:
                 return None
             question_id = started.question_id
+            lifecycle.saved_question = True
             return started.conversation
 
         try:

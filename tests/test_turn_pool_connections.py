@@ -1063,8 +1063,10 @@ async def test_two_first_sends_for_one_new_conversation_get_one_answer_and_one_r
     """A double click sends the first question of a new conversation twice.
     With as many unit slots as a Postgres pool lends, both requests look for
     the conversation before either creates it, and both create it. The second
-    insert does not fail its request: one question is answered and the other
-    is refused as a duplicate send."""
+    insert does not fail its request. Both compute the same turn number, so
+    one question is answered and the other is refused as a duplicate send,
+    whether it reaches the registry while the first turn answers or after
+    that turn has saved its question and ended."""
     units._SLOTS.set(anyio.CapacityLimiter(4))
     model = PausedModel()
     monkeypatch.setattr(harness_mod, "build_chat_session", model.build)
@@ -1806,6 +1808,71 @@ async def test_a_connector_probe_whose_conversation_read_is_refused_tells_the_fo
     assert completed[1]["response"]["status"] == "failed"
     assert _form_patches(answered.text) == [{"form_id": "probe-form", "form_error": server_busy_message(WAIT)}]
     assert len(asked) == 1, asked
+    logged = [r for r in caplog.records if r.name == probe_handler.logger.name]
+    assert [(r.levelno, r.exc_info) for r in logged] == [(logging.WARNING, None)], [r.getMessage() for r in logged]
+
+
+async def test_a_connector_probe_whose_settings_read_is_refused_ends_at_that_refusal(
+    one_connection_pool, monkeypatch, caplog,
+):
+    """The probe's conversation read gets the pool's only connection, then
+    the connection is taken, so the settings read finds none within
+    POOL_TIMEOUT. The stream ends at that refusal: no unit is asked to save
+    the busy text, so the stream does not wait another POOL_TIMEOUT, and a
+    connection that frees afterwards does not put the busy text into the
+    conversation's history."""
+    probe_handler = _probe_runs_against_a_stand_in_form(monkeypatch)
+    _logging_on(monkeypatch, probe_handler.logger)
+
+    class _NeverStarts:
+        def __init__(self, **_kwargs) -> None:
+            raise AssertionError("the probe must not start without its settings")
+
+    monkeypatch.setattr(probe_handler, "CredentialProbe", _NeverStarts)
+    asked = []
+    held = []
+    run_db = probe_handler.run_db
+
+    async def run_db_then_take_the_connection(fn, *, scope):
+        asked.append(getattr(fn, "func", fn).__name__)
+        try:
+            result = await run_db(fn, scope=scope)
+        finally:
+            if held:
+                # The settings read was refused: free the connection, so a
+                # save asked for after it would succeed.
+                held.pop().close()
+        if len(asked) == 1:
+            held.append(await _take_the_only_connection(one_connection_pool))
+        return result
+
+    monkeypatch.setattr(probe_handler, "run_db", run_db_then_take_the_connection)
+    conversation_id = _conversation()
+
+    try:
+        async with _client() as client:
+            answered = await asyncio.wait_for(client.post(
+                "/api/v1/connectors/submissions/",
+                json={
+                    "connector_id": "postgres", "name": "warehouse",
+                    "conversation_id": str(conversation_id), "values": {"password": "hunter2"},
+                },
+            ), timeout=5 * WAIT)
+    finally:
+        for connection in held:
+            connection.close()
+
+    assert answered.status_code == 200, answered.text
+    assert asked == ["_read_conversation", "_read_probe_settings"]
+    frames = _frames(answered.text)
+    deltas = [data["delta"] for kind, data in frames if kind == "response.output_text.delta"]
+    assert deltas[0] == server_busy_message(WAIT), deltas
+    kind, completed = frames[-1]
+    assert kind == "response.completed", frames
+    assert completed["response"]["status"] == "failed"
+    assert "assistant_message_id" not in completed
+    assert _form_patches(answered.text) == [{"form_id": "probe-form", "form_error": server_busy_message(WAIT)}]
+    assert _rows(conversation_id) == []
     logged = [r for r in caplog.records if r.name == probe_handler.logger.name]
     assert [(r.levelno, r.exc_info) for r in logged] == [(logging.WARNING, None)], [r.getMessage() for r in logged]
 

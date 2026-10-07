@@ -1,5 +1,5 @@
 """Database units: one pooled connection per unit, held from its first
-statement to its end; one POOL_TIMEOUT budget for a unit's waits; threads
+statement to its end; one POOL_TIMEOUT budget for a caller's waits; threads
 apart from the ones sync routes share; and a caller that is cancelled waits
 for a unit that has started."""
 from __future__ import annotations
@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import math
 import threading
+import time
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -125,6 +126,56 @@ async def test_the_slot_wait_and_the_connection_wait_share_one_pool_timeout(one_
     )
     await _until(lambda: slots.borrowed_tokens == 0 and one_connection_pool.pool.checkedout() == 0)
     assert ran == []
+
+
+async def test_a_unit_asked_after_an_abandoned_one_runs_once_the_connection_frees(
+    one_connection_pool,
+):
+    """A refused caller's worker thread can still be waiting in the pool, and
+    it keeps its slot meanwhile. The first connection that frees goes to that
+    thread, which hands it straight back and frees the slot without running
+    its unit. So a unit asked after the refusal runs as soon as the connection
+    frees, well before its own deadline."""
+    budget = units.db_session.settings.database.pool_timeout
+    slots = units._slots(one_connection_pool)
+    slot_held = asyncio.Event()
+
+    async def hold_the_slot():
+        async with slots:
+            slot_held.set()
+            await asyncio.sleep(0.6 * budget)
+
+    ran = []
+
+    def record(name):
+        def unit(session) -> float:
+            ran.append(name)
+            return time.monotonic()
+        return unit
+
+    held_elsewhere = one_connection_pool.connect()
+    try:
+        holder = asyncio.create_task(hold_the_slot())
+        await slot_held.wait()
+        with pytest.raises(DatabaseBusy):
+            await run_db(record("refused"), scope=LOCAL_SCOPE)
+        await holder
+        refused_thread_kept_its_slot = slots.borrowed_tokens == 1
+        later_asked = time.monotonic()
+        later = asyncio.create_task(run_db(record("later"), scope=LOCAL_SCOPE))
+        await asyncio.sleep(0.25 * budget)
+        waited_for_the_connection = not later.done()
+        freed = time.monotonic()
+        held_elsewhere.close()
+        ran_at = await asyncio.wait_for(later, timeout=2 * budget)
+    finally:
+        held_elsewhere.close()
+
+    assert refused_thread_kept_its_slot
+    assert waited_for_the_connection
+    assert ran == ["later"]
+    assert ran_at - freed < 0.2, f"ran {ran_at - freed:.2f}s after the connection freed"
+    assert ran_at - later_asked < 0.5 * budget
 
 
 async def test_a_caller_cancelled_while_its_unit_waits_for_a_connection_leaves_at_once(

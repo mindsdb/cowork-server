@@ -110,12 +110,19 @@ class TurnLifecycle:
     ``shutting_down`` means "the server is exiting, not the user's own Stop".
     Set BEFORE the cancel, same ordering as ``discarded``: a producer's
     ``CancelledError`` handler checks it to persist an interrupted turn.
+
+    ``saved_question`` means "this turn's question is in the conversation".
+    The producer sets it once its first unit saves the question. From then on
+    a request that reads the history counts that row, so only a request that
+    read it earlier can still name this turn's number; ``RunRegistry.start``
+    refuses that request.
     """
 
     discarded: bool = False
     shutting_down: bool = False
     # Watchdog expiry is an interruption, separate from deliberate user Stop.
     timed_out: bool = False
+    saved_question: bool = False
 
 
 @dataclass
@@ -226,9 +233,20 @@ class RunRegistry:
         a buffer is named by conversation and turn number, and two requests
         that read the history at the same moment compute the same turn number,
         so opening one for a refused request would write into the running
-        turn's file or stream. A refused start creates no buffer and no
-        producer coroutine. An accepted one opens its buffer clear of the
-        records of an earlier turn at the same number (backend.new_buffer).
+        turn's file or stream.
+
+        Also raises TurnInProgress when the current turn has saved its
+        question and this start names that turn's number or an earlier one,
+        even if that turn has ended. Such a request read the history before
+        that question was saved: its routing gate outlasted the whole earlier
+        turn. Admitting it would truncate the earlier turn's buffer under a
+        reader still behind, and boot recovery reads a buffer's turn number as
+        its question's position in the history, which this question does not
+        hold. A start after a turn that saved nothing keeps the number.
+
+        A refused start creates no buffer and no producer coroutine. An
+        accepted one opens its buffer clear of the records of an earlier turn
+        at the same number (backend.new_buffer).
         """
         loop = asyncio.get_running_loop()
         lock = self._start_locks.get(conversation_id)
@@ -241,6 +259,16 @@ class RunRegistry:
                 logger.info(
                     "Refused a second turn for conversation %s; turn %d is still answering.",
                     conversation_id, existing.turn_id,
+                )
+                raise TurnInProgress(conversation_id=conversation_id, turn_id=existing.turn_id)
+            if (
+                existing is not None and existing.lifecycle.saved_question
+                and turn_id <= existing.turn_id
+            ):
+                logger.info(
+                    "Refused turn %d for conversation %s; it read the history before "
+                    "turn %d saved its question.",
+                    turn_id, conversation_id, existing.turn_id,
                 )
                 raise TurnInProgress(conversation_id=conversation_id, turn_id=existing.turn_id)
             if existing is not None and existing.is_running and not existing.buffer.is_closed:

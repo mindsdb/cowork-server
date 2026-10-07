@@ -935,6 +935,88 @@ async def test_a_stop_while_the_artifact_record_waits_for_a_slot_still_writes_it
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("cleanup_tmp_projects")
+async def test_a_stop_while_the_artifact_record_times_out_still_logs_the_unrecorded_slugs(
+    monkeypatch, tmp_path, caplog,
+):
+    """The pod finished cleanly and created an artifact, and a Stop lands
+    while the unit that records it waits for a slot that stays taken past
+    POOL_TIMEOUT. In org mode no later turn records the folder, so the Stop
+    still waits for the error that names it, rather than leaving only the
+    units module's generic warning."""
+    import asyncio
+
+    from cowork.db import units
+    from cowork.db.scoped import TenantScope
+    from cowork.db.units import DatabaseBusy
+    from test_artifact_ownership import make_conversation, make_project, project_root, write_artifact
+
+    org_id, creator = str(uuid4()), str(uuid4())
+    scope = TenantScope(org_mode=True, org_id=org_id, user_id=creator)
+    project = make_project(tmp_path, org_id)
+    conversation_id = make_conversation(project, creator)
+    source = project_root(project)
+    slug = "sales-report"
+    handler = _remote_handler(monkeypatch, {})
+    _units_on_the_test_database(monkeypatch, scope=scope)
+    _no_workspace_or_memory_units(monkeypatch)
+    monkeypatch.setattr(units.db_session.settings.database, "pool_timeout", 1)
+    monkeypatch.setattr(responses_mod.logger, "disabled", False)
+    monkeypatch.setattr(units.logger, "disabled", False)
+    monkeypatch.setattr(
+        ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: (
+            SimpleNamespace(created_by=creator), source.base, str(project.id), project.name,
+        )),
+    )
+    # The test database is SQLite, so units share one slot.
+    slots = units._slots(units._engine())
+    holder = object()
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        write_artifact(source.base, slug, conversation=conversation_id)
+        yield "turn_delta", {"text": "done"}
+        await slots.acquire_on_behalf_of(holder)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    buffer = _RecBuffer()
+    with caplog.at_level(logging.WARNING):
+        task = asyncio.create_task(handler._produce_remote(
+            conv_id=conversation_id, input_text="hi", original_content="hi",
+            model="anton", harness_id="anton", buffer=buffer,
+        ))
+        try:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 5
+            while slots.statistics().tasks_waiting == 0:
+                assert loop.time() < deadline, "the artifact record never waited for a slot"
+                await asyncio.sleep(0.01)
+            task.cancel()
+            # Past POOL_TIMEOUT, so the record unit is refused before the
+            # slot frees for the Stop's own units.
+            await asyncio.sleep(1.3)
+        finally:
+            if holder in slots.statistics().borrowers:
+                slots.release_on_behalf_of(holder)
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+
+    assert buffer.frames[-1] == "CLOSE:cancelled"
+    errors = [
+        r for r in caplog.records
+        if r.name == responses_mod.logger.name and r.levelno == logging.ERROR
+    ]
+    assert len(errors) == 1, [r.getMessage() for r in caplog.records]
+    assert slug in errors[0].getMessage() and str(conversation_id) in errors[0].getMessage()
+    assert isinstance(errors[0].exc_info[1], DatabaseBusy)
+    assert not [
+        r for r in caplog.records
+        if r.name == units.logger.name and "caller was cancelled" in r.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
 async def test_the_remote_turns_settings_reads_resolve_its_org_from_the_turn_snapshot(monkeypatch):
     """handle() binds the turn's settings snapshot around the producer's
     creation. The remote producer binds its org at its top, so a settings
