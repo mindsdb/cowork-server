@@ -213,6 +213,10 @@ same change; a contract test fails if only one of the two happens.
 
 Set `LOG_LEVEL` (default `WARNING`) to control verbosity. Enable file logging with `ENABLE_FILE_LOGGING=true` (writes to `LOG_DIR`, defaults to `~/.cowork/logs/`).
 
+Database exception records in the owned console/file handlers and the CLI-configured Uvicorn error handlers omit SQL, parameter values, driver details and tracebacks. Session logs retain error types and client HTTP status; the shared handler filter also retains valid driver SQLSTATE codes. Exceptions and HTTP errors returned to callers stay unchanged.
+
+SQLAlchemy query and connection diagnostics stay at `WARNING`, even when application logging is set to `DEBUG`.
+
 ## Releasing
 
 Releases are automatic on merge; there is no version to bump by hand (the

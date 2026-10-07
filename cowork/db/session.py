@@ -28,10 +28,12 @@ def _create_engine(db_uri: str):
             engine = create_engine(
                 db_uri,
                 connect_args={"check_same_thread": False},
+                hide_parameters=True,
             )
         else:
             engine = create_engine(
                 db_uri,
+                hide_parameters=True,
                 pool_size=settings.database.pool_size,
                 max_overflow=settings.database.max_overflow,
                 pool_timeout=settings.database.pool_timeout,
@@ -41,7 +43,7 @@ def _create_engine(db_uri: str):
         return engine
     except Exception as e:
         error_msg = str(e).lower()
-        logger.error(f"Failed to create engine: {error_msg}")
+        logger.error("Failed to create engine: error_type=%s", type(e).__name__)
         raise RuntimeError(f"Engine creation failed: {error_msg}") from e
 
 
@@ -110,11 +112,17 @@ def get_session(db_uri: str = settings.database.uri):
     except Exception as e:
         # A 4xx HTTPException is the endpoint's intended answer (a 409 for a
         # steer during an approval, a 404 for a missing task); it still rolls
-        # the transaction back, but it is not an error worth a traceback.
+        # the transaction back, but it is not an error worth an error-level log.
+        # Exception text and tracebacks can expose SQL, credentials or database
+        # error details, even when create_engine hides bound parameters.
         if _is_client_error(e):
-            logger.debug(f"Session rolled back after a client error: {e}")
+            logger.debug(
+                "Session rolled back after a client error: error_type=%s status=%d",
+                type(e).__name__,
+                e.status_code,
+            )
         else:
-            logger.exception(f"❌ Session error: {str(e)}")
+            logger.error("Session error: error_type=%s", type(e).__name__)
         db.rollback()
         raise
     finally:

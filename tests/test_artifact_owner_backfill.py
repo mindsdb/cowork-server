@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from contextlib import contextmanager
 from uuid import uuid4
@@ -25,6 +26,26 @@ from test_artifact_ownership import (
     project_root,
     write_artifact,
 )
+
+
+PRIVATE_SQL = "SELECT 'private_backfill_sql_marker'"
+PRIVATE_BIND = "private_backfill_bind_marker"
+PRIVATE_DETAIL = "private_backfill_driver_detail_marker"
+
+
+def _assert_safe_database_log(caplog, error_type, level):
+    records = [record for record in caplog.records
+               if record.name == backfill.__name__
+               and record.getMessage().startswith("Database operation failed:")]
+    assert len(records) == 1
+    record = records[0]
+    assert record.levelno == level
+    assert record.getMessage() == f"Database operation failed: error_type={error_type} sqlstate=unknown"
+    assert record.args == (error_type, "unknown")
+    assert record.exc_info is None and record.exc_text is None
+    for captured in caplog.records:
+        assert all(value not in repr(captured.__dict__)
+                   for value in (PRIVATE_SQL, PRIVATE_BIND, PRIVATE_DETAIL))
 
 
 def _engine():
@@ -224,7 +245,7 @@ def test_a_data_error_on_one_artifact_marks_only_it_unknown(org, monkeypatch, ca
 
     def data_error_for_bad(session, project_id, slug):
         if slug == "bad":
-            raise sa.exc.DataError("stmt", {}, Exception("invalid input"))
+            raise sa.exc.DataError(PRIVATE_SQL, {"value": PRIVATE_BIND}, Exception(PRIVATE_DETAIL))
         return real(session, project_id, slug)
 
     monkeypatch.setattr(backfill, "_owner_from_task_objects", data_error_for_bad)
@@ -235,24 +256,31 @@ def test_a_data_error_on_one_artifact_marks_only_it_unknown(org, monkeypatch, ca
     assert summary is not None
     assert (str(project.id), "bad") in summary.unknown
     assert _owner(org_id, source, "good").owner_user_id == owner
-    assert f"artifact_owner_backfill failed project={project.id} slug=bad" in caplog.text
+    _assert_safe_database_log(caplog, "DataError", logging.WARNING)
     with Session(_engine()) as raw:
         assert raw.exec(select(Setting).where(Setting.key == backfill.SENTINEL_KEY)).first() is not None
 
 
-def test_an_interface_error_aborts_the_pass_and_logs_where(org, monkeypatch, caplog):
+def test_an_interface_error_aborts_the_pass_and_logs_safe_metadata(org, monkeypatch, caplog):
     write_artifact(org[3].base, "no-provenance")
+    failure = sa.exc.InterfaceError(PRIVATE_SQL, {"value": PRIVATE_BIND}, Exception(PRIVATE_DETAIL))
 
     def boom(*_args, **_kwargs):
-        raise sa.exc.InterfaceError("stmt", {}, Exception("connection closed"))
+        raise failure
 
     monkeypatch.setattr(backfill, "_owner_from_task_objects", boom)
 
     with caplog.at_level("WARNING", logger=backfill.__name__):
-        with pytest.raises(sa.exc.InterfaceError):
+        with pytest.raises(sa.exc.InterfaceError) as caught:
             _run(org[2])
 
-    assert f"artifact_owner_backfill aborted project={org[2].id} slug=no-provenance" in caplog.text
+    assert caught.value is failure
+    assert caught.value.statement == PRIVATE_SQL
+    assert caught.value.params == {"value": PRIVATE_BIND}
+    assert caught.value.orig.args == (PRIVATE_DETAIL,)
+    _assert_safe_database_log(caplog, "InterfaceError", logging.ERROR)
+    with Session(_engine()) as raw:
+        assert raw.exec(select(Setting).where(Setting.key == backfill.SENTINEL_KEY)).first() is None
 
 
 def test_local_mode_never_runs(monkeypatch):

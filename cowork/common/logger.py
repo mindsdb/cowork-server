@@ -3,8 +3,15 @@ import logging
 # Add logging import for rotating file handler
 import logging.handlers
 import os
+import re
 import sys
+from copy import deepcopy
 from pathlib import Path
+from sqlite3 import Error as SQLiteError
+
+from psycopg import Error as PsycopgError
+from psycopg2 import Error as Psycopg2Error
+from sqlalchemy.exc import SQLAlchemyError, StatementError
 
 try:
     import colorlog
@@ -20,6 +27,73 @@ try:
     HAS_RICH = True
 except ImportError:
     HAS_RICH = False
+
+
+def _database_error(exc: BaseException) -> SQLAlchemyError | SQLiteError | PsycopgError | Psycopg2Error | None:
+    """Find a database error even when an application exception wraps it."""
+    pending = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, (SQLAlchemyError, SQLiteError, PsycopgError, Psycopg2Error)):
+            return current
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+    return None
+
+
+class DatabaseErrorFilter(logging.Filter):
+    """Replace database exception records before a handler formats them.
+
+    hide_parameters on an engine protects bound values, but not SQL literals,
+    driver error details or a caller that already interpolated the exception
+    into its message. Replace the entire message and clear the traceback;
+    the propagated exception and any response built from it stay unchanged.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        candidates: list[BaseException] = []
+        if record.exc_info is not None and record.exc_info[1] is not None:
+            candidates.append(record.exc_info[1])
+        if isinstance(record.msg, BaseException):
+            candidates.append(record.msg)
+        args = record.args.values() if isinstance(record.args, dict) else (record.args or ())
+        candidates.extend(arg for arg in args if isinstance(arg, BaseException))
+        for exc in candidates:
+            error = _database_error(exc)
+            if error is None:
+                continue
+            driver_error = error.orig if isinstance(error, StatementError) else error
+            sqlstate = getattr(driver_error, "sqlstate", None) or getattr(driver_error, "pgcode", None)
+            # Driver SQLSTATE is a five-character code, never its DETAIL or text.
+            if not isinstance(sqlstate, str) or re.fullmatch(r"[A-Z0-9]{5}", sqlstate) is None:
+                sqlstate = "unknown"
+            record.msg = "Database operation failed: error_type=%s sqlstate=%s"
+            record.args = (type(error).__name__, sqlstate)
+            record.message = record.getMessage()
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
+            break
+        return True
+
+
+def uvicorn_logging_config() -> dict[str, object]:
+    """Keep Uvicorn's handlers from bypassing the database exception filter."""
+    from uvicorn.config import LOGGING_CONFIG
+
+    config = deepcopy(LOGGING_CONFIG)
+    config["filters"] = {"database_errors": {"()": DatabaseErrorFilter}}
+    for handler in config["handlers"].values():
+        handler["filters"] = ["database_errors"]
+    return config
 
 
 class EventLoopClosedFilter(logging.Filter):
@@ -122,6 +196,7 @@ def setup_file_logging(log_dir: str = "logs", max_bytes: int = 10485760, backup_
             datefmt="%Y-%m-%d %H:%M:%S",
         )
     )
+    all_logs_handler.addFilter(DatabaseErrorFilter())
     handlers.append(all_logs_handler)
 
     # Error logs file
@@ -136,6 +211,7 @@ def setup_file_logging(log_dir: str = "logs", max_bytes: int = 10485760, backup_
             datefmt="%Y-%m-%d %H:%M:%S",
         )
     )
+    error_handler.addFilter(DatabaseErrorFilter())
     handlers.append(error_handler)
 
     return handlers
@@ -161,6 +237,7 @@ def setup_console_handler():
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(get_colored_formatter())
 
+    handler.addFilter(DatabaseErrorFilter())
     return handler
 
 
@@ -253,6 +330,12 @@ def setup_logging():
 
     for logger_name in third_party_loggers:
         logging.getLogger(logger_name).setLevel(logging.ERROR)
+
+    # SQLAlchemy diagnostic logs can contain SQL literals, result rows and
+    # connection representations. Keep them off even when another logger
+    # config enables diagnostics on the sqlalchemy parent namespace.
+    for logger_name in ("sqlalchemy.engine", "sqlalchemy.pool"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
     # Add filter to suppress "Event loop is closed" errors during cleanup
     event_loop_filter = EventLoopClosedFilter()
