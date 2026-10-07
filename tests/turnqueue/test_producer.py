@@ -142,6 +142,39 @@ async def test_turn_failed_yields_classified_code_and_message(monkeypatch):
     assert items == [items[-1]]  # terminal is the only yield, then the generator ends
 
 
+@pytest.mark.asyncio
+async def test_a_pod_model_call_timeout_keeps_its_own_code(monkeypatch):
+    # The pod's _scrub keeps only "TypeName: message", so the name is what
+    # carries anton's model-call deadline across the hop.
+    failed = await _failed_turn(monkeypatch, {
+        "error": "ModelCallTimeoutError: The model sent no output for 10 minutes, so the call was stopped.",
+    })
+    assert failed["code"] == "model_timeout"
+    assert failed["message"] == "The model sent no output for 10 minutes, so the call was stopped."
+
+
+@pytest.mark.asyncio
+async def test_a_stale_cancel_cause_is_cleared_with_the_stale_flag(monkeypatch):
+    # A cause left by an earlier turn that reused the id would turn this
+    # turn's own Stop into a stall.
+    class RecordingRedis(FakeRedis):
+        def __init__(self, replies):
+            super().__init__(replies)
+            self.deleted: list[str] = []
+
+        async def delete(self, *keys):
+            self.deleted.extend(keys)
+            return len(keys)
+
+    fake = RecordingRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+    assert "cowork:cancel:r" in fake.deleted
+    assert "cowork:cancel_cause:r" in fake.deleted
+
+
 # What anton's worker sends, via scratchpad-controller, for a billing stop the
 # gate timed: `reset_at` beside `error` on the turn_failed reply.
 _FUSE_STOP = "FreeServingPausedError: Free serving for 'x' is paused until the daily budget resets."

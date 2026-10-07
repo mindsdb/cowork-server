@@ -19,6 +19,7 @@ from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratc
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
 from cowork.services.projects import display_label
+from cowork.streaming.liveness import ModelWaitTicker
 
 
 logger = get_logger(__name__)
@@ -462,6 +463,8 @@ class AntonHarness:
         trace_metadata: dict[str, str] | None = None,
         channel_context: ChannelContext | None = None,
         tool_messages: bool = False,
+        # Keeps the turn alive while a model call is quiet (see HarnessProvider).
+        model_wait: ModelWaitTicker | None = None,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -542,6 +545,8 @@ class AntonHarness:
                 channel_context=channel_context,
                 tool_messages=tool_messages,
             )
+            if model_wait is not None:
+                model_wait.attach(session=session)
             # Length of the seeded history — everything anton appends past this
             # index is this turn's block-messages (tool_use / tool_result / text).
             # Guarded: an anton build (or test double) without `.history` simply
@@ -583,6 +588,8 @@ class AntonHarness:
                     turn_slice = turn_slice[1:]
                 turn_rows = _split_turn_into_rows(turn_slice) or None
         finally:
+            if model_wait is not None:
+                model_wait.detach()
             if temp_vault_dir:
                 shutil.rmtree(temp_vault_dir, ignore_errors=True)
             if session is not None:

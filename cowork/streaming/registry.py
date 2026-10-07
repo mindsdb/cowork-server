@@ -88,12 +88,18 @@ class TurnLifecycle:
     ``shutting_down`` means "the server is exiting, not the user's own Stop".
     Set BEFORE the cancel, same ordering as ``discarded``: a producer's
     ``CancelledError`` handler checks it to persist an interrupted turn.
+
+    ``stalled`` means "the UI heard nothing for its idle window and gave up",
+    not the user's own Stop. Set BEFORE the cancel, same ordering again: the
+    producer's ``CancelledError`` handler checks it to persist a stall record.
+    ``shutting_down`` and ``timed_out`` win over it.
     """
 
     discarded: bool = False
     shutting_down: bool = False
     # Watchdog expiry is an interruption, separate from deliberate user Stop.
     timed_out: bool = False
+    stalled: bool = False
 
 
 @dataclass
