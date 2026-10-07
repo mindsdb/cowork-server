@@ -5,8 +5,10 @@ from unittest import mock
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.db import session as db_session
+from cowork.db.units import DatabaseBusy
 
 
 def _drive(monkeypatch: pytest.MonkeyPatch, exc: BaseException) -> tuple[mock.Mock, mock.Mock]:
@@ -45,3 +47,20 @@ def test_a_5xx_http_exception_is_still_logged(monkeypatch: pytest.MonkeyPatch) -
     _, logger = _drive(monkeypatch, HTTPException(status_code=500, detail="Coding operation failed"))
 
     logger.exception.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        pytest.param(PoolTimeoutError("QueuePool limit of size 20 overflow 20 reached"), id="pool"),
+        pytest.param(DatabaseBusy("no database unit slot freed within POOL_TIMEOUT"), id="unit-slot"),
+    ],
+)
+def test_a_full_pool_rolls_back_without_a_logged_traceback(monkeypatch: pytest.MonkeyPatch, exc) -> None:
+    # The app answers both with a 503 that names the wait, and logs one line
+    # for it; a traceback per refused request would bury that line.
+    db, logger = _drive(monkeypatch, exc)
+
+    db.rollback.assert_called_once()
+    db.close.assert_called_once()
+    logger.exception.assert_not_called()

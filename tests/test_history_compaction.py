@@ -19,6 +19,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import UserSettings
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from cowork.db.session import get_engine
+from cowork.db.units import unit_session
 from cowork.harnesses.anton_harness.harness import AntonHarness
 from cowork.services.conversations import ConversationService
 from cowork.services.projects import GENERAL_PROJECT_ID
@@ -54,6 +55,14 @@ def svc():
     engine = get_engine(get_app_settings().database.uri)
     with Session(engine) as s:
         yield ConversationService(ScopedSession(s, LOCAL_SCOPE))
+
+
+def _stored(conversation_id):
+    """The conversation as the database holds it now. The harness saves a
+    compaction on a short session of its own, which the fixture's session,
+    holding the row it created, does not see."""
+    with unit_session(scope=LOCAL_SCOPE) as session:
+        return ConversationService(session).get_conversation(conversation_id)
 
 
 class TestHistoryCompactionSetting:
@@ -227,7 +236,7 @@ class TestPersistHistoryCompaction:
             conv, fake_anton_session, {"ordered_messages": [], "tail_start": 0, "synthetic_prefix_len": 0},
         )
 
-        assert svc.get_conversation(conv.id).history_summary is None
+        assert _stored(conv.id).history_summary is None
 
     def test_noop_on_anton_predating_last_compaction(self, svc):
         """cowork-server and anton deploy independently — an older anton
@@ -242,7 +251,7 @@ class TestPersistHistoryCompaction:
             conv, _OldChatSession(), {"ordered_messages": [], "tail_start": 0, "synthetic_prefix_len": 0},
         )
 
-        assert svc.get_conversation(conv.id).history_summary is None
+        assert _stored(conv.id).history_summary is None
 
     def test_persists_cutoff_on_first_compaction(self, svc):
         conv = svc.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
@@ -257,7 +266,7 @@ class TestPersistHistoryCompaction:
 
         AntonHarness._persist_history_compaction(conv, fake_anton_session, seed_info)
 
-        refreshed = svc.get_conversation(conv.id)
+        refreshed = _stored(conv.id)
         assert refreshed.history_summary == "[COMPACTED] state record"
         assert refreshed.history_summary_cutoff_id == ordered[3].id
 
@@ -277,7 +286,7 @@ class TestPersistHistoryCompaction:
 
         AntonHarness._persist_history_compaction(conv, fake_anton_session, seed_info)
 
-        assert svc.get_conversation(conv.id).history_summary_cutoff_id == ordered[3].id
+        assert _stored(conv.id).history_summary_cutoff_id == ordered[3].id
 
     def test_no_new_material_covered_does_not_persist(self, svc):
         """covered_through only reaches the synthetic summary entry itself
@@ -292,4 +301,4 @@ class TestPersistHistoryCompaction:
 
         AntonHarness._persist_history_compaction(conv, fake_anton_session, seed_info)
 
-        assert svc.get_conversation(conv.id).history_summary is None
+        assert _stored(conv.id).history_summary is None

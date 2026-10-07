@@ -20,6 +20,8 @@ from cowork.handlers.responses import (
     cancelled_ask_user_retirements,
 )
 
+from _fakes import inline_run_db
+
 
 def _ask(question_id: str) -> dict:
     return {"type": "response.ask_user", "question_id": question_id, "prompt": "?"}
@@ -75,6 +77,10 @@ class _FakeBuffer:
     async def close(self, reason, extra=None):
         self.closed = reason
 
+    @property
+    def is_closed(self) -> bool:
+        return self.closed is not None
+
 
 def _cancellable_handler(monkeypatch, saved, published: asyncio.Event):
     """A handler whose turn publishes one ask_user and then blocks forever."""
@@ -86,15 +92,16 @@ def _cancellable_handler(monkeypatch, saved, published: asyncio.Event):
             pass
 
         def get_conversation(self, conv_id):
-            return object()
+            return SimpleNamespace(project=None)
 
         def save_user_message(self, conv_id, content, *, created_at=None, pending=False):
             msg = SimpleNamespace(id=uuid4())
             saved["user_id"] = msg.id
             return msg
 
-        def finalize_pending(self, conv_id, message_id=None):
+        def clear_pending(self, conv_id, *, message_id=None):
             saved["finalized"] = True
+            return True
 
         def save_assistant_turn(self, conv_id, text, events, harness=None, tool_rows=None):
             saved["events"] = events
@@ -115,8 +122,7 @@ def _cancellable_handler(monkeypatch, saved, published: asyncio.Event):
     )
 
     monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
-    monkeypatch.setattr(responses_mod, "ScopedSession", lambda s, scope: FakeSession())
-    monkeypatch.setattr(responses_mod, "get_open_session", lambda: None)
+    monkeypatch.setattr(responses_mod, "run_db", inline_run_db(FakeSession()))
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: None)
     monkeypatch.setattr(responses_mod, "get_harness", lambda name: fake_harness)
     return handler

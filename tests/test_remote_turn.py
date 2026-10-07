@@ -28,7 +28,7 @@ def _fake_handler(
         "FakeResponsesHandler", (), {
             "_remote_artifacts_context": staticmethod(remote_artifacts_context or (lambda s, c: None)),
             "_remote_seed_history": staticmethod(remote_seed_history or (lambda s, c: ([], None))),
-            "_persist_remote_compaction": staticmethod(lambda c, d, si, sc: None),
+            "_persist_remote_compaction": staticmethod(lambda s, *, conv_id, data, seed_info: None),
             "_remote_workspace": staticmethod(lambda s, c: {}),
             "_remote_started_at": staticmethod(lambda s, c: None),
             "_persist_turn_memory": staticmethod(persist_turn_memory or (lambda s, c, e: None)),
