@@ -6,18 +6,21 @@ import shutil
 import tempfile
 import uuid
 from collections.abc import AsyncGenerator
+from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-from sqlmodel import Session
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.schemas.responses import Role
 from cowork.services.connectors.persist import persist_connection, vault_for_scope
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import store
-from cowork.db.scoped import ScopedSession
+from cowork.db.scoped import ScopedSession, TenantScope
+from cowork.db.units import conversation_writes, run_db
 from cowork.services.conversations import ConversationService
 
 logger = logging.getLogger(__name__)
@@ -45,9 +48,40 @@ def _extract_connection_label_fields(credentials: dict) -> tuple[str, str]:
     return label, user_label
 
 
+@dataclass(frozen=True)
+class _ProbeConversation:
+    """The conversation a probe's turn is saved into, and the project
+    directory its probe runs in."""
+
+    id: UUID
+    workspace_path: Path
+
+
+def _read_conversation(session: ScopedSession, *, conversation_id: UUID) -> _ProbeConversation:
+    conversation = ConversationService(session).get_conversation(conversation_id)
+    return _ProbeConversation(id=conversation.id, workspace_path=Path(conversation.project.path))
+
+
+def _save_probe_turn(
+    session: ScopedSession, *, conversation_id: UUID, text: str, events: tuple[dict, ...],
+) -> UUID | None:
+    """The probe's narrative as an assistant turn: the saved row's id, or
+    None when nothing was saved."""
+    message = ConversationService(session).save_assistant_turn(conversation_id, text, list(events))
+    return message.id if message is not None else None
+
+
 class ProbeHandler:
-    def __init__(self, session: ScopedSession) -> None:
-        self.session = session
+    """The connector form's stream: an LLM-driven credential probe, narrated
+    as an assistant turn.
+
+    Its database work runs as units (cowork.db.units): the conversation read
+    before the probe and the assistant-turn write after it. No connection is
+    held while the probe waits on the model.
+    """
+
+    def __init__(self, *, scope: TenantScope) -> None:
+        self.scope = scope
 
     async def run(
         self,
@@ -74,7 +108,7 @@ class ProbeHandler:
             recorded_events.append(payload)
             return _sse(event_type, payload)
 
-        def _persist_once(conversation_id: UUID | None):
+        async def _persist_once(conversation_id: UUID | None) -> UUID | None:
             # Idempotent — every response.completed below calls this so the
             # turn's real assistant message id can ride the SAME
             # frame the client's SSE reader stops at; a probe turn legitimately
@@ -85,11 +119,26 @@ class ProbeHandler:
             persisted = True
             if not conversation_id or not "".join(body_parts):
                 return None
-            return ConversationService(self.session).save_assistant_turn(
-                conversation_id, "".join(body_parts), recorded_events
+            save = partial(
+                _save_probe_turn,
+                conversation_id=conversation_id,
+                text="".join(body_parts),
+                events=tuple(recorded_events),
             )
+            try:
+                async with conversation_writes(conversation_id):
+                    return await run_db(save, scope=self.scope)
+            except PoolTimeoutError:
+                # The probe's outcome (a saved connection, or the reason it
+                # failed) still reaches the form in the frame below; only its
+                # narrative is missing from the conversation.
+                logger.warning(
+                    "No database connection freed in time to save the probe turn for conversation %s",
+                    conversation_id,
+                )
+                return None
 
-        def _completed(conversation_id: UUID | None, response_fields: dict) -> str:
+        async def _completed(conversation_id: UUID | None, response_fields: dict) -> str:
             # _push records the (id-less) event and bumps seq first, exactly
             # like every other event — persistence must see this completion
             # event in recorded_events, matching the ordering this replaced,
@@ -98,14 +147,14 @@ class ProbeHandler:
                 "response.completed",
                 {"type": "response.completed", "response": {"id": response_id, **response_fields}},
             )
-            msg = _persist_once(conversation_id)
-            if msg is None:
+            message_id = await _persist_once(conversation_id)
+            if message_id is None:
                 return wire
             # Same recorded payload, republished with the id added — the
             # persisted copy in recorded_events is deliberately left without
             # it, matching how response_failed_payload's persisted copy
             # doesn't carry it either.
-            wire_payload = {**recorded_events[-1], "assistant_message_id": str(msg.id)}
+            wire_payload = {**recorded_events[-1], "assistant_message_id": str(message_id)}
             return _sse("response.completed", wire_payload)
 
         def _delta(text: str) -> str:
@@ -138,9 +187,17 @@ class ProbeHandler:
 
             if conversation_id:
                 try:
-                    conversation = ConversationService(self.session).get_conversation(UUID(conversation_id))
+                    conversation = await run_db(
+                        partial(_read_conversation, conversation_id=UUID(conversation_id)),
+                        scope=self.scope,
+                    )
                     db_conversation_id = conversation.id
-                    workspace_path = Path(conversation.project.path)
+                    workspace_path = conversation.workspace_path
+                except PoolTimeoutError:
+                    logger.warning(
+                        "No database connection freed in time to read conversation %s; "
+                        "the probe runs without it", conversation_id,
+                    )
                 except Exception:
                     logger.warning("Could not resolve conversation %s", conversation_id)
 
@@ -158,7 +215,7 @@ class ProbeHandler:
                     "The form submission expired before I could process it. "
                     "Please re-submit the form."
                 )
-                yield _completed(db_conversation_id, {"status": "failed"})
+                yield await _completed(db_conversation_id, {"status": "failed"})
                 return
 
             values = submission.get("values", {}) or {}
@@ -190,7 +247,7 @@ class ProbeHandler:
             # Missing conversation context is fine: a temp workspace is created below.
             if spec is None:
                 try:
-                    vault = vault_for_scope(self.session.scope)
+                    vault = vault_for_scope(self.scope)
                     slug = persist_connection(
                         connector_id, method, name, credentials,
                         label=connection_label, user_label=connection_user_label, vault=vault,
@@ -199,7 +256,7 @@ class ProbeHandler:
                     saved_user_label = str(saved_record.get("fields", {}).get("_user_label", "")).strip() or None
                 except Exception as exc:
                     yield _delta(f"Could not save: `{exc}`.")
-                    yield _completed(db_conversation_id, {"status": "failed"})
+                    yield await _completed(db_conversation_id, {"status": "failed"})
                     return
                 reason = "connector is not in the registry"
                 yield _delta(f"Saved as `{slug}` (no live probe — {reason}).\n\n")
@@ -212,7 +269,7 @@ class ProbeHandler:
                     "_is_success": True,
                     "actions": [{"id": "dismiss", "label": "Close", "kind": "cancel"}],
                 })
-                yield _completed(db_conversation_id, {"status": "success", "user_label": saved_user_label})
+                yield await _completed(db_conversation_id, {"status": "success", "user_label": saved_user_label})
                 return
 
             # Probe path: build workspace + LLM client
@@ -244,7 +301,7 @@ class ProbeHandler:
                 err = "Could not initialize the probe (workspace or LLM client unavailable)."
                 yield _delta(err)
                 yield _patch_delta({"form_id": form_id, "form_error": err})
-                yield _completed(db_conversation_id, {"status": "failed"})
+                yield await _completed(db_conversation_id, {"status": "failed"})
                 return
 
             # Intro + initial probing patch
@@ -347,7 +404,7 @@ class ProbeHandler:
             saved_user_label: str | None = None
             if final_outcome.status == "success":
                 try:
-                    vault = vault_for_scope(self.session.scope)
+                    vault = vault_for_scope(self.scope)
                     slug = persist_connection(
                         connector_id, method, name, credentials,
                         label=connection_label, user_label=connection_user_label, vault=vault,
@@ -372,7 +429,7 @@ class ProbeHandler:
                     "_is_probing": False,
                     "_is_success": True,
                 })
-                yield _completed(db_conversation_id, {"status": "success", "user_label": saved_user_label})
+                yield await _completed(db_conversation_id, {"status": "success", "user_label": saved_user_label})
             elif final_outcome.status == "needs_input":
                 reason = final_outcome.follow_up or "We need a few more details before we can connect."
                 yield _delta(f"\n\nI need a bit more info before I can finish: {reason}\n")
@@ -406,7 +463,7 @@ class ProbeHandler:
                         "form_error": None,
                         "fields": extra,
                     })
-                yield _completed(db_conversation_id, {"status": "needs_input"})
+                yield await _completed(db_conversation_id, {"status": "needs_input"})
             else:
                 err = final_outcome.error or "Connection failed."
                 hint = final_outcome.follow_up or "Update the form and try again."
@@ -419,7 +476,7 @@ class ProbeHandler:
                     "form_error": err,
                     "_is_success": False,
                 })
-                yield _completed(db_conversation_id, {"status": "retry"})
+                yield await _completed(db_conversation_id, {"status": "retry"})
 
         finally:
             if _temp_workspace_dir:

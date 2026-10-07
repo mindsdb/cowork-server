@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import dataclasses
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 from anton.core.session import ChatSessionConfig
@@ -98,7 +97,7 @@ async def _probe_session_config(monkeypatch):
             form_id="probe-form", model_dump=lambda: {"form_id": "probe-form"}
         )),
     )
-    handler = probe_handler.ProbeHandler(session=MagicMock())
+    handler = probe_handler.ProbeHandler(scope=LOCAL_SCOPE)
     async for _event in handler.run(
         submission_id="staged", connector_id="postgres", method=None,
         name="test connection", conversation_id=None,

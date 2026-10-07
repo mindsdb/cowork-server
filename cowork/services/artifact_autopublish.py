@@ -15,14 +15,18 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 from uuid import UUID
 
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
 from cowork.services.publish import publish_artifact
+
+if TYPE_CHECKING:
+    from cowork.services.artifact_ownership import OwnerResolution
 
 logger = logging.getLogger(__name__)
 
@@ -188,7 +192,24 @@ def _record(result: str, **fields: object) -> None:
     logger.warning("artifact_autopublish result=%s %s", result, tail)
 
 
-def _owned_slugs(
+def _artifact_owners(
+    session, *, artifacts_base: Path, project_id: str, slugs: list[str]
+) -> dict[str, OwnerResolution] | None:
+    """The owner of each slug under the project's root at ``artifacts_base``,
+    or None when no root of the project sits there. Read-only, one query; run
+    as a unit (cowork.db.units)."""
+    from cowork.services.artifact_ownership import (
+        artifact_root_for_base,
+        resolve_artifact_owners,
+    )
+
+    source = artifact_root_for_base(session, project_id, artifacts_base)
+    if source is None:
+        return None
+    return resolve_artifact_owners(session, source, slugs)
+
+
+async def _owned_slugs(
     artifacts_base: Path, scope, project_id: str, slugs: list[str]
 ) -> tuple[list[str], int, int]:
     """Filter ``slugs`` down to the ones this scope's user owns.
@@ -200,33 +221,31 @@ def _owned_slugs(
     with `ArtifactOwnerUnknown` or "Only the artifact owner can publish" — on
     every turn of every member, forever.
 
-    Read-only, one query. Fails closed: if the source cannot be found or
-    anything raises, nothing is treated as owned rather than risking a publish
-    attempt on someone else's artifact.
+    The lookup runs as one database unit in a worker thread, so a wait for a
+    connection never stalls the event loop. Fails closed: if the source cannot
+    be found or anything raises, a full pool included, nothing is treated as
+    owned rather than risking a publish attempt on someone else's artifact.
 
     Returns (owned, not_owner_count, owner_unknown_count).
     """
-    from cowork.common.settings.app_settings import get_app_settings
-    from cowork.db.scoped import ScopedSession
-    from cowork.db.session import get_open_session
-    from cowork.services.artifact_ownership import (
-        artifact_root_for_base,
-        resolve_artifact_owners,
-    )
+    from cowork.db.units import run_db
 
     try:
-        with get_open_session(get_app_settings().database.uri) as raw_session:
-            session = ScopedSession(raw_session, scope)
-            source = artifact_root_for_base(session, project_id, artifacts_base)
-            if source is None:
-                logger.warning(
-                    "artifact_autopublish owner filter: root not found for project=%s base=%s",
-                    project_id, artifacts_base,
-                )
-                return [], 0, len(slugs)
-            resolutions = resolve_artifact_owners(session, source, slugs)
+        resolutions = await run_db(
+            partial(
+                _artifact_owners,
+                artifacts_base=artifacts_base, project_id=project_id, slugs=slugs,
+            ),
+            scope=scope,
+        )
     except Exception:
         logger.warning("artifact_autopublish owner filter failed", exc_info=True)
+        return [], 0, len(slugs)
+    if resolutions is None:
+        logger.warning(
+            "artifact_autopublish owner filter: root not found for project=%s base=%s",
+            project_id, artifacts_base,
+        )
         return [], 0, len(slugs)
 
     owned: list[str] = []
@@ -363,11 +382,12 @@ async def autopublish_project_artifacts(
     is not. The one exception is CancelledError, which propagates.
 
     Every settings read goes through `scope` explicitly rather than the ambient
-    `use_settings_scope` binding. The remote-turn producer that drives this on an
-    org deployment (handlers/responses.py `_produce_remote`) is a DETACHED task
-    with no ambient scope bound, and an unscoped `get_user_settings()` silently
-    resolves LOCAL_SCOPE — which would read the global row for the org-scoped
-    enable flag and the wrong provider for the publish URL.
+    `use_settings_scope` binding, because an unscoped `get_user_settings()`
+    outside a bound scope silently resolves LOCAL_SCOPE, which would read the
+    global row for the org-scoped enable flag and the wrong provider for the
+    publish URL. Inside a turn (handlers/responses.py `_produce_remote` on an
+    org deployment), the turn's settings snapshot answers those reads
+    (use_turn_settings), so none of them opens a connection.
 
     `project_id` is required in org mode: publishing resolves the artifact's
     owner by it (ENG-2961).
@@ -388,7 +408,7 @@ async def autopublish_project_artifacts(
 
     base = Path(artifacts_base)
     all_slugs = _candidate_slugs(base)
-    all_slugs, not_owner, owner_unknown = _owned_slugs(base, scope, project_id, all_slugs)
+    all_slugs, not_owner, owner_unknown = await _owned_slugs(base, scope, project_id, all_slugs)
     if not_owner or owner_unknown:
         _record("skipped", not_owner=not_owner or None, owner_unknown=owner_unknown or None)
     phase_one = [s for s in all_slugs if s in touched]

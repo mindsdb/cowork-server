@@ -170,8 +170,7 @@ async def _probe_session_config(
     monkeypatch, settings: UserSettings, *, changed_settings: UserSettings | None = None
 ):
     """Drive the real handler through client construction and its probe session."""
-    from unittest.mock import MagicMock
-
+    from cowork.db.scoped import LOCAL_SCOPE
     from cowork.handlers import probe as handler_module
     from cowork.services.connectors import probe as probe_module
 
@@ -194,7 +193,7 @@ async def _probe_session_config(
             form_id="probe-form", model_dump=lambda: {"form_id": "probe-form"}
         )),
     )
-    handler = handler_module.ProbeHandler(session=MagicMock())
+    handler = handler_module.ProbeHandler(scope=LOCAL_SCOPE)
     async for event in handler.run(
         submission_id="staged", connector_id="postgres", method=None,
         name="test connection", conversation_id=None,

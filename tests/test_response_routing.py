@@ -955,7 +955,6 @@ async def test_produce_direct_persists_before_emitting_and_roots_metadata(monkey
 
     handler = _routing_handler(monkeypatch)
     calls = []
-    monkeypatch.setattr(responses, "get_open_session", lambda: SimpleNamespace(close=lambda: None))
     monkeypatch.setattr(responses, "ScopedSession", lambda session, scope: SimpleNamespace(close=lambda: None))
     monkeypatch.setattr(
         responses,

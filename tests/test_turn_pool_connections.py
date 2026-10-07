@@ -45,6 +45,7 @@ from cowork.handlers.turn_errors import INTERRUPTED_TURN_MESSAGE, SERVER_BUSY_CO
 from cowork.harnesses.anton_harness import harness as harness_mod
 from cowork.models.message import Message
 from cowork.models.schedule import Schedule, ScheduleRun
+from cowork.models.task_object import TaskObject
 from cowork.schemas.schedules import RunStatus
 from cowork.server import create_app
 from cowork.services.conversations import ConversationService
@@ -984,3 +985,287 @@ async def test_a_scheduled_runs_last_writes_land_after_the_pool_refuses_them(mon
     assert finished.status == RunStatus.success
     assert not finished.still_active
     assert finished.next_run_at > datetime.now(timezone.utc)
+
+
+# ── T1, remote backend: no connection held while the pod answers ─────────────
+
+
+def _turns_go_to_the_remote_backend(monkeypatch) -> None:
+    """COWORK_TURN_BACKEND=remote, with no per-turn key minted for the gate.
+    Each test replaces the pod's replies at stream_remote_replies."""
+    monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")
+
+    async def no_minted_key(self):
+        return None, None
+
+    monkeypatch.setattr(responses_mod.ResponsesHandler, "_router_binding", no_minted_key)
+
+
+async def test_a_remote_answer_holds_no_connection_while_the_pod_answers(monkeypatch):
+    """Sampled at every frame the turn appends and while the pod's replies
+    are awaited. The memory, compaction and artifact the pod reports are
+    saved, and every checkout, the end-of-turn artifact index included, runs
+    off the event loop's thread, one per thread."""
+    _turns_go_to_the_remote_backend(monkeypatch)
+    engine = _app_engine()
+    pool = engine.pool
+    conversation_id = _conversation(turns=[("q1", "a1"), ("q2", "a2")])
+    with unit_session(scope=LOCAL_SCOPE) as session:
+        service = ConversationService(session)
+        project_path = Path(service.get_conversation(conversation_id).project.path)
+        # The pod's compaction covers the first two seeded messages.
+        covered = service.get_ordered_messages(conversation_id)[1].id
+    slug = f"pool-test-{uuid4().hex[:8]}"
+    artifact = project_path / ".anton" / "artifacts" / slug
+    workspace = project_path / "conversations" / str(conversation_id)
+    held: dict[str, list[int]] = {"appends": [], "replies": []}
+    memory_saved: list[int] = []
+    replying, release = asyncio.Event(), asyncio.Event()
+
+    async def pod_replies(**_kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_delta", {"text": "o"}
+        replying.set()
+        await release.wait()
+        artifact.mkdir(parents=True)
+        (artifact / "index.html").write_text("<html></html>")
+        (artifact / "metadata.json").write_text(json.dumps({
+            "slug": slug, "name": slug, "type": "html-app",
+            "provenance": [{"conversation": str(conversation_id), "turns": []}],
+        }))
+        yield "turn_memory", {"entries": [{"text": "remember", "kind": "always", "scope": "project"}]}
+        yield "turn_compaction", {"summary": "SUMMARY", "covered_through": 2}
+        yield "turn_delta", {"text": "k"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", pod_replies)
+
+    def apply_turn_memory(scope, path, entries, **_kwargs):
+        # The memory write itself is the memory service's; what is pinned
+        # here is that it runs in its own unit, off the event loop's thread.
+        memory_saved.append(threading.get_ident())
+        return len(entries)
+
+    monkeypatch.setattr(responses_mod, "apply_turn_memory", apply_turn_memory)
+    append = FileStreamBuffer.append
+
+    async def sampled_append(self, type_, data):
+        held["appends"].append(pool.checkedout())
+        return await append(self, type_, data)
+
+    monkeypatch.setattr(FileStreamBuffer, "append", sampled_append)
+
+    try:
+        with _logging_checkouts(engine) as log:
+            async with _client() as client:
+                answer = asyncio.create_task(_ask(client, conversation_id, "q3"))
+                await asyncio.wait_for(replying.wait(), timeout=10)
+                held["replies"].append(pool.checkedout())
+                release.set()
+                answered = await asyncio.wait_for(answer, timeout=10)
+    finally:
+        shutil.rmtree(artifact, ignore_errors=True)
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert answered.status_code == 200, answered.text
+    kinds = [kind for kind, _ in _frames(answered.text)]
+    assert kinds[-1] == "response.completed", kinds
+    assert "response.artifact_created" in kinds
+    assert held["appends"], "the turn appended no frame"
+    assert held == {"appends": [0] * len(held["appends"]), "replies": [0]}
+    assert log.on_the_loop == [], f"{len(log.on_the_loop)} checkout(s) on the event loop's thread"
+    assert max(log.most_at_once.values()) == 1, log.most_at_once
+    assert memory_saved and threading.get_ident() not in memory_saved
+    assert _rows(conversation_id)[-2:] == [
+        _Row(role="user", pending=False, seq=4), _Row(role="assistant", pending=False, seq=5),
+    ]
+    with unit_session(scope=LOCAL_SCOPE) as session:
+        conversation = ConversationService(session).get_conversation(conversation_id)
+        assert (conversation.history_summary, conversation.history_summary_cutoff_id) == ("SUMMARY", covered)
+        indexed = session.exec(
+            session.select(TaskObject).where(
+                TaskObject.conversation_id == conversation_id, TaskObject.ref == slug,
+            )
+        ).all()
+    assert len(indexed) == 1
+
+
+async def test_a_remote_turn_that_finds_the_pool_full_ends_as_server_busy(one_connection_pool, monkeypatch):
+    """The pool's only connection is taken while the request's gate runs, so
+    the remote producer's first unit finds no connection within
+    POOL_TIMEOUT. The stream ends with one response.failed frame that says
+    so, with the wait, as a refused request's 503 does, and the question is
+    not saved."""
+    _turns_go_to_the_remote_backend(monkeypatch)
+
+    async def pod_replies(**_kwargs):
+        raise AssertionError("the pod must not be asked when the turn found no connection")
+        yield  # an async generator, like the real one
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", pod_replies)
+    gate_entered, gate_release = asyncio.Event(), asyncio.Event()
+
+    async def paused_gate(**_kwargs):
+        gate_entered.set()
+        await gate_release.wait()
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses_mod, "decide_route", paused_gate)
+    conversation_id = _conversation()
+
+    async with _client() as client:
+        answer = asyncio.create_task(_ask(client, conversation_id, "hi"))
+        await asyncio.wait_for(gate_entered.wait(), timeout=10)
+        held = await _take_the_only_connection(one_connection_pool)
+        gate_release.set()
+        try:
+            answered = await asyncio.wait_for(answer, timeout=5 * WAIT)
+        finally:
+            held.close()
+
+    assert answered.status_code == 200, answered.text
+    frames = _frames(answered.text)
+    kinds = [kind for kind, _ in frames]
+    assert kinds[-1] == "response.failed", kinds
+    failed = frames[-1][1]
+    assert failed["code"] == SERVER_BUSY_CODE, failed
+    assert failed["retry_after"] == WAIT
+    assert _rows(conversation_id) == []
+
+
+
+def _artifact_indexed(conversation_id: UUID, slug: str) -> bool:
+    with unit_session(scope=LOCAL_SCOPE) as session:
+        return session.exec(
+            session.select(TaskObject).where(
+                TaskObject.conversation_id == conversation_id, TaskObject.ref == slug,
+            )
+        ).first() is not None
+
+
+async def test_a_stop_during_a_remote_frame_records_the_pods_artifact_before_the_stream_ends(monkeypatch):
+    """The pod wrote an artifact, and the Stop lands while the turn appends a
+    frame, so the reply generator is suspended rather than unwinding. The
+    artifact is indexed as this conversation's before the stream's terminal
+    record, by the turn itself, not later by the abandoned generator's close."""
+    _turns_go_to_the_remote_backend(monkeypatch)
+    conversation_id = _conversation()
+    with unit_session(scope=LOCAL_SCOPE) as session:
+        project_path = Path(ConversationService(session).get_conversation(conversation_id).project.path)
+    slug = f"pool-test-{uuid4().hex[:8]}"
+    artifact = project_path / ".anton" / "artifacts" / slug
+    workspace = project_path / "conversations" / str(conversation_id)
+
+    async def pod_replies(**_kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        artifact.mkdir(parents=True)
+        (artifact / "index.html").write_text("<html></html>")
+        (artifact / "metadata.json").write_text(json.dumps({
+            "slug": slug, "name": slug, "type": "html-app",
+            "provenance": [{"conversation": str(conversation_id), "turns": []}],
+        }))
+        yield "turn_delta", {"text": "partial"}
+        await asyncio.sleep(3600)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", pod_replies)
+    appending, never = asyncio.Event(), asyncio.Event()
+    append, close = FileStreamBuffer.append, FileStreamBuffer.close
+    indexed_at_close: list[bool] = []
+
+    async def held_append(self, type_, data):
+        if "partial" in data.get("sse", ""):
+            appending.set()
+            await never.wait()
+        return await append(self, type_, data)
+
+    async def sampled_close(self, reason, extra=None):
+        indexed_at_close.append(_artifact_indexed(conversation_id, slug))
+        return await close(self, reason, extra)
+
+    monkeypatch.setattr(FileStreamBuffer, "append", held_append)
+    monkeypatch.setattr(FileStreamBuffer, "close", sampled_close)
+
+    try:
+        async with _client() as client:
+            answer = asyncio.create_task(_ask(client, conversation_id, "make a report"))
+            await asyncio.wait_for(appending.wait(), timeout=10)
+            assert await registry.get(str(conversation_id)).cancel()
+            answered = await asyncio.wait_for(answer, timeout=10)
+    finally:
+        shutil.rmtree(artifact, ignore_errors=True)
+        shutil.rmtree(workspace, ignore_errors=True)
+
+    assert _frames(answered.text)[-1][0] == "response.cancelled"
+    assert indexed_at_close == [True]
+    assert _terminal(conversation_id) == "Cancelled"
+
+
+# ── The connector form stream: no connection held during the probe ───────────
+
+
+class _PausedProbe:
+    """Stands in for CredentialProbe: it reports a status, waits on
+    ``release`` the way a probe waits on its model, then fails the
+    credentials. ``probing`` is set while it waits."""
+
+    probing = asyncio.Event()
+    release = asyncio.Event()
+
+    def __init__(self, **_kwargs) -> None:
+        pass
+
+    async def run(self):
+        from cowork.services.connectors.probe import ProbeOutcome
+
+        yield "status", "Connecting…"
+        type(self).probing.set()
+        await type(self).release.wait()
+        yield "verdict", ProbeOutcome(status="failure", error="Password rejected.")
+
+
+async def test_a_connector_probe_holds_no_connection_while_it_runs(monkeypatch):
+    """POST /api/v1/connectors/submissions/ streams a credential probe that
+    waits on a model. While it waits no connection is checked out; the
+    conversation read before it and the assistant turn saved after it run
+    off the event loop's thread. Only the settings read that builds the
+    probe's model client checks out on the loop, before the probe starts."""
+    from cowork.handlers import probe as probe_handler
+
+    engine = _app_engine()
+    pool = engine.pool
+    conversation_id = _conversation()
+    monkeypatch.setattr(_PausedProbe, "probing", asyncio.Event())
+    monkeypatch.setattr(_PausedProbe, "release", asyncio.Event())
+    monkeypatch.setattr(probe_handler, "CredentialProbe", _PausedProbe)
+    monkeypatch.setattr(probe_handler.ProbeHandler, "_build_llm_client", staticmethod(lambda settings=None: object()))
+    monkeypatch.setattr("anton.workspace.Workspace", lambda path: SimpleNamespace(path=path))
+    spec = SimpleNamespace(form=SimpleNamespace(
+        form_id="probe-form", methods=None, fields=[], model_dump=lambda: {"form_id": "probe-form"},
+    ))
+    monkeypatch.setattr(probe_handler.registry, "get_connector", lambda _connector_id: spec)
+
+    with _logging_checkouts(engine) as log:
+        async with _client() as client:
+            submitted = asyncio.create_task(client.post(
+                "/api/v1/connectors/submissions/",
+                json={
+                    "connector_id": "postgres", "name": "warehouse",
+                    "conversation_id": str(conversation_id), "values": {"password": "hunter2"},
+                },
+            ))
+            await asyncio.wait_for(_PausedProbe.probing.wait(), timeout=10)
+            held_while_probing = pool.checkedout()
+            _PausedProbe.release.set()
+            answered = await asyncio.wait_for(submitted, timeout=10)
+
+    assert answered.status_code == 200, answered.text
+    completed = _frames(answered.text)[-1]
+    assert completed[0] == "response.completed", completed
+    assert held_while_probing == 0
+    on_the_loop = [c for c in log.on_the_loop if "_load_from_db" not in c.sites]
+    assert on_the_loop == [], f"{len(on_the_loop)} checkout(s) on the event loop's thread"
+    with unit_session(scope=LOCAL_SCOPE) as session:
+        (saved,) = ConversationService(session).get_ordered_messages(conversation_id)
+    assert saved.role == "assistant" and "Password rejected." in saved.content
+    assert completed[1]["assistant_message_id"] == str(saved.id)

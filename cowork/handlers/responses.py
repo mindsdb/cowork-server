@@ -27,7 +27,6 @@ from cowork.common.settings.user_settings import (
     use_settings_scope,
     use_turn_settings,
 )
-from cowork.db.session import get_open_session
 from cowork.db.units import busy_retry_seconds, conversation_writes, run_db, run_to_completion
 from cowork.harnesses.base import available_harness_ids, get_harness
 from cowork.handlers import jev_shadow
@@ -91,7 +90,6 @@ from cowork.handlers.turn_errors import (
 )
 from cowork.db.scoped import (
     ScopedSession,
-    TenantScope,
     scope_from_principal,
     unsafe_unscoped_session,
 )
@@ -106,7 +104,7 @@ from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectService
 from cowork.services.settings import SettingService
 from cowork.services.skills import SkillService
-from cowork.services.task_objects import remote_skill_draft_result
+from cowork.services.task_objects import ArtifactChanges, remote_skill_draft_result
 
 
 import logging
@@ -326,15 +324,6 @@ def _turn_anchor_id(user_message: Message, assistant_message: Message | None) ->
     return assistant_message.id if assistant_message is not None else user_message.id
 
 
-def _message_id_str(message: Message | None) -> str | None:
-    """The row's id as a string, or None when the producer persisted nothing.
-
-    Shapes a Message for the optional `assistant_message_id` field the
-    failure frames carry.
-    """
-    return str(message.id) if message is not None else None
-
-
 @dataclass(frozen=True)
 class _TurnStart:
     """What a request reads, as one unit, before its gate runs."""
@@ -440,6 +429,63 @@ def _save_answer(
         conversation_id, text, list(events), harness=harness, tool_rows=list(tool_rows),
     )
     return message.id if message is not None else None
+
+
+@dataclass(frozen=True)
+class _RemoteArtifactsDir:
+    """The project artifacts directory a remote turn's pod writes into."""
+
+    base: Path
+    project_id: str | None
+    project_name: str
+    # The conversation's creator, recorded in org mode as the owner of each
+    # artifact the turn creates.
+    creator: str | None
+
+
+@dataclass(frozen=True)
+class _RemoteTurnInputs:
+    """What a remote turn's pod is seeded with, read in one unit
+    (ResponsesHandler._read_remote_turn_inputs)."""
+
+    history: list[dict]
+    # Maps the pod's compaction count back onto our message ids
+    # (_remote_seed_history); None when compaction is off.
+    seed_info: dict | None
+    artifacts: _RemoteArtifactsDir | None
+    memory: dict | None
+    # stream_remote_replies' project_id and workspace_rel_path, or empty when
+    # they could not be resolved (_remote_workspace).
+    workspace: dict
+    started_at: str | None
+
+
+@dataclass
+class _RemoteTurnArtifacts:
+    """A remote turn's view of its project's artifacts directory: how it stood
+    before the pod ran, whether the pod's workspace may keep what it writes
+    there (persistent), and whether the turn has recorded what changed."""
+
+    directory: _RemoteArtifactsDir
+    before_slugs: set[str]
+    before_mtimes: dict[str, int]
+    writes_allowed: bool = False
+    recorded: bool = False
+
+
+def _save_remote_question(
+    session: ScopedSession, *, lifecycle: TurnLifecycle, conversation_id: UUID, content,
+) -> UUID | None:
+    """A remote turn's first write: the question, saved as pending (ENG-1231)
+    so a refresh mid-turn shows it while replayed history
+    (get_ordered_messages) leaves it out. None when the turn was deleted
+    while this unit waited for a connection: its row would land in the
+    history the delete cut."""
+    if lifecycle.discarded:
+        return None
+    return ConversationService(session).save_user_message(
+        conversation_id, content, pending=True,
+    ).id
 
 
 def _failed_frame_for(exc: Exception, *, request_id: str | None = None) -> str:
@@ -1203,33 +1249,6 @@ class ResponsesHandler:
             logger.exception("[responses] failed to stage workspace files for conversation %s", conv_id)
 
     @staticmethod
-    def _stage_remote_workspace_files_in_new_session(
-        conv_id: UUID,
-        scope: TenantScope,
-    ) -> None:
-        raw_session = None
-        session = None
-        try:
-            raw_session = get_open_session()
-            session = ScopedSession(raw_session, scope)
-            ResponsesHandler._stage_remote_workspace_files(session, conv_id)
-        except Exception:
-            logger.exception(
-                "[responses] failed to open workspace staging session for conversation %s",
-                conv_id,
-            )
-        finally:
-            opened = session or raw_session
-            if opened is not None:
-                try:
-                    opened.close()
-                except Exception:
-                    logger.exception(
-                        "[responses] failed to close workspace staging session for conversation %s",
-                        conv_id,
-                    )
-
-    @staticmethod
     def _remote_started_at(session: ScopedSession, conv_id: UUID) -> str | None:
         """The conversation's creation time as ISO 8601, for the pod's fixed
         "conversation started" prompt line. Mirrors what the in-process path
@@ -1281,9 +1300,10 @@ class ResponsesHandler:
         mount, so cowork-server reads the same directory the worker just wrote —
         this is the whole reason the in-process flow transplants onto the remote
         path unchanged. `conversation` comes back attached to `session` because
-        `index_turn_artifacts` recovers the tenant scope from the session the row
-        is bound to; the ids and the project name are read here, while it is
-        unambiguously attached, rather than after the turn.
+        a channel turn's `index_turn_artifacts` recovers the tenant scope from
+        the session the row is bound to; the ids, the project name and (on the
+        remote producer, _read_remote_turn_inputs) the creator are read here,
+        while it is unambiguously attached, rather than after the turn.
 
         None on any failure: no artifact card and no autopublish is a recoverable
         outcome (the next turn in this project reconciles), a failed turn is not.
@@ -1388,41 +1408,26 @@ class ResponsesHandler:
         except Exception:
             logger.exception("[responses] failed to apply memory for conversation %s", conv_id)
 
-    @staticmethod
-    def _persist_turn_memory_in_new_session(
-        conv_id: UUID,
-        entries: list,
-        principal: Principal | None,
-        scope: TenantScope,
-    ) -> None:
-        if not entries:
-            return
-        raw_session = None
-        session = None
-        try:
-            raw_session = get_open_session()
-            session = ScopedSession(raw_session, scope)
-            ResponsesHandler._persist_turn_memory(
-                session,
-                conv_id,
-                entries,
-                principal,
-            )
-        except Exception:
-            logger.exception(
-                "[responses] failed to open memory persistence session for conversation %s",
-                conv_id,
-            )
-        finally:
-            opened = session or raw_session
-            if opened is not None:
-                try:
-                    opened.close()
-                except Exception:
-                    logger.exception(
-                        "[responses] failed to close memory persistence session for conversation %s",
-                        conv_id,
-                    )
+    def _read_remote_turn_inputs(self, session: ScopedSession, *, conv_id: UUID) -> _RemoteTurnInputs:
+        """What a remote turn's pod is seeded with, read as one unit once the
+        question is saved: the scrubbed history, where the project's artifacts
+        live and who created the conversation, the project's memory, its
+        workspace, and when the conversation started."""
+        history, seed_info = self._remote_seed_history(session, conv_id)
+        artifacts = self._remote_artifacts_context(session, conv_id)
+        return _RemoteTurnInputs(
+            history=history,
+            seed_info=seed_info,
+            artifacts=None if artifacts is None else _RemoteArtifactsDir(
+                base=artifacts[1],
+                project_id=artifacts[2],
+                project_name=artifacts[3],
+                creator=getattr(artifacts[0], "created_by", None),
+            ),
+            memory=self._remote_memory(session, conv_id),
+            workspace=self._remote_workspace(session, conv_id),
+            started_at=self._remote_started_at(session, conv_id),
+        )
 
     @staticmethod
     def _remote_seed_history(session, conv_id) -> tuple[list[dict], dict | None]:
@@ -1470,9 +1475,10 @@ class ResponsesHandler:
 
     @staticmethod
     def _persist_remote_compaction(
-        conv_id: UUID, data: dict, seed_info: dict | None, scope: TenantScope,
+        session: ScopedSession, conv_id: UUID, data: dict, seed_info: dict | None,
     ) -> None:
-        """Save the summary the pod folded this turn's leading history into.
+        """Save the summary the pod folded this turn's leading history into,
+        in the caller's session (a unit's, on the remote producer).
 
         Everything here is untrusted: the pod reports `covered_through` against
         the history we sent it, so a wrong or malformed count must degrade to
@@ -1515,28 +1521,28 @@ class ResponsesHandler:
         )
         if idx is None:
             return
-        raw_session = None
         try:
-            raw_session = get_open_session()
-            ConversationService(
-                ScopedSession(raw_session, scope)
-            ).update_history_compaction(conv_id, summary, message_ids[idx])
+            ConversationService(session).update_history_compaction(
+                conv_id, summary, message_ids[idx],
+            )
         except Exception:
+            # Rolled back so the session stays usable: the unit still commits,
+            # and a channel turn goes on in the same session.
+            session.rollback()
             logger.exception(
                 "[responses] failed to persist history compaction for conversation %s",
                 conv_id,
             )
-        finally:
-            if raw_session is not None:
-                try:
-                    raw_session.close()
-                except Exception:
-                    logger.exception(
-                        "[responses] failed to close compaction session for conversation %s",
-                        conv_id,
-                    )
 
-    async def _produce_remote(
+    async def _produce_remote(self, **kwargs) -> None:
+        # Detached task: bind the turn's org scope, as _produce does. Every
+        # settings read in the remote turn's subtree then resolves this org,
+        # and the turn's settings snapshot, which handle() bound around this
+        # task's creation, answers it without a connection (use_turn_settings).
+        with use_settings_scope(scope_from_principal(self.principal)):
+            await self._run_remote_turn(**kwargs)
+
+    async def _run_remote_turn(
         self,
         *,
         conv_id: UUID,
@@ -1550,12 +1556,26 @@ class ResponsesHandler:
         turn_llm: dict | None = None,
         disabled: list[dict] | None = None,
     ) -> None:
-        """Remote-backend counterpart of _produce: pipe the turn's replies
+        """Remote-backend counterpart of _run_turn: pipe the pod's replies
         through the same SSE formatter as the in-process path (full step /
-        thinking parity, live and in the persisted events log) and persist
-        user + assistant together on terminal (deferred, so _remote_seed_history
-        reads prior turns without the current input)."""
+        thinking parity, live and in the persisted events log).
+
+        Its database work runs as units (cowork.db.units), so it holds no
+        pooled connection while the pod answers, and a wait for one never
+        stalls the event loop. Staging the workspace is the first unit. The
+        next saves the question (pending, ENG-1231) under the conversation's
+        write lock. What the pod is seeded with is read in one unit when the
+        reply stream starts (get_ordered_messages leaves the pending row out,
+        so the current input isn't replayed). Memory and compaction the pod
+        reports are saved as they arrive, the artifacts it created are
+        recorded once whichever way the turn ends, and the last unit saves the
+        assistant turn and clears the question's pending flag in one commit.
+        Never reaches the HTTP response: readers tail the buffer.
+        """
         lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
+        # Scoped from the immutable principal captured at handler
+        # construction, never from request state.
+        scope = scope_from_principal(self.principal)
         collected_text: list[str] = []
         collected_events: list[dict] = []
         # This turn's tool block-rows, for LLM-history persistence only. Kept
@@ -1563,7 +1583,8 @@ class ResponsesHandler:
         # tool rows are hidden from the UI (mirrors _run_turn's event_sink).
         turn_rows: list[dict] = []
         persisted = False
-        pending_message_id: UUID | None = None
+        question_id: UUID | None = None
+        turn_artifacts: _RemoteTurnArtifacts | None = None
         failure: dict = {}
         # Resolved once, up front — not left for stream_remote_replies to mint
         # internally on a None — so every failure branch below (classified or
@@ -1584,261 +1605,371 @@ class ResponsesHandler:
             collected_events.append(data)
             accumulate_answer_text(collected_text, event_type, data)
 
-        producer_scope: TenantScope | None = None
-        producer_session: ScopedSession | None = None
+        async def save_memory(entries: list) -> None:
+            """Apply what the pod asked to remember, as it arrives. Never
+            fails the turn: a lost memory is recoverable, a lost reply isn't."""
+            if not entries:
+                return
+            try:
+                await run_db(
+                    partial(
+                        self._persist_turn_memory,
+                        conv_id=conv_id, entries=entries, principal=self.principal,
+                    ),
+                    scope=scope,
+                )
+            except PoolTimeoutError:
+                logger.warning(
+                    "[responses] no database connection freed in time to apply memory for "
+                    "conversation %s", conv_id, extra={"request_id": corr},
+                )
+            except Exception:
+                logger.exception(
+                    "[responses] failed to apply memory for conversation %s", conv_id,
+                    extra={"request_id": corr},
+                )
+
+        async def save_compaction(data: dict, seed_info: dict | None) -> None:
+            """Save the summary the pod folded earlier history into, as it
+            arrives: the cutoff names a message from an earlier turn, so it
+            stays correct even if this turn goes on to fail. Never fails the
+            turn: without it the next turn replays in full."""
+            try:
+                await run_db(
+                    partial(
+                        self._persist_remote_compaction,
+                        conv_id=conv_id, data=data, seed_info=seed_info,
+                    ),
+                    scope=scope,
+                )
+            except PoolTimeoutError:
+                logger.warning(
+                    "[responses] no database connection freed in time to save the compaction for "
+                    "conversation %s", conv_id, extra={"request_id": corr},
+                )
+            except Exception:
+                logger.exception(
+                    "[responses] failed to persist history compaction for conversation %s", conv_id,
+                    extra={"request_id": corr},
+                )
+
+        async def record_artifacts(*, completed_cleanly: bool) -> ArtifactChanges | None:
+            """Record what the pod did to the project's artifacts, once per
+            turn, whichever way the turn ends, as the in-process harness's
+            `finally` does: the folders it created are indexed as this
+            conversation's (and, in org mode, its creator's), in a unit. The
+            changes, for a clean finish to publish and card; None when the
+            turn may not keep what the pod wrote (its workspace was not
+            persistent), when it recorded them already, or when the diff
+            failed, which the next turn in the project heals."""
+            from cowork.services.task_objects import record_new_artifacts, turn_artifact_changes
+
+            if turn_artifacts is None or not turn_artifacts.writes_allowed or turn_artifacts.recorded:
+                return None
+            turn_artifacts.recorded = True
+            directory = turn_artifacts.directory
+            try:
+                changes = turn_artifact_changes(
+                    conversation_id=conv_id,
+                    artifacts_base=directory.base,
+                    before=turn_artifacts.before_slugs,
+                    before_mtimes=turn_artifacts.before_mtimes,
+                    # ENG-2961: the project base is shared, so only folders
+                    # whose provenance names this conversation are its own.
+                    attribute_by_provenance=True,
+                    completed_cleanly=completed_cleanly,
+                )
+            except Exception:
+                logger.warning(
+                    "[responses] could not diff the artifacts of remote turn %s", conv_id,
+                    exc_info=True, extra={"request_id": corr},
+                )
+                return None
+            if changes.created:
+                try:
+                    await run_db(
+                        partial(
+                            record_new_artifacts,
+                            conversation_id=conv_id,
+                            project_id=UUID(directory.project_id) if directory.project_id else None,
+                            slugs=changes.created,
+                            creator=directory.creator,
+                        ),
+                        scope=scope,
+                    )
+                except Exception:
+                    # Indexing is recoverable: the next turn in the project
+                    # reconciles it. A busy pool lands here too.
+                    logger.warning(
+                        "[responses] could not index the artifacts remote turn %s created", conv_id,
+                        exc_info=True, extra={"request_id": corr},
+                    )
+            return changes
+
+        async def persist(*, clean: bool) -> _SavedAnswer:
+            """Save the answer as it stands, once per turn, in one unit.
+
+            The flag is set and the collected parts copied here, on the event
+            loop, before the unit starts: the loop goes on appending to the
+            lists while the unit's thread reads its copies, and a later call
+            must not save the turn again. A turn whose question was never
+            saved has nothing to answer, so it saves nothing.
+
+            Tool rows only on a clean finish. They arrive before the terminal
+            event, so a turn can carry rows and then fail or be cancelled,
+            and this runs on those paths too.
+            """
+            nonlocal persisted
+            if persisted or question_id is None:
+                return _SavedAnswer()
+            persisted = True
+            save = partial(
+                _save_answer,
+                lifecycle=lifecycle,
+                conversation_id=conv_id,
+                question_id=question_id,
+                text="".join(collected_text),
+                events=tuple(collected_events),
+                tool_rows=tuple(turn_rows) if clean else (),
+                harness=harness_id,
+            )
+            try:
+                async with conversation_writes(conv_id):
+                    return _SavedAnswer(message_id=await run_db(save, scope=scope))
+            except PoolTimeoutError as exc:
+                logger.warning(
+                    "[responses] no database connection freed in time to save the remote turn "
+                    "for conversation %s", conv_id, extra={"request_id": corr},
+                )
+                return _SavedAnswer(failure=exc)
+            except Exception as exc:
+                logger.exception(
+                    "[responses] failed to persist remote turn for conversation %s", conv_id,
+                    extra={"request_id": corr},
+                )
+                return _SavedAnswer(failure=exc)
+
+        async def finish(completed_frame: str | None) -> None:
+            """Save the answer, then write the frame that reports it and the
+            terminal record: completed with the saved row's id, or failed when
+            the save failed, so the stream never says completed for an answer
+            the database does not hold."""
+            saved = await persist(clean=True)
+            if lifecycle.discarded:
+                # Deleted while it saved: its buffer is gone, and writing a
+                # terminal record would recreate it for the next turn to tail.
+                return
+            if saved.failure is not None:
+                await buffer.append("sse", {"sse": _failed_frame_for(saved.failure, request_id=corr)})
+                await buffer.close("error")
+                return
+            if completed_frame is not None:
+                await buffer.append("sse", {"sse": self._inject_completion_id(completed_frame, saved.message_id)})
+            await buffer.close("completed")
+
+        async def end_turn(
+            reason: TerminalReason, failed_frame: Callable[[str | None], str] | None = None,
+        ) -> None:
+            """Record the pod's artifacts and save the answer as it stands,
+            then write the failure frame, if any, carrying the saved row's id,
+            and the terminal record. The cancel and error branches below run it
+            under run_to_completion, so a second Stop or a shutdown that lands
+            during a save waits for it, and the stream still ends the way this
+            turn did."""
+            await record_artifacts(completed_cleanly=False)
+            saved = await persist(clean=False)
+            if lifecycle.discarded:
+                # Deleted while it saved: see finish().
+                return
+            if failed_frame is not None:
+                await buffer.append("sse", {"sse": failed_frame(saved.assistant_message_id)})
+            await buffer.close(reason)
+
+        async def start() -> None:
+            """The question's unit, under the conversation's write lock. Run
+            under run_to_completion: a cancel that lands while the unit
+            writes waits for it, so the branches below know the question it
+            saved and finalize it instead of leaving it pending."""
+            nonlocal question_id
+            async with conversation_writes(conv_id):
+                question_id = await run_db(
+                    partial(
+                        _save_remote_question,
+                        lifecycle=lifecycle, conversation_id=conv_id, content=original_content,
+                    ),
+                    scope=scope,
+                )
 
         async def replies_as_stream_events():
-            if producer_session is None or producer_scope is None:
-                raise RuntimeError("Remote producer session is not initialized")
+            nonlocal turn_artifacts
             from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
             from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated
             from cowork.services.task_objects import (
-                index_turn_artifacts,
                 publish_and_card_turn_artifacts,
                 snapshot_artifact_state,
             )
 
-            # Resolved once and held for the whole turn: the pod counts its
-            # compaction against exactly the history seeded here, so re-reading
-            # it when the reply arrives could map the count onto a different list.
-            seeded_history, seed_info = self._remote_seed_history(producer_session, conv_id)
-            # The worker writes artifacts into the shared tree while this turn
-            # runs, so cowork-server does the same before/after diff it does for
-            # an in-process turn. Snapshotting here rather than in the caller is
-            # what makes it a genuine "before": stream_remote_replies below only
-            # enqueues the job once this generator is first iterated.
-            artifacts = self._remote_artifacts_context(producer_session, conv_id)
-            before_slugs, before_mtimes = (
-                snapshot_artifact_state(artifacts[1]) if artifacts else (set(), {})
-            )
-            new_slugs: list[str] = []
-            touched_slugs: set[str] = set()
-            turn_scope = None
-            artifact_writes_allowed = False
+            # Read once and held for the whole turn: the pod counts its
+            # compaction against exactly the history seeded here, so
+            # re-reading it when the reply arrives could map the count onto a
+            # different list.
+            seed = await run_db(partial(self._read_remote_turn_inputs, conv_id=conv_id), scope=scope)
+            if seed.artifacts is not None:
+                # The worker writes artifacts into the shared tree while this
+                # turn runs, so cowork-server does the same before/after diff
+                # it does for an in-process turn. Snapshotting here rather than
+                # in the caller is what makes it a genuine "before":
+                # stream_remote_replies below only enqueues the job once this
+                # generator is first iterated.
+                before_slugs, before_mtimes = snapshot_artifact_state(seed.artifacts.base)
+                turn_artifacts = _RemoteTurnArtifacts(
+                    directory=seed.artifacts, before_slugs=before_slugs, before_mtimes=before_mtimes,
+                )
             # Set only on turn_completed: any other exit (Stop, cancel, failure)
             # may have cut anton off between writing an artifact's metadata and
             # appending its provenance, see `turn_created_slugs`.
             completed_cleanly = False
-            # Off the loop: this reads the project's memory slots off the shared
-            # mount, and one worker serves every other request on this process
-            # while a blocking EFS round trip is in flight.
-            memory = await asyncio.to_thread(
-                self._remote_memory, producer_session, conv_id
-            )
 
-            try:
-                async for kind, data in stream_remote_replies(
-                    conversation_id=str(conv_id),
-                    org_id=self.scope.org_id,
-                    user_id=self.scope.user_id,
-                    input_text=input_text,
-                    model=model,
-                    turn_id=turn_id,
-                    # Read on the producer session: this coroutine is detached
-                    # from the request that started it.
-                    history=seeded_history,
-                    # Global memory and skills use read-only mounts. Project
-                    # memory is outside the conversation workspace and therefore
-                    # travels as a bounded, sheddable wire block.
-                    memory=memory,
-                    **self._remote_workspace(producer_session, conv_id),
-                    started_at=self._remote_started_at(producer_session, conv_id),
-                    correlation_id=corr,
-                    llm=(turn_llm or {}).get("llm"),
-                    turn_key_id=(turn_llm or {}).get("turn_key_id"),
-                    disabled=disabled,
-                    # Questions need someone to answer them: this path serves
-                    # the web UI, which renders the card and posts /answer.
-                    interactive=self.interactive and get_app_settings().ask_user_enabled,
-                    # This handler serves the cowork UI (scheduled turns show
-                    # there too), which renders a tool's message whether or
-                    # not it can answer questions. Channel turns build their
-                    # own request in turnqueue/remote_turn.py and leave it off.
-                    tool_messages=True,
-                ):
-                    if kind == "progress" and data.get("phase") == "workspace_authorized":
-                        artifact_writes_allowed = data.get("workspace_mode") == "persistent"
-                    elif kind == "turn_delta":
-                        yield StreamTextDelta(text=data.get("text", ""))
-                    elif kind == "turn_step":
-                        for event in step_stream_events(data):
-                            yield event
-                    elif kind == "turn_memory":
-                        await asyncio.to_thread(
-                            self._persist_turn_memory_in_new_session,
-                            conv_id,
-                            data.get("entries") or [],
-                            self.principal,
-                            producer_scope,
-                        )
-                    elif kind == "turn_history":
-                        # Slice-assign, not extend: the pod emits one frame per
-                        # turn, so a repeated frame must replace the rows rather
-                        # than double them. Sanitized at the boundary — the pod
-                        # is semi-trusted and these rows reach both the DB and
-                        # every later turn's LLM context.
-                        turn_rows[:] = sanitize_turn_history_rows(data.get("rows"))
-                    elif kind == "turn_compaction":
-                        # Persisted as it arrives, like memory: the cutoff names
-                        # a message from an earlier turn, so it stays correct
-                        # even if this turn goes on to fail.
-                        await asyncio.to_thread(
-                            self._persist_remote_compaction,
-                            conv_id,
-                            data,
-                            seed_info,
-                            producer_scope,
-                        )
-                    elif kind == "turn_skill":
-                        # Not persisted like memory: a draft is the user's decision.
-                        # Yielding SkillCreated puts it through the same formatter the
-                        # in-process path uses, so the card renders — and replays off
-                        # the events log — identically to a desktop one. A rejected
-                        # draft, or a sibling file quietly excluded from an otherwise
-                        # saved one, also gets a StreamTaskProgress notice — the
-                        # generic "thought_progress" role already rendered inline,
-                        # so a loss is visible in the turn instead of only in the
-                        # server log.
-                        for entry in data.get("entries") or []:
-                            payload, reasons = remote_skill_draft_result(entry)
-                            if payload is not None:
-                                yield SkillCreated(payload)
-                            for reason in reasons:
-                                yield StreamTaskProgress(phase="skill_draft_dropped", message=reason)
-                    elif kind == "turn_completed":
-                        # `break`, not `return`: the publish/card block below the
-                        # try must still run on a clean finish.
-                        completed_cleanly = True
-                        break
-                    elif kind == "turn_failed":
-                        if await _remote_cancel_confirmed(data.get("error"), corr):
-                            # A /cancel that reached a replica which doesn't
-                            # own the producer sets the Redis flag only, so
-                            # the controller is what discards the pod and it
-                            # reports the stop as a turn_failed. Neither of
-                            # its cancel literals reaches remote_turn_error,
-                            # which would collapse them to anton_error.
-                            # Route them through the same path a locally
-                            # aborted turn takes: partial text persists, no
-                            # response.failed frame, no error bubble on
-                            # reload.
-                            raise asyncio.CancelledError()
-                        failure.update(data)
-                        raise _RemoteTurnFailed()
-            finally:
-                # Mirrors the in-process harness: indexing runs on EVERY exit so
-                # an artifact the worker wrote is recorded even when the turn
-                # failed or was stopped, and it is synchronous because an await
-                # in a generator's finally is skipped on cancellation.
-                if artifacts is not None and artifact_writes_allowed:
-                    new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
-                        artifacts[0], conv_id, artifacts[2], artifacts[1],
-                        before_slugs, before_mtimes,
-                        # ENG-2961: the project base is shared, so only folders
-                        # whose provenance names this conversation are its own.
-                        attribute_by_provenance=True,
-                        completed_cleanly=completed_cleanly,
-                    )
+            async for kind, data in stream_remote_replies(
+                conversation_id=str(conv_id),
+                org_id=self.scope.org_id,
+                user_id=self.scope.user_id,
+                input_text=input_text,
+                model=model,
+                turn_id=turn_id,
+                history=seed.history,
+                # Global memory and skills use read-only mounts. Project
+                # memory is outside the conversation workspace and therefore
+                # travels as a bounded, sheddable wire block.
+                memory=seed.memory,
+                **seed.workspace,
+                started_at=seed.started_at,
+                correlation_id=corr,
+                llm=(turn_llm or {}).get("llm"),
+                turn_key_id=(turn_llm or {}).get("turn_key_id"),
+                disabled=disabled,
+                # Questions need someone to answer them: this path serves
+                # the web UI, which renders the card and posts /answer.
+                interactive=self.interactive and get_app_settings().ask_user_enabled,
+                # This handler serves the cowork UI (scheduled turns show
+                # there too), which renders a tool's message whether or
+                # not it can answer questions. Channel turns build their
+                # own request in turnqueue/remote_turn.py and leave it off.
+                tool_messages=True,
+            ):
+                if kind == "progress" and data.get("phase") == "workspace_authorized":
+                    if turn_artifacts is not None:
+                        turn_artifacts.writes_allowed = data.get("workspace_mode") == "persistent"
+                elif kind == "turn_delta":
+                    yield StreamTextDelta(text=data.get("text", ""))
+                elif kind == "turn_step":
+                    for event in step_stream_events(data):
+                        yield event
+                elif kind == "turn_memory":
+                    await save_memory(data.get("entries") or [])
+                elif kind == "turn_history":
+                    # Slice-assign, not extend: the pod emits one frame per
+                    # turn, so a repeated frame must replace the rows rather
+                    # than double them. Sanitized at the boundary — the pod
+                    # is semi-trusted and these rows reach both the DB and
+                    # every later turn's LLM context.
+                    turn_rows[:] = sanitize_turn_history_rows(data.get("rows"))
+                elif kind == "turn_compaction":
+                    await save_compaction(data, seed.seed_info)
+                elif kind == "turn_skill":
+                    # Not persisted like memory: a draft is the user's decision.
+                    # Yielding SkillCreated puts it through the same formatter the
+                    # in-process path uses, so the card renders — and replays off
+                    # the events log — identically to a desktop one. A rejected
+                    # draft, or a sibling file quietly excluded from an otherwise
+                    # saved one, also gets a StreamTaskProgress notice — the
+                    # generic "thought_progress" role already rendered inline,
+                    # so a loss is visible in the turn instead of only in the
+                    # server log.
+                    for entry in data.get("entries") or []:
+                        payload, reasons = remote_skill_draft_result(entry)
+                        if payload is not None:
+                            yield SkillCreated(payload)
+                        for reason in reasons:
+                            yield StreamTaskProgress(phase="skill_draft_dropped", message=reason)
+                elif kind == "turn_completed":
+                    # `break`, not `return`: the record/publish/card block
+                    # below must still run on a clean finish.
+                    completed_cleanly = True
+                    break
+                elif kind == "turn_failed":
+                    if await _remote_cancel_confirmed(data.get("error"), corr):
+                        # A /cancel that reached a replica which doesn't
+                        # own the producer sets the Redis flag only, so
+                        # the controller is what discards the pod and it
+                        # reports the stop as a turn_failed. Neither of
+                        # its cancel literals reaches remote_turn_error,
+                        # which would collapse them to anton_error.
+                        # Route them through the same path a locally
+                        # aborted turn takes: partial text persists, no
+                        # response.failed frame, no error bubble on
+                        # reload.
+                        raise asyncio.CancelledError()
+                    failure.update(data)
+                    raise _RemoteTurnFailed()
 
-            # Clean completion only — a raise inside the try skips this, matching
-            # the in-process path where Stop/error produce no cards and the next
-            # turn in the project heals the publish.
-            if artifacts is not None and artifact_writes_allowed:
+            # The reply stream ended without a raise. Every other exit records
+            # the artifacts in end_turn, with no publish and no cards, matching
+            # the in-process path, where Stop/error produce no cards and the
+            # next turn in the project heals the publish.
+            changes = await record_artifacts(completed_cleanly=completed_cleanly)
+            if changes is not None:
                 for card in await publish_and_card_turn_artifacts(
-                    artifacts[1],
-                    new_slugs=new_slugs,
-                    touched_slugs=touched_slugs,
-                    scope=turn_scope,
-                    project_id=artifacts[2],
-                    project_name=artifacts[3],
+                    turn_artifacts.directory.base,
+                    new_slugs=changes.created,
+                    touched_slugs=changes.touched,
+                    scope=scope,
+                    project_id=turn_artifacts.directory.project_id,
+                    project_name=turn_artifacts.directory.project_name,
                 ):
                     yield ArtifactCreated(card)
 
-        def persist(*, clean: bool = False) -> Message | None:
-            nonlocal persisted
-            if persisted:
-                return None  # already persisted this turn — the caller has no new row to report
-            persisted = True
-            if producer_session is None:
-                logger.error(
-                    "[responses] cannot persist remote turn without a session for conversation %s",
-                    conv_id,
-                )
-                return None
-            try:
-                # Re-anchor first: the conversation may be gone or out of scope.
-                svc = ConversationService(producer_session)
-                svc.get_conversation(conv_id)
-                # The user message was already persisted (pending) at turn start
-                # (ENG-1231). Clear the flag first — even if save_assistant_turn
-                # early-returns on an empty turn — so the question rejoins replayed
-                # history; then persist the assistant turn. Scope to THIS turn's
-                # row so a completing turn can't absorb a pending row stranded by
-                # an earlier crashed turn into history. If the pending persist
-                # never succeeded (id unset), this turn owns no row — skip
-                # finalize rather than fall back to clearing every pending row.
-                if pending_message_id is not None:
-                    svc.finalize_pending(conv_id, pending_message_id)
-                return svc.save_assistant_turn(
-                    conv_id, "".join(collected_text), collected_events, harness=harness_id,
-                    # Tool rows only on a clean finish. They arrive before the
-                    # terminal event, so a turn can carry rows and then fail or
-                    # be cancelled — and this is called on those paths too. The
-                    # default is False so a future except-branch inherits
-                    # text-only instead of silently persisting a torn turn.
-                    tool_rows=turn_rows if clean else None,
-                )
-            except Exception:
-                logger.exception("[responses] failed to persist remote turn for conversation %s", conv_id)
-                return None
-
         try:
-            # Stage attachments + project instructions before the pod runs. The
-            # copies use a worker-owned session, so cancellation can safely close
-            # this producer without racing blocking EFS or database work.
-            producer_scope = scope_from_principal(self.principal)
-            await asyncio.to_thread(
-                self._stage_remote_workspace_files_in_new_session,
-                conv_id,
-                producer_scope,
-            )
-            producer_session = ScopedSession(
-                get_open_session(),
-                producer_scope,
-            )
-            # Persist the user message (pending) as the first thing this producer
-            # does (ENG-1231) — see the note in handle(). Committed here, before
-            # streaming, so a refresh/reconnect mid-turn shows the question via
-            # /items. _remote_seed_history reads get_ordered_messages, which excludes
-            # pending, so the current input isn't replayed into the remote job.
-            pending_message_id = ConversationService(producer_session).save_user_message(
-                conv_id, original_content, pending=True,
-            ).id
+            # Stage attachments + project instructions before the pod runs.
+            try:
+                await run_db(partial(self._stage_remote_workspace_files, conv_id=conv_id), scope=scope)
+            except PoolTimeoutError:
+                # A full pool is not a missing file: the turn is refused
+                # (server_busy) rather than run without what the user sent.
+                raise
+            except Exception:
+                # Staging never fails the turn (_stage_remote_workspace_files
+                # degrades on its own); this is its unit failing to connect or
+                # to commit.
+                logger.exception(
+                    "[responses] failed to stage workspace files for conversation %s", conv_id,
+                )
+            # Save the question (pending) as this producer's first write
+            # (ENG-1231); see the note in handle(). Committed before
+            # streaming, so a refresh/reconnect mid-turn shows the question
+            # via /items.
+            await run_to_completion(start())
             first = True
+            completed_frame: str | None = None
             async for sse in format_responses_stream(
                 replies_as_stream_events(), model or "", event_sink,
             ):
                 if first:
                     # The formatter's created frame lacks conversation_id +
                     # harness; inject them like the in-process path does.
-                    sse = self._inject_created(sse, conv_id, harness_id, pending_message_id)
+                    sse = self._inject_created(sse, conv_id, harness_id, question_id)
                     first = False
                 if self._sse_event_type(sse) == "response.completed":
-                    # Persist now — event_sink has already seen
-                    # every delta/event this turn produced, since the
-                    # formatter only yields its terminal frame after its
-                    # source is exhausted — so this turn's real id can ride
-                    # the frame the client's SSE reader actually stops at.
-                    # The unconditional persist(clean=True) below stays as a
-                    # fallback for a formatter that (today, never) returns
-                    # without yielding a terminal frame; it's a no-op here.
-                    assistant_msg = persist(clean=True)
-                    sse = self._inject_completion_id(
-                        sse, assistant_msg.id if assistant_msg else None
-                    )
+                    # The formatter yields its terminal frame last, once its
+                    # source is exhausted, so event_sink has already seen
+                    # everything this turn produced. finish() sends it once
+                    # the answer is saved, carrying the saved row's id.
+                    completed_frame = sse
+                    continue
                 await buffer.append("sse", {"sse": sse})
-            persist(clean=True)
-            await buffer.close("completed")
+            # A Stop that lands here waits for the save and its frame, so the
+            # stream's terminal record always matches what the database holds.
+            await run_to_completion(finish(completed_frame))
         except _RemoteTurnFailed:
             message = failure.get("message") or GENERIC_TURN_ERROR_MESSAGE
             code = failure.get("code") or GENERIC_TURN_ERROR_CODE
@@ -1859,79 +1990,93 @@ class ResponsesHandler:
             collected_events.extend(cancelled_ask_user_retirements(collected_events))
             collected_events.append(response_failed_payload(
                 message, code, reset_at=reset_at, request_id=corr))
-            # Persist before building the frame — a client's SSE
-            # reader stops at response.failed, so any id has to ride this
-            # frame, not one after it.
-            assistant_msg = persist()
-            await buffer.append("sse", {"sse": response_failed_sse(
-                message, code, reset_at=reset_at, request_id=corr,
-                assistant_message_id=_message_id_str(assistant_msg),
-            )})
-            if code in CONTENT_REPAIR_CODES:
-                # ENG-1992: the remote/org path's twin of the streaming
-                # handler's repair — producer.py already classified this via
-                # remote_turn_error from the pod's scrubbed error string, so
-                # `code` alone is enough to act on here.
-                try:
-                    repaired = ConversationService(producer_session).repair_image_content(conv_id)
-                    logger.warning(
-                        "[responses] content validation error on remote conversation %s — "
-                        "repaired %d message(s) with image content: %s",
-                        conv_id, len(repaired), failure.get("error"),
-                    )
-                except Exception:
-                    logger.exception(
-                        "[responses] failed to repair conversation %s after remote content validation error",
-                        conv_id,
-                    )
-            await buffer.close("error")
+
+            async def fail() -> None:
+                if code in CONTENT_REPAIR_CODES:
+                    # ENG-1992: the remote/org path's twin of the streaming
+                    # handler's repair. producer.py already classified this
+                    # via remote_turn_error from the pod's scrubbed error
+                    # string, so `code` alone is enough to act on here.
+                    # Repaired before the terminal record, so the next
+                    # question into this conversation reads the repaired
+                    # history. Never lets a repair failure mask the turn's
+                    # real outcome.
+                    try:
+                        async with conversation_writes(conv_id):
+                            repaired = await run_db(
+                                lambda session: ConversationService(session).repair_image_content(conv_id),
+                                scope=scope,
+                            )
+                        logger.warning(
+                            "[responses] content validation error on remote conversation %s — "
+                            "repaired %d message(s) with image content: %s",
+                            conv_id, len(repaired), failure.get("error"),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "[responses] failed to repair conversation %s after remote content "
+                            "validation error", conv_id,
+                        )
+                await end_turn("error", lambda message_id: response_failed_sse(
+                    message, code, reset_at=reset_at, request_id=corr,
+                    assistant_message_id=message_id,
+                ))
+
+            await run_to_completion(fail())
         except asyncio.CancelledError:
             if lifecycle.discarded:
                 # Same reasoning as _run_turn's discarded branch — see there.
+                # The artifacts the pod wrote are still recorded, as the
+                # in-process harness's `finally` records them.
                 logger.info("[responses] discarded remote turn %s — not persisting", conv_id)
+                await record_artifacts(completed_cleanly=False)
+                return
+            if buffer.is_closed:
+                # The cancel arrived while finish() saved the answer and wrote
+                # the terminal record, and waited for both. The turn is over.
                 return
             if lifecycle.shutting_down or lifecycle.timed_out:
                 collected_events.extend(cancelled_ask_user_retirements(collected_events))
                 collected_events.append(response_failed_payload(
                     INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
                 ))
-                assistant_msg = persist()
-                await buffer.append("sse", {"sse": response_failed_sse(
+                await run_to_completion(end_turn("interrupted", lambda message_id: response_failed_sse(
                     INTERRUPTED_TURN_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
-                    assistant_message_id=_message_id_str(assistant_msg),
-                )})
-                await buffer.close("interrupted")
+                    assistant_message_id=message_id,
+                )))
                 return
             # Partial text generated before cancellation is persisted, with
             # every question the Stop left open retired.
             collected_events.extend(cancelled_ask_user_retirements(collected_events))
-            persist()
-            await buffer.close("cancelled")
-        except Exception:
-            logger.exception(
-                "[responses] remote turn failed for conversation %s correlation_id=%s",
-                conv_id, corr, extra={"request_id": corr},
-            )
+            await run_to_completion(end_turn("cancelled"))
+        except Exception as exc:
+            if isinstance(exc, PoolTimeoutError):
+                # No database connection freed in time. The frame says so with
+                # the wait, as a refused request's 503 does.
+                code, message = friendly_turn_error(exc)
+                retry_after = busy_retry_seconds()
+                extra: dict = {"retry_after": retry_after, "retry_at": retry_at_instant(retry_after)}
+                logger.warning(
+                    "[responses] remote turn for conversation %s correlation_id=%s found no free "
+                    "database connection", conv_id, corr, extra={"request_id": corr},
+                )
+            else:
+                code, message, extra = GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE, {}
+                logger.exception(
+                    "[responses] remote turn failed for conversation %s correlation_id=%s",
+                    conv_id, corr, extra={"request_id": corr},
+                )
             collected_events.extend(cancelled_ask_user_retirements(collected_events))
-            collected_events.append(response_failed_payload(
-                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr))
-            # Persist before building the frame — see the
-            # _RemoteTurnFailed branch above for why.
-            assistant_msg = persist()
-            await buffer.append("sse", {"sse": response_failed_sse(
-                GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=corr,
-                assistant_message_id=_message_id_str(assistant_msg),
-            )})
-            await buffer.close("error")
+            collected_events.append(response_failed_payload(message, code, request_id=corr, **extra))
+            # Saved before the frame is built: a client's SSE reader stops
+            # at response.failed, so any id has to ride this frame.
+            await run_to_completion(end_turn("error", lambda message_id: response_failed_sse(
+                message, code, request_id=corr, assistant_message_id=message_id, **extra,
+            )))
         finally:
             await _seal_unterminated_buffer(
                 buffer, lifecycle, conv_id, request_id=corr
             )
-            # The session is only bound part-way into the try above, so a
-            # failure before that point leaves it None. Closing unguarded would
-            # raise here and mask the exception that actually ended the turn.
-            if producer_session is not None:
-                producer_session.close()
 
     async def _produce(self, **kwargs) -> None:
         # Detached task: bind the turn's org scope so every settings reader in the

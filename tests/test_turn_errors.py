@@ -274,12 +274,12 @@ def test_the_real_shape_dialects_still_qualify():
 
 def test_every_repair_guard_consults_the_shared_set():
     """The two tests above cover the local streaming and non-streaming sites
-    behaviourally. The remote site (`_produce_remote`) needs a producer session,
-    seeded history, an artifact snapshot and a memory read before it reaches its
-    guard — mocking all of that would produce a test that passes for reasons
-    unrelated to the guard, which is the failure mode this whole exercise is
-    about. So that third site is pinned structurally instead, in the same style
-    as `test_no_return_emits_a_literal_code` below.
+    behaviourally. The remote site (`_produce_remote`) needs staged files, a
+    saved question, seeded history, an artifact snapshot and a memory read
+    before it reaches its guard. Mocking all of that would produce a test that
+    passes for reasons unrelated to the guard, which is the failure mode this
+    whole exercise is about. So that third site is pinned structurally
+    instead, in the same style as `test_no_return_emits_a_literal_code` below.
 
     This is the exact mutation that went undetected: replacing the three guards
     with `code == "content_recovery"` while leaving `CONTENT_REPAIR_CODES`
@@ -383,10 +383,8 @@ async def _collect_produce_sse(handler: ResponsesHandler) -> list[str]:
             pass
 
     conv_id = uuid4()
-    mock_session = MagicMock()
 
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=mock_session),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -434,7 +432,6 @@ async def test_produce_pending_persist_failure_does_not_clear_all_pending():
             pass
 
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -606,7 +603,6 @@ def test_stream_repairs_conversation_on_content_validation_error(make_exc):
 
     conv_id = uuid4()
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -639,7 +635,6 @@ def test_stream_does_not_repair_conversation_for_unrelated_errors():
 
     conv_id = uuid4()
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):

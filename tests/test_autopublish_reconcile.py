@@ -88,12 +88,16 @@ def published(monkeypatch):
 def owned_slugs(monkeypatch):
     """Keep testing reconciliation logic in isolation from the owner filter.
 
-    `_owned_slugs` opens its own DB session and resolves real ownership rows;
-    this module's fixtures use a non-UUID project id ("project-1") and write no
-    DB rows, so the default here is "everything is owned" and individual tests
+    `_owned_slugs` resolves real ownership rows in a database unit; this
+    module's fixtures use a non-UUID project id ("project-1") and write no DB
+    rows, so the default here is "everything is owned" and individual tests
     override it to exercise the filter itself.
     """
-    monkeypatch.setattr(ap, "_owned_slugs", lambda base, scope, project_id, slugs: (list(slugs), 0, 0))
+
+    async def all_owned(base, scope, project_id, slugs):
+        return list(slugs), 0, 0
+
+    monkeypatch.setattr(ap, "_owned_slugs", all_owned)
 
 
 pytestmark = pytest.mark.usefixtures("publish_url")
@@ -564,7 +568,7 @@ async def test_not_owned_slugs_are_dropped_and_logged(
     _make(base, "theirs", files={"other.html": "<html></html>"},
           meta={"slug": "theirs", "type": "html-app"})
 
-    def fake_owned(base_, scope, project_id, slugs):
+    async def fake_owned(base_, scope, project_id, slugs):
         return ([s for s in slugs if s == "mine"], 1, 0)
 
     monkeypatch.setattr(ap, "_owned_slugs", fake_owned)
