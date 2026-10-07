@@ -357,6 +357,20 @@ GENERIC_TURN_ERROR_CODE = "anton_error"
 # its own — same as TurnInterrupted below.
 INTERRUPTED_TURN_MESSAGE = "The response was interrupted before it finished. Please try again."
 
+# anton ended a model call that sent no output within its deadline. Its own
+# message names the deadline, so it passes through; this is the fallback for
+# an empty one. A code of its own because the next step differs from
+# anton_error: the model, not the agent, went silent.
+MODEL_TIMEOUT_CODE = "model_timeout"
+MODEL_TIMEOUT_USER_MESSAGE = "The model didn't respond, so this turn was ended. Please try again."
+
+# The UI heard nothing for its idle window and cancelled the turn with
+# reason "stalled". Saved as a failure with this code, so a reload shows the
+# stall card instead of a partial answer that reads like a Stop. Same
+# sentence the UI shows live.
+STALLED_CODE = "stalled"
+STALLED_TURN_MESSAGE = "The response stalled and was ended. Please try sending again."
+
 # Curated copy for scratchpad-controller literals that carry no "TypeName:"
 # prefix at all (main.py's own turn_failed publishes), so the type-name parse
 # in remote_turn_error never sees them. Matched by prefix/suffix rather than
@@ -693,6 +707,36 @@ def provider_overloaded_info(exc: Exception) -> tuple[str, str] | None:
     if code == PROVIDER_OVERLOADED_CODE:
         return code, str(getattr(exc, "model", "") or "")
     return None
+
+
+def is_model_timeout_error(exc: Exception) -> bool:
+    """Whether ``exc`` is anton's ``ModelCallTimeoutError``: a model call sent
+    no output within its deadline.
+
+    Typed check first, imported lazily because the installed anton can predate
+    the class; it keeps matching if anton ever changes the class's wire code.
+    The duck-typed fallback, for an anton that predates or moved the class,
+    keys on the structured ``code`` and excludes anything carrying
+    ``.response`` or ``.request``. An SDK error fills ``.code`` from a body a
+    BYOK endpoint controls, and the OpenAI and Anthropic SDKs set ``.request``
+    on every error, including the bare ``APIError`` that a mid-stream SSE
+    error frame raises with no ``.response``. anton also wraps that bare error
+    into its own fixed-code error (``except openai.APIError`` in
+    ``OpenAIProvider``'s stream readers), so it should never arrive here
+    unwrapped.
+    """
+    try:
+        from anton.core.llm.provider import ModelCallTimeoutError
+
+        if isinstance(exc, ModelCallTimeoutError):
+            return True
+    except ImportError:
+        pass
+    return (
+        getattr(exc, "code", None) == MODEL_TIMEOUT_CODE
+        and not hasattr(exc, "response")
+        and not hasattr(exc, "request")
+    )
 
 
 def is_auth_error(exc: Exception) -> bool:
@@ -1260,6 +1304,15 @@ def friendly_turn_error(
     (the streaming handler needs the rejected model for the card) pass it in so
     it isn't computed twice; omit it and it's resolved on demand.
     """
+    # anton's model-call deadline. Its message is curated copy that names the
+    # deadline, so it passes through. Checked before every rung that walks the
+    # cause chain: anton raises it `from None` inside the deadline's handler,
+    # but `__context__` still holds whatever the call was doing when the
+    # deadline fired, such as an SDK retry sleeping after a gateway 429. Read
+    # through the chain, that response would relabel the deadline.
+    if is_model_timeout_error(exc):
+        return MODEL_TIMEOUT_CODE, str(exc) or MODEL_TIMEOUT_USER_MESSAGE
+
     status, reason, host = _http_error_context(exc)
 
     # The gateway's explicit reason header wins — it names the billing decision
@@ -1448,6 +1501,12 @@ _REMOTE_TYPE_MAPPINGS: dict[str, _RemoteTypeMapping] = {
     "TokenLimitExceeded": _RemoteTypeMapping(TOKEN_LIMIT_CODE, TOKEN_LIMIT_USER_MESSAGE),
     "ProviderOverloadedError": _RemoteTypeMapping(
         PROVIDER_OVERLOADED_CODE, PROVIDER_OVERLOADED_FALLBACK_MESSAGE,
+        passes_message_through=True,
+    ),
+    # anton's model-call deadline. Its message is curated copy that names the
+    # deadline, so it passes through like the overload copy above.
+    "ModelCallTimeoutError": _RemoteTypeMapping(
+        MODEL_TIMEOUT_CODE, MODEL_TIMEOUT_USER_MESSAGE,
         passes_message_through=True,
     ),
     # _scrub sends "Type: message" — the structured `code` doesn't survive,

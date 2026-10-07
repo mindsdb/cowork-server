@@ -27,3 +27,84 @@ The design of the API has also been hardened by removing several unusued endpoin
 For example, the Responses API has been updated to allow for file inputs along with support for an OpenAI-compatible Files API. This alleviates the need for maintaining the /attachments endpoints defined in the orignial server defines a standard way for handling file uploads and attachments across different agents. More information regarding these design updates can be found in the design document linked below.
 
 Further details regarding this design can be found in this document: [Cowork Server API for Agents](https://docs.google.com/document/d/1YBgr59GoO47wvLtZAO7wbNL8DKrigww_PYeUlcMDgos/edit?usp=sharing).
+
+## Turn liveness and idle bounds
+
+TLDR; A turn that sends nothing for too long is ended by whichever idle bound fires first. While anton waits on a model call that sends no output, cowork-server (in cloud, the anton pod) writes a `model_wait` progress frame every 20 to 25 seconds, so no bound fires until anton's own 10-minute model-call deadline ends the call. In cloud, the controller's 600 s hard cap can end the turn first. A non-streamed call through MindsHub is ended sooner, by the gateway's 110 s budget.
+
+### The bounds a quiet turn meets
+
+Each bound watches a different wire. A bound restarts only on activity it can see, so a frame has to reach the buffer, and from there the client, to keep a turn alive.
+
+| Bound | Value | Where | What restarts it | What happens at expiry |
+| -- | -- | -- | -- | -- |
+| UI idle cut | 300 s. After a `response.ask_user` frame: the question's `timeout_s` plus 300 s | cowork `src/renderer/cowork/api.js`, `STREAM_IDLE_TIMEOUT_MS` | Any SSE event with a `data:` line. The server's `: keepalive` comments do not count | The UI aborts the stream, calls `POST /api/v1/responses/cancel` with `reason: "stalled"` and shows "The response stalled and was ended." |
+| SSE keepalive comment | Every 20 s of quiet | `SSE_KEEPALIVE_SECONDS` in `cowork/handlers/responses.py` | Not a bound | Keeps proxies from closing an idle connection. It never keeps a turn alive, so a hung server still meets the UI cut |
+| Idle watchdog | 600 s, checked every 15 s | `COWORK_MAX_TURN_IDLE_SECONDS`, `cowork/streaming/registry.py` | Any record appended to the turn's buffer | The producer is cancelled and saves `response.failed` with code `anton_error` and "The response was interrupted before it finished." The buffer closes `interrupted` |
+| Redis tail | 300 s | `REDIS_TAIL_IDLE_TIMEOUT_SECONDS`, `cowork/streaming/buffer.py`. Only with `COWORK_STREAM_BACKEND=redis` | Any record in the turn's Redis stream | The reader writes an `Interrupted` terminal record and logs "went quiet for 300s" |
+| Reply idle | 600 s | `COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS`. Only for remote turns | Any reply for this turn on the controller's reply stream | The turn fails with code `worker_unresponsive` |
+| Controller stall window | 120 s | scratchpad-controller `turn_stall_timeout_seconds` | Any line from the turn's pod, including its heartbeat every 5 s | The controller ends the turn, and the user sees "This turn stopped producing output and was ended." |
+| Controller hard cap | 600 s in total | scratchpad-controller `hard_turn_timeout_seconds` | Nothing | The controller ends the turn, and the user sees "This turn took too long and was stopped." In cloud this cap ends a stuck model call before anton's deadline does |
+| Question timeout | 300 s, or the question's own `timeout_s` | `DEFAULT_TIMEOUT_S`, `cowork/harnesses/anton_harness/elicitor.py` | An answer ends the wait | anton receives a `timeout` answer and carries on |
+| MindsHub gateway | Streamed: a keepalive comment every 15 s, and the stream ended after 1800 s with nothing else. Non-streamed: 110 s for the whole request | mindshub_inference `keepalive_interval_seconds`, `max_upstream_silence_seconds` and `nonstreaming_budget_seconds` | Streamed: any output that reaches the client. Non-streamed: nothing | Streamed: the gateway ends the stream. Non-streamed: the gateway answers 504 marked not to retry, and anton raises a transient provider error that its caller handles |
+| SDK read timeout | 600 s per read | OpenAI SDK default | Any bytes, the gateway's keepalive comments included | A request whose response has not started is re-sent by the SDK, twice by default. A streamed call that goes quiet mid-response raises a read-timeout error, which the turn handles as an error |
+| Model-call deadline | 600 s | anton `ANTON_MODEL_CALL_IDLE_TIMEOUT_S`. A value of 0 or less turns it off, and then a model call that never answers keeps the turn alive until the SDK, the gateway or a Stop ends it | Each event of a streamed call. A non-streamed call gets one bound over the whole call. Both keep running across the SDK's own retries | anton raises `ModelCallTimeoutError`. The turn saves `response.failed` with code `model_timeout` and closes `error`. Inside the completion verifier it instead ends the turn quietly on the answer that already streamed |
+| Model-wait tick | Written after 20 s of quiet, checked every 5 s | `MODEL_WAIT_TICK_SECONDS` and `MODEL_WAIT_POLL_SECONDS`, `cowork/streaming/liveness.py`. In cloud: anton's pod heartbeat and `MODEL_WAIT_TICK_S` | Not a bound | Restarts every bound above that watches the buffer, the reply stream or the SSE stream |
+
+A model-call deadline above 600 s needs the SDK's read timeout raised too. On an endpoint that sends no keepalives, a streamed call that goes quiet after its response starts ends at 600 s with a read-timeout error instead of the deadline.
+
+### How a silent model call stays alive
+
+anton keeps a per-turn record of its open model calls and exposes it as `session.model_calls`. Its `snapshot()` names the oldest call that is waiting on the provider, or returns `None`.
+
+On desktop and self-hosted, the turn's producer runs a `ModelWaitTicker` beside the formatter loop. The anton harness attaches its session to the ticker once the session exists. Every 5 seconds the ticker checks the buffer. When no record has arrived for 20 seconds and the snapshot names a waiting call, it appends one `response.in_progress` frame with `phase: "model_wait"` and a message such as "Waiting for the model (2m 40s)". The frame goes straight to the buffer and never through `event_sink`, so the turn's saved events never hold it.
+
+In cloud, the pod's 5-second heartbeat task makes the same check against its own output and writes a `progress` line with `phase: "model_wait"`. The controller relays it, and the formatter turns it into the same frame. The formatter never throttles it and never saves it.
+
+```mermaid
+sequenceDiagram
+    participant UI as Cowork UI
+    participant Buffer as Turn buffer
+    participant Ticker as Model-wait ticker
+    participant Anton as anton
+    participant Model
+    Anton->>Model: model call
+    Note over Model: thinks with no output
+    loop every 5 s
+        Ticker->>Buffer: check for new records
+        opt 20 s with no record
+            Ticker->>Anton: read the call snapshot
+            opt a call is waiting
+                Ticker->>Buffer: append a model_wait frame
+                Buffer->>UI: response.in_progress with phase model_wait
+                Note over UI,Buffer: the UI cut, the watchdog and the Redis tail restart
+            end
+        end
+    end
+    Model-->>Anton: first output
+    Anton->>Buffer: frames through the formatter
+```
+
+### Why ticks never fire during tools, cells or questions
+
+A frame goes out only while anton reports a call waiting on the provider. Everything else that can hang a turn reports nothing, so it still meets every bound:
+
+- **Tools.** While a tool runs its own code, no model call is waiting. A tool that calls the model itself, such as `generate_artifact`, keeps the turn alive only while that call waits on the provider. Its calls are non-streamed, so on MindsHub the gateway's 110 s budget ends one first. A tool that never returns is reaped by the watchdog at 600 s and cut by the UI at 300 s.
+- **Scratchpad cells.** A cell runs in its own process. Its model calls never register on the turn's record, so a cell gets the same bounds as any tool.
+- **Questions.** anton's snapshot returns `None` while an `ask_user` question is open. The UI extends its own window for the question instead.
+- **A call parked between events.** Only a call awaiting the provider counts. A stream that has handed anton an event and waits for anton to ask for the next one does not.
+- **A frozen or dead process.** The ticker runs inside the server process, so it freezes and dies with it. A hung server, a stopped sidecar or a dead proxy still meets the UI cut.
+
+An anton without `session.model_calls` produces no ticks, and the turn meets the bounds above unchanged.
+
+### What a stall and a Stop save
+
+The UI's idle cut and the Stop button call the same endpoint. The optional `reason` tells them apart.
+
+- **Stop** (no `reason`). The server saves the partial answer and its events with no terminal event, and the buffer closes `cancelled`. The live UI receives `response.cancelled`. A reload shows the partial answer with no error row.
+- **Stall** (`reason: "stalled"`). `cancel_response` sets `TurnLifecycle.stalled` before it cancels the producer, and every later cancel sets it again from its own reason. So a Stop after a stall cancel the turn swallowed, such as one a running cell caught, saves as a Stop. The producer saves the partial answer, retires any open question, and appends `response.failed` with code `stalled` and "The response stalled and was ended. Please try sending again." The buffer closes `interrupted`, with no `response.cancelled`. A reload shows the stall card with Try again.
+- **Stall on a replica that does not own a cloud turn.** That replica can only write Redis keys. In one transaction it sets `cowork:cancel_cause:<correlation_id>` = `stalled` and the cancel flag, both with a 300 s TTL. Any other cancel deletes the cause in the same transaction as its flag, so the latest cancel decides. The controller stops the pod, reports `turn_failed "cancelled"`, and its `_clear_cancel` deletes the flag. The owning replica reads the cause key when that report arrives and saves the stall record. If it cannot read the key, it logs an error and saves the turn as a Stop. The producer clears a stale cause key beside the stale flag before each turn.
+- **Watchdog or shutdown.** These win over a stall. The turn saves `response.failed` with code `anton_error` and "The response was interrupted before it finished.", and closes `interrupted`.
+- **Model-call deadline.** The turn saves `response.failed` with code `model_timeout` and anton's message, and closes `error`.
+
+Any other `reason` value is accepted and ignored, so the turn saves as a Stop. A UI that sends no reason saves its stalls as a Stop. If a stall's cancel never reaches the server and the turn then completes, a reload shows the full answer.
