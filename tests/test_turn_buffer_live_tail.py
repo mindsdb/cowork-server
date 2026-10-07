@@ -79,3 +79,29 @@ async def test_a_line_written_in_two_pieces_is_parsed_once_it_is_whole(tmp_path,
     assert seen_before_the_rest == ["whole"]
     assert received == ["whole", "split", "Done"]
     assert len(parsed) == 3, parsed
+
+
+async def test_a_close_while_the_reader_holds_a_record_still_reaches_it(tmp_path):
+    """A slow client keeps the reader paused inside a batch it already read.
+    The turn's last records and its close can land in that pause, and the
+    reader still reads them before it ends."""
+    buffer = FileStreamBuffer(turn_buffer_path(tmp_path, "conv-1", 0))
+    await buffer.append("sse", {"sse": "a"})
+    received = []
+    holding, slow_send = asyncio.Event(), asyncio.Event()
+
+    async def read():
+        async for record in buffer.tail():
+            received.append(record.data.get("sse") or record.type)
+            if len(received) == 1:
+                holding.set()
+                await slow_send.wait()
+
+    reader = asyncio.create_task(read())
+    await asyncio.wait_for(holding.wait(), timeout=5)
+    await buffer.append("sse", {"sse": "b"})
+    await buffer.close("completed")
+    slow_send.set()
+    await asyncio.wait_for(reader, timeout=5)
+
+    assert received == ["a", "b", "Done"]

@@ -236,7 +236,7 @@ class TestPersistHistoryCompaction:
             conv, fake_anton_session, {"ordered_messages": [], "tail_start": 0, "synthetic_prefix_len": 0},
         )
 
-        assert svc.get_conversation(conv.id).history_summary is None
+        assert _stored(conv.id).history_summary is None
 
     def test_noop_on_anton_predating_last_compaction(self, svc):
         """cowork-server and anton deploy independently — an older anton
@@ -251,7 +251,7 @@ class TestPersistHistoryCompaction:
             conv, _OldChatSession(), {"ordered_messages": [], "tail_start": 0, "synthetic_prefix_len": 0},
         )
 
-        assert svc.get_conversation(conv.id).history_summary is None
+        assert _stored(conv.id).history_summary is None
 
     def test_persists_cutoff_on_first_compaction(self, svc):
         conv = svc.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
@@ -301,4 +301,4 @@ class TestPersistHistoryCompaction:
 
         AntonHarness._persist_history_compaction(conv, fake_anton_session, seed_info)
 
-        assert svc.get_conversation(conv.id).history_summary is None
+        assert _stored(conv.id).history_summary is None

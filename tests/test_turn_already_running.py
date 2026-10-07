@@ -174,11 +174,11 @@ async def test_two_questions_racing_through_the_gate_leave_the_first_stream_whol
 ):
     """Both questions pass the early check while neither turn has started, read
     the same history and so compute the same turn number, which names the
-    turn's buffer file. The second is refused while the first turn's file
-    still holds no record: the registry refuses it under its lock before it
-    opens that file, so the first stream keeps every record. The second
-    question reaches the registry from the delegated path or the direct one,
-    depending on its route."""
+    turn's buffer file. The second is refused once the first turn has written
+    its first record: the registry refuses it under its lock before it opens
+    that file, so the first stream keeps every record. The second question
+    reaches the registry from the delegated path or the direct one, depending
+    on its route."""
     gate = _PausedBeforeItsFirstRecord()
     monkeypatch.setattr(responses_mod, "get_harness", lambda name: gate)
     arrived = [asyncio.Event(), asyncio.Event()]
@@ -215,7 +215,9 @@ async def test_two_questions_racing_through_the_gate_leave_the_first_stream_whol
         await asyncio.wait_for(gate.turn_started.wait(), timeout=10)
         running = registry.get(conversation_id)
         path = turn_buffer_path(get_streams_dir(), conversation_id, running.turn_id)
-        empty_before_refusal = path.exists() and path.stat().st_size == 0
+        gate.write.set()
+        await asyncio.wait_for(gate.answering.wait(), timeout=10)
+        records_before_refusal = [record.type for record in read_records(path)]
 
         go[1].set()
         try:
@@ -225,13 +227,12 @@ async def test_two_questions_racing_through_the_gate_leave_the_first_stream_whol
         file_after_refusal = path.exists()
         still_running = registry.get(conversation_id)
 
-        gate.write.set()
         gate.release.set()
         answered = await asyncio.wait_for(first, timeout=10)
         items = await _items(client, conversation_id)
 
     assert starts == [0, 0]
-    assert empty_before_refusal
+    assert records_before_refusal == ["sse"]
     assert refused.status_code == 409, refused.text
     assert refused.json() == REFUSAL
     assert file_after_refusal

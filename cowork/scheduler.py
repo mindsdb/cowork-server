@@ -8,7 +8,7 @@ from functools import partial
 from typing import TYPE_CHECKING, TypeVar
 from uuid import UUID
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.common.datetime_utils import ensure_utc
@@ -44,7 +44,7 @@ _MAX_RUN_DURATION_SECONDS = 600
 # `running` stops its schedule firing until a restart, and an outcome never
 # recorded leaves its slot due, so the slot would run a second time. Each try
 # already waits POOL_TIMEOUT for a connection; the pause between tries only
-# keeps a misconfigured zero wait from spinning.
+# keeps a refusal that comes back at once from spinning.
 _BOOKKEEPING_DEADLINE_SECONDS = _MAX_RUN_DURATION_SECONDS
 _BOOKKEEPING_RETRY_PAUSE_SECONDS = 1.0
 _scheduler_task: asyncio.Task | None = None
@@ -494,6 +494,15 @@ def _due_schedules(session, now: datetime) -> list[Schedule]:
         # not consumed — once the run finishes, the freshness guard decides
         # whether it still fires.
         if not s.enabled or ensure_utc(s.next_run_at) > now or run_service.has_active_run(s.id):
+            continue
+        # Read the row again: a run that ended after this poll read it has
+        # already consumed its slot or disabled its one-off, and the poll's
+        # session still holds the row as it was.
+        try:
+            session.refresh(s)
+        except InvalidRequestError:
+            continue  # deleted since this poll read it
+        if not s.enabled or ensure_utc(s.next_run_at) > now:
             continue
         if _ran_recently(s, run_service, now):
             logger.info(

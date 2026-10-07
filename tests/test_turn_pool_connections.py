@@ -52,6 +52,7 @@ from cowork.services.projects import GENERAL_PROJECT_ID
 from cowork.services.schedules import ScheduleRunService, ScheduleService
 from cowork.streaming import discard_conversation, registry
 from cowork.streaming.buffer import FileStreamBuffer, read_records
+from cowork.streaming.recovery import seal_orphan_turns_in_history
 
 from _fakes import PausedModel
 
@@ -343,6 +344,36 @@ async def test_a_turn_checks_out_off_the_event_loop_one_connection_per_thread(mo
         assert session.exec(session.select(TaskObject).where(
             TaskObject.conversation_id == conversation_id, TaskObject.ref == slug,
         )).first() is not None
+
+
+async def test_a_direct_answer_checks_out_off_the_event_loop_one_connection_per_thread(monkeypatch):
+    """A turn the gate answers itself: every checkout runs off the loop, no
+    thread holds two connections at once, and none is held while a frame is
+    appended."""
+
+    async def direct(**_kwargs):
+        return RouteDecision(route=DIRECT_CONTEXT, reason="test", model="m", text="direct answer")
+
+    monkeypatch.setattr(responses_mod, "decide_route", direct)
+    engine = _app_engine()
+    held: list[int] = []
+    append = FileStreamBuffer.append
+
+    async def sampled_append(self, type_, data):
+        held.append(engine.pool.checkedout())
+        return await append(self, type_, data)
+
+    monkeypatch.setattr(FileStreamBuffer, "append", sampled_append)
+
+    with _logging_checkouts(engine) as log:
+        async with _client() as client:
+            answered = await asyncio.wait_for(_ask(client, uuid4(), "hi"), timeout=10)
+
+    assert answered.status_code == 200, answered.text
+    assert _frames(answered.text)[-1][0] == "response.completed"
+    assert log.on_the_loop == [], f"{len(log.on_the_loop)} checkout(s) on the event loop's thread"
+    assert max(log.most_at_once.values()) == 1, log.most_at_once
+    assert held and set(held) == {0}, held
 
 
 # ── T5: a failed save ends the stream as failed ──────────────────────────────
@@ -836,6 +867,109 @@ async def test_a_stop_whose_final_save_fails_reports_failure(monkeypatch):
     assert _frames(answered.text)[-1][0] == "response.failed"
     assert _terminal(conversation_id) == "Error"
     assert _rows(conversation_id) == [_Row(role="user", pending=True, seq=0)]
+
+
+@pytest.mark.parametrize("how", ["shutdown", "watchdog"])
+async def test_an_interrupted_turn_whose_save_fails_is_left_for_boot_recovery(monkeypatch, tmp_path, how):
+    """A restart's shutdown, or the idle watchdog, stops a turn whose save
+    then fails. The turn still ends interrupted, with the interruption frame,
+    so the next boot's recovery seals its question and answer into history."""
+    conversation_id = uuid4()
+    model = PausedModel()
+    monkeypatch.setattr(harness_mod, "build_chat_session", model.build)
+    save = ConversationService.save_assistant_turn
+
+    def failed_save(*_args, **_kwargs):
+        raise RuntimeError("disk full")
+
+    async with _client() as client:
+        answer = asyncio.create_task(_ask(client, conversation_id, "hi"))
+        await asyncio.wait_for(model.answering.wait(), timeout=10)
+        monkeypatch.setattr(ConversationService, "save_assistant_turn", failed_save)
+        handle = registry.get(str(conversation_id))
+        if how == "shutdown":
+            await registry.shutdown(timeout_seconds=5)
+        else:
+            handle.lifecycle.timed_out = True
+            handle.task.cancel()
+            await asyncio.gather(handle.task, return_exceptions=True)
+        answered = await asyncio.wait_for(answer, timeout=10)
+    monkeypatch.setattr(ConversationService, "save_assistant_turn", save)
+
+    last_kind, last = _frames(answered.text)[-1]
+    assert last_kind == "response.failed"
+    assert last["error"] == INTERRUPTED_TURN_MESSAGE, last
+    assert _terminal(conversation_id) == "Interrupted"
+    assert _rows(conversation_id) == [_Row(role="user", pending=True, seq=0)]
+    # Boot recovery over this turn's buffer alone.
+    streams_root = tmp_path / "streams"
+    shutil.copytree(handle.buffer.path.parent, streams_root / str(conversation_id))
+    with unit_session(scope=SYSTEM_SCOPE) as session:
+        assert seal_orphan_turns_in_history(session, streams_root) == 1
+    assert [(r.role, r.pending) for r in _rows(conversation_id)] == [("user", False), ("assistant", False)]
+
+
+async def test_an_error_whose_save_fails_keeps_its_own_code(monkeypatch):
+    """The provider rejects an image in the stored history, and the save of
+    the failed answer fails too. The stream still ends with the turn's own
+    content_recovery card, not a generic save error."""
+    from anton.core.llm.provider import ContentValidationError
+
+    async def reject_image(_session):
+        raise ContentValidationError("Invalid value: 'image'. Supported values are: 'input_text'.")
+
+    model = PausedModel(before_answer=reject_image)
+    monkeypatch.setattr(harness_mod, "build_chat_session", model.build)
+
+    def failed_save(*_args, **_kwargs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(ConversationService, "save_assistant_turn", failed_save)
+    conversation_id = uuid4()
+
+    async with _client() as client:
+        answered = await asyncio.wait_for(_ask(client, conversation_id, "hi"), timeout=10)
+
+    last_kind, last = _frames(answered.text)[-1]
+    assert last_kind == "response.failed"
+    assert last["code"] == "content_recovery", last
+    assert _terminal(conversation_id) == "Error"
+
+
+async def test_a_stop_during_the_content_repair_still_ends_the_turn_as_that_error(monkeypatch):
+    """The provider rejects an image in the stored history, and Stop lands
+    while the error branch repairs it. The Stop waits for the repair, and the
+    turn ends with content_recovery, its question and failed answer saved."""
+    from anton.core.llm.provider import ContentValidationError
+
+    async def reject_image(_session):
+        raise ContentValidationError("Invalid value: 'image'. Supported values are: 'input_text'.")
+
+    model = PausedModel(before_answer=reject_image)
+    monkeypatch.setattr(harness_mod, "build_chat_session", model.build)
+    repairing, proceed = threading.Event(), threading.Event()
+    repair = ConversationService.repair_image_content
+
+    def slow_repair(self, conversation_id):
+        repairing.set()
+        proceed.wait(timeout=10)
+        return repair(self, conversation_id)
+
+    monkeypatch.setattr(ConversationService, "repair_image_content", slow_repair)
+    conversation_id = uuid4()
+
+    async with _client() as client:
+        answer = asyncio.create_task(_ask(client, conversation_id, "hi"))
+        await _until(repairing.is_set)
+        stop = asyncio.create_task(registry.cancel(str(conversation_id)))
+        await asyncio.sleep(0.3)
+        proceed.set()
+        assert await asyncio.wait_for(stop, timeout=10) is True
+        answered = await asyncio.wait_for(answer, timeout=10)
+
+    assert _frames(answered.text)[-1][1]["code"] == "content_recovery"
+    assert _terminal(conversation_id) == "Error"
+    assert [(r.role, r.pending) for r in _rows(conversation_id)] == [("user", False), ("assistant", False)]
 
 
 async def test_stop_waits_for_artifact_cleanup_without_blocking_the_loop(one_connection_pool, monkeypatch):

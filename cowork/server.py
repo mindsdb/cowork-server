@@ -310,8 +310,8 @@ def create_app() -> FastAPI:
 
     # No database connection freed within POOL_TIMEOUT. DatabaseBusy, a unit
     # that waited for its slot or its connection, subclasses the pool timeout,
-    # so this answers both. The web UI shows `detail` and ignores Retry-After,
-    # which is why the sentence names the wait too.
+    # so this answers both. The web UI waits for Retry-After before it offers
+    # a retry, and the sentence names the wait for clients that don't read it.
     @app.exception_handler(PoolTimeoutError)
     async def _database_busy(request, exc):
         retry_after = busy_retry_seconds()

@@ -326,8 +326,9 @@ class DatabaseSettings(Settings):
     )  # DATABASE_URI
 
     # Connection pool configurations. These read their bare names: a
-    # DATABASE_ prefix is not honored for them. SQLite engines take none of
-    # them and keep SQLAlchemy's own pool (5 plus 10, a 30 s wait).
+    # DATABASE_ prefix is not honored for them. SQLite engines are built
+    # without them and keep SQLAlchemy's own pool (5 plus 10, a 30 s wait),
+    # but POOL_TIMEOUT still bounds every database unit (cowork.db.units).
     max_overflow: int = Field(
         default=20, description="The maximum overflow size of the database connection pool"
     )  # MAX_OVERFLOW
@@ -336,17 +337,12 @@ class DatabaseSettings(Settings):
     pool_size: int = Field(default=20, description="The size of the database connection pool")  # POOL_SIZE
     pool_timeout: int = Field(
         default=5,
+        ge=1,
         description=(
             "Seconds a request waits for a pooled connection before it is refused "
             "with 503. Short, so a full pool answers within seconds."
         ),
     )  # POOL_TIMEOUT
-
-    # Query timeout configurations
-    query_timeout: int = Field(default=300, description="The query timeout in seconds")  # QUERY_TIMEOUT
-    statement_timeout: int = Field(
-        default=300000, description="The statement timeout in milliseconds"
-    )  # STATEMENT_TIMEOUT
 
 
 class ProjectSettings(Settings):

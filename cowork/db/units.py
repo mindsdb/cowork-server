@@ -67,16 +67,20 @@ def _slots(engine: Engine) -> anyio.CapacityLimiter:
     Units queue here, where the wait is bounded and holds no thread, rather
     than inside the pool. SQLite gets one slot: its writers serialize on the
     database file anyway, and one unit at a time keeps the desktop's writes in
-    the order the event loop gave them before units ran in threads.
+    the order the event loop gave them before units ran in threads. A
+    negative MAX_OVERFLOW lets the pool open connections without limit, so
+    units then have no slot limit either.
     """
     try:
         return _SLOTS.get()
     except LookupError:
         pass
+    database = db_session.settings.database
     if engine.dialect.name == "sqlite":
         total = 1
+    elif database.max_overflow < 0:
+        total = math.inf
     else:
-        database = db_session.settings.database
         total = database.pool_size + database.max_overflow
     limiter = anyio.CapacityLimiter(total)
     _SLOTS.set(limiter)
@@ -257,12 +261,17 @@ async def _finish_even_if_cancelled(task: asyncio.Future[T]) -> T:
 
 async def _drain(task: asyncio.Future[Any]) -> None:
     """Wait for ``task`` to end, absorbing cancels, and log a failure that its
-    cancelled caller will never see."""
-    while not task.done():
-        try:
-            await asyncio.wait([task])
-        except asyncio.CancelledError:
-            continue
+    cancelled caller will never see.
+
+    The shield holds off an enclosing anyio cancel scope, which would
+    otherwise cancel each wait again on every pass of the event loop.
+    """
+    with anyio.CancelScope(shield=True):
+        while not task.done():
+            try:
+                await asyncio.wait([task])
+            except asyncio.CancelledError:
+                continue
     if not task.cancelled() and task.exception() is not None:
         logger.warning(
             "work its caller waited for failed after the caller was cancelled",
