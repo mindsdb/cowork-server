@@ -30,6 +30,24 @@ def cancel_flag_key(correlation_id: str) -> str:
     return f"cowork:cancel:{correlation_id}"
 
 
+# The one cancel reason that changes what a turn saves: the UI cancelled it
+# after hearing nothing for its idle window, so it saves as a stall, not a Stop.
+STALLED_CANCEL_REASON = "stalled"
+
+
+def cancel_cause_key(correlation_id: str) -> str:
+    """Why a ``/cancel`` asked this turn to stop, when the reason matters.
+
+    Separate from ``cancel_flag_key`` because scratchpad-controller deletes the
+    flag as soon as it reports the cancel, before the replica that owns the
+    turn reads anything. Only this server reads and writes it: the replica
+    that takes the ``/cancel`` writes it before the flag, the owner reads it
+    when the cancel comes back, and the producer clears a stale one before
+    each turn.
+    """
+    return f"cowork:cancel_cause:{correlation_id}"
+
+
 def answer_queue_key(correlation_id: str) -> str:
     """The list /answer pushes a remote turn's ask_user answers onto.
 

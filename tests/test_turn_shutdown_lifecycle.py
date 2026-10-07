@@ -155,12 +155,14 @@ async def test_shutdown_reports_a_turn_still_unwinding_past_its_budget():
 
 
 @pytest.mark.parametrize("backend", ["local", "remote"])
-@pytest.mark.parametrize("cause", ["watchdog", "shutdown", "user_stop"])
+@pytest.mark.parametrize("cause", ["watchdog", "shutdown", "user_stop", "ui_stall"])
 async def test_only_user_stop_emits_cancelled(monkeypatch, tmp_path, backend, cause):
     import sys
 
+    from cowork.api.v1.endpoints.responses import CancelRequest, cancel_response
+    from cowork.db.scoped import LOCAL_SCOPE
     from cowork.handlers.responses import sse_from_buffer
-    from cowork.streaming.buffer import FileStreamBuffer, turn_buffer_path
+    from cowork.streaming.buffer import FileStreamBuffer, read_records, turn_buffer_path
     from test_responses_remote_backend import _remote_handler_with_message_id
 
     registry_module = sys.modules["cowork.streaming.registry"]
@@ -192,17 +194,33 @@ async def test_only_user_stop_emits_cancelled(monkeypatch, tmp_path, backend, ca
     if cause == "shutdown":
         await registry.shutdown()
     elif cause == "user_stop":
-        await handle.cancel()
+        await cancel_response(CancelRequest(conversation_id=CID), LOCAL_SCOPE)
+    elif cause == "ui_stall":
+        # The UI's idle cut: the same endpoint as Stop, with a reason.
+        await cancel_response(CancelRequest(conversation_id=CID, reason="stalled"), LOCAL_SCOPE)
     await asyncio.wait_for(handle.task, timeout=5)
 
     frames = [frame async for frame in sse_from_buffer(buffer)]
     assert saved["assistant"] == "partial"
     assert handle.lifecycle.timed_out is (cause == "watchdog")
     assert handle.lifecycle.shutting_down is (cause == "shutdown")
+    records = list(read_records(buffer.path))
     if cause == "user_stop":
         assert frames[-1].startswith("event: response.cancelled\n")
         assert not any(e.get("type") == "response.failed" for e in saved["events"])
+        assert records[-1].type == "Cancelled"
     else:
         assert frames[-1].startswith("event: response.failed\n")
         assert not any("response.cancelled" in frame for frame in frames)
+        assert records[-1].type == "Interrupted"
+    if cause == "ui_stall":
+        # Saved as a failure with its own code, so a reload shows the stall
+        # card rather than a partial answer that reads like a Stop.
+        assert saved["events"][-1]["type"] == "response.failed"
+        assert saved["events"][-1]["code"] == "stalled"
+        assert saved["events"][-1]["error"] == (
+            "The response stalled and was ended. Please try sending again."
+        )
+        assert handle.lifecycle.stalled is True
+    elif cause != "user_stop":
         assert saved["events"][-1]["error"] == INTERRUPTED_TURN_MESSAGE

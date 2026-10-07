@@ -34,7 +34,7 @@ from cowork.turnqueue.auth_keys import (
 )
 from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnReply
 from cowork.streaming.turn_index import record_turn
-from cowork.turnqueue.redis_client import cancel_flag_key, get_redis, reply_stream_key
+from cowork.turnqueue.redis_client import cancel_cause_key, cancel_flag_key, get_redis, reply_stream_key
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host, get_app_settings
 
 logger = logging.getLogger(__name__)
@@ -506,8 +506,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     )
     r = get_redis()
     corr = correlation_id or _new_correlation_id()
-    # A flag left by an earlier turn would cancel this one on its first line.
-    await r.delete(cancel_flag_key(corr))
+    # A flag left by an earlier turn would cancel this one on its first line,
+    # and its cause would turn this turn's own Stop into a stall.
+    await r.delete(cancel_flag_key(corr), cancel_cause_key(corr))
     reply_stream = reply_stream_key(conversation_id)
 
     # No client-picked model → the deployment's resolved default (org mode: the

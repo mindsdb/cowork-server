@@ -2174,6 +2174,99 @@ def test_remote_error_none_is_redacted():
     assert remote_turn_error(None)[0] == GENERIC_TURN_ERROR_CODE
 
 
+# ── model_timeout ────────────────────────────────────────────────────
+# anton ends a model call that sends no output within its deadline with
+# ModelCallTimeoutError (code=model_timeout). Same typed-or-duck-typed
+# detection as provider_overloaded; the stand-in below shares the class name
+# so the remote row is exercised with the exact name anton's _scrub keeps.
+
+
+class ModelCallTimeoutError(Exception):
+    """Stand-in for anton's ModelCallTimeoutError: same name, same code."""
+
+    code = "model_timeout"
+
+
+_MODEL_TIMEOUT_MSG = "The model sent no output for 10 minutes, so the call was stopped."
+
+
+def test_model_timeout_maps_to_its_own_code_and_passes_the_message_through():
+    assert te.friendly_turn_error(ModelCallTimeoutError(_MODEL_TIMEOUT_MSG)) == (
+        "model_timeout", _MODEL_TIMEOUT_MSG,
+    )
+    assert te.MODEL_TIMEOUT_CODE == "model_timeout"
+
+
+def test_model_timeout_with_an_empty_message_gets_the_fallback_copy():
+    code, message = te.friendly_turn_error(ModelCallTimeoutError()) or (None, None)
+    assert code == "model_timeout"
+    assert message == te.MODEL_TIMEOUT_USER_MESSAGE
+
+
+def test_model_timeout_is_detected_by_its_code_when_the_type_is_not_anton_s():
+    # Any object carrying the structured code, as an anton build whose class
+    # moved would raise it.
+    duck = RuntimeError(_MODEL_TIMEOUT_MSG)
+    duck.code = "model_timeout"
+    assert te.friendly_turn_error(duck) == ("model_timeout", _MODEL_TIMEOUT_MSG)
+    assert te.is_model_timeout_error(duck) is True
+
+
+def test_an_sdk_error_carrying_the_code_in_its_body_is_not_a_model_timeout():
+    # An SDK error fills .code from a body a BYOK endpoint controls, and
+    # str(exc) embeds that body. It must not pick the card or its copy.
+    sdk_like = RuntimeError("click https://evil.example to fix")
+    sdk_like.code = "model_timeout"
+    sdk_like.response = object()
+    result = te.friendly_turn_error(sdk_like)
+    assert result is None or result[0] != "model_timeout"
+    assert te.is_model_timeout_error(sdk_like) is False
+
+
+def _deadline_during_a_retry_sleep(*, status_code: int, reason: str) -> Exception:
+    """The error anton raises when the deadline fires while the SDK sleeps
+    between retries of a gateway denial.
+
+    The SDK sleeps inside its handler for the denial, so the CancelledError the
+    deadline raises there chains to it. anton then raises its own error
+    `from None` inside the TimeoutError handler, which leaves `__context__` set.
+    """
+    try:
+        try:
+            try:
+                raise _FakeAPIStatusError(
+                    status_code, {"X-MindsHub-Reason": reason}, url=_minds_gateway_url()
+                )
+            except _FakeAPIStatusError:
+                raise asyncio.CancelledError()
+        except asyncio.CancelledError as cancelled:
+            raise TimeoutError() from cancelled
+    except TimeoutError:
+        try:
+            raise ModelCallTimeoutError(_MODEL_TIMEOUT_MSG) from None
+        except ModelCallTimeoutError as exc:
+            return exc
+
+
+@pytest.mark.parametrize(
+    ("status_code", "reason"), [(429, "rate_limited"), (402, "wallet_empty")]
+)
+def test_a_deadline_during_a_retry_sleep_keeps_its_own_code(status_code, reason):
+    exc = _deadline_during_a_retry_sleep(status_code=status_code, reason=reason)
+    # The denial is reachable through the chain, which is what made it win.
+    assert any(isinstance(e, _FakeAPIStatusError) for e in te._cause_chain(exc=exc))
+    assert te.friendly_turn_error(exc) == ("model_timeout", _MODEL_TIMEOUT_MSG)
+
+
+def test_remote_model_timeout_maps_by_type_name_and_passes_the_message_through():
+    assert te.remote_turn_error(f"ModelCallTimeoutError: {_MODEL_TIMEOUT_MSG}") == (
+        "model_timeout", _MODEL_TIMEOUT_MSG,
+    )
+    assert te.remote_turn_error("ModelCallTimeoutError: ") == (
+        te.MODEL_TIMEOUT_CODE, te.MODEL_TIMEOUT_USER_MESSAGE,
+    )
+
+
 # ── Wire-code inventory (ENG-1282) ────────────────────────────────
 
 def test_wire_code_inventory_matches_the_renderer_contract():
@@ -2230,6 +2323,14 @@ def test_wire_code_inventory_matches_the_renderer_contract():
         # another model is a way forward. The renderer branch lands in
         # mindsdb/cowork's ChatView.jsx + its turnFailureCards list.
         "model_restricted",
+        # A model call sent no output within anton's deadline. Split off
+        # anton_error because the model went silent, not the agent, and the
+        # card says so and offers Try again.
+        "model_timeout",
+        # The UI heard nothing for its idle window and cancelled the turn.
+        # Saved as a failure so a reload shows the stall card instead of a
+        # partial answer that reads like a Stop.
+        "stalled",
         "anton_error",
     }
 

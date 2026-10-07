@@ -178,3 +178,87 @@ async def test_cancel_works_on_a_turn_that_has_not_spoken_yet(client, fake_redis
 
     assert body["cancelled"] is True
     assert await fake_redis.exists("cowork:cancel:corr-10") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_stall_cancel_writes_its_cause_before_the_flag(client, fake_redis, monkeypatch):
+    """The controller deletes the flag as soon as it reports the cancel, so
+    the cause has to be in Redis before the flag can start that clock."""
+    await _running_turn("c11", 1, "corr-11")
+    writes: list[str] = []
+    real_set = fake_redis.set
+
+    async def recording_set(key, value, *args, **kwargs):
+        writes.append(key)
+        return await real_set(key, value, *args, **kwargs)
+
+    monkeypatch.setattr(fake_redis, "set", recording_set)
+
+    body = client.post(
+        "/api/v1/responses/cancel",
+        json={"conversation_id": "c11", "reason": "stalled"},
+    ).json()
+
+    assert body["cancelled"] is True
+    assert writes == ["cowork:cancel_cause:corr-11", "cowork:cancel:corr-11"]
+    assert await fake_redis.get("cowork:cancel_cause:corr-11") == "stalled"
+    assert 0 < await fake_redis.ttl("cowork:cancel_cause:corr-11") <= 300
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", [None, "user", "something-newer"])
+async def test_only_a_stall_writes_a_cancel_cause(client, fake_redis, reason):
+    """A Stop, and any reason this server does not know, cancels exactly as
+    before and leaves no cause behind."""
+    await _running_turn("c12", 1, "corr-12")
+    payload = {"conversation_id": "c12"} if reason is None else {
+        "conversation_id": "c12", "reason": reason,
+    }
+
+    resp = client.post("/api/v1/responses/cancel", json=payload)
+
+    assert resp.status_code == 200
+    assert await fake_redis.exists("cowork:cancel:corr-12") == 1
+    assert await fake_redis.exists("cowork:cancel_cause:corr-12") == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stalled", [True, False])
+async def test_the_owner_saves_a_stall_another_replica_reported(monkeypatch, fake_redis, stalled):
+    """The replica that owns the turn learns of the cancel only from the
+    controller's turn_failed, after the controller deleted the flag. The cause
+    key is what tells it a stall from a Stop."""
+    import cowork.handlers.responses as responses_mod
+    from test_responses_remote_backend import _RecBuffer, _remote_handler
+
+    monkeypatch.setattr(responses_mod, "get_redis", lambda: fake_redis)
+    if stalled:
+        await fake_redis.set("cowork:cancel_cause:corr-13", "stalled", ex=300)
+    saved: dict = {}
+    handler = _remote_handler(monkeypatch, saved)
+
+    async def replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_delta", {"text": "partial"}
+        yield "turn_failed", {"error": "cancelled"}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", replies)
+    buffer = _RecBuffer()
+
+    await handler._produce_remote(
+        conv_id="c13", input_text="hi", original_content="hi", model="anton",
+        harness_id="anton", buffer=buffer, turn_llm={"correlation_id": "corr-13"},
+    )
+
+    assert saved["assistant"] == "partial"
+    if stalled:
+        assert buffer.frames[-1] == "CLOSE:interrupted"
+        failed = [f for f in buffer.frames if f.startswith("event: response.failed")]
+        assert len(failed) == 1 and '"code": "stalled"' in failed[0]
+        assert saved["events"][-1]["code"] == "stalled"
+        assert saved["events"][-1]["request_id"] == "corr-13"
+    else:
+        # A Stop: partial answer, no error row, closed cancelled.
+        assert buffer.frames[-1] == "CLOSE:cancelled"
+        assert not any("response.failed" in f for f in buffer.frames)
+        assert not any(e.get("type") == "response.failed" for e in saved["events"])

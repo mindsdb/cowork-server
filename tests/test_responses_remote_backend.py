@@ -8,6 +8,7 @@ the persistence layer inside _produce_remote) are stubbed.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import contextmanager
 import logging
@@ -2369,3 +2370,124 @@ async def test_produce_remote_does_not_retire_an_answered_question(monkeypatch):
         model="anton", harness_id="anton", buffer=_RecBuffer(),
     )
     assert [e["status"] for e in _retirements(saved["events"])] == ["answered"]
+
+
+# ── Cloud keep-alive while a model call is quiet ──────────────────────
+# The pod sends a model_wait progress line every 20 s while anton waits on a
+# quiet model call. Each one must reach the buffer, so the watchdog and the
+# Redis tail both see a live turn, and none may be saved into the turn's
+# events, since a reload has nothing to show for them. Timings are shrunk so
+# the turn outlives both bounds many times over.
+
+
+@pytest.fixture
+def _shrunk_redis_bounds(monkeypatch):
+    import sys
+
+    import fakeredis.aioredis
+
+    from cowork.streaming import buffer as buffer_mod
+    from cowork.streaming.buffer import RedisStreamBuffer
+    from cowork.streaming.registry import registry
+
+    client = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(buffer_mod, "get_redis", lambda: client)
+    monkeypatch.setattr(buffer_mod, "REDIS_TAIL_IDLE_TIMEOUT_SECONDS", 0.3)
+    monkeypatch.setattr(RedisStreamBuffer, "_BLOCK_MS", 50)
+    registry_module = sys.modules["cowork.streaming.registry"]
+    monkeypatch.setattr(registry_module, "_IDLE_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(registry_module, "_MAX_TURN_IDLE_SECONDS", 0.3)
+    monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")
+    registry.reset()
+    yield
+    registry.reset()
+
+
+async def _collect_frames(stream):
+    return [frame async for frame in stream]
+
+
+@pytest.mark.asyncio
+async def test_a_quiet_model_call_on_the_pod_keeps_a_redis_turn_alive(
+    monkeypatch, caplog, _shrunk_redis_bounds,
+):
+    from cowork.handlers.responses import sse_from_buffer
+    from cowork.streaming.buffer import RedisStreamBuffer
+    from cowork.streaming.registry import registry
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    ticks = 30
+
+    async def replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        # 1.5 s with nothing but keep-alives: five times the tail and
+        # watchdog bounds.
+        for i in range(ticks):
+            await asyncio.sleep(0.05)
+            yield "turn_step", {
+                "step": "progress", "phase": "model_wait",
+                "message": f"Waiting for the model ({i}s)", "eta_seconds": float(i),
+                "id": None, "ok": None,
+            }
+        yield "turn_delta", {"text": "done"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", replies)
+    conv_id = str(uuid4())
+    buffer = RedisStreamBuffer(conversation_id=conv_id, turn_id=0)
+    lifecycle = TurnLifecycle()
+    caplog.set_level(logging.WARNING)
+
+    handle = await registry.start(
+        conversation_id=conv_id, turn_id=0, buffer=buffer, lifecycle=lifecycle,
+        producer_coro=handler._produce_remote(
+            conv_id=conv_id, input_text="hi", original_content="hi", model="anton",
+            harness_id="anton", buffer=buffer, lifecycle=lifecycle,
+        ),
+    )
+    # Another replica's reader, as the web tier tails a cloud turn.
+    reader = RedisStreamBuffer(conversation_id=conv_id, turn_id=0)
+    frames = await asyncio.wait_for(
+        _collect_frames(sse_from_buffer(reader)), timeout=10,
+    )
+    await asyncio.wait_for(handle.task, timeout=5)
+
+    assert lifecycle.timed_out is False
+    assert frames[-1].startswith("event: response.completed\n")
+    assert saved["assistant"] == "done"
+    waits = [f for f in frames if '"phase": "model_wait"' in f]
+    assert len(waits) == ticks  # none throttled away
+    assert not [e for e in saved["events"] if e.get("phase") == "model_wait"]
+    assert "went quiet" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_pod_model_call_timeout_saves_its_own_code_and_request_id(monkeypatch):
+    from cowork.handlers.turn_errors import remote_turn_error
+
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    wire_error = "ModelCallTimeoutError: The model sent no output for 10 minutes, so the call was stopped."
+
+    async def replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_delta", {"text": "partial"}
+        # Classified the way stream_remote_replies classifies every turn_failed.
+        code, message = remote_turn_error(wire_error)
+        yield "turn_failed", {"error": wire_error, "code": code, "message": message}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", replies)
+    buffer = _RecBuffer()
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi", model="anton",
+        harness_id="anton", buffer=buffer, turn_llm={"correlation_id": "corr-deadline"},
+    )
+
+    assert buffer.frames[-1] == "CLOSE:error"
+    failed = saved["events"][-1]
+    assert failed["type"] == "response.failed"
+    assert failed["code"] == "model_timeout"
+    assert failed["error"] == "The model sent no output for 10 minutes, so the call was stopped."
+    assert failed["request_id"] == "corr-deadline"

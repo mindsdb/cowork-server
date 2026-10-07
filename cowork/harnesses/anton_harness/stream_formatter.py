@@ -26,6 +26,7 @@ from cowork.schemas.responses import (
     ResponseStatus,
     Role,
 )
+from cowork.streaming.liveness import MODEL_WAIT_LABEL, MODEL_WAIT_PHASE, model_wait_sse
 
 
 @dataclass
@@ -87,6 +88,8 @@ PHASE_LABELS = {
     # The turn is handing back with an explanation instead of continuing, so
     # the text after it adds to the answer rather than replacing it.
     "handback": "Wrapping up",
+    # A model call is open and quiet; the turn is alive, not hung.
+    MODEL_WAIT_PHASE: MODEL_WAIT_LABEL,
 }
 
 PROGRESS_THROTTLE = 0.25  # seconds
@@ -385,6 +388,20 @@ async def format_responses_stream(
             # under PROGRESS_THROTTLE — dropping a scratchpad_done
             # would leave the cell stuck in_progress in the UI.
             phase_str = event.phase or ""
+            # A keep-alive from the cloud pod while a model call is quiet.
+            # Never throttled: dropping it lets the idle bounds end a live
+            # turn, and the pod sends one only after 20 s of quiet, so it
+            # cannot flood the stream. It also stays out of event_sink and
+            # off the throttle anchor: it says the turn is alive, and a
+            # reload has nothing to show for it.
+            if phase_str == MODEL_WAIT_PHASE:
+                seq += 1
+                yield model_wait_sse(
+                    message=event.message or "",
+                    waited_s=getattr(event, "eta_seconds", None),
+                    sequence_number=seq,
+                )
+                continue
             # Latched ahead of the throttling below: this notice is
             # rate-limited like any other, but the reset it implies is not.
             if phase_str == "continuation":
