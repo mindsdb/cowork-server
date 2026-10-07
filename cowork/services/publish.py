@@ -26,7 +26,11 @@ from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings  # noqa: F401
 
 from cowork.services.connectors.persist import vault_for_scope
-from cowork.services.providers import is_mindshub_publish_url, publish_url_for_endpoint
+from cowork.services.providers import (
+    is_mindshub_publish_url,
+    normalize_publish_url,
+    publish_url_for_endpoint,
+)
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
 from anton.minds_client import describe_minds_connection_error
 from anton.publish_access import access_from_owner_side
@@ -245,6 +249,9 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
          SettingService, which passes DB rows as init kwargs);
       2. the ``publish_url`` setting;
       3. the host derived from the active provider endpoint.
+
+    A result on the retired 4nton.ai host becomes the prod publish host
+    (`normalize_publish_url`): a saved setting may still name it.
     """
     oai_host = (urlparse(settings.openai_base_url or "").hostname or "").lower()
     if oai_host.startswith("api") and oai_host.endswith(".mindshub.ai"):
@@ -253,7 +260,9 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
     else:
         endpoint, api_key = settings.minds_url, _secret_str(settings.minds_api_key)
     env_publish_url = os.environ.get("ANTON_PUBLISH_URL", "").strip()
-    publish_url = env_publish_url or settings.publish_url or publish_url_for_endpoint(endpoint)
+    publish_url = normalize_publish_url(
+        env_publish_url or settings.publish_url or publish_url_for_endpoint(endpoint)
+    )
     return publish_url, api_key
 
 
