@@ -612,11 +612,10 @@ async def publish_and_card_turn_artifacts(
     """Reconcile publishes for this turn, then build the cards to emit.
 
     The second half of the end-of-turn artifact flow. The first half records
-    what the turn created and produces the arguments: `index_turn_artifacts`
-    in the in-process harness, whose `finally` runs it synchronously (so an
-    artifact is recorded even on error or Stop, and an `await` there is
-    skipped on cancellation), and `turn_artifact_changes` plus a
-    `record_new_artifacts` unit in the remote producer.
+    what the turn created and produces the arguments. The in-process harness
+    protects its cleanup with run_to_completion and records the
+    turn_artifact_changes result in a database unit, including on error or
+    Stop. The remote producer uses the same two artifact helpers.
 
     Shared by both producers. The in-process harness reaches it through
     `AntonHarness.stream_response`; on an org deployment that harness refuses to

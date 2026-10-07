@@ -42,6 +42,17 @@ from cowork.streaming.records import (
 logger = logging.getLogger(__name__)
 
 
+def _is_final_client_frame(type_: str, data: dict) -> bool:
+    if type_ in REASON_TO_TYPE.values():
+        return True
+    if type_ != "sse":
+        return False
+    return any(
+        line in {"event: response.completed", "event: response.failed", "event: response.cancelled"}
+        for line in (data.get("sse") or "").splitlines()
+    )
+
+
 # ── interface ────────────────────────────────────────────────────────
 
 
@@ -65,6 +76,12 @@ class StreamBuffer(ABC):
     def tail(self, from_seq: int = 0) -> AsyncIterator[TurnRecord]:
         """Yield records with ``seq >= from_seq``, then live-tail to the
         terminal record. Never raises on consumer cancellation."""
+
+    @property
+    def is_finishing(self) -> bool:
+        """A final client frame is being written; the next turn may wait for
+        the internal terminal record instead of receiving a refusal."""
+        return getattr(self, "_finishing", False)
 
     @property
     @abstractmethod
@@ -203,6 +220,8 @@ class FileStreamBuffer(StreamBuffer):
         if self._closed:
             logger.warning("Append to closed buffer %s ignored", self._path)
             return self._seq
+        if _is_final_client_frame(type_, data):
+            self._finishing = True
         record = {"seq": self._seq, "ts": now_iso(), "type": type_, "data": data}
         try:
             self._writer.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -295,6 +314,8 @@ class RedisStreamBuffer(StreamBuffer):
         # Serialised: seq is assigned in this process, so two concurrent
         # appends could otherwise claim the same number.
         async with self._write_lock:
+            if _is_final_client_frame(type_, data):
+                self._finishing = True
             seq = self._next_seq
             self._next_seq += 1
             r = get_redis()

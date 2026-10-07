@@ -9,6 +9,7 @@ import warnings
 from uuid import uuid4
 
 import httpx
+import fakeredis.aioredis
 import pytest
 
 import cowork.handlers.responses as responses_mod
@@ -16,6 +17,7 @@ from cowork.handlers.response_routing import DELEGATED_AGENTIC, DIRECT_CONTEXT, 
 from cowork.server import create_app
 from cowork.streaming import RunRegistry, TurnInProgress, get_streams_dir, registry
 from cowork.streaming.buffer import FileStreamBuffer, read_records, turn_buffer_path
+from cowork.streaming import backend as backend_mod, buffer as buffer_mod
 
 from _fakes import PausedHarness, opens
 
@@ -313,3 +315,90 @@ async def test_a_turn_that_wrote_its_terminal_record_does_not_refuse_the_next(tm
     assert runs.get("c") is second
     unwound.set()
     await asyncio.gather(first.task, second.task)
+
+
+@pytest.mark.parametrize(
+    "frame,reason,task_cancelled",
+    [("response.failed", "error", False), ("response.failed", "error", True),
+     ("response.cancelled", "cancelled", True)],
+)
+async def test_a_follow_up_waits_for_the_redis_terminal_instead_of_being_refused(
+    monkeypatch, frame, reason, task_cancelled,
+):
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    monkeypatch.setattr(buffer_mod, "get_redis", lambda: redis)
+    monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")
+    runs = RunRegistry()
+    final_written, release = asyncio.Event(), asyncio.Event()
+    expire = redis.expire
+
+    async def held_expiry(key, seconds):
+        if not final_written.is_set():
+            final_written.set()
+            await release.wait()
+        return await expire(key, seconds)
+
+    monkeypatch.setattr(redis, "expire", held_expiry)
+
+    async def refused(buffer):
+        await buffer.append("sse", {"sse": f"event: {frame}\ndata: {{}}\n\n"})
+        await buffer.close(reason)
+        if task_cancelled:
+            raise asyncio.CancelledError()
+
+    first = await runs.start(
+        conversation_id="c", turn_id=0,
+        open_buffer=lambda: backend_mod.new_buffer("c", 0), produce=refused,
+    )
+    await asyncio.wait_for(final_written.wait(), timeout=5)
+
+    async def answered(buffer):
+        await buffer.append("sse", {"sse": "event: response.completed\ndata: {}\n\n"})
+        await buffer.close("completed")
+
+    following = asyncio.create_task(runs.start(
+        conversation_id="c", turn_id=0,
+        open_buffer=lambda: backend_mod.new_buffer("c", 0), produce=answered,
+    ))
+    try:
+        await asyncio.sleep(0.05)
+        assert not first.is_answering
+        assert not following.done(), "a queued follow-up must wait rather than receive 409"
+    finally:
+        release.set()
+    second = await asyncio.wait_for(following, timeout=5)
+    await asyncio.gather(first.task, second.task, return_exceptions=True)
+    records = [record async for record in second.buffer.tail()]
+    assert [record.type for record in records] == ["sse", "Done"]
+    assert "response.completed" in records[0].data["sse"]
+    await redis.aclose()
+
+
+async def test_a_slow_buffer_open_does_not_block_another_conversation(tmp_path):
+    runs = RunRegistry()
+    opening, release_open, release_turn = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def slow_open():
+        opening.set()
+        await release_open.wait()
+        return FileStreamBuffer(tmp_path / "one.jsonl")
+
+    async def answer(buffer):
+        await release_turn.wait()
+        await buffer.close("completed")
+
+    first = asyncio.create_task(runs.start(
+        conversation_id="one", turn_id=0, open_buffer=slow_open, produce=answer,
+    ))
+    await opening.wait()
+    try:
+        second = await asyncio.wait_for(runs.start(
+            conversation_id="two", turn_id=0,
+            open_buffer=opens(FileStreamBuffer(tmp_path / "two.jsonl")), produce=answer,
+        ), timeout=1)
+    finally:
+        release_open.set()
+        release_turn.set()
+        first_handle = await first
+        await first_handle.task
+    await second.task
