@@ -41,7 +41,7 @@ from cowork.db import units
 from cowork.db.scoped import LOCAL_SCOPE, SYSTEM_SCOPE
 from cowork.db.units import DatabaseBusy, conversation_writes, unit_session
 from cowork.handlers.response_routing import DELEGATED_AGENTIC, DIRECT_CONTEXT, RouteDecision
-from cowork.handlers.turn_errors import INTERRUPTED_TURN_MESSAGE, SERVER_BUSY_CODE
+from cowork.handlers.turn_errors import INTERRUPTED_TURN_MESSAGE, SERVER_BUSY_CODE, server_busy_message
 from cowork.harnesses.anton_harness import harness as harness_mod
 from cowork.models.message import Message
 from cowork.models.schedule import Schedule, ScheduleRun
@@ -1201,6 +1201,148 @@ async def test_a_stop_during_a_remote_frame_records_the_pods_artifact_before_the
     assert _terminal(conversation_id) == "Cancelled"
 
 
+def _the_pod_replies(monkeypatch, *replies: tuple[str, dict]) -> None:
+    """The pod sends ``replies`` at once."""
+
+    async def pod_replies(**_kwargs):
+        for reply in replies:
+            yield reply
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", pod_replies)
+
+
+def _paused_unit(monkeypatch, name: str) -> tuple[threading.Event, threading.Event]:
+    """Pause the remote producer's unit function ``name`` in its worker
+    thread: ``entered`` is set once it runs, and it goes on once ``proceed``
+    is set."""
+    entered, proceed = threading.Event(), threading.Event()
+    unit = getattr(responses_mod, name)
+
+    def paused(session, **kwargs):
+        entered.set()
+        proceed.wait(timeout=10)
+        return unit(session, **kwargs)
+
+    monkeypatch.setattr(responses_mod, name, paused)
+    return entered, proceed
+
+
+async def _stop_while_paused(
+    conversation_id: UUID, entered: threading.Event, proceed: threading.Event,
+) -> tuple[httpx.Response, bool]:
+    """Ask, Stop the turn once its paused unit runs, and let the unit go on.
+    The answer, and whether the Stop waited for the unit."""
+    async with _client() as client:
+        answer = asyncio.create_task(_ask(client, conversation_id, "hi"))
+        await _until(entered.is_set)
+        stop = asyncio.create_task(registry.cancel(str(conversation_id)))
+        await asyncio.sleep(0.3)
+        stop_waited_for_the_unit = not stop.done()
+        proceed.set()
+        assert await asyncio.wait_for(stop, timeout=10) is True
+        return await asyncio.wait_for(answer, timeout=10), stop_waited_for_the_unit
+
+
+async def test_a_stop_during_the_remote_question_save_waits_for_it_and_finalizes_the_question(monkeypatch):
+    """A Stop lands while the remote producer's first write, the question,
+    runs in its worker thread. The Stop waits for it, so the turn knows the
+    question it saved and finalizes it rather than leaving it pending for
+    good, and the pod is never asked."""
+    _turns_go_to_the_remote_backend(monkeypatch)
+
+    async def pod_replies(**_kwargs):
+        raise AssertionError("the pod must not be asked once the turn is stopped")
+        yield  # an async generator, like the real one
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", pod_replies)
+    conversation_id = _conversation()
+    entered, proceed = _paused_unit(monkeypatch, "_save_remote_question")
+
+    answered, stop_waited_for_the_unit = await _stop_while_paused(conversation_id, entered, proceed)
+
+    assert stop_waited_for_the_unit
+    assert _frames(answered.text)[-1][0] == "response.cancelled"
+    assert _terminal(conversation_id) == "Cancelled"
+    assert [(r.role, r.pending) for r in _rows(conversation_id)] == [("user", False)]
+
+
+async def test_a_stop_during_the_remote_answer_save_waits_for_it_and_ends_completed(monkeypatch):
+    """A Stop lands while the remote producer saves the pod's finished
+    answer. The Stop waits for the save and the frame that reports it, so
+    the stream ends completed with the saved row's id, as the database
+    holds it, rather than cancelled."""
+    _turns_go_to_the_remote_backend(monkeypatch)
+    _the_pod_replies(monkeypatch, ("turn_delta", {"text": "done"}), ("turn_completed", {}))
+    conversation_id = _conversation()
+    entered, proceed = _paused_unit(monkeypatch, "_save_answer")
+
+    answered, stop_waited_for_the_unit = await _stop_while_paused(conversation_id, entered, proceed)
+
+    assert stop_waited_for_the_unit
+    last_kind, last = _frames(answered.text)[-1]
+    assert last_kind == "response.completed", _frames(answered.text)
+    assert last["assistant_message_id"]
+    assert _terminal(conversation_id) == "Done"
+    assert [(r.role, r.pending) for r in _rows(conversation_id)] == [("user", False), ("assistant", False)]
+
+
+@pytest.mark.parametrize("failure", ["no_connection_frees", "the_save_raises"])
+async def test_a_remote_answer_whose_save_fails_ends_the_stream_as_failed(request, monkeypatch, failure):
+    """No connection frees within POOL_TIMEOUT for the remote producer's
+    last unit, or the answer's insert raises. The pod's answer was streamed,
+    but it is not in the database, so the stream ends with response.failed
+    and an error terminal record, never response.completed, and the
+    question stays pending."""
+    _turns_go_to_the_remote_backend(monkeypatch)
+    replying, release = asyncio.Event(), asyncio.Event()
+
+    async def pod_replies(**_kwargs):
+        yield "turn_delta", {"text": "done"}
+        replying.set()
+        await release.wait()
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", pod_replies)
+    one_connection_pool = None
+    if failure == "no_connection_frees":
+        one_connection_pool = request.getfixturevalue("one_connection_pool")
+    else:
+
+        def disk_full(*_args, **_kwargs):
+            raise RuntimeError("disk full")
+
+        monkeypatch.setattr(ConversationService, "save_assistant_turn", disk_full)
+    conversation_id = _conversation()
+
+    held = None
+    async with _client() as client:
+        answer = asyncio.create_task(_ask(client, conversation_id, "hi"))
+        await asyncio.wait_for(replying.wait(), timeout=10)
+        if one_connection_pool is not None:
+            held = await _take_the_only_connection(one_connection_pool)
+        release.set()
+        try:
+            answered = await asyncio.wait_for(answer, timeout=5 * WAIT)
+        finally:
+            if held is not None:
+                held.close()
+
+    frames = _frames(answered.text)
+    kinds = [kind for kind, _ in frames]
+    assert "response.output_text.delta" in kinds
+    assert "response.completed" not in kinds
+    assert kinds[-1] == "response.failed", kinds
+    failed = frames[-1][1]
+    if failure == "no_connection_frees":
+        assert failed["code"] == SERVER_BUSY_CODE
+        assert failed["retry_after"] == WAIT
+    else:
+        assert failed["code"] == "anton_error"
+    assert "assistant_message_id" not in failed
+    assert _terminal(conversation_id) == "Error"
+    assert [(r.role, r.pending) for r in _rows(conversation_id)] == [("user", True)]
+
+
 # ── The connector form stream: no connection held during the probe ───────────
 
 
@@ -1224,26 +1366,40 @@ class _PausedProbe:
         yield "verdict", ProbeOutcome(status="failure", error="Password rejected.")
 
 
-async def test_a_connector_probe_holds_no_connection_while_it_runs(monkeypatch):
-    """POST /api/v1/connectors/submissions/ streams a credential probe that
-    waits on a model. While it waits no connection is checked out; the
-    conversation read before it and the assistant turn saved after it run
-    off the event loop's thread. Only the settings read that builds the
-    probe's model client checks out on the loop, before the probe starts."""
+def _probe_runs_against_a_stand_in_form(monkeypatch):
+    """A registry connector whose form has no fields, a workspace and a model
+    client that are stand-ins, and the probe handler module to patch further."""
     from cowork.handlers import probe as probe_handler
 
-    engine = _app_engine()
-    pool = engine.pool
-    conversation_id = _conversation()
-    monkeypatch.setattr(_PausedProbe, "probing", asyncio.Event())
-    monkeypatch.setattr(_PausedProbe, "release", asyncio.Event())
-    monkeypatch.setattr(probe_handler, "CredentialProbe", _PausedProbe)
     monkeypatch.setattr(probe_handler.ProbeHandler, "_build_llm_client", staticmethod(lambda settings=None: object()))
     monkeypatch.setattr("anton.workspace.Workspace", lambda path: SimpleNamespace(path=path))
     spec = SimpleNamespace(form=SimpleNamespace(
         form_id="probe-form", methods=None, fields=[], model_dump=lambda: {"form_id": "probe-form"},
     ))
     monkeypatch.setattr(probe_handler.registry, "get_connector", lambda _connector_id: spec)
+    return probe_handler
+
+
+def _form_patches(body: str) -> list[dict]:
+    """The form patches a probe stream sent, in order: each is a fenced
+    data-vault-form-patch block inside a text delta."""
+    text = "".join(data["delta"] for kind, data in _frames(body) if kind == "response.output_text.delta")
+    fence = "```data-vault-form-patch\n"
+    return [json.loads(block.split("\n```", 1)[0]) for block in text.split(fence)[1:]]
+
+
+async def test_a_connector_probe_holds_no_connection_while_it_runs(monkeypatch):
+    """POST /api/v1/connectors/submissions/ streams a credential probe that
+    waits on a model. While it waits no connection is checked out. The
+    conversation read and the settings read before it, and the assistant
+    turn saved after it, all run off the event loop's thread."""
+    probe_handler = _probe_runs_against_a_stand_in_form(monkeypatch)
+    engine = _app_engine()
+    pool = engine.pool
+    conversation_id = _conversation()
+    monkeypatch.setattr(_PausedProbe, "probing", asyncio.Event())
+    monkeypatch.setattr(_PausedProbe, "release", asyncio.Event())
+    monkeypatch.setattr(probe_handler, "CredentialProbe", _PausedProbe)
 
     with _logging_checkouts(engine) as log:
         async with _client() as client:
@@ -1263,9 +1419,43 @@ async def test_a_connector_probe_holds_no_connection_while_it_runs(monkeypatch):
     completed = _frames(answered.text)[-1]
     assert completed[0] == "response.completed", completed
     assert held_while_probing == 0
-    on_the_loop = [c for c in log.on_the_loop if "_load_from_db" not in c.sites]
-    assert on_the_loop == [], f"{len(on_the_loop)} checkout(s) on the event loop's thread"
+    assert log.on_the_loop == [], f"{len(log.on_the_loop)} checkout(s) on the event loop's thread"
     with unit_session(scope=LOCAL_SCOPE) as session:
         (saved,) = ConversationService(session).get_ordered_messages(conversation_id)
     assert saved.role == "assistant" and "Password rejected." in saved.content
     assert completed[1]["assistant_message_id"] == str(saved.id)
+
+
+async def test_a_connector_probe_that_finds_the_pool_full_tells_the_form_cowork_is_busy(
+    one_connection_pool, monkeypatch, caplog,
+):
+    """The pool's only connection is taken, so the unit that reads the
+    probe's settings finds none within POOL_TIMEOUT. The form is told Cowork
+    is busy, with the wait, the probe never starts, and the refusal is
+    logged as a warning, without a traceback."""
+    probe_handler = _probe_runs_against_a_stand_in_form(monkeypatch)
+    _logging_on(monkeypatch, probe_handler.logger)
+
+    class _NeverStarts:
+        def __init__(self, **_kwargs) -> None:
+            raise AssertionError("the probe must not start without its settings")
+
+    monkeypatch.setattr(probe_handler, "CredentialProbe", _NeverStarts)
+
+    held = await _take_the_only_connection(one_connection_pool)
+    try:
+        async with _client() as client:
+            answered = await asyncio.wait_for(client.post(
+                "/api/v1/connectors/submissions/",
+                json={"connector_id": "postgres", "name": "warehouse", "values": {"password": "hunter2"}},
+            ), timeout=5 * WAIT)
+    finally:
+        held.close()
+
+    assert answered.status_code == 200, answered.text
+    completed = _frames(answered.text)[-1]
+    assert completed[0] == "response.completed", completed
+    assert completed[1]["response"]["status"] == "failed"
+    assert _form_patches(answered.text) == [{"form_id": "probe-form", "form_error": server_busy_message(WAIT)}]
+    logged = [r for r in caplog.records if r.name == probe_handler.logger.name]
+    assert [(r.levelno, r.exc_info) for r in logged] == [(logging.WARNING, None)], [r.getMessage() for r in logged]

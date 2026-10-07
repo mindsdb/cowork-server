@@ -14,14 +14,17 @@ from uuid import UUID
 
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
+from cowork.common.settings.user_settings import UserSettings
+from cowork.handlers.turn_errors import server_busy_message
 from cowork.schemas.responses import Role
 from cowork.services.connectors.persist import persist_connection, vault_for_scope
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import store
-from cowork.db.scoped import ScopedSession, TenantScope
-from cowork.db.units import conversation_writes, run_db
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, unsafe_unscoped_session
+from cowork.db.units import busy_retry_seconds, conversation_writes, run_db
 from cowork.services.conversations import ConversationService
+from cowork.services.settings import SettingService
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +65,15 @@ def _read_conversation(session: ScopedSession, *, conversation_id: UUID) -> _Pro
     return _ProbeConversation(id=conversation.id, workspace_path=Path(conversation.project.path))
 
 
+def _read_probe_settings(session: ScopedSession) -> UserSettings:
+    """The settings the probe's model client is built from. They are read for
+    LOCAL_SCOPE, the install's global rows, which is what get_user_settings()
+    resolves when no tenant is bound for settings, as none is here.
+    SettingService routes each key to its row itself, so it reads through the
+    raw session."""
+    return SettingService(unsafe_unscoped_session(session), LOCAL_SCOPE).load()
+
+
 def _save_probe_turn(
     session: ScopedSession, *, conversation_id: UUID, text: str, events: tuple[dict, ...],
 ) -> UUID | None:
@@ -76,8 +88,9 @@ class ProbeHandler:
     as an assistant turn.
 
     Its database work runs as units (cowork.db.units): the conversation read
-    before the probe and the assistant-turn write after it. No connection is
-    held while the probe waits on the model.
+    and the settings read before the probe, and the assistant-turn write after
+    it. No connection is held while the probe waits on the model, and none is
+    checked out on the event loop.
     """
 
     def __init__(self, *, scope: TenantScope) -> None:
@@ -284,23 +297,27 @@ class ProbeHandler:
                 logger.exception("Could not build workspace for probe")
 
             llm_client = None
+            init_error = "Could not initialize the probe (workspace or LLM client unavailable)."
             try:
-                from cowork.common.settings.user_settings import get_user_settings
                 from cowork.services.providers import web_tool_kwargs_for
 
                 # Capture the client and its web policy together, before the
                 # yields below let a settings update run ahead of the probe.
-                settings = get_user_settings()
+                settings = await run_db(_read_probe_settings, scope=self.scope)
                 web_tools = web_tool_kwargs_for(settings.resolved_planning_provider)
                 llm_client = self._build_llm_client(settings=settings)
+            except PoolTimeoutError:
+                # The form says so, with the wait, so the user submits it
+                # again rather than checking a model key that is fine.
+                init_error = server_busy_message(busy_retry_seconds())
+                logger.warning("No database connection freed in time to read the probe's settings")
             except Exception:
                 logger.exception("Could not build LLM client for probe")
 
             # Workspace / LLM client availability
             if workspace is None or llm_client is None:
-                err = "Could not initialize the probe (workspace or LLM client unavailable)."
-                yield _delta(err)
-                yield _patch_delta({"form_id": form_id, "form_error": err})
+                yield _delta(init_error)
+                yield _patch_delta({"form_id": form_id, "form_error": init_error})
                 yield await _completed(db_conversation_id, {"status": "failed"})
                 return
 

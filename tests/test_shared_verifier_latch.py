@@ -78,9 +78,7 @@ async def _chat_session_config(monkeypatch):
 async def _probe_session_config(monkeypatch):
     """The connector probe's ChatSessionConfig, built by the real probe handler."""
     settings = _settings()
-    monkeypatch.setattr(
-        "cowork.common.settings.user_settings.get_user_settings", lambda *a, **k: settings
-    )
+    monkeypatch.setattr(probe_handler, "_read_probe_settings", lambda _session: settings)
     configs = []
 
     def _capture(config):

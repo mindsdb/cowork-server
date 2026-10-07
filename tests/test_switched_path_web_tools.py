@@ -174,8 +174,13 @@ async def _probe_session_config(
     from cowork.handlers import probe as handler_module
     from cowork.services.connectors import probe as probe_module
 
+    # The handler reads its settings in a unit; anything after it would read
+    # them through get_user_settings. Both answer from `current`.
+    current = {"settings": settings}
+    monkeypatch.setattr(handler_module, "_read_probe_settings", lambda _session: current["settings"])
     monkeypatch.setattr(
-        "cowork.common.settings.user_settings.get_user_settings", lambda *a, **k: settings
+        "cowork.common.settings.user_settings.get_user_settings",
+        lambda *a, **k: current["settings"],
     )
     configs = []
 
@@ -201,10 +206,7 @@ async def _probe_session_config(
         if changed_settings is not None and "Starting probe" in event:
             # The handler has built its client and yielded to the consumer.
             # A settings write can complete before CredentialProbe.run starts.
-            monkeypatch.setattr(
-                "cowork.common.settings.user_settings.get_user_settings",
-                lambda *a, **k: changed_settings,
-            )
+            current["settings"] = changed_settings
     (config,) = configs
     await config.llm_client.aclose()
     return config
