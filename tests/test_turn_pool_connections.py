@@ -1062,8 +1062,10 @@ async def test_two_first_sends_for_one_new_conversation_get_one_answer_and_one_r
     """A double click sends the first question of a new conversation twice.
     With as many unit slots as a Postgres pool lends, both requests look for
     the conversation before either creates it, and both create it. The second
-    insert does not fail its request: one question is answered and the other
-    is refused as a duplicate send."""
+    insert does not fail its request. Both compute the same turn number, so
+    one question is answered and the other is refused as a duplicate send,
+    whether it reaches the registry while the first turn answers or after
+    that turn has saved its question and ended."""
     units._SLOTS.set(anyio.CapacityLimiter(4))
     model = PausedModel()
     monkeypatch.setattr(harness_mod, "build_chat_session", model.build)

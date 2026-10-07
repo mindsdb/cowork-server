@@ -6,9 +6,12 @@ unit runs. ``unit_session`` is that session for synchronous code. ``run_db``
 runs a unit in a worker thread for async code, so a wait for a connection
 never stalls the event loop.
 
-A unit's waits, first for a slot and then for a connection, share one
-POOL_TIMEOUT budget and end in ``DatabaseBusy``, which the app answers with 503
-(cowork.server).
+A caller of ``run_db`` waits first for a slot and then for a connection, and
+gives up at one deadline, POOL_TIMEOUT after it asked, with ``DatabaseBusy``,
+which the app answers with 503 (cowork.server). A worker thread still waiting
+in the pool after that keeps its slot until the pool's own timeout passes or
+a connection frees. When a connection frees first, the thread hands it
+straight back without running the unit.
 """
 from __future__ import annotations
 

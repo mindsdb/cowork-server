@@ -15,11 +15,12 @@ import pytest
 import cowork.handlers.responses as responses_mod
 from cowork.handlers.response_routing import DELEGATED_AGENTIC, DIRECT_CONTEXT, RouteDecision
 from cowork.server import create_app
-from cowork.streaming import RunRegistry, TurnInProgress, get_streams_dir, registry
+from cowork.streaming import RunRegistry, TurnInProgress, TurnLifecycle, get_streams_dir, registry
 from cowork.streaming.buffer import FileStreamBuffer, read_records, turn_buffer_path
 from cowork.streaming import backend as backend_mod, buffer as buffer_mod
 
 from _fakes import PausedHarness, opens
+from test_responses_remote_backend import _FakeBuffer, _remote_handler
 
 REFUSAL = {
     "detail": (
@@ -246,6 +247,131 @@ async def test_two_questions_racing_through_the_gate_leave_the_first_stream_whol
     assert items == [("user", "one"), ("assistant", "ok")]
 
 
+@pytest.mark.parametrize("route", [DELEGATED_AGENTIC, DIRECT_CONTEXT])
+async def test_a_question_whose_gate_outlasted_the_turn_it_raced_is_refused(monkeypatch, route):
+    """Both questions read the history before either is saved, so both compute
+    the same turn number. The first question's turn ends while the second is
+    still in its gate. That turn saved its question, so the registry refuses
+    the second when it arrives: the first turn's buffer keeps its own records
+    and the question is not saved."""
+    gate = PausedHarness()
+    gate.release.set()
+    monkeypatch.setattr(responses_mod, "get_harness", lambda name: gate)
+    arrived = [asyncio.Event(), asyncio.Event()]
+    go = [asyncio.Event(), asyncio.Event()]
+
+    async def decide(**_kwargs):
+        index = sum(event.is_set() for event in arrived)
+        arrived[index].set()
+        await go[index].wait()
+        return RouteDecision(route=route, reason="test", model="m", text="direct")
+
+    monkeypatch.setattr(responses_mod, "decide_route", decide)
+    starts = []
+    start = registry.start
+
+    async def recording_start(**kwargs):
+        starts.append(kwargs["turn_id"])
+        return await start(**kwargs)
+
+    monkeypatch.setattr(registry, "start", recording_start)
+    conversation_id = str(uuid4())
+
+    async with _client() as client:
+        first = asyncio.create_task(_ask(client, conversation_id, "one"))
+        await asyncio.wait_for(arrived[0].wait(), timeout=10)
+        second = asyncio.create_task(_ask(client, conversation_id, "two"))
+        await asyncio.wait_for(arrived[1].wait(), timeout=10)
+
+        go[0].set()
+        answered = await asyncio.wait_for(first, timeout=10)
+        ended = registry.get(conversation_id)
+        await asyncio.wait_for(ended.task, timeout=10)
+        path = turn_buffer_path(get_streams_dir(), conversation_id, ended.turn_id)
+        records_of_the_first_turn = [record.type for record in read_records(path)]
+
+        go[1].set()
+        try:
+            refused = await asyncio.wait_for(second, timeout=5)
+        except asyncio.TimeoutError:
+            pytest.fail("the second question got a stream no producer writes")
+        items = await _items(client, conversation_id)
+
+    answer = "ok" if route == DELEGATED_AGENTIC else "direct"
+    assert starts == [0, 0]
+    assert answered.status_code == 200
+    assert _frame_types(answered.text)[-1] == "response.completed"
+    assert refused.status_code == 409, refused.text
+    assert refused.json() == REFUSAL
+    assert registry.get(conversation_id) is ended
+    assert records_of_the_first_turn[-1] == "Done"
+    assert [record.type for record in read_records(path)] == records_of_the_first_turn
+    assert items == [("user", "one"), ("assistant", answer)]
+
+
+@pytest.mark.parametrize("saves", [True, False])
+async def test_a_remote_turn_marks_its_question_saved_only_once_it_saves(monkeypatch, saves):
+    """The remote producer saves the question in its own first write. The
+    registry refuses a start at the turn's number only after that write."""
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    if not saves:
+        def refused_save(self, conv_id, content, *, pending=False):
+            raise RuntimeError("db down")
+
+        monkeypatch.setattr(responses_mod.ConversationService, "save_user_message", refused_save)
+
+    async def replies(**_kwargs):
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", replies)
+    lifecycle = TurnLifecycle()
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(), lifecycle=lifecycle,
+    )
+
+    assert lifecycle.saved_question is saves
+    assert ("user" in saved) is saves
+
+
+async def test_a_non_streaming_question_is_refused_while_a_streamed_turn_runs(monkeypatch):
+    """A stream:false question would run a second turn inside the running one
+    and interleave the history, so it is refused like a streamed one and not
+    saved. A running stream:false turn never registers, so it refuses
+    nothing."""
+    gate = PausedHarness()
+    monkeypatch.setattr(responses_mod, "get_harness", lambda name: gate)
+
+    async def decide(**_kwargs):
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses_mod, "decide_route", decide)
+    conversation_id = str(uuid4())
+
+    async with _client() as client:
+        first = asyncio.create_task(_ask(client, conversation_id, "one"))
+        await asyncio.wait_for(gate.answering.wait(), timeout=10)
+        try:
+            refused = await asyncio.wait_for(client.post(
+                "/api/v1/responses/",
+                json={"input": "two", "stream": False, "conversation": conversation_id},
+            ), timeout=5)
+        except asyncio.TimeoutError:
+            pytest.fail("the stream:false question started a second turn inside the running one")
+        finally:
+            gate.release.set()
+        answered = await asyncio.wait_for(first, timeout=10)
+        items = await _items(client, conversation_id)
+
+    assert refused.status_code == 409, refused.text
+    assert refused.json() == REFUSAL
+    assert gate.started == 1
+    assert _frame_types(answered.text)[-1] == "response.completed"
+    assert items == [("user", "one"), ("assistant", "ok")]
+
+
 async def test_the_registry_refuses_a_second_turn_before_opening_its_buffer(tmp_path):
     runs = RunRegistry()
     path = tmp_path / "turn_000003.jsonl"
@@ -278,6 +404,57 @@ async def test_the_registry_refuses_a_second_turn_before_opening_its_buffer(tmp_
     release.set()
     await first.task
     assert [record.type for record in read_records(path)] == ["Done"]
+
+
+async def test_an_ended_turn_that_saved_its_question_refuses_a_start_at_its_number(tmp_path):
+    """A start at an ended turn's number comes from a request that read the
+    history before that turn saved its question. It is refused before its
+    buffer opens. A later number is accepted, and so is the same number after
+    a turn that saved nothing."""
+    path = tmp_path / "turn_000003.jsonl"
+
+    async def answer(buffer):
+        await buffer.append("sse", {"sse": "first"})
+        await buffer.close("completed")
+
+    async def ended_turn(*, saved_question: bool) -> RunRegistry:
+        runs = RunRegistry()
+        handle = await runs.start(
+            conversation_id="c", turn_id=3, open_buffer=opens(FileStreamBuffer(path)),
+            produce=answer, lifecycle=TurnLifecycle(saved_question=saved_question),
+        )
+        await handle.task
+        return runs
+
+    opened = []
+
+    def open_at(turn_id):
+        async def open_buffer():
+            opened.append(turn_id)
+            return FileStreamBuffer(tmp_path / f"turn_{turn_id:06d}.jsonl")
+        return open_buffer
+
+    runs = await ended_turn(saved_question=True)
+    first = runs.get("c")
+    for stale in (3, 2):
+        with pytest.raises(TurnInProgress) as refused:
+            await runs.start(
+                conversation_id="c", turn_id=stale, open_buffer=open_at(stale), produce=answer,
+            )
+        assert (refused.value.conversation_id, refused.value.turn_id) == ("c", 3)
+    assert opened == []
+    assert runs.get("c") is first
+    assert [record.type for record in read_records(path)] == ["sse", "Done"]
+
+    later = await runs.start(conversation_id="c", turn_id=5, open_buffer=open_at(5), produce=answer)
+    await later.task
+    assert opened == [5]
+
+    runs = await ended_turn(saved_question=False)
+    retried = await runs.start(conversation_id="c", turn_id=3, open_buffer=open_at(3), produce=answer)
+    await retried.task
+    assert opened == [5, 3]
+    assert runs.get("c") is retried
 
 
 async def test_a_turn_that_wrote_its_terminal_record_does_not_refuse_the_next(tmp_path):

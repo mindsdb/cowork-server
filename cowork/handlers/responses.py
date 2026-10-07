@@ -687,8 +687,10 @@ class ResponsesHandler:
                         # A second first send for this new conversation (a
                         # double click, a client retry) inserted it between
                         # the read above and this insert. Go on with that row:
-                        # the registry refuses whichever question comes
-                        # second, as it does any duplicate send.
+                        # both requests compute the same turn number, and the
+                        # registry refuses whichever reaches it second, while
+                        # the first turn answers or after it has ended, since
+                        # that turn saved its question.
                         session.rollback()
                         conversation = conversation_service.get_conversation(conv_id)
             else:
@@ -1051,6 +1053,8 @@ class ResponsesHandler:
         async def answer() -> None:
             async with conversation_writes(conv_id):
                 saved = await run_db(save_turn, scope=scope_from_principal(self.principal))
+            if saved is not None:
+                lifecycle.saved_question = True
             if saved is None or lifecycle.discarded:
                 # Deleted while it saved: its buffer is gone, and writing a
                 # terminal record would recreate it for the next turn to tail.
@@ -1816,6 +1820,7 @@ class ResponsesHandler:
             pending_message_id = ConversationService(producer_session).save_user_message(
                 conv_id, original_content, pending=True,
             ).id
+            lifecycle.saved_question = True
             first = True
             async for sse in format_responses_stream(
                 replies_as_stream_events(), model or "", event_sink,
@@ -2097,6 +2102,7 @@ class ResponsesHandler:
             if started is None:
                 return None
             question_id = started.question_id
+            lifecycle.saved_question = True
             return started.conversation
 
         try:
