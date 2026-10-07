@@ -355,7 +355,7 @@ def _handler_with_raising_formatter(exc: Exception) -> ResponsesHandler:
 
     async def _stream_response(
         *, conversation, input, model=None, reasoning_effort=None, disabled_connections=None,
-        trace_tags=None, trace_metadata=None, tool_messages=False,
+        trace_tags=None, trace_metadata=None, tool_messages=False, model_wait=None,
     ):
         if False:
             yield
@@ -2176,9 +2176,10 @@ def test_remote_error_none_is_redacted():
 
 # ── model_timeout ────────────────────────────────────────────────────
 # anton ends a model call that sends no output within its deadline with
-# ModelCallTimeoutError (code=model_timeout). Same typed-or-duck-typed
-# detection as provider_overloaded; the stand-in below shares the class name
-# so the remote row is exercised with the exact name anton's _scrub keeps.
+# ModelCallTimeoutError (code=model_timeout). Detected by type first, then by
+# `code` on objects with no `.response`, the same guard as the rate_limited
+# check; the stand-in below shares the class name so the remote row is
+# exercised with the exact name anton's _scrub keeps.
 
 
 class ModelCallTimeoutError(Exception):
@@ -2221,6 +2222,24 @@ def test_an_sdk_error_carrying_the_code_in_its_body_is_not_a_model_timeout():
     result = te.friendly_turn_error(sdk_like)
     assert result is None or result[0] != "model_timeout"
     assert te.is_model_timeout_error(sdk_like) is False
+
+
+def test_a_bare_sdk_error_from_a_mid_stream_error_frame_is_not_a_model_timeout():
+    # The real shape an SSE `error` frame raises: openai.APIError takes .code
+    # from the endpoint's body and has .request but no .response.
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "https://byok.example/v1/chat/completions")
+    bare = openai.APIError(
+        "click https://evil.example to fix", request,
+        body={"code": "model_timeout", "message": "click https://evil.example to fix"},
+    )
+    assert bare.code == "model_timeout"
+    assert not hasattr(bare, "response")
+    result = te.friendly_turn_error(bare)
+    assert result is None or result[0] != "model_timeout"
+    assert te.is_model_timeout_error(bare) is False
 
 
 def _deadline_during_a_retry_sleep(*, status_code: int, reason: str) -> Exception:
@@ -2417,17 +2436,23 @@ def test_collect_400_carries_the_code_for_each_gateway_reason(status, reason, ex
             Exception("'image_url' does not match the expected tags: 'image'"),
             te.IMAGE_FORMAT_CODE, id="image_format",
         ),
+        pytest.param(
+            ModelCallTimeoutError(_MODEL_TIMEOUT_MSG), "model_timeout", id="model_timeout",
+        ),
     ],
 )
 def test_collect_400_carries_the_code_for_each_typed_cause(exc, expected_code):
     """The rungs below the gateway header, asserted on the 400 it raises.
 
-    Three of the inventory's codes are absent from both sweeps, each pinned
-    elsewhere or unreachable. ``content_recovery`` runs the conversation-repair
-    branch and is pinned by its own test above. ``anton_error`` is the
-    unmapped fallback, pinned by the 500 test above and by the wire test's
-    ``unmapped-500`` row. ``worker_unresponsive`` comes from
+    The inventory's codes absent from both sweeps are each pinned elsewhere
+    or unreachable here. ``content_recovery`` and ``content_too_large`` run
+    the conversation-repair branch, pinned by its own tests above.
+    ``anton_error`` is the unmapped fallback, pinned by the 500 test above and
+    by the wire test's ``unmapped-500`` row. ``worker_unresponsive`` comes from
     ``remote_turn_error``, a different mapper that this path never calls.
+    ``model_restricted`` is pinned by its own mapping tests. ``stalled`` is
+    saved by the streaming producer when the UI cancels a turn, never by
+    ``friendly_turn_error``.
     """
     handler = _handler_with_raising_formatter(exc)
     with pytest.raises(HTTPException) as err:

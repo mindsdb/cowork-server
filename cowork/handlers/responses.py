@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import inspect
 import json
 import time
 from collections.abc import AsyncGenerator
@@ -233,18 +232,20 @@ async def _remote_cancel_stalled(correlation_id: str) -> bool:
     """Whether a confirmed remote cancel was the UI giving up on a stall.
 
     A ``/cancel`` that lands on a replica which does not own the turn can only
-    leave Redis keys behind, and the controller deletes the flag before this
-    replica hears of the cancel. The cause key outlives it, so it is what
-    tells a stall from a Stop here.
+    leave Redis keys behind, and scratchpad-controller's ``_clear_cancel`` may
+    already have deleted the flag when this replica hears of the cancel. The
+    cause key outlives it, so it is what tells a stall from a Stop here.
     """
     try:
         return await get_redis().get(cancel_cause_key(correlation_id)) == STALLED_CANCEL_REASON
     except Exception:
-        # Read as a Stop, the outcome of any cancel with no cause. The partial
-        # answer is kept either way; only the stall card is lost.
-        logger.warning(
+        # Read as a Stop, the outcome of any cancel with no cause: reading it
+        # as a stall would put a failure row under a real Stop, the more
+        # common cancel. The partial answer is kept either way; only the
+        # stall card is lost. ERROR, like _remote_cancel_confirmed's fallback.
+        logger.exception(
             "[responses] could not read the cancel cause for correlation_id=%s; "
-            "saving the turn as a Stop", correlation_id, exc_info=True,
+            "saving the turn as a Stop", correlation_id,
         )
         return False
 
@@ -1822,13 +1823,10 @@ class ResponsesHandler:
                 conv_id, original_content, created_at=sent_at, pending=True,
             ).id
             harness = get_harness(harness_name)
-            # Keeps the turn alive while anton waits on a quiet model call.
-            # Offered only to a harness that takes it, the same gating the
-            # anton harness applies to turn_stream's newer kwargs.
+            # Keeps the turn alive while anton waits on a quiet model call. An
+            # installed anton without the tracker gives the ticker nothing to
+            # read, so it writes no frames (ModelWaitTicker._snapshot).
             model_wait = ModelWaitTicker()
-            harness_kwargs: dict = {}
-            if "model_wait" in inspect.signature(harness.stream_response).parameters:
-                harness_kwargs["model_wait"] = model_wait
             stream = harness.stream_response(
                 conversation=conv, input=harness_input, model=model,
                 reasoning_effort=reasoning_effort, disabled_connections=disabled,
@@ -1836,7 +1834,7 @@ class ResponsesHandler:
                 # The cowork UI (scheduled turns show there too) renders a
                 # tool's message to the user, as on the remote path.
                 tool_messages=True,
-                **harness_kwargs,
+                model_wait=model_wait,
             )
             event_count = 0
             # The ticker stops before any branch below closes the buffer, so

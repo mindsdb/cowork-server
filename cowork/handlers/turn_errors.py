@@ -714,19 +714,29 @@ def is_model_timeout_error(exc: Exception) -> bool:
     no output within its deadline.
 
     Typed check first, imported lazily because the installed anton can predate
-    the class. The duck-typed fallback keys on the structured ``code`` and
-    excludes anything carrying ``.response``, for the same reason as the
-    rate_limited hoist in ``friendly_turn_error``: an SDK error fills ``.code``
-    from a response body a BYOK endpoint controls.
+    the class; it keeps matching if anton ever changes the class's wire code.
+    The duck-typed fallback, for an anton that predates or moved the class,
+    keys on the structured ``code`` and excludes anything carrying
+    ``.response`` or ``.request``. An SDK error fills ``.code`` from a body a
+    BYOK endpoint controls, and the OpenAI and Anthropic SDKs set ``.request``
+    on every error, including the bare ``APIError`` that a mid-stream SSE
+    error frame raises with no ``.response``. anton also wraps that bare error
+    into its own fixed-code error (``except openai.APIError`` in
+    ``OpenAIProvider``'s stream readers), so it should never arrive here
+    unwrapped.
     """
     try:
         from anton.core.llm.provider import ModelCallTimeoutError
 
         if isinstance(exc, ModelCallTimeoutError):
             return True
-    except Exception:
+    except ImportError:
         pass
-    return getattr(exc, "code", None) == MODEL_TIMEOUT_CODE and not hasattr(exc, "response")
+    return (
+        getattr(exc, "code", None) == MODEL_TIMEOUT_CODE
+        and not hasattr(exc, "response")
+        and not hasattr(exc, "request")
+    )
 
 
 def is_auth_error(exc: Exception) -> bool:

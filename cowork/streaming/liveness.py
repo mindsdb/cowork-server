@@ -18,7 +18,6 @@ through the formatter's ``event_sink``, so a reload does not replay it.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -27,6 +26,7 @@ from typing import Any, Protocol
 
 from cowork.schemas.responses import Role
 from cowork.streaming.buffer import StreamBuffer
+from cowork.streaming.sse import sse_frame
 
 logger = logging.getLogger(__name__)
 
@@ -57,9 +57,12 @@ def model_wait_sse(*, message: str, waited_s: float | None, sequence_number: int
     """One ``model_wait`` progress frame as an SSE string.
 
     Same shape as the formatter's generic progress frame, so a UI that does
-    not know the phase still counts it as activity. ``sequence_number`` is the
-    formatter's counter when the formatter relays a pod's frame; the in-process
-    ticker has no counter to draw from and leaves it out.
+    not know the phase still counts it as activity. ``content`` mirrors that
+    frame's "Label: message" for such clients; the cowork UI reads
+    ``message`` (responseStreamAdapter.js, the model_wait branch).
+    ``sequence_number`` is the formatter's counter when the formatter relays a
+    pod's frame; the in-process ticker has no counter to draw from and leaves
+    it out.
     """
     data: dict[str, Any] = {"type": "response.in_progress"}
     if sequence_number is not None:
@@ -73,7 +76,7 @@ def model_wait_sse(*, message: str, waited_s: float | None, sequence_number: int
         "tool_use_id": "",
         "at_ms": int(time.time() * 1000),
     })
-    return f"event: response.in_progress\ndata: {json.dumps(data)}\n\n"
+    return sse_frame("response.in_progress", data)
 
 
 class ModelWaitTicker:
@@ -95,7 +98,9 @@ class ModelWaitTicker:
         self._session = None
 
     def _snapshot(self) -> ModelCallSnapshot | None:
-        # Read late and by attribute: an anton without `model_calls` returns
+        # Read on every poll, not once at attach: anton arms `model_calls`
+        # per turn inside turn_stream, after the harness attached the
+        # session. Read by attribute: an anton without `model_calls` returns
         # None here, so the turn behaves exactly as it did without a ticker.
         tracker = getattr(self._session, "model_calls", None)
         if tracker is None:

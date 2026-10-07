@@ -74,22 +74,32 @@ class _Harness:
     """An anton-like harness whose only model call is silent.
 
     ``session`` is what it attaches to the ticker: one with a tracker, or one
-    without the attribute, as an anton that predates it. ``hang`` makes the
-    call never return, the shape of a hung tool once the tracker reports
-    nothing. ``partial`` is text streamed before the call goes quiet, and
-    ``raises`` is what the call ends with instead of its answer.
+    without the attribute, as an anton that predates it. Real anton builds the
+    session with ``model_calls = None`` and arms the turn's tracker inside
+    ``turn_stream``, after the harness has attached the session, so this
+    harness holds the tracker back until after ``attach`` the same way. A
+    ticker that read the tracker once at attach would then see None and fail
+    these tests. ``hang`` makes the call never return, the shape of a hung
+    tool once the tracker reports nothing. ``partial`` is text streamed before
+    the call goes quiet, and ``raises`` is what the call ends with instead of
+    its answer. ``then_hang`` answers the silent call, stops reporting a wait,
+    and then hangs, the shape of a tool the model called that never returns.
     """
 
     formatter = staticmethod(format_responses_stream)
 
     def __init__(
         self, *, session: object, hang: bool = False, partial: str | None = None,
-        raises: Exception | None = None,
+        raises: Exception | None = None, then_hang: bool = False,
     ) -> None:
         self.session = session
+        self._tracker = getattr(session, "model_calls", None)
+        if self._tracker is not None:
+            session.model_calls = None
         self.hang = hang
         self.partial = partial
         self.raises = raises
+        self.then_hang = then_hang
 
     async def stream_response(
         self, *, conversation, input, model=None, reasoning_effort=None,
@@ -98,6 +108,8 @@ class _Harness:
     ):
         if model_wait is not None:
             model_wait.attach(session=self.session)
+        if self._tracker is not None:
+            self.session.model_calls = self._tracker
         try:
             if self.partial is not None:
                 yield StreamTextDelta(text=self.partial)
@@ -106,7 +118,11 @@ class _Harness:
             await asyncio.sleep(SILENT_CALL_SECONDS)
             if self.raises is not None:
                 raise self.raises
+            if self.then_hang:
+                self._tracker.waiting = False
             yield StreamTextDelta(text="done")
+            if self.then_hang:
+                await asyncio.Event().wait()
         finally:
             if model_wait is not None:
                 model_wait.detach()
@@ -207,7 +223,12 @@ async def test_a_silent_model_call_outlives_the_redis_tail(monkeypatch, caplog):
     await asyncio.wait_for(handle.task, timeout=5)
 
     assert records[-1].type == "Done"
-    assert "went quiet" not in caplog.text
+    # No warning from the Redis tail, and none anywhere about going quiet.
+    assert not [
+        r for r in caplog.records
+        if (r.name == "cowork.streaming.buffer" and r.levelno >= logging.WARNING)
+        or "went quiet" in r.getMessage()
+    ]
     assert not [r for r in records if r.type == "Interrupted"]
     assert _model_wait_frames([r.data.get("sse", "") for r in records])
     assert not [e for e in saved["events"] if e.get("phase") == "model_wait"]
@@ -239,10 +260,35 @@ async def test_a_hung_turn_with_no_waiting_call_is_still_reaped(monkeypatch, tmp
     assert saved["events"][-1]["error"] == INTERRUPTED_TURN_MESSAGE
 
 
+async def test_a_tool_that_hangs_after_a_silent_call_is_still_reaped(monkeypatch, tmp_path):
+    # The model is what calls the tool, so a hung tool always follows a call
+    # that waited. Frames must stop when that call ends; a ticker that kept
+    # its first waiting snapshot would keep the hung turn alive forever.
+    saved: dict = {}
+    buffer = FileStreamBuffer(turn_buffer_path(tmp_path, CID, 0))
+    harness = _Harness(
+        session=SimpleNamespace(model_calls=_Tracker(waiting=True)), then_hang=True,
+    )
+
+    handle = await _run(monkeypatch, buffer, harness, saved)
+    await asyncio.wait_for(handle.task, timeout=5)
+
+    records = list(read_records(buffer.path))
+    sse = [r.data.get("sse", "") for r in records]
+    waits_at = [i for i, s in enumerate(sse) if _model_wait_frames([s])]
+    assert waits_at, "the silent call got no frame, so the hang below proves nothing"
+    answer_at = next(i for i, s in enumerate(sse) if "response.output_text.delta" in s)
+    assert max(waits_at) < answer_at, "a frame went out after the call ended"
+    assert handle.lifecycle.timed_out is True
+    assert records[-1].type == "Interrupted"
+
+
 _TERMINAL_TYPES = {"Done", "Cancelled", "Error", "Interrupted"}
 
 
-@pytest.mark.parametrize("reason", [None, "stalled"], ids=["user-stop", "ui-stall"])
+@pytest.mark.parametrize(
+    "reason", [None, "something-newer", "stalled"], ids=["user-stop", "unknown-reason", "ui-stall"],
+)
 async def test_a_cancel_during_a_silent_call_ends_with_the_terminal_record(
     monkeypatch, tmp_path, reason,
 ):
@@ -273,7 +319,9 @@ async def test_a_cancel_during_a_silent_call_ends_with_the_terminal_record(
     assert handle.lifecycle.timed_out is False
     assert saved["assistant"] == "partial"
     assert not [e for e in saved["events"] if e.get("phase") == "model_wait"]
-    if reason is None:
+    if reason != "stalled":
+        # Any reason but "stalled" is a Stop, so a newer client's reason never
+        # turns the user's own Stop into a stall card.
         assert records[-1].type == "Cancelled"
         assert not [e for e in saved["events"] if e.get("type") == "response.failed"]
     else:
@@ -309,27 +357,6 @@ async def test_a_deadline_after_a_silent_call_saves_model_timeout(monkeypatch, t
     ]
     assert [f["code"] for f in sse_failed] == ["model_timeout"]
 
-
-async def test_a_harness_without_the_hook_runs_unchanged(monkeypatch, tmp_path):
-    # A harness whose signature lacks model_wait is never handed it.
-    saved: dict = {}
-    buffer = FileStreamBuffer(turn_buffer_path(tmp_path, CID, 0))
-
-    class _OldHarness:
-        formatter = staticmethod(format_responses_stream)
-
-        async def stream_response(
-            self, *, conversation, input, model=None, reasoning_effort=None,
-            disabled_connections=None, trace_tags=None, trace_metadata=None,
-            tool_messages=False,
-        ):
-            yield StreamTextDelta(text="done")
-
-    handle = await _run(monkeypatch, buffer, _OldHarness(), saved)
-    await asyncio.wait_for(handle.task, timeout=5)
-
-    assert list(read_records(buffer.path))[-1].type == "Done"
-    assert saved["assistant"] == "done"
 
 
 @pytest.mark.parametrize("fails", [False, True])
@@ -396,6 +423,49 @@ async def test_the_anton_harness_attaches_its_session_for_the_turn_only(monkeypa
     assert recorder.session is None
 
 
+# ── The contract with the real anton ─────────────────────────────────
+# Everything above uses stand-ins, and cowork-server reads anton's tracker and
+# error by attribute and by class name. These run against the installed
+# anton, so they skip until uv.lock moves to an anton release that has the
+# tracker, then catch a rename the stand-ins would hide.
+
+
+def _real_anton_liveness():
+    liveness_mod = pytest.importorskip("anton.core.llm.liveness")
+    if getattr(liveness_mod, "ModelCallTracker", None) is None:
+        pytest.skip("installed anton predates the model-call tracker (ENG-3281)")
+    return liveness_mod
+
+
+async def test_a_real_anton_tracker_drives_the_ticker():
+    real = _real_anton_liveness()
+    tracker = real.ModelCallTracker()
+    tracker.open(role="planning", idle_timeout_s=600.0).awaiting = True
+    buffer = _Buffer()
+    ticker = liveness.ModelWaitTicker()
+    ticker.attach(session=SimpleNamespace(model_calls=tracker))
+
+    async with ticker.running(buffer=buffer):
+        await asyncio.sleep(0.2)
+
+    waits = _waits(buffer)
+    assert waits, "no frame from a real tracker reporting a waiting call"
+    assert waits[0]["message"].startswith("Waiting for the model (")
+    assert isinstance(waits[0]["eta_seconds"], float)
+
+
+def test_a_real_anton_deadline_maps_to_model_timeout_in_process_and_remote():
+    _real_anton_liveness()
+    from anton.core.llm.provider import ModelCallTimeoutError
+
+    from cowork.handlers.turn_errors import MODEL_TIMEOUT_CODE, friendly_turn_error, remote_turn_error
+
+    exc = ModelCallTimeoutError(role="planning", model="m", idle_timeout_s=600.0)
+    assert friendly_turn_error(exc)[0] == MODEL_TIMEOUT_CODE
+    # The pod's turn_failed carries "TypeName: message" (anton's _scrub).
+    assert remote_turn_error(f"{type(exc).__name__}: {exc}")[0] == MODEL_TIMEOUT_CODE
+
+
 # ── The ticker on its own ─────────────────────────────────────────────
 
 
@@ -417,21 +487,59 @@ def _waits(buffer: _Buffer) -> list[dict]:
     return _model_wait_frames([data.get("sse", "") for _, data in buffer.records])
 
 
+class _BusyBuffer(_Buffer):
+    """A record lands between every two polls for as long as ``busy`` is set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.busy = True
+        self._landed = 0
+
+    @property
+    def latest_seq(self) -> int:
+        if self.busy:
+            self._landed += 1
+        return len(self.records) + self._landed
+
+
 async def test_no_frame_goes_out_while_other_records_keep_arriving():
     # The wire is not quiet, so the turn needs no help; a frame here would
-    # also keep a hung turn alive if the tracker were ever wrong.
-    buffer = _Buffer()
+    # also keep a hung turn alive if the tracker were ever wrong. No race with
+    # the clock: the buffer moves between every two polls while it is busy.
+    buffer = _BusyBuffer()
     ticker = liveness.ModelWaitTicker()
     ticker.attach(session=SimpleNamespace(model_calls=_Tracker(waiting=True)))
 
     async with ticker.running(buffer=buffer):
-        for _ in range(15):
-            await buffer.append("sse", {"sse": "event: response.output_text.delta\ndata: {}\n\n"})
-            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.3)
         assert _waits(buffer) == []
-        await asyncio.sleep(0.2)
+        buffer.busy = False
+        await asyncio.sleep(0.3)
 
     assert _waits(buffer)
+
+
+async def test_frames_come_no_faster_than_the_quiet_window():
+    # Each frame restarts the window, so a long silent call gets one frame per
+    # window, not one per poll: the documented 20 to 25 s cadence, not 5 s.
+    loop = asyncio.get_running_loop()
+    stamps: list[float] = []
+
+    class _TimedBuffer(_Buffer):
+        async def append(self, type_, data):
+            stamps.append(loop.time())
+            return await super().append(type_, data)
+
+    buffer = _TimedBuffer()
+    ticker = liveness.ModelWaitTicker()
+    ticker.attach(session=SimpleNamespace(model_calls=_Tracker(waiting=True)))
+
+    async with ticker.running(buffer=buffer):
+        await asyncio.sleep(0.4)
+
+    gaps = [later - earlier for earlier, later in zip(stamps, stamps[1:])]
+    assert len(stamps) >= 3, f"{len(stamps)} frames in 0.4 s"
+    assert min(gaps) >= liveness.MODEL_WAIT_TICK_SECONDS * 0.9, f"frames {gaps} s apart"
 
 
 async def test_no_frame_after_detach_or_once_the_buffer_closes():
@@ -474,11 +582,18 @@ async def test_a_tracker_that_raises_stops_the_ticks_not_the_turn(caplog):
     ticker = liveness.ModelWaitTicker()
     ticker.attach(session=SimpleNamespace(model_calls=_Broken()))
 
+    caplog.set_level(logging.ERROR, logger="cowork.streaming.liveness")
     async with ticker.running(buffer=buffer):
         await asyncio.sleep(0.2)
 
     assert _waits(buffer) == []
-    assert "model-wait ticker failed" in caplog.text
+    logged = [
+        r for r in caplog.records
+        if r.name == "cowork.streaming.liveness" and r.levelno == logging.ERROR
+    ]
+    assert len(logged) == 1
+    assert "model-wait ticker failed" in logged[0].getMessage()
+    assert logged[0].exc_info is not None, "the traceback was not logged"
 
 
 def test_the_frame_omits_a_sequence_number_it_does_not_have():

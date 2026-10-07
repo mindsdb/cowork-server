@@ -181,17 +181,27 @@ async def test_cancel_works_on_a_turn_that_has_not_spoken_yet(client, fake_redis
 
 
 @pytest.mark.asyncio
-async def test_a_stall_cancel_writes_its_cause_before_the_flag(client, fake_redis, monkeypatch):
-    """The controller deletes the flag as soon as it reports the cancel, so
-    the cause has to be in Redis before the flag can start that clock."""
+async def test_a_stall_cancel_writes_its_cause_in_one_transaction_with_the_flag(
+    client, fake_redis, monkeypatch,
+):
+    """The controller deletes the flag right after it reports the cancel, so
+    the cause must be in Redis whenever the flag is. Written together in one
+    transaction, a failed write can leave no stray cause for a later Stop to
+    pick up."""
     await _running_turn("c11", 1, "corr-11")
-    writes: list[str] = []
-    real_set = fake_redis.set
+    transactions: list[bool | None] = []
+    direct_sets: list[str] = []
+    real_pipeline, real_set = fake_redis.pipeline, fake_redis.set
+
+    def recording_pipeline(*args, **kwargs):
+        transactions.append(kwargs.get("transaction"))
+        return real_pipeline(*args, **kwargs)
 
     async def recording_set(key, value, *args, **kwargs):
-        writes.append(key)
+        direct_sets.append(key)
         return await real_set(key, value, *args, **kwargs)
 
+    monkeypatch.setattr(fake_redis, "pipeline", recording_pipeline)
     monkeypatch.setattr(fake_redis, "set", recording_set)
 
     body = client.post(
@@ -200,9 +210,24 @@ async def test_a_stall_cancel_writes_its_cause_before_the_flag(client, fake_redi
     ).json()
 
     assert body["cancelled"] is True
-    assert writes == ["cowork:cancel_cause:corr-11", "cowork:cancel:corr-11"]
+    assert transactions == [True]
+    assert direct_sets == [], "the cause or the flag was written outside the transaction"
     assert await fake_redis.get("cowork:cancel_cause:corr-11") == "stalled"
+    assert await fake_redis.exists("cowork:cancel:corr-11") == 1
     assert 0 < await fake_redis.ttl("cowork:cancel_cause:corr-11") <= 300
+
+
+@pytest.mark.asyncio
+async def test_a_stop_after_a_stall_clears_the_stall_cause(client, fake_redis):
+    """A running cell swallows the stall cancel and the user then clicks Stop.
+    The latest cancel decides, so the owner must find no stall cause."""
+    await _running_turn("c14", 1, "corr-14")
+
+    client.post("/api/v1/responses/cancel", json={"conversation_id": "c14", "reason": "stalled"})
+    client.post("/api/v1/responses/cancel", json={"conversation_id": "c14"})
+
+    assert await fake_redis.exists("cowork:cancel:corr-14") == 1
+    assert await fake_redis.exists("cowork:cancel_cause:corr-14") == 0
 
 
 @pytest.mark.asyncio

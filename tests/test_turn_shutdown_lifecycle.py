@@ -155,6 +155,100 @@ async def test_shutdown_reports_a_turn_still_unwinding_past_its_budget():
 
 
 @pytest.mark.parametrize("backend", ["local", "remote"])
+@pytest.mark.parametrize("cause", ["watchdog", "shutdown"])
+async def test_the_watchdog_and_shutdown_win_over_a_stall(monkeypatch, tmp_path, backend, cause):
+    """A stall cancel set the flag, then the server ended the turn on its own
+    before the producer unwound. The server's reason wins in both producers:
+    the turn saves the interrupted failure, never the stall card. The flag is
+    written directly, because a stall through cancel_response would end the
+    turn before the second cause could overlap it."""
+    import sys
+
+    from cowork.streaming.buffer import FileStreamBuffer, turn_buffer_path
+    from test_responses_remote_backend import _remote_handler_with_message_id
+
+    registry_module = sys.modules["cowork.streaming.registry"]
+    monkeypatch.setattr(registry_module, "_IDLE_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(
+        registry_module, "_MAX_TURN_IDLE_SECONDS", 0.05 if cause == "watchdog" else 600,
+    )
+    saved: dict = {}
+    buffer = FileStreamBuffer(turn_buffer_path(tmp_path, CID, 0))
+    lifecycle = TurnLifecycle(stalled=True)
+    if backend == "local":
+        started = asyncio.Event()
+        handler = _streaming_handler(monkeypatch, saved, started)
+        coro = handler._run_turn(
+            conv_id=uuid4(), harness_input=[], original_content="hi", model="anton",
+            disabled=None, harness_name="anton", harness_id="anton", buffer=buffer,
+            lifecycle=lifecycle,
+        )
+    else:
+        started = asyncio.Event()
+        handler = _remote_handler_with_message_id(monkeypatch, saved, assistant_message_id=uuid4())
+
+        async def replies(**kwargs):
+            yield "turn_delta", {"text": "partial"}
+            started.set()
+            await asyncio.sleep(3600)
+
+        monkeypatch.setattr(responses_mod, "stream_remote_replies", replies)
+        coro = handler._produce_remote(
+            conv_id=uuid4(), input_text="hi", original_content="hi", model="anton",
+            harness_id="anton", buffer=buffer, lifecycle=lifecycle,
+        )
+    handle = await registry.start(
+        conversation_id=CID, turn_id=0, buffer=buffer, producer_coro=coro, lifecycle=lifecycle,
+    )
+    await asyncio.wait_for(started.wait(), timeout=5)
+    if cause == "shutdown":
+        await registry.shutdown()
+    await asyncio.wait_for(handle.task, timeout=5)
+
+    assert saved["assistant"] == "partial"
+    assert saved["events"][-1]["type"] == "response.failed"
+    assert saved["events"][-1]["code"] == GENERIC_TURN_ERROR_CODE
+    assert saved["events"][-1]["error"] == INTERRUPTED_TURN_MESSAGE
+    assert not [e for e in saved["events"] if e.get("code") == "stalled"]
+
+
+async def test_a_stop_after_a_swallowed_stall_cancel_saves_as_a_stop():
+    """A running cell swallows the UI's stall cancel, so the turn goes on and
+    the user clicks Stop. The latest cancel decides: the turn saves as a Stop,
+    not as the stall the first cancel asked for."""
+    from cowork.api.v1.endpoints.responses import CancelRequest, cancel_response
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    async def _swallows_the_first_cancel():
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.sleep(3600)
+        await asyncio.sleep(3600)
+
+    task = asyncio.create_task(_swallows_the_first_cancel())
+    await asyncio.sleep(0)
+    lifecycle = TurnLifecycle()
+    registry._by_cid[CID] = RunHandle(
+        conversation_id=CID, turn_id=0, buffer=_FakeBuffer(), task=task, lifecycle=lifecycle,
+    )
+    stall = asyncio.ensure_future(
+        cancel_response(CancelRequest(conversation_id=CID, reason="stalled"), LOCAL_SCOPE)
+    )
+    try:
+        await asyncio.sleep(0.01)
+        assert lifecycle.stalled is True
+        assert not task.done(), "the turn must have swallowed the stall cancel"
+
+        await asyncio.wait_for(
+            cancel_response(CancelRequest(conversation_id=CID), LOCAL_SCOPE), timeout=2,
+        )
+
+        assert lifecycle.stalled is False
+    finally:
+        task.cancel()
+        await asyncio.gather(task, stall, return_exceptions=True)
+
+
+@pytest.mark.parametrize("backend", ["local", "remote"])
 @pytest.mark.parametrize("cause", ["watchdog", "shutdown", "user_stop", "ui_stall"])
 async def test_only_user_stop_emits_cancelled(monkeypatch, tmp_path, backend, cause):
     import sys

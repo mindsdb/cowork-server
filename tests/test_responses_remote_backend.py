@@ -2415,16 +2415,27 @@ async def test_a_quiet_model_call_on_the_pod_keeps_a_redis_turn_alive(
     from cowork.streaming.buffer import RedisStreamBuffer
     from cowork.streaming.registry import registry
 
+    import sys
+
+    from cowork.streaming import buffer as buffer_mod
+
+    # Ticks spaced past the formatter's PROGRESS_THROTTLE, as the pod's 20 s
+    # gate spaces them in production, so a regression shows on what this PR
+    # changes (saved, labelled with the raw phase) rather than on a cadence
+    # no pod sends. The bounds sit above the spacing and well under the
+    # silence.
+    monkeypatch.setattr(buffer_mod, "REDIS_TAIL_IDLE_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(sys.modules["cowork.streaming.registry"], "_MAX_TURN_IDLE_SECONDS", 1.0)
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
-    ticks = 30
+    ticks = 7
 
     async def replies(**kwargs):
         yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
-        # 1.5 s with nothing but keep-alives: five times the tail and
+        # 2.45 s with nothing but keep-alives: more than twice the tail and
         # watchdog bounds.
         for i in range(ticks):
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.35)
             yield "turn_step", {
                 "step": "progress", "phase": "model_wait",
                 "message": f"Waiting for the model ({i}s)", "eta_seconds": float(i),
@@ -2457,9 +2468,15 @@ async def test_a_quiet_model_call_on_the_pod_keeps_a_redis_turn_alive(
     assert frames[-1].startswith("event: response.completed\n")
     assert saved["assistant"] == "done"
     waits = [f for f in frames if '"phase": "model_wait"' in f]
-    assert len(waits) == ticks  # none throttled away
+    assert len(waits) == ticks
+    assert all('"content": "Still working: Waiting for the model' in f for f in waits)
     assert not [e for e in saved["events"] if e.get("phase") == "model_wait"]
-    assert "went quiet" not in caplog.text
+    # No warning from the Redis tail, and none anywhere about going quiet.
+    assert not [
+        r for r in caplog.records
+        if (r.name == "cowork.streaming.buffer" and r.levelno >= logging.WARNING)
+        or "went quiet" in r.getMessage()
+    ]
 
 
 @pytest.mark.asyncio
