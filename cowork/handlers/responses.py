@@ -476,7 +476,7 @@ class _RemoteTurnArtifacts:
 def _save_remote_question(
     session: ScopedSession, *, lifecycle: TurnLifecycle, conversation_id: UUID, content,
 ) -> UUID | None:
-    """A remote turn's first write: the question, saved as pending (ENG-1231)
+    """A remote turn's first write: the question, saved as pending
     so a refresh mid-turn shows it while replayed history
     (get_ordered_messages) leaves it out. None when the turn was deleted
     while this unit waited for a connection: its row would land in the
@@ -1475,7 +1475,7 @@ class ResponsesHandler:
 
     @staticmethod
     def _persist_remote_compaction(
-        session: ScopedSession, conv_id: UUID, data: dict, seed_info: dict | None,
+        session: ScopedSession, *, conv_id: UUID, data: dict, seed_info: dict | None,
     ) -> None:
         """Save the summary the pod folded this turn's leading history into,
         in the caller's session (a unit's, on the remote producer).
@@ -1563,7 +1563,7 @@ class ResponsesHandler:
         Its database work runs as units (cowork.db.units), so it holds no
         pooled connection while the pod answers, and a wait for one never
         stalls the event loop. Staging the workspace is the first unit. The
-        next saves the question (pending, ENG-1231) under the conversation's
+        next saves the question (pending) under the conversation's
         write lock. What the pod is seeded with is read in one unit when the
         reply stream starts (get_ordered_messages leaves the pending row out,
         so the current input isn't replayed). Memory and compaction the pod
@@ -1687,7 +1687,11 @@ class ResponsesHandler:
                 return None
             if changes.created:
                 try:
-                    await run_db(
+                    # The turn is marked recorded before this unit, so its
+                    # cancel branches never record again. A Stop that lands
+                    # while the unit waits for a slot or a connection waits
+                    # for it, rather than abandoning the rows.
+                    await run_to_completion(run_db(
                         partial(
                             record_new_artifacts,
                             conversation_id=conv_id,
@@ -1696,7 +1700,7 @@ class ResponsesHandler:
                             creator=directory.creator,
                         ),
                         scope=scope,
-                    )
+                    ))
                 except Exception:
                     # Indexing is recoverable: the next turn in the project
                     # reconciles it. A busy pool lands here too.

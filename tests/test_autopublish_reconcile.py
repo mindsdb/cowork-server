@@ -94,7 +94,7 @@ def owned_slugs(monkeypatch):
     override it to exercise the filter itself.
     """
 
-    async def all_owned(base, scope, project_id, slugs):
+    async def all_owned(*, artifacts_base, scope, project_id, slugs):
         return list(slugs), 0, 0
 
     monkeypatch.setattr(ap, "_owned_slugs", all_owned)
@@ -568,7 +568,7 @@ async def test_not_owned_slugs_are_dropped_and_logged(
     _make(base, "theirs", files={"other.html": "<html></html>"},
           meta={"slug": "theirs", "type": "html-app"})
 
-    async def fake_owned(base_, scope, project_id, slugs):
+    async def fake_owned(*, artifacts_base, scope, project_id, slugs):
         return ([s for s in slugs if s == "mine"], 1, 0)
 
     monkeypatch.setattr(ap, "_owned_slugs", fake_owned)

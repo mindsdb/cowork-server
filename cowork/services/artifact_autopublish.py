@@ -210,7 +210,7 @@ def _artifact_owners(
 
 
 async def _owned_slugs(
-    artifacts_base: Path, scope, project_id: str, slugs: list[str]
+    *, artifacts_base: Path, scope, project_id: str, slugs: list[str]
 ) -> tuple[list[str], int, int]:
     """Filter ``slugs`` down to the ones this scope's user owns.
 
@@ -408,7 +408,9 @@ async def autopublish_project_artifacts(
 
     base = Path(artifacts_base)
     all_slugs = _candidate_slugs(base)
-    all_slugs, not_owner, owner_unknown = await _owned_slugs(base, scope, project_id, all_slugs)
+    all_slugs, not_owner, owner_unknown = await _owned_slugs(
+        artifacts_base=base, scope=scope, project_id=project_id, slugs=all_slugs,
+    )
     if not_owner or owner_unknown:
         _record("skipped", not_owner=not_owner or None, owner_unknown=owner_unknown or None)
     phase_one = [s for s in all_slugs if s in touched]

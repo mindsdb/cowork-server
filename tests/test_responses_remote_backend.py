@@ -472,7 +472,8 @@ def test_compaction_cutoff_maps_onto_our_own_message_ids(monkeypatch):
     conv_id = uuid4()
 
     ResponsesHandler._persist_remote_compaction(
-        _FakeUnitSession(), conv_id, {"summary": "EARLIER: …", "covered_through": 3}, _SEED,
+        _FakeUnitSession(), conv_id=conv_id,
+        data={"summary": "EARLIER: …", "covered_through": 3}, seed_info=_SEED,
     )
 
     assert saved == {"conv_id": conv_id, "summary": "EARLIER: …", "cutoff_id": _IDS[2]}
@@ -485,7 +486,8 @@ def test_compaction_cutoff_skips_the_synthetic_prefix(monkeypatch):
     seed = {"message_ids": _IDS, "tail_start": 1, "synthetic_prefix_len": 2}
 
     ResponsesHandler._persist_remote_compaction(
-        _FakeUnitSession(), uuid4(), {"summary": "EARLIER: …", "covered_through": 4}, seed,
+        _FakeUnitSession(), conv_id=uuid4(),
+        data={"summary": "EARLIER: …", "covered_through": 4}, seed_info=seed,
     )
 
     # 4 counted - 2 synthetic = 2 real, starting at tail_start 1 -> _IDS[2]
@@ -508,7 +510,9 @@ def test_an_untrustworthy_compaction_is_dropped_not_guessed(monkeypatch, data, c
     saved = _capture_compaction(monkeypatch)
 
     with caplog.at_level(logging.ERROR, logger="cowork.handlers.responses"):
-        ResponsesHandler._persist_remote_compaction(_FakeUnitSession(), uuid4(), data, _SEED)
+        ResponsesHandler._persist_remote_compaction(
+            _FakeUnitSession(), conv_id=uuid4(), data=data, seed_info=_SEED,
+        )
 
     assert saved == {}
     assert caplog.records == []
@@ -528,7 +532,9 @@ def test_a_wrongly_typed_compaction_frame_cannot_fail_the_turn(monkeypatch, data
     saved = _capture_compaction(monkeypatch)
 
     with caplog.at_level(logging.WARNING, logger="cowork.handlers.responses"):
-        ResponsesHandler._persist_remote_compaction(_FakeUnitSession(), uuid4(), data, _SEED)
+        ResponsesHandler._persist_remote_compaction(
+            _FakeUnitSession(), conv_id=uuid4(), data=data, seed_info=_SEED,
+        )
 
     assert saved == {}
     assert "malformed compaction frame" in caplog.text
@@ -544,7 +550,8 @@ def test_an_oversized_summary_is_rejected_rather_than_stored(monkeypatch, caplog
 
     with caplog.at_level(logging.WARNING, logger="cowork.handlers.responses"):
         ResponsesHandler._persist_remote_compaction(
-            _FakeUnitSession(), uuid4(), {"summary": summary, "covered_through": 3}, _SEED,
+            _FakeUnitSession(), conv_id=uuid4(),
+            data={"summary": summary, "covered_through": 3}, seed_info=_SEED,
         )
 
     assert saved == {}
@@ -558,7 +565,8 @@ def test_a_summary_at_the_cap_is_still_stored(monkeypatch):
     summary = "x" * responses_mod._MAX_COMPACTION_SUMMARY_BYTES
 
     ResponsesHandler._persist_remote_compaction(
-        _FakeUnitSession(), uuid4(), {"summary": summary, "covered_through": 3}, _SEED,
+        _FakeUnitSession(), conv_id=uuid4(),
+        data={"summary": summary, "covered_through": 3}, seed_info=_SEED,
     )
 
     assert saved["cutoff_id"] == _IDS[2]
@@ -570,7 +578,8 @@ def test_no_compaction_is_saved_when_seeding_was_disabled(monkeypatch):
     saved = _capture_compaction(monkeypatch)
 
     ResponsesHandler._persist_remote_compaction(
-        _FakeUnitSession(), uuid4(), {"summary": "EARLIER: …", "covered_through": 2}, None,
+        _FakeUnitSession(), conv_id=uuid4(),
+        data={"summary": "EARLIER: …", "covered_through": 2}, seed_info=None,
     )
 
     assert saved == {}
@@ -583,7 +592,7 @@ async def test_produce_remote_saves_the_pods_compaction(monkeypatch):
     handler._remote_seed_history = lambda session, conv_id: ([], _SEED)
     persisted = {}
     handler._persist_remote_compaction = (
-        lambda session, conv_id, data, seed_info: persisted.update(
+        lambda session, *, conv_id, data, seed_info: persisted.update(
             data=data, seed_info=seed_info,
         )
     )
@@ -666,14 +675,16 @@ def test_persist_turn_memory_refetches_under_project_lock(monkeypatch):
     ]
 
 
-def _units_on_the_test_database(monkeypatch):
+def _units_on_the_test_database(monkeypatch, *, scope=None):
     """The real units, each in a worker thread on the test database, for a
-    test that needs a unit to block or a cancel to wait for one."""
+    test that needs a unit to block or a cancel to wait for one. They run in
+    ``scope``, local mode unless a test passes an organization's."""
     from cowork.db import units
     from cowork.db.scoped import LOCAL_SCOPE
 
+    turn_scope = scope if scope is not None else LOCAL_SCOPE
     monkeypatch.setattr(responses_mod, "run_db", units.run_db)
-    monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: LOCAL_SCOPE)
+    monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: turn_scope)
 
 
 @pytest.mark.asyncio
@@ -764,6 +775,79 @@ async def test_a_cancel_during_a_memory_save_waits_for_it_then_saves_the_turn(mo
     assert buffer.frames[-1] == "CLOSE:cancelled"
     assert saved["assistant"] == "partial"
     assert saved["finalized_id"] == saved["user_id"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("cleanup_tmp_projects")
+async def test_a_stop_while_the_artifact_record_waits_for_a_slot_still_writes_its_rows(
+    monkeypatch, tmp_path,
+):
+    """The pod finished cleanly and created an artifact, and a Stop lands
+    while the unit that records it waits for a slot. The turn records its
+    artifacts once, so the Stop waits for that unit: the artifact still gets
+    its task_objects row and its owner row. Without the owner row, every
+    later turn's autopublish counts it as owner_unknown."""
+    import asyncio
+
+    from cowork.db import units
+    from cowork.db.scoped import TenantScope
+    from cowork.models.task_object import TaskObject
+    from cowork.services import artifact_ownership as ownership
+    from test_artifact_ownership import make_conversation, make_project, project_root, write_artifact
+
+    org_id, creator = str(uuid4()), str(uuid4())
+    scope = TenantScope(org_mode=True, org_id=org_id, user_id=creator)
+    project = make_project(tmp_path, org_id)
+    conversation_id = make_conversation(project, creator)
+    source = project_root(project)
+    slug = "sales-report"
+    handler = _remote_handler(monkeypatch, {})
+    _units_on_the_test_database(monkeypatch, scope=scope)
+    monkeypatch.setattr(
+        ResponsesHandler, "_remote_artifacts_context",
+        staticmethod(lambda session, conv_id: (
+            SimpleNamespace(created_by=creator), source.base, str(project.id), project.name,
+        )),
+    )
+    # The test database is SQLite, so units share one slot.
+    slots = units._slots(units._engine())
+    holder = object()
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        write_artifact(source.base, slug, conversation=conversation_id)
+        yield "turn_delta", {"text": "done"}
+        await slots.acquire_on_behalf_of(holder)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    buffer = _RecBuffer()
+    task = asyncio.create_task(handler._produce_remote(
+        conv_id=conversation_id, input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=buffer,
+    ))
+    try:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        while slots.statistics().tasks_waiting == 0:
+            assert loop.time() < deadline, "the artifact record never waited for a slot"
+            await asyncio.sleep(0.01)
+        task.cancel()
+        await asyncio.sleep(0.2)
+    finally:
+        if holder in slots.statistics().borrowers:
+            slots.release_on_behalf_of(holder)
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+
+    assert buffer.frames[-1] == "CLOSE:cancelled"
+    with units.unit_session(scope=scope) as session:
+        indexed = session.exec(
+            session.select(TaskObject).where(
+                TaskObject.conversation_id == conversation_id, TaskObject.ref == slug,
+            )
+        ).all()
+        owner = ownership.resolve_artifact_owner(session, source, slug)
+    assert (len(indexed), owner) == (1, ownership.OwnerResolution(creator, "recorded"))
 
 
 @pytest.mark.asyncio
