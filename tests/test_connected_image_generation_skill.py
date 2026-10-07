@@ -1,4 +1,4 @@
-"""The image generation host skill must stay wired to the connector flow.
+"""The image generation host skill must stay wired to the connector flow and the prompt.
 
 Its "not connected" path recalls `connect-datasource` (the skill that unlocks
 the deferred connection tools) and looks up the `replicate` spec by id. Both
@@ -8,11 +8,13 @@ the agent with no tools and no form, and it would fall back to wandering.
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
 from anton.core.memory.skills import SkillStore
 
 import cowork.harnesses.anton_harness.harness as harness_mod
+from cowork.harnesses.base import ChannelContext
 from cowork.harnesses.anton_harness.tools import build_cowork_lookup_connector_tool
 from cowork.services.connectors.specs._registry import registry
 
@@ -64,3 +66,18 @@ def test_user_skill_with_a_generic_image_name_does_not_shadow_it(tmp_path):
     assert skill is not None
     assert skill.provenance == "host"
     assert {s.label for s in store.list_all()} >= {"generate-image", _LABEL}
+
+
+def test_desktop_prompt_routes_image_requests_to_the_skill(tmp_path):
+    text = harness_mod._image_generation_context(None)
+    assert f"recall the `{_LABEL}` skill" in text
+    assert _store(tmp_path).load(_LABEL) is not None
+
+
+def test_channel_turns_get_no_image_routing():
+    assert harness_mod._image_generation_context(ChannelContext(channel_type="telegram")) == ""
+
+
+def test_session_suffix_includes_the_image_routing():
+    source = inspect.getsource(harness_mod.AntonHarness._build_chat_session)
+    assert "_image_generation_context(channel_context)" in source
