@@ -395,7 +395,7 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/skills` | Agent skill definitions |
 | `/memory` | Persistent agent memory |
 | `/artifacts` | Agent-produced file previews |
-| `/publish` | Publish HTML artifacts to 4nton.ai |
+| `/publish` | Publish artifacts to MindsHub (view.mindshub.ai in prod) |
 | `/connectors` | Third-party service connections and OAuth |
 | `/settings` | User preferences and API keys |
 | `/runtime-credential` | Desktop hand-over of the MindsHub credential (write-only, loopback, local mode) |

@@ -148,17 +148,10 @@ def is_mindshub_publish_url(publish_url: str | None) -> bool:
     points `ANTON_PUBLISH_URL` or the `publish_url` setting at, such as one a
     customer built from the publishing specification, stores static bundles
     only. Matches the hosts `publish_url_for_endpoint` can return (MindsHub
-    hosts, via `is_minds_host`) and the retired `4nton.ai` host, which a
-    caller may still pass.
+    hosts, via `is_minds_host`); a retired `4nton.ai` URL counts as the prod
+    publish host it maps to.
     """
-    if is_minds_host(publish_url):
-        return True
-    try:
-        host = (urlparse(publish_url or "").hostname or "").lower()
-    except ValueError:
-        # `.hostname` raises on an unbalanced bracket; see `is_minds_host`.
-        return False
-    return host == LEGACY_PUBLISH_HOST
+    return is_minds_host(normalize_publish_url(publish_url or ""))
 
 
 # Gemini speaks OpenAI-compatible at Google's endpoint — NOT api.openai.com.
