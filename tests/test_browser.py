@@ -160,6 +160,20 @@ def test_embed_before_provisioning_is_a_409(client, mindshub):
     assert client.post("/api/v1/browse/embed", headers=HUB, json={}).status_code == 409
 
 
+def test_mindshub_failures_say_what_failed(monkeypatch):
+    def broken(request):
+        return httpx.Response(500, json={"message": "Internal server error"})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(svc.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(broken), **kw))
+    monkeypatch.setattr(svc, "instance_api_base", lambda: "https://api-pr-x.dev.mindshub.ai")
+    with pytest.raises(svc.BrowserServiceError) as err:
+        asyncio.run(svc.fetch_status("jwt"))
+    # 4xx, not 502: the ingress replaces 5xx bodies and the reason would be lost.
+    assert err.value.status == 424
+    assert err.value.detail == "api-pr-x.dev.mindshub.ai returned HTTP 500: Internal server error"
+
+
 def test_mindshub_refusals_pass_through(client, monkeypatch):
     async def refused(*args, **kwargs):
         raise svc.BrowserServiceError(403, "Your plan doesn't include agents.")

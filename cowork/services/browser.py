@@ -32,6 +32,11 @@ _SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _ENDPOINT = re.compile(r"^https://br-[a-z0-9-]+\.(?:[a-z0-9-]+\.)*(?:4nton\.ai|mindshub\.ai)$")
 
 
+#: Status for "MindsHub failed us". Not 502: the cluster's ingress swaps a 5xx
+#: body for its own page, and the reason is what the user needs to see.
+UPSTREAM_FAILED = 424
+
+
 class BrowserServiceError(Exception):
     def __init__(self, status: int, detail: str) -> None:
         super().__init__(detail)
@@ -71,17 +76,24 @@ async def _call(method: str, url: str, bearer: str, *, json: Optional[dict] = No
     try:
         response = await asyncio.wait_for(_send(), _TIMEOUT_S)
     except Exception as exc:
-        logger.warning("browser %s %s failed: %s", method, url, type(exc).__name__)
-        raise BrowserServiceError(502, "MindsHub did not answer. Try again in a moment.") from exc
+        logger.warning("browser %s %s failed: %r", method, url, exc)
+        raise BrowserServiceError(
+            UPSTREAM_FAILED, f"MindsHub did not answer at {_host(url)} ({type(exc).__name__}). Try again in a moment.",
+        ) from exc
     if response.status_code in (401, 403):
         raise BrowserServiceError(response.status_code, _message(response) or "MindsHub refused this request.")
     if response.status_code >= 400:
-        logger.warning("browser %s %s returned HTTP %s", method, url, response.status_code)
-        raise BrowserServiceError(502, _message(response) or f"MindsHub returned HTTP {response.status_code}.")
+        logger.warning("browser %s %s returned HTTP %s: %s", method, url, response.status_code, response.text[:300])
+        reason = _message(response) or "no reason given"
+        raise BrowserServiceError(UPSTREAM_FAILED, f"{_host(url)} returned HTTP {response.status_code}: {reason}")
     try:
         return response.json()
     except ValueError as exc:
-        raise BrowserServiceError(502, "MindsHub returned an unreadable answer.") from exc
+        raise BrowserServiceError(UPSTREAM_FAILED, f"{_host(url)} returned an unreadable answer.") from exc
+
+
+def _host(url: str) -> str:
+    return httpx.URL(url).host
 
 
 def _message(response: httpx.Response) -> str:
@@ -129,7 +141,7 @@ async def embed(bearer: str, endpoint: str, session_id: str = PROFILE) -> dict:
         raise BrowserServiceError(400, "session_id must be 1-64 letters, digits, '-' or '_'.")
     raw = await _call("POST", f"{endpoint.rstrip('/')}/_embed", bearer, json={"session_id": session_id})
     if not isinstance(raw, dict) or not str(raw.get("view_url") or "").startswith(endpoint.rstrip("/") + "/"):
-        raise BrowserServiceError(502, "The browser returned an unexpected viewer URL.")
+        raise BrowserServiceError(UPSTREAM_FAILED, "The browser returned an unexpected viewer URL.")
     return {"session_id": session_id, "view_url": raw["view_url"], "expires_at": int(raw.get("expires_at") or 0)}
 
 
