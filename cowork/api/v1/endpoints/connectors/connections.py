@@ -165,7 +165,7 @@ def _persist_direct_connection(
     try:
         # default_label gives a brand-new OAuth connection's tile a
         # meaningful title (the account/org/workspace name the provider
-        # returned) instead of the generic engine-id default — but only for
+        # returned) instead of no label at all — but only for
         # a genuinely new connection; it can never clobber a label the user
         # already set on a reconnect (see persist_connection's default_label
         # docs). Mirrors the same wiring in oauth/google.py's callback(),
