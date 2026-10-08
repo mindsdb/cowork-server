@@ -98,3 +98,49 @@ class CustomConnectorService:
         self.session.commit()
         self.session.refresh(row)
         return row
+
+    def update(self, connector_id: str, changes: dict[str, Any]) -> CustomConnector | None:
+        """Change a definition's display fields, featured flag or form.
+
+        Args:
+            connector_id: The definition to change.
+            changes: Any of ``label``, ``description``, ``category``,
+                ``featured`` and ``spec`` (a full connection form).
+
+        Returns:
+            The updated row, or None when the scope has no such definition.
+
+        Raises:
+            pydantic.ValidationError: when ``spec`` is not a valid connection form.
+
+        Side effects:
+            Commits the session.
+        """
+        row = self.get(connector_id)
+        if row is None:
+            return None
+        if "spec" in changes:
+            row.spec = stored_form(connector_id, changes["spec"])
+        for key in ("label", "description", "category", "featured"):
+            if key in changes:
+                setattr(row, key, changes[key])
+        self.session.add(row)
+        self.session.commit()
+        self.session.refresh(row)
+        return row
+
+    def delete(self, connector_id: str) -> bool:
+        """Delete a definition. Saved connections that use it are kept.
+
+        Returns:
+            True when a definition was deleted, False when there was none.
+
+        Side effects:
+            Commits the session.
+        """
+        row = self.get(connector_id)
+        if row is None:
+            return False
+        self.session.delete(row)
+        self.session.commit()
+        return True
