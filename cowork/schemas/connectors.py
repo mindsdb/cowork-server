@@ -284,6 +284,8 @@ class ConnectionSummaryResponse(BaseModel):
     # when healthy. Lets the catalogue card show a warning without requiring
     # the client to fetch each connection's full detail first.
     status: str | None = None
+    # The connection's connector is a custom one built in Cowork.
+    custom: bool = False
 
 
 class ConnectionDetailResponse(BaseModel):

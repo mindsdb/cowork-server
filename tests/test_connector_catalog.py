@@ -92,10 +92,13 @@ class TestCatalog:
         monkeypatch.setattr(catalog_module.logger, "warning", lambda msg, *args: warnings.append(msg % args))
         _add(engine, connector_id="postgres", label="Shadow Postgres")
 
-        spec = _catalog(engine, LOCAL_SCOPE).get_connector("postgres")
+        catalog = _catalog(engine, LOCAL_SCOPE)
+        spec = catalog.get_connector("postgres")
+        listed = {c.id: c for c in catalog.list_connectors()}
 
         assert spec.custom is False
         assert spec.label != "Shadow Postgres"
+        assert listed["postgres"].custom is False
         assert any("'postgres'" in w for w in warnings)
 
 
