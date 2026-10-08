@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.handlers.probe import ProbeHandler
-from cowork.schemas.connectors import ConnectorField, SubmitFormRequest
+from cowork.schemas.connectors import ConnectorField, InvalidConnectorIdError, SubmitFormRequest
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import store
 
@@ -73,6 +73,8 @@ def _missing_required(fields: list, values: dict, skipped: list[str]) -> list[st
 async def submit_form(req: SubmitFormRequest, scope: TenantScopeDep) -> StreamingResponse:
     try:
         connector_id = req.resolve_connector_id()
+    except InvalidConnectorIdError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
