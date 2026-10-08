@@ -113,7 +113,7 @@ PUBLISH_FAILSAFE_URL = "https://view.mindshub.ai"
 LEGACY_PUBLISH_HOST = "4nton.ai"
 
 
-def normalize_publish_url(publish_url: str) -> str:
+def normalize_publish_url(publish_url: str | None) -> str | None:
     """`publish_url` with the retired 4nton.ai host replaced by the prod
     publish host; any other URL is returned unchanged."""
     try:
@@ -151,7 +151,7 @@ def is_mindshub_publish_url(publish_url: str | None) -> bool:
     hosts, via `is_minds_host`); a retired `4nton.ai` URL counts as the prod
     publish host it maps to.
     """
-    return is_minds_host(normalize_publish_url(publish_url or ""))
+    return is_minds_host(normalize_publish_url(publish_url))
 
 
 # Gemini speaks OpenAI-compatible at Google's endpoint — NOT api.openai.com.

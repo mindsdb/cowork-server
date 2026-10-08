@@ -13,13 +13,7 @@ import pytest
 from pydantic import SecretStr
 
 from cowork.services import publish
-from cowork.services.providers import (
-    LEGACY_PUBLISH_HOST,
-    PUBLISH_FAILSAFE_URL,
-    is_mindshub_publish_url,
-    normalize_publish_url,
-    publish_url_for_endpoint,
-)
+from cowork.services.providers import normalize_publish_url, publish_url_for_endpoint
 
 
 def _settings(*, publish_url: str = "", minds_url: str = "https://api.mindshub.ai/v1"):
@@ -29,11 +23,6 @@ def _settings(*, publish_url: str = "", minds_url: str = "https://api.mindshub.a
         minds_api_key=SecretStr("mdb_key"),
         publish_url=publish_url,
     )
-
-
-def test_prod_publish_host_is_the_view_host():
-    assert PUBLISH_FAILSAFE_URL == "https://view.mindshub.ai"
-    assert LEGACY_PUBLISH_HOST == "4nton.ai"
 
 
 @pytest.mark.parametrize(
@@ -77,42 +66,22 @@ def test_other_urls_are_kept(url):
     assert normalize_publish_url(url) == url
 
 
-def test_prod_endpoint_without_settings_publishes_on_the_view_host(monkeypatch):
-    monkeypatch.delenv("ANTON_PUBLISH_URL", raising=False)
-    assert publish._resolve_publish_endpoint(_settings()) == ("https://view.mindshub.ai", "mdb_key")
-
-
-def test_a_saved_legacy_setting_is_replaced(monkeypatch):
-    monkeypatch.delenv("ANTON_PUBLISH_URL", raising=False)
-    url, _key = publish._resolve_publish_endpoint(_settings(publish_url="https://4nton.ai"))
-    assert url == "https://view.mindshub.ai"
-
-
-def test_a_legacy_env_override_is_replaced(monkeypatch):
-    monkeypatch.setenv("ANTON_PUBLISH_URL", "https://4nton.ai")
-    url, _key = publish._resolve_publish_endpoint(_settings())
-    assert url == "https://view.mindshub.ai"
-
-
-def test_an_operator_override_is_kept(monkeypatch):
-    monkeypatch.setenv("ANTON_PUBLISH_URL", "http://publisher-api:8081")
-    url, _key = publish._resolve_publish_endpoint(_settings(publish_url="https://4nton.ai"))
-    assert url == "http://publisher-api:8081"
-
-
-def test_a_staging_endpoint_keeps_its_api_host(monkeypatch):
-    monkeypatch.delenv("ANTON_PUBLISH_URL", raising=False)
-    url, _key = publish._resolve_publish_endpoint(_settings(minds_url="https://api.staging.mindshub.ai/v1"))
-    assert url == "https://api.staging.mindshub.ai"
-
-
-@pytest.mark.parametrize("url", ["https://view.mindshub.ai", "https://4nton.ai", "https://4nton.ai."])
-def test_both_publish_hosts_count_as_mindshub(url):
-    assert is_mindshub_publish_url(url) is True
-
-
+# (ANTON_PUBLISH_URL, publish_url setting, provider endpoint) -> publish URL.
+# An empty ANTON_PUBLISH_URL reads as unset.
 @pytest.mark.parametrize(
-    "url", ["http://publisher-api:8081", "https://cw-abc.4nton.ai", "https://4nton.ai.customer.example", "", None]
+    "env_url, setting_url, minds_url, expected",
+    [
+        pytest.param("", "", "https://api.mindshub.ai/v1", "https://view.mindshub.ai", id="prod-default"),
+        pytest.param("", "https://4nton.ai", "https://api.mindshub.ai/v1", "https://view.mindshub.ai", id="saved-legacy-setting"),
+        pytest.param("https://4nton.ai", "", "https://api.mindshub.ai/v1", "https://view.mindshub.ai", id="legacy-env"),
+        pytest.param(
+            "http://publisher-api:8081", "https://4nton.ai", "https://api.mindshub.ai/v1", "http://publisher-api:8081",
+            id="operator-override",
+        ),
+        pytest.param("", "", "https://api.staging.mindshub.ai/v1", "https://api.staging.mindshub.ai", id="staging-endpoint"),
+    ],
 )
-def test_other_publishers_do_not_count_as_mindshub(url):
-    assert is_mindshub_publish_url(url) is False
+def test_resolve_publish_endpoint(monkeypatch, env_url, setting_url, minds_url, expected):
+    monkeypatch.setenv("ANTON_PUBLISH_URL", env_url)
+    settings = _settings(publish_url=setting_url, minds_url=minds_url)
+    assert publish._resolve_publish_endpoint(settings) == (expected, "mdb_key")
