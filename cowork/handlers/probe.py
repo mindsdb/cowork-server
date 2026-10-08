@@ -257,7 +257,9 @@ class ProbeHandler:
             # Mirrors submit_form: a handcrafted form keeps its own spec, and a
             # custom connector's stored spec arrives staged with the submission.
             staged_spec = submission.get("form_spec") or {}
-            stamped = not staged_spec or bool(staged_spec.get("_connector_id"))
+            # Only an explicit False from submit_form skips the stored spec, so
+            # a submission can never be validated as one connector and saved untested.
+            stamped = submission.get("checked_against_stored_spec") is not False
             spec = registry.get_connector(connector_id) if stamped else None
             if spec is None and submission.get("custom_spec"):
                 spec = ConnectorSpecResponse.model_validate(submission["custom_spec"])
