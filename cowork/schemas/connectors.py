@@ -196,6 +196,16 @@ class ConnectorMetadataResponse(BaseModel):
     custom: bool = False
 
 
+class CustomConnectorUpdate(BaseModel):
+    """Changes an admin makes to a custom connector; omitted fields stay as they are."""
+
+    label: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = None
+    category: str | None = Field(default=None, max_length=64)
+    featured: bool | None = None
+    spec: dict[str, Any] | None = None
+
+
 class ConnectorSpecResponse(ConnectorMetadataResponse):
     keywords: list[str] = []
     form: ConnectorForm
