@@ -270,9 +270,6 @@ class ProbeHandler:
             # persist as the label/user_label.
             connection_label, connection_user_label = _extract_connection_label_fields(credentials)
 
-            # Connector spec — absent for agent-handcrafted (non-registry)
-            # connectors; those fall back to the form_spec staged with the
-            # submission and skip the probe below.
             # Mirrors submit_form: a handcrafted form keeps its own spec, and a
             # custom connector's stored spec arrives staged with the submission.
             staged_spec = submission.get("form_spec") or {}

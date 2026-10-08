@@ -42,8 +42,8 @@ def _resolve_fields(spec, method_id: str | None) -> list:
 
 
 def _fields_from_spec_dict(form_spec: dict, method_id: str | None) -> list[ConnectorField]:
-    # Agent-handcrafted specs are loose JSON — tolerate missing label/type
-    # rather than rejecting a save the form UI already accepted.
+    # Reads fields leniently; submit_form has already checked the form
+    # itself with check_handcrafted_form.
     methods = form_spec.get("methods") or []
     if methods:
         method_def = next((m for m in methods if isinstance(m, dict) and m.get("id") == method_id), None)
@@ -128,9 +128,8 @@ async def submit_form(req: SubmitFormRequest, scope: TenantScopeDep) -> Streamin
 
         fields = _resolve_fields(spec, method)
     else:
-        # Non-registry connector: the agent handcrafted this form. Validate
-        # against the submitted form_spec; the probe handler saves it to the
-        # vault without a live probe.
+        # Handcrafted form: validated against itself, then probed like any
+        # other connector before anything is saved.
         if not req.form_spec:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connector not found.")
         # Checked before the probe, so a form that could never be stored as a
