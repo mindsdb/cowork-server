@@ -106,18 +106,25 @@ def spec_secret_fields(connector_id: str, method: str | None, form: dict | None 
 
     ``form`` is the connection form to read when the connector is not in the
     static registry (a custom or handcrafted one); otherwise the registry's.
+    A model-written form can forget the flag, so there a ``password`` field
+    counts as secret too.
     """
+    model_written = form is not None
     if form is None:
         form = (registry.get_connectors().get(connector_id) or {}).get("form") or {}
+
+    def is_secret(field: dict) -> bool:
+        return bool(field.get("secret")) or (model_written and field.get("type") == "password")
+
     secret: set[str] = set()
     for m in form.get("methods", []) or []:
         if method and m.get("id") != method:
             continue
         for f in m.get("fields", []) or []:
-            if f.get("secret") and f.get("name"):
+            if is_secret(f) and f.get("name"):
                 secret.add(f["name"])
     for f in form.get("fields", []) or []:
-        if f.get("secret") and f.get("name"):
+        if is_secret(f) and f.get("name"):
             secret.add(f["name"])
     return sorted(secret)
 

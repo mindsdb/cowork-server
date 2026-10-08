@@ -249,6 +249,22 @@ class TestSecretFieldsFromNonRegistrySpecs:
 
         assert "signing_material" not in vault.read_record("signer", slug)["secure_keys"]
 
+    def test_a_password_field_in_a_model_written_form_is_masked_without_the_flag(self, tmp_path):
+        # The shape the model actually writes: a password field, no `secret`.
+        form = {
+            "form_id": "fm_aaaaaaaaaa", "title": "Connect signer",
+            "fields": [{"name": "signing_material", "label": "Signing material", "type": "password"}],
+        }
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        slug = persist_connection("signer", None, "", {"signing_material": "m"}, spec_form=form, vault=vault)
+
+        assert "signing_material" in vault.read_record("signer", slug)["secure_keys"]
+
+    def test_the_tool_schema_offers_the_secret_flag(self):
+        item = tools._REQUEST_CREDENTIALS_SCHEMA["properties"]["fields"]["items"]["properties"]
+
+        assert item["secret"]["type"] == "boolean"
+
     def test_a_registry_connector_still_reads_its_own_spec(self, tmp_path):
         vault = LocalDataVault(Path(tmp_path) / "vault")
         slug = persist_connection("postgres", None, "", {"host": "h", "password": "p"}, vault=vault)
