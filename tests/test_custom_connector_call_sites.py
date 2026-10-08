@@ -151,7 +151,7 @@ class TestSubmitForm:
         monkeypatch.setattr(submissions_endpoints, "vault_for_scope", lambda scope: vault)
         req = SubmitFormRequest(
             form_spec={
-                "form_id": "fm_bbbbbbbbbb", "engine": "httpbin", "fields": [],
+                "form_id": "fm_bbbbbbbbbb", "engine": "httpbin", "title": "httpbin", "fields": [],
                 "_extends_connection": "httpbin-1a2b3c4d",
             },
             values={"refresh": "r"},

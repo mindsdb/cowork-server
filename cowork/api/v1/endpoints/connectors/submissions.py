@@ -9,12 +9,13 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.units import run_db
 from cowork.handlers.probe import ProbeHandler
-from cowork.schemas.connectors import ConnectorField, InvalidConnectorIdError, SubmitFormRequest
+from cowork.schemas.connectors import ConnectorField, ConnectorForm, InvalidConnectorIdError, SubmitFormRequest
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.connectors.specs._registry import registry
@@ -132,6 +133,15 @@ async def submit_form(req: SubmitFormRequest, scope: TenantScopeDep) -> Streamin
         # vault without a live probe.
         if not req.form_spec:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connector not found.")
+        # Checked before the probe, so a form that could never be stored as a
+        # connector fails here instead of after its credentials are saved.
+        try:
+            ConnectorForm.model_validate(req.form_spec)
+        except ValidationError as e:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"The connection form is not valid: {e.errors()[0]['msg']}",
+            ) from e
         form_id = req.form_spec.get("form_id") or req.form_id or f"{connector_id}-connector"
         fields = _fields_from_spec_dict(req.form_spec, method)
         if extends_name is not None and (
