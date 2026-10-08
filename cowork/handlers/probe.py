@@ -85,12 +85,20 @@ def _save_probe_turn(
     return message.id if message is not None else None
 
 
-def _is_oauth_grant(form_spec: dict, method: str | None) -> bool:
-    """True when the submitted method is an OAuth launch, whose grant already ran."""
-    if form_spec.get("submit_action") == "oauth_launch":
-        return True
+def _is_oauth_grant(form_spec: dict, method: str | None, credentials: dict) -> bool:
+    """True when this submission is the result of an OAuth browser grant.
+
+    The form is model-written, so a flag alone is not enough: the selected
+    method must be an OAuth launch with an ``oauth`` block (the only shape the
+    renderer runs a grant for), and the values must carry a token from it.
+    """
+    if not (credentials.get("access_token") or credentials.get("refresh_token")):
+        return False
     for m in form_spec.get("methods") or []:
-        if isinstance(m, dict) and m.get("id") == method and m.get("submit_action") == "oauth_launch":
+        if (
+            isinstance(m, dict) and m.get("id") == method
+            and m.get("submit_action") == "oauth_launch" and isinstance(m.get("oauth"), dict)
+        ):
             return True
     return False
 
@@ -297,7 +305,7 @@ class ProbeHandler:
             extends_name = form_spec.get("_extends_connection") if spec is None else None
             # A handcrafted OAuth method arrives after the browser grant, which
             # is its test; probing again could throw a working grant away.
-            if spec is None and _is_oauth_grant(form_spec, method):
+            if spec is None and _is_oauth_grant(form_spec, method, credentials):
                 try:
                     vault = vault_for_scope(self.scope)
                     slug = persist_connection(
