@@ -28,6 +28,7 @@ from typing import Any
 import uuid
 
 from cowork.schemas.connectors import InvalidConnectorIdError, validate_engine_id
+from cowork.services.connectors.specs._registry import registry
 
 logger = logging.getLogger(__name__)
 
@@ -611,12 +612,26 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
         validate_engine_id(connector_id)
     except InvalidConnectorIdError as e:
         return f"request_credentials: {e}"
+    # A submission is checked against the registry spec whenever its id is a
+    # registry id, so a handcrafted form for one would be refused after the
+    # user filled it in.
+    if not spec.get("_connector_id") and registry.get_connector(connector_id) is not None:
+        return (
+            f"request_credentials: {connector_id!r} is a built-in connector. Call "
+            f"lookup_connector with id {connector_id!r} and pass its form, with "
+            "`_connector_id`, instead of a handcrafted spec."
+        )
 
     spec = dict(spec)
     extends_name = spec.pop("extends_connection", None)
     if extends_name is not None:
         if not isinstance(extends_name, str) or not extends_name.strip():
             return "request_credentials: `extends_connection` must be the saved connection's name."
+        if spec.get("_connector_id"):
+            return (
+                "request_credentials: `extends_connection` applies only to handcrafted "
+                "forms; a built-in connector's form saves its connection in one step."
+            )
         # The renderer submits `_existing_name` as the record name; the server
         # reads `_extends_connection` to merge instead of creating a sibling.
         spec["_extends_connection"] = extends_name.strip()

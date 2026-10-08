@@ -59,6 +59,7 @@ class TestHandlerResult:
             session=None,
             tc_input={
                 "engine": "postgres",
+                "_connector_id": "postgres",
                 "title": "Connect to Postgres",
                 "fields": [
                     {"name": "password", "label": "Password", "type": "password", "value": "hunter2"},
@@ -74,7 +75,7 @@ class TestHandlerResult:
     async def test_result_does_not_reference_unregistered_tools(self):
         result = await _cowork_request_credentials(
             session=None,
-            tc_input={"engine": "postgres", "title": "Connect"},
+            tc_input={"engine": "postgres", "_connector_id": "postgres", "title": "Connect"},
         )
         assert "fetch_submission" not in result
         assert "update_form" not in result
