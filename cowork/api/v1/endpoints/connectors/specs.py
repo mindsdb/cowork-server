@@ -4,15 +4,17 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.common.settings.app_settings import OAuthSettings
 from cowork.db.scoped import TenantScope, get_tenant_scope
+from cowork.db.units import run_db
 from cowork.schemas.connectors import (
     ConnectorMetadataResponse,
     ConnectorSpecResponse,
     MatchRequest,
     MatchResponse,
 )
+from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.specs._registry import registry
 
@@ -43,10 +45,14 @@ async def list_connector_specs(
     which case the rest comes back too, flagged `cloud_available=False` so
     the caller can show them as desktop-only rather than pretend they don't
     exist. The default stays filtered so existing callers are unaffected.
+
+    Desktop also lists the install's custom connectors. Org mode does not
+    yet: no org definitions are written, and auth's catalogue would file
+    them as desktop-only.
     """
-    connectors = registry.list_connectors()
     if not scope.org_mode:
-        return connectors
+        return await run_db(lambda session: ConnectorCatalog(session).list_connectors(), scope=scope)
+    connectors = registry.list_connectors()
     # The full registry (~230 connectors, most with no OAuth relay or
     # org-mode save path) is a desktop concept. auth's catalogue is the
     # same allow-list list_connections already trusts.
@@ -60,21 +66,30 @@ async def list_connector_specs(
     ]
 
 
-# OpenByDesign, standalone reason: static connector registry lookup, no
-# tenant data, no secrets — identical response for every caller.
+# AuthenticatedInOrgMode: the answer includes the scope's custom connectors,
+# which are tenant data, so it is no longer the same for every caller.
 @router.get(
-    "/{connector_id}", response_model=ConnectorSpecResponse, dependencies=[Depends(require(OpenByDesign))]
+    "/{connector_id}",
+    response_model=ConnectorSpecResponse,
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
 )
-def get_connector_spec(connector_id: str):
-    spec = registry.get_connector(connector_id)
+async def get_connector_spec(connector_id: str, scope: ScopeDep):
+    """Return one connector's full spec, built-in or custom.
+
+    Raises:
+        HTTPException: 404 when the scope has no connector with that id.
+    """
+    spec = await run_db(lambda session: ConnectorCatalog(session).get_connector(connector_id), scope=scope)
     if not spec:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connector not found.")
     return spec
 
 
-# OpenByDesign, standalone reason: registry.match_connector is a stateless
-# static-registry token match, no tenant data, no secrets — identical
-# response for every caller.
-@router.post("/match", response_model=MatchResponse, dependencies=[Depends(require(OpenByDesign))])
-def match_connector_spec(req: MatchRequest) -> MatchResponse:
-    return registry.match_connector(req.query, req.max_candidates)
+# AuthenticatedInOrgMode for the same reason as the lookup above.
+@router.post("/match", response_model=MatchResponse, dependencies=[Depends(require(AuthenticatedInOrgMode))])
+async def match_connector_spec(req: MatchRequest, scope: ScopeDep) -> MatchResponse:
+    """Match a free-text query against the scope's built-in and custom connectors."""
+    return await run_db(
+        lambda session: ConnectorCatalog(session).match_connector(req.query, req.max_candidates),
+        scope=scope,
+    )

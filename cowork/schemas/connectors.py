@@ -191,6 +191,9 @@ class ConnectorMetadataResponse(BaseModel):
     # run yet, so the directory can list it under a desktop-only group instead
     # of hiding it. Always True on desktop, where the whole registry works.
     cloud_available: bool = True
+    # Built in Cowork and stored per org (or per local install), not shipped
+    # in the static registry.
+    custom: bool = False
 
 
 class ConnectorSpecResponse(ConnectorMetadataResponse):
