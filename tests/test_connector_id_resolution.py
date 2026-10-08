@@ -122,6 +122,27 @@ class TestRequestCredentialsTool:
         assert "Invalid connector id" in result
 
     @pytest.mark.asyncio
+    async def test_handcrafted_spec_for_a_builtin_connector_is_refused(self):
+        result = await _cowork_request_credentials(
+            session=None,
+            tc_input={
+                "engine": "postgres",
+                "title": "Connect",
+                "fields": [{"name": "host", "label": "Host", "type": "text"}],
+            },
+        )
+        assert "data-vault-form" not in result
+        assert "lookup_connector" in result
+
+    @pytest.mark.asyncio
+    async def test_extends_connection_on_a_builtin_form_is_refused(self):
+        result = await _cowork_request_credentials(
+            session=None,
+            tc_input={"_connector_id": "gmail", "title": "Gmail", "extends_connection": "nope"},
+        )
+        assert "data-vault-form" not in result
+
+    @pytest.mark.asyncio
     async def test_stamped_connector_id_is_checked_instead_of_engine(self):
         result = await _cowork_request_credentials(
             session=None,
