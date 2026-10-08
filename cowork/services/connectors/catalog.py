@@ -10,6 +10,7 @@ from typing import Any
 
 from cowork.db.scoped import ScopedSession
 from cowork.models.custom_connector import CustomConnector
+from cowork.schemas.connectors import ConnectorSpecResponse
 from cowork.services.connectors.specs._registry import ConnectorSpecRegistry, registry
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,18 @@ class ConnectorCatalog(ConnectorSpecRegistry):
         if not self._session.scope.org_mode:
             stmt = stmt.where(CustomConnector.org_id.is_(None))
         return list(self._session.exec(stmt).all())
+
+    def get_connector(self, connector_id: str) -> ConnectorSpecResponse | None:
+        """Return one connector's spec, the built-in one when the id is both.
+
+        Args:
+            connector_id: The connector id to look up.
+
+        Returns:
+            The base registry's spec when it has the id, else this scope's
+            custom spec, else None.
+        """
+        return self._base.get_connector(connector_id) or super().get_connector(connector_id)
 
     def get_connectors(self) -> dict[str, dict]:
         """Return built-in and custom specs keyed by connector id.

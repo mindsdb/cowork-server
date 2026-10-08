@@ -28,10 +28,11 @@ from typing import Any
 import uuid
 
 from cowork.common.settings.user_settings import current_settings_scope
-from cowork.db.scoped import MissingTenantScopeError
+from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError
+from cowork.db.units import run_db
 from cowork.schemas.connectors import InvalidConnectorIdError, validate_engine_id
+from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.persist import vault_for_scope
-from cowork.services.connectors.specs._registry import registry
 
 logger = logging.getLogger(__name__)
 
@@ -361,18 +362,14 @@ def _lookup_score(query: str, c: dict) -> float:
 async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
     """Tool handler for `lookup_connector`.
 
-    Pulls a registry-backed connector spec by id (slug) or by
+    Pulls a connector spec, built-in or one of this scope's custom ones, by id (slug) or by
     natural-language query. The returned `form` blob is what the LLM
     should pass to `request_credentials` verbatim — methods, OAuth
     blocks, how_to markdown, and help_url all already filled in. We
     also stamp `_connector_id` onto the form so submissions land via
     the registry-aware save path (POST /v1/connectors/{id}/save).
     """
-    try:
-        from cowork.services.connectors.specs._registry import registry
-    except Exception as exc:
-        logger.exception("Cowork lookup_connector could not import registry")
-        return f"lookup_connector: registry unavailable ({exc})"
+    connectors = await _scope_connectors()
 
     cid = (tc_input.get("id") or "").strip()
     query = (tc_input.get("query") or "").strip()
@@ -413,9 +410,9 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
 
     # Stage 0 — explicit id always wins.
     if cid:
-        c = registry.get_connector(cid)
+        c = connectors.get(cid)
         if c:
-            return _present(c.model_dump(), 1.0, "id")
+            return _present(c, 1.0, "id")
         # Fall through to query-style lookup if the id didn't match.
         if not query:
             return json.dumps({
@@ -427,14 +424,14 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
                     f"handcraft the form spec — see the request_credentials "
                     f"schema for the OAuth/how_to/help_url fields."
                 ),
-                "available_ids": sorted(registry.get_connectors().keys()),
+                "available_ids": sorted(connectors),
             })
         # If both were given and id missed, treat the id as part of the query.
         query = f"{cid} {query}".strip()
 
     # Stage 1 — exact match (id or alias) on the query.
     nq = _lookup_normalize(query)
-    for c in registry.get_connectors().values():
+    for c in connectors.values():
         if _lookup_normalize(c.get("id", "")) == nq:
             return _present(c, 1.0, "exact-id")
         for alias in c.get("aliases", []):
@@ -443,7 +440,7 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
 
     # Stage 2 — token-overlap. Return up to 3 candidates with confidence.
     scored: list[tuple[float, dict]] = []
-    for c in registry.get_connectors().values():
+    for c in connectors.values():
         s = _lookup_score(query, c)
         if s > 0:
             scored.append((s, c))
@@ -459,7 +456,7 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
                 "request_credentials schema for the OAuth/how_to/help_url "
                 "fields you should fill in when you know the auth shape."
             ),
-            "available_ids": sorted(registry.get_connectors().keys()),
+            "available_ids": sorted(connectors),
         })
 
     top_score, top_c = scored[0]
@@ -538,6 +535,18 @@ def build_cowork_lookup_connector_tool():
         # the `connect-datasource` SKILL.md; duplicating it here would re-enter
         # the system prompt on every turn once the tool sticks after unlock.
         unlock_skill="connect-datasource",
+    )
+
+
+async def _scope_connectors() -> dict[str, dict]:
+    """Return built-in and custom connector specs visible to this turn's scope.
+
+    Returns:
+        Raw specs keyed by connector id, read off the event loop.
+    """
+    return await run_db(
+        lambda session: ConnectorCatalog(session).get_connectors(),
+        scope=current_settings_scope() or LOCAL_SCOPE,
     )
 
 
@@ -629,26 +638,28 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
         validate_engine_id(connector_id)
     except InvalidConnectorIdError as e:
         return f"request_credentials: {e}"
-    # For a registry id the server validates and saves against the registry
-    # spec, not this form, so a handcrafted form for one can't be honoured.
-    is_builtin = registry.get_connector(connector_id) is not None
-    if not spec.get("_connector_id") and is_builtin:
+    # A known id is validated and saved against its stored spec, not this
+    # form; only a handcrafted follow-up step of a custom connector may reuse one.
+    known = (await _scope_connectors()).get(connector_id)
+    extends_name = spec.get("extends_connection")
+    extending_custom = bool(known and known.get("custom")) and extends_name is not None
+    if not spec.get("_connector_id") and known is not None and not extending_custom:
         return (
-            f"request_credentials: {connector_id!r} is a built-in connector. Call "
+            f"request_credentials: {connector_id!r} is already a connector. Call "
             f"lookup_connector with id {connector_id!r} and pass its form, with "
             "`_connector_id`, instead of a handcrafted spec."
         )
 
     spec = dict(spec)
-    if spec.get("_connector_id") and not is_builtin:
-        # A stamped form saves an OAuth step through the registry-only direct
-        # save; a handcrafted one must route by `engine` through the submission.
+    if spec.get("_connector_id") and known is None:
+        # A stamped form saves an OAuth step through direct save, which only
+        # takes known connectors; an unknown id must route by `engine`.
         spec["engine"] = spec.pop("_connector_id")
-    extends_name = spec.pop("extends_connection", None)
+    spec.pop("extends_connection", None)
     if extends_name is not None:
         if not isinstance(extends_name, str) or not extends_name.strip():
             return "request_credentials: `extends_connection` must be the saved connection's name."
-        if is_builtin:
+        if known is not None and spec.get("_connector_id"):
             return (
                 "request_credentials: `extends_connection` applies only to handcrafted "
                 "forms; a built-in connector's form saves its connection in one step."

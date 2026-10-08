@@ -16,6 +16,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.common.settings.user_settings import UserSettings
 from cowork.handlers.turn_errors import server_busy_message
+from cowork.schemas.connectors import ConnectorSpecResponse
 from cowork.schemas.responses import Role
 from cowork.services.connectors.persist import persist_connection, vault_for_scope
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
@@ -253,7 +254,13 @@ class ProbeHandler:
             # Connector spec — absent for agent-handcrafted (non-registry)
             # connectors; those fall back to the form_spec staged with the
             # submission and skip the probe below.
-            spec = registry.get_connector(connector_id)
+            # Mirrors submit_form: a handcrafted form keeps its own spec, and a
+            # custom connector's stored spec arrives staged with the submission.
+            staged_spec = submission.get("form_spec") or {}
+            stamped = not staged_spec or bool(staged_spec.get("_connector_id"))
+            spec = registry.get_connector(connector_id) if stamped else None
+            if spec is None and submission.get("custom_spec"):
+                spec = ConnectorSpecResponse.model_validate(submission["custom_spec"])
             if spec is not None:
                 form_id = spec.form.form_id
                 form_spec = spec.form.model_dump()
