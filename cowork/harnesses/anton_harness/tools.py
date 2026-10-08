@@ -419,10 +419,8 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
                 "id": None,
                 "match": "none",
                 "message": (
-                    f"No connector with id `{cid}` in the registry. "
-                    f"Either retry with a `query` (natural-language) or "
-                    f"handcraft the form spec — see the request_credentials "
-                    f"schema for the OAuth/how_to/help_url fields."
+                    f"No connector with id `{cid}`. Retry with a `query` "
+                    f"(natural-language), or: {_BUILD_CUSTOM_CONNECTOR}"
                 ),
                 "available_ids": sorted(connectors),
             })
@@ -451,10 +449,8 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
             "id": None,
             "match": "none",
             "message": (
-                "No connector matched the query. Either ask the user to "
-                "clarify, or handcraft the form spec — see the "
-                "request_credentials schema for the OAuth/how_to/help_url "
-                "fields you should fill in when you know the auth shape."
+                "No connector matched the query. If the user may have meant a "
+                f"listed one, ask them to clarify. Otherwise: {_BUILD_CUSTOM_CONNECTOR}"
             ),
             "available_ids": sorted(connectors),
         })
@@ -536,6 +532,17 @@ def build_cowork_lookup_connector_tool():
         # the system prompt on every turn once the tool sticks after unlock.
         unlock_skill="connect-datasource",
     )
+
+
+_BUILD_CUSTOM_CONNECTOR = (
+    "No built-in or saved connector matches. Build a custom connector: ask the "
+    "user how the system is reached (a REST or GraphQL API, a database, or file "
+    "exports; reaching a website through the browser isn't available yet). Then "
+    "handcraft the form with `engine` set to the new connector's id and a "
+    "`connector` block (label, description, category, usage_notes), and pass it "
+    "to `request_credentials`. Credentials go only through that form, never chat. "
+    "Once its connection test passes it is saved for reuse."
+)
 
 
 async def _scope_connectors() -> dict[str, dict]:
@@ -707,6 +714,16 @@ _REQUEST_CREDENTIALS_SCHEMA = {
         "extends_connection": {
             "type": "string",
             "description": "Name of a connection saved earlier in this flow (the slug from 'Saved as `...`'). Set it on a follow-up step of a multi-step connect, e.g. tokens after an OAuth grant, so the new fields are added to that connection instead of creating a second one.",
+        },
+        "connector": {
+            "type": "object",
+            "description": "Only when building a new custom connector: how it is listed for reuse once its connection test passes.",
+            "properties": {
+                "label": {"type": "string", "description": "Display name (e.g. 'Kinaxis RapidResponse')."},
+                "description": {"type": "string", "description": "One line on what it connects to."},
+                "category": {"type": "string", "description": "Picker category (e.g. 'database', 'crm', 'developer')."},
+                "usage_notes": {"type": "string", "description": "Short notes for using it later: base URL, auth header, key endpoints, quirks. Never credential values."},
+            },
         },
         "_connector_id": {
             "type": "string",

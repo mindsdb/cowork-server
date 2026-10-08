@@ -271,3 +271,29 @@ class TestSecretFieldsFromNonRegistrySpecs:
 
         record = LocalDataVault(Path(tmp_path) / "vault").read_record("signer", result["name"])
         assert "signing_material" in record["secure_keys"]
+
+
+class TestBuildFlowPrompt:
+    @pytest.mark.asyncio
+    async def test_the_connector_block_reaches_the_form(self, engine):
+        result = await tools._cowork_request_credentials(None, {
+            "engine": "kinaxis", "title": "Connect Kinaxis",
+            "fields": [{"name": "api_key", "label": "API key", "type": "password", "secret": True}],
+            "connector": {"label": "Kinaxis", "category": "erp", "usage_notes": "Base URL is per tenant."},
+        })
+
+        block = json.loads(result.split("```data-vault-form\n", 1)[1].rsplit("\n```", 1)[0])
+        assert block["connector"] == {"label": "Kinaxis", "category": "erp", "usage_notes": "Base URL is per tenant."}
+
+    def test_the_schema_declares_the_connector_block(self):
+        props = tools._REQUEST_CREDENTIALS_SCHEMA["properties"]["connector"]["properties"]
+
+        assert set(props) == {"label", "description", "category", "usage_notes"}
+
+    @pytest.mark.asyncio
+    async def test_a_failed_lookup_points_to_building_a_custom_connector(self, engine):
+        result = json.loads(await tools._cowork_lookup_connector(None, {"query": "kinaxis rapidresponse"}))
+
+        assert result["match"] == "none"
+        assert "custom connector" in result["message"]
+        assert "request_credentials" in result["message"]
