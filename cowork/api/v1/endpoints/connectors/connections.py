@@ -182,6 +182,7 @@ def _persist_direct_connection(
             body.name,
             values,
             replace_existing=body.replace_existing,
+            spec_form=known.form.model_dump() if known.custom else None,
             default_label=oauth_default_label(values, body.connector_id),
             # HubSpot's MCP connector has no connect-time read/write/none
             # picker (see the HubSpot blueprint tab, Stage 0) — every new

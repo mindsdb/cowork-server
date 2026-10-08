@@ -23,6 +23,7 @@ from cowork.harnesses.anton_harness import tools
 from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import DirectSaveRequest, SubmitFormRequest
 from cowork.services.connectors.connections import ConnectionsService
+from cowork.services.connectors.persist import persist_connection
 from tests._fakes import FakeRequest
 
 HTTPBIN_FORM = {
@@ -216,3 +217,57 @@ class TestConnectionsAndSaves:
         with pytest.raises(HTTPException) as exc:
             await oauth_endpoints.start_oauth("httpbin", FakeRequest(), LOCAL_SCOPE)
         assert exc.value.status_code == 404
+
+
+class TestSecretFieldsFromNonRegistrySpecs:
+    """A field a custom or handcrafted spec marks secret is masked, even when
+    its name doesn't look like a secret."""
+
+    FORM = {
+        "form_id": "signer-connector",
+        "title": "Connect signer",
+        "fields": [
+            {"name": "account", "label": "Account", "type": "text"},
+            {"name": "signing_material", "label": "Signing material", "type": "text", "secret": True},
+        ],
+    }
+
+    def test_the_spec_form_marks_the_field_secret(self, tmp_path):
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        slug = persist_connection(
+            "signer", None, "", {"account": "a1", "signing_material": "m"},
+            spec_form=self.FORM, vault=vault,
+        )
+
+        assert "signing_material" in vault.read_record("signer", slug)["secure_keys"]
+
+    def test_without_the_form_the_name_check_misses_it(self, tmp_path):
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        slug = persist_connection(
+            "signer", None, "", {"account": "a1", "signing_material": "m"}, vault=vault,
+        )
+
+        assert "signing_material" not in vault.read_record("signer", slug)["secure_keys"]
+
+    def test_a_registry_connector_still_reads_its_own_spec(self, tmp_path):
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        slug = persist_connection("postgres", None, "", {"host": "h", "password": "p"}, vault=vault)
+
+        assert "password" in vault.read_record("postgres", slug)["secure_keys"]
+
+    def test_direct_save_of_a_custom_connector_uses_its_stored_form(self, engine, tmp_path, monkeypatch):
+        with Session(engine) as session:
+            session.add(CustomConnector(
+                connector_id="signer", label="Signer", spec=self.FORM, description="",
+            ))
+            session.commit()
+        monkeypatch.setattr(
+            "cowork.api.v1.endpoints.connectors.connections.ConnectorSettings",
+            lambda: type("S", (), {"vault_dir": str(Path(tmp_path) / "vault")})(),
+        )
+        body = DirectSaveRequest(connector_id="signer", values={"account": "a1", "signing_material": "m"})
+
+        result = connections_endpoints.save_connection_direct(body, LOCAL_SCOPE)
+
+        record = LocalDataVault(Path(tmp_path) / "vault").read_record("signer", result["name"])
+        assert "signing_material" in record["secure_keys"]
