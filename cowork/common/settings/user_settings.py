@@ -668,12 +668,12 @@ class UserSettings(Settings):
         description="Automatically pin important items.",
     )
     show_dots: bool = Field(
-        default=True,
+        default=False,
         title="Show Dots",
         description="Show dot grid background.",
     )
     show_counters: bool = Field(
-        default=True,
+        default=False,
         title="Show Counters",
         description="Show counters in the UI.",
     )
