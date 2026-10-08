@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from anton.utils.datasources import default_user_label, ensure_unique_user_label
+from anton.utils.datasources import ensure_unique_user_label
 
 from cowork.common.settings.app_settings import ConnectorSettings
 from cowork.services.connectors.identity import (
@@ -72,9 +72,9 @@ def persist_connection(
     ``user_label`` — passed explicitly or as a ``user_label`` / ``_user_label``
     field in ``credentials`` — is the newer, globally-unique, de-duplicated
     replacement for ``label``; stored as ``_user_label`` and carried forward
-    the same way. A brand-new connection that doesn't set one gets a computed
-    default: ``default_label`` if the caller supplied one (e.g. an OAuth
-    connector's fetched account/org/workspace name), else the engine id.
+    the same way. A brand-new connection that doesn't set one gets
+    ``default_label`` when the caller supplied one (e.g. an OAuth connector's
+    fetched account/org/workspace name), and otherwise no label at all.
 
     ``default_label`` only ever applies to a genuinely new connection (see the
     ``existing is None`` branch below) — unlike ``user_label``, it can never
@@ -167,21 +167,11 @@ def persist_connection(
         if not user_label:
             user_label = str((existing or {}).get("fields", {}).get("_user_label", "")).strip()
         if not user_label and existing is None:
-            # Genuinely new connection — nothing existed at this slug before
-            # this save, nothing explicit was passed, nothing to carry
-            # forward. Compute the same default anton's CLI prompt would show
-            # (engine id, de-duplicated); otherwise a connection created via
-            # cowork without an explicit label ends up with none at all,
-            # while every anton-created connection always gets one.
-            #
-            # Checked against `existing is None`, not `is_edit` — `is_edit`
-            # is only true when the request carried a GUI modify-flow
-            # keep-sentinel; a same-account re-save that reaches this
-            # function some other way (no sentinel) still resolves to the
-            # pre-existing record via `resolve_unique_slug()`'s
-            # `is_same_account()` check, and `existing` correctly reflects
-            # that (non-None) even though `is_edit` would be False.
-            user_label = str(default_label or "").strip() or default_user_label(vault, connector_id)
+            # Only a genuinely new connection takes the caller's default, so
+            # a re-save never overwrites a name the user already set. No
+            # default means no label: `_user_label` records what someone
+            # named the connection, never a guess such as the engine id.
+            user_label = str(default_label or "").strip()
         if user_label:
             payload["_user_label"] = ensure_unique_user_label(
                 vault, user_label, exclude=(connector_id, slug)
