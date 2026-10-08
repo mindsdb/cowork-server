@@ -19,6 +19,8 @@ from cowork.handlers.responses import ResponsesHandler
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, INTERRUPTED_TURN_MESSAGE
 from cowork.streaming.registry import RunHandle, TurnLifecycle, registry
 
+from _fakes import inline_run_db, opens
+
 CID = "conv-shutdown-test"
 
 
@@ -44,6 +46,10 @@ class _FakeBuffer:
     async def close(self, reason, extra=None):
         self.closed = reason
 
+    @property
+    def is_closed(self) -> bool:
+        return self.closed is not None
+
 
 def _streaming_handler(monkeypatch, saved: dict, started: asyncio.Event):
     """A handler whose turn is mid-stream (a real delta already sent) when
@@ -56,14 +62,15 @@ def _streaming_handler(monkeypatch, saved: dict, started: asyncio.Event):
             pass
 
         def get_conversation(self, conv_id):
-            return object()
+            return SimpleNamespace(project=None)
 
         def save_user_message(self, conv_id, content, *, created_at=None, pending=False):
             saved["user"] = content
             return SimpleNamespace(id=uuid4())
 
-        def finalize_pending(self, conv_id, message_id=None):
+        def clear_pending(self, conv_id, *, message_id=None):
             saved["finalized"] = True
+            return True
 
         def save_assistant_turn(self, conv_id, text, events, harness=None, tool_rows=None):
             saved["assistant"] = text
@@ -81,8 +88,7 @@ def _streaming_handler(monkeypatch, saved: dict, started: asyncio.Event):
         yield "event: response.completed\ndata: {}\n\n"
 
     monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
-    monkeypatch.setattr(responses_mod, "ScopedSession", lambda s, scope: FakeSession())
-    monkeypatch.setattr(responses_mod, "get_open_session", lambda: None)
+    monkeypatch.setattr(responses_mod, "run_db", inline_run_db(FakeSession()))
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: None)
     monkeypatch.setattr(responses_mod, "get_harness", lambda name: SimpleNamespace(
         stream_response=lambda **kwargs: None, formatter=formatter,
@@ -94,13 +100,13 @@ async def _start_streaming_turn(monkeypatch, saved, buffer):
     started = asyncio.Event()
     handler = _streaming_handler(monkeypatch, saved, started)
     lifecycle = TurnLifecycle()
-    coro = handler._run_turn(
-        conv_id=uuid4(), harness_input=[], original_content="hi", model="anton",
-        disabled=None, harness_name="anton", harness_id="anton", buffer=buffer,
-        lifecycle=lifecycle,
-    )
     handle = await registry.start(
-        conversation_id=CID, turn_id=0, buffer=buffer, producer_coro=coro,
+        conversation_id=CID, turn_id=0, open_buffer=opens(buffer),
+        produce=lambda buffer: handler._run_turn(
+            conv_id=uuid4(), harness_input=[], original_content="hi", model="anton",
+            disabled=None, harness_name="anton", harness_id="anton", buffer=buffer,
+            lifecycle=lifecycle,
+        ),
         lifecycle=lifecycle,
     )
     await asyncio.wait_for(started.wait(), timeout=5)
@@ -178,11 +184,13 @@ async def test_the_watchdog_and_shutdown_win_over_a_stall(monkeypatch, tmp_path,
     if backend == "local":
         started = asyncio.Event()
         handler = _streaming_handler(monkeypatch, saved, started)
-        coro = handler._run_turn(
-            conv_id=uuid4(), harness_input=[], original_content="hi", model="anton",
-            disabled=None, harness_name="anton", harness_id="anton", buffer=buffer,
-            lifecycle=lifecycle,
-        )
+
+        def produce(buffer):
+            return handler._run_turn(
+                conv_id=uuid4(), harness_input=[], original_content="hi", model="anton",
+                disabled=None, harness_name="anton", harness_id="anton", buffer=buffer,
+                lifecycle=lifecycle,
+            )
     else:
         started = asyncio.Event()
         handler = _remote_handler_with_message_id(monkeypatch, saved, assistant_message_id=uuid4())
@@ -193,12 +201,15 @@ async def test_the_watchdog_and_shutdown_win_over_a_stall(monkeypatch, tmp_path,
             await asyncio.sleep(3600)
 
         monkeypatch.setattr(responses_mod, "stream_remote_replies", replies)
-        coro = handler._produce_remote(
-            conv_id=uuid4(), input_text="hi", original_content="hi", model="anton",
-            harness_id="anton", buffer=buffer, lifecycle=lifecycle,
-        )
+
+        def produce(buffer):
+            return handler._produce_remote(
+                conv_id=uuid4(), input_text="hi", original_content="hi", model="anton",
+                harness_id="anton", buffer=buffer, lifecycle=lifecycle,
+            )
     handle = await registry.start(
-        conversation_id=CID, turn_id=0, buffer=buffer, producer_coro=coro, lifecycle=lifecycle,
+        conversation_id=CID, turn_id=0, open_buffer=opens(buffer), produce=produce,
+        lifecycle=lifecycle,
     )
     await asyncio.wait_for(started.wait(), timeout=5)
     if cause == "shutdown":
@@ -278,8 +289,8 @@ async def test_only_user_stop_emits_cancelled(monkeypatch, tmp_path, backend, ca
         monkeypatch.setattr(responses_mod, "stream_remote_replies", replies)
         lifecycle = TurnLifecycle()
         handle = await registry.start(
-            conversation_id=CID, turn_id=0, buffer=buffer, lifecycle=lifecycle,
-            producer_coro=handler._produce_remote(
+            conversation_id=CID, turn_id=0, open_buffer=opens(buffer), lifecycle=lifecycle,
+            produce=lambda buffer: handler._produce_remote(
                 conv_id=uuid4(), input_text="hi", original_content="hi", model="anton",
                 harness_id="anton", buffer=buffer, lifecycle=lifecycle,
             ),

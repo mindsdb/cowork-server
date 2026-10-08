@@ -14,6 +14,7 @@ from uuid import UUID, uuid4
 
 import sqlalchemy as sa
 
+from cowork.common.logger import log_context
 from cowork.common.paths import (
     PinnedDir,
     dir_mkdir,
@@ -744,8 +745,8 @@ class ProjectService:
                 # real `skills/<slug>` directory or be read-only, which is
                 # exactly how this now fails. Same treatment as rename.
                 logger.exception(
-                    "Could not reconcile desktop skill links for project %s",
-                    project.id,
+                    "Could not reconcile desktop skill links for the project",
+                    extra=log_context(project_id=project.id),
                 )
 
         return project
@@ -815,8 +816,8 @@ class ProjectService:
                 self.rollback_project_rename(stage)
             except Exception:
                 logger.exception(
-                    "Could not fully restore project %s after rename staging failed",
-                    project.id,
+                    "Could not fully restore the project after rename staging failed",
+                    extra=log_context(project_id=project.id),
                 )
             raise
         return stage
@@ -835,8 +836,8 @@ class ProjectService:
             except Exception as exc:
                 first_error = exc
                 logger.exception(
-                    "Could not restore skill references for project %s",
-                    stage.project_id,
+                    "Could not restore skill references for the project",
+                    extra=log_context(project_id=stage.project_id),
                 )
         if stage.directory_moved:
             try:
@@ -845,8 +846,8 @@ class ProjectService:
             except Exception as exc:
                 first_error = first_error or exc
                 logger.exception(
-                    "Could not restore the directory for project %s",
-                    stage.project_id,
+                    "Could not restore the directory for the project",
+                    extra=log_context(project_id=stage.project_id),
                 )
         if first_error is not None:
             raise RuntimeError(
@@ -928,8 +929,8 @@ class ProjectService:
                     self.rollback_project_rename(stage)
                 except Exception:
                     logger.exception(
-                        "Could not fully restore project %s after update staging failed",
-                        project_id,
+                        "Could not fully restore the project after update staging failed",
+                        extra=log_context(project_id=project_id),
                     )
             raise
         return project, stage
@@ -959,8 +960,8 @@ class ProjectService:
                     self.rollback_project_rename(stage)
                 except Exception:
                     logger.exception(
-                        "Could not fully restore project %s after commit failed",
-                        project.id,
+                        "Could not fully restore the project after commit failed",
+                        extra=log_context(project_id=project.id),
                     )
             raise
 
@@ -993,8 +994,8 @@ class ProjectService:
             )
         except Exception:
             logger.exception(
-                "Could not reconcile desktop links for renamed project %s",
-                project.id,
+                "Could not reconcile desktop links for the renamed project",
+                extra=log_context(project_id=project.id),
             )
 
     def update_project(
@@ -1134,8 +1135,8 @@ class ProjectService:
                     self._rename_in_root(staged_path, path)
                 except Exception:
                     logger.exception(
-                        "Could not restore project directory after delete failed: %s",
-                        project_id,
+                        "Could not restore the project directory after delete failed",
+                        extra=log_context(project_id=project_id),
                     )
             raise
         for conversation_stage in conversation_stages:

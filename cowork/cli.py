@@ -2,7 +2,6 @@
 
 import uvicorn
 
-from cowork.common.logger import uvicorn_logging_config
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.dev_setup import run_dev_setup
 
@@ -29,7 +28,6 @@ def main() -> None:
         port=port,
         reload=False,
         log_level="info",
-        log_config=uvicorn_logging_config(),
         timeout_graceful_shutdown=SHUTDOWN_GRACE_SECONDS,
     )
 

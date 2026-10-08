@@ -39,6 +39,7 @@ from cowork.api.v1.artifact_scope import (
     artifact_sources_for_request,
     scoped_project_id_for_request,
 )
+from cowork.common.logger import log_context
 from cowork.common.paths import dir_scandir, dir_stat, open_pinned_child
 from cowork.services.artifact_roots import (
     artifacts_sources_for_project,
@@ -839,7 +840,9 @@ async def delete_artifact_for_request(
         )
     except Exception:
         logger.warning(
-            "Could not drop the owner of deleted artifact %s", folder_name, exc_info=True
+            "Could not drop the owner of a deleted artifact",
+            exc_info=True,
+            extra=log_context(artifact_slug=folder_name),
         )
 
 

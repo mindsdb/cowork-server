@@ -274,12 +274,12 @@ def test_the_real_shape_dialects_still_qualify():
 
 def test_every_repair_guard_consults_the_shared_set():
     """The two tests above cover the local streaming and non-streaming sites
-    behaviourally. The remote site (`_produce_remote`) needs a producer session,
-    seeded history, an artifact snapshot and a memory read before it reaches its
-    guard — mocking all of that would produce a test that passes for reasons
-    unrelated to the guard, which is the failure mode this whole exercise is
-    about. So that third site is pinned structurally instead, in the same style
-    as `test_no_return_emits_a_literal_code` below.
+    behaviourally. The remote site (`_produce_remote`) needs staged files, a
+    saved question, seeded history, an artifact snapshot and a memory read
+    before it reaches its guard. Mocking all of that would produce a test that
+    passes for reasons unrelated to the guard, which is the failure mode this
+    whole exercise is about. So that third site is pinned structurally
+    instead, in the same style as `test_no_return_emits_a_literal_code` below.
 
     This is the exact mutation that went undetected: replacing the three guards
     with `code == "content_recovery"` while leaving `CONTENT_REPAIR_CODES`
@@ -383,10 +383,8 @@ async def _collect_produce_sse(handler: ResponsesHandler) -> list[str]:
             pass
 
     conv_id = uuid4()
-    mock_session = MagicMock()
 
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=mock_session),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -420,7 +418,7 @@ async def test_stream_emits_friendly_failed_event_for_image_error():
 async def test_produce_pending_persist_failure_does_not_clear_all_pending():
     # ENG-1231 hardening (in-process _produce, mirror of the _produce_remote test):
     # if the pending user persist raises before its id is captured, this turn owns
-    # no pending row — persist() must NOT fall back to finalize_pending(conv, None),
+    # no pending row — persist() must NOT fall back to clear_pending(conv, message_id=None),
     # which would clear a pending row stranded by an earlier crashed turn.
     from unittest.mock import MagicMock, patch
 
@@ -434,7 +432,6 @@ async def test_produce_pending_persist_failure_does_not_clear_all_pending():
             pass
 
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -450,9 +447,39 @@ async def test_produce_pending_persist_failure_does_not_clear_all_pending():
             harness_id="anton",
             buffer=_Buffer(),
         )
-        # No row was persisted for this turn → finalize must not have run at all,
+        # No row was persisted for this turn → clearing must not have run at all,
         # in particular never the clear-all (message_id=None) form.
-        conv_svc.return_value.finalize_pending.assert_not_called()
+        conv_svc.return_value.clear_pending.assert_not_called()
+
+
+def test_a_full_pool_maps_to_server_busy():
+    """A pool that freed no connection in time is not a provider failure: it
+    gets its own code and a sentence that names the wait."""
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+    from cowork.db.units import DatabaseBusy
+
+    busy = (te.SERVER_BUSY_CODE, "Cowork is busy. Try again in about 5 seconds.")
+    assert te.friendly_turn_error(PoolTimeoutError("QueuePool limit of size 20 overflow 20 reached")) == busy
+    assert te.friendly_turn_error(DatabaseBusy("no database unit slot freed within POOL_TIMEOUT")) == busy
+
+
+async def test_stream_fails_a_turn_that_finds_the_pool_full_with_a_timed_retry():
+    """Inside a stream a full pool is one response.failed frame, carrying the
+    wait the way rate_limited does, so a card can gate its Retry on it."""
+    from cowork.db.units import DatabaseBusy
+
+    frames = await _collect_produce_sse(
+        _handler_with_raising_formatter(DatabaseBusy("no database connection freed within POOL_TIMEOUT"))
+    )
+
+    failed = [f for f in frames if "response.failed" in f]
+    assert len(failed) == 1
+    payload = json.loads(failed[0].split("data: ", 1)[1].strip())
+    assert payload["code"] == te.SERVER_BUSY_CODE
+    assert payload["error"] == "Cowork is busy. Try again in about 5 seconds."
+    assert payload["retry_after"] == 5
+    assert payload["retry_at"].endswith("Z")
 
 
 async def test_stream_redacts_generic_error():
@@ -517,10 +544,11 @@ def test_collect_puts_the_same_id_on_the_body_and_the_log_line():
     # it failed with no id at all: the user got the generic message and the log
     # line named neither the turn nor a reference to quote.
     handler = _handler_with_raising_formatter(Exception("kaboom"))
+    conversation_id = uuid4()
     with _records_from("cowork.handlers.responses") as records:
         with pytest.raises(HTTPException) as err:
             asyncio.run(handler._collect(
-                stream=None, conversation_id=uuid4(), model="anton", original_content="hi",
+                stream=None, conversation_id=conversation_id, model="anton", original_content="hi",
             ))
 
     request_id = err.value.detail["request_id"]
@@ -528,6 +556,10 @@ def test_collect_puts_the_same_id_on_the_body_and_the_log_line():
     deployed = [r for r in records if r.levelno >= logging.WARNING]
     assert deployed
     assert all(getattr(r, "request_id", None) == request_id for r in deployed)
+    # The conversation travels beside the id, so a database error's sanitized
+    # line still names it.
+    [failed] = [r for r in deployed if r.getMessage() == "[responses] turn failed"]
+    assert failed.conversation_id == str(conversation_id)
 
 
 def test_collect_raises_500_generic_for_unmapped_error():
@@ -576,7 +608,6 @@ def test_stream_repairs_conversation_on_content_validation_error(make_exc):
 
     conv_id = uuid4()
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -609,7 +640,6 @@ def test_stream_does_not_repair_conversation_for_unrelated_errors():
 
     conv_id = uuid4()
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -629,11 +659,13 @@ def test_stream_does_not_repair_conversation_for_unrelated_errors():
 
 @pytest.mark.parametrize("make_exc", _REPAIR_FAMILIES)
 def test_collect_repairs_conversation_on_content_validation_error(make_exc):
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
+
+    from cowork.db.scoped import LOCAL_SCOPE
 
     exc = make_exc()
     handler = _handler_with_raising_formatter(exc)
-    handler.scoped = MagicMock()  # __init__ bypassed; _collect's repair path needs this
+    handler.scope = LOCAL_SCOPE  # __init__ bypassed; _collect's repair unit needs this
     conv_id = uuid4()
 
     with patch("cowork.handlers.responses.ConversationService") as conv_svc:
@@ -796,8 +828,10 @@ async def test_auth_reconnectable_keys_on_the_failing_role_not_planning():
 
     exc = ProviderAuthError("provider rejected the credential")
     exc.role = "coding"
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
@@ -822,8 +856,10 @@ async def test_auth_reconnectable_uses_planning_role_in_a_mixed_config():
     with patch(
         "cowork.handlers.responses.get_user_settings",
         return_value=_MixedSettings(),
-    ):
+    ) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     failed = next(f for f in frames if "response.failed" in f)
     payload = json.loads(failed.split("data: ", 1)[1].strip())
@@ -851,8 +887,10 @@ async def test_auth_without_a_role_does_not_name_a_provider_in_a_mixed_config():
     # LLMClient's confirmation wrappers set it.
     exc = ProviderAuthError("provider rejected the credential")
     assert exc.role is None
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_MixedSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_MixedSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
@@ -873,8 +911,10 @@ async def test_auth_without_a_role_still_names_an_unambiguous_provider():
         resolved_router_provider = Provider.OPENAI
 
     exc = ProviderAuthError("provider rejected the credential")
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_MindsSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_MindsSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
@@ -1863,8 +1903,10 @@ async def test_overloaded_reconnectable_keys_on_the_failing_model_not_planning()
         resolved_coding_provider = Provider.ANTHROPIC
 
     exc = _FakeOverloadedErr(_OVERLOAD_MSG, model="latest:haiku")  # the coding model
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
     )
@@ -1887,8 +1929,10 @@ async def test_overloaded_reconnectable_true_when_failing_model_is_managed():
         resolved_coding_provider = Provider.MINDS_CLOUD
 
     exc = _FakeOverloadedErr(_OVERLOAD_MSG, model="latest:sonnet")  # the planning model
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
     )
@@ -2342,6 +2386,11 @@ def test_wire_code_inventory_matches_the_renderer_contract():
         # another model is a way forward. The renderer branch lands in
         # mindsdb/cowork's ChatView.jsx + its turnFailureCards list.
         "model_restricted",
+        # No database connection freed within the pool timeout. A renderer
+        # without a branch for it shows the frame's `error` in its generic
+        # alert, and that sentence already names the wait, so the next step
+        # survives until the card lands in mindsdb/cowork's ChatView.jsx.
+        "server_busy",
         # A model call sent no output within anton's deadline. Split off
         # anton_error because the model went silent, not the agent, and the
         # card says so and offers Try again.

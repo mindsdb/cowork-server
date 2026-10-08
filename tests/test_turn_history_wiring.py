@@ -41,12 +41,12 @@ def _norm(obj) -> str:
     return re.sub(r"\s+", " ", "\n".join(lines))
 
 
-# `_produce_remote`'s source includes its nested `replies_as_stream_events` and
-# `persist`, which is where the remote turn's history flow lives.
+# `_run_remote_turn`'s source includes its nested `replies_as_stream_events`
+# and `persist`, which is where the remote turn's history flow lives.
 PERSISTERS = [
     pytest.param(r.ResponsesHandler._run_turn, id="in-process-streaming"),
     pytest.param(r.ResponsesHandler._collect, id="in-process-non-streaming"),
-    pytest.param(r.ResponsesHandler._produce_remote, id="remote"),
+    pytest.param(r.ResponsesHandler._run_remote_turn, id="remote"),
     pytest.param(rt.AntonChannelRuntime._run_anton, id="channels"),
 ]
 
@@ -80,28 +80,17 @@ def test_remote_path_gates_rows_on_a_clean_finish():
     """Rows arrive before the terminal event and persist() also runs on failure
     and cancellation, so the gate is what keeps a torn turn text-only.
 
-    Two `persist(clean=True)` call sites live on the SAME clean-finish path:
-    one fires as soon as the terminal frame is about to go out,
-    so the assistant message's real id can ride it; the other is the
-    original unconditional call after the formatter loop drains, kept as a
-    fallback for a formatter that returns without yielding a terminal frame
-    (persist() is idempotent, so it's a no-op once the first one ran). The
-    failure/cancellation branches below must still never opt into `clean`.
+    One `persist(clean=True)` call site, in finish(), on the clean-finish
+    path. Failure, user Stop, shutdown and watchdog interruption all end
+    through end_turn's `persist(clean=False)`: none may retain a torn set of
+    tool rows as a clean finish.
     """
-    src = _norm(r.ResponsesHandler._produce_remote)
-    assert "def persist(*, clean: bool = False)" in src
-    assert "tool_rows=turn_rows if clean else None" in src
-    assert "persist(clean=True)" in src
-    # Both clean=True call sites live on the success path: the early one
-    # fires as the terminal frame is about to go out, so the
-    # assistant message's real id can ride it; the other is the original
-    # unconditional call after the formatter loop drains, kept as a fallback
-    # for a formatter that returns without yielding a terminal frame
-    # (persist() is idempotent, so it's a no-op once the first one ran).
-    assert src.count("persist(clean=True)") == 2
-    # Failure, user Stop, shutdown and watchdog interruption all use plain
-    # persist(): none may retain a torn set of tool rows as a clean finish.
-    assert src.count("persist()") == 4
+    src = _norm(r.ResponsesHandler._run_remote_turn)
+    assert "async def persist(*, clean: bool)" in src
+    assert "tool_rows=tuple(turn_rows) if clean else ()" in src
+    assert src.count("persist(clean=True)") == 1
+    assert src.count("persist(clean=False)") == 1
+    assert src.count("persist(") == 3  # the definition and the two calls
 
 
 IN_PROCESS_PERSISTERS = [
@@ -142,5 +131,5 @@ def test_the_in_process_guard_is_not_the_pod_sanitizer():
 
 def test_remote_path_sanitizes_before_persisting():
     """The pod is semi-trusted; unvalidated rows must not reach the DB."""
-    src = _norm(r.ResponsesHandler._produce_remote)
+    src = _norm(r.ResponsesHandler._run_remote_turn)
     assert "sanitize_turn_history_rows(" in src

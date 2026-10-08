@@ -7,6 +7,7 @@ folder is kept.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -139,6 +140,52 @@ def test_an_allocated_project_still_renames(engine, projects_root):
     assert updated.name == "renamed"
     assert stage is not None
     renaming.rollback_project_rename(stage)
+
+
+def test_a_failed_rename_restore_names_the_project_on_its_log_lines(
+    engine, monkeypatch, owned_logger, caplog
+):
+    """The directory moved, the skill rewrite failed, and moving the directory
+    back failed too. Both lines carry the project id as a record attribute."""
+    from cowork.services import projects as projects_module
+    from cowork.services.skills import SkillService
+
+    svc = _svc(engine)
+    project_id = svc.create_project("notes").id
+    original_rename = ProjectService._rename_in_root
+    renames: list[tuple[Path, Path]] = []
+
+    def move_then_fail_the_restore(self, old, new):
+        renames.append((old, new))
+        if len(renames) > 1:
+            raise OSError("directory restore failed")
+        original_rename(self, old, new)
+
+    def fail_the_rewrites(self, rewrites):
+        raise RuntimeError("skill rewrite failed")
+
+    monkeypatch.setattr(ProjectService, "_rename_in_root", move_then_fail_the_restore)
+    monkeypatch.setattr(SkillService, "apply_project_reference_rewrites", fail_the_rewrites)
+    logged = owned_logger(projects_module.__name__)
+    with pytest.raises(RuntimeError, match="skill rewrite failed"):
+        _svc(engine).stage_project_update(
+            project_id,
+            resolved_name="renamed",
+            is_active=None,
+            display_label="renamed",
+        )
+
+    assert len(renames) == 2  # the move, then the failed move back
+    records = [
+        r for r in caplog.records
+        if r.name == logged.logger.name and r.levelno == logging.ERROR
+    ]
+    assert [r.getMessage() for r in records] == [
+        "Could not restore the directory for the project",
+        "Could not fully restore the project after rename staging failed",
+    ]
+    assert [r.project_id for r in records] == [str(project_id)] * 2
+    assert logged.output().count(f"[Project:{project_id}]: ") == 2
 
 
 def test_a_label_only_change_is_allowed_on_an_adopted_folder(engine, tmp_path):

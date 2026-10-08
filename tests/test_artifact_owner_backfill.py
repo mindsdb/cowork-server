@@ -33,19 +33,28 @@ PRIVATE_BIND = "private_backfill_bind_marker"
 PRIVATE_DETAIL = "private_backfill_driver_detail_marker"
 
 
-def _assert_safe_database_log(caplog, error_type, level):
+def _assert_safe_database_log(caplog, logged, error_type, level, *, project_id, slug):
     records = [record for record in caplog.records
                if record.name == backfill.__name__
                and record.getMessage().startswith("Database operation failed:")]
     assert len(records) == 1
     record = records[0]
     assert record.levelno == level
-    assert record.getMessage() == f"Database operation failed: error_type={error_type} sqlstate=unknown"
-    assert record.args == (error_type, "unknown")
+    site = ("artifact_owner_backfill", "_backfill_project", record.lineno)
+    assert record.getMessage() == (
+        f"Database operation failed: error_type={error_type} sqlstate=unknown "
+        f"site=artifact_owner_backfill._backfill_project:{record.lineno}"
+    )
+    assert record.args == (error_type, "unknown", *site)
+    # The project and slug the message used to carry travel as attributes.
+    assert (record.project_id, record.artifact_slug) == (str(project_id), slug)
     assert record.exc_info is None and record.exc_text is None
     for captured in caplog.records:
         assert all(value not in repr(captured.__dict__)
                    for value in (PRIVATE_SQL, PRIVATE_BIND, PRIVATE_DETAIL))
+    [line] = [line for line in logged.output().splitlines() if "Database operation failed" in line]
+    assert f"[Project:{project_id}][Artifact:{slug!r}]" in line
+    assert all(value not in logged.output() for value in (PRIVATE_SQL, PRIVATE_BIND, PRIVATE_DETAIL))
 
 
 def _engine():
@@ -234,7 +243,7 @@ def test_a_transient_db_error_aborts_the_pass_and_writes_no_sentinel(org, monkey
         assert raw.exec(select(Setting).where(Setting.key == backfill.SENTINEL_KEY)).first() is None
 
 
-def test_a_data_error_on_one_artifact_marks_only_it_unknown(org, monkeypatch, caplog):
+def test_a_data_error_on_one_artifact_marks_only_it_unknown(org, monkeypatch, caplog, owned_logger):
     """Only connection-level errors abort the pass. A `DataError` (like any
     statement error) is about one artifact: that one stays unknown and the rest
     of the walk, and the sentinel, still happen."""
@@ -249,6 +258,7 @@ def test_a_data_error_on_one_artifact_marks_only_it_unknown(org, monkeypatch, ca
         return real(session, project_id, slug)
 
     monkeypatch.setattr(backfill, "_owner_from_task_objects", data_error_for_bad)
+    logged = owned_logger(backfill.__name__)
 
     with caplog.at_level("WARNING", logger=backfill.__name__):
         summary = _run(project)
@@ -256,12 +266,12 @@ def test_a_data_error_on_one_artifact_marks_only_it_unknown(org, monkeypatch, ca
     assert summary is not None
     assert (str(project.id), "bad") in summary.unknown
     assert _owner(org_id, source, "good").owner_user_id == owner
-    _assert_safe_database_log(caplog, "DataError", logging.WARNING)
+    _assert_safe_database_log(caplog, logged, "DataError", logging.WARNING, project_id=project.id, slug="bad")
     with Session(_engine()) as raw:
         assert raw.exec(select(Setting).where(Setting.key == backfill.SENTINEL_KEY)).first() is not None
 
 
-def test_an_interface_error_aborts_the_pass_and_logs_safe_metadata(org, monkeypatch, caplog):
+def test_an_interface_error_aborts_the_pass_and_logs_safe_metadata(org, monkeypatch, caplog, owned_logger):
     write_artifact(org[3].base, "no-provenance")
     failure = sa.exc.InterfaceError(PRIVATE_SQL, {"value": PRIVATE_BIND}, Exception(PRIVATE_DETAIL))
 
@@ -269,6 +279,7 @@ def test_an_interface_error_aborts_the_pass_and_logs_safe_metadata(org, monkeypa
         raise failure
 
     monkeypatch.setattr(backfill, "_owner_from_task_objects", boom)
+    logged = owned_logger(backfill.__name__)
 
     with caplog.at_level("WARNING", logger=backfill.__name__):
         with pytest.raises(sa.exc.InterfaceError) as caught:
@@ -278,7 +289,9 @@ def test_an_interface_error_aborts_the_pass_and_logs_safe_metadata(org, monkeypa
     assert caught.value.statement == PRIVATE_SQL
     assert caught.value.params == {"value": PRIVATE_BIND}
     assert caught.value.orig.args == (PRIVATE_DETAIL,)
-    _assert_safe_database_log(caplog, "InterfaceError", logging.ERROR)
+    _assert_safe_database_log(
+        caplog, logged, "InterfaceError", logging.ERROR, project_id=org[2].id, slug="no-provenance",
+    )
     with Session(_engine()) as raw:
         assert raw.exec(select(Setting).where(Setting.key == backfill.SENTINEL_KEY)).first() is None
 

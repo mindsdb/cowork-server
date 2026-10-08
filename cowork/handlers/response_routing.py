@@ -15,6 +15,8 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal
 
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
 from cowork.common.logger import exception_http_status
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.services.providers import build_llm_client
@@ -558,6 +560,9 @@ async def decide_route(
     per-turn key); when None the binding comes from stored settings.
     Gate/provider failures intentionally fail open to Anton.  This boundary must
     never make a chat turn unavailable because the optional fast path is down.
+    A database pool that freed no connection in time is not a gate failure: it
+    propagates, and the request is refused rather than delegated into the same
+    wait.
     """
     reason = ineligible_reason(
         has_non_text_input=has_non_text_input,
@@ -618,13 +623,16 @@ async def decide_route(
             model=binding.model,
             text=text,
         )
+    except PoolTimeoutError:
+        raise
     except Exception as exc:
         # Provider body fields (including type/code/param) can echo private
         # request content. Only the class and a validated HTTP status are safe.
+        status = exception_http_status(exc)
         logger.warning(
             "[gate] reason=router_unavailable error=%s status=%s",
             type(exc).__name__,
-            exception_http_status(exc),
+            "unknown" if status is None else status,
         )
         # Attribution survives the failure: a 402 on a paid router pick is
         # only diagnosable in the traces if the model that failed is named.

@@ -1,16 +1,14 @@
 """Owned handlers must not archive provider bodies, requests or wrapped messages."""
 from __future__ import annotations
 
-import io
+import asyncio
 import json
 import logging
 import os
 import subprocess
 import sys
 import textwrap
-from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 from uuid import uuid4
 
 import anthropic
@@ -19,8 +17,11 @@ import httpx2
 import openai
 import pytest
 from fastapi import HTTPException
+from openai.types.chat import ChatCompletion
 
 from cowork.common import logger as app_logger
+from cowork.db.scoped import LOCAL_SCOPE
+from tests._uvicorn_harness import Launch, run_uvicorn_app
 
 PRIVATE = "provider_private_request_marker"
 
@@ -45,39 +46,16 @@ def _sdk_error(provider: str = "openai"):
     raise AssertionError("the endpoint must reject the request")
 
 
-@pytest.fixture
-def owned_logger(monkeypatch, caplog, tmp_path):
-    handlers = []
-
-    def install(name, kind="console", level=logging.ERROR):
-        stream = io.StringIO()
-        if kind == "console":
-            monkeypatch.setenv("RICH_LOGGING", "false")
-            handler = app_logger.setup_console_handler()
-            handler.setStream(stream)
-            handlers.append(handler)
-        else:
-            files = app_logger.setup_file_logging(str(tmp_path))
-            handlers.extend(files)
-            handler = files[0 if kind == "all_file" else 1]
-        logger = logging.getLogger(name)
-        monkeypatch.setattr(logger, "handlers", [handler, caplog.handler])
-        monkeypatch.setattr(logger, "propagate", False)
-        monkeypatch.setattr(logger, "level", level)
-        monkeypatch.setattr(logger, "disabled", False)
-        return logger, handler, stream
-
-    yield install
-    for handler in handlers:
-        handler.close()
-
-
-def _assert_safe(caplog, name, *, error_type="BadRequestError", status=400, level=logging.ERROR):
+def _assert_safe(caplog, name, *, error_type="BadRequestError", provider_error=None, status=400,
+                 level=logging.ERROR):
+    provider_error = provider_error or error_type
     records = [r for r in caplog.records if r.name == name and r.levelno == level]
     assert len(records) == 1
     record = records[0]
-    assert record.getMessage() == f"Provider operation failed: error_type={error_type} status={status}"
-    assert record.args == (error_type, status)
+    assert record.getMessage() == (
+        f"Provider operation failed: error_type={error_type} provider_error={provider_error} status={status}"
+    )
+    assert record.args == (error_type, provider_error, status)
     assert record.exc_info is None
     assert record.exc_text is None
     assert record.stack_info is None
@@ -86,29 +64,35 @@ def _assert_safe(caplog, name, *, error_type="BadRequestError", status=400, leve
 
 
 @pytest.mark.parametrize("kind", ["console", "all_file", "error_file"])
-@pytest.mark.parametrize("chain", ["cause", "context", "group"])
+@pytest.mark.parametrize("chain", ["cause", "context", "suppressed_context", "group"])
 @pytest.mark.parametrize("provider", ["openai", "anthropic", "anton"])
 def test_owned_handlers_sanitize_real_provider_errors(kind, chain, provider, owned_logger, caplog):
     from anton.core.llm.provider import EndpointConfigurationError
 
     error = EndpointConfigurationError(PRIVATE) if provider == "anton" else _sdk_error(provider)
-    logger, handler, stream = owned_logger("cowork.test.provider_filter", kind)
+    logged = owned_logger("cowork.test.provider_filter", kind=kind)
     try:
         if chain == "cause":
             raise RuntimeError("wrapper " + PRIVATE) from error
-        if chain == "context":
+        if chain in ("context", "suppressed_context"):
             try:
                 raise error
             except Exception:
-                raise RuntimeError("wrapper " + PRIVATE)
+                if chain == "context":
+                    raise RuntimeError("wrapper " + PRIVATE)
+                # `from None` hides the context from the traceback, but the
+                # wrapper's own message still repeats the provider's text.
+                raise RuntimeError("wrapper " + PRIVATE) from None
         raise ExceptionGroup("group " + PRIVATE, [error])
     except Exception as wrapper:
-        logger.exception(f"Provider failure: {wrapper}", extra={"request_id": "request-123"}, stack_info=True)
+        logged.logger.exception(f"Provider failure: {wrapper}", extra={"request_id": "request-123"}, stack_info=True)
     status = "unknown" if provider == "anton" else 400
-    record = _assert_safe(caplog, logger.name, error_type=type(error).__name__, status=status)
+    # The record's own exception is the wrapper; the provider error is in its chain.
+    wrapper_type = "ExceptionGroup" if chain == "group" else "RuntimeError"
+    record = _assert_safe(caplog, logged.logger.name, error_type=wrapper_type, provider_error=type(error).__name__,
+                          status=status)
     assert record.request_id == "request-123"
-    handler.flush()
-    emitted = stream.getvalue() if kind == "console" else Path(handler.baseFilename).read_text()
+    emitted = logged.output()
     assert PRIVATE not in emitted
     assert PRIVATE in str(error)
     if provider != "anton":
@@ -119,25 +103,35 @@ def test_owned_handlers_sanitize_real_provider_errors(kind, chain, provider, own
 @pytest.mark.parametrize("shape", ["argument", "mapping", "message"])
 def test_provider_exception_without_traceback_is_filtered(shape, owned_logger, caplog):
     error = _sdk_error()
-    logger, _, stream = owned_logger("cowork.test.provider_argument", level=logging.INFO)
+    logged = owned_logger("cowork.test.provider_argument", level=logging.INFO)
     if shape == "argument":
-        logger.info("User-facing provider error: %s", error)
+        logged.logger.info("User-facing provider error: %s", error)
     elif shape == "mapping":
-        logger.info("User-facing provider error: %(error)s", {"error": error})
+        logged.logger.info("User-facing provider error: %(error)s", {"error": error})
     else:
-        logger.info(error)
-    _assert_safe(caplog, logger.name, level=logging.INFO)
-    assert PRIVATE not in stream.getvalue()
+        logged.logger.info(error)
+    _assert_safe(caplog, logged.logger.name, level=logging.INFO)
+    assert PRIVATE not in logged.output()
     assert PRIVATE in str(error)
 
 
-@pytest.mark.parametrize("status", [True, 99, 600, "400", PRIVATE, None])
+class _TextStatus(int):
+    """An in-range int whose rendering carries private text."""
+
+    def __str__(self) -> str:
+        return PRIVATE
+
+    __repr__ = __str__
+
+
+# An int subclass can render anything, so only an exact int counts as a status.
+@pytest.mark.parametrize("status", [True, 99, 600, "400", PRIVATE, None, _TextStatus(429)])
 def test_provider_status_must_be_an_integer_http_status(status, owned_logger, caplog):
     error = _sdk_error()
     error.status_code = status
-    logger, _, _ = owned_logger("cowork.test.provider_status")
-    logger.error("Provider error: %s", error)
-    _assert_safe(caplog, logger.name, status="unknown")
+    logged = owned_logger("cowork.test.provider_status")
+    logged.logger.error("Provider error: %s", error)
+    _assert_safe(caplog, logged.logger.name, status="unknown")
     assert error.status_code == status
 
 
@@ -150,22 +144,22 @@ def test_bare_stream_api_error_and_hostile_status_are_never_coerced(owned_logger
                             body={"message": PRIVATE})
     error.status_code = HostileStatus()
     error.__cause__ = error  # Malformed chains must terminate.
-    logger, _, _ = owned_logger("cowork.test.provider_stream")
-    logger.error("Provider error: %s", error)
-    _assert_safe(caplog, logger.name, error_type="APIError", status="unknown")
+    logged = owned_logger("cowork.test.provider_stream")
+    logged.logger.error("Provider error: %s", error)
+    _assert_safe(caplog, logged.logger.name, error_type="APIError", status="unknown")
 
 
 def test_nonprovider_connection_errors_keep_their_traceback(owned_logger, caplog):
-    logger, _, stream = owned_logger("cowork.test.ordinary_connection")
+    logged = owned_logger("cowork.test.ordinary_connection")
     try:
         raise ConnectionError("ordinary socket failure")
     except ConnectionError:
-        logger.exception("Reconnect failed")
-    (record,) = [r for r in caplog.records if r.name == logger.name and r.levelno == logging.ERROR]
+        logged.logger.exception("Reconnect failed")
+    (record,) = [r for r in caplog.records if r.name == logged.logger.name and r.levelno == logging.ERROR]
     assert record.getMessage() == "Reconnect failed"
     assert record.exc_info is not None
     assert str(record.exc_info[1]) == "ordinary socket failure"
-    assert "ordinary socket failure" in stream.getvalue()
+    assert "ordinary socket failure" in logged.output()
 
 
 @pytest.mark.asyncio
@@ -194,7 +188,7 @@ async def test_real_credential_probe_keeps_verdict_but_sanitizes_log(
     monkeypatch.setattr(probe_module, "_probe_tmp_dir", lambda: tmp_path)
     monkeypatch.setattr(probe_module, "build_chat_session", build)
     monkeypatch.setattr(probe_module, "close_session_scratchpads", lambda s, **kwargs: closed.append(s))
-    logger, _, stream = owned_logger(probe_module.__name__)
+    logged = owned_logger(probe_module.__name__)
     probe = probe_module.CredentialProbe(engine="postgres", credentials={"password": PRIVATE},
                                          llm_client=None, workspace=None)
     events = [event async for event in probe.run()]
@@ -205,8 +199,8 @@ async def test_real_credential_probe_keeps_verdict_but_sanitizes_log(
     assert outcome.error == prefix + str(error)
     assert closed == ([] if stage == "build" else [session])
     assert not list(tmp_path.glob("probe-*.env"))
-    _assert_safe(caplog, logger.name)
-    assert PRIVATE not in stream.getvalue()
+    _assert_safe(caplog, logged.logger.name)
+    assert PRIVATE not in logged.output()
     assert PRIVATE in repr(error.body)
 
 
@@ -225,19 +219,19 @@ async def test_real_probe_handler_keeps_sse_outcome_but_sanitizes_iteration_erro
     monkeypatch.setattr(handler_module.store, "get", lambda _: {"values": {"password": PRIVATE}})
     monkeypatch.setattr(handler_module.registry, "get_connector", lambda _: SimpleNamespace(
         form=SimpleNamespace(form_id="probe-form", model_dump=lambda: {"form_id": "probe-form"})))
-    monkeypatch.setattr("cowork.common.settings.user_settings.get_user_settings",
-                        lambda: SimpleNamespace(resolved_planning_provider=None))
+    monkeypatch.setattr(handler_module, "_read_probe_settings",
+                        lambda _session: SimpleNamespace(resolved_planning_provider=None))
     monkeypatch.setattr("cowork.services.providers.web_tool_kwargs_for", lambda _: {})
     monkeypatch.setattr(handler_module.ProbeHandler, "_build_llm_client", lambda *a, **kw: object())
     monkeypatch.setattr(handler_module, "CredentialProbe", lambda **kw: SimpleNamespace(run=failed_probe))
-    logger, _, stream = owned_logger(handler_module.__name__)
-    handler = handler_module.ProbeHandler(session=MagicMock())
+    logged = owned_logger(handler_module.__name__)
+    handler = handler_module.ProbeHandler(scope=LOCAL_SCOPE)
     events = [event async for event in handler.run("staged", "postgres", None, "test", None)]
     assert PRIVATE in "".join(events)  # Client outcome is deliberately unchanged.
     completed = json.loads(events[-1].split("data: ", 1)[1])
     assert completed["response"]["status"] == "retry"
-    _assert_safe(caplog, logger.name)
-    assert PRIVATE not in stream.getvalue()
+    _assert_safe(caplog, logged.logger.name)
+    assert PRIVATE not in logged.output()
 
 
 @pytest.mark.asyncio
@@ -254,19 +248,18 @@ async def test_real_response_collection_keeps_http_outcome_but_sanitizes_provide
         raise error
         yield
 
-    monkeypatch.setattr(responses, "get_user_settings", lambda _: SimpleNamespace(harness="anton"))
-    handler = responses.ResponsesHandler(MagicMock())
+    handler = responses.ResponsesHandler()
     handler.harness = SimpleNamespace(formatter=formatter)
-    logger, _, stream = owned_logger(responses.__name__, level=logging.INFO)
+    logged = owned_logger(responses.__name__, level=logging.INFO)
     with pytest.raises(HTTPException) as caught:
         await handler._collect(None, uuid4(), "test-model", "input")
     assert caught.value.status_code == (400 if curated else 500)
     assert caught.value.detail["code"] == ("provider_auth" if curated else "anton_error")
-    record = _assert_safe(caplog, logger.name, error_type=type(error).__name__,
+    record = _assert_safe(caplog, logged.logger.name, error_type=type(error).__name__,
                           status="unknown" if curated else 400,
                           level=logging.INFO if curated else logging.ERROR)
     assert record.request_id == caught.value.detail["request_id"]
-    assert PRIVATE not in stream.getvalue()
+    assert PRIVATE not in logged.output()
     assert PRIVATE in str(error)
 
 
@@ -291,7 +284,7 @@ async def test_real_streamed_turn_preserves_failure_frame_and_sanitizes_sdk_trac
     saved = {}
     handler = _handler(monkeypatch, saved, Harness())
     buffer = FileStreamBuffer(tmp_path / "turn.log")
-    logger, _, stream = owned_logger(responses.__name__)
+    logged = owned_logger(responses.__name__)
     await handler._run_turn(conv_id=uuid4(), harness_input=[], original_content="input",
                             model="anton", disabled=None, harness_name="anton", harness_id="anton", buffer=buffer)
     records = list(read_records(buffer.path))
@@ -300,91 +293,216 @@ async def test_real_streamed_turn_preserves_failure_frame_and_sanitizes_sdk_trac
     assert failed["type"] == "response.failed"
     assert failed["code"] == "anton_error"
     assert failed["error"] == "An unexpected error occurred."
-    record = _assert_safe(caplog, logger.name)
+    record = _assert_safe(caplog, logged.logger.name)
     assert record.request_id == failed["request_id"]
-    assert PRIVATE not in stream.getvalue()
+    assert PRIVATE not in logged.output()
     assert PRIVATE in str(error)
 
 
-def test_cli_uvicorn_handlers_sanitize_real_provider_failure(tmp_path):
-    # Isolate dictConfig, which closes process-wide handlers. No socket needed.
-    program = textwrap.dedent("""
-        import asyncio, h11, httpx, json, logging, openai
-        from unittest import mock
-        from types import SimpleNamespace
-        import uvicorn
-        from uvicorn.protocols.http.h11_impl import RequestResponseCycle
-        from cowork import cli
-        records = []
-        class Capture(logging.Handler):
-            def emit(self, record): records.append(record)
-        error = openai.BadRequestError('provider_private_request_marker',
-            response=httpx.Response(400, request=httpx.Request('POST', 'https://example.com/provider_private_request_marker')),
-            body={'message': 'provider_private_request_marker'})
-        async def app(scope, receive, send):
-            raise RuntimeError('wrapper provider_private_request_marker') from error
-        async def run():
-            with mock.patch.object(cli.uvicorn, 'run') as start: cli.main()
-            config = uvicorn.Config(app, **{key: value for key, value in start.call_args.kwargs.items()
-                if key not in ('host', 'port', 'reload', 'timeout_graceful_shutdown')})
-            logger = logging.getLogger('uvicorn.error')
-            logger.addHandler(Capture())
-            conn = h11.Connection(h11.SERVER)
-            conn.receive_data(b'GET /fail HTTP/1.1\\r\\nHost: localhost\\r\\n\\r\\n')
-            conn.next_event()
-            transport = mock.Mock()
-            cycle = RequestResponseCycle(
-                scope={'type': 'http', 'headers': [], 'http_version': '1.1', 'method': 'GET',
-                       'path': '/fail', 'query_string': b'', 'client': ('127.0.0.1', 1234)},
-                conn=conn, transport=transport, flow=SimpleNamespace(write_paused=False), logger=logger,
-                access_logger=logging.getLogger('uvicorn.access'), access_log=False,
-                default_headers=[], message_event=asyncio.Event(), on_response=lambda: None)
-            await cycle.run_asgi(app)
-            response = b''.join(call.args[0] for call in transport.write.call_args_list)
-            selected = [r for r in records if r.name == 'uvicorn.error' and r.levelno == logging.ERROR]
-            print(json.dumps({'status_500': b'500' in response.split(b'\\r\\n', 1)[0],
-                'records': [{'message': r.getMessage(), 'args': r.args, 'traceback': r.exc_info is not None,
-                             'exc_text': r.exc_text} for r in selected],
-                'original_message': str(error)}))
-        asyncio.run(run())
-    """)
-    result = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True,
-                            env={**os.environ, "COWORK_HOME": str(tmp_path), "DATABASE_URI": "sqlite://"}, timeout=30)
-    assert result.returncode == 0, result.stderr
-    report = json.loads(result.stdout.splitlines()[-1])
-    assert report["status_500"] is True
-    assert report["records"] == [{"message": "Provider operation failed: error_type=BadRequestError status=400",
-                                  "args": ["BadRequestError", 400], "traceback": False, "exc_text": None}]
-    assert report["original_message"] == PRIVATE
-    assert PRIVATE not in result.stderr
-    assert PRIVATE not in "\n".join(result.stdout.splitlines()[:-1])
+# A route's provider error escapes to Uvicorn, which logs "Exception in ASGI
+# application" with the whole chain, provider message and body included.
+_PROVIDER_FAILURE_APP = f"""
+    import httpx, openai
+    from fastapi import FastAPI
+    from cowork.common.logger import setup_logging
+
+    # cowork.server runs this at import, under every launcher.
+    setup_logging()
+    app = FastAPI()
+
+    @app.get("/fail")
+    async def fail():
+        error = openai.BadRequestError(
+            "{PRIVATE}",
+            response=httpx.Response(400, request=httpx.Request("POST", "https://example.com/{PRIVATE}")),
+            body={{"message": "{PRIVATE}"}},
+        )
+        raise RuntimeError("wrapper {PRIVATE}") from error
+"""
 
 
-def test_debug_app_logging_suppresses_actual_anthropic_request_diagnostics(tmp_path):
-    program = textwrap.dedent("""
-        import json, logging
+@pytest.mark.parametrize("launch", ["module", "run"])
+def test_uvicorns_default_log_config_prints_only_sanitized_provider_errors(tmp_path, launch: Launch):
+    run = run_uvicorn_app(tmp_path=tmp_path, app_source=_PROVIDER_FAILURE_APP, paths=("/fail",), launch=launch)
+    assert run.statuses == (500,)
+    assert ("Provider operation failed: error_type=RuntimeError provider_error=BadRequestError status=400"
+            in run.stderr), run.stderr
+    assert "Finished server process" in run.stderr
+    assert PRIVATE not in run.stdout + run.stderr
+
+
+def test_debug_app_logging_keeps_real_sdk_transport_traces_out(tmp_path):
+    # A real localhost provider, so each SDK sends through its default HTTP
+    # client and transport, as it does against OpenAI or Anthropic.
+    program = textwrap.dedent(f"""
+        import http.server, json, logging, threading
+        import anthropic, openai
         from cowork.common.logger import setup_logging
-        from tests.test_provider_log_filter import _sdk_error
-        for name in ('anthropic', 'anthropic._base_client', 'httpx2'):
-            logging.getLogger(name).setLevel(logging.DEBUG)
         setup_logging()
         records = []
         class Capture(logging.Handler):
             def emit(self, record): records.append(record)
         logging.getLogger().addHandler(Capture())
-        error = _sdk_error('anthropic')
-        logging.getLogger('cowork.test.provider_debug').error('Provider failure: %s', error)
-        diagnostics = [r for r in records if r.name in ('anthropic._base_client', 'httpx2')]
-        print(json.dumps({'diagnostics': [r.getMessage() for r in diagnostics],
-            'levels': {name: logging.getLogger(name).level for name in ('anthropic._base_client', 'httpx2')},
-            'errors': [r.getMessage() for r in records if r.name == 'cowork.test.provider_debug']}))
+
+        class Provider(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                body = json.dumps({{"error": {{"message": "{PRIVATE}", "type": "invalid_request_error"}}}}).encode()
+                self.send_response(400)
+                self.send_header("set-cookie", "session={PRIVATE}-cookie")
+                self.send_header("x-request-id", "{PRIVATE}-request-id")
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Provider)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        base = "http://127.0.0.1:%d" % server.server_address[1]
+        calls = [
+            lambda: openai.OpenAI(api_key="test-key", base_url=base + "/v1", max_retries=0)
+                .responses.create(model="test-model", input="hello"),
+            lambda: anthropic.Anthropic(api_key="test-key", base_url=base, max_retries=0)
+                .messages.create(model="test-model", max_tokens=1, messages=[{{"role": "user", "content": "hello"}}]),
+        ]
+        for call in calls:
+            try:
+                call()
+            except (openai.APIError, anthropic.APIError) as error:
+                logging.getLogger("cowork.test.provider_debug").error("Provider failure: %s", error)
+        server.shutdown()
+        transport = ("httpcore", "httpcore2", "httpx", "httpx2", "openai._base_client", "anthropic._base_client")
+        print(json.dumps({{
+            "diagnostics": sorted({{r.name for r in records if r.name.split(".")[0] in transport[:4]
+                                    or r.name in transport[4:]}}),
+            "levels": {{name: logging.getLogger(name).level for name in transport}},
+            "errors": [r.getMessage() for r in records if r.name == "cowork.test.provider_debug"],
+        }}))
     """)
     result = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True,
                             env={**os.environ, "COWORK_HOME": str(tmp_path), "DATABASE_URI": "sqlite://",
-                                 "LOG_LEVEL": "DEBUG"}, timeout=30)
+                                 "LOG_LEVEL": "DEBUG"}, timeout=60)
     assert result.returncode == 0, result.stderr
-    report = json.loads(result.stdout.splitlines()[-1])
-    assert report == {"diagnostics": [],
-                      "levels": {"anthropic._base_client": logging.ERROR, "httpx2": logging.ERROR},
-                      "errors": ["Provider operation failed: error_type=BadRequestError status=400"]}
     assert PRIVATE not in result.stdout + result.stderr
+    report = json.loads(result.stdout.splitlines()[-1])
+    assert report == {
+        "diagnostics": [],
+        "levels": dict.fromkeys(
+            ("httpcore", "httpcore2", "httpx", "httpx2", "openai._base_client", "anthropic._base_client"),
+            logging.ERROR,
+        ),
+        "errors": ["Provider operation failed: error_type=BadRequestError provider_error=BadRequestError status=400",
+                   "Provider operation failed: error_type=BadRequestError provider_error=BadRequestError status=400"],
+    }
+
+
+def _request() -> httpx.Request:
+    return httpx.Request("POST", "https://provider.example/v1/chat/completions")
+
+
+def _rate_limit_error() -> openai.RateLimitError:
+    return openai.RateLimitError(
+        PRIVATE, response=httpx.Response(429, request=_request()), body={"message": PRIVATE},
+    )
+
+
+def _raised(*, error: BaseException) -> BaseException:
+    try:
+        raise error
+    except BaseException as caught:
+        return caught
+
+
+def _wrapped_with_its_own_status() -> BaseException:
+    try:
+        raise _rate_limit_error()
+    except openai.RateLimitError as provider_error:
+        wrapper = RuntimeError(PRIVATE)
+        wrapper.status_code = 502  # A gateway status on the wrapper is not the provider's.
+        try:
+            raise wrapper from provider_error
+        except RuntimeError as caught:
+            return caught
+
+
+def _raised_while_handling() -> BaseException:
+    try:
+        try:
+            raise _rate_limit_error()
+        except openai.RateLimitError:
+            raise KeyError(PRIVATE)
+    except KeyError as caught:
+        return caught
+
+
+def _cause_subtree_before_context() -> BaseException:
+    # The provider error sits one level down the cause, and another sits on the
+    # wrapper's own context. A depth-first walk reaches the cause's context first.
+    cause = RuntimeError(PRIVATE)
+    cause.__context__ = _rate_limit_error()
+    wrapper = RuntimeError(PRIVATE)
+    wrapper.__cause__ = cause
+    wrapper.__context__ = openai.APIConnectionError(message=PRIVATE, request=_request())
+    return wrapper
+
+
+# Anton's ProviderErrorFilter runs these same cases and expects the same lines,
+# so the two copies stay aligned.
+@pytest.mark.parametrize("build,expected", [
+    (lambda: _raised(error=_rate_limit_error()),
+     "error_type=RateLimitError provider_error=RateLimitError status=429"),
+    (_wrapped_with_its_own_status,
+     "error_type=RuntimeError provider_error=RateLimitError status=429"),
+    (lambda: _raised(error=openai.APIConnectionError(message=PRIVATE, request=_request())),
+     "error_type=APIConnectionError provider_error=APIConnectionError status=unknown"),
+    (_raised_while_handling,
+     "error_type=KeyError provider_error=RateLimitError status=429"),
+    (lambda: _raised(error=openai.LengthFinishReasonError(completion=ChatCompletion.model_construct(usage=None))),
+     "error_type=LengthFinishReasonError provider_error=LengthFinishReasonError status=unknown"),
+    (_cause_subtree_before_context,
+     "error_type=RuntimeError provider_error=RateLimitError status=429"),
+], ids=["provider_429", "wrapper_status", "no_status", "raised_while_handling", "not_an_api_error",
+        "cause_subtree_before_context"])
+def test_provider_filter_parity_cases(build, expected: str) -> None:
+    error = build()
+    record = logging.LogRecord("cowork.test.provider_parity", logging.ERROR, __file__, 1,
+                               f"Failed: {PRIVATE}", (), (type(error), error, error.__traceback__))
+    assert app_logger.ProviderErrorFilter().filter(record)
+    assert record.getMessage() == f"Provider operation failed: {expected}"
+    assert record.exc_info is None and record.exc_text is None and record.stack_info is None
+    assert PRIVATE not in logging.Formatter().format(record)
+
+
+@pytest.mark.parametrize("path", ["streamed", "collected"])
+def test_a_repaired_content_validation_error_keeps_its_count_in_the_log(path, monkeypatch, owned_logger, caplog):
+    from anton.core.llm.provider import ContentValidationError
+    from cowork.handlers import responses
+    from tests.test_inprocess_request_id import _RecBuffer, _failed_payload, _failing_handler, _run
+
+    saved: dict = {}
+    handler = _failing_handler(monkeypatch, saved, ContentValidationError(PRIVATE))
+    logged = owned_logger(responses.__name__, level=logging.WARNING)
+    conversation_id = uuid4()
+    if path == "streamed":
+        _run(handler, _RecBuffer(), conv_id=conversation_id)
+        request_id = _failed_payload(saved)["request_id"]
+    else:
+        handler.scope = None
+        handler.harness = responses.get_harness("anton")
+        with pytest.raises(HTTPException) as caught:
+            asyncio.run(handler._collect(None, conversation_id, "test-model", "input"))
+        request_id = caught.value.detail["request_id"]
+    assert saved.get("repaired")
+    [record] = [r for r in caplog.records if r.name == logged.logger.name and "repaired" in r.getMessage()]
+    assert record.levelno == logging.WARNING
+    # The ids travel as record attributes, not in the message.
+    assert record.getMessage() == (
+        "[responses] content validation error; "
+        "repaired 1 message(s) with image content: error_type=ContentValidationError"
+    )
+    assert (record.request_id, record.conversation_id) == (request_id, str(conversation_id))
+    emitted = logged.output()
+    assert f"[Req:{request_id}][Conversation:{conversation_id}]" in emitted
+    assert PRIVATE not in emitted
