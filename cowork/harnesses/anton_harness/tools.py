@@ -612,10 +612,10 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
         validate_engine_id(connector_id)
     except InvalidConnectorIdError as e:
         return f"request_credentials: {e}"
-    # A submission is checked against the registry spec whenever its id is a
-    # registry id, so a handcrafted form for one would be refused after the
-    # user filled it in.
-    if not spec.get("_connector_id") and registry.get_connector(connector_id) is not None:
+    # For a registry id the server validates and saves against the registry
+    # spec, not this form, so a handcrafted form for one can't be honoured.
+    is_builtin = registry.get_connector(connector_id) is not None
+    if not spec.get("_connector_id") and is_builtin:
         return (
             f"request_credentials: {connector_id!r} is a built-in connector. Call "
             f"lookup_connector with id {connector_id!r} and pass its form, with "
@@ -627,7 +627,7 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
     if extends_name is not None:
         if not isinstance(extends_name, str) or not extends_name.strip():
             return "request_credentials: `extends_connection` must be the saved connection's name."
-        if spec.get("_connector_id"):
+        if is_builtin:
             return (
                 "request_credentials: `extends_connection` applies only to handcrafted "
                 "forms; a built-in connector's form saves its connection in one step."

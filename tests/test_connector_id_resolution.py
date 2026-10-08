@@ -141,6 +141,22 @@ class TestRequestCredentialsTool:
             tc_input={"_connector_id": "gmail", "title": "Gmail", "extends_connection": "nope"},
         )
         assert "data-vault-form" not in result
+        assert "extends_connection" in result
+
+    @pytest.mark.asyncio
+    async def test_extends_connection_on_a_non_registry_stamped_form_renders(self):
+        # `linkedin` is not a registry id, so copying it into `_connector_id`
+        # still leaves the form handcrafted and mergeable.
+        result = await _cowork_request_credentials(
+            session=None,
+            tc_input={
+                "engine": "linkedin",
+                "_connector_id": "linkedin",
+                "title": "Finish",
+                "extends_connection": "linkedin-1a2b3c4d",
+            },
+        )
+        assert '"_extends_connection": "linkedin-1a2b3c4d"' in result
 
     @pytest.mark.asyncio
     async def test_stamped_connector_id_is_checked_instead_of_engine(self):
