@@ -756,6 +756,10 @@ _REQUEST_CREDENTIALS_SCHEMA = {
                         "enum": ["text", "password", "url", "select", "textarea", "boolean"],
                     },
                     "required": {"type": "boolean"},
+                    "secret": {
+                        "type": "boolean",
+                        "description": "True for any credential (password, API key, token, secret). It is masked wherever the connection is shown.",
+                    },
                     "placeholder": {"type": "string"},
                     "default": {},
                     "value": {"description": "Pre-fill on re-render. NEVER for secrets — password values are scrubbed server-side."},
