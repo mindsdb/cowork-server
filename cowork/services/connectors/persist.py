@@ -135,6 +135,8 @@ def persist_connection(
         payload = {**cred, "_connector_id": connector_id}
         if method:
             payload["_method"] = method
+        elif extends and target["fields"].get("_method"):
+            payload["_method"] = target["fields"]["_method"]
         secure_keys = secure_keys_for(connector_id, method, payload)
         reconnecting_named_record = replace_existing and bool((name or "").strip()) and target is not None
         if is_edit or reconnecting_named_record or extends:
@@ -167,10 +169,8 @@ def persist_connection(
         if not user_label:
             user_label = str((existing or {}).get("fields", {}).get("_user_label", "")).strip()
         if not user_label and existing is None:
-            # Only a genuinely new connection takes the caller's default, so
-            # a re-save never overwrites a name the user already set. No
-            # default means no label: `_user_label` records what someone
-            # named the connection, never a guess such as the engine id.
+            # Only a new connection takes the caller's default. No default
+            # means no label; `_user_label` is never a guess like the engine id.
             user_label = str(default_label or "").strip()
         if user_label:
             payload["_user_label"] = ensure_unique_user_label(
