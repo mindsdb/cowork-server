@@ -12,6 +12,43 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 # otherwise-hyphenated ids), so both are allowed.
 _METHOD_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_-]*$")
 
+# A connector id names vault records on disk and prefixes DS_* env vars, and
+# a handcrafted one is model-chosen, so it is checked and rejected, never
+# rewritten. No hyphen: the vault joins "{engine}-{name}" into one file name.
+_ENGINE_ID_PATTERN = re.compile(r"[a-z][a-z0-9_]{1,63}")
+_SYNTHESIZED_FORM_ID_PATTERN = re.compile(r"fm_[0-9a-f]+")
+
+
+class InvalidConnectorIdError(ValueError):
+    """A connector id that cannot be used as a vault engine."""
+
+
+def validate_engine_id(value: Any) -> str:
+    """Return ``value`` when it is a usable connector id, else raise.
+
+    Args:
+        value: The candidate connector id, as sent by a client or the model.
+
+    Returns:
+        The same string, unchanged.
+
+    Raises:
+        InvalidConnectorIdError: when ``value`` is not a lowercase
+        ``[a-z][a-z0-9_]`` id of 2 to 64 characters, or is a synthesized
+        ``fm_<hex>`` form id.
+    """
+    if not isinstance(value, str) or not _ENGINE_ID_PATTERN.fullmatch(value):
+        raise InvalidConnectorIdError(
+            f"Invalid connector id {value!r}: use 2 to 64 lowercase letters, "
+            "digits and underscores, starting with a letter (e.g. 'linkedin')."
+        )
+    if _SYNTHESIZED_FORM_ID_PATTERN.fullmatch(value):
+        raise InvalidConnectorIdError(
+            f"Invalid connector id {value!r}: that is a generated form id, not a "
+            "connector. Set `engine` to the service's name (e.g. 'linkedin')."
+        )
+    return value
+
 
 class ConnectorField(BaseModel):
     name: str
@@ -191,13 +228,26 @@ class SubmitFormRequest(BaseModel):
     form_spec: dict[str, Any] | None = None
 
     def resolve_connector_id(self) -> str:
-        if self.connector_id:
-            return self.connector_id
-        if self.form_spec and self.form_spec.get("_connector_id"):
-            return self.form_spec["_connector_id"]
-        if self.form_id:
-            return self.form_id.removesuffix("-connector")
-        raise ValueError("connector_id is required")
+        """Return the connector id this submission saves under.
+
+        Precedence: explicit ``connector_id``, the registry-stamped
+        ``form_spec._connector_id``, the spec's declared ``engine``, then the
+        legacy ``form_id`` fallthrough.
+
+        Raises:
+            InvalidConnectorIdError: when the resolved id is not a usable engine.
+            ValueError: when nothing names a connector.
+        """
+        spec = self.form_spec or {}
+        candidate = (
+            self.connector_id
+            or spec.get("_connector_id")
+            or spec.get("engine")
+            or (self.form_id.removesuffix("-connector") if self.form_id else None)
+        )
+        if not candidate:
+            raise ValueError("connector_id is required")
+        return validate_engine_id(candidate)
 
     def resolve_method(self) -> str | None:
         if self.method:

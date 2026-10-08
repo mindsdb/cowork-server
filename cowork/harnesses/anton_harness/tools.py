@@ -27,6 +27,8 @@ from pathlib import Path
 from typing import Any
 import uuid
 
+from cowork.schemas.connectors import InvalidConnectorIdError, validate_engine_id
+
 logger = logging.getLogger(__name__)
 
 
@@ -599,6 +601,17 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
     if not isinstance(spec, dict):
         return "request_credentials: invalid spec — must be a JSON object with `title` and `fields`"
 
+    connector_id = spec.get("_connector_id") or spec.get("engine")
+    if not connector_id:
+        return (
+            "request_credentials: invalid spec — set `engine` to the service's "
+            "connector id (e.g. 'linkedin'), or copy `_connector_id` from lookup_connector."
+        )
+    try:
+        validate_engine_id(connector_id)
+    except InvalidConnectorIdError as e:
+        return f"request_credentials: {e}"
+
     spec = _scrub_secret_values(_ensure_form_id(spec))
     block = "```data-vault-form\n" + json.dumps(spec, indent=2) + "\n```"
     return (
@@ -627,7 +640,7 @@ _REQUEST_CREDENTIALS_SCHEMA = {
         },
         "engine": {
             "type": "string",
-            "description": "REQUIRED. Connector slug (e.g. 'postgres', 'gmail'). Any value is accepted — unknown engines are saved as 'custom' connections.",
+            "description": "REQUIRED. Connector slug (e.g. 'postgres', 'gmail'): 2-64 lowercase letters, digits and underscores, starting with a letter, no hyphens. Unknown engines are saved as 'custom' connections under this id.",
         },
         "_connector_id": {
             "type": "string",
