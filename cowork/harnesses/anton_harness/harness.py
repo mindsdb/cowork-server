@@ -1065,15 +1065,16 @@ class AntonHarness:
         project_context = (
             # Conversational only. The next line hands the agent the real path,
             # so the name here never has to resolve to anything (ENG-1676).
-            f"You are operating in the project {display_label(conversation.project)}."
-            f"You have access to all of the files in the project at {str(base)} except for the .anton/ directory."
-            "They are off limits. Do not mention the .anton/ directory in your responses."
-            "You can perform operations on these files via the scratchpad."
-            "You can freely read any of these project files."
-            "If you need to perform any actions on these files, ask the user for permission first."
-            "The only other files that you are allowed to access are any items that are attached to the conversation."
-            "Access to any files not attached to the conversation or located outside the project is strictly forbidden."
-            "ALWAYS use the scratchpad to interact with files."
+            f"You are operating in the project {display_label(conversation.project)}. "
+            f"You have access to all of the files in the project at {str(base)} except for the .anton/ directory "
+            f"(the artifacts under `{str(artifacts_dir)}` are the exception). "
+            "Everything else in .anton/ is off limits. Do not mention the .anton/ directory in your responses. "
+            "You can perform operations on these files via the scratchpad. "
+            "You can freely read any of these project files. "
+            "If you need to perform any actions on these files, ask the user for permission first. "
+            "The only other files that you are allowed to access are any items that are attached to the conversation. "
+            "Access to any files not attached to the conversation or located outside the project is strictly forbidden. "
+            "You can read text files with `read_text_file`, or in the scratchpad when that is more efficient (for example, when the data goes straight into scratchpad code or the file needs special parsing). Use the scratchpad for everything else you do with files. "
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
             # Each turn's scratchpad processes are killed when the turn ends
             # (close_session_scratchpads), with their whole process group.
@@ -1095,8 +1096,8 @@ class AntonHarness:
             "Workflow:\n"
             "  1. Call `create_artifact(name, description, type)` BEFORE writing any output. "
             "It returns `{slug, path, ...}` — write your files into the returned `path`.\n"
-            "  2. To MODIFY an existing artifact, call `list_artifacts()` to find its slug, "
-            "then `open_artifact(slug)` to get the path again.\n"
+            "  2. To MODIFY an existing artifact, call `list_artifacts()` to find it; its folder is `<root>/<slug>`. "
+            "Read the files you will change with `read_text_file`.\n"
             "  3. Use absolute paths from a scratchpad cell so the file always lands in the right place: "
             "`with open(f\"{path}/dashboard.html\", \"w\") as f: ...`\n"
             "Never write to the legacy `.anton/output/` directory — it's no longer scanned by the artifacts view."
