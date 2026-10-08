@@ -56,6 +56,24 @@ class TestPersistExtends:
         secure = set(vault.read_record("linkedin", slug)["secure_keys"])
         assert {"client_secret", "access_token", "refresh_token"} <= secure
 
+    def test_a_field_stored_as_secret_stays_secret_after_the_merge(self, vault):
+        # `signing_material` is not secret-shaped by name, so only the stored
+        # record's secure_keys say it is one.
+        vault.save(
+            "linkedin", "linkedin-1a2b3c4d",
+            {"client_id": "86nwdt9sl34cuy", "signing_material": "m", "_connector_id": "linkedin"},
+            secure_keys=["signing_material"],
+        )
+        persist_connection("linkedin", None, "linkedin-1a2b3c4d", GRANT, extends=True, vault=vault)
+
+        record = vault.read_record("linkedin", "linkedin-1a2b3c4d")
+        assert "signing_material" in record["secure_keys"]
+
+    def test_a_follow_up_without_a_method_keeps_the_stored_method(self, vault):
+        slug = persist_connection("linkedin", "app", "", APP_CREDENTIALS, vault=vault)
+        persist_connection("linkedin", None, slug, GRANT, extends=True, vault=vault)
+        assert vault.read_record("linkedin", slug)["fields"]["_method"] == "app"
+
     def test_resubmitted_field_replaces_the_stored_one(self, vault):
         slug = persist_connection("linkedin", "app", "", APP_CREDENTIALS, vault=vault)
         persist_connection(
