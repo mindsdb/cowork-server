@@ -32,6 +32,7 @@ from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError
 from cowork.db.units import run_db
 from cowork.schemas.connectors import InvalidConnectorIdError, validate_engine_id
 from cowork.services.connectors.catalog import ConnectorCatalog
+from cowork.services.connectors.custom_connectors import UnstorableFormError, check_handcrafted_form
 from cowork.services.connectors.persist import vault_for_scope
 
 logger = logging.getLogger(__name__)
@@ -682,6 +683,13 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
         spec["_existing_name"] = extends_name.strip()
 
     spec = _scrub_secret_values(_ensure_form_id(spec))
+    if known is None or extending_custom:
+        # Checked before the form renders, so the user never fills in a form
+        # the server would refuse.
+        try:
+            check_handcrafted_form(spec)
+        except UnstorableFormError as e:
+            return f"request_credentials: {e}"
     block = "```data-vault-form\n" + json.dumps(spec, indent=2) + "\n```"
     return (
         "Form ready. Include the following markdown block VERBATIM in your "
