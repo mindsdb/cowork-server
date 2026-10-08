@@ -159,6 +159,7 @@ async def submit_form(req: SubmitFormRequest, scope: TenantScopeDep) -> Streamin
         skipped=req.skipped,
         form_spec=req.form_spec,
         custom_spec=spec.model_dump() if spec is not None and is_custom else None,
+        checked_against_stored_spec=stamped,
     )
 
     handler = ProbeHandler(scope=scope)

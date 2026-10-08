@@ -20,6 +20,7 @@ class SubmissionStore:
         skipped: list[str] | None = None,
         form_spec: dict[str, Any] | None = None,
         custom_spec: dict[str, Any] | None = None,
+        checked_against_stored_spec: bool | None = None,
     ) -> str:
         self._purge_expired()
         submission_id = "sub_" + uuid.uuid4().hex[:12]
@@ -34,6 +35,8 @@ class SubmissionStore:
             # A custom connector's stored spec, resolved at submit time so the
             # probe stream never reads the database while it runs.
             "custom_spec": dict(custom_spec) if custom_spec else None,
+            # submit_form's decision, carried so the probe cannot reach another.
+            "checked_against_stored_spec": checked_against_stored_spec,
             "created_at": time.time(),
             "status": "received",
         }
