@@ -289,6 +289,19 @@ class TestSecretFieldsFromNonRegistrySpecs:
         assert "signing_material" in record["secure_keys"]
 
 
+class TestOrgModeWithoutABoundScope:
+    @pytest.mark.asyncio
+    async def test_the_agent_sees_built_ins_only(self, engine, monkeypatch):
+        monkeypatch.setattr(tools, "current_settings_scope", lambda: None)
+        monkeypatch.setattr(tools, "get_app_settings", lambda: type("S", (), {"tenancy_mode": "org"})())
+
+        result = json.loads(await tools._cowork_lookup_connector(None, {"id": "httpbin"}))
+
+        assert result["id"] is None
+        assert "httpbin" not in result["available_ids"]
+        assert "postgres" in result["available_ids"]
+
+
 class TestBuildFlowPrompt:
     @pytest.mark.asyncio
     async def test_the_connector_block_reaches_the_form(self, engine):
