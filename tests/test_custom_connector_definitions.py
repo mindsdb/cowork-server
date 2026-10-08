@@ -188,6 +188,51 @@ class TestProbeStream:
         assert [r.connector_id for r in _rows(engine)] == ["httpbin"]
 
 
+class TestProbeIsNotSkippedByAModelFlag:
+    """Only a real OAuth grant on the selected method skips the live test."""
+
+    @pytest.mark.asyncio
+    async def test_a_form_level_oauth_flag_is_still_probed(self, engine, vault):
+        _Probe.verdict = "failure"
+        form = {**HTTPBIN_FORM, "form_id": "fm_eeeeeeeeee", "submit_action": "oauth_launch"}
+
+        await _probe(form, {"token": "typed-key"})
+
+        assert _Probe.runs == 1
+        assert vault.list_connections() == []
+        assert _rows(engine) == []
+
+    @pytest.mark.asyncio
+    async def test_an_oauth_method_without_a_token_is_still_probed(self, engine, vault):
+        _Probe.verdict = "failure"
+        form = {
+            "form_id": "fm_ffffffffff", "engine": "httpbin", "title": "Connect httpbin",
+            "methods": [{
+                "id": "oauth", "label": "Sign in", "submit_action": "oauth_launch",
+                "oauth": {"auth_url": "https://example.com/auth", "token_url": "https://example.com/token"},
+                "fields": [{"name": "api_key", "label": "API key", "type": "password"}],
+            }],
+        }
+
+        await _probe(form, {"api_key": "typed-key"}, method="oauth")
+
+        assert _Probe.runs == 1
+        assert _rows(engine) == []
+
+    @pytest.mark.asyncio
+    async def test_an_oauth_flag_on_a_method_without_an_oauth_block_is_still_probed(self, engine, vault):
+        _Probe.verdict = "failure"
+        form = {
+            "form_id": "fm_0000000000", "engine": "httpbin", "title": "Connect httpbin",
+            "methods": [{"id": "oauth", "label": "Sign in", "submit_action": "oauth_launch"}],
+        }
+
+        await _probe(form, {"access_token": "t"}, method="oauth")
+
+        assert _Probe.runs == 1
+        assert _rows(engine) == []
+
+
 class TestSubmit:
     @pytest.mark.asyncio
     async def test_an_invalid_handcrafted_form_is_a_422_before_anything_is_staged(self, monkeypatch):
