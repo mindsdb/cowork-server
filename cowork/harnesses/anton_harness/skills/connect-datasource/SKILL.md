@@ -11,6 +11,8 @@ DATA VAULT WORKFLOW — when the user asks to connect a service or database and 
 
 2. RENDER THE FORM. Pass the looked-up `form` spec to `request_credentials` VERBATIM — tweak only `selected_method` or `subtitle`, and copy `_connector_id` onto the spec. Never strip or paraphrase `methods[]`, OAuth blocks, `how_to`, or `help_url`. Include the markdown block the tool returns VERBATIM in your next message (blank lines around the fence) so the form renders in the side panel.
    - Handcraft a spec ONLY when the registry returns no match, using your own knowledge of the service's auth shape (host/port/user/password, API key, or OAuth). For engines with several auth options emit `methods[]` instead of `fields[]`, mark the simplest `recommended: true`, and pre-set `selected_method` if the user already signalled a preference.
+   - A handcrafted spec MUST set `engine` to the service's id: lowercase letters, digits and underscores (e.g. `linkedin`). The connection is saved under it.
+   - When a connect takes several forms (e.g. app credentials first, then tokens after an OAuth grant), set `extends_connection` on each later form to the name the first save reported ("Saved as <name>"). Without it each form becomes a separate, incomplete connection.
 
 3. STOP THERE. The server tests the connection and saves credentials on submit. Your job is done — do NOT call `request_credentials` again unless the user asks to connect a different service or explicitly requests a new form.
 

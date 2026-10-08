@@ -26,6 +26,10 @@ if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
 
 
+class ConnectionNotFoundError(LookupError):
+    """An ``extends`` save named a connection that does not exist."""
+
+
 def vault_for_scope(scope: "TenantScope | None" = None):
     from anton.core.datasources.data_vault import LocalDataVault
     from cowork.db.scoped import scoped_storage_root
@@ -47,6 +51,7 @@ def persist_connection(
     label: str | None = None,
     user_label: str | None = None,
     replace_existing: bool = False,
+    extends: bool = False,
     default_label: str | None = None,
     default_fields: dict[str, str] | None = None,
     vault=None,
@@ -78,6 +83,11 @@ def persist_connection(
     ``replace_existing`` is reserved for an explicit reconnect of the named
     record. It replaces that record atomically after the caller has validated
     the new credential, while retaining its label and picked-file metadata.
+
+    ``extends`` is a later step of a multi-step connect (credentials first,
+    tokens after an OAuth grant) adding fields to the named record: stored
+    fields this save omits are kept and resubmitted ones are replaced.
+    Raises ``ConnectionNotFoundError`` when no record has that name.
 
     ``default_fields`` generalizes the same "default once, then sticky"
     behavior ``default_label``/``user_label`` already have, for any other
@@ -114,13 +124,20 @@ def persist_connection(
         # updated, so an unchanged secret keeps its stored value instead of
         # persisting the literal sentinel.
         target = vault.read_record(connector_id, base_slug)
+        if extends:
+            if not (name or "").strip() or target is None:
+                raise ConnectionNotFoundError(
+                    f"No {connector_id} connection named {base_slug!r} to add these fields to."
+                )
+            stored = {k: v for k, v in target.get("fields", {}).items() if not k.startswith("_")}
+            cred = {**stored, **cred}
         cred, is_edit = resolve_keep_sentinels(cred, target)
         payload = {**cred, "_connector_id": connector_id}
         if method:
             payload["_method"] = method
         secure_keys = secure_keys_for(connector_id, method, payload)
         reconnecting_named_record = replace_existing and bool((name or "").strip()) and target is not None
-        if is_edit or reconnecting_named_record:
+        if is_edit or reconnecting_named_record or extends:
             slug = base_slug  # an edit targets the named connection — update in place
         else:
             slug = resolve_unique_slug(vault, connector_id, base_slug, payload, secure_keys)
@@ -139,6 +156,10 @@ def persist_connection(
             if key not in payload and existing_fields.get(key):
                 payload[key] = existing_fields[key]
         secure_keys = secure_keys_for(connector_id, method, payload)
+        if extends:
+            # A field the record already held as a secret stays one, even if
+            # this step's method would not classify it that way.
+            secure_keys = sorted(set(secure_keys) | set(target.get("secure_keys") or []))
         if not label:
             label = str((existing or {}).get("fields", {}).get("_label", "")).strip()
         if label:
