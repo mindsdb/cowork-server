@@ -612,6 +612,16 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
     except InvalidConnectorIdError as e:
         return f"request_credentials: {e}"
 
+    spec = dict(spec)
+    extends_name = spec.pop("extends_connection", None)
+    if extends_name is not None:
+        if not isinstance(extends_name, str) or not extends_name.strip():
+            return "request_credentials: `extends_connection` must be the saved connection's name."
+        # The renderer submits `_existing_name` as the record name; the server
+        # reads `_extends_connection` to merge instead of creating a sibling.
+        spec["_extends_connection"] = extends_name.strip()
+        spec["_existing_name"] = extends_name.strip()
+
     spec = _scrub_secret_values(_ensure_form_id(spec))
     block = "```data-vault-form\n" + json.dumps(spec, indent=2) + "\n```"
     return (
@@ -641,6 +651,10 @@ _REQUEST_CREDENTIALS_SCHEMA = {
         "engine": {
             "type": "string",
             "description": "REQUIRED. Connector slug (e.g. 'postgres', 'gmail'): 2-64 lowercase letters, digits and underscores, starting with a letter, no hyphens. Unknown engines are saved as 'custom' connections under this id.",
+        },
+        "extends_connection": {
+            "type": "string",
+            "description": "Name of a connection saved earlier in this flow (the slug from 'Saved as `...`'). Set it on a follow-up step of a multi-step connect, e.g. tokens after an OAuth grant, so the new fields are added to that connection instead of creating a second one.",
         },
         "_connector_id": {
             "type": "string",
