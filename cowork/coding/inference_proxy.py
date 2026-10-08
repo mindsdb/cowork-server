@@ -143,6 +143,8 @@ def inference_headers(request: Request, api_key: str) -> dict[str, str]:
     headers = {"Authorization": f"Bearer {api_key}"}
     if content_type := request.headers.get("content-type"):
         headers["content-type"] = content_type
+    if originator := request.headers.get("originator"):
+        headers["originator"] = originator
     return headers
 
 
