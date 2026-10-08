@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, Response, status
-from pydantic import ValidationError
 
 from cowork.api.v1.permissions import AuthenticatedOrgAdmin, require
 from cowork.db.scoped import ScopedSessionDep
 from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import ConnectorMetadataResponse, CustomConnectorUpdate
-from cowork.services.connectors.custom_connectors import CustomConnectorService
+from cowork.services.connectors.custom_connectors import CustomConnectorService, UnstorableFormError
 
 # AuthenticatedOrgAdmin: a custom connector is listed for everyone in the
 # organization, so changing or removing one is an admin decision. A no-op on a
@@ -35,15 +34,12 @@ def update_custom_connector(
 
     Raises:
         HTTPException: 404 when the scope has no such custom connector, 422
-            when ``spec`` is not a valid connection form.
+            when ``spec`` is invalid or unsafe to keep.
     """
     try:
         row = CustomConnectorService(session).update(connector_id, body.model_dump(exclude_none=True))
-    except ValidationError as e:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"The connection form is not valid: {e.errors()[0]['msg']}",
-        ) from e
+    except UnstorableFormError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Custom connector not found.")
     return _metadata(row)

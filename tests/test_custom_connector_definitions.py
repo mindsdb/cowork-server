@@ -11,7 +11,6 @@ from types import SimpleNamespace
 import pytest
 from anton.core.datasources.data_vault import LocalDataVault
 from fastapi import HTTPException
-from pydantic import ValidationError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
@@ -21,7 +20,8 @@ from cowork.handlers import probe as probe_handler
 from cowork.models.custom_connector import CustomConnector
 from cowork.schemas.connectors import SubmitFormRequest
 from cowork.services.connectors.catalog import ConnectorCatalog
-from cowork.services.connectors.custom_connectors import CustomConnectorService
+from cowork.harnesses.anton_harness import tools
+from cowork.services.connectors.custom_connectors import CustomConnectorService, UnstorableFormError, check_handcrafted_form
 from cowork.services.connectors.probe import ProbeOutcome
 from cowork.services.connectors.submissions import store
 
@@ -120,7 +120,7 @@ class TestService:
 
     def test_an_invalid_form_is_refused(self, engine):
         with Session(engine) as session:
-            with pytest.raises(ValidationError):
+            with pytest.raises(UnstorableFormError):
                 CustomConnectorService(ScopedSession(session, LOCAL_SCOPE)).upsert_from_form(
                     "httpbin", {"form_id": "x", "fields": [{"name": "token"}]},
                 )
@@ -248,4 +248,64 @@ class TestSubmit:
         with pytest.raises(HTTPException) as exc:
             await submissions_endpoints.submit_form(req, LOCAL_SCOPE)
         assert exc.value.status_code == 422
+        assert staged == []
+
+
+OAUTH_METHOD = {
+    "id": "oauth", "label": "Sign in", "submit_action": "oauth_launch",
+    "oauth": {"auth_url": "https://example.com/auth", "token_url": "https://example.com/token"},
+}
+
+
+class TestUnstorableForms:
+    """A model-written form is checked before it renders and before it is kept."""
+
+    @pytest.mark.parametrize("form, why", [
+        ({**HTTPBIN_FORM, "help_url": "http://example.com/help"}, "help_url"),
+        ({**HTTPBIN_FORM, "help_url": "javascript:alert(1)"}, "help_url"),
+        ({**HTTPBIN_FORM, "methods": [{**OAUTH_METHOD, "oauth": {
+            "auth_url": "https://example.com/auth", "token_url": "http://example.com/token",
+        }}]}, "oauth.token_url"),
+        ({**HTTPBIN_FORM, "logo_color": "red; background: url(x)"}, "logo_color"),
+        ({**HTTPBIN_FORM, "connector": {"usage_notes": "x" * 1601}}, "usage_notes"),
+        ({**HTTPBIN_FORM, "methods": [{**OAUTH_METHOD, "id": "apiKey"}]}, "not valid"),
+    ])
+    def test_check_refuses(self, form, why):
+        with pytest.raises(UnstorableFormError, match=why):
+            check_handcrafted_form(form)
+
+    def test_a_safe_form_passes(self):
+        check_handcrafted_form({**HTTPBIN_FORM, "help_url": "https://example.com/help", "methods": [OAUTH_METHOD]})
+
+    @pytest.mark.asyncio
+    async def test_the_tool_refuses_before_the_form_renders(self, engine, monkeypatch):
+        async def run_db(fn, *, scope):
+            with Session(engine) as session:
+                return fn(ScopedSession(session, scope))
+
+        monkeypatch.setattr(tools, "run_db", run_db)
+        result = await tools._cowork_request_credentials(None, {
+            **HTTPBIN_FORM, "methods": [{**OAUTH_METHOD, "id": "apiKey"}],
+        })
+
+        assert "data-vault-form" not in result
+        assert "not valid" in result
+
+    @pytest.mark.asyncio
+    async def test_submit_refuses_an_insecure_oauth_endpoint(self, monkeypatch):
+        staged = []
+        monkeypatch.setattr(submissions_endpoints.store, "stage", lambda **kw: staged.append(kw))
+
+        async def run_db(fn, *, scope):
+            return None
+
+        monkeypatch.setattr(submissions_endpoints, "run_db", run_db)
+        req = SubmitFormRequest(form_spec={**HTTPBIN_FORM, "methods": [{**OAUTH_METHOD, "oauth": {
+            "auth_url": "http://example.com/auth", "token_url": "https://example.com/token",
+        }}]})
+
+        with pytest.raises(HTTPException) as exc:
+            await submissions_endpoints.submit_form(req, LOCAL_SCOPE)
+        assert exc.value.status_code == 422
+        assert "auth_url" in exc.value.detail
         assert staged == []
