@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any
 import uuid
 
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import current_settings_scope
 from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError
 from cowork.db.units import run_db
@@ -34,6 +35,7 @@ from cowork.schemas.connectors import InvalidConnectorIdError, validate_engine_i
 from cowork.services.connectors.catalog import ConnectorCatalog
 from cowork.services.connectors.custom_connectors import UnstorableFormError, check_handcrafted_form
 from cowork.services.connectors.persist import vault_for_scope
+from cowork.services.connectors.specs._registry import registry
 
 logger = logging.getLogger(__name__)
 
@@ -550,12 +552,17 @@ async def _scope_connectors() -> dict[str, dict]:
     """Return built-in and custom connector specs visible to this turn's scope.
 
     Returns:
-        Raw specs keyed by connector id, read off the event loop.
+        Raw specs keyed by connector id, read off the event loop. In org mode
+        with no bound scope, built-ins only: falling back to the local scope
+        would read another tenant's rows.
     """
-    return await run_db(
-        lambda session: ConnectorCatalog(session).get_connectors(),
-        scope=current_settings_scope() or LOCAL_SCOPE,
-    )
+    scope = current_settings_scope()
+    if scope is None:
+        if get_app_settings().tenancy_mode == "org":
+            logger.warning("connectors: no tenant scope is bound in org mode; custom connectors skipped")
+            return dict(registry.get_connectors())
+        scope = LOCAL_SCOPE
+    return await run_db(lambda session: ConnectorCatalog(session).get_connectors(), scope=scope)
 
 
 # Request Credentials Tool
