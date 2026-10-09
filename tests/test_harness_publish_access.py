@@ -247,3 +247,10 @@ async def test_not_found_reply_shortens_a_long_path(project):
     text = _text(out)
     assert "…" in text
     assert "a" * 201 not in text
+
+
+def test_publish_description_says_what_to_pass_not_where_artifacts_live():
+    description = htools.build_cowork_publish_tool().description
+    for stale in ("artifacts/<artifact-id>", "e.g. artifacts/<slug>", "<workspace>/artifacts/"):
+        assert stale not in description
+    assert "slug" in description
