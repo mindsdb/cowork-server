@@ -102,13 +102,39 @@ class TestAgentTools:
         assert "lookup_connector" in result
 
     @pytest.mark.asyncio
-    async def test_a_handcrafted_follow_up_step_of_a_custom_connector_renders(self, engine):
+    async def test_a_handcrafted_follow_up_step_of_a_custom_connector_renders(self, engine, tmp_path, monkeypatch):
+        vault = LocalDataVault(Path(tmp_path) / "vault")
+        vault.save("httpbin", "httpbin-1a2b3c4d", {"token": "t"}, secure_keys=["token"])
+        monkeypatch.setattr(tools, "vault_for_scope", lambda scope: vault)
         result = await tools._cowork_request_credentials(
             None,
             {"engine": "httpbin", "title": "Finish", "fields": [], "extends_connection": "httpbin-1a2b3c4d"},
         )
 
         assert '"_extends_connection": "httpbin-1a2b3c4d"' in result
+
+
+class TestConnectorIdStamp:
+    """Direct save takes known connectors only, so only an unknown id loses its stamp."""
+
+    @pytest.mark.asyncio
+    async def test_a_stamped_custom_connector_keeps_its_stamp(self, engine):
+        result = await tools._cowork_request_credentials(
+            None, {"_connector_id": "httpbin", "title": "Connect httpbin", "fields": []},
+        )
+
+        block = json.loads(result.split("```data-vault-form\n", 1)[1].rsplit("\n```", 1)[0])
+        assert block["_connector_id"] == "httpbin"
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_stamped_id_routes_by_engine(self, engine):
+        result = await tools._cowork_request_credentials(
+            None, {"_connector_id": "acme", "title": "Connect Acme", "fields": []},
+        )
+
+        block = json.loads(result.split("```data-vault-form\n", 1)[1].rsplit("\n```", 1)[0])
+        assert "_connector_id" not in block
+        assert block["engine"] == "acme"
 
 
 class TestSubmitForm:
