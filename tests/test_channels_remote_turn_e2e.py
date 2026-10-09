@@ -297,6 +297,7 @@ class _ReplyOnlyRedis:
     async def sadd(self, key, member): return 1
     async def hset(self, key, mapping=None): return 1
     async def expire(self, key, seconds): return 1
+    async def xrevrange(self, key, count=None): return []
     async def xadd(self, stream, fields): return "1-0"
 
     async def xread(self, streams, count=None, block=None):

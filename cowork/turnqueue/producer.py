@@ -627,6 +627,13 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         project_id=project_id,
         params=params,
     )
+    # Read replies from after the reply stream's newest entry as it is now,
+    # before the job is queued. The controller cannot answer a job that is not
+    # queued yet, so every reply to this turn lands after that entry, and the
+    # earlier turns' replies the stream still holds (until the conversation has
+    # been quiet for an hour) are never read.
+    tail = await r.xrevrange(reply_stream, count=1)
+    last_id = tail[0][0] if tail else "0-0"
     # Registry first: a conversation whose stream exists but isn't registered would
     # be invisible to the controller. The reverse is harmless, it prunes empty queues.
     await r.sadd(f"{settings.jobs_stream}:queues", conversation_id)
@@ -640,12 +647,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         org_id=org_id, user_id=user_id, client=r,
     )
 
-    last_id = "0-0"
     authorized_workspace_mode = None
     idle_timeout = settings.reply_idle_timeout_seconds
     last_reply_at = time.monotonic()
     while True:
-        resp = await r.xread({reply_stream: last_id}, count=10, block=5000)
+        resp = await r.xread({reply_stream: last_id}, count=100, block=5000)
         if not resp:
             # Unbounded, this loop spun forever whenever the worker was down:
             # only a terminal reply ends the turn, so the SSE response never

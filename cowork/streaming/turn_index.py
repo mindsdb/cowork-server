@@ -88,13 +88,26 @@ def forget_turn_sync(conversation_id: str) -> None:
 
 
 async def list_turns() -> list[dict]:
-    """Every recorded turn, pruning set members whose hash has expired."""
+    """Every recorded turn, pruning set members whose hash has expired.
+
+    Every member's hash is read in one pipelined round trip rather than one
+    round trip each."""
     r = get_redis()
+    # Materialized once: the pipeline's replies pair with members by position.
+    members = list(await r.smembers(_TURNS_SET))
+    if not members:
+        return []
+    async with r.pipeline(transaction=False) as pipe:
+        for conversation_id in members:
+            pipe.hgetall(_turn_key(conversation_id))
+        turns = await pipe.execute()
     out: list[dict] = []
-    for conversation_id in await r.smembers(_TURNS_SET):
-        turn = await r.hgetall(_turn_key(conversation_id))
+    expired: list[str] = []
+    for conversation_id, turn in zip(members, turns, strict=True):
         if not turn:
-            await r.srem(_TURNS_SET, conversation_id)
+            expired.append(conversation_id)
             continue
         out.append({"conversation_id": conversation_id, **turn})
+    if expired:
+        await r.srem(_TURNS_SET, *expired)
     return out

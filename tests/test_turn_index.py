@@ -75,6 +75,48 @@ async def test_list_returns_every_recorded_turn(fake_redis):
     assert turns["c2"]["org_id"] == "o2"
 
 
+@pytest.mark.asyncio
+async def test_list_pairs_each_turn_with_its_own_conversation_and_prunes_only_expired_ones(fake_redis):
+    for n in range(6):
+        await turn_index.record_turn(
+            f"c{n}", turn_id=n, correlation_id=f"corr-{n}", org_id=f"o{n}", user_id=None)
+    for gone in ("c1", "c4"):
+        await fake_redis.delete(f"cowork:turn:{gone}")   # stands in for TTL expiry
+
+    turns = await turn_index.list_turns()
+
+    assert sorted((t["conversation_id"], t["turn_id"], t["correlation_id"]) for t in turns) == [
+        (f"c{n}", str(n), f"corr-{n}") for n in (0, 2, 3, 5)
+    ]
+    assert await fake_redis.smembers("cowork:turns") == {"c0", "c2", "c3", "c5"}
+
+
+@pytest.mark.asyncio
+async def test_list_of_no_turns_removes_nothing(fake_redis, monkeypatch):
+    async def no_srem(*_args):
+        raise AssertionError("SREM with no members is a Redis error")
+
+    monkeypatch.setattr(fake_redis, "srem", no_srem)
+
+    assert await turn_index.list_turns() == []
+
+
+@pytest.mark.asyncio
+async def test_list_reads_every_turn_in_one_round_trip(fake_redis, monkeypatch):
+    """/in-flight-list runs this every few seconds per open client, so it
+    reads every member's hash in one pipeline, not one call each."""
+    for n in range(3):
+        await turn_index.record_turn(
+            f"c{n}", turn_id=n, correlation_id=f"corr-{n}", org_id=None, user_id=None)
+
+    async def per_member(*_args):
+        raise AssertionError("list_turns must not read one hash per call")
+
+    monkeypatch.setattr(fake_redis, "hgetall", per_member)
+
+    assert {t["conversation_id"] for t in await turn_index.list_turns()} == {"c0", "c1", "c2"}
+
+
 def test_discard_conversation_forgets_the_turn(monkeypatch, tmp_path):
     """Truncating a conversation deletes its buffers. Leaving the index entry
     behind would have /in-flight keep naming a turn with nothing behind it."""

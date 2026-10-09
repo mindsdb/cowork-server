@@ -25,6 +25,9 @@ class _FakeRedis:
     async def sadd(self, *_a):
         return None
 
+    async def xrevrange(self, *_a, **_k):
+        return []
+
     async def xadd(self, _stream, fields):
         self._captured["payload"] = json.loads(fields["payload"])
         raise _StopEnqueue
