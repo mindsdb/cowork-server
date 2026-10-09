@@ -113,3 +113,137 @@ async def test_harness_restricted_invalid_email_returns_error(tmp_path):
     assert "colleague@corp" in text
     assert "INVALID" in text
     fake.assert_not_called()
+
+
+SLUG = "path-check-1a2b3c4d"
+
+
+def _text(out) -> str:
+    return getattr(out, "content", out)
+
+
+@pytest.fixture
+def project(tmp_path):
+    """A project folder laid out like desktop Cowork's: one artifact, a
+    `.anton/memory` folder and a symlink in the artifacts folder pointing at it.
+
+    Returns (base, artifact, memory), resolved: on macOS `tmp_path` sits under
+    the `/var` -> `/private/var` symlink and the tool replies with resolved paths.
+    """
+    base = tmp_path / "general"
+    artifacts = base / ".anton" / "artifacts"
+    artifact = artifacts / SLUG
+    artifact.mkdir(parents=True)
+    (artifact / "index.html").write_text("<h1>hello</h1>")
+    (artifact / "metadata.json").write_text("{}")
+    memory = base / ".anton" / "memory"
+    memory.mkdir()
+    (memory / "notes.md").write_text("private")
+    (artifacts / "escape").symlink_to(memory)
+    return base.resolve(), artifact.resolve(), memory.resolve()
+
+
+def _project_session(base: Path):
+    s = mock.Mock()
+    ws = mock.Mock()
+    ws.base = str(base)
+    ws.artifacts_dir = base / ".anton" / "artifacts"
+    s._workspace = ws
+    return s
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "form",
+    [
+        "{slug}",
+        "{slug}/index.html",
+        "artifacts/{slug}",
+        "artifacts/{slug}/index.html",
+        ".anton/artifacts/{slug}",
+        "{absolute}",
+    ],
+)
+async def test_ask_finds_the_artifact_by_any_supported_path(project, form):
+    base, artifact, _ = project
+    raw = form.format(slug=SLUG, absolute=artifact)
+    with mock.patch.object(htools, "_published_state", return_value={}):
+        out = await htools._cowork_publish_or_preview(
+            _project_session(base), {"file_path": raw, "action": "ask"},
+        )
+    text = _text(out)
+    assert str(artifact) in text
+    assert "NOT been published" in text
+    assert "not found" not in text.lower()
+
+
+@pytest.mark.asyncio
+async def test_artifacts_folder_wins_over_a_same_named_project_folder(project):
+    base, artifact, _ = project
+    (base / SLUG).mkdir()
+    (base / SLUG / "index.html").write_text("<h1>user file</h1>")
+    with mock.patch.object(htools, "_published_state", return_value={}):
+        out = await htools._cowork_publish_or_preview(
+            _project_session(base), {"file_path": SLUG, "action": "ask"},
+        )
+    assert f"is at {artifact} " in _text(out)
+
+
+@pytest.mark.asyncio
+async def test_publish_by_short_path_hands_the_service_the_absolute_artifact_path(project):
+    base, artifact, _ = project
+    fake = mock.Mock(return_value={"url": "https://v/r/1"})
+    with mock.patch.object(htools, "_publish_artifact", fake):
+        out = await htools._cowork_publish_or_preview(
+            _project_session(base),
+            {"file_path": f"artifacts/{SLUG}", "action": "publish", "access_mode": "public"},
+        )
+    args, _ = fake.call_args
+    assert args[0] == str(artifact)
+    assert "https://v/r/1" in _text(out)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["ask", "publish"])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "artifacts/../memory",
+        "artifacts/../.anton/memory",
+        "artifacts/no-such-slug",
+        "artifacts/escape",
+        "x\x00y",
+        "a" * 300,
+    ],
+    ids=["dotdot", "dotdot-into-anton", "missing", "symlink-escape", "nul", "too-long"],
+)
+async def test_unmatched_path_gets_a_not_found_reply_and_publishes_nothing(project, raw, action):
+    base, _, memory = project
+    fake = mock.Mock(return_value={"url": "https://v/r/1"})
+    with mock.patch.object(htools, "_publish_artifact", fake), \
+         mock.patch.object(htools, "_published_state", return_value={}):
+        out = await htools._cowork_publish_or_preview(
+            _project_session(base),
+            {"file_path": raw, "action": action, "access_mode": "public"},
+        )
+    text = _text(out)
+    assert "not found" in text
+    assert "Pass the artifact's slug" in text
+    assert "create_artifact" in text
+    assert str(memory) not in text
+    # The reply echoes the input, so `.anton/memory` may appear only when the
+    # agent wrote it.
+    if ".anton/memory" not in raw:
+        assert ".anton/memory" not in text
+    fake.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_not_found_reply_shortens_a_long_path(project):
+    base, _, _ = project
+    out = await htools._cowork_publish_or_preview(
+        _project_session(base), {"file_path": "a" * 300, "action": "ask"},
+    )
+    text = _text(out)
+    assert "…" in text
+    assert "a" * 201 not in text

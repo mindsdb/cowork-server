@@ -123,6 +123,37 @@ COWORK_PUBLISH_PROMPT = (
 )
 
 
+def _resolve_publish_path(session: Any, raw_path: str) -> Path | None:
+    """The existing path `raw_path` names, or None when nothing matches.
+
+    A relative path is looked up in the session project's artifacts folder
+    first (`<slug>`, `<slug>/<file>`, `artifacts/<slug>/...`), then under the
+    project folder, where `.anton/artifacts/<slug>` resolves. `..` is refused
+    on both: resolving collapses it even through a missing folder, so
+    `artifacts/../.anton/memory` would otherwise land in `.anton/memory`.
+    """
+    from cowork.services.artifacts import _candidate_relative_artifacts
+
+    try:
+        path = Path(raw_path).expanduser()
+        workspace = getattr(session, "_workspace", None)
+        base = getattr(workspace, "base", None) if workspace is not None else None
+        if not path.is_absolute() and base:
+            if ".." in path.parts:
+                return None
+            matches = _candidate_relative_artifacts(
+                raw_path, [Path(workspace.artifacts_dir)]
+            )
+            if matches:
+                return matches[0]
+            path = Path(base) / raw_path
+        path = path.resolve()
+        return path if path.exists() else None
+    except (OSError, RuntimeError, ValueError):
+        # NUL bytes, over-long names and unknown `~user` raise here.
+        return None
+
+
 async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     """Server-side equivalent of anton.tools.handle_publish_or_preview.
 
@@ -140,18 +171,16 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     if not raw_path:
         return "publish_or_preview: missing file_path"
 
-    file_path = Path(raw_path).expanduser()
-    if not file_path.is_absolute():
-        # Anton's session carries the active workspace base.
-        workspace = getattr(session, "_workspace", None)
-        if workspace is not None:
-            base = getattr(workspace, "base", None)
-            if base:
-                file_path = Path(base) / raw_path
-    file_path = file_path.resolve()
-
-    if not file_path.exists():
-        return f"File not found: {file_path}"
+    file_path = _resolve_publish_path(session, raw_path)
+    if file_path is None:
+        # Echo only what the agent passed: the joined path could name a folder
+        # outside the artifacts (e.g. `.anton/memory`).
+        shown = raw_path if len(raw_path) <= 200 else raw_path[:200] + "…"
+        return (
+            f"Artifact not found: {shown!r}. Pass the artifact's slug "
+            "(list_artifacts shows it) or the absolute path that "
+            "create_artifact or generate_artifact returned."
+        )
 
     abs_path = str(file_path)
 

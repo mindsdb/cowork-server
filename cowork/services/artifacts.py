@@ -757,7 +757,7 @@ def serve_url_for(
     return ""
 
 
-def _candidate_relative_artifacts(raw_path: str) -> list[Path]:
+def _candidate_relative_artifacts(raw_path: str, artifact_dirs: list[Path]) -> list[Path]:
     text = (raw_path or "").strip().replace("\\", "/")
     while text.startswith("./"):
         text = text[2:]
@@ -767,7 +767,7 @@ def _candidate_relative_artifacts(raw_path: str) -> list[Path]:
     if text.startswith("artifacts/"):
         text = text[len("artifacts/"):]
     matches: dict[str, Path] = {}
-    for art_root in _scan_artifact_dirs():
+    for art_root in artifact_dirs:
         try:
             target = (art_root / text).resolve()
             target.relative_to(art_root.resolve())
@@ -812,7 +812,7 @@ def resolve_artifact_path(raw_path: str, *, allow_dir: bool = False) -> Path | N
                 return resolved
         raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
-    matches = _candidate_relative_artifacts(raw_path)
+    matches = _candidate_relative_artifacts(raw_path, _scan_artifact_dirs())
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
