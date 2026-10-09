@@ -57,7 +57,7 @@ def _resolve_coding(
     from cowork.common.settings.user_settings import (
         UI_TYPE_TO_PROVIDER,
         get_user_settings,
-        provider_api_key_str,
+        inference_api_key_str,
     )
     from cowork.services.providers import provider_base_url
 
@@ -79,7 +79,7 @@ def _resolve_coding(
     if coding_api_key:
         api_key = coding_api_key
     elif enum_provider is not None:
-        api_key = provider_api_key_str(us, enum_provider)
+        api_key = inference_api_key_str(us, enum_provider)
     else:
         api_key = ""
 
