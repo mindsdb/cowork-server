@@ -110,7 +110,7 @@ from cowork.coding.workspace_models import (
     WorkspaceResourcePage,
     WorkspaceSearchPage,
 )
-from cowork.common.settings.user_settings import Provider, provider_api_key_str
+from cowork.common.settings.user_settings import Provider, inference_api_key_str, provider_api_key_str
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
 from cowork.services.providers import cached_minds_models
@@ -146,7 +146,7 @@ def _settings(session: Session, scope: TenantScope):
 def _credentials(settings) -> EngineCredentials:
     return EngineCredentials(
         minds_url=settings.minds_url,
-        minds_api_key=provider_api_key_str(settings, Provider.MINDS_CLOUD),
+        minds_api_key=inference_api_key_str(settings, Provider.MINDS_CLOUD),
     )
 
 

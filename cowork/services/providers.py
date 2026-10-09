@@ -155,10 +155,10 @@ async def _current_runtime_minds_credential() -> str:
     the seed captured when the chat session was created. That seed can be an
     expired access token after the desktop refreshes or signs out.
     """
-    credential = runtime_credential.get_minds_credential()
+    credential = runtime_credential.get_inference_credential()
     if credential is None:
         raise _provider_auth_error(
-            "The MindsHub session credential is no longer available."
+            "The MindsHub credential for this organization is not available."
         )
     return credential
 
@@ -1554,6 +1554,7 @@ def build_llm_client(
     from cowork.common.settings.user_settings import (
         Provider,
         get_user_settings,
+        inference_api_key_str,
         provider_api_key,
     )
 
@@ -1617,7 +1618,9 @@ def build_llm_client(
         # or misroute another's key.
         key = provider_api_key(settings, role)
         if role == Provider.MINDS_CLOUD:
-            if key is None:
+            # The scratchpad keeps this construction-time key, so it must be the pinned one too.
+            key = SecretStr(inference_api_key_str(settings, role)) if key is not None else None
+            if key is None or not key.get_secret_value():
                 raise ValueError(f"{role.label} API key is not configured")
             # The runtime credential is local-only by contract. A static
             # settings/env key and every org-mode per-turn credential leave

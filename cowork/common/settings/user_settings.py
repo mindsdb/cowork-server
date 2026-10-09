@@ -116,6 +116,18 @@ def provider_api_key_str(settings: "UserSettings", provider: "Provider") -> str:
     return val.get_secret_value() if isinstance(val, SecretStr) else ""
 
 
+def inference_api_key_str(settings: "UserSettings", provider: "Provider") -> str:
+    """The key an LLM call sends: on a desktop, the turn key pinned to its organization.
+
+    Publishing, comments and model listing keep ``provider_api_key_str`` (the session token).
+    """
+    from cowork.common.settings import runtime_credential
+
+    if provider == Provider.MINDS_CLOUD and runtime_credential.get_minds_credential() is not None:
+        return runtime_credential.get_inference_credential() or ""
+    return provider_api_key_str(settings, provider)
+
+
 def _defaults_with_declared(
     role: str, compiled: dict[str, str], declared: dict[str, str]
 ) -> dict[str, str]:

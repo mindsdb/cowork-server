@@ -25,9 +25,24 @@ tear.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
 from cowork.common.settings.app_settings import get_app_settings
 
 _minds_credential: str | None = None
+# The organization the desktop has mounted, and the turn key pinned to it.
+# Set only by a desktop that sends its organization; older ones leave both None.
+_organization_id: str | None = None
+_inference_key: InferenceKey | None = None
+
+
+@dataclass(frozen=True)
+class InferenceKey:
+    value: str
+    organization_id: str
+    instance_id: str
+    expires_at: datetime
 
 
 def _org_mode() -> bool:
@@ -50,8 +65,50 @@ def set_minds_credential(value: str) -> None:
 
 def clear_minds_credential() -> None:
     """Drop the held credential. Sign-out and a failed hand-over both land here."""
-    global _minds_credential
+    global _minds_credential, _organization_id, _inference_key
     _minds_credential = None
+    _organization_id = None
+    _inference_key = None
+
+
+def set_organization(organization_id: str | None) -> None:
+    global _organization_id
+    if not _org_mode():
+        _organization_id = organization_id
+
+
+def get_organization() -> str | None:
+    return None if _org_mode() else _organization_id
+
+
+def set_inference_key(key: InferenceKey | None) -> None:
+    global _inference_key
+    if not _org_mode():
+        _inference_key = key
+
+
+def get_inference_key() -> InferenceKey | None:
+    return None if _org_mode() else _inference_key
+
+
+def get_inference_credential() -> str | None:
+    """The credential LLM calls bill with.
+
+    With a mounted organization, only a live key pinned to it: the session
+    token would bill whatever organization Keycloak has active right now.
+    """
+    if _org_mode():
+        return None
+    if _organization_id is None:
+        return get_minds_credential()
+    key = _inference_key
+    if (
+        key
+        and key.organization_id == _organization_id
+        and key.expires_at > datetime.now(timezone.utc)
+    ):
+        return key.value
+    return None
 
 
 def get_minds_credential() -> str | None:
