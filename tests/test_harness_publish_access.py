@@ -15,10 +15,11 @@ def _artifact(tmp_path: Path) -> Path:
     return art / "index.html"
 
 
-def _session(tmp_path):
+def _session(base: Path):
     s = mock.Mock()
     ws = mock.Mock()
-    ws.base = str(tmp_path)
+    ws.base = str(base)
+    ws.artifacts_dir = Path(base) / ".anton" / "artifacts"
     s._workspace = ws
     return s
 
@@ -143,13 +144,12 @@ def project(tmp_path):
     return base.resolve(), artifact.resolve(), memory.resolve()
 
 
-def _project_session(base: Path):
-    s = mock.Mock()
-    ws = mock.Mock()
-    ws.base = str(base)
-    ws.artifacts_dir = base / ".anton" / "artifacts"
-    s._workspace = ws
-    return s
+async def _ask(base: Path, raw: str) -> str:
+    with mock.patch.object(htools, "_published_state", return_value={}):
+        out = await htools._cowork_publish_or_preview(
+            _session(base), {"file_path": raw, "action": "ask"},
+        )
+    return _text(out)
 
 
 @pytest.mark.asyncio
@@ -168,12 +168,7 @@ def _project_session(base: Path):
 )
 async def test_ask_finds_the_artifact_by_any_supported_path(project, form):
     base, artifact, _ = project
-    raw = form.format(slug=SLUG, absolute=artifact)
-    with mock.patch.object(htools, "_published_state", return_value={}):
-        out = await htools._cowork_publish_or_preview(
-            _project_session(base), {"file_path": raw, "action": "ask"},
-        )
-    text = _text(out)
+    text = await _ask(base, form.format(slug=SLUG, absolute=artifact))
     assert str(artifact) in text
     assert "NOT been published" in text
     assert "not found" not in text.lower()
@@ -184,11 +179,7 @@ async def test_artifacts_folder_wins_over_a_same_named_project_folder(project):
     base, artifact, _ = project
     (base / SLUG).mkdir()
     (base / SLUG / "index.html").write_text("<h1>user file</h1>")
-    with mock.patch.object(htools, "_published_state", return_value={}):
-        out = await htools._cowork_publish_or_preview(
-            _project_session(base), {"file_path": SLUG, "action": "ask"},
-        )
-    assert f"is at {artifact} " in _text(out)
+    assert f"is at {artifact} " in await _ask(base, SLUG)
 
 
 @pytest.mark.asyncio
@@ -197,7 +188,7 @@ async def test_publish_by_short_path_hands_the_service_the_absolute_artifact_pat
     fake = mock.Mock(return_value={"url": "https://v/r/1"})
     with mock.patch.object(htools, "_publish_artifact", fake):
         out = await htools._cowork_publish_or_preview(
-            _project_session(base),
+            _session(base),
             {"file_path": f"artifacts/{SLUG}", "action": "publish", "access_mode": "public"},
         )
     args, _ = fake.call_args
@@ -210,24 +201,14 @@ async def test_publish_by_short_path_hands_the_service_the_absolute_artifact_pat
 @pytest.mark.parametrize(
     "raw",
     [
-        "artifacts/../memory",
-        "artifacts/../.anton/memory",
-        "artifacts/no-such-slug",
-        "artifacts/escape",
-        "artifacts/escape/notes.md",
-        "x\x00y",
-        "a" * 300,
-        "~no-such-user-7f3a/report",
-    ],
-    ids=[
-        "dotdot",
-        "dotdot-into-anton",
-        "missing",
-        "symlink-escape",
-        "symlink-escape-file",
-        "nul",
-        "too-long",
-        "unknown-user",
+        pytest.param("artifacts/../memory", id="dotdot"),
+        pytest.param("artifacts/../.anton/memory", id="dotdot-into-anton"),
+        pytest.param("artifacts/no-such-slug", id="missing"),
+        pytest.param("artifacts/escape", id="symlink-escape"),
+        pytest.param("artifacts/escape/notes.md", id="symlink-escape-file"),
+        pytest.param("x\x00y", id="nul"),
+        pytest.param("a" * 300, id="too-long"),
+        pytest.param("~no-such-user-7f3a/report", id="unknown-user"),
     ],
 )
 async def test_unmatched_path_gets_a_not_found_reply_and_publishes_nothing(project, raw, action):
@@ -236,7 +217,7 @@ async def test_unmatched_path_gets_a_not_found_reply_and_publishes_nothing(proje
     with mock.patch.object(htools, "_publish_artifact", fake), \
          mock.patch.object(htools, "_published_state", return_value={}):
         out = await htools._cowork_publish_or_preview(
-            _project_session(base),
+            _session(base),
             {"file_path": raw, "action": action, "access_mode": "public"},
         )
     text = _text(out)
@@ -254,10 +235,7 @@ async def test_unmatched_path_gets_a_not_found_reply_and_publishes_nothing(proje
 @pytest.mark.asyncio
 async def test_not_found_reply_shortens_a_long_path(project):
     base, _, _ = project
-    out = await htools._cowork_publish_or_preview(
-        _project_session(base), {"file_path": "a" * 300, "action": "ask"},
-    )
-    text = _text(out)
+    text = await _ask(base, "a" * 300)
     assert "…" in text
     assert "a" * 201 not in text
     assert repr("a" * 200 + "…") in text
