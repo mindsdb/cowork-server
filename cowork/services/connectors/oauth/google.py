@@ -38,6 +38,7 @@ _SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str | None]] = {
     "supabase":         ("supabase_client_id",          "supabase_client_secret"),
     "posthog":          ("posthog_client_id",           None),
     "hubspot":          ("hubspot_client_id",           "hubspot_client_secret"),
+    "notion":           ("notion_client_id",            None),
 }
 
 # engine name (e.g. "google_drive") → service id (e.g. "google-drive")
@@ -322,11 +323,26 @@ def _revoke_posthog(token: str, client_id: str, client_secret: str) -> None:
         pass
 
 
+def _revoke_notion(token: str, client_id: str, client_secret: str) -> None:
+    """Public client, same shape as `_revoke_posthog`. Notion documents no
+    client-side revoke, but its metadata advertises this endpoint; revoke()
+    already treats any failure as local-cleanup-only."""
+    request = Request(
+        "https://mcp.notion.com/token",
+        data=urlencode({"token": token, "client_id": client_id}).encode("utf-8"),
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    with urlopen(request, timeout=10):
+        pass
+
+
 # engine → custom revoke function, for providers whose revoke call doesn't
 # fit the generic revoke_url/POST/form-body shape (see OAuthConfig.revoke_url).
 # Checked before the generic path in revoke() below.
 _REVOKE_HANDLERS: dict[str, Callable[[str, str, str], None]] = {
     "github": _revoke_github,
+    "notion": _revoke_notion,
     "posthog": _revoke_posthog,
     "supabase": _revoke_supabase,
 }
