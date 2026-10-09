@@ -122,11 +122,11 @@ def spec_secret_fields(connector_id: str, method: str | None) -> list[str]:
 # `account_email` as a synthetic composite placeholder — `org:<slug>` (see
 # `_fetch_userinfo_supabase`) or `<email>:<workspace_id>`/
 # `<email>:<organization_id>` (see `_fetch_userinfo_linear`/
-# `_fetch_userinfo_posthog`) — rather than a real, displayable email. Shared
-# so any caller falling back from `account_name` to `account_email` can skip
-# that fallback for exactly these three instead of leaking the composite
-# string.
-SYNTHETIC_ACCOUNT_EMAIL_ENGINES = frozenset({"supabase", "linear", "posthog"})
+# `_fetch_userinfo_posthog`, and Notion's MCP identity bridge) — rather than a
+# real, displayable email. Shared so any caller falling back from
+# `account_name` to `account_email` can skip that fallback for exactly these
+# engines instead of leaking the composite string.
+SYNTHETIC_ACCOUNT_EMAIL_ENGINES = frozenset({"supabase", "linear", "posthog", "notion"})
 
 
 def connection_display_name(fields: dict, engine: str = "") -> str | None:
@@ -140,7 +140,7 @@ def connection_display_name(fields: dict, engine: str = "") -> str | None:
     the caller then falls back to the slug.
 
     ``account_name`` is checked first only for ``SYNTHETIC_ACCOUNT_EMAIL_ENGINES``
-    (supabase/linear/posthog): their ``account_email`` is a synthetic
+    (supabase/linear/posthog/notion): their ``account_email`` is a synthetic
     placeholder, not a real email/display value, so the human org/workspace
     name is more useful there. Every other engine populates a real
     ``account_email`` already, and ``account_name`` there is just a

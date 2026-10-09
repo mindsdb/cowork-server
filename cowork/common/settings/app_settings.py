@@ -451,6 +451,10 @@ class OAuthSettings(Settings):
 
     posthog_client_id: str = Field(default="", validation_alias=AliasChoices("POSTHOG_CLIENT_ID"))
 
+    # Notion MCP is a public client like PostHog: the id is our hosted Client
+    # ID Metadata Document's URL, and there is no secret.
+    notion_client_id: str = Field(default="", validation_alias=AliasChoices("NOTION_CLIENT_ID"))
+
     # HubSpot's MCP Auth App — a fixed client_id/secret pair, same shape as
     # Google/Linear/GitHub/Supabase, but the resulting token can only call
     # HubSpot's remote MCP server, never its REST API.

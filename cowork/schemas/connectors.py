@@ -69,6 +69,10 @@ class OAuthConfig(BaseModel):
     # False means "skip this behavior silently," never a faked success.
     supports_refresh: bool = True
     supports_revoke: bool = True
+    # A refreshing provider whose code exchange may still omit the
+    # refresh_token (Notion, sometimes). The connect then saves anyway and
+    # the connection asks to reconnect once the access token expires.
+    refresh_token_optional: bool = False
     # Client authentication method at the token endpoint. Most providers
     # accept credentials in the form body; Supabase Management API OAuth uses
     # HTTP Basic authentication.

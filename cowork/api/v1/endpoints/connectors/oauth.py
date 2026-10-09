@@ -4,6 +4,7 @@ import json
 import logging
 from typing import Annotated, Any
 
+import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
@@ -26,10 +27,16 @@ _log = logging.getLogger("cowork.connectors.oauth")
 
 # Engines whose identity can only be resolved via an MCP tool call, not a
 # plain REST/GraphQL request Electron can make on its own — see
-# get_mcp_identity below. Only HubSpot today; kept as a set (not a bare
-# `engine == "hubspot"` check) since Stage 1 built this as general MCP
-# infrastructure and Linear/PostHog both already run their own MCP servers.
-_MCP_IDENTITY_ENGINES = {"hubspot"}
+# get_mcp_identity below.
+_MCP_IDENTITY_ENGINES = {"hubspot", "notion"}
+
+# Shown on the connect form when a Notion workspace's admin allows only
+# approved AI apps. Notion's exact rejection isn't known yet, so any rejected
+# identity call maps here and the raw error is logged for refining the match.
+NOTION_ADMIN_APPROVAL_MESSAGE = (
+    "Your Notion workspace only allows AI apps your admin has approved. "
+    "Ask your Notion admin to approve MindsHub Cowork, then connect again."
+)
 
 # Same alias as connections.py: the vault/relay choice is per-request tenancy
 # context, not a bare settings flag — resolving it once here keeps this file
@@ -93,6 +100,10 @@ def get_oauth_credentials(engine: str):
 
 class McpIdentityRequest(BaseModel):
     access_token: str
+    # Notion returns these only in the code-exchange response, so Electron
+    # forwards them; HubSpot ignores them.
+    workspace_id: str | None = None
+    workspace_name: str | None = None
 
 
 def _first_str(*values: Any) -> str:
@@ -169,6 +180,7 @@ async def get_mcp_identity(engine: str, body: McpIdentityRequest):
     # here would surface to Electron as an opaque 500; 501 says what is
     # actually true — this build cannot do MCP identity resolution at all.
     try:
+        from anton.core.mcp.servers import mcp_server_url
         from anton.core.mcp.wiring import call_mcp_tool
     except ImportError as exc:
         _log.warning("MCP identity resolution unavailable for %s: installed anton has no anton.core.mcp", engine)
@@ -176,6 +188,17 @@ async def get_mcp_identity(engine: str, body: McpIdentityRequest):
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
             detail=f"This build's anton has no MCP client, so {engine} identity cannot be resolved.",
         ) from exc
+    # An anton that predates this engine's server URL would otherwise fail
+    # inside call_mcp_tool, which for Notion reads as a workspace rejection.
+    if mcp_server_url(engine) is None:
+        _log.warning("MCP identity resolution unavailable for %s: installed anton has no server URL for it", engine)
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail=f"This build's anton has no MCP server for {engine}, so its identity cannot be resolved.",
+        )
+
+    if engine == "notion":
+        return await _resolve_notion_identity(call_mcp_tool, body)
 
     try:
         user_details = await call_mcp_tool(engine, body.access_token, "get_user_details")
@@ -197,6 +220,63 @@ async def get_mcp_identity(engine: str, body: McpIdentityRequest):
     if not account_email:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Could not retrieve {engine} account email.")
     return {"account_email": account_email, "account_name": account_name}
+
+
+def _parse_notion_self_user(result: Any) -> tuple[str, str]:
+    """(email, user_id) from `notion-get-users` called with `self`.
+
+    Accepts a bare user object or a `results` list, as a JSON string or an
+    already-decoded value, since the exact shape isn't verified live yet.
+    """
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except ValueError:
+            return "", ""
+    if isinstance(result, dict) and isinstance(result.get("results"), list):
+        result = result["results"][0] if result["results"] else {}
+    if not isinstance(result, dict):
+        return "", ""
+    person = result.get("person") if isinstance(result.get("person"), dict) else {}
+    return _first_str(result.get("email"), person.get("email")), _first_str(result.get("id"))
+
+
+def _is_rejection(exc: BaseException) -> bool:
+    """A tool error or a 401/403 from the MCP server, looking through the
+    exception groups and causes the MCP SDK wraps them in."""
+    seen: list[BaseException] = [exc]
+    while seen:
+        e = seen.pop()
+        if isinstance(e, RuntimeError) and "returned an error" in str(e):
+            return True
+        if isinstance(e, httpx.HTTPStatusError) and e.response.status_code in (401, 403):
+            return True
+        seen.extend(getattr(e, "exceptions", ()))
+        if e.__cause__ is not None:
+            seen.append(e.__cause__)
+    return False
+
+
+async def _resolve_notion_identity(call_mcp_tool, body: McpIdentityRequest) -> dict[str, str]:
+    """Identity is `<email>:<workspace_id>` so each workspace gets its own
+    connection; the tile shows the workspace name, else the email."""
+    try:
+        result = await call_mcp_tool("notion", body.access_token, "notion-get-users", user_id="self")
+    except Exception as exc:
+        _log.warning("Notion identity call failed: %r", exc)
+        if _is_rejection(exc):
+            raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=NOTION_ADMIN_APPROVAL_MESSAGE) from exc
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not resolve notion account identity.") from exc
+
+    email, user_id = _parse_notion_self_user(result)
+    who = email or user_id
+    if not who:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not retrieve notion account email.")
+    workspace_id = _first_str(body.workspace_id)
+    return {
+        "account_email": f"{who}:{workspace_id}" if workspace_id else who,
+        "account_name": _first_str(body.workspace_name, email, user_id),
+    }
 
 
 # AuthenticatedInOrgMode: in org mode this forwards to auth_proxy.proxy_catalogue.
