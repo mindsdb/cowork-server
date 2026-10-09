@@ -550,6 +550,9 @@ class AntonHarness:
         # end-of-turn finally must not depend on the session still being live.
         conv_id = conversation.id
         conv_project_id = conversation.project_id
+        # The previous turn stopped at anton's spend ceiling and asked whether
+        # to go on, so this message is the user's answer (see `turn_kwargs`).
+        after_spend_ceiling = getattr(conversation, "last_turn_ended_by", None) == "spend_ceiling"
         # Same reason: reading the relation after the turn could hit an expired
         # session, so both of the card's project values are read now. The label
         # is what the card shows, beside project_id which carries the identity
@@ -577,6 +580,23 @@ class AntonHarness:
 
         async def record_turn_cleanup():
             nonlocal new_slugs, touched_slugs, turn_scope, skill_drafts
+            # Every exit, so a cancelled or failed turn clears a stale
+            # "spend_ceiling" rather than raising the next turn's ceiling. An
+            # anton build without the property records nothing.
+            if session is not None and hasattr(session, "last_turn_ended_by"):
+                from cowork.services.conversations import ConversationService
+
+                ended_by = session.last_turn_ended_by
+                try:
+                    await run_db(
+                        lambda db: ConversationService(db).update_last_turn_ended_by(conv_id, ended_by),
+                        scope=_units_scope(),
+                    )
+                except Exception:
+                    logger.exception(
+                        "[anton_harness] failed to record how the turn ended for conversation %s",
+                        conv_id,
+                    )
             if session is not None and seed_info is not None and getattr(session, "last_compaction", None) is not None:
                 # Best-effort: a missing compaction does not lose the answer.
                 try:
@@ -644,6 +664,10 @@ class AntonHarness:
                 turn_kwargs["trace_tags"] = trace_tags
             if "trace_metadata" in _turn_params:
                 turn_kwargs["trace_metadata"] = trace_metadata
+            # Raises the spend ceiling for a reply to a ceiling hand-back. Gated
+            # like the trace kwargs, for anton builds that predate it.
+            if "after_spend_ceiling" in _turn_params:
+                turn_kwargs["after_spend_ceiling"] = after_spend_ceiling
             async for event in session.turn_stream(self._to_anton_input(input), **turn_kwargs):
                 # Under context pressure anton summarizes history mid-turn,
                 # reassigning session.history and invalidating seed_len.

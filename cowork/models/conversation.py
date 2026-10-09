@@ -39,6 +39,15 @@ class Conversation(BaseSQLModel, table=True):
     reasoning_effort: str | None = Field(
         default=None, description="Reasoning effort the task's harness was launched with"
     )
+    last_turn_ended_by: str | None = Field(
+        default=None,
+        max_length=32,
+        description=(
+            "How the latest anton turn ended (anton's `ended_by`). The session "
+            "is rebuilt every turn, so this is how the next turn knows the user "
+            "is answering a spend-ceiling hand-back."
+        ),
+    )
 
     project: "Project" = Relationship()
     messages: list["Message"] = Relationship()

@@ -593,6 +593,16 @@ class ConversationService:
         self.session.add(conversation)
         self.session.commit()
 
+    def update_last_turn_ended_by(self, conversation_id: UUID, ended_by: str | None) -> None:
+        """Record how the latest turn ended. Best-effort, like
+        `update_history_compaction`: runs from the turn's cleanup path."""
+        conversation = self._owned(conversation_id)
+        if conversation is None:
+            return
+        conversation.last_turn_ended_by = ended_by
+        self.session.add(conversation)
+        self.session.commit()
+
     def archived_messages(self, conversation_id: UUID) -> list[dict]:
         """The messages the saved summary replaced, oldest first, as plain dicts.
 
