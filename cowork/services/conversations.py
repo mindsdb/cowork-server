@@ -13,7 +13,6 @@ from uuid import UUID
 
 from sqlalchemy import case, func, tuple_
 from sqlalchemy import select as sa_select
-from sqlalchemy.orm import selectinload
 
 from cowork.common.paths import (
     dir_lstat,
@@ -82,6 +81,9 @@ _MESSAGE_ORDER = (
     case((Message.role == Role.user, 0), else_=1),
     Message.id,
 )
+# The exact reverse of _MESSAGE_ORDER, for reads that walk back from the newest
+# row: id is unique, so every row has one place in either direction.
+_MESSAGE_ORDER_NEWEST_FIRST = tuple(column.desc() for column in _MESSAGE_ORDER)
 
 
 def _message_cursor_key(message: Message) -> tuple[int, int, UUID]:
@@ -117,6 +119,19 @@ def _decode_message_cursor(cursor: str) -> tuple[int, int, UUID]:
     if not 0 <= seq <= _MAX_CURSOR_SEQ or role_rank not in (0, 1):
         raise InvalidPaginationParams("Malformed pagination cursor")
     return (seq, role_rank, message_id)
+
+
+@dataclass(frozen=True)
+class ReplayHistory:
+    """What a harness replays into a turn, read in one unit.
+
+    ``messages`` is the history get_ordered_messages returns. ``events`` holds
+    the stored events of those messages that carry one of the requested
+    thought roles, in history order and each message's event order.
+    """
+
+    messages: list[Message]
+    events: list[dict]
 
 
 @dataclass(frozen=True)
@@ -1033,18 +1048,66 @@ class ConversationService:
         stmt = self._ordered_messages(conversation_id, include_pending=include_pending)
         return list(self.session.exec(stmt).all())
 
-    def get_replay_messages(self, conversation_id: UUID) -> list[Message]:
-        """The history get_ordered_messages returns, with each message's
-        events loaded in one more query.
+    def message_count(self, conversation: Conversation) -> int:
+        """How many rows the conversation stores, pending and hidden tool rows
+        included: the number a new turn's stream buffer is keyed by, and the
+        index boot recovery reads that turn's question at.
 
-        For a reader that replays the history after its session has closed,
-        as the harness does with what its database unit read: the rows and
-        their events stay readable, and a long conversation costs two queries
-        rather than one per message."""
+        Counted in SQL rather than by loading every row. Takes the
+        conversation the caller already resolved through this session, as
+        len(conversation.messages) did, so it adds no anchor query. Not
+        max(seq) + 1: seq can repeat, and the buffer key must be the count."""
+        return self.session.exec(
+            self.session.select(Message)
+            .with_only_columns(func.count())
+            .where(Message.conversation_id == conversation.id)
+        ).one()
+
+    def get_recent_messages(
+        self, conversation_id: UUID, *, roles: tuple[Role, ...], limit: int
+    ) -> list[Message]:
+        """The last `limit` messages with one of `roles` in the history
+        get_ordered_messages returns, oldest first, read without loading the
+        rest of the conversation."""
+        stmt = self._ordered_messages(conversation_id, include_pending=False, newest_first=True)
+        rows = self.session.exec(stmt.where(Message.role.in_(roles)).limit(limit)).all()
+        return list(reversed(rows))
+
+    def get_replay_history(
+        self, conversation_id: UUID, *, event_roles: tuple[str, ...]
+    ) -> ReplayHistory:
+        """The history get_ordered_messages returns, with the stored events of
+        those messages whose thought_role is one of `event_roles`.
+
+        For a reader that replays the history after its session has closed, as
+        the harness does with what its database unit read. The events are
+        filtered in SQL, so a long conversation does not load every text delta
+        and progress event it ever stored only to have them skipped."""
         stmt = self._ordered_messages(conversation_id, include_pending=False)
-        return list(self.session.exec(stmt.options(selectinload(Message.message_events))).all())
+        messages = list(self.session.exec(stmt).all())
+        if not messages:
+            return ReplayHistory(messages=[], events=[])
+        events = self.session.exec(self._replay_events(conversation_id, event_roles=event_roles)).all()
+        return ReplayHistory(messages=messages, events=[event.event_data for event in events])
 
-    def _ordered_messages(self, conversation_id: UUID, *, include_pending: bool):
+    def _replay_events(self, conversation_id: UUID, *, event_roles: tuple[str, ...]):
+        # The relationship orders each message's events by sequence_number, so
+        # history order then sequence_number is the order a per-message read
+        # gives. JSON_EXTRACT on SQLite and ->> on Postgres both give NULL for
+        # an event_data that is not an object, which the IN never matches.
+        # SQLite reads a stored NaN (json.dumps writes it bare) only from 3.42.
+        return (
+            self.session.select(MessageEvent)
+            .join(Message, Message.id == MessageEvent.message_id)
+            .where(Message.conversation_id == conversation_id)
+            .where(Message.pending == False)  # noqa: E712 — SQL boolean column, not Python identity
+            .where(MessageEvent.event_data["thought_role"].as_string().in_(event_roles))
+            .order_by(*_MESSAGE_ORDER, MessageEvent.sequence_number)
+        )
+
+    def _ordered_messages(
+        self, conversation_id: UUID, *, include_pending: bool, newest_first: bool = False
+    ):
         # Anchor the parent: Message has no org_id, so tenancy comes from
         # resolving the conversation through the scoped session — a foreign
         # id must answer like a nonexistent one, not leak another org's
@@ -1055,7 +1118,7 @@ class ConversationService:
         )
         if not include_pending:
             stmt = stmt.where(Message.pending == False)  # noqa: E712 — SQL boolean column, not Python identity
-        return stmt.order_by(*_MESSAGE_ORDER)
+        return stmt.order_by(*(_MESSAGE_ORDER_NEWEST_FIRST if newest_first else _MESSAGE_ORDER))
 
     def _hydrate_message_items(self, messages: Iterable[Message]) -> list[dict]:
         """Turn ordered Message rows into the UI-facing item-dict shape,
@@ -1141,7 +1204,7 @@ class ConversationService:
         # silently — a fourth column added to _MESSAGE_ORDER would widen the
         # cursor while this stayed at three, and the walk would start skipping
         # rows while the unbounded read looked fine.
-        stmt = stmt.order_by(*[column.desc() for column in _MESSAGE_ORDER])
+        stmt = stmt.order_by(*_MESSAGE_ORDER_NEWEST_FIRST)
 
         scan_cap = limit * _SCAN_CAP_MULTIPLIER
         raw_rows = list(self.session.exec(stmt.limit(scan_cap + 1)).all())
