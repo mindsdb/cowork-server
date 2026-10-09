@@ -139,16 +139,18 @@ def _resolve_publish_path(session: Any, raw_path: str) -> Path | None:
     try:
         path = Path(raw_path).expanduser()
         workspace = getattr(session, "_workspace", None)
-        base = getattr(workspace, "base", None) if workspace is not None else None
+        base = getattr(workspace, "base", None)
         if not path.is_absolute() and base:
             if ".." in path.parts:
                 return None
+            # `as_posix()` drops the `.` segments and doubled slashes that
+            # the helper would otherwise reject (`artifacts//<slug>`).
             matches = _candidate_relative_artifacts(
-                raw_path, [Path(workspace.artifacts_dir)]
+                path.as_posix(), [Path(workspace.artifacts_dir)]
             )
             if matches:
                 return matches[0]
-            path = Path(base) / raw_path
+            path = Path(base) / path
         path = path.resolve()
         return path if path.exists() else None
     except (OSError, RuntimeError, ValueError):

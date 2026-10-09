@@ -160,6 +160,8 @@ def _project_session(base: Path):
         "{slug}/index.html",
         "artifacts/{slug}",
         "artifacts/{slug}/index.html",
+        "artifacts//{slug}",
+        "./{slug}/./index.html",
         ".anton/artifacts/{slug}",
         "{absolute}",
     ],
@@ -215,6 +217,7 @@ async def test_publish_by_short_path_hands_the_service_the_absolute_artifact_pat
         "artifacts/escape/notes.md",
         "x\x00y",
         "a" * 300,
+        "~no-such-user-7f3a/report",
     ],
     ids=[
         "dotdot",
@@ -224,6 +227,7 @@ async def test_publish_by_short_path_hands_the_service_the_absolute_artifact_pat
         "symlink-escape-file",
         "nul",
         "too-long",
+        "unknown-user",
     ],
 )
 async def test_unmatched_path_gets_a_not_found_reply_and_publishes_nothing(project, raw, action):
@@ -263,4 +267,7 @@ def test_publish_description_says_what_to_pass_not_where_artifacts_live():
     description = htools.build_cowork_publish_tool().description
     for stale in ("artifacts/<artifact-id>", "e.g. artifacts/<slug>", "<workspace>/artifacts/"):
         assert stale not in description
-    assert "slug" in description
+    assert "the artifact's slug" in description
+    assert "`create_artifact`" in description
+    assert "`generate_artifact`" in description
+    assert "open_artifact" not in description
