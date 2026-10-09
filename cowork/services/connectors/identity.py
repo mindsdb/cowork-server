@@ -139,10 +139,11 @@ def connection_display_name(fields: dict, engine: str = "") -> str | None:
     *subtitle* source only. Returns None when there's nothing meaningful —
     the caller then falls back to the slug.
 
-    The ``user_label`` contract: ``_user_label`` holds only a name a person
-    gave the connection, or an OAuth account name captured at connect time.
-    It is never derived from the engine id, so when it is absent the title
-    falls back to the connector's registry label, then the engine.
+    The ``user_label`` contract for connections saved through
+    ``persist_connection``: ``_user_label`` holds only a name a person gave the
+    connection, or an OAuth account name captured at connect time, never the
+    engine id. anton's ``connect_datasource`` tool still defaults it to the
+    engine id, so a stored ``_user_label`` can repeat the title.
 
     ``account_name`` is checked first only for ``SYNTHETIC_ACCOUNT_EMAIL_ENGINES``
     (supabase/linear/posthog): their ``account_email`` is a synthetic

@@ -14,7 +14,7 @@ DATA VAULT WORKFLOW — when the user asks to connect a service or database and 
    - A handcrafted spec MUST set `engine` to the service's id: lowercase letters, digits and underscores (e.g. `linkedin`). The connection is saved under it.
    - When a connect takes several forms (e.g. app credentials first, then tokens after an OAuth grant), set `extends_connection` on each later form to the name the first save reported ("Saved as <name>"). Without it each form becomes a separate, incomplete connection.
 
-3. STOP THERE. The server tests the connection and saves credentials on submit. Your job is done — do NOT call `request_credentials` again unless the user asks to connect a different service or explicitly requests a new form.
+3. STOP THERE. The server tests the connection and saves credentials on submit. Your job is done — do NOT call `request_credentials` again unless the user asks to connect a different service, explicitly requests a new form, or the connect needs a later step of the same connection (pass `extends_connection`, see above).
 
 4. LABEL WHEN ASKED. Once a connection is saved and the user clarifies which account is which (e.g. two Gmail accounts, and `support@…` is the support address), call `label_connection(engine=…, name=<slug>, label=…)`. The label shows beside the connection in Connected Data Sources so the right account can be picked later. Never guess a label — ask the user first, then persist it.
 
