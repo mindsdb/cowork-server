@@ -1,4 +1,4 @@
-"""Notion's MCP connector: the hidden `mcp` method, id-only credentials,
+"""Notion's MCP connector: the `mcp` method, id-only credentials,
 the identity bridge, and best-effort revoke."""
 from __future__ import annotations
 
@@ -32,10 +32,13 @@ class TestSpec:
         spec = ConnectorSpecRegistry().get_connector("notion")
         return {m.id: m for m in spec.form.methods}
 
-    def test_mcp_method_is_recommended_but_ships_hidden(self):
+    def test_mcp_method_is_recommended_and_visible(self):
         mcp = self._methods()["mcp"]
         assert mcp.recommended is True
-        assert mcp.hidden is True
+        assert mcp.hidden is False
+
+    def test_notion_is_featured(self):
+        assert ConnectorSpecRegistry().get_connector("notion").featured is True
 
     def test_mcp_method_oauth_shape(self):
         oauth = self._methods()["mcp"].oauth
