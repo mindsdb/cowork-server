@@ -16,7 +16,9 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.common.settings.user_settings import UserSettings
 from cowork.handlers.turn_errors import server_busy_message
+from cowork.schemas.connectors import ConnectorSpecResponse
 from cowork.schemas.responses import Role
+from cowork.services.connectors.custom_connectors import CustomConnectorService
 from cowork.services.connectors.persist import persist_connection, vault_for_scope
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
 from cowork.services.connectors.specs._registry import registry
@@ -81,6 +83,24 @@ def _save_probe_turn(
     None when nothing was saved."""
     message = ConversationService(session).save_assistant_turn(conversation_id, text, list(events))
     return message.id if message is not None else None
+
+
+def _is_oauth_grant(form_spec: dict, method: str | None, credentials: dict) -> bool:
+    """True when this submission is the result of an OAuth browser grant.
+
+    The form is model-written, so a flag alone is not enough: the selected
+    method must be an OAuth launch with an ``oauth`` block (the only shape the
+    renderer runs a grant for), and the values must carry a token from it.
+    """
+    if not (credentials.get("access_token") or credentials.get("refresh_token")):
+        return False
+    for m in form_spec.get("methods") or []:
+        if (
+            isinstance(m, dict) and m.get("id") == method
+            and m.get("submit_action") == "oauth_launch" and isinstance(m.get("oauth"), dict)
+        ):
+            return True
+    return False
 
 
 class ProbeHandler:
@@ -250,10 +270,15 @@ class ProbeHandler:
             # persist as the label/user_label.
             connection_label, connection_user_label = _extract_connection_label_fields(credentials)
 
-            # Connector spec — absent for agent-handcrafted (non-registry)
-            # connectors; those fall back to the form_spec staged with the
-            # submission and skip the probe below.
-            spec = registry.get_connector(connector_id)
+            # Mirrors submit_form: a handcrafted form keeps its own spec, and a
+            # custom connector's stored spec arrives staged with the submission.
+            staged_spec = submission.get("form_spec") or {}
+            # Only an explicit False from submit_form skips the stored spec, so
+            # a submission can never be validated as one connector and saved untested.
+            stamped = submission.get("checked_against_stored_spec") is not False
+            spec = registry.get_connector(connector_id) if stamped else None
+            if spec is None and submission.get("custom_spec"):
+                spec = ConnectorSpecResponse.model_validate(submission["custom_spec"])
             if spec is not None:
                 form_id = spec.form.form_id
                 form_spec = spec.form.model_dump()
@@ -274,17 +299,16 @@ class ProbeHandler:
                 yield await _completed(None, {"status": "failed"})
                 return
 
-            # Save without probe only when there is no registry spec —
-            # there is no engine to verify a handcrafted connector against.
-            # Missing conversation context is fine: a temp workspace is created below.
-            if spec is None:
+            extends_name = form_spec.get("_extends_connection") if spec is None else None
+            # A handcrafted OAuth method arrives after the browser grant, which
+            # is its test; probing again could throw a working grant away.
+            if spec is None and _is_oauth_grant(form_spec, method, credentials):
                 try:
                     vault = vault_for_scope(self.scope)
-                    extends_name = form_spec.get("_extends_connection")
                     slug = persist_connection(
                         connector_id, method, extends_name or name, credentials,
                         label=connection_label, user_label=connection_user_label,
-                        extends=bool(extends_name), vault=vault,
+                        extends=bool(extends_name), spec_form=form_spec, vault=vault,
                     )
                     saved_record = vault.read_record(connector_id, slug) or {}
                     saved_user_label = str(saved_record.get("fields", {}).get("_user_label", "")).strip() or None
@@ -292,12 +316,15 @@ class ProbeHandler:
                     yield _delta(f"Could not save: `{exc}`.")
                     yield await _completed(db_conversation_id, {"status": "failed"})
                     return
-                reason = "connector is not in the registry"
-                yield _delta(f"Saved as `{slug}` (no live probe — {reason}).\n\n")
+                yield _delta(f"Saved as `{slug}` (authorized with the provider).\n\n")
+                if not extends_name:
+                    note = await self._save_definition(connector_id, form_spec)
+                    if note:
+                        yield _delta(note)
                 yield _patch_delta({
                     "form_id": form_id,
                     "title": f"Saved — {slug}",
-                    "subtitle": "Stored in the vault. No live verification was performed.",
+                    "subtitle": "Stored in the vault after the provider's authorization.",
                     "status_text": None,
                     "_is_probing": False,
                     "_is_success": True,
@@ -449,8 +476,9 @@ class ProbeHandler:
                 try:
                     vault = vault_for_scope(self.scope)
                     slug = persist_connection(
-                        connector_id, method, name, credentials,
-                        label=connection_label, user_label=connection_user_label, vault=vault,
+                        connector_id, method, extends_name or name, credentials,
+                        label=connection_label, user_label=connection_user_label,
+                        extends=bool(extends_name), spec_form=form_spec, vault=vault,
                     )
                     saved_slug = slug
                     saved_record = vault.read_record(connector_id, slug) or {}
@@ -462,7 +490,11 @@ class ProbeHandler:
 
             if final_outcome.status == "success":
                 summary = final_outcome.summary or "Connection works."
-                yield _delta(f"\n\n{summary}\n")
+                yield _delta(f"\n\n{summary}\n\nSaved as `{saved_slug}`.\n")
+                if spec is None and not extends_name:
+                    note = await self._save_definition(connector_id, form_spec)
+                    if note:
+                        yield _delta(note)
                 yield _patch_delta({
                     "form_id": form_id,
                     "title": f"Connected — {saved_slug}",
@@ -524,6 +556,28 @@ class ProbeHandler:
         finally:
             if _temp_workspace_dir:
                 shutil.rmtree(_temp_workspace_dir, ignore_errors=True)
+
+    async def _save_definition(self, connector_id: str, form_spec: dict) -> str | None:
+        """Store a tested handcrafted form as the scope's custom connector.
+
+        Local installs only for now: who may publish a connector to a whole
+        organization is not decided yet.
+
+        Returns:
+            None when saved or skipped, else a line telling the user the
+            connection is saved but the connector could not be.
+        """
+        if self.scope.org_mode:
+            return None
+        try:
+            await run_db(
+                lambda session: CustomConnectorService(session).upsert_from_form(connector_id, form_spec),
+                scope=self.scope,
+            )
+        except Exception:
+            logger.exception("Could not save the custom connector definition for %s", connector_id)
+            return "\nThe connection is saved, but it could not be added to your connectors list.\n"
+        return None
 
     @staticmethod
     def _build_llm_client(settings=None):

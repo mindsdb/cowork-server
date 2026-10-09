@@ -51,13 +51,24 @@ class ConnectionsService:
         except (json.JSONDecodeError, TypeError):
             return []
 
-    def list(self) -> list[ConnectionSummaryResponse]:
+    def list(self, specs: dict[str, dict] | None = None) -> list[ConnectionSummaryResponse]:
+        """Summarize every saved connection for the connections list.
+
+        Args:
+            specs: Connector specs keyed by id, used for each card's label and
+                logo. Defaults to the static registry; the endpoint passes the
+                scope's catalog so custom connectors are named too.
+
+        Returns:
+            One summary per vault record.
+        """
+        specs = registry.get_connectors() if specs is None else specs
         vault = self._vault()
         result = []
         for item in vault.list_connections():
             engine = item.get("engine", "")
             name = item.get("name", "")
-            spec = registry.get_connector(engine)
+            spec = specs.get(engine) or {}
             # Load the record's fields to derive a human display name (label or
             # identity) so the card shows e.g. "Support" / "user@gmail.com"
             # instead of the opaque slug.
@@ -70,11 +81,12 @@ class ConnectionsService:
                 name=name,
                 display_name=connection_display_name(fields, engine),
                 created_at=item.get("created_at"),
-                label=spec.label if spec else None,
+                label=spec.get("label"),
                 user_label=user_label,
-                logo=spec.logo if spec else None,
-                logo_color=spec.logo_color if spec else None,
+                logo=spec.get("logo"),
+                logo_color=spec.get("logo_color"),
                 status=(fields or {}).get("status"),
+                custom=bool(spec.get("custom")),
             ))
         return result
 

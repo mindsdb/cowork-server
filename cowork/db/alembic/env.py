@@ -11,6 +11,7 @@ import cowork.models.artifact_identity  # noqa: F401
 
 # Import models so SQLModel.metadata is fully populated for autogenerate.
 import cowork.models.conversation  # noqa: F401
+import cowork.models.custom_connector  # noqa: F401
 import cowork.models.file  # noqa: F401
 import cowork.models.message  # noqa: F401
 import cowork.models.message_event  # noqa: F401
