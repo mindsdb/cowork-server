@@ -623,6 +623,10 @@ async def _cowork_request_credentials(session: Any, tc_input: dict) -> str:
         )
 
     spec = dict(spec)
+    if spec.get("_connector_id") and not is_builtin:
+        # A stamped form saves an OAuth step through the registry-only direct
+        # save; a handcrafted one must route by `engine` through the submission.
+        spec["engine"] = spec.pop("_connector_id")
     extends_name = spec.pop("extends_connection", None)
     if extends_name is not None:
         if not isinstance(extends_name, str) or not extends_name.strip():

@@ -5,6 +5,8 @@ names the vault record, so it must be that declared engine and never a
 synthesized ``fm_<hex>`` form id or an unsafe string.
 """
 
+import json
+
 import pytest
 from fastapi import HTTPException
 
@@ -157,6 +159,26 @@ class TestRequestCredentialsTool:
             },
         )
         assert '"_extends_connection": "linkedin-1a2b3c4d"' in result
+
+    @pytest.mark.asyncio
+    async def test_a_copied_connector_id_is_dropped_for_a_non_registry_connector(self):
+        # A stamped form's OAuth step goes to the registry-only direct save,
+        # which 404s; without the stamp it routes by `engine` instead.
+        result = await _cowork_request_credentials(
+            session=None,
+            tc_input={"engine": "linked-in", "_connector_id": "linkedin", "title": "Connect"},
+        )
+        block = json.loads(result.split("```data-vault-form\n", 1)[1].rsplit("\n```", 1)[0])
+        assert "_connector_id" not in block
+        assert block["engine"] == "linkedin"
+
+    @pytest.mark.asyncio
+    async def test_a_registry_stamp_is_kept(self):
+        result = await _cowork_request_credentials(
+            session=None, tc_input={"_connector_id": "google_drive", "title": "Drive"},
+        )
+        block = json.loads(result.split("```data-vault-form\n", 1)[1].rsplit("\n```", 1)[0])
+        assert block["_connector_id"] == "google_drive"
 
     @pytest.mark.asyncio
     async def test_stamped_connector_id_is_checked_instead_of_engine(self):
