@@ -1003,6 +1003,8 @@ class ResponsesHandler:
             base_url=block["base_url"],
             flavor=OpenAIProvider.FLAVOR_MINDS_PASSTHROUGH,
         )
+        # Built outside LLMClient, so nothing else names this call's role.
+        provider.trace_role = "router"
         binding = RouterBinding(
             provider=provider,
             model=settings.resolved_gate_model or MINDS_FREE_MODEL,

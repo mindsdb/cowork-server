@@ -851,6 +851,8 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
     assert binding.label == "minds_cloud"
     assert binding.model == "mindshub_air"
     assert type(binding.provider).__name__ == "OpenAIProvider"
+    # anton reports it as the gate call's role, so its tokens sum under router.
+    assert binding.provider.trace_role == "router"
     assert turn_llm == {"correlation_id": minted["corr"], "llm": block}
     # The routing gate's own pre-mint must carry the caller's picked workspace
     # too — this key is what a delegated remote turn ends up reusing as its
