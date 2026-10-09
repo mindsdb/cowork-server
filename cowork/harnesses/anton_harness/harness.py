@@ -1083,9 +1083,8 @@ class AntonHarness:
             + attachment_context
         )
         output_context = (
-            # Artifacts now live in their own visible folder at the
-            # project root (`<base>/artifacts/<slug>/...`), one folder
-            # per output. The agent never picks the folder name itself
+            # Artifacts live under `<base>/.anton/artifacts/<slug>/`, one
+            # folder per output. The agent never picks the folder name itself
             # — it calls `create_artifact` to claim one, then writes
             # files into the absolute path the tool returns. Provenance
             # (which conversation, which turns) is tracked server-side

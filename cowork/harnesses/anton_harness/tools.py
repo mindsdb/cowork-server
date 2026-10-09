@@ -69,13 +69,14 @@ def _access_from_state(entry: dict) -> dict:
 
 
 # Cowork-flavoured description/prompt for the publish_or_preview tool.
-# The CLI-flavoured copies inside anton-core's `tools.py` mention the
-# legacy `.anton/output/` artifacts dir and reference a `/publish`
-# slash command that doesn't exist in antontron — both confuse the
-# LLM in the desktop context, so we override them in `build_cowork_publish_tool`.
+# The CLI-flavoured copies inside anton-core's `tools.py` reference a
+# `/publish` slash command that doesn't exist in antontron, which
+# confuses the LLM in the desktop context, so we override them in
+# `build_cowork_publish_tool`.
 COWORK_PUBLISH_DESCRIPTION = (
-    "Preview, check, or publish an HTML dashboard / report. Files live "
-    "under the project's `artifacts/<artifact-id>/<name>.html`. Actions: "
+    "Preview, check, or publish an HTML dashboard / report. Pass as "
+    "`file_path` the artifact's slug or the absolute path that "
+    "`create_artifact` or `generate_artifact` returned. Actions: "
     "'ask' (default) and 'preview' check whether the file is already "
     "published and return the public URL if so — they DON'T publish; "
     "use them when generating a new file to confirm state. 'publish' "
@@ -323,8 +324,7 @@ def build_cowork_publish_tool():
     can build the session config without paying the import cost twice.
 
     The description and prompt are replaced with cowork-flavoured copy
-    that names the right artifacts path (`artifacts/<id>/<file>.html`,
-    not the legacy `.anton/output/`) and tells the LLM publishing
+    that says what to pass as `file_path` and tells the LLM publishing
     works directly from chat — no slash command, no UI dance. Without
     these overrides the LLM defaults to CLI-era guidance and refuses
     to call `action: 'publish'` even when the user explicitly asked.
