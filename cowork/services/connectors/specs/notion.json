@@ -34,7 +34,7 @@
         "label": "In-Browser Connect",
         "description": "Opens Notion sign-in in your browser through Notion MCP, the same mechanism Claude's own Notion connector uses. No credentials required, just click Connect. Anton can reach whatever you can reach in the workspace you pick.",
         "recommended": true,
-        "hidden": true,
+        "hidden": false,
         "fields": [],
         "oauth": {
           "auth_url": "https://mcp.notion.com/authorize",
@@ -119,5 +119,5 @@
     "logo_url": "logos/notion.svg"
   },
   "logo_url": "logos/notion.svg",
-  "featured": false
+  "featured": true
 }
