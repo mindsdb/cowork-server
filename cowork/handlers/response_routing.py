@@ -628,7 +628,7 @@ async def decide_route(
     except Exception as exc:
         # Provider body fields (including type/code/param) can echo private
         # request content. Only the class and a validated HTTP status are safe.
-        status = exception_http_status(exc)
+        status = exception_http_status(exc=exc)
         logger.warning(
             "[gate] reason=router_unavailable error=%s status=%s",
             type(exc).__name__,

@@ -4,10 +4,11 @@ import io
 import json
 import logging
 import os
-import re
 import subprocess
 import sys
 import textwrap
+import traceback
+import types
 from pathlib import Path
 
 import httpx
@@ -16,10 +17,13 @@ import psycopg.errors
 import psycopg2.errors
 import pytest
 import sqlalchemy as sa
+from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
 
 from cowork.common import logger as app_logger
 from cowork.db import session as db_session
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession
 from tests._uvicorn_harness import Launch, run_uvicorn_app
 from tests.test_db_session_logging import BIND_SECRET, DETAIL_SECRET, SECRETS, SQL_SECRET
 
@@ -152,10 +156,31 @@ def test_other_exception_logs_keep_their_message_and_traceback(
     assert "RuntimeError: ordinary application failure" in logged.output()
 
 
+def _cowork_module(*, name: str, source: str) -> types.ModuleType:
+    """A module inside the cowork package built from ``source``, as a route's service module is."""
+    module = types.ModuleType(name)
+    exec(compile(source, f"<{name}>", "exec"), module.__dict__)
+    return module
+
+
+def _line_of(*, source: str, text: str) -> int:
+    return next(number for number, line in enumerate(source.splitlines(), start=1) if text in line)
+
+
+# The route's statements run in a service module inside the cowork package.
+_DATABASE_FAILURE_SERVICE = f"""
+import sqlalchemy as sa
+
+def insert_twice(session):
+    session.execute(sa.text("CREATE TABLE {SQL_SECRET} ({DETAIL_SECRET} TEXT UNIQUE)"))
+    for _ in range(2):
+        session.execute(sa.text("INSERT INTO {SQL_SECRET} VALUES ('{BIND_SECRET}')"))
+"""
+
 # A route's database error escapes get_session, and Starlette re-raises it to
 # Uvicorn, which logs "Exception in ASGI application" with the whole chain.
 _DATABASE_FAILURE_APP = f"""
-    import sqlalchemy as sa
+    import types
     from fastapi import Depends, FastAPI
     from cowork.common.logger import setup_logging
     from cowork.db.session import get_session
@@ -163,12 +188,12 @@ _DATABASE_FAILURE_APP = f"""
     # cowork.server runs this at import, under every launcher.
     setup_logging()
     app = FastAPI()
+    service = types.ModuleType("cowork.served_service")
+    exec({_DATABASE_FAILURE_SERVICE!r}, service.__dict__)
 
     @app.get("/fail")
     def fail(session=Depends(get_session)):
-        session.execute(sa.text("CREATE TABLE {SQL_SECRET} ({DETAIL_SECRET} TEXT UNIQUE)"))
-        for _ in range(2):
-            session.execute(sa.text("INSERT INTO {SQL_SECRET} VALUES ('{BIND_SECRET}')"))
+        service.insert_twice(session)
 """
 
 
@@ -176,10 +201,13 @@ _DATABASE_FAILURE_APP = f"""
 def test_uvicorns_default_log_config_prints_only_sanitized_database_errors(tmp_path: Path, launch: Launch) -> None:
     run = run_uvicorn_app(tmp_path=tmp_path, app_source=_DATABASE_FAILURE_APP, paths=("/fail",), launch=launch)
     assert run.statuses == (500,)
-    assert re.search(
-        r"Database operation failed: error_type=IntegrityError sqlstate=unknown site=(h11|httptools)_impl\.run_asgi:\d+",
-        run.stderr,
-    ), run.stderr
+    # Uvicorn's request runner logs the error, so the line names the service
+    # frame that ran the failing statement, not the runner.
+    insert_line = _line_of(source=_DATABASE_FAILURE_SERVICE, text="INSERT INTO")
+    assert (
+        "Database operation failed: error_type=IntegrityError sqlstate=unknown "
+        f"site=served_service.insert_twice:{insert_line}\n"
+    ) in run.stderr, run.stderr
     # uvicorn.error keeps its INFO level, so the shutdown line still prints.
     assert "Finished server process" in run.stderr
     assert not any(secret in run.stdout + run.stderr for secret in SECRETS)
@@ -234,7 +262,8 @@ def test_setup_logging_adds_each_uvicorn_filter_once_in_either_configuration_ord
     report = json.loads(result.stdout.splitlines()[-1])
     expected = ["DatabaseErrorFilter", "ProviderErrorFilter"]
     assert report["logger_filters"] == {
-        "uvicorn": expected, "uvicorn.error": expected, "uvicorn.access": expected, "uvicorn.asgi": expected,
+        "uvicorn": expected, "uvicorn.error": expected, "uvicorn.access": [*expected, "AccessQueryFilter"],
+        "uvicorn.asgi": expected,
     }
     assert report["error_level"] == logging.INFO
     if order == "dict_config_first":
@@ -283,14 +312,14 @@ def uvicorn_error_lines(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptu
 async def test_a_database_error_at_startup_leaves_no_database_text_in_uvicorns_log(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, owned_logger, uvicorn_error_lines,
 ) -> None:
-    from cowork import server
+    from cowork import dev_setup, server
 
     database_error = _sql_error()
 
-    def failing_setup() -> None:
+    def failing_migrations(engine, db_uri) -> None:
         raise database_error
 
-    monkeypatch.setattr(server, "run_dev_setup", failing_setup)
+    monkeypatch.setattr(dev_setup, "run_schema_migrations", failing_migrations)
     logged = owned_logger(server.logger.name)
     assert await _start_and_stop(app=server.create_app()) is True
     # Starlette hands Uvicorn the failure as traceback text, which no filter reads.
@@ -302,8 +331,10 @@ async def test_a_database_error_at_startup_leaves_no_database_text_in_uvicorns_l
     assert "Application startup failed. Exiting." in lines
     [record] = [record for record in caplog.records
                 if record.name == server.logger.name and record.levelno == logging.ERROR]
+    # The guard only relays the error, so the line names the deepest cowork
+    # frame it failed in: the migration step, not the guard.
     assert record.getMessage().startswith(
-        "Database operation failed: error_type=IntegrityError sqlstate=unknown site=server._lifespan_without_database_text:"
+        "Database operation failed: error_type=IntegrityError sqlstate=unknown site=dev_setup.run_dev_setup:"
     )
 
 
@@ -341,6 +372,75 @@ async def test_a_startup_error_without_a_database_cause_keeps_its_traceback(
     assert await _start_and_stop(app=server.create_app()) is True
     lines = uvicorn_error_lines()
     assert any(line.rstrip().endswith("PermissionError: ordinary startup failure") for line in lines), lines
+
+
+class _Base(DeclarativeBase):
+    pass
+
+
+class _UniqueRow(_Base):
+    __tablename__ = SQL_SECRET
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    value: Mapped[str] = mapped_column(DETAIL_SECRET, unique=True)
+
+
+# A service that writes through ScopedSession, as cowork's services do.
+_SCOPED_SERVICE = """
+def save_both(session, rows):
+    for row in rows:
+        session.add(row)
+    session.commit()
+"""
+
+
+def _error_through_scoped_session() -> IntegrityError:
+    engine = db_session._create_engine("sqlite://")
+    try:
+        _Base.metadata.create_all(engine)
+        service = _cowork_module(name="cowork.test_service", source=_SCOPED_SERVICE)
+        rows = [_UniqueRow(value=BIND_SECRET), _UniqueRow(value=BIND_SECRET)]
+        with Session(engine) as raw:
+            try:
+                service.save_both(ScopedSession(raw, LOCAL_SCOPE), rows)
+            except IntegrityError as exc:
+                return exc
+        raise AssertionError("the duplicate insert must fail")
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("logged_by", ["outside_cowork", "cowork"])
+def test_the_site_names_the_failing_cowork_frame_only_when_the_logging_call_relays_the_error(
+    logged_by: str, caplog: pytest.LogCaptureFixture, owned_logger,
+) -> None:
+    error = _error_through_scoped_session()
+    traceback_modules = [frame.f_globals.get("__name__") for frame, _ in traceback.walk_tb(error.__traceback__)]
+    assert "cowork.db.scoped" in traceback_modules
+    if logged_by == "outside_cowork":
+        # This test module stands in for Uvicorn's request runner.
+        logged = owned_logger("cowork.test.database_filter.relay")
+        logged.logger.error("Exception in ASGI application", exc_info=error)
+    else:
+        # get_session logs a 5xx's cause from its own line, which names the failure.
+        logged = owned_logger(db_session.logger.name)
+        generator = db_session.get_session()
+        next(generator)
+        try:
+            raise HTTPException(status_code=500) from error
+        except HTTPException as exc:
+            with pytest.raises(HTTPException):
+                generator.throw(exc)
+    [record] = [record for record in caplog.records
+                if record.name == logged.logger.name and record.levelno == logging.ERROR]
+    if logged_by == "outside_cowork":
+        # The deepest cowork frame outside the session plumbing: the service's
+        # commit line, not ScopedSession.commit.
+        site = f"test_service.save_both:{_line_of(source=_SCOPED_SERVICE, text='session.commit()')}"
+    else:
+        site = f"session.get_session:{record.lineno}"
+    assert record.getMessage() == f"Database operation failed: error_type=IntegrityError sqlstate=unknown site={site}"
+    assert not any(secret in logged.output() for secret in SECRETS)
 
 
 def _provider_error() -> openai.BadRequestError:

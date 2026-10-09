@@ -815,9 +815,11 @@ class ProjectService:
             try:
                 self.rollback_project_rename(stage)
             except Exception:
+                # The stage's id: the rollback expired `project`, and reading
+                # its id would query the database again.
                 logger.exception(
                     "Could not fully restore the project after rename staging failed",
-                    extra=log_context(project_id=project.id),
+                    extra=log_context(project_id=stage.project_id),
                 )
             raise
         return stage
@@ -959,9 +961,11 @@ class ProjectService:
                 try:
                     self.rollback_project_rename(stage)
                 except Exception:
+                    # The stage's id: the rollback expired `project`, and
+                    # reading its id would query the database again.
                     logger.exception(
                         "Could not fully restore the project after commit failed",
-                        extra=log_context(project_id=project.id),
+                        extra=log_context(project_id=stage.project_id),
                     )
             raise
 

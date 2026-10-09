@@ -162,6 +162,53 @@ def test_nonprovider_connection_errors_keep_their_traceback(owned_logger, caplog
     assert "ordinary socket failure" in logged.output()
 
 
+# asyncio's default exception handler logs a context that carries no
+# exception, such as a pending task that was garbage collected, with
+# exc_info=False.
+@pytest.mark.parametrize("kind", ["console", "all_file", "error_file"])
+@pytest.mark.parametrize("exc_info", [False, 0])
+def test_a_record_with_a_falsy_exc_info_prints_unchanged(kind, exc_info, owned_logger, caplog):
+    logged = owned_logger("cowork.test.falsy_exc_info", kind=kind)
+    logged.logger.error("Task was destroyed but it is pending!", exc_info=exc_info)
+    (record,) = [r for r in caplog.records if r.name == logged.logger.name and r.levelno == logging.ERROR]
+    assert record.getMessage() == "Task was destroyed but it is pending!"
+    assert record.exc_info is exc_info
+    assert "Task was destroyed but it is pending!" in logged.output()
+
+
+def test_asyncios_message_for_a_context_without_an_exception_survives_setup_logging(tmp_path):
+    program = textwrap.dedent("""
+        import asyncio
+        from cowork.common.logger import setup_logging
+        setup_logging()
+        loop = asyncio.new_event_loop()
+        try:
+            loop.call_exception_handler({"message": "Task was destroyed but it is pending!"})
+        finally:
+            loop.close()
+    """)
+    result = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True,
+                            env={**os.environ, "COWORK_HOME": str(tmp_path), "DATABASE_URI": "sqlite://",
+                                 "LOG_LEVEL": "WARNING", "RICH_LOGGING": "false"}, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert "[ERROR] asyncio: Task was destroyed but it is pending!" in result.stdout, result.stdout + result.stderr
+    assert "Exception in default exception handler" not in result.stdout + result.stderr
+
+
+def test_importing_the_logger_loads_neither_provider_sdk(tmp_path):
+    # cowork-code-runtime reaches the logger through cowork.db.session and
+    # never calls a provider, so it must not pay for loading both SDKs.
+    program = textwrap.dedent("""
+        import json, sys
+        import cowork.common.logger
+        print(json.dumps(sorted({"openai", "anthropic"} & set(sys.modules))))
+    """)
+    result = subprocess.run([sys.executable, "-c", program], capture_output=True, text=True,
+                            env={**os.environ, "COWORK_HOME": str(tmp_path), "DATABASE_URI": "sqlite://"}, timeout=60)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.splitlines()[-1]) == []
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["build", "turn"])
 @pytest.mark.parametrize("provider", ["openai", "anthropic"])

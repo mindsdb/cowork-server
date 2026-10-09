@@ -40,12 +40,11 @@ def _assert_safe_database_log(caplog, logged, error_type, level, *, project_id, 
     assert len(records) == 1
     record = records[0]
     assert record.levelno == level
-    site = ("artifact_owner_backfill", "_backfill_project", record.lineno)
+    site = f"artifact_owner_backfill._backfill_project:{record.lineno}"
     assert record.getMessage() == (
-        f"Database operation failed: error_type={error_type} sqlstate=unknown "
-        f"site=artifact_owner_backfill._backfill_project:{record.lineno}"
+        f"Database operation failed: error_type={error_type} sqlstate=unknown site={site}"
     )
-    assert record.args == (error_type, "unknown", *site)
+    assert record.args == (error_type, "unknown", site)
     # The project and slug the message used to carry travel as attributes.
     assert (record.project_id, record.artifact_slug) == (str(project_id), slug)
     assert record.exc_info is None and record.exc_text is None

@@ -79,8 +79,7 @@ TURN_SHUTDOWN_GRACE_SECONDS = 5
 class TurnInProgress(Exception):
     """A conversation already has a turn answering, so a new question is refused.
 
-    The app answers it with 409 (cowork.server). ``status_code`` marks it as
-    an expected refusal for code that logs by status (cowork.db.session).
+    The app answers it with 409 (cowork.server), which reads ``status_code``.
     """
 
     status_code = 409

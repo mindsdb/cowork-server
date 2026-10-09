@@ -19,6 +19,7 @@ from cowork.build_info import KEY_ANTON_VERSION, account_ids, build_trace_metada
 from cowork.handlers.turn_errors import (
     RESET_AT_CODES,
     WORKER_UNRESPONSIVE_TYPE_NAME,
+    remote_error_label,
     remote_turn_error,
 )
 from cowork.services.providers import minds_chat_base_url
@@ -707,8 +708,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                     if reset_at is not None:
                         data["reset_at"] = reset_at
                     logger.warning(
-                        "Remote turn failed conversation=%s correlation_id=%s error=%s",
-                        conversation_id, corr, data.get("error"),
+                        "Remote turn failed conversation=%s correlation_id=%s error_type=%s error_code=%s",
+                        conversation_id, corr, remote_error_label(error=data.get("error")), code,
                     )
                 if kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill",
                             "turn_history", "turn_compaction", "turn_completed", "turn_failed"):

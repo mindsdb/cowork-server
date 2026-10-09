@@ -26,7 +26,7 @@ from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.streaming import TurnInProgress
-from cowork.common.logger import find_database_error, setup_logging
+from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.dev_setup import run_dev_setup
@@ -268,8 +268,8 @@ async def _lifespan_without_database_text(app: FastAPI):
     message, which no exception filter can read. A migration, the seed rows,
     or a reboot that starts Cowork before Postgres would print SQL and driver
     detail on every restart. The owned handlers log the error instead, as its
-    type, SQLSTATE and call site, and Uvicorn gets an error that carries no
-    database text.
+    type, SQLSTATE and the cowork frame it failed in, and Uvicorn gets an
+    error that carries no database text.
     """
     phase = "startup"
     try:
@@ -279,7 +279,7 @@ async def _lifespan_without_database_text(app: FastAPI):
     except Exception as exc:
         if find_database_error(exc=exc) is None:
             raise
-        logger.error("Server %s failed", phase, exc_info=True)
+        logger.error("Server %s failed", phase, exc_info=True, extra=relayed_error())
         raise RuntimeError(f"Database operation failed during server {phase}") from None
 
 

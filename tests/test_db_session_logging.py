@@ -216,7 +216,11 @@ def test_a_5xx_http_exception_logs_its_status_and_cause_but_not_its_detail(
     assert not any(secret in repr(record.__dict__) for secret in SECRETS)
 
 
+# A 4xx on an error that is not an HTTPException, such as a provider SDK's
+# BadRequestError, is not the endpoint's answer, so it is no expected refusal.
+@pytest.mark.parametrize("status", [400, 404, 502])
 def test_an_error_with_a_status_that_is_not_an_http_exception_logs_only_its_type(
+    status: int,
     database_uri: str,
     caplog: pytest.LogCaptureFixture,
     owned_logger,
@@ -224,9 +228,9 @@ def test_an_error_with_a_status_that_is_not_an_http_exception_logs_only_its_type
     # Starlette re-raises it to Uvicorn, which logs the whole chain through
     # the filters, so the session line names only the type.
     class UpstreamFailure(Exception):
-        status_code = 502
+        status_code = status
 
-    logged = owned_logger(db_session.logger.name)
+    logged = owned_logger(db_session.logger.name, level=logging.DEBUG)
     generator = db_session.get_session()
     next(generator)
     exc = UpstreamFailure(" ".join(SECRETS))
@@ -234,6 +238,8 @@ def test_an_error_with_a_status_that_is_not_an_http_exception_logs_only_its_type
     with pytest.raises(UpstreamFailure) as raised:
         generator.throw(exc)
     assert raised.value is exc
+    assert db_session._is_expected_refusal(exc) is False
+    assert not [record for record in _records(caplog, logging.DEBUG) if "expected refusal" in record.getMessage()]
     [record] = _records(caplog, logging.ERROR)
     assert record.getMessage() == "Session error: error_type=UpstreamFailure"
     _assert_safe([record])

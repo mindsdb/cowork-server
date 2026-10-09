@@ -842,7 +842,7 @@ async def delete_artifact_for_request(
         logger.warning(
             "Could not drop the owner of a deleted artifact",
             exc_info=True,
-            extra=log_context(artifact_slug=folder_name),
+            extra=log_context(project_id=source.project_id, artifact_slug=folder_name),
         )
 
 

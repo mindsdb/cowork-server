@@ -224,18 +224,29 @@ class TaskObjectService:
         # commit a half-applied batch of index rows along with it.
         if rekeys:
             actor = str(self.session.scope.user_id or creator)
+            # Plain values: a failed rekey commit expires every loaded row,
+            # and reading one back needs the session the failure broke.
+            dest_id, dest_name, conversation_id = dest.id, dest.name, conversation.id
             for old_slug, new_slug in rekeys:
                 try:
                     rekey_artifact_owner(
-                        self.session, src_root, old_slug, dest.id, new_slug, actor_id=actor
+                        self.session, src_root, old_slug, dest_id, new_slug, actor_id=actor
                     )
                 except Exception:
+                    # The record names the folder at its new address: a name
+                    # collision gives it a new slug in the destination.
                     logger.warning(
-                        "Could not move the owner of an artifact to project %r",
-                        dest.name,
+                        "Could not move the owner of artifact %r to project %r",
+                        old_slug,
+                        dest_name,
                         exc_info=True,
-                        extra=log_context(project_id=dest.id, artifact_slug=old_slug),
+                        extra=log_context(
+                            project_id=dest_id, conversation_id=conversation_id, artifact_slug=new_slug,
+                        ),
                     )
+                    # The next rekey and the caller's own writes need a
+                    # usable session.
+                    self.session.rollback()
         return moved
 
     @staticmethod
@@ -408,7 +419,11 @@ def _index_new_slugs(
                 creator=getattr(conversation, "created_by", None),
             )
     except Exception:
-        logger.warning("Could not index artifacts created this turn", exc_info=True)
+        logger.warning(
+            "Could not index artifacts created this turn",
+            exc_info=True,
+            extra=log_context(conversation_id=conversation_id, project_id=project_id, artifact_slugs=slugs or None),
+        )
 
 
 @dataclass(frozen=True)

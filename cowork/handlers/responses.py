@@ -91,6 +91,7 @@ from cowork.handlers.turn_errors import (
     gate_reset_at,
     model_unavailable_info,
     provider_overloaded_info,
+    remote_error_label,
     response_failed_payload,
     retry_after_seconds,
     retry_at_instant,
@@ -2050,7 +2051,7 @@ class ResponsesHandler:
             # or support has nothing to search for.
             logger.warning(
                 "[responses] remote turn reported a failure for conversation %s "
-                "correlation_id=%s code=%s", conv_id, corr, code,
+                "correlation_id=%s error_code=%s", conv_id, corr, code,
                 extra={"request_id": corr},
             )
             # The producer keeps `reset_at` only for RESET_AT_CODES and only as
@@ -2078,10 +2079,13 @@ class ResponsesHandler:
                                 lambda session: ConversationService(session).repair_image_content(conv_id),
                                 scope=scope,
                             )
+                        # A fixed label and the code only: the pod's error
+                        # text can quote the provider.
                         logger.warning(
-                            "[responses] content validation error on remote conversation %s — "
-                            "repaired %d message(s) with image content: %s",
-                            conv_id, len(repaired), failure.get("error"),
+                            "[responses] content validation error; "
+                            "repaired %d message(s) with image content: error_type=%s error_code=%s",
+                            len(repaired), remote_error_label(error=failure.get("error")), code,
+                            extra=log_context(request_id=corr, conversation_id=conv_id),
                         )
                     except Exception:
                         logger.exception(

@@ -19,12 +19,15 @@ _session_factories = {}
 
 
 def _is_expected_refusal(exc: BaseException) -> bool:
-    """True for an answer the request was meant to get: a 4xx, or the 503 for a
-    pool that freed no connection in time (cowork.server answers it)."""
+    """True for an answer the request was meant to get: a 4xx HTTPException, or
+    the 503 for a pool that freed no connection in time (cowork.server answers
+    it). Another error's status_code, such as a provider SDK's, is not one."""
     if isinstance(exc, PoolTimeoutError):
         return True
-    status = getattr(exc, "status_code", None)
-    return isinstance(status, int) and 400 <= status < 500
+    if not isinstance(exc, HTTPException):
+        return False
+    status = exc.status_code
+    return type(status) is int and 400 <= status < 500
 
 def _create_engine(db_uri: str):
     is_sqlite = db_uri.startswith("sqlite")

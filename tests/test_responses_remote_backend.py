@@ -1417,6 +1417,49 @@ async def test_produce_remote_failure_frame_and_log_both_carry_the_request_id(mo
 
 
 @pytest.mark.asyncio
+async def test_a_remote_content_repair_logs_the_mapped_type_and_code_never_the_pods_text(monkeypatch, caplog):
+    """The pod's error string quotes the provider. The repair line names the
+    mapped type and the classified code, and every line names the code as
+    error_code=, which the self-hosted archive does not mask."""
+    from cowork.handlers.turn_errors import CONTENT_TOO_LARGE_CODE
+
+    sentinel = "SECRET-PROMPT-TEXT"
+    handler = _remote_handler(monkeypatch, {})
+    _no_workspace_or_memory_units(monkeypatch)
+    monkeypatch.setattr(
+        responses_mod.ConversationService, "repair_image_content",
+        lambda self, conv_id: ["message-1"], raising=False,
+    )
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_failed", {
+            "error": f"ContentTooLargeError: The image is too large. The provider said: {sentinel}",
+            "code": CONTENT_TOO_LARGE_CODE, "message": "The image is too large.",
+        }
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    conv_id = uuid4()
+    with caplog.at_level(logging.WARNING, logger=responses_mod.logger.name):
+        await handler._produce_remote(
+            conv_id=conv_id, input_text="hi", original_content="hi",
+            model="anton", harness_id="anton", buffer=_RecBuffer(),
+            turn_llm={"correlation_id": "corr-repair"},
+        )
+
+    records = [r for r in caplog.records if r.name == responses_mod.logger.name]
+    [repair] = [r for r in records if r.levelno == logging.WARNING and "repaired" in r.getMessage()]
+    assert repair.getMessage() == (
+        "[responses] content validation error; repaired 1 message(s) with image content: "
+        "error_type=ContentTooLargeError error_code=content_too_large"
+    )
+    assert (repair.request_id, repair.conversation_id) == ("corr-repair", str(conv_id))
+    for record in records:
+        assert sentinel not in repr(record.__dict__)
+        assert " code=" not in record.getMessage()
+
+
+@pytest.mark.asyncio
 async def test_produce_remote_unclassified_crash_still_carries_a_request_id(monkeypatch):
     # A crash in cowork-server's OWN consumption of the reply stream (a bug in
     # the formatter, a dropped Redis connection) never goes through

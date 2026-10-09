@@ -5,6 +5,7 @@ import logging.handlers
 import os
 import re
 import sys
+import traceback
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,12 +13,7 @@ from sqlite3 import Error as SQLiteError
 from typing import Any
 from uuid import UUID
 
-# cowork-server does not declare anthropic or openai itself: both arrive as
-# anton-agent dependencies, so an anton-agent release that drops either one
-# breaks this import.
-from anthropic import AnthropicError
 from anton.core.llm.provider import CURATED_PROVIDER_ERRORS
-from openai import OpenAIError
 from psycopg import Error as PsycopgError
 from psycopg2 import Error as Psycopg2Error
 from sqlalchemy.exc import SQLAlchemyError, StatementError
@@ -40,9 +36,16 @@ except ImportError:
 
 _DATABASE_ERROR_TYPES = (SQLAlchemyError, SQLiteError, PsycopgError, Psycopg2Error)
 
-# The SDK base classes, not only their APIError: an OpenAIError such as
-# LengthFinishReasonError carries provider text without being an APIError.
-_PROVIDER_ERROR_TYPES = (OpenAIError, AnthropicError, *CURATED_PROVIDER_ERRORS)
+# The cowork package directory. A logging call whose file is outside it, such
+# as Uvicorn's request runner, only relays the error it logs.
+_COWORK_DIR = os.path.dirname(os.path.dirname(__file__)) + os.sep
+
+# Session and unit-of-work wrappers that every query passes through. Their
+# frames name the wrapper, never the code that ran the query.
+_DATABASE_PLUMBING_MODULES = frozenset({"cowork.db.scoped", "cowork.db.session", "cowork.db.units"})
+
+# The record attribute relayed_error() sets.
+_RELAYS_ERROR = "relays_error"
 
 
 def _exception_chain(*, exc: BaseException) -> Iterator[BaseException]:
@@ -77,7 +80,8 @@ def find_database_error(*, exc: BaseException) -> SQLAlchemyError | SQLiteError 
 def _exception_candidates(*, record: logging.LogRecord) -> list[BaseException]:
     """The exceptions a record carries: its exc_info, then its message, then its arguments."""
     candidates: list[BaseException] = []
-    if record.exc_info is not None and record.exc_info[1] is not None:
+    # asyncio logs a context without an exception with exc_info=False.
+    if record.exc_info and record.exc_info[1] is not None:
         candidates.append(record.exc_info[1])
     if isinstance(record.msg, BaseException):
         candidates.append(record.msg)
@@ -101,6 +105,34 @@ def _replace_record(*, record: logging.LogRecord, msg: str, args: tuple[object, 
     record.stack_info = None
 
 
+def relayed_error() -> dict[str, bool]:
+    """The ``extra=`` for a logging call that only relays an error raised elsewhere.
+
+    The database line then names where the error failed, as it does for a
+    logging call outside cowork, instead of the relaying call.
+    """
+    return {_RELAYS_ERROR: True}
+
+
+def _failure_site(*, record: logging.LogRecord, error: BaseException) -> str:
+    """Where a database error failed, as ``<module>.<function>:<line>``.
+
+    That is the logging call, unless the call is outside cowork (Uvicorn's
+    request runner) or marked with relayed_error(). Then it is the deepest
+    frame of the error's own traceback in a cowork module outside the session
+    plumbing, or still the logging call when there is none. walk_tb reads only
+    each frame's module, function and line, never its source or locals.
+    """
+    site = f"{record.module}.{record.funcName}:{record.lineno}"
+    if record.pathname.startswith(_COWORK_DIR) and not getattr(record, _RELAYS_ERROR, False):
+        return site
+    for frame, lineno in traceback.walk_tb(error.__traceback__):
+        module = frame.f_globals.get("__name__", "")
+        if module.startswith("cowork.") and module not in _DATABASE_PLUMBING_MODULES:
+            site = f"{module.rsplit('.', 1)[-1]}.{frame.f_code.co_name}:{lineno}"
+    return site
+
+
 class DatabaseErrorFilter(logging.Filter):
     """Replace database exception records before a handler formats them.
 
@@ -108,9 +140,9 @@ class DatabaseErrorFilter(logging.Filter):
     driver error details or a caller that already interpolated the exception
     into its message. Replace the entire message and clear the traceback;
     the propagated exception and any response built from it stay unchanged.
-    The replacement names the call site from the record's own code location.
-    A caller's ids travel as record attributes (see CustomFormatter), which
-    this filter leaves alone.
+    The replacement names the call site (see _failure_site). A caller's ids
+    travel as record attributes (see CustomFormatter), which this filter
+    leaves alone.
     """
 
     def filter(self, record: logging.LogRecord) -> bool:
@@ -125,26 +157,50 @@ class DatabaseErrorFilter(logging.Filter):
                 sqlstate = "unknown"
             _replace_record(
                 record=record,
-                msg="Database operation failed: error_type=%s sqlstate=%s site=%s.%s:%s",
-                args=(type(error).__name__, sqlstate, record.module, record.funcName, record.lineno),
+                msg="Database operation failed: error_type=%s sqlstate=%s site=%s",
+                args=(type(error).__name__, sqlstate, _failure_site(record=record, error=error)),
             )
             break
         return True
 
 
-def exception_http_status(exc: BaseException) -> int | None:
+def _own_http_status(*, error: BaseException) -> int | None:
+    """``error``'s own ``status_code`` when it is an actual HTTP status, else None.
+
+    Only an exact int counts: an int subclass can render any text.
+    """
+    status = getattr(error, "status_code", None)
+    return status if type(status) is int and 100 <= status <= 599 else None
+
+
+def exception_http_status(*, exc: BaseException) -> int | None:
     """Return an actual HTTP status, never a provider body field coerced to text."""
     for error in _exception_chain(exc=exc):
-        status = getattr(error, "status_code", None)
-        if type(status) is int and 100 <= status <= 599:
+        status = _own_http_status(error=error)
+        if status is not None:
             return status
     return None
 
 
 def _provider_status(*, error: BaseException) -> int | str:
     """The provider error's own HTTP status, or ``unknown`` when it has no real one."""
-    status = getattr(error, "status_code", None)
-    return status if type(status) is int and 100 <= status <= 599 else "unknown"
+    status = _own_http_status(error=error)
+    return "unknown" if status is None else status
+
+
+def _provider_error(*, exc: BaseException) -> BaseException | None:
+    """The first provider error in ``exc``'s chain, found by type alone."""
+    # Imported on first use, not with this module: the two SDKs take most of
+    # a second to load, and a process such as cowork-code-runtime otherwise
+    # never loads them. cowork-server does not declare anthropic or openai
+    # itself: both arrive as anton-agent dependencies.
+    from anthropic import AnthropicError
+    from openai import OpenAIError
+
+    # The SDK base classes, not only their APIError: an OpenAIError such as
+    # LengthFinishReasonError carries provider text without being an APIError.
+    provider_types = (OpenAIError, AnthropicError, *CURATED_PROVIDER_ERRORS)
+    return next((error for error in _exception_chain(exc=exc) if isinstance(error, provider_types)), None)
 
 
 class ProviderErrorFilter(logging.Filter):
@@ -162,9 +218,7 @@ class ProviderErrorFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         for exc in _exception_candidates(record=record):
-            provider_error = next(
-                (error for error in _exception_chain(exc=exc) if isinstance(error, _PROVIDER_ERROR_TYPES)), None,
-            )
+            provider_error = _provider_error(exc=exc)
             if provider_error is None:
                 continue
             _replace_record(
@@ -181,6 +235,24 @@ def _add_privacy_filters(*, target: logging.Filterer) -> None:
     for filter_type in (DatabaseErrorFilter, ProviderErrorFilter):
         if not any(isinstance(existing, filter_type) for existing in target.filters):
             target.addFilter(filter_type())
+
+
+class AccessQueryFilter(logging.Filter):
+    """Keep the path and redact the query in Uvicorn's access line.
+
+    Uvicorn logs each request at INFO, whatever LOG_LEVEL says, with the
+    arguments (client, method, path?query, HTTP version, status). A query can
+    carry an OAuth callback's code or a webhook's verify token. Uvicorn
+    percent-encodes a ``?`` inside the path, so the first one starts the query.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
+            path, separator, _ = args[2].partition("?")
+            if separator:
+                record.args = (args[0], args[1], f"{path}?[redacted]", args[3], args[4])
+        return True
 
 
 class EventLoopClosedFilter(logging.Filter):
@@ -472,6 +544,12 @@ def setup_logging():
         _add_privacy_filters(target=uvicorn_logger)
         for handler in uvicorn_logger.handlers:
             _add_privacy_filters(target=handler)
+
+    # Uvicorn logs access lines straight to `uvicorn.access`, so its logger
+    # filter sees every one.
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(existing, AccessQueryFilter) for existing in access_logger.filters):
+        access_logger.addFilter(AccessQueryFilter())
 
     # Suppress verbose logging from third-party libraries
     third_party_loggers = [

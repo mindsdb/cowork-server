@@ -613,7 +613,13 @@ class AntonHarness:
                         scope=turn_scope,
                     )
             except Exception:
-                logger.warning("Could not index artifacts created this turn", exc_info=True)
+                logger.warning(
+                    "Could not index artifacts created this turn",
+                    exc_info=True,
+                    extra=log_context(
+                        conversation_id=conv_id, project_id=conv_project_id, artifact_slugs=new_slugs or None,
+                    ),
+                )
             skill_drafts = finalize_turn_skill_drafts(project_path, before_drafts, before_strays)
 
         try:
