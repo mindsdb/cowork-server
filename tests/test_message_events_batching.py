@@ -302,3 +302,74 @@ def test_replay_events_filter_compiles_to_json_operators(session, conversation):
 
     assert "->>" in str(stmt.compile(dialect=postgresql.dialect()))
     assert "JSON_EXTRACT" in str(stmt.compile(dialect=sqlite.dialect()))
+
+
+def _text_delta(text: str, seq: int) -> dict:
+    return {"type": "response.output_text.delta", "sequence_number": seq, "item_id": "msg-1", "delta": text,
+            "at_ms": 1000 + seq}
+
+
+def _joined_deltas(events: list[dict]) -> str:
+    return "".join(e["delta"] for e in events if e["type"] == "response.output_text.delta")
+
+
+def test_a_saved_turn_stores_each_run_of_text_deltas_as_one_row(session, conversation):
+    events = [
+        {"type": "response.created", "sequence_number": 0},
+        _text_delta("Let", 1), _text_delta(" me", 2), _text_delta(" check.", 3),
+        _scratchpad_event("start", "scratchpad"), _exec_end(), _result("x = 1"),
+        _text_delta("Done", 7), _text_delta(".", 8),
+        {"type": "response.completed", "sequence_number": 9},
+    ]
+    service = ConversationService(session)
+    service.save_user_message(conversation.id, "q")
+
+    saved = service.save_assistant_turn(conversation.id, "Let me check.Done.", events)
+
+    rows = session.exec(
+        session.select(MessageEvent).where(MessageEvent.message_id == saved.id).order_by(MessageEvent.sequence_number)
+    ).all()
+    assert [row.sequence_number for row in rows] == list(range(7))
+    stored = [row.event_data for row in rows]
+    assert [e.get("delta") for e in stored if e["type"] == "response.output_text.delta"] == ["Let me check.", "Done."]
+    (answer,) = [item for item in service.get_messages(conversation.id) if item["role"] == "assistant"]
+    page = service.get_messages_page(conversation.id, limit=10).items
+    assert answer["events"] == stored == page[-1]["events"]
+    assert _joined_deltas(answer["events"]) == _joined_deltas(events)
+
+
+def test_a_history_mixing_per_delta_and_merged_answers_reads_back_in_order(session, conversation):
+    """Answers saved before the merge keep a row per delta, and both kinds
+    read back alike."""
+    _add_message(session, conversation, role=Role.user, content="q0", seq=0, events=[])
+    _add_message(
+        session, conversation, role=Role.assistant, content="abc", seq=1,
+        events=[_text_delta("a", 1), _text_delta("b", 2), _text_delta("c", 3)],
+    )
+    service = ConversationService(session)
+    service.save_user_message(conversation.id, "q1")
+    service.save_assistant_turn(
+        conversation.id, "def", [_text_delta("d", 1), _text_delta("e", 2), _text_delta("f", 3), {"type": "response.completed"}],
+    )
+
+    for items in (service.get_messages(conversation.id), service.get_messages_page(conversation.id, limit=10).items):
+        answers = [item for item in items if item["role"] == "assistant"]
+        assert [a["content"] for a in answers] == ["abc", "def"]
+        assert [len(a["events"]) for a in answers] == [3, 2]
+        assert [_joined_deltas(a["events"]) for a in answers] == ["abc", "def"]
+
+
+def test_merged_deltas_rebuild_the_same_scratchpad_cells(session, conversation):
+    events = [
+        _text_delta("a", 1), _exec_end(), _text_delta("b", 3), _text_delta("c", 4), _result("first"),
+        _text_delta("d", 6), _scratchpad_event("end", {"action": "reset"}), _text_delta("e", 8),
+        _exec_end(), _result("second"), _text_delta("f", 11), _text_delta("g", 12),
+    ]
+    service = ConversationService(session)
+    service.save_user_message(conversation.id, "q")
+    service.save_assistant_turn(conversation.id, "abcdefg", events)
+
+    history = service.get_replay_history(conversation.id, event_roles=SCRATCHPAD_REPLAY_ROLES)
+
+    assert extract_scratchpad_cells(history.events) == extract_scratchpad_cells(events)
+    assert [c.code for c in extract_scratchpad_cells(history.events)] == ["second"]

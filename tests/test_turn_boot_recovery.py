@@ -282,3 +282,24 @@ def test_a_turn_numbered_by_the_row_count_recovers_its_own_question(svc, conv, s
     assert messages[turn_id].id == question.id and not messages[turn_id].pending
     assert messages[turn_id + 1].content == "second answer"
     assert [m.content for m in messages if m.pending] == ["stranded"]
+
+
+def test_recovery_appends_its_terminal_after_merged_deltas(svc, conv, session, tmp_path):
+    """An answer saved with merged deltas has fewer event rows than frames, and
+    the recovered terminal still lands right after them."""
+    svc.save_user_message(conv.id, "hello", pending=True)
+    deltas = [
+        {"type": "response.output_text.delta", "sequence_number": seq, "item_id": "m", "delta": text}
+        for seq, text in enumerate(("Hi", " there", "!"), start=1)
+    ]
+    reply = svc.save_assistant_turn(conv.id, "Hi there!", [{"type": "response.created"}, *deltas])
+    _write_orphan_buffer(tmp_path, conv.id, 0, [CREATED, *(DELTA.format(d["delta"]) for d in deltas)])
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+
+    assert seal_orphan_turns_in_history(scoped, tmp_path) == 1
+    assert seal_orphan_turns_in_history(scoped, tmp_path) == 0
+    events = sorted(_events_for(session, reply.id), key=lambda e: e.sequence_number)
+    assert [e.sequence_number for e in events] == [0, 1, 2]
+    assert [e.event_data["type"] for e in events] == [
+        "response.created", "response.output_text.delta", "response.failed",
+    ]

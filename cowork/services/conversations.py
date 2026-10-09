@@ -31,6 +31,7 @@ from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.schedules import ScheduleService
 from cowork.services.scratchpad_sessions import remove_conversation_sessions
 from cowork.services.task_objects import TaskObjectService
+from cowork.streaming.answer_text import coalesce_text_deltas
 
 # Defaults/bounds for GET /conversations/{id}/items's opt-in pagination
 # (see get_messages_page). Omitting both limit and before keeps the route's
@@ -895,6 +896,9 @@ class ConversationService:
         one commit (hence one `created_at`); `seq` fixes their order, since the
         role tiebreak in _MESSAGE_ORDER would otherwise sort tool_result (user)
         ahead of tool_use (assistant). Hidden from the UI by `get_messages`.
+
+        `events` are stored with each run of adjacent plain text deltas merged
+        into one row (coalesce_text_deltas); the live stream stays per delta.
         """
         # Persist when there's body text OR any events — an artifact-only turn
         # (the agent writes a file and says little/nothing) carries no text but
@@ -929,7 +933,7 @@ class ConversationService:
         # Flush for foreign-key ordering, but commit the text and its events
         # together: a crash must not leave an answer without its failure marker.
         self.session.flush()
-        for event_seq, event_data in enumerate(events):
+        for event_seq, event_data in enumerate(coalesce_text_deltas(events)):
             self.session.add(
                 MessageEvent(
                     message_id=assistant_msg.id,
