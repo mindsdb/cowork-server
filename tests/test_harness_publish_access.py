@@ -212,10 +212,19 @@ async def test_publish_by_short_path_hands_the_service_the_absolute_artifact_pat
         "artifacts/../.anton/memory",
         "artifacts/no-such-slug",
         "artifacts/escape",
+        "artifacts/escape/notes.md",
         "x\x00y",
         "a" * 300,
     ],
-    ids=["dotdot", "dotdot-into-anton", "missing", "symlink-escape", "nul", "too-long"],
+    ids=[
+        "dotdot",
+        "dotdot-into-anton",
+        "missing",
+        "symlink-escape",
+        "symlink-escape-file",
+        "nul",
+        "too-long",
+    ],
 )
 async def test_unmatched_path_gets_a_not_found_reply_and_publishes_nothing(project, raw, action):
     base, _, memory = project
@@ -247,6 +256,7 @@ async def test_not_found_reply_shortens_a_long_path(project):
     text = _text(out)
     assert "…" in text
     assert "a" * 201 not in text
+    assert repr("a" * 200 + "…") in text
 
 
 def test_publish_description_says_what_to_pass_not_where_artifacts_live():

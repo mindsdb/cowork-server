@@ -69,10 +69,10 @@ def _access_from_state(entry: dict) -> dict:
 
 
 # Cowork-flavoured description/prompt for the publish_or_preview tool.
-# The CLI-flavoured copies inside anton-core's `tools.py` reference a
-# `/publish` slash command that doesn't exist in antontron, which
-# confuses the LLM in the desktop context, so we override them in
-# `build_cowork_publish_tool`.
+# The CLI-flavoured copies inside anton-core's `tools.py` describe the
+# interactive CLI flow ('ask' prompts the user, 'preview' opens a
+# browser), which doesn't exist in the desktop process and confuses the
+# LLM there, so we override them in `build_cowork_publish_tool`.
 COWORK_PUBLISH_DESCRIPTION = (
     "Preview, check, or publish an HTML dashboard / report. Pass as "
     "`file_path` the artifact's slug or the absolute path that "
@@ -129,9 +129,10 @@ def _resolve_publish_path(session: Any, raw_path: str) -> Path | None:
 
     A relative path is looked up in the session project's artifacts folder
     first (`<slug>`, `<slug>/<file>`, `artifacts/<slug>/...`), then under the
-    project folder, where `.anton/artifacts/<slug>` resolves. `..` is refused
-    on both: resolving collapses it even through a missing folder, so
-    `artifacts/../.anton/memory` would otherwise land in `.anton/memory`.
+    project folder, where `.anton/artifacts/<slug>` resolves. `..` in a
+    relative path is refused: resolving collapses it even through a missing
+    folder, so `artifacts/../.anton/memory` would otherwise land in
+    `.anton/memory`.
     """
     from cowork.services.artifacts import _candidate_relative_artifacts
 
