@@ -12,7 +12,7 @@ from anton.core.datasources.data_vault import LocalDataVault
 from fastapi import HTTPException
 
 from cowork.api.v1.endpoints.connectors.submissions import submit_form
-from cowork.db.scoped import LOCAL_SCOPE
+from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError
 from cowork.harnesses.anton_harness.tools import _cowork_request_credentials
 from cowork.schemas.connectors import SubmitFormRequest
 from cowork.services.connectors.persist import ConnectionNotFoundError, persist_connection
@@ -125,9 +125,18 @@ class TestSubmitEndpointExtends:
         assert staged == []
 
 
+@pytest.fixture
+def saved_linkedin(tmp_path, monkeypatch):
+    """A vault holding the connection a follow-up step extends, as the tool sees it."""
+    vault = LocalDataVault(Path(tmp_path) / "tool-vault")
+    vault.save("linkedin", "linkedin-1a2b3c4d", {"client_id": "c"}, secure_keys=[])
+    monkeypatch.setattr("cowork.harnesses.anton_harness.tools.vault_for_scope", lambda scope: vault)
+    return vault
+
+
 class TestRequestCredentialsExtends:
     @pytest.mark.asyncio
-    async def test_extends_connection_is_stamped_for_the_renderer_and_server(self):
+    async def test_extends_connection_is_stamped_for_the_renderer_and_server(self, saved_linkedin):
         result = await _cowork_request_credentials(
             session=None,
             tc_input={"engine": "linkedin", "title": "Finish", "extends_connection": "linkedin-1a2b3c4d"},
@@ -135,6 +144,27 @@ class TestRequestCredentialsExtends:
         assert '"_extends_connection": "linkedin-1a2b3c4d"' in result
         assert '"_existing_name": "linkedin-1a2b3c4d"' in result
         assert '"extends_connection"' not in result
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_connection_is_refused_before_the_form_renders(self, saved_linkedin):
+        result = await _cowork_request_credentials(
+            session=None,
+            tc_input={"engine": "linkedin", "title": "Finish", "extends_connection": "linkedin-deadbeef"},
+        )
+        assert "data-vault-form" not in result
+        assert "linkedin-deadbeef" in result
+
+    @pytest.mark.asyncio
+    async def test_without_a_tenant_scope_the_form_renders_and_submit_checks(self, monkeypatch):
+        def no_scope(scope):
+            raise MissingTenantScopeError("no org in scope")
+
+        monkeypatch.setattr("cowork.harnesses.anton_harness.tools.vault_for_scope", no_scope)
+        result = await _cowork_request_credentials(
+            session=None,
+            tc_input={"engine": "linkedin", "title": "Finish", "extends_connection": "linkedin-1a2b3c4d"},
+        )
+        assert "data-vault-form" in result
 
     @pytest.mark.asyncio
     async def test_blank_extends_connection_is_refused(self):
