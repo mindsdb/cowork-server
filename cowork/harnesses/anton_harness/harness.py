@@ -27,6 +27,7 @@ from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
+from cowork.services.connectors.notion_pages import describe_project_pages
 from cowork.services.projects import display_label
 from cowork.streaming.liveness import ModelWaitTicker
 
@@ -1226,6 +1227,10 @@ class AntonHarness:
                         "includeItemsFromAllDrives=true and supportsAllDrives=true, that already correctly "
                         "surfaces every file this app can legitimately see, Shared Drive items included."
                     )
+
+                integration_guidance += describe_project_pages(
+                    service.picked_files_by_project(data_vault, conversation.project.name, engine="notion")
+                )
 
             cells = extract_scratchpad_cells_from_message_events(ordered_messages)
             os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"

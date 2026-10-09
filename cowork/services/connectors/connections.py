@@ -78,6 +78,15 @@ class ConnectionsService:
             ))
         return result
 
+    def mcp_access_token(self, engine: str, name: str) -> str | None:
+        """The stored access token of an MCP-method connection, for a server-side
+        tool call on the user's behalf; None for any other connection."""
+        record = self._read_record(self._vault(), engine, name)
+        fields = (record or {}).get("fields") or {}
+        if fields.get("_method") != "mcp":
+            return None
+        return fields.get("access_token") or None
+
     def get(self, engine: str, name: str) -> ConnectionDetailResponse | None:
         vault = self._vault()
         record = self._read_record(vault, engine, name)
@@ -250,12 +259,16 @@ class ConnectionsService:
             vault.save(engine, name, fields, secure_keys=secure_keys)
             return remaining
 
-    def picked_files_by_project(self, data_vault, project_name: str) -> dict[str, list[dict]]:
-        """Google-Picker-granted files visible to `project_name`, keyed by
-        connection name. Callers (the Anton harness, once per chat turn) use
-        this to tell the agent about files a plain files.list()/files.search()
-        call won't return — the google_drive connector's drive.file scope only
-        covers files the app created plus these specifically granted ones.
+    def picked_files_by_project(
+        self, data_vault, project_name: str, engine: str = "google_drive",
+    ) -> dict[str, list[dict]]:
+        """Picked files of `engine`'s connections visible to `project_name`,
+        keyed by connection name. Callers (the Anton harness, once per chat
+        turn) use this to tell the agent about them: for google_drive, files a
+        plain files.list()/files.search() call won't return, since the
+        drive.file scope only covers files the app created plus these
+        specifically granted ones; for notion, pages the user added to the
+        project, which nothing else would point the agent at.
 
         A file is visible if it's untagged (picked with no project context —
         a connection-wide grant meant to be usable everywhere, same as the
@@ -271,9 +284,9 @@ class ConnectionsService:
         """
         picked_by_connection: dict[str, list[dict]] = {}
         for conn in data_vault.list_connections():
-            engine, name = conn["engine"], conn["name"]
-            if engine != "google_drive":
+            if conn["engine"] != engine:
                 continue
+            name = conn["name"]
             fields = data_vault.load(engine, name) or {}
             scoped = [
                 f for f in self._load_picked_files(fields)
