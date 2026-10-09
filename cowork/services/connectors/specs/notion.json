@@ -30,10 +30,31 @@
     "logo_color": "#000000",
     "methods": [
       {
+        "id": "mcp",
+        "label": "In-Browser Connect",
+        "description": "Opens Notion sign-in in your browser through Notion MCP, the same mechanism Claude's own Notion connector uses. No credentials required, just click Connect. Anton can reach whatever you can reach in the workspace you pick.",
+        "recommended": true,
+        "hidden": false,
+        "fields": [],
+        "oauth": {
+          "auth_url": "https://mcp.notion.com/authorize",
+          "token_url": "https://mcp.notion.com/token",
+          "revoke_url": "https://mcp.notion.com/token",
+          "scopes": [
+            "default"
+          ],
+          "service_id": "notion",
+          "supports_refresh": true,
+          "supports_revoke": true,
+          "refresh_token_optional": true,
+          "redirect_port": 47294
+        }
+      },
+      {
         "id": "internal-integration-secret",
         "label": "Internal Integration Secret",
         "description": "Paste an Internal Integration token from your Notion workspace. The simplest path — no OAuth flow required, just create an integration and copy the secret.",
-        "recommended": true,
+        "recommended": false,
         "how_to": "## Create a Notion Internal Integration\n\nNotion internal integrations are workspace-scoped API keys that you create in seconds. No OAuth client setup needed.\n\n### Steps\n\n1. Open [Notion](https://www.notion.so) and navigate to **Settings & Members** (bottom-left sidebar or top-right avatar menu).\n2. Select **Connections** in the left sidebar, then click **Develop or manage integrations**. This opens `https://www.notion.so/my-integrations`.\n3. Click **+ New integration**.\n4. Give it a name (e.g. `Anton`), choose your workspace, and optionally upload a logo.\n5. Under **Capabilities**, select the permissions Anton needs:\n   - **Read content** — to read pages and databases\n   - **Update content** — to write back to pages\n   - **Insert content** — to create new pages or blocks\n6. Click **Save**. Notion displays the **Internal Integration Secret** (starts with `secret_`).\n7. Click **Show** and then copy the token. Paste it into the **Integration Secret** field below.\n\n### Connect pages and databases\n\nNotion integrations only see content you explicitly share with them:\n1. Open any page or database you want Anton to access.\n2. Click **⋯ More** (top-right) → **Add connections** → find your integration and click **Confirm**.\n\n### Notes\n\n- The secret is shown immediately after creation. If you lose it, regenerate it from the same integrations page.\n- Rotating the secret invalidates the old one — paste the new secret into Anton to reconnect.\n- Read [Notion's authorization guide](https://developers.notion.com/docs/authorization) for full details.\n",
         "help_url": "https://developers.notion.com/docs/create-a-notion-integration",
         "fields": [
@@ -91,11 +112,12 @@
             "placeholder": "secret_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
             "description": "From notion.so/my-integrations → your public integration → OAuth client secret."
           }
-        ]
+        ],
+        "hidden": true
       }
     ],
     "logo_url": "logos/notion.svg"
   },
   "logo_url": "logos/notion.svg",
-  "featured": false
+  "featured": true
 }
