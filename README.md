@@ -246,13 +246,6 @@ reusable in [mindsdb/github-actions](https://github.com/mindsdb/github-actions)
 workflows: PyPI trusted publishing matches the OIDC claim on the workflow
 filename and does not support reusable workflows.
 
-### Answer performance measurements
-
-[The measurement runbook](docs/ANSWER_PERFORMANCE.md) describes the opt-in CPU
-workload, flamegraphs, dedicated staging identity, and baseline/candidate controls.
-It uses a manual mode of the existing nightly workflow; scheduled checks keep their
-functional suite. No performance run starts on a push or ordinary nightly run.
-
 ### Nightly staging integration
 
 The cowork-server maintainers own the deployed integration signal and its

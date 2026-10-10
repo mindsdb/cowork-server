@@ -5,50 +5,11 @@ on:
     # Staggered from the other staging suites to limit shared environment load.
     - cron: "41 6 * * *"
   workflow_dispatch:
-    inputs:
-      measure-answers:
-        description: Run the opt-in CPU workload instead of the functional suite
-        type: boolean
-        default: false
-      server-sha:
-        description: Exact 40-character cowork-server SHA already deployed to staging
-        type: string
-        default: ''
-      model:
-        description: Model alias held constant across both measurements
-        type: string
-        default: mindshub_air
-      scenario:
-        description: Workload scenario
-        type: choice
-        options: [text, scratchpad]
-        default: text
-      concurrency:
-        description: Concurrent conversations (1 to 8)
-        type: string
-        default: '1'
-      history-turns:
-        description: Real history setup turns per conversation (0 to 500)
-        type: string
-        default: '0'
-      answers:
-        description: Measured answers per conversation (1 to 50)
-        type: string
-        default: '5'
-      remote-worker-provenance:
-        description: Verified controller/worker image and Anton revision
-        type: string
-        default: ''
-      quiet-window-confirmed:
-        description: Operator reserved staging and prepared the dedicated identity and profiler
-        type: boolean
-        default: false
 
 permissions: {}
 
 jobs:
   integration:
-    if: github.event_name != 'workflow_dispatch' || !inputs.measure-answers
     permissions:
       contents: read
     uses: ./.github/workflows/tests-integration.yml
@@ -60,25 +21,9 @@ jobs:
       ref: staging
     secrets: inherit
 
-  performance:
-    if: github.event_name == 'workflow_dispatch' && inputs.measure-answers
-    permissions:
-      contents: read
-    uses: ./.github/workflows/measure-staging-answers.yml
-    with:
-      server-sha: ${{ inputs.server-sha }}
-      model: ${{ inputs.model }}
-      scenario: ${{ inputs.scenario }}
-      concurrency: ${{ inputs.concurrency }}
-      history-turns: ${{ inputs.history-turns }}
-      answers: ${{ inputs.answers }}
-      remote-worker-provenance: ${{ inputs.remote-worker-provenance }}
-      quiet-window-confirmed: ${{ inputs.quiet-window-confirmed }}
-    secrets: inherit
-
   notify:
     needs: [integration]
-    if: ${{ !cancelled() && needs.integration.result != 'skipped' && !contains(needs.*.result, 'cancelled') }}
+    if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') }}
     permissions:
       contents: read
       actions: read

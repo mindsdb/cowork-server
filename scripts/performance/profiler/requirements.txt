@@ -1,4 +1,0 @@
-# Linux wheels from https://pypi.org/pypi/py-spy/0.4.1/json
-py-spy==0.4.1 \
-    --hash=sha256:6a80ec05eb8a6883863a367c6a4d4f2d57de68466f7956b6367d4edd5c61bb29 \
-    --hash=sha256:ee776b9d512a011d1ad3907ed53ae32ce2f3d9ff3e1782236554e22103b5c084
