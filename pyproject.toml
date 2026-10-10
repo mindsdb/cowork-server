@@ -169,15 +169,14 @@ packages = ["cowork"]
 # three, and since mindsdb/anton#429 it also carries the typed provider-auth
 # error and the per-request API-key supplier that refresh desktop credentials
 # without rebuilding an active session (ENG-2116).
-# ENG-3168 also needs the role-aware provider from mindsdb/anton#551, which is
-# not on main yet. Pin its reviewed revision so frozen image builds consume
-# trace_role; move to the released revision when #551 ships.
+# Pin the tested revision so frozen image builds use the role-aware provider
+# and cached turn setup.
 #
 # The version-skew fallbacks in `services/providers.py` (the live supplier's
 # capability gate) and `handlers/turn_errors.py` (the legacy 401 classifier)
 # predate the `anton-agent` floor above, which no longer admits a release that
 # needs them.
-anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "b289d55fb8e2d374b76f8ac038e6b6e28893e97a" }
+anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "5b0003aa5fab33e0bac957c30e4881653ba78dfa" }
 
 [dependency-groups]
 dev = [

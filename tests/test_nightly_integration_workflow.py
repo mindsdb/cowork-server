@@ -15,14 +15,15 @@ def test_nightly_workflow_calls_staging_suite_and_reports_its_result():
     workflow = NIGHTLY_WORKFLOW.read_text(encoding="utf-8")
     parsed_workflow = yaml.safe_load(workflow)
 
-    assert parsed_workflow[True] == {
-        "schedule": [{"cron": "41 6 * * *"}],
-        "workflow_dispatch": None,
-    }
+    assert parsed_workflow[True]["schedule"] == [{"cron": "41 6 * * *"}]
+    inputs = parsed_workflow[True]["workflow_dispatch"]["inputs"]
+    assert inputs["measure-answers"]["default"] is False
+    assert len(inputs) <= 10
     assert "permissions: {}" in workflow
     assert (
         """\
   integration:
+    if: github.event_name != 'workflow_dispatch' || !inputs.measure-answers
     permissions:
       contents: read
     uses: ./.github/workflows/tests-integration.yml
@@ -40,7 +41,7 @@ def test_nightly_workflow_calls_staging_suite_and_reports_its_result():
         """\
   notify:
     needs: [integration]
-    if: ${{ !cancelled() && !contains(needs.*.result, 'cancelled') }}
+    if: ${{ !cancelled() && needs.integration.result != 'skipped' && !contains(needs.*.result, 'cancelled') }}
     permissions:
       contents: read
       actions: read
@@ -142,3 +143,18 @@ def test_required_integration_prerequisite_fails_in_staging(monkeypatch):
 
     with pytest.raises(pytest.fail.Exception, match="absence is a defect"):
         missing_prerequisite("missing target")
+
+
+def test_performance_dispatch_uses_feature_ref_and_does_not_run_the_functional_load():
+    workflow = yaml.safe_load(NIGHTLY_WORKFLOW.read_text())
+    measure = workflow["jobs"]["performance"]
+    assert measure["if"] == "github.event_name == 'workflow_dispatch' && inputs.measure-answers"
+    assert measure["uses"] == "./.github/workflows/measure-staging-answers.yml"
+    reusable = yaml.safe_load((ROOT / ".github/workflows/measure-staging-answers.yml").read_text())
+    inputs = reusable[True]["workflow_call"]["inputs"]
+    assert set(measure["with"]) == set(inputs)
+    # Checkout the manually selected feature revision, not the measured image.
+    checkouts = [step for step in reusable["jobs"]["measure"]["steps"] if step.get("uses", "").startswith("actions/checkout@")]
+    assert len(checkouts) == 1 and "ref" not in checkouts[0].get("with", {})
+    assert reusable["jobs"]["measure"]["environment"] == "staging"
+    assert "schedule" not in reusable[True] and "pull_request" not in reusable[True]
