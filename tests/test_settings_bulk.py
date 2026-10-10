@@ -40,6 +40,34 @@ def test_save_all_writes_every_key_in_one_transaction():
         session.close()
 
 
+def test_favicon_round_trips_through_save_list_and_clear():
+    favicon = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'/%3E"
+    session = get_open_session()
+    try:
+        _cleanup(session, "favicon", "nav_logo")
+        service = SettingService(session)
+        service.save_all({"favicon": favicon, "nav_logo": "sidebar-logo"})
+    finally:
+        session.close()
+
+    session = get_open_session()
+    try:
+        service = SettingService(session)
+        assert service.load().favicon == favicon
+        setting = next(row for row in service.list_settings() if row.key == "favicon")
+        assert setting.value == favicon
+        assert setting.is_sensitive is False
+        assert setting.is_set is True
+
+        service.save_all({"favicon": ""})
+        assert service.get_setting("favicon").value == ""
+        assert service.load().favicon == ""
+        assert service.get_setting("nav_logo").value == "sidebar-logo"
+    finally:
+        _cleanup(session, "favicon", "nav_logo")
+        session.close()
+
+
 def test_save_all_is_all_or_nothing_on_an_invalid_value():
     session = get_open_session()
     try:

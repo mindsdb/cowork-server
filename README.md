@@ -926,6 +926,13 @@ in this path runs, so the flag is also the rollback.
 
 Configuration is read from the database (`UserSettings` table) and can be managed through the Settings UI in the desktop app or via `PUT /api/v1/settings/`.
 
+The `favicon` setting stores a browser tab icon as a data URI, separately from
+the sidebar's `nav_logo`. It defaults to an empty string, which keeps the
+page's original icon. Saving an empty string restores that default. Like the sidebar
+logo, this is a personal preference scoped to each member within an
+organization; local tenancy uses the instance's shared setting. `GET /api/v1/settings/`
+returns the data URI without masking it.
+
 Environment variables fall into these groups:
 
 **Server-level** (`COWORK_*`) — control the cowork-server process itself:
