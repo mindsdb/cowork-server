@@ -30,6 +30,8 @@ uv run cowork-server
 
 When running alongside the Electron app in dev mode, the app spawns the server automatically — no manual start needed. The Electron app looks for a sibling `cowork-server/` directory by convention (override with `COWORK_SERVER_DIR`).
 
+cowork-server imports anton's artifact folder constants (`anton.core.artifacts.internal_files`) at startup, with no fallback. A local editable anton older than the `anton-agent` floor in `pyproject.toml` makes the server fail to start with `ImportError`.
+
 ### Dev setup helper
 
 ```sh
@@ -211,6 +213,18 @@ same change; a contract test fails if only one of the two happens.
 
 Set `LOG_LEVEL` (default `WARNING`) to control verbosity. Enable file logging with `ENABLE_FILE_LOGGING=true` (writes to `LOG_DIR`, defaults to `~/.cowork/logs/`).
 
+Database exception records omit SQL, parameter values, driver details and tracebacks, in the owned console and file handlers and in everything Uvicorn logs. `setup_logging()` attaches the database and provider filters to the `uvicorn`, `uvicorn.error`, `uvicorn.access` and `uvicorn.asgi` loggers, and to any handler a launcher already installed on them, so the policy holds under every launcher: the `cowork-server` CLI, `python -m uvicorn cowork.server:app`, or `uvicorn spa_wrapper:app` with Uvicorn's default log config. Uvicorn's levels stay as the launcher set them, so lifecycle lines such as `Finished server process` still print. The shared filter replaces each such record with `Database operation failed: error_type=<class> sqlstate=<code or unknown> site=<module>.<function>:<line>`, keeping only valid driver SQLSTATE codes. `site` names the logging call. When that call only relays the error, as Uvicorn's request runner and the server's lifespan guard do, `site` names the deepest Cowork frame the error passed through outside the session wrappers (`cowork.db.scoped`, `cowork.db.session` and `cowork.db.units`), such as the service line that ran a route's failing statement. Session logs retain error types and client HTTP status, including the 503 for a full pool. A 5xx `HTTPException` logs its status. Its own detail is not logged, but its cause's class, message and traceback are, unless the cause chain holds a database or provider error, which the filters replace. Any other error, including one that carries a `status_code` without being an `HTTPException`, logs only its type in the session line, then reaches Uvicorn, which logs it through the same filters. Exceptions and HTTP errors returned to callers stay unchanged.
+
+A database error while the server starts or stops (a migration, the seed rows, or Postgres not yet reachable after a reboot) logs that safe line through the owned handlers. Uvicorn then prints only `RuntimeError: Database operation failed during server startup` (or `shutdown`), because Starlette hands it the failure as plain traceback text, which no filter can read. Other startup errors keep their traceback.
+
+A call site passes the ids that locate a failure as `extra=log_context(...)` from `cowork.common.logger`, which sets record attributes: `request_id`, `project_id`, `schedule_id`, `conversation_id`, and `artifact_slug` for one artifact or `artifact_slugs` for several. The filters never change them, and the console and file formatters render them before the message, for example `[Req:<id>][Project:<id>][Schedule:<id>][Conversation:<id>][Artifact:'<slug>']` or `[Artifacts:'<slug>', '<slug>']`. Artifact slugs are folder names, so they render quoted. A site that carries only a request id passes `extra={"request_id": ...}` directly.
+
+OpenAI and Anthropic SDK errors (any `OpenAIError` or `AnthropicError`) and Anton's typed provider errors are found, in the same handlers and Uvicorn loggers, through each exception's cause, then its context (even a suppressed one), then its exception group members. The record becomes `Provider operation failed: error_type=<the record's exception class> provider_error=<the first provider error's class> status=<that provider error's HTTP status or unknown>`; a wrapper's own status is never used. Cowork's request ID (`[Req:<id>]`) stays on the line; the provider's own request ID is not logged. Provider messages, bodies, requests and tracebacks are omitted. Routing failure warnings also omit body-derived type, code and parameter fields. Original exceptions, probe verdicts and client HTTP/SSE errors stay unchanged.
+
+Uvicorn's access line keeps each request's method, path and status, and `setup_logging()` replaces its query with `?[redacted]`, because a query can carry an OAuth callback's code or a webhook's verify token.
+
+SQLAlchemy query and connection diagnostics stay at `WARNING`, even when application logging is set to `DEBUG`. SDK request diagnostics and HTTP client logging stay at `ERROR`, including Anthropic, `httpx2` and the whole `httpcore` and `httpcore2` namespaces, because they can include request bodies, URLs or response headers such as `set-cookie`.
+
 ## Releasing
 
 Releases are automatic on merge; there is no version to bump by hand (the
@@ -277,9 +291,19 @@ A **harness** adapts an external agent library (Anton today) to the cowork-serve
 
 Agent responses stream to clients via **Server-Sent Events** (SSE) on `POST /responses/`. The server tracks in-flight streams and supports cancellation (`/responses/cancel`) and late-join tailing (`/responses/tail`).
 
+`/responses/cancel` takes an optional `reason`. The UI sends `"stalled"` when it heard nothing for its idle window, and the turn then saves as a `response.failed` with code `stalled`, so a reload shows the stall card. Without a reason, or with any other value, the cancel is a Stop and keeps the partial answer with no error row. While anton waits on a model call that sends no output, the server (in cloud, the anton pod) writes a `model_wait` progress frame every 20 to 25 seconds so the turn's idle bounds do not end it. A model call that sends no output for 600 seconds ends the turn with code `model_timeout`; anton's `ANTON_MODEL_CALL_IDLE_TIMEOUT_S` sets that limit, and 0 or less turns it off. [Turn liveness and idle bounds](docs/DESIGN.md#turn-liveness-and-idle-bounds) lists every bound a quiet turn meets and what happens when each one fires.
+
+`POST /responses/` reads what it needs (the turn's settings, its attachments, the conversation and the routing gate's history) as one short database unit in a worker thread (`run_db` in `cowork/db/units.py`). The request holds no pooled connection while the gate or the stream runs, and a wait for one never stalls the event loop. When no connection frees within `POOL_TIMEOUT` (5 s by default), the request is refused with `503`, a `Retry-After` header and `{"detail": "Cowork is busy. Try again in about 5 seconds.", "code": "server_busy"}`. An answer that meets the same wait after its stream started ends with one `response.failed` frame with code `server_busy` and the `retry_after` and `retry_at` fields `rate_limited` carries. The question sent again after that frame gets a stream of its own.
+
+An answer produced in this process (`COWORK_TURN_BACKEND=inprocess`, the default) runs its own database work as units too. One at the start saves the question (pending) and loads the conversation. The harness reads the history, the attachments and each `recall_history` lookup in units of its own. One at the end saves the answer and clears the question's pending flag in one commit. Both hold a per-conversation lock that keeps a conversation's message writes in order. So such an answer holds no pooled connection while the model answers or the stream runs. A save that fails at the end of a finished or stopped answer ends the stream with `response.failed` (`server_busy` when no connection freed in time), never `response.completed`. An interrupted or failed answer whose save fails keeps its own `response.failed` frame, and the next boot's recovery seals an interrupted one into history. A Stop, a second Stop or a shutdown that arrives while a turn saves its question or its answer waits for that save, so the stream's last frame always matches what the database holds. The compacted history summary and new artifact index are database units too. The harness waits for its cleanup through `run_to_completion`, so Stop and shutdown cannot abandon these writes, and a full pool never blocks the event loop. When the pool stays full, a Stop waits up to `POOL_TIMEOUT` for each pending write (the answer, a compacted summary and a new artifact's row), so `/responses/cancel` can take up to three times `POOL_TIMEOUT`. A Stop during a running cell returns within 5 s only while the pool frees connections. An answer produced by the remote backend (`COWORK_TURN_BACKEND=remote`) works the same way. Staging the pod's workspace, saving the question, reading what the pod is seeded with, saving the memory and the compacted summary the pod reports, indexing the artifacts it created and saving the answer are each a unit, and the artifacts' owners are looked up in a unit before they are published. So it holds no pooled connection while the pod answers, and its settings come from the snapshot the request loaded. The turn indexes the artifacts the pod created once, however it ends. A Stop waits for that write and then for the answer's save, so with the pool full `/responses/cancel` can take up to twice `POOL_TIMEOUT`. A memory or summary save that is still waiting for a connection when a Stop lands is dropped.
+
+The connector form's stream (`POST /api/v1/connectors/submissions/`) reads its conversation and the settings that build the probe's model client, and saves the probe's narrative, as units too. So it holds no connection while the credential probe waits on the model, and it never waits for one on the event loop. When no connection frees in time for the conversation read or the settings read, the form shows `Cowork is busy. Try again in about 5 seconds.` and the probe does not start. The stream ends at that refusal and saves nothing to the conversation. A save of the probe's narrative that fails still ends the stream with `response.completed`, because the form carries the probe's outcome.
+
+A question sent into a conversation whose streamed turn is still answering is refused with `409` and `{"detail": "Another question is still being answered in this conversation. Wait for it to finish, then send yours again.", "code": "turn_in_progress"}`. It is refused before anything reads or saves it, and the running answer goes on. A turn whose stream has already ended counts as finished, so a question queued behind it is accepted. The check runs before any database read, and `RunRegistry.start` repeats it under a lock for that conversation before it opens the new turn's buffer. Two questions racing through the gate read the same history, so both compute the same turn number, which names the turn's buffer and which boot recovery reads as the question's position in the history. Once a turn saves its question, the registry refuses a later start at that turn's number or an earlier one, even after that turn has ended. So the second of two racing questions is refused with the same `409` whether it reaches the registry before or after the first turn ends, and two questions never share a buffer. A question that follows a turn that saved nothing (refused for a full pool, say) keeps that turn's number and is accepted. A queued follow-up waits for the preceding turn's internal terminal record once its final client frame is being written; slow buffer creation for one conversation does not hold up other conversations. It covers the turns running on the replica that receives the question: with several replicas, a duplicate send that reaches another replica is not refused there.
+
 A turn that fails ends with one `response.failed` frame carrying a stable `code` and the user-facing `error` (`cowork/handlers/turn_errors.py`), and the conversation's saved events keep the same payload, so a reload shows the same card. For `included_allowance_exhausted` and `free_serving_paused` the frame also carries `reset_at`, the instant the free way forward comes back. An in-process turn passes the gate's `X-MindsHub-Reset-At` header through as sent. A hosted turn takes it from the anton worker's `turn_failed` reply, which scratchpad-controller forwards beside `error`. The producer keeps it only for those two codes and only when it parses as an ISO-8601 instant with a UTC offset. An older worker sends none, and its frame has no `reset_at`.
 
-A background **scheduler** loop polls the database every 30 seconds for due schedules, supporting `once`, `hourly`, `daily`, and `weekly` cadences. Each run creates a conversation and is tracked in `schedule_runs`. Deleting that conversation does not delete the run: the run keeps its status, timings, and error as audit history, and only its link to the conversation is released. A channel binding pinned to the conversation is released the same way, so the external chat stays bound to its project and the next inbound message starts a fresh conversation.
+A background **scheduler** loop polls the database every 30 seconds for due schedules, supporting `once`, `hourly`, `daily`, and `weekly` cadences. The poll and each run's reads and writes are database units, so a full pool refuses them after `POOL_TIMEOUT` rather than stalling the server. A run whose first write is refused does not start, and a cron slot then stays due for the next poll. A run's last two writes, its outcome and its finish, try again while the pool stays full, for up to 10 minutes, so a busy moment never leaves a run at `running` or its slot due. Each run creates a conversation and is tracked in `schedule_runs`. Deleting that conversation does not delete the run: the run keeps its status, timings, and error as audit history, and only its link to the conversation is released. A channel binding pinned to the conversation is released the same way, so the external chat stays bound to its project and the next inbound message starts a fresh conversation.
 
 ## Data Layer
 
@@ -877,11 +901,39 @@ and the publisher's artifact-only authentication path before this server change.
 Keep these admission checks in place during rollback while restrictive custom
 roles remain assigned. No new customer or staff permission grants are introduced.
 
+### Datasource grants on cloud turns
+
+`COWORK_TURN_DATASOURCE_ENABLED` (default `false`) lets a hosted turn query the
+user's verified PostgreSQL and MySQL connections in the organization. When it
+is on, the producer lists them from auth under the dedicated
+producer service role (`COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID` and
+`COWORK_TURN_DATASOURCE_PRODUCER_KEY`), bound to the turn key it has just
+minted, registers one grant per connection before enqueueing, and puts only
+connection ids and credential versions on the queue. No capability or
+password crosses Redis; the pod reaches the gateway on the inference host the
+turn's `llm` block already names. A listing or registration failure fails the
+dispatch as `permission_unavailable` instead of silently dropping the
+datasources.
+
+Turn the flag on only after auth serves the datasource producer and resolver
+endpoints, the inference deployment serves `/v1/datasources/`, the
+scratchpad-controller passes the `datasource` block on, and the scratchpad image
+includes the typed helper that reads the gateway from the turn's inference host,
+with live pods from an older image recycled first. With the flag off nothing
+in this path runs, so the flag is also the rollback.
+
 ## Configuration
 
 Configuration is read from the database (`UserSettings` table) and can be managed through the Settings UI in the desktop app or via `PUT /api/v1/settings/`.
 
-Environment variables fall into three groups:
+The `favicon` setting stores a browser tab icon as a data URI, separately from
+the sidebar's `nav_logo`. It defaults to an empty string, which keeps the
+page's original icon. Saving an empty string restores that default. Like the sidebar
+logo, this is a personal preference scoped to each member within an
+organization; local tenancy uses the instance's shared setting. `GET /api/v1/settings/`
+returns the data URI without masking it.
+
+Environment variables fall into these groups:
 
 **Server-level** (`COWORK_*`) — control the cowork-server process itself:
 
@@ -899,6 +951,14 @@ Environment variables fall into three groups:
 | `COWORK_MEMORY_DIR` | `~/.cowork/memory` | Memory store root (local mode only) |
 | `COWORK_VAULT_DIR` | `~/.cowork/data-vault` | Connector credential vault |
 | `COWORK_OPENAI_COMPATIBLE_API` | `chat_completions` | The API an `openai_compatible` provider's planning and coding roles call. `responses` moves them to `{base}/responses` through anton's openai flavor, where OpenAI and Azure accept function tools together with a reasoning effort. It needs an anton that reports `RESPONSES_TRANSPORT_READY`; with an older anton both roles stay on chat completions, and Cowork logs one warning that says so. On the Responses path the agent loop runs without web tools, because OpenAI's hosted `web_search` reads the web from the provider's side, outside the deployment's egress controls. A Python cell's `web_search()` is separate and unchanged. The router and Gemini stay on chat completions. Read once at start. |
+
+**Database pool**: these read their bare names, with no `DATABASE_` prefix. A SQLite engine is built without them and waits SQLAlchemy's 30 s for a connection outside a database unit; its database units run one at a time, and `POOL_TIMEOUT` still bounds a unit's waits.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `POOL_SIZE` | `20` | Connections the pool keeps open. |
+| `MAX_OVERFLOW` | `20` | Connections the pool may open beyond `POOL_SIZE` under load. Database units take one of `POOL_SIZE` plus `MAX_OVERFLOW` slots before they ask the pool. A negative value means no limit, for the pool and for units. |
+| `POOL_TIMEOUT` | `5` | Seconds a database unit may wait in all, for a slot and then for a connection, before it is refused: a request with `503` and a `Retry-After` of the same number of seconds, a streamed answer with `server_busy`. On Postgres it is also the pool's own wait, so every route that reads the database answers `503` with `Retry-After` once it passes, `/api/v1/health/` included. `/api/v1/health/live` reads no database and keeps answering. It must be at least `1`; a lower value stops the server at startup. |
 
 **Harness-level** (`ANTON_*`) — configure a specific agent harness. These are read by the harness adapter, not by cowork-server core. They use the harness prefix because the upstream agent library (anton) defines them:
 

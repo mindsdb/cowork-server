@@ -1,8 +1,11 @@
 from dataclasses import dataclass
-from typing import AsyncIterator, Literal, Protocol
+from typing import TYPE_CHECKING, AsyncIterator, Literal, Protocol
 from typing_extensions import TypedDict
 
 from cowork.models.conversation import Conversation
+
+if TYPE_CHECKING:
+    from cowork.streaming.liveness import ModelWaitTicker
 
 
 class TextInputBlock(TypedDict):
@@ -63,6 +66,15 @@ class HarnessProvider(Protocol):
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
         channel_context: ChannelContext | None = None,
+        # True only for a client that renders a tool's message to the user
+        # as an agent message (the cowork UI). A channel bot or the
+        # non-streaming API gets only the answer text.
+        tool_messages: bool = False,
+        # Liveness hook for silent model calls (cowork/streaming/liveness.py).
+        # A harness with an anton session attaches it so the producer can keep
+        # the turn alive while a model call is quiet; other harnesses accept
+        # and ignore it.
+        model_wait: "ModelWaitTicker | None" = None,
     ) -> AsyncIterator[str]:
         ...
 

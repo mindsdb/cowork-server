@@ -31,7 +31,10 @@ from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 from urllib.parse import urlparse
 
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
 from cowork.common.settings.app_settings import default_minds_url
+from cowork.db.units import busy_retry_seconds
 
 # Curated copy for the unsupported-image case. Surfaced verbatim.
 IMAGE_FORMAT_USER_MESSAGE = (
@@ -357,6 +360,20 @@ GENERIC_TURN_ERROR_CODE = "anton_error"
 # its own — same as TurnInterrupted below.
 INTERRUPTED_TURN_MESSAGE = "The response was interrupted before it finished. Please try again."
 
+# anton ended a model call that sent no output within its deadline. Its own
+# message names the deadline, so it passes through; this is the fallback for
+# an empty one. A code of its own because the next step differs from
+# anton_error: the model, not the agent, went silent.
+MODEL_TIMEOUT_CODE = "model_timeout"
+MODEL_TIMEOUT_USER_MESSAGE = "The model didn't respond, so this turn was ended. Please try again."
+
+# The UI heard nothing for its idle window and cancelled the turn with
+# reason "stalled". Saved as a failure with this code, so a reload shows the
+# stall card instead of a partial answer that reads like a Stop. Same
+# sentence the UI shows live.
+STALLED_CODE = "stalled"
+STALLED_TURN_MESSAGE = "The response stalled and was ended. Please try sending again."
+
 # Curated copy for scratchpad-controller literals that carry no "TypeName:"
 # prefix at all (main.py's own turn_failed publishes), so the type-name parse
 # in remote_turn_error never sees them. Matched by prefix/suffix rather than
@@ -475,6 +492,19 @@ WORKER_UNRESPONSIVE_MESSAGE = (
     "The agent didn't start, so this turn never ran. That's a fault on our "
     "side rather than a problem with your request. Try again in a moment."
 )
+
+# Wire code for a request refused because no database connection freed within
+# POOL_TIMEOUT. Before a stream exists the sentence is a 503's `detail`
+# (cowork.server). Inside one it is a response.failed frame that carries
+# `retry_after` and `retry_at`, as rate_limited does. The web UI waits for
+# Retry-After, or the frame's `retry_at`, before it offers a retry, and the
+# sentence names the wait for clients that read neither.
+SERVER_BUSY_CODE = "server_busy"
+
+
+def server_busy_message(retry_after: int) -> str:
+    unit = "second" if retry_after == 1 else "seconds"
+    return f"Cowork is busy. Try again in about {retry_after} {unit}."
 
 
 def is_image_format_error(exc: Exception) -> bool:
@@ -693,6 +723,36 @@ def provider_overloaded_info(exc: Exception) -> tuple[str, str] | None:
     if code == PROVIDER_OVERLOADED_CODE:
         return code, str(getattr(exc, "model", "") or "")
     return None
+
+
+def is_model_timeout_error(exc: Exception) -> bool:
+    """Whether ``exc`` is anton's ``ModelCallTimeoutError``: a model call sent
+    no output within its deadline.
+
+    Typed check first, imported lazily because the installed anton can predate
+    the class; it keeps matching if anton ever changes the class's wire code.
+    The duck-typed fallback, for an anton that predates or moved the class,
+    keys on the structured ``code`` and excludes anything carrying
+    ``.response`` or ``.request``. An SDK error fills ``.code`` from a body a
+    BYOK endpoint controls, and the OpenAI and Anthropic SDKs set ``.request``
+    on every error, including the bare ``APIError`` that a mid-stream SSE
+    error frame raises with no ``.response``. anton also wraps that bare error
+    into its own fixed-code error (``except openai.APIError`` in
+    ``OpenAIProvider``'s stream readers), so it should never arrive here
+    unwrapped.
+    """
+    try:
+        from anton.core.llm.provider import ModelCallTimeoutError
+
+        if isinstance(exc, ModelCallTimeoutError):
+            return True
+    except ImportError:
+        pass
+    return (
+        getattr(exc, "code", None) == MODEL_TIMEOUT_CODE
+        and not hasattr(exc, "response")
+        and not hasattr(exc, "request")
+    )
 
 
 def is_auth_error(exc: Exception) -> bool:
@@ -1260,6 +1320,20 @@ def friendly_turn_error(
     (the streaming handler needs the rejected model for the card) pass it in so
     it isn't computed twice; omit it and it's resolved on demand.
     """
+    # The database had no connection to give within POOL_TIMEOUT. Matched
+    # first: it is not a provider failure, so nothing below applies to it.
+    if isinstance(exc, PoolTimeoutError):
+        return SERVER_BUSY_CODE, server_busy_message(busy_retry_seconds())
+
+    # anton's model-call deadline. Its message is curated copy that names the
+    # deadline, so it passes through. Checked before every rung that walks the
+    # cause chain: anton raises it `from None` inside the deadline's handler,
+    # but `__context__` still holds whatever the call was doing when the
+    # deadline fired, such as an SDK retry sleeping after a gateway 429. Read
+    # through the chain, that response would relabel the deadline.
+    if is_model_timeout_error(exc):
+        return MODEL_TIMEOUT_CODE, str(exc) or MODEL_TIMEOUT_USER_MESSAGE
+
     status, reason, host = _http_error_context(exc)
 
     # The gateway's explicit reason header wins — it names the billing decision
@@ -1450,6 +1524,12 @@ _REMOTE_TYPE_MAPPINGS: dict[str, _RemoteTypeMapping] = {
         PROVIDER_OVERLOADED_CODE, PROVIDER_OVERLOADED_FALLBACK_MESSAGE,
         passes_message_through=True,
     ),
+    # anton's model-call deadline. Its message is curated copy that names the
+    # deadline, so it passes through like the overload copy above.
+    "ModelCallTimeoutError": _RemoteTypeMapping(
+        MODEL_TIMEOUT_CODE, MODEL_TIMEOUT_USER_MESSAGE,
+        passes_message_through=True,
+    ),
     # _scrub sends "Type: message" — the structured `code` doesn't survive,
     # so 403-gate and 404-not-found are indistinguishable here. Default to
     # the CONSERVATIVE one: model_not_found steers to Settings and promises
@@ -1551,6 +1631,40 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
     ):
         return AUTH_ERROR_CODE, AUTH_ERROR_USER_MESSAGE
     return GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
+
+
+def remote_error_label(*, error: str | None) -> str:
+    """A fixed label for a pod's failure string, for a log line.
+
+    Takes remote_turn_error's branches in its order, plus the two cancel
+    strings, and names the one the string takes. The string can quote the
+    provider, so no part of it is returned: each label is a constant here or
+    a type name the mapping table holds, and ``unmapped`` covers everything
+    else.
+    """
+    text = (error or "").strip()
+    if text in SELF_AUTHORED_TURN_FAILURES:
+        return text.partition(":")[0]
+    if text.startswith(POD_STREAM_ENDED_PREFIX):
+        return "pod_stream_ended"
+    if text.startswith(TURN_ABORTED_TIMEOUT_PREFIX):
+        return "turn_aborted_timeout"
+    if text.startswith(TURN_ABORTED_STALL_PREFIX):
+        return "turn_aborted_stall"
+    if text.startswith(MISSING_ORGANIZATION_PREFIXES) and text.endswith(MISSING_ORGANIZATION_SUFFIX):
+        return "missing_organization"
+    if text.startswith(LIVE_POD_PREFIX) and any(marker in text for marker in LIVE_POD_NEVER_RAN_MARKERS):
+        return "live_pod_never_ran"
+    if text.startswith(POD_IDENTITY_MISMATCH_PREFIX) and POD_IDENTITY_MISMATCH_MARKER in text:
+        return "pod_identity_mismatch"
+    if text in (REMOTE_CANCEL_LITERAL, REMOTE_CANCEL_VIA_FAIL_JOB):
+        return "cancelled"
+    type_name, _, message = text.partition(":")
+    if type_name in _REMOTE_TYPE_MAPPINGS:
+        return type_name
+    if type_name == "ConnectionError" and message.strip().lower().startswith(LEGACY_AUTH_ERROR_MESSAGE_PREFIX):
+        return "ConnectionError"
+    return "unmapped"
 
 
 def response_failed_payload(

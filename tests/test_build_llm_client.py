@@ -60,6 +60,10 @@ def build(monkeypatch):
     _fake_openai.FLAVOR_OPENAI_COMPATIBLE_GENERIC = (
         _RealOpenAIProvider.FLAVOR_OPENAI_COMPATIBLE_GENERIC
     )
+    # Direct OpenAI's transport is gated on this marker (see _make_provider).
+    _fake_openai.RESPONSES_TRANSPORT_READY = getattr(
+        _RealOpenAIProvider, "RESPONSES_TRANSPORT_READY", False
+    )
     # Production capability-gates new Anton kwargs from the callable signature.
     # Preserve the real constructor contract on this kwargs-capturing fake.
     _fake_openai.__signature__ = inspect.signature(_RealOpenAIProvider)
@@ -110,6 +114,40 @@ def test_openai_never_inherits_contaminated_base(build):
     assert kw["api_key"] == "sk-openai"
     assert kw["base_url"] is None  # SDK default host, never the shared slot
     assert "api_key_provider" not in kw
+
+
+def test_direct_openai_uses_the_responses_transport(build):
+    # Follows the installed anton: CI can run against an anton that predates
+    # the marker, where the generic flavor is the correct outcome (covered by
+    # the skew test below on every build).
+    ready = getattr(_RealOpenAIProvider, "RESPONSES_TRANSPORT_READY", False) is True
+    settings = UserSettings(
+        planning_provider=Provider.OPENAI,
+        coding_provider=Provider.OPENAI,
+        openai_api_key=SecretStr("sk-openai"),
+    )
+    _client, calls = build(settings)
+    if ready:
+        assert all(kw["flavor"] == _RealOpenAIProvider.FLAVOR_OPENAI for kw in calls["openai"])
+    else:
+        assert all("flavor" not in kw for kw in calls["openai"])
+
+
+def test_direct_openai_stays_generic_on_an_anton_without_a_ready_transport(
+    build, monkeypatch
+):
+    # cowork-server pins anton to a branch; an older build's Responses path
+    # drops truncation, tool_result images and trace headers.
+    import anton.core.llm.openai as anton_openai
+
+    monkeypatch.setattr(anton_openai.OpenAIProvider, "RESPONSES_TRANSPORT_READY", False)
+    settings = UserSettings(
+        planning_provider=Provider.OPENAI,
+        coding_provider=Provider.OPENAI,
+        openai_api_key=SecretStr("sk-openai"),
+    )
+    _client, calls = build(settings)
+    assert all("flavor" not in kw for kw in calls["openai"])
 
 
 def test_openai_compatible_uses_dedicated_key_and_own_base(build):

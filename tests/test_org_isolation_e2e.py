@@ -502,11 +502,14 @@ class _LiveHandle:
         latest_seq = 3
 
     def __init__(self, conversation_id: str, org_id: str, user_id: str) -> None:
+        from cowork.streaming.registry import TurnLifecycle
+
         self.conversation_id = conversation_id
         self.org_id = org_id
         self.user_id = user_id
         self.turn_id = 1
         self.buffer = self._Buffer()
+        self.lifecycle = TurnLifecycle()
         self.cancelled = False
 
     @property
@@ -594,3 +597,25 @@ def test_org_settings_writes_require_admin_role(client):
     assert client.put(
         "/api/v1/settings/", json={"values": {"openai_api_key": "***", "greeting": "hi"}}, headers=A
     ).status_code == 200
+
+
+def test_member_can_save_and_clear_favicon_without_changing_peers(client):
+    favicon = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'/%3E"
+    assert _setting(client, A, "favicon")["value"] == ""
+
+    saved = client.put(
+        "/api/v1/settings/", json={"values": {"favicon": favicon}}, headers=A
+    )
+    assert saved.status_code == 200, saved.text
+    setting = _setting(client, A, "favicon")
+    assert setting["value"] == favicon
+    assert setting["is_sensitive"] is False
+    assert setting["is_set"] is True
+    assert _setting(client, A_PEER, "favicon")["value"] == ""
+    assert _setting(client, B, "favicon")["value"] == ""
+
+    cleared = client.put(
+        "/api/v1/settings/", json={"values": {"favicon": ""}}, headers=A
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert _setting(client, A, "favicon")["value"] == ""

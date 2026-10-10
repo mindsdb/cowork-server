@@ -42,6 +42,17 @@ from cowork.streaming.records import (
 logger = logging.getLogger(__name__)
 
 
+def _is_final_client_frame(type_: str, data: dict) -> bool:
+    if type_ in REASON_TO_TYPE.values():
+        return True
+    if type_ != "sse":
+        return False
+    return any(
+        line in {"event: response.completed", "event: response.failed", "event: response.cancelled"}
+        for line in (data.get("sse") or "").splitlines()
+    )
+
+
 # ── interface ────────────────────────────────────────────────────────
 
 
@@ -65,6 +76,12 @@ class StreamBuffer(ABC):
     def tail(self, from_seq: int = 0) -> AsyncIterator[TurnRecord]:
         """Yield records with ``seq >= from_seq``, then live-tail to the
         terminal record. Never raises on consumer cancellation."""
+
+    @property
+    def is_finishing(self) -> bool:
+        """A final client frame is being written; the next turn may wait for
+        the internal terminal record instead of receiving a refusal."""
+        return getattr(self, "_finishing", False)
 
     @property
     @abstractmethod
@@ -96,6 +113,23 @@ def turn_buffer_path(streams_dir: Path, conversation_id: str, turn_id: int) -> P
     return conversation_dir(streams_dir, conversation_id) / f"turn_{int(turn_id):06d}.jsonl"
 
 
+def _parse_record(line: str | bytes) -> TurnRecord | None:
+    """One JSONL line as a record, or None for a blank or half-written line."""
+    line = line.strip()
+    if not line:
+        return None
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None  # half-written record from a crash
+    return TurnRecord(
+        seq=int(obj.get("seq", -1)),
+        ts=str(obj.get("ts", "")),
+        type=str(obj.get("type", "")),
+        data=dict(obj.get("data") or {}),
+    )
+
+
 def read_records(path: Path, from_seq: int = 0) -> Iterator[TurnRecord]:
     """Read JSONL records with ``seq >= from_seq``. Tolerates a partial
     last line (producer crash mid-write) — skipped, not raised."""
@@ -104,24 +138,41 @@ def read_records(path: Path, from_seq: int = 0) -> Iterator[TurnRecord]:
     try:
         with path.open("r", encoding="utf-8") as f:
             for line in f:
-                line = line.rstrip("\n")
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except json.JSONDecodeError:
-                    continue  # half-written record from a crash
-                seq = int(obj.get("seq", -1))
-                if seq < from_seq:
-                    continue
-                yield TurnRecord(
-                    seq=seq,
-                    ts=str(obj.get("ts", "")),
-                    type=str(obj.get("type", "")),
-                    data=dict(obj.get("data") or {}),
-                )
+                record = _parse_record(line)
+                if record is not None and record.seq >= from_seq:
+                    yield record
     except OSError as exc:
         logger.warning("Could not read turn buffer at %s: %s", path, exc)
+
+
+class _NewRecords:
+    """Reads a turn file a little at a time: each call parses only the
+    complete lines written since the last one.
+
+    A reader that re-read the whole file on every wake would parse a turn of
+    N records about N * N / 2 times, on the event loop. This one keeps the
+    byte offset it has read up to, and holds back a last line that has no
+    newline yet until the rest of it is written.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._offset = 0
+        self._partial = b""
+
+    def read(self) -> list[TurnRecord]:
+        try:
+            with self._path.open("rb") as f:
+                f.seek(self._offset)
+                chunk = f.read()
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            logger.warning("Could not read turn buffer at %s: %s", self._path, exc)
+            return []
+        self._offset += len(chunk)
+        *lines, self._partial = (self._partial + chunk).split(b"\n")
+        return [record for record in map(_parse_record, lines) if record is not None]
 
 
 class FileStreamBuffer(StreamBuffer):
@@ -138,7 +189,16 @@ class FileStreamBuffer(StreamBuffer):
     def __init__(self, path: Path) -> None:
         self._path = Path(path)
         self._path.parent.mkdir(parents=True, exist_ok=True)
+        # A new turn starts with an empty file. The path is named by the turn
+        # number, which is the conversation's message count, so a turn that
+        # saved no message leaves its file where the next turn writes; its
+        # records would be replayed to the next turn's readers, which stop at
+        # its terminal record. Only this process writes these files, and the
+        # registry opens one only once no turn of the conversation is
+        # answering, so whatever the file held had already ended. Opened to
+        # append, so every record still lands at the file's end.
         self._writer = self._path.open("a", encoding="utf-8")
+        self._writer.truncate(0)
         self._seq = 0
         self._new_data = asyncio.Event()
         self._done = asyncio.Event()
@@ -160,6 +220,8 @@ class FileStreamBuffer(StreamBuffer):
         if self._closed:
             logger.warning("Append to closed buffer %s ignored", self._path)
             return self._seq
+        if _is_final_client_frame(type_, data):
+            self._finishing = True
         record = {"seq": self._seq, "ts": now_iso(), "type": type_, "data": data}
         try:
             self._writer.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -187,19 +249,23 @@ class FileStreamBuffer(StreamBuffer):
         old.set()
 
     async def tail(self, from_seq: int = 0) -> AsyncIterator[TurnRecord]:
-        seen = from_seq - 1
+        new_records = _NewRecords(self._path)
         while True:
             # Snapshot the event BEFORE reading so an append between the
             # read and the wait can't be lost (it either shows on re-read
             # or fires the snapshot we're about to await).
             waiter = self._new_data
+            # Taken before the read: a close that lands while this batch is
+            # yielded is followed by one more read, which holds its records.
+            closed = self._closed
             emitted_terminal = False
-            for rec in read_records(self._path, from_seq=seen + 1):
-                seen = rec.seq
+            for rec in new_records.read():
+                if rec.seq < from_seq:
+                    continue
                 yield rec
                 if rec.is_terminal:
                     emitted_terminal = True
-            if emitted_terminal or self._closed:
+            if emitted_terminal or closed:
                 return
             done_waiter = asyncio.create_task(self._done.wait())
             data_waiter = asyncio.create_task(waiter.wait())
@@ -251,16 +317,22 @@ class RedisStreamBuffer(StreamBuffer):
         # Serialised: seq is assigned in this process, so two concurrent
         # appends could otherwise claim the same number.
         async with self._write_lock:
+            if _is_final_client_frame(type_, data):
+                self._finishing = True
             seq = self._next_seq
             self._next_seq += 1
-            r = get_redis()
-            await r.xadd(self.key, {
-                "seq": str(seq),
-                "ts": now_iso(),
-                "type": type_,
-                "data": json.dumps(data or {}),
-            })
-            await r.expire(self.key, REDIS_BUFFER_TTL_SECONDS)
+            # One round trip per frame, with the TTL refresh in the same
+            # transaction as the write, so a connection lost mid-append cannot
+            # leave a stream with no TTL.
+            async with get_redis().pipeline(transaction=True) as pipe:
+                pipe.xadd(self.key, {
+                    "seq": str(seq),
+                    "ts": now_iso(),
+                    "type": type_,
+                    "data": json.dumps(data or {}),
+                })
+                pipe.expire(self.key, REDIS_BUFFER_TTL_SECONDS)
+                await pipe.execute()
             return seq
 
     async def close(self, reason: TerminalReason, extra: dict | None = None) -> None:
@@ -324,6 +396,19 @@ class RedisStreamBuffer(StreamBuffer):
                     yield rec
                     if rec.is_terminal:
                         return
+
+    async def clear_if_ended(self) -> None:
+        """Delete this turn's stream when the turn that wrote it has ended.
+
+        A new turn writes here when the turn before it at the same number
+        saved no message, and its readers would replay that turn's records and
+        stop at its terminal record. A stream with no terminal record may
+        still be live on another replica, so it is left alone.
+        """
+        r = get_redis()
+        entries = await r.xrevrange(self.key, count=1)
+        if entries and self._record(entries[0][1]).is_terminal:
+            await r.delete(self.key)
 
     async def refresh(self) -> None:
         """Load latest_seq and is_closed from Redis.

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from uuid import UUID
 
+import pytest
 from sqlalchemy import create_engine
 from sqlmodel import Session, SQLModel
 
@@ -218,7 +220,7 @@ def test_execute_schedule_stamps_trace_identity(monkeypatch):
     captured: list = []
 
     class FakeHandler:
-        def __init__(self, session, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True):
             pass
 
         async def handle(self, request):
@@ -296,7 +298,7 @@ def test_execute_schedule_resolves_default_sentinel_to_none(monkeypatch):
     captured: list = []
 
     class FakeHandler:
-        def __init__(self, session, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True):
             pass
 
         async def handle(self, request):
@@ -347,7 +349,7 @@ def test_execute_schedule_passes_pinned_model_through(monkeypatch):
     captured: list = []
 
     class FakeHandler:
-        def __init__(self, session, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True):
             pass
 
         async def handle(self, request):
@@ -410,7 +412,7 @@ def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch, grante
     captured: dict = {}
 
     class FakeHandler:
-        def __init__(self, session, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True):
             captured["principal"] = principal
             captured["interactive"] = interactive
 
@@ -587,6 +589,8 @@ def test_turn_terminal_reason_with_real_registry_cancel(tmp_path):
     from cowork.streaming.buffer import FileStreamBuffer
     from cowork.streaming.registry import registry
 
+    from _fakes import opens
+
     buf = FileStreamBuffer(tmp_path / "turn.jsonl")
     conversation_id = "eng688-real-cancel-test"
 
@@ -606,8 +610,8 @@ def test_turn_terminal_reason_with_real_registry_cancel(tmp_path):
         handle = await registry.start(
             conversation_id=conversation_id,
             turn_id=0,
-            buffer=buf,
-            producer_coro=producer(),
+            open_buffer=opens(buf),
+            produce=lambda _buffer: producer(),
         )
         await started.wait()
         await registry.cancel(conversation_id)
@@ -641,7 +645,7 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
     from cowork.services.schedules import ScheduleService
 
     class FakeHandler:
-        def __init__(self, session, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True):
             pass
 
         async def handle(self, request):
@@ -679,6 +683,7 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
         fresh = ScheduleService(ScopedSession(check, SYSTEM_SCOPE)).get_schedule(schedule_id)
         run = ScheduleRunService(ScopedSession(check, SYSTEM_SCOPE)).list_runs(schedule_id)[0]
         state = {
+            "schedule_id": schedule_id,
             "run_status": run.status,
             "run_error": run.error,
             "run_conversation_id": run.conversation_id,
@@ -729,6 +734,52 @@ def test_execute_schedule_completed_is_success(monkeypatch):
     assert state["next_advanced"] is True
 
 
+def test_a_database_error_in_a_runs_last_writes_logs_its_schedule_and_conversation(
+    monkeypatch, caplog, owned_logger,
+):
+    """The outcome write and the finish write both fail on the database. The
+    database filter replaces each line with its type and call site, and the
+    schedule and conversation it concerned travel as record attributes, so
+    the line still says which schedule wedged."""
+    import logging
+
+    from sqlalchemy.exc import OperationalError
+
+    import cowork.scheduler as scheduler_mod
+
+    driver_text = "server closed the connection unexpectedly"
+
+    def connection_lost(session, **kwargs):
+        raise OperationalError("UPDATE schedule_runs SET private_statement_marker", {}, Exception(driver_text))
+
+    monkeypatch.setattr(scheduler_mod, "_record_turn_outcome", connection_lost)
+    monkeypatch.setattr(scheduler_mod, "_finish_run", connection_lost)
+    logged = owned_logger(scheduler_mod.logger.name)
+
+    state = _execute_with_terminal(monkeypatch, "completed")
+
+    schedule_id, conversation_id = state["schedule_id"], state["run_conversation_id"]
+    assert conversation_id is not None
+    errors = [r for r in caplog.records if r.name == scheduler_mod.logger.name and r.levelno == logging.ERROR]
+    assert len(errors) == 2, [r.getMessage() for r in errors]
+    for record in errors:
+        assert record.getMessage() == (
+            "Database operation failed: error_type=OperationalError sqlstate=unknown "
+            f"site=scheduler.execute_schedule:{record.lineno}"
+        )
+        assert (record.schedule_id, record.conversation_id) == (str(schedule_id), str(conversation_id))
+        assert record.exc_info is None
+        assert driver_text not in repr(record.__dict__)
+    # The run's failure is logged first, then the finish write's.
+    assert errors[0].lineno < errors[1].lineno
+    lines = [line for line in logged.output().splitlines() if "Database operation failed" in line]
+    assert len(lines) == 2
+    for line in lines:
+        assert f"[Schedule:{schedule_id}][Conversation:{conversation_id}]" in line
+    assert driver_text not in logged.output()
+    assert "private_statement_marker" not in logged.output()
+
+
 def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
     """The run's conversation is recorded as soon as it exists — not at
     finish — so the runs list can open a run that is still executing."""
@@ -756,7 +807,7 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
     seen: dict = {}
 
     class FakeHandler:
-        def __init__(self, session, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True):
             pass
 
         async def handle(self, request):
@@ -835,7 +886,7 @@ def test_execute_schedule_derives_service_principal_in_org_mode(monkeypatch, gra
     seen: dict = {}
 
     class FakeHandler:
-        def __init__(self, session, principal=None, interactive=True):
+        def __init__(self, *, principal=None, interactive=True):
             seen["principal"] = principal
 
         async def handle(self, request):
@@ -936,6 +987,92 @@ def test_missed_runs_once_near_catchup_boundary():
     due_ids = [s.id for s in _due_schedules(scoped, now)]
     assert inside.id in due_ids
     assert outside.id not in due_ids
+
+
+# --- A poll runs in a worker thread beside the run's units, so a run can end
+# between the poll's read of a schedule and its active-run check.
+
+def _file_engine(tmp_path):
+    """A SQLite file database, so the poll and the run each hold a connection
+    of their own and see each other's commits, as on Postgres."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'poll.db'}")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(Project(id=GENERAL_PROJECT_ID, name="general", path="/general"))
+        session.commit()
+    return engine
+
+
+@pytest.mark.parametrize(("cadence", "reason"), [("daily", "cancelled"), ("once", "error")])
+def test_a_poll_skips_a_slot_its_run_used_up_after_the_poll_read_it(tmp_path, monkeypatch, cadence, reason):
+    """The run records its outcome and its finish after the poll has read the
+    schedule and before the poll asks whether a run is active. The poll then
+    sees the slot as used: a Stopped daily run does not start again, and
+    neither does a one-off its failed run disabled."""
+    from cowork.scheduler import _finish_run, _poll, _record_turn_outcome
+
+    engine = _file_engine(tmp_path)
+    with Session(engine) as session:
+        schedule_id = _schedule(
+            session, cadence=cadence, next_run_at=datetime.now(timezone.utc) - timedelta(minutes=1)
+        ).id
+        run_id = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE)).create_run(
+            schedule_id, is_manual=False
+        ).id
+
+    has_active_run = ScheduleRunService.has_active_run
+    ended: list[UUID] = []
+
+    def the_run_ends_first(self, asked_id):
+        if not ended:
+            ended.append(asked_id)
+            with Session(engine) as run_session:
+                scoped = ScopedSession(run_session, SYSTEM_SCOPE)
+                outcome = _record_turn_outcome(
+                    scoped, schedule_id=schedule_id, reason=reason, is_manual=False, conversation_id=None,
+                )
+                _finish_run(scoped, run_id=run_id, conversation_id=None, error=outcome.error, status=outcome.status)
+        return has_active_run(self, asked_id)
+
+    monkeypatch.setattr(ScheduleRunService, "has_active_run", the_run_ends_first)
+
+    with Session(engine) as poll_session:
+        due = _poll(ScopedSession(poll_session, SYSTEM_SCOPE))
+
+    assert ended == [schedule_id]
+    assert due == []
+
+
+def test_a_poll_skips_a_schedule_deleted_after_the_poll_read_it(tmp_path, monkeypatch):
+    """A schedule deleted between the poll's read and its active-run check is
+    left out, and the poll still returns the other due schedules."""
+    from cowork.scheduler import _poll
+
+    engine = _file_engine(tmp_path)
+    due_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    with Session(engine) as session:
+        schedule_ids = {
+            _schedule(session, title="first", next_run_at=due_at).id,
+            _schedule(session, title="second", next_run_at=due_at).id,
+        }
+
+    has_active_run = ScheduleRunService.has_active_run
+    deleted: list[UUID] = []
+
+    def deleted_first(self, asked_id):
+        if not deleted:
+            deleted.append(asked_id)
+            with Session(engine) as other:
+                ScheduleService(ScopedSession(other, SYSTEM_SCOPE)).delete_schedule(asked_id)
+        return has_active_run(self, asked_id)
+
+    monkeypatch.setattr(ScheduleRunService, "has_active_run", deleted_first)
+
+    with Session(engine) as poll_session:
+        due = _poll(ScopedSession(poll_session, SYSTEM_SCOPE))
+
+    assert len(deleted) == 1
+    assert due == list(schedule_ids - set(deleted))
 
 
 # --- ENG-769: reap orphaned `running` runs left by a crash/restart.
