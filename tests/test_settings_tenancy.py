@@ -65,7 +65,7 @@ def test_provider_config_is_org_scoped():
 def test_ui_and_model_choice_are_user_scoped():
     for key in (
         "tone", "greeting", "planning_model", "coding_reasoning_effort",
-        "router_reasoning_effort", "auto_pin",
+        "router_reasoning_effort", "auto_pin", "favicon",
     ):
         assert setting_is_org_scoped(key) is False
 
@@ -95,6 +95,17 @@ def test_user_key_isolated_between_users_of_same_org(engine):
     assert _svc(engine, _org(ORG_A, "alice")).get_setting("tone").value == "spicy"
     # bob has no personal tone and no org/global override → field default
     assert _svc(engine, _org(ORG_A, "bob")).get_setting("tone").value == "balanced"
+
+
+@pytest.mark.parametrize("other_scope", [_org(ORG_A, "bob"), _org(ORG_B, "alice")])
+def test_favicon_is_isolated_by_member_and_organization(engine, other_scope):
+    favicon = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'/%3E"
+    owner = _org(ORG_A, "alice")
+    _svc(engine, owner).upsert_setting("favicon", favicon)
+
+    assert _svc(engine, owner).get_setting("favicon").value == favicon
+    assert _svc(engine, other_scope).get_setting("favicon").value == ""
+    assert _svc(engine, LOCAL_SCOPE).get_setting("favicon").value == ""
 
 
 def test_user_write_requires_user_in_scope(engine):
