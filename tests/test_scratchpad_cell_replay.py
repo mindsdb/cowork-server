@@ -85,9 +85,10 @@ def test_events_that_are_not_objects_are_skipped():
 
 
 def test_dropping_events_outside_the_replay_roles_keeps_the_cells():
-    """The harness filters events by SCRATCHPAD_REPLAY_ROLES in SQL. If the
-    extractor ever reacts to another thought_role, this fails, rather than the
-    SQL filter silently dropping the events it needs."""
+    """The harness reads only the events whose thought_role is one of
+    SCRATCHPAD_REPLAY_ROLES. If the extractor ever reacts to another
+    thought_role, this fails, rather than that read silently dropping the
+    events it needs."""
     rng = random.Random(3362)
     pool = [
         _start,

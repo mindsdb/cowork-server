@@ -11,7 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from uuid import UUID
 
-from sqlalchemy import case, func, tuple_
+from sqlalchemy import Text, case, cast, func, or_, tuple_
 from sqlalchemy import select as sa_select
 
 from cowork.common.paths import (
@@ -1085,27 +1085,39 @@ class ConversationService:
 
         For a reader that replays the history after its session has closed, as
         the harness does with what its database unit read. The events are
-        filtered in SQL, so a long conversation does not load every text delta
-        and progress event it ever stored only to have them skipped."""
+        prefiltered in SQL, so a long conversation does not load every text
+        delta and progress event it ever stored only to have them skipped."""
         stmt = self._ordered_messages(conversation_id, include_pending=False)
         messages = list(self.session.exec(stmt).all())
         if not messages:
             return ReplayHistory(messages=[], events=[])
-        events = self.session.exec(self._replay_events(conversation_id, event_roles=event_roles)).all()
-        return ReplayHistory(messages=messages, events=[event.event_data for event in events])
+        rows = self.session.exec(self._replay_events(conversation_id, event_roles=event_roles)).all()
+        events = [
+            row.event_data for row in rows
+            if isinstance(row.event_data, dict) and row.event_data.get("thought_role") in event_roles
+        ]
+        return ReplayHistory(messages=messages, events=events)
 
     def _replay_events(self, conversation_id: UUID, *, event_roles: tuple[str, ...]):
         # The relationship orders each message's events by sequence_number, so
         # history order then sequence_number is the order a per-message read
-        # gives. JSON_EXTRACT on SQLite and ->> on Postgres both give NULL for
-        # an event_data that is not an object, which the IN never matches.
-        # SQLite reads a stored NaN (json.dumps writes it bare) only from 3.42.
+        # gives.
+        #
+        # The filter looks for each role in the event's stored JSON text, where
+        # json.dumps writes a plain ASCII role unescaped, and get_replay_history
+        # then keeps only the events whose thought_role is one of them. No JSON
+        # is parsed in SQL: Postgres's ->> decodes every string escape in the
+        # document and raises on a \u0000 or a lone surrogate anywhere in it,
+        # both of which a json column stores as written, and SQLite before 3.42
+        # rejects a bare NaN. Postgres's json::text and SQLite's TEXT both
+        # return the text as stored.
+        stored_text = cast(MessageEvent.event_data, Text)
         return (
             self.session.select(MessageEvent)
             .join(Message, Message.id == MessageEvent.message_id)
             .where(Message.conversation_id == conversation_id)
             .where(Message.pending == False)  # noqa: E712 — SQL boolean column, not Python identity
-            .where(MessageEvent.event_data["thought_role"].as_string().in_(event_roles))
+            .where(or_(*(stored_text.contains(role) for role in event_roles)))
             .order_by(*_MESSAGE_ORDER, MessageEvent.sequence_number)
         )
 

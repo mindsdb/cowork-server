@@ -257,9 +257,9 @@ def test_replay_history_rebuilds_the_same_cells(engine, session, conversation):
 
 
 def test_replay_history_reads_an_event_with_a_non_finite_float(session, conversation):
-    """json.dumps writes NaN bare and SQLite stores it as written. The replay
-    filter's JSON_EXTRACT reads such a row only on SQLite 3.42 or later; an
-    older SQLite raises "malformed JSON" on every later turn instead."""
+    """json.dumps writes NaN bare and SQLite stores it as written. SQLite's
+    JSON functions reject such a row before 3.42, so the replay read, which
+    parses no JSON in SQL, reads it on any SQLite."""
     _add_message(session, conversation, role=Role.user, content="q", seq=0, events=[])
     _add_message(
         session, conversation, role=Role.assistant, content="a", seq=1,
@@ -296,12 +296,69 @@ def test_replay_history_of_a_history_with_no_rows_issues_no_events_query(engine,
     assert not any("message_events" in s for s in statements)
 
 
-def test_replay_events_filter_compiles_to_json_operators(session, conversation):
-    """No unit lane runs Postgres, so the filter's SQL is checked per dialect."""
+def test_replay_history_reads_events_postgres_cannot_decode(session, conversation):
+    """A raw tool result is stored under thought.scratchpad.result as it came,
+    NUL bytes included, and a progress line can name a file Python decoded
+    with surrogateescape. json.dumps writes those as \\u0000 and \\udcff,
+    which a Postgres json column stores as written but its ->> refuses to
+    decode anywhere in the document, so one such row would fail every later
+    turn. SQLite decodes both, so the next test pins the SQL itself."""
+    raw_tool_result = {
+        "type": "response.in_progress", "thought_role": "thought.scratchpad.result",
+        "content": "col_a\x00col_b",
+    }
+    undecodable_filename = {
+        "type": "response.in_progress", "thought_role": "thought.progress",
+        "content": "reading caf\udcff.csv",
+    }
+    _add_message(session, conversation, role=Role.user, content="q", seq=0, events=[])
+    _add_message(
+        session, conversation, role=Role.assistant, content="a", seq=1,
+        events=[undecodable_filename, _exec_end(), _result("x"), raw_tool_result],
+    )
+
+    history = ConversationService(session).get_replay_history(
+        conversation.id, event_roles=SCRATCHPAD_REPLAY_ROLES,
+    )
+
+    assert history.events == [_exec_end(), _result("x"), raw_tool_result]
+    assert [c.code for c in extract_scratchpad_cells(history.events)] == ["x"]
+
+
+def test_replay_events_filter_parses_no_json_in_sql(session, conversation):
+    """No unit lane runs Postgres, so the filter's SQL is checked per dialect.
+    It reads each event's stored text: Postgres's ->> raises on a \\u0000 or
+    a lone surrogate escape anywhere in an event, and SQLite's JSON functions
+    reject a bare NaN before 3.42."""
     stmt = ConversationService(session)._replay_events(conversation.id, event_roles=SCRATCHPAD_REPLAY_ROLES)
 
-    assert "->>" in str(stmt.compile(dialect=postgresql.dialect()))
-    assert "JSON_EXTRACT" in str(stmt.compile(dialect=sqlite.dialect()))
+    for dialect in (postgresql.dialect(), sqlite.dialect()):
+        sql = str(stmt.compile(dialect=dialect))
+        assert "->" not in sql and "JSON" not in sql.upper(), sql
+        assert "CAST(message_events.event_data AS TEXT) LIKE" in sql, sql
+
+
+def test_replay_history_keeps_only_events_whose_thought_role_matches(session, conversation):
+    """The SQL filter finds a role anywhere in an event's text, so the read
+    narrows what it returns to the events whose thought_role is the role."""
+    _add_message(session, conversation, role=Role.user, content="q", seq=0, events=[])
+    _add_message(
+        session, conversation, role=Role.assistant, content="a", seq=1,
+        events=[
+            {"type": "response.in_progress", "thought_role": "thought.progress",
+             "content": "waiting for thought.scratchpad.result"},
+            "thought.scratchpad.end",
+            _exec_end(),
+            {"type": "response.output_text.delta", "delta": "thought.scratchpad.end"},
+            _result("x"),
+        ],
+    )
+
+    history = ConversationService(session).get_replay_history(
+        conversation.id, event_roles=SCRATCHPAD_REPLAY_ROLES,
+    )
+
+    assert history.events == [_exec_end(), _result("x")]
 
 
 def _text_delta(text: str, seq: int) -> dict:
