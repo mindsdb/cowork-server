@@ -32,7 +32,7 @@ from cowork.turnqueue.auth_keys import (
     mint_turn_key_details,
     register_datasource_grants,
 )
-from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnReply
+from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnReply, TurnReplyHeader
 from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.redis_client import cancel_cause_key, cancel_flag_key, get_redis, reply_stream_key
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host, get_app_settings
@@ -669,12 +669,15 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         for _stream, entries in resp:
             for entry_id, fields in entries:
                 last_id = entry_id
-                reply = TurnReply.model_validate_json(fields["payload"])
-                if reply.correlation_id != corr:
-                    # Deliberately does NOT refresh the idle clock: liveness
-                    # means "this turn is progressing", and another turn's
-                    # replies say nothing about ours.
+                if TurnReplyHeader.model_validate_json(fields["payload"]).correlation_id != corr:
+                    # Skipped before its kind is validated: an earlier turn
+                    # still finishing after Stop or the idle timeout can write
+                    # a kind this build does not know, and that must not fail
+                    # this turn. Deliberately does NOT refresh the idle clock:
+                    # liveness means "this turn is progressing", and another
+                    # turn's replies say nothing about ours.
                     continue
+                reply = TurnReply.model_validate_json(fields["payload"])
                 last_reply_at = time.monotonic()
                 kind = reply.kind
                 data = reply.data or {}

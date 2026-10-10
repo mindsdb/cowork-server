@@ -1580,3 +1580,44 @@ async def test_an_earlier_turns_late_replies_are_skipped_and_keep_no_turn_alive(
     assert data["error"] == prod.UNRESPONSIVE_WORKER_ERROR
     # Eight reads each returned a late reply, and the first quiet one ended it.
     assert len(reads) == 9
+
+
+@pytest.mark.asyncio
+async def test_an_earlier_turns_reply_of_an_unknown_kind_after_the_start_id_is_skipped(monkeypatch):
+    """An earlier turn still finishing after Stop can write a kind this build
+    does not know after this turn's start id. It is another turn's reply, so
+    it is skipped before its kind is validated, and this turn completes."""
+    replied = False
+
+    async def an_earlier_turn_then_this_one_replies(xadd):
+        nonlocal replied
+        if not replied:
+            replied = True
+            await xadd(_REPLY_STREAM, _foreign_reply("turn_future"))
+            for kind, data in (_AUTHORIZED, ("turn_completed", {})):
+                await xadd(_REPLY_STREAM, _reply(kind, data))
+
+    _client, _reads = await _controller_redis(
+        monkeypatch, earlier=[], answer=[], before_each_read=an_earlier_turn_then_this_one_replies,
+    )
+
+    items = await asyncio.wait_for(_drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+    )), timeout=5)
+
+    assert items == [("turn_completed", {})]
+
+
+@pytest.mark.asyncio
+async def test_this_turns_own_reply_of_an_unknown_kind_still_fails_it(monkeypatch):
+    """Only another turn's reply is skipped unread. A kind this build does not
+    know on this turn's own reply means the controller and this build
+    disagree, and it fails the turn rather than being ignored."""
+    from pydantic import ValidationError
+
+    await _controller_redis(monkeypatch, earlier=[], answer=[_AUTHORIZED, ("turn_future", {})])
+
+    with pytest.raises(ValidationError, match="kind"):
+        await asyncio.wait_for(_drain(prod.stream_remote_replies(
+            conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+        )), timeout=5)
