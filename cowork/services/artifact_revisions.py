@@ -861,6 +861,8 @@ def create_agent_repair(
         "do not create a replacement artifact and do not resolve the comment yourself.\n\n"
         f"Artifact id: {artifact_id}\n"
         f"Source path: {source['path']}\n"
+        "Find the artifact with `list_artifacts` by passing this artifact id in "
+        "`match`; `Source path` is relative to the artifact folder.\n"
         f"Base revision: {current['id']}\n"
         f"Repair id: {repair_id}\n"
         f"Selected element: {selector or 'General artifact feedback'}\n"
