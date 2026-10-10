@@ -717,6 +717,22 @@ class UserSettings(Settings):
         title="Memory Enabled",
         description="Enable conversation memory.",
     )
+    # The shared browser (ENG-3298). Untagged, so per-user in org mode and the
+    # single global row on desktop, like `hub_workspace_id`: it is the person's
+    # own MindsHub browser instance, not org configuration.
+    browser_enabled: bool = Field(
+        default=False,
+        title="Browser Enabled",
+        description="Let the agent use your MindsHub browser, shown beside the chat.",
+    )
+    # Written by POST /browse/provision from MindsHub's answer, never typed by
+    # the user; `services.browser.valid_endpoint` refuses anything but a
+    # hosted br- instance before it reaches anton.
+    browser_url: str = Field(
+        default="",
+        title="Browser Instance",
+        description="Your MindsHub browser instance, set when it is provisioned.",
+    )
     # `hub_workspace_id`, not `workspace_id`: in this repo `workspace` already
     # means a filesystem location (the per-conversation private directory, the
     # project tree, the paths on AntonSettings), and that meaning is load-bearing

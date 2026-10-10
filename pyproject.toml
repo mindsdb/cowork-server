@@ -176,7 +176,9 @@ packages = ["cowork"]
 # capability gate) and `handlers/turn_errors.py` (the legacy 401 classifier)
 # predate the `anton-agent` floor above, which no longer admits a release that
 # needs them.
-anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
+# TEMPORARY (ENG-3298): the browser tool's anton branch (mindsdb/anton#540),
+# so this PR's environment and tests run with it. Back to `main` before merge.
+anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "jorge/eng-3296-browser-anton-browser-tool-skill-and-login-memory-anton" }
 
 [dependency-groups]
 dev = [
