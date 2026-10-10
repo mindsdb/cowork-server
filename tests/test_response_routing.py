@@ -817,6 +817,12 @@ async def test_pre_minted_binding_skips_settings_and_is_used(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch):
+    import json
+
+    import httpx2 as httpx
+    import openai
+    from anton.core.llm.tracing import TraceContext, reset_trace_context, set_trace_context
+
     import cowork.handlers.responses as responses
     import cowork.turnqueue.producer as producer
     from cowork.common.settings.user_settings import Provider
@@ -835,8 +841,28 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
             hub_workspace_id="ws-1",
         ),
     )
-    block = {"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "http://gw/v1"}
+    block = {"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "https://llm.mdb.ai/v1"}
     minted = {}
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        chunk = {
+            "id": "chatcmpl-router", "object": "chat.completion.chunk", "created": 0,
+            "model": "mindshub_air",
+            "choices": [{"index": 0, "delta": {"content": "Hello."}, "finish_reason": "stop"}],
+        }
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"},
+            content=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    real_client = openai.AsyncOpenAI
+    monkeypatch.setattr(
+        openai, "AsyncOpenAI",
+        lambda **kwargs: real_client(http_client=http_client, max_retries=0, **kwargs),
+    )
 
     async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
         minted["corr"] = correlation_id
@@ -845,14 +871,31 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
 
     monkeypatch.setattr(producer, "_mint_llm_block", fake_mint)
 
-    binding, turn_llm = await handler._router_binding()
+    trace_token = set_trace_context(TraceContext(session_id="conv-router"))
+    try:
+        binding, turn_llm = await handler._router_binding()
+        decision = await decide_route(
+            history=[{"role": "user", "content": "Hello"}],
+            has_non_text_input=False,
+            has_attachments=False,
+            has_disabled_connections=False,
+            binding=binding,
+        )
+    finally:
+        reset_trace_context(trace_token)
+        await http_client.aclose()
 
     assert binding is not None
     assert binding.label == "minds_cloud"
     assert binding.model == "mindshub_air"
     assert type(binding.provider).__name__ == "OpenAIProvider"
-    # anton reports it as the gate call's role, so its tokens sum under router.
-    assert binding.provider.trace_role == "router"
+    assert decision.route == DIRECT_CONTEXT
+    assert len(requests) == 1
+    assert requests[0].headers["Langfuse-Session-Id"] == "conv-router"
+    # Exercise the installed Anton: assigning the attribute alone also passes
+    # with an older dependency that never reads it when building headers.
+    metadata = json.loads(requests[0].headers["Langfuse-Metadata"])
+    assert metadata["role"] == "router"
     assert turn_llm == {"correlation_id": minted["corr"], "llm": block}
     # The routing gate's own pre-mint must carry the caller's picked workspace
     # too — this key is what a delegated remote turn ends up reusing as its
