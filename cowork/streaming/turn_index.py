@@ -18,6 +18,9 @@ from __future__ import annotations
 import logging
 import time
 
+from redis.asyncio import Redis
+from redis.exceptions import WatchError
+
 from cowork.turnqueue.redis_client import get_redis, get_sync_redis
 
 logger = logging.getLogger(__name__)
@@ -49,16 +52,20 @@ async def record_turn(
     """
     r = client or get_redis()
     key = _turn_key(conversation_id)
-    await r.delete(key)
-    await r.hset(key, mapping={
-        "turn_id": str(turn_id),
-        "correlation_id": correlation_id,
-        "org_id": org_id or "",
-        "user_id": user_id or "",
-        "started_at": str(time.time()),
-    })
-    await r.expire(key, TURN_INDEX_TTL_SECONDS)
-    await r.sadd(_TURNS_SET, conversation_id)
+    # One MULTI, so no reader finds the hash empty between its DELETE and its
+    # HSET, which list_turns would read as an expired turn.
+    async with r.pipeline(transaction=True) as pipe:
+        pipe.delete(key)
+        pipe.hset(key, mapping={
+            "turn_id": str(turn_id),
+            "correlation_id": correlation_id,
+            "org_id": org_id or "",
+            "user_id": user_id or "",
+            "started_at": str(time.time()),
+        })
+        pipe.expire(key, TURN_INDEX_TTL_SECONDS)
+        pipe.sadd(_TURNS_SET, conversation_id)
+        await pipe.execute()
 
 
 async def get_turn(conversation_id: str) -> dict | None:
@@ -109,5 +116,28 @@ async def list_turns() -> list[dict]:
             continue
         out.append({"conversation_id": conversation_id, **turn})
     if expired:
-        await r.srem(_TURNS_SET, *expired)
+        await _prune(r, expired)
     return out
+
+
+async def _prune(r: Redis, conversation_ids: list[str]) -> None:
+    """Remove these members from the set if each one's hash is still gone.
+
+    A turn can be recorded after list_turns read its conversation's hash as
+    expired. Its SADD is then a no-op, so a plain SREM landing after it would
+    hide a running turn from /in-flight-list until the conversation's next
+    turn. So the SREM runs only while every hash is still missing, under a
+    WATCH that aborts it if one is written before it lands. A prune that does
+    not run leaves its members to the next list."""
+    keys = [_turn_key(conversation_id) for conversation_id in conversation_ids]
+    try:
+        async with r.pipeline(transaction=True) as pipe:
+            await pipe.watch(*keys)
+            if await pipe.exists(*keys):
+                await pipe.reset()
+                return
+            pipe.multi()
+            pipe.srem(_TURNS_SET, *conversation_ids)
+            await pipe.execute()
+    except WatchError:
+        return

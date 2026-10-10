@@ -8,6 +8,8 @@ import pytest
 from cowork.handlers import turn_errors as te
 from cowork.turnqueue import producer as prod
 
+from _fakes import QueuedPipeline
+
 
 @pytest.fixture(autouse=True)
 def _stub_llm_mint(monkeypatch):
@@ -40,6 +42,7 @@ class FakeRedis:
     async def expire(self, key, seconds): return 1
     async def delete(self, *keys): return len(keys)
     async def xrevrange(self, key, count=None): return []
+    def pipeline(self, transaction=True): return QueuedPipeline(self)
 
     async def xadd(self, stream, fields):
         self.added.append((stream, fields))
@@ -872,6 +875,9 @@ class SilentRedis:
 
     async def xrevrange(self, key, count=None):
         return []
+
+    def pipeline(self, transaction=True):
+        return QueuedPipeline(self)
 
     async def xadd(self, stream, fields):
         self.added.append((stream, fields))
