@@ -43,6 +43,8 @@ class InferenceKey:
     organization_id: str
     instance_id: str
     expires_at: datetime
+    # The desktop's workspace pick it was minted for; None is the org's Default.
+    workspace_id: str | None = None
 
 
 def _org_mode() -> bool:

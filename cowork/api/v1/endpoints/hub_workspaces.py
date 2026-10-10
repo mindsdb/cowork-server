@@ -38,6 +38,7 @@ and talked the refusal into accepting it.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Annotated
 
@@ -45,6 +46,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlmodel import Session
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.common.settings import runtime_credential
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
 from cowork.principal import hub_credential
@@ -58,6 +60,7 @@ from cowork.services.hub_workspaces import (
     resolve_active,
     selectable,
 )
+from cowork.services.inference_key import refresh_inference_key
 from cowork.services.settings import SettingService
 
 logger = logging.getLogger(__name__)
@@ -155,4 +158,9 @@ async def set_active_hub_workspace(
         )
 
     SettingService(session, scope).upsert_setting(SETTING_KEY, body.workspace_id)
+    # On a desktop, bill the new workspace from the next LLM call, not the next re-mint.
+    # Both are None in org mode, where every turn mints its own key.
+    token, organization_id = runtime_credential.get_minds_credential(), runtime_credential.get_organization()
+    if token and organization_id:
+        await asyncio.to_thread(refresh_inference_key, token, organization_id)
     return await _build_view(request, session, scope)

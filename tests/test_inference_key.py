@@ -1,7 +1,7 @@
 """The turn key that pins the desktop's LLM billing to its mounted organization."""
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -131,6 +131,44 @@ class TestRefresh:
 
         assert runtime_credential.get_inference_key() is None
         http.schedule_retry.assert_called_once()
+
+    def test_mints_for_the_desktop_workspace_pick(self, http):
+        with patch.object(inference_key, "desktop_workspace_pick", return_value="ws-1"):
+            inference_key.refresh_inference_key("jwt", ORG_A)
+
+        assert http.post.call_args.kwargs["json"]["workspace_id"] == "ws-1"
+        assert runtime_credential.get_inference_key().workspace_id == "ws-1"
+
+    def test_no_pick_sends_no_workspace(self, http):
+        with patch.object(inference_key, "desktop_workspace_pick", return_value=None):
+            inference_key.refresh_inference_key("jwt", ORG_A)
+
+        assert "workspace_id" not in http.post.call_args.kwargs["json"]
+
+    def test_a_changed_pick_mints_at_once(self, http):
+        runtime_credential.set_inference_key(_key(minutes_left=29))
+
+        with patch.object(inference_key, "desktop_workspace_pick", return_value="ws-2"):
+            inference_key.refresh_inference_key("jwt", ORG_A)
+
+        assert runtime_credential.get_inference_key().workspace_id == "ws-2"
+
+    def test_a_stale_pick_falls_back_to_the_default(self, http):
+        refused, minted = MagicMock(), MagicMock()
+        refused.json.return_value = {"code": "workspace_not_found"}
+        minted.json.return_value = {"key": "mdb_default"}
+        http.post.side_effect = [refused, minted]
+
+        with patch.object(
+            inference_key, "desktop_workspace_pick", return_value="ws-gone"
+        ):
+            inference_key.refresh_inference_key("jwt", ORG_A)
+
+        assert "workspace_id" not in http.post.call_args_list[1].kwargs["json"]
+        held = runtime_credential.get_inference_key()
+        assert held.value == "mdb_default"
+        # Recorded against the pick, so the next hand-over doesn't re-mint for it again.
+        assert held.workspace_id == "ws-gone"
 
     def test_a_successful_mint_schedules_no_retry(self, http):
         inference_key.refresh_inference_key("jwt", ORG_A)
