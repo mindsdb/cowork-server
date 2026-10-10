@@ -938,7 +938,7 @@ async def test_a_stop_while_the_artifact_record_waits_for_a_slot_still_writes_it
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("cleanup_tmp_projects")
 async def test_a_stop_while_the_artifact_record_times_out_still_logs_the_unrecorded_slugs(
-    monkeypatch, tmp_path, caplog,
+    monkeypatch, tmp_path, caplog, owned_logger,
 ):
     """The pod finished cleanly and created an artifact, and a Stop lands
     while the unit that records it waits for a slot that stays taken past
@@ -949,7 +949,6 @@ async def test_a_stop_while_the_artifact_record_times_out_still_logs_the_unrecor
 
     from cowork.db import units
     from cowork.db.scoped import TenantScope
-    from cowork.db.units import DatabaseBusy
     from test_artifact_ownership import make_conversation, make_project, project_root, write_artifact
 
     org_id, creator = str(uuid4()), str(uuid4())
@@ -962,7 +961,7 @@ async def test_a_stop_while_the_artifact_record_times_out_still_logs_the_unrecor
     _units_on_the_test_database(monkeypatch, scope=scope)
     _no_workspace_or_memory_units(monkeypatch)
     monkeypatch.setattr(units.db_session.settings.database, "pool_timeout", 1)
-    monkeypatch.setattr(responses_mod.logger, "disabled", False)
+    logged = owned_logger(responses_mod.logger.name)
     monkeypatch.setattr(units.logger, "disabled", False)
     monkeypatch.setattr(
         ResponsesHandler, "_remote_artifacts_context",
@@ -1009,8 +1008,20 @@ async def test_a_stop_while_the_artifact_record_times_out_still_logs_the_unrecor
         if r.name == responses_mod.logger.name and r.levelno == logging.ERROR
     ]
     assert len(errors) == 1, [r.getMessage() for r in caplog.records]
-    assert slug in errors[0].getMessage() and str(conversation_id) in errors[0].getMessage()
-    assert isinstance(errors[0].exc_info[1], DatabaseBusy)
+    # The database filter replaces the message; the slug and ids travel as
+    # record attributes, which the console line renders.
+    record = errors[0]
+    assert record.getMessage().startswith(
+        "Database operation failed: error_type=DatabaseBusy sqlstate=unknown site=responses.record:"
+    )
+    assert (record.project_id, record.conversation_id, record.artifact_slugs) == (
+        str(project.id), str(conversation_id), (slug,),
+    )
+    assert record.exc_info is None
+    assert "POOL_TIMEOUT" not in repr(record.__dict__)
+    [line] = [line for line in logged.output().splitlines() if "Database operation failed" in line]
+    assert f"[Project:{project.id}][Conversation:{conversation_id}][Artifacts:{slug!r}]" in line
+    assert "POOL_TIMEOUT" not in logged.output()
     assert not [
         r for r in caplog.records
         if r.name == units.logger.name and "caller was cancelled" in r.getMessage()
@@ -1403,6 +1414,49 @@ async def test_produce_remote_failure_frame_and_log_both_carry_the_request_id(mo
         for r in caplog.records
         if r.levelno >= logging.WARNING
     )
+
+
+@pytest.mark.asyncio
+async def test_a_remote_content_repair_logs_the_mapped_type_and_code_never_the_pods_text(monkeypatch, caplog):
+    """The pod's error string quotes the provider. The repair line names the
+    mapped type and the classified code, and every line names the code as
+    error_code=, which the self-hosted archive does not mask."""
+    from cowork.handlers.turn_errors import CONTENT_TOO_LARGE_CODE
+
+    sentinel = "SECRET-PROMPT-TEXT"
+    handler = _remote_handler(monkeypatch, {})
+    _no_workspace_or_memory_units(monkeypatch)
+    monkeypatch.setattr(
+        responses_mod.ConversationService, "repair_image_content",
+        lambda self, conv_id: ["message-1"], raising=False,
+    )
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_failed", {
+            "error": f"ContentTooLargeError: The image is too large. The provider said: {sentinel}",
+            "code": CONTENT_TOO_LARGE_CODE, "message": "The image is too large.",
+        }
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    conv_id = uuid4()
+    with caplog.at_level(logging.WARNING, logger=responses_mod.logger.name):
+        await handler._produce_remote(
+            conv_id=conv_id, input_text="hi", original_content="hi",
+            model="anton", harness_id="anton", buffer=_RecBuffer(),
+            turn_llm={"correlation_id": "corr-repair"},
+        )
+
+    records = [r for r in caplog.records if r.name == responses_mod.logger.name]
+    [repair] = [r for r in records if r.levelno == logging.WARNING and "repaired" in r.getMessage()]
+    assert repair.getMessage() == (
+        "[responses] content validation error; repaired 1 message(s) with image content: "
+        "error_type=ContentTooLargeError error_code=content_too_large"
+    )
+    assert (repair.request_id, repair.conversation_id) == ("corr-repair", str(conv_id))
+    for record in records:
+        assert sentinel not in repr(record.__dict__)
+        assert " code=" not in record.getMessage()
 
 
 @pytest.mark.asyncio
@@ -2022,11 +2076,12 @@ def _artifacts_context_at(monkeypatch, artifacts_base):
             str(conversation.project_id), conversation.project.name,
         )),
     )
+    return conversation
 
 
 @pytest.mark.asyncio
 async def test_a_remote_artifact_record_that_fails_logs_the_unrecorded_slugs_as_an_error(
-    monkeypatch, tmp_path, caplog,
+    monkeypatch, tmp_path, caplog, owned_logger,
 ):
     """The unit that records the folders a remote turn created finds no
     connection. In org mode no later turn records them, so the failure is
@@ -2034,14 +2089,15 @@ async def test_a_remote_artifact_record_that_fails_logs_the_unrecorded_slugs_as_
     from cowork.db.units import DatabaseBusy
     from cowork.services import task_objects
 
+    busy_text = "no database connection freed within POOL_TIMEOUT"
     handler = _remote_handler(monkeypatch, {})
     artifacts_base = tmp_path / "proj" / ".anton" / "artifacts"
     artifacts_base.mkdir(parents=True)
-    _artifacts_context_at(monkeypatch, artifacts_base)
+    project_id = _artifacts_context_at(monkeypatch, artifacts_base).project_id
     _no_workspace_or_memory_units(monkeypatch)
 
     def no_connection(session, **kwargs):
-        raise DatabaseBusy("no database connection freed within POOL_TIMEOUT")
+        raise DatabaseBusy(busy_text)
 
     monkeypatch.setattr(task_objects, "record_new_artifacts", no_connection)
 
@@ -2057,7 +2113,7 @@ async def test_a_remote_artifact_record_that_fails_logs_the_unrecorded_slugs_as_
         yield "turn_completed", {}
 
     monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
-    monkeypatch.setattr(responses_mod.logger, "disabled", False)
+    logged = owned_logger(responses_mod.logger.name)
 
     with caplog.at_level(logging.WARNING, logger=responses_mod.logger.name):
         await handler._produce_remote(
@@ -2070,8 +2126,20 @@ async def test_a_remote_artifact_record_that_fails_logs_the_unrecorded_slugs_as_
         if r.name == responses_mod.logger.name and r.levelno == logging.ERROR
     ]
     assert len(errors) == 1, [r.getMessage() for r in errors]
-    assert "sales-report" in errors[0].getMessage()
-    assert isinstance(errors[0].exc_info[1], DatabaseBusy)
+    # The database filter replaces the message; the slugs and ids travel as
+    # record attributes, which the console line renders.
+    record = errors[0]
+    assert record.getMessage().startswith(
+        "Database operation failed: error_type=DatabaseBusy sqlstate=unknown site=responses.record:"
+    )
+    assert (record.project_id, record.conversation_id, record.artifact_slugs) == (
+        str(project_id), str(conv_id), ("sales-report",),
+    )
+    assert record.exc_info is None
+    assert busy_text not in repr(record.__dict__)
+    [line] = [line for line in logged.output().splitlines() if "Database operation failed" in line]
+    assert f"[Project:{project_id}][Conversation:{conv_id}][Artifacts:'sales-report']" in line
+    assert busy_text not in logged.output()
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ from pathlib import Path
 from uuid import UUID
 
 
+from cowork.common.logger import log_context
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, scope_of_session
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
@@ -223,16 +224,29 @@ class TaskObjectService:
         # commit a half-applied batch of index rows along with it.
         if rekeys:
             actor = str(self.session.scope.user_id or creator)
+            # Plain values: a failed rekey commit expires every loaded row,
+            # and reading one back needs the session the failure broke.
+            dest_id, dest_name, conversation_id = dest.id, dest.name, conversation.id
             for old_slug, new_slug in rekeys:
                 try:
                     rekey_artifact_owner(
-                        self.session, src_root, old_slug, dest.id, new_slug, actor_id=actor
+                        self.session, src_root, old_slug, dest_id, new_slug, actor_id=actor
                     )
                 except Exception:
+                    # The record names the folder at its new address: a name
+                    # collision gives it a new slug in the destination.
                     logger.warning(
                         "Could not move the owner of artifact %r to project %r",
-                        old_slug, dest.name, exc_info=True,
+                        old_slug,
+                        dest_name,
+                        exc_info=True,
+                        extra=log_context(
+                            project_id=dest_id, conversation_id=conversation_id, artifact_slug=new_slug,
+                        ),
                     )
+                    # The next rekey and the caller's own writes need a
+                    # usable session.
+                    self.session.rollback()
         return moved
 
     @staticmethod
@@ -341,8 +355,9 @@ def record_new_artifacts(
 
     Each slug's write is tried on its own and rolled back when it fails, so
     one failure does not drop the slugs after it. A failure is logged at
-    ERROR with the conversation, the project and the slug, since the caller
-    never sees it.
+    ERROR with the conversation, the project and the slug as record
+    attributes, since the caller never sees it and a database error's
+    sanitized line keeps only those.
     """
     org_mode = bool(getattr(session.scope, "org_mode", False))
     if org_mode and not creator:
@@ -358,8 +373,9 @@ def record_new_artifacts(
         except Exception:
             session.rollback()
             logger.error(
-                "Could not index artifact %r for conversation %s in project %s",
-                slug, conversation_id, project_id, exc_info=True,
+                "Could not index an artifact",
+                exc_info=True,
+                extra=log_context(project_id=project_id, conversation_id=conversation_id, artifact_slug=slug),
             )
     if org_mode and creator and project_id:
         from cowork.services.artifact_ownership import record_artifact_owner
@@ -370,8 +386,9 @@ def record_new_artifacts(
             except Exception:
                 session.rollback()
                 logger.error(
-                    "Could not record the owner of artifact %r for conversation %s in project %s",
-                    slug, conversation_id, project_id, exc_info=True,
+                    "Could not record the owner of an artifact",
+                    exc_info=True,
+                    extra=log_context(project_id=project_id, conversation_id=conversation_id, artifact_slug=slug),
                 )
 
 
@@ -402,7 +419,11 @@ def _index_new_slugs(
                 creator=getattr(conversation, "created_by", None),
             )
     except Exception:
-        logger.warning("Could not index artifacts created this turn", exc_info=True)
+        logger.warning(
+            "Could not index artifacts created this turn",
+            exc_info=True,
+            extra=log_context(conversation_id=conversation_id, project_id=project_id, artifact_slugs=slugs or None),
+        )
 
 
 @dataclass(frozen=True)

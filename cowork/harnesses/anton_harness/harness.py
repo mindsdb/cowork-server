@@ -14,7 +14,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from cowork.build_info import account_kwargs, supported_kwargs, surface_kwarg
 from cowork.common.chat_session import build_chat_session, close_session_scratchpads
 from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
-from cowork.common.logger import get_logger
+from cowork.common.logger import get_logger, log_context
 from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import current_settings_scope
@@ -413,10 +413,10 @@ async def _read_attachments(conversation, *, scope: TenantScope | None) -> list[
         # the user no files were uploaded (the Cyberdeck bug this helper
         # exists to fix). Log it so the failure is diagnosable.
         logger.warning(
-            "Failed to build conversation attachment context for conversation %s; "
+            "Failed to build conversation attachment context; "
             "the agent will not see attached files this turn",
-            getattr(conversation, "id", "<unknown>"),
             exc_info=True,
+            extra=log_context(conversation_id=getattr(conversation, "id", None)),
         )
         return None
 
@@ -593,8 +593,8 @@ class AntonHarness:
                     )
                 except Exception:
                     logger.exception(
-                        "[anton_harness] failed to persist history compaction for conversation %s",
-                        conv_id,
+                        "[anton_harness] failed to persist history compaction",
+                        extra=log_context(conversation_id=conv_id),
                     )
             try:
                 changes = turn_artifact_changes(
@@ -618,7 +618,13 @@ class AntonHarness:
                         scope=turn_scope,
                     )
             except Exception:
-                logger.warning("Could not index artifacts created this turn", exc_info=True)
+                logger.warning(
+                    "Could not index artifacts created this turn",
+                    exc_info=True,
+                    extra=log_context(
+                        conversation_id=conv_id, project_id=conv_project_id, artifact_slugs=new_slugs or None,
+                    ),
+                )
             skill_drafts = finalize_turn_skill_drafts(project_path, before_drafts, before_strays)
 
         try:

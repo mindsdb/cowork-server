@@ -13,6 +13,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from uuid import UUID
 
+from cowork.common.logger import log_context
 from cowork.streaming.buffer import read_records
 from cowork.streaming.records import TerminalReason, TurnRecord, now_iso
 
@@ -172,8 +173,9 @@ def seal_orphan_turns_in_history(session, streams_root: Path) -> int:
             except Exception:
                 session.rollback()
                 logger.exception(
-                    "Could not seal orphan turn %d for conversation %s into history",
-                    turn_id, conversation_id,
+                    "Could not seal orphan turn %d into history",
+                    turn_id,
+                    extra=log_context(conversation_id=conversation_id),
                 )
     if sealed:
         logger.info("Sealed %d orphan turn(s) into conversation history on boot.", sealed)
