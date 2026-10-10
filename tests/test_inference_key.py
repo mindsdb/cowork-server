@@ -67,8 +67,12 @@ class TestInferenceCredential:
 
 @pytest.fixture
 def http():
-    with patch.object(inference_key, "httpx") as mock:
+    with (
+        patch.object(inference_key, "httpx") as mock,
+        patch.object(inference_key, "_schedule_retry") as retry,
+    ):
         mock.post.return_value.json.return_value = {"key": "mdb_new"}
+        mock.schedule_retry = retry
         yield mock
 
 
@@ -93,13 +97,14 @@ class TestRefresh:
 
         http.post.assert_not_called()
 
-    def test_an_ageing_key_is_replaced_and_revoked(self, http):
+    def test_an_ageing_key_is_replaced_but_not_revoked(self, http):
         runtime_credential.set_inference_key(_key(minutes_left=15))
 
         inference_key.refresh_inference_key("jwt", ORG_A)
 
         assert runtime_credential.get_inference_key().value == "mdb_new"
-        assert http.delete.call_args.args[0].endswith("/v1/turn-keys/desktop-old/")
+        # The scratchpad and coding sessions still hold it; it expires on its own.
+        http.delete.assert_not_called()
 
     def test_an_org_change_mints_at_once(self, http):
         runtime_credential.set_inference_key(_key(org=ORG_A, minutes_left=29))
@@ -116,6 +121,7 @@ class TestRefresh:
         inference_key.refresh_inference_key("jwt", ORG_A)
 
         assert runtime_credential.get_inference_key() == held
+        http.schedule_retry.assert_called_once()
 
     def test_a_failed_mint_drops_a_key_for_another_org(self, http):
         runtime_credential.set_inference_key(_key(org=ORG_A))
@@ -124,6 +130,12 @@ class TestRefresh:
         inference_key.refresh_inference_key("jwt", ORG_B)
 
         assert runtime_credential.get_inference_key() is None
+        http.schedule_retry.assert_called_once()
+
+    def test_a_successful_mint_schedules_no_retry(self, http):
+        inference_key.refresh_inference_key("jwt", ORG_A)
+
+        http.schedule_retry.assert_not_called()
 
     def test_a_failed_revoke_is_ignored(self, http):
         http.delete.side_effect = RuntimeError("auth down")
@@ -201,3 +213,29 @@ def test_org_mode_holds_no_org_or_key(monkeypatch):
         assert runtime_credential.get_inference_credential() is None
     finally:
         get_app_settings.cache_clear()
+
+
+class TestRetry:
+    def test_retries_with_the_latest_hand_over(self):
+        runtime_credential.set_minds_credential("jwt-latest")
+        runtime_credential.set_organization(ORG_A)
+        with patch.object(inference_key, "refresh_inference_key") as refresh:
+            inference_key._retry()
+
+        refresh.assert_called_once_with("jwt-latest", ORG_A)
+
+    def test_does_nothing_after_sign_out(self):
+        with patch.object(inference_key, "refresh_inference_key") as refresh:
+            inference_key._retry()
+
+        refresh.assert_not_called()
+
+    def test_only_one_retry_is_pending(self):
+        with patch.object(inference_key.threading, "Timer") as timer:
+            inference_key._schedule_retry()
+            first = timer.return_value
+            inference_key._schedule_retry()
+
+        first.cancel.assert_called_once()
+        assert timer.call_args.args == (inference_key._RETRY_S, inference_key._retry)
+        assert timer.return_value.daemon is True
