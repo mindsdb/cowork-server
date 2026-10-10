@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 import pytest
+from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, select
 
 from cowork.common.settings.app_settings import get_app_settings
@@ -192,6 +194,34 @@ def test_failed_history_recovery_retries_on_next_boot(
     assert [m.role for m in messages] == ["user", "assistant"]
     assert messages[1].content == "survives"
     assert _events_for(session, messages[1].id)[0].event_data["type"] == "response.failed"
+
+
+def test_a_database_error_while_sealing_names_the_conversation(
+    svc, conv, session, tmp_path, monkeypatch, owned_logger, caplog,
+):
+    # The database filter replaces the message, so the conversation survives
+    # only as a record attribute.
+    secret = "recovery_private_sql_marker"
+    svc.save_user_message(conv.id, "hello", pending=True)
+    _write_orphan_buffer(tmp_path, conv.id, 0, [DELTA.format("Hi")])
+
+    def fail_recover(self, *args, **kwargs):
+        raise OperationalError(f"UPDATE {secret}", {"value": secret}, Exception(secret))
+
+    monkeypatch.setattr(ConversationService, "recover_interrupted_turn", fail_recover)
+    logged = owned_logger(seal_orphan_turns_in_history.__module__)
+
+    assert seal_orphan_turns_in_history(ScopedSession(session, SYSTEM_SCOPE), tmp_path) == 0
+
+    [record] = [r for r in caplog.records if r.name == logged.logger.name and r.levelno == logging.ERROR]
+    assert record.getMessage() == (
+        "Database operation failed: error_type=OperationalError sqlstate=unknown "
+        f"site=recovery.seal_orphan_turns_in_history:{record.lineno}"
+    )
+    assert record.conversation_id == str(conv.id)
+    emitted = logged.output()
+    assert f"[Conversation:{conv.id}]: Database operation failed" in emitted
+    assert secret not in emitted
 
 
 def test_assistant_and_terminal_event_commit_together(svc, conv, session, monkeypatch):
