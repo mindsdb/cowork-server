@@ -653,13 +653,14 @@ async def test_handle_registers_vault_secrets_before_routing(monkeypatch):
 
     handler = _routing_handler(monkeypatch)
     conv_id = uuid4()
-    conversation = SimpleNamespace(id=conv_id, messages=[])
+    conversation = SimpleNamespace(id=conv_id)
     monkeypatch.setattr(
         responses,
         "ConversationService",
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: conversation,
-            get_ordered_messages=lambda _cid: [],
+            message_count=lambda _conversation: 0,
+            get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )
     calls = []
@@ -729,6 +730,9 @@ async def test_ineligible_route_skips_the_history_query(monkeypatch):
         def get_ordered_messages(self, *args, **kwargs):
             raise AssertionError("must not read the gate's history")
 
+        def get_recent_messages(self, *args, **kwargs):
+            raise AssertionError("must not read the gate's history")
+
     handler = _routing_handler(monkeypatch)
     monkeypatch.setattr(responses, "ConversationService", _NoHistory)
 
@@ -763,7 +767,7 @@ async def test_history_query_failure_fails_open(monkeypatch):
         responses,
         "ConversationService",
         lambda scoped: SimpleNamespace(
-            get_ordered_messages=lambda _cid: (_ for _ in ()).throw(RuntimeError("db down")),
+            get_recent_messages=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("db down")),
         ),
     )
     rolled_back = []
@@ -785,6 +789,76 @@ async def test_history_query_failure_fails_open(monkeypatch):
     assert decision.reason == "router_unavailable"
     assert decision.fallback is True
     assert turn_llm is None
+
+
+@pytest.mark.asyncio
+async def test_turn_start_counts_every_stored_row(monkeypatch):
+    """turn_id names the turn's stream buffer, and boot recovery indexes the
+    stored rows with it, so it counts every row: hidden tool rows and a
+    stranded pending question too. The gate reads the tail of the replayed
+    history. Neither read loads every stored row to get there."""
+    from functools import partial
+
+    from sqlalchemy import event
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.db.session import get_engine
+    from cowork.db.units import run_db
+    from cowork.handlers.response_routing import _MAX_HISTORY_MESSAGES
+    from cowork.schemas.responses import ResponsesRequest
+    from cowork.services.conversations import ConversationService
+    from cowork.services.projects import GENERAL_PROJECT_ID
+
+    tool_rows = [
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "x", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "r"}]},
+    ]
+
+    def seed(session):
+        service = ConversationService(session)
+        conversation = service.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
+        for turn in range(6):
+            service.save_user_message(conversation.id, f"question {turn}")
+            service.save_assistant_turn(conversation.id, f"answer {turn}", [], tool_rows=tool_rows)
+        service.save_user_message(conversation.id, "stranded", pending=True)
+        return conversation.id
+
+    def read_back(session, *, conversation_id):
+        service = ConversationService(session)
+        stored = service.get_ordered_messages(conversation_id, include_pending=True)
+        replayed = service.get_ordered_messages(conversation_id)
+        tail = [m.id for m in replayed if m.role in {"user", "assistant"}][-_MAX_HISTORY_MESSAGES:]
+        return len(stored), tail
+
+    conversation_id = await run_db(seed, scope=LOCAL_SCOPE)
+    handler = _routing_handler(monkeypatch)
+    engine = get_engine(get_app_settings().database.uri)
+    statements: list[str] = []
+
+    def record(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        start = await run_db(
+            partial(
+                handler._read_turn_start,
+                request=ResponsesRequest(input="Hello", conversation=str(conversation_id)),
+                has_disabled_connections=False,
+            ),
+            scope=LOCAL_SCOPE,
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    stored, tail = await run_db(partial(read_back, conversation_id=conversation_id), scope=LOCAL_SCOPE)
+
+    assert start.turn_id == stored == 6 * 4 + 1
+    assert [m.id for m in start.gate_rows] == tail
+    assert len(tail) == _MAX_HISTORY_MESSAGES
+    message_reads = [s for s in statements if "FROM messages" in s]
+    assert message_reads
+    assert [s for s in message_reads if "count(" not in s and "LIMIT" not in s] == []
 
 
 @pytest.mark.asyncio

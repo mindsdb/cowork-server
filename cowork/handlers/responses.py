@@ -797,7 +797,7 @@ class ResponsesHandler:
         # turn_id: prior message count. The current user message is NOT
         # persisted yet (deferred to the producer for the streaming path), so
         # this is a stable per-conversation index for the buffer file.
-        turn_id = len(conversation.messages)
+        turn_id = conversation_service.message_count(conversation)
 
         # Shape checks first: a turn the gate cannot route skips the history
         # read, as _route_request skips the gate.
@@ -822,11 +822,13 @@ class ResponsesHandler:
     @staticmethod
     def _read_gate_rows(session: ScopedSession, *, conversation_id: UUID) -> list[Message] | None:
         """The rows decide_route can use: user and assistant messages, at most
-        _MAX_HISTORY_MESSAGES, so scrubbing never pays for the whole
-        conversation. None when the read fails: routing failures send the turn
-        to the agent rather than failing it."""
+        _MAX_HISTORY_MESSAGES, so neither the read nor scrubbing pays for the
+        whole conversation. None when the read fails: routing failures send the
+        turn to the agent rather than failing it."""
         try:
-            rows = ConversationService(session).get_ordered_messages(conversation_id)
+            return ConversationService(session).get_recent_messages(
+                conversation_id, roles=(Role.user, Role.assistant), limit=_MAX_HISTORY_MESSAGES,
+            )
         except PoolTimeoutError:
             raise
         except Exception:
@@ -835,7 +837,6 @@ class ResponsesHandler:
             # loses nothing: creating or relinking above committed already.
             session.rollback()
             return None
-        return [m for m in rows if m.role in {"user", "assistant"}][-_MAX_HISTORY_MESSAGES:]
 
     async def _route_request(
         self,

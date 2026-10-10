@@ -33,7 +33,7 @@ from cowork.turnqueue.auth_keys import (
     mint_turn_key_details,
     register_datasource_grants,
 )
-from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnReply
+from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnReply, TurnReplyHeader
 from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.redis_client import cancel_cause_key, cancel_flag_key, get_redis, reply_stream_key
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host, get_app_settings
@@ -628,6 +628,13 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         project_id=project_id,
         params=params,
     )
+    # Read replies from after the reply stream's newest entry as it is now,
+    # before the job is queued. The controller cannot answer a job that is not
+    # queued yet, so every reply to this turn lands after that entry, and the
+    # earlier turns' replies the stream still holds (until the conversation has
+    # been quiet for an hour) are never read.
+    tail = await r.xrevrange(reply_stream, count=1)
+    last_id = tail[0][0] if tail else "0-0"
     # Registry first: a conversation whose stream exists but isn't registered would
     # be invisible to the controller. The reverse is harmless, it prunes empty queues.
     await r.sadd(f"{settings.jobs_stream}:queues", conversation_id)
@@ -641,12 +648,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         org_id=org_id, user_id=user_id, client=r,
     )
 
-    last_id = "0-0"
     authorized_workspace_mode = None
     idle_timeout = settings.reply_idle_timeout_seconds
     last_reply_at = time.monotonic()
     while True:
-        resp = await r.xread({reply_stream: last_id}, count=10, block=5000)
+        resp = await r.xread({reply_stream: last_id}, count=100, block=5000)
         if not resp:
             # Unbounded, this loop spun forever whenever the worker was down:
             # only a terminal reply ends the turn, so the SSE response never
@@ -664,12 +670,15 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         for _stream, entries in resp:
             for entry_id, fields in entries:
                 last_id = entry_id
-                reply = TurnReply.model_validate_json(fields["payload"])
-                if reply.correlation_id != corr:
-                    # Deliberately does NOT refresh the idle clock: liveness
-                    # means "this turn is progressing", and another turn's
-                    # replies say nothing about ours.
+                if TurnReplyHeader.model_validate_json(fields["payload"]).correlation_id != corr:
+                    # Skipped before its kind is validated: an earlier turn
+                    # still finishing after Stop or the idle timeout can write
+                    # a kind this build does not know, and that must not fail
+                    # this turn. Deliberately does NOT refresh the idle clock:
+                    # liveness means "this turn is progressing", and another
+                    # turn's replies say nothing about ours.
                     continue
+                reply = TurnReply.model_validate_json(fields["payload"])
                 last_reply_at = time.monotonic()
                 kind = reply.kind
                 data = reply.data or {}
