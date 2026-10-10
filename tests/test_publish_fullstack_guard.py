@@ -174,7 +174,7 @@ def test_share_route_answers_400_with_the_reason(fullstack, artifacts_base, publ
     app.include_router(publish_ep.router, prefix="/api/v1/publish")
     context = (fullstack, artifacts_base, "mdb_publish_secret", SELF_HOSTED_PUBLISH_URL)
 
-    with mock.patch.object(publish_ep, "_desktop_context", lambda raw: context):
+    with mock.patch.object(publish_ep, "_desktop_context", lambda raw, session=None: context):
         res = TestClient(app).post("/api/v1/publish/", json={"path": str(fullstack)})
 
     assert res.status_code == 400
@@ -190,7 +190,7 @@ async def test_agent_publish_tool_reports_the_refusal_without_a_key_stop(
     "api key" in the message. This refusal must read as a plain failure, or the
     agent would send the tester to configure a key they already have."""
     context = (fullstack, artifacts_base, "mdb_publish_secret", SELF_HOSTED_PUBLISH_URL)
-    monkeypatch.setattr(publish, "desktop_publish_context", lambda raw: context)
+    monkeypatch.setattr(publish, "desktop_publish_context", lambda raw, session=None: context)
     session = mock.Mock()
     session._workspace = mock.Mock(base=str(artifacts_base.parent.parent))
 

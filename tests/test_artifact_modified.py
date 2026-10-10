@@ -404,7 +404,7 @@ def test_update_endpoint_delegates(tmp_path: Path):
 
     captured = {}
 
-    def _fake_update(path):
+    def _fake_update(path, session=None):
         captured["path"] = path
         return {"status": "ok", "url": "https://4nton.ai/a/uuid-1"}
 
@@ -424,7 +424,7 @@ def test_update_endpoint_404_when_not_published(tmp_path: Path):
     app.include_router(publish_ep.router, prefix="/api/v1/publish")
     client = TestClient(app)
 
-    def _raise(path):
+    def _raise(path, session=None):
         raise FileNotFoundError("No published version to update")
 
     with patch.object(publish_ep, "_update", _raise):

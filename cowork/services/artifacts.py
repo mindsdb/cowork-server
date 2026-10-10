@@ -228,6 +228,59 @@ def _scan_artifact_dirs() -> list[Path]:
     return list(dirs.values())
 
 
+def _artifact_dirs_for_scope(session: "ScopedSession | None" = None) -> list[Path]:
+    """Every `.anton/artifacts` dir a desktop caller can address by path.
+
+    The scan only sees direct children of the projects root, so a project
+    pointed at a folder the user chose has to come from its row. Without a
+    session, or in org mode, this IS the scan: callers that legitimately hold
+    no session keep today's behavior, and the org path is resolved by
+    `artifact_roots.artifacts_sources_for_scope` rather than by any scan.
+    """
+    dirs = _scan_artifact_dirs()
+    if session is None or _org_mode():
+        return dirs
+    # Imported here because `artifact_roots` imports this module at module
+    # level; the same cycle `_external_project_artifacts_base` works around.
+    from cowork.services.artifact_roots import _sources_outside_the_projects_root
+
+    known = {str(d.resolve(strict=False)) for d in dirs}
+    for source in _sources_outside_the_projects_root(session):
+        base = Path(source.base)
+        if str(base.resolve(strict=False)) in known:
+            continue
+        known.add(str(base.resolve(strict=False)))
+        dirs.append(base)
+    return dirs
+
+
+def _project_dirs_for_scope(session: "ScopedSession | None" = None) -> list[Path]:
+    """Registered project directories, plus folders the user chose, all resolved.
+
+    `_registered_project_dirs` resolves what it returns and callers match against
+    it with bare set membership, so a row path has to be resolved here too: on
+    macOS an adopted folder under /var reaches this as /private/var and would
+    simply fail to match.
+    """
+    dirs = _registered_project_dirs()
+    if session is None or _org_mode():
+        return dirs
+    # Imported here for the `artifact_roots` cycle; see `_artifact_dirs_for_scope`.
+    from cowork.services.artifact_roots import _sources_outside_the_projects_root
+
+    known = {str(d) for d in dirs}
+    for source in _sources_outside_the_projects_root(session):
+        anchor = source.trusted_anchor
+        if anchor is None:
+            continue
+        project_dir = Path(anchor).resolve(strict=False)
+        if str(project_dir) in known:
+            continue
+        known.add(str(project_dir))
+        dirs.append(project_dir)
+    return dirs
+
+
 def _iter_artifact_folders(project_path: str | None = None) -> Iterator[Path]:
     """Yield artifact folders containing readable metadata.json."""
     roots: list[Path]
@@ -710,6 +763,33 @@ def _project_artifacts_base(
     return base if base.is_dir() else None
 
 
+def _external_source_for_path(
+    path: Path, session: "ScopedSession | None" = None
+) -> "ProjectArtifacts | None":
+    """The adopted-folder source whose artifacts dir holds `path`, if any.
+
+    A serve URL for such a folder cannot be rediscovered by scanning, and its
+    basename is not its project name, so callers holding only a path need the
+    source itself to build one.
+    """
+    if session is None or _org_mode():
+        return None
+    # Imported here for the `artifact_roots` cycle; see `_artifact_dirs_for_scope`.
+    from cowork.services.artifact_roots import _sources_outside_the_projects_root
+
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return None
+    for source in _sources_outside_the_projects_root(session):
+        try:
+            resolved.relative_to(Path(source.base).resolve())
+        except (ValueError, OSError):
+            continue
+        return source
+    return None
+
+
 def serve_url_for(
     path: str | Path,
     *,
@@ -757,7 +837,7 @@ def serve_url_for(
     return ""
 
 
-def _candidate_relative_artifacts(raw_path: str) -> list[Path]:
+def _candidate_relative_artifacts(raw_path: str, artifact_dirs: list[Path]) -> list[Path]:
     text = (raw_path or "").strip().replace("\\", "/")
     while text.startswith("./"):
         text = text[2:]
@@ -767,7 +847,7 @@ def _candidate_relative_artifacts(raw_path: str) -> list[Path]:
     if text.startswith("artifacts/"):
         text = text[len("artifacts/"):]
     matches: dict[str, Path] = {}
-    for art_root in _scan_artifact_dirs():
+    for art_root in artifact_dirs:
         try:
             target = (art_root / text).resolve()
             target.relative_to(art_root.resolve())
@@ -778,7 +858,13 @@ def _candidate_relative_artifacts(raw_path: str) -> list[Path]:
     return list(matches.values())
 
 
-def resolve_artifact_path(raw_path: str, *, allow_dir: bool = False) -> Path | None:
+def resolve_artifact_path(
+    raw_path: str,
+    *,
+    allow_dir: bool = False,
+    session: "ScopedSession | None" = None,
+    artifact_dirs: list[Path] | None = None,
+) -> Path | None:
     """Turn an artifact request path into an absolute path on disk.
 
     Returns None if invalid, or the resolved Path if found.
@@ -789,6 +875,9 @@ def resolve_artifact_path(raw_path: str, *, allow_dir: bool = False) -> Path | N
     by publish/unpublish so a folder-based artifact can be addressed by its
     folder. The relative-path branch stays file-only (the client always
     sends absolute folder paths).
+
+    `artifact_dirs` lets a caller that already resolved the roots for
+    `session` pass them in, so resolution does not read the database again.
     """
     if "\x00" in raw_path:
         raise ValueError("Invalid artifact path")
@@ -799,9 +888,11 @@ def resolve_artifact_path(raw_path: str, *, allow_dir: bool = False) -> Path | N
     if not str(target).strip():
         raise ValueError("Invalid artifact path")
 
+    if artifact_dirs is None:
+        artifact_dirs = _artifact_dirs_for_scope(session)
     if target.is_absolute():
         resolved = target.resolve()
-        for art_root in _scan_artifact_dirs():
+        for art_root in artifact_dirs:
             try:
                 resolved.relative_to(art_root.resolve())
             except ValueError:
@@ -812,7 +903,7 @@ def resolve_artifact_path(raw_path: str, *, allow_dir: bool = False) -> Path | N
                 return resolved
         raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
-    matches = _candidate_relative_artifacts(raw_path)
+    matches = _candidate_relative_artifacts(raw_path, artifact_dirs)
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
@@ -820,7 +911,12 @@ def resolve_artifact_path(raw_path: str, *, allow_dir: bool = False) -> Path | N
     raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
 
-def _artifact_root_for(path: Path) -> Path:
+def _artifact_root_for(
+    path: Path,
+    *,
+    session: "ScopedSession | None" = None,
+    containers: set[str] | None = None,
+) -> Path:
     """Climb from an artifact file to the folder that holds its
     `metadata.json` — the artifact root.
 
@@ -833,8 +929,13 @@ def _artifact_root_for(path: Path) -> Path:
     bounded by the registered artifact container dirs
     (`<base>/.anton/artifacts/`) so a metadata-less tree can't send us
     climbing into the rest of the disk. Falls back to `path.parent`.
+
+    `containers` is for callers that climb many files under roots they have
+    already resolved: deriving the set costs a database read now, and this runs
+    once per file in the publish picker.
     """
-    containers = {str(d.resolve()) for d in _scan_artifact_dirs()}
+    if containers is None:
+        containers = {str(d.resolve()) for d in _artifact_dirs_for_scope(session)}
     current = path.parent.resolve()
     while True:
         if (current / "metadata.json").is_file():
@@ -1593,7 +1694,7 @@ def preview_artifact(path: Path) -> dict:
     }
 
 
-async def mount_preview(path: Path) -> dict:
+async def mount_preview(path: Path, *, session: "ScopedSession | None" = None) -> dict:
     """Register an artifact for iframe preview.
 
     Two payload shapes share a `kind` discriminator:
@@ -1608,7 +1709,7 @@ async def mount_preview(path: Path) -> dict:
     # primary file's parent — fullstack apps keep their frontend in a
     # `static/` subdir. Resolve it explicitly for all backend lookups so
     # we read the `port` from the root, not from `static/`.
-    root = _artifact_root_for(path)
+    root = _artifact_root_for(path, session=session)
 
     # Backend+frontend artifacts: detect them by a `port` field in the
     # root's metadata.json. The iframe will load through our proxy
@@ -1646,7 +1747,7 @@ async def mount_preview(path: Path) -> dict:
         root_token = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
         _PREVIEW_MOUNTS[root_token] = root
         running, launch_detail, current_port = await _ensure_backend_running(
-            root, backend_port
+            root, backend_port, session
         )
         return {
             "kind": "proxy",
@@ -1668,13 +1769,18 @@ async def mount_preview(path: Path) -> dict:
         raise ValueError("Preview mount is only available for HTML artifacts")
     token = hashlib.sha256(str(parent).encode("utf-8")).hexdigest()[:16]
     _PREVIEW_MOUNTS[token] = parent
+    _external = _external_source_for_path(path, session)
 
     return {
         "kind": "static",
         "token": token,
         "entry": path.name,
         "relUrl": f"/artifacts/preview-asset/{token}/{path.name}",
-        "serveUrl": serve_url_for(path),
+        "serveUrl": serve_url_for(
+            path,
+            artifacts_base=_external.base if _external else None,
+            project_name=_external.project_name if _external else None,
+        ),
         # Route through _published_url_for so a soft-deleted (published=False)
         # record reports an empty URL — matching the artifact grid and the
         # fullstack branch, instead of surfacing a dead 4nton.ai link.
@@ -1687,7 +1793,7 @@ def get_preview_mount(token: str) -> Path | None:
     return _PREVIEW_MOUNTS.get(token)
 
 
-def html_artifacts() -> list[dict]:
+def html_artifacts(session: "ScopedSession | None" = None) -> list[dict]:
     """List every publishable file (HTML + Markdown) under every project's
     artifacts tree.
 
@@ -1700,7 +1806,9 @@ def html_artifacts() -> list[dict]:
     seen: set[str] = set()
     seen_roots: set[str] = set()
     fullstack_types = _fullstack_types()
-    for art_root in _scan_artifact_dirs():
+    roots = _artifact_dirs_for_scope(session)
+    containers = {str(d.resolve()) for d in roots}
+    for art_root in roots:
         if not art_root.exists():
             continue
         candidates = [p for ext in ("*.html", "*.md") for p in art_root.rglob(ext)]
@@ -1710,7 +1818,7 @@ def html_artifacts() -> list[dict]:
                 continue
 
             # Group fullstack apps by their artifact root — one entry per app.
-            artifact_root = _artifact_root_for(path)
+            artifact_root = _artifact_root_for(path, containers=containers)
             meta = _load_metadata(artifact_root) if (artifact_root / "metadata.json").is_file() else None
             if (meta or {}).get("type") in fullstack_types:
                 root_key = str(artifact_root.resolve())
@@ -1770,7 +1878,9 @@ def _probe_port(port: int, *, timeout: float = 0.3) -> bool:
         return False
 
 
-def _resolve_project_root(artifact_dir: Path) -> Path | None:
+def _resolve_project_root(
+    artifact_dir: Path, session: "ScopedSession | None" = None
+) -> Path | None:
     """The registered project root that owns this artifact dir, if any.
 
     `artifact_dir` is the parent of the primary file (e.g.
@@ -1783,7 +1893,7 @@ def _resolve_project_root(artifact_dir: Path) -> Path | None:
         artifact_resolved = artifact_dir.resolve()
     except OSError:
         return None
-    registered = _registered_project_dirs()
+    registered = _project_dirs_for_scope(session)
     for parent in (artifact_resolved, *artifact_resolved.parents):
         if parent in registered:
             return parent
@@ -1791,7 +1901,7 @@ def _resolve_project_root(artifact_dir: Path) -> Path | None:
 
 
 async def _ensure_backend_running(
-    artifact_dir: Path, port: int
+    artifact_dir: Path, port: int, session: "ScopedSession | None" = None
 ) -> tuple[bool, str, int]:
     """Bring up the artifact's backend if it isn't already listening.
 
@@ -1816,11 +1926,11 @@ async def _ensure_backend_running(
     async with _launch_lock(slug):
         if _probe_port(port):
             return True, "already_running", port
-        return await _launch_backend_locked(artifact_dir, slug)
+        return await _launch_backend_locked(artifact_dir, slug, session)
 
 
 async def _launch_backend_locked(
-    artifact_dir: Path, slug: str
+    artifact_dir: Path, slug: str, session: "ScopedSession | None" = None
 ) -> tuple[bool, str, int]:
     """Spawn the artifact's backend via anton's shared launcher.
 
@@ -1835,7 +1945,7 @@ async def _launch_backend_locked(
 
     from cowork.services.scratchpad_runtime import WorkspaceScopedPool
 
-    project_root = _resolve_project_root(artifact_dir)
+    project_root = _resolve_project_root(artifact_dir, session)
     if project_root is None:
         return False, "Artifact is not in a registered project.", 0
 
