@@ -14,18 +14,28 @@ import redis.asyncio as aioredis
 
 from cowork.streaming import turn_index
 from cowork.streaming.buffer import RedisStreamBuffer
+from tests.integration.prereq import missing_prerequisite
 
 pytestmark = pytest.mark.integration
 
 
 @pytest.fixture
 async def redis_url(monkeypatch):
-    url = os.environ.get("COWORK_TEST_REDIS_URL", "redis://localhost:6379/1")
+    named_url = os.environ.get("COWORK_TEST_REDIS_URL")
+    url = named_url or "redis://localhost:6379/1"
     client = aioredis.from_url(url, decode_responses=True)
     try:
         await client.ping()
     except Exception:
-        pytest.skip("no Redis reachable for integration test")
+        reason = "no Redis reachable for integration test"
+        # A run promises a Redis by naming it, as tests-integration.yml does
+        # for its service container. Then an unreachable one is a defect
+        # wherever COWORK_REQUIRE_INTEGRATION is true. A run that names none
+        # promised none, so it skips. The staging nightly needs that: it runs
+        # main's copy of the workflow against staging's tests.
+        if named_url:
+            missing_prerequisite(reason)
+        pytest.skip(reason)
     await client.flushdb()
     monkeypatch.setenv("COWORK_TURN_REDIS_URL", url)
     monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")

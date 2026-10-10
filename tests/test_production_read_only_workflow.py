@@ -93,7 +93,8 @@ def test_workflow_is_manual_and_prod_scoped() -> None:
         "environment",
         "steps",
     }
-    assert production_job["runs-on"] == "mdb-prod"
+    # GitHub-hosted: the smoke reads only the public host.
+    assert production_job["runs-on"] == "ubuntu-latest"
     assert production_job["timeout-minutes"] == 10
     assert production_job["if"] == "github.ref == 'refs/heads/main'"
     assert production_job["environment"] == {"name": "prod-read-only"}
@@ -131,16 +132,14 @@ def test_workflow_runs_only_the_read_only_selection_and_notifies() -> None:
     assert smoke_step["run"] == "make test/integration-production-read-only"
     assert production_steps == [
         {
-            "uses": "actions/checkout@v5",
+            "uses": "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
             "with": {"persist-credentials": False},
         },
         {
             "name": "Setup uv",
-            "uses": "astral-sh/setup-uv@v7",
+            "uses": "astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78",
             "with": {
                 "version": "0.12.2",
-                "cache-local-path": "/home/runner/_work/_tool/uv-local-cache",
-                "prune-cache": False,
                 "python-version": "3.12",
             },
         },
@@ -338,7 +337,7 @@ def test_readme_records_the_no_write_boundary() -> None:
         "never provisions an identity",
         "does not create conversations, schedules, files, artifacts, or model turns",
         "43 7 * * *",
-        "cannot reference the existing `prod` Environment",
+        "does not reference the `prod` Environment",
         "dedicated `prod-read-only` Environment",
         "no required-reviewer or wait-timer rule",
         "only entry is the exact `main` branch",
