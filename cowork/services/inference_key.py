@@ -3,12 +3,13 @@
 Auth bills a session token against whatever organization Keycloak has active,
 so a switch on another device would move this desktop's billing. A turn key
 pins the organization. It is re-minted on a token hand-over (about every nine
-minutes) once it is past half its life.
+minutes) once it has less than 20 minutes left.
 """
 
 from __future__ import annotations
 
 import logging
+import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -23,6 +24,9 @@ _TTL = timedelta(minutes=30)
 # More than one missed hand-over of headroom, so a late push never finds it expired.
 _REMINT_WHEN_LEFT = timedelta(minutes=20)
 _TIMEOUT_S = 10.0
+# A failed mint stops the desktop's LLM calls, so retry well before the next hand-over.
+_RETRY_S = 60.0
+_retry_timer: threading.Timer | None = None
 
 
 def _turn_keys_url() -> str:
@@ -34,8 +38,9 @@ def _turn_keys_url() -> str:
 def refresh_inference_key(token: str, organization_id: str) -> None:
     """Mint a key for ``organization_id`` unless a fresh one is already held.
 
-    A failed mint keeps a still-valid key for the same organization, so one
-    blip doesn't stop the desktop's turns; the next hand-over retries.
+    A failed mint keeps a still-valid key for the same organization and
+    retries in a minute. The old key is never revoked here: the scratchpad and
+    coding sessions keep using it until it expires.
     """
     current = runtime_credential.get_inference_key()
     now = datetime.now(timezone.utc)
@@ -67,6 +72,7 @@ def refresh_inference_key(token: str, organization_id: str) -> None:
         )
         if current and current.organization_id != organization_id:
             runtime_credential.set_inference_key(None)
+        _schedule_retry()
         return
 
     runtime_credential.set_inference_key(
@@ -77,8 +83,23 @@ def refresh_inference_key(token: str, organization_id: str) -> None:
             expires_at=expires_at,
         )
     )
-    if current:
-        revoke_inference_key(token, current)
+
+
+def _schedule_retry() -> None:
+    global _retry_timer
+    if _retry_timer:
+        _retry_timer.cancel()
+    _retry_timer = threading.Timer(_RETRY_S, _retry)
+    _retry_timer.daemon = True
+    _retry_timer.start()
+
+
+def _retry() -> None:
+    # The latest hand-over's token and organization; nothing if signed out since.
+    token = runtime_credential.get_minds_credential()
+    organization_id = runtime_credential.get_organization()
+    if token and organization_id:
+        refresh_inference_key(token, organization_id)
 
 
 def revoke_inference_key(token: str, key: InferenceKey) -> None:
