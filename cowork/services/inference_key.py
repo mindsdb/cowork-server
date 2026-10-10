@@ -35,35 +35,47 @@ def _turn_keys_url() -> str:
     return f"{default_minds_auth_host().rstrip('/')}/v1/turn-keys/"
 
 
+def desktop_workspace_pick() -> str | None:
+    """The workspace picked in the desktop's menu; the console's pick never counts."""
+    from cowork.common.settings.user_settings import get_user_settings
+
+    return get_user_settings().hub_workspace_id or None
+
+
 def refresh_inference_key(token: str, organization_id: str) -> None:
-    """Mint a key for ``organization_id`` unless a fresh one is already held.
+    """Mint a key for ``organization_id`` and the desktop's workspace pick, unless a fresh one is held.
 
     A failed mint keeps a still-valid key for the same organization and
     retries in a minute. The old key is never revoked here: the scratchpad and
     coding sessions keep using it until it expires.
     """
     current = runtime_credential.get_inference_key()
+    workspace_id = desktop_workspace_pick()
     now = datetime.now(timezone.utc)
     if (
         current
         and current.organization_id == organization_id
+        and current.workspace_id == workspace_id
         and current.expires_at - now > _REMINT_WHEN_LEFT
     ):
         return
 
     instance_id = f"desktop-{uuid.uuid4()}"
     expires_at = now + _TTL
+    body = {
+        "organization_id": organization_id,
+        "instance_id": instance_id,
+        "expiry_date": expires_at.isoformat(),
+    }
+    if workspace_id:
+        body["workspace_id"] = workspace_id
     try:
-        response = httpx.post(
-            _turn_keys_url(),
-            json={
-                "organization_id": organization_id,
-                "instance_id": instance_id,
-                "expiry_date": expires_at.isoformat(),
-            },
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=_TIMEOUT_S,
-        )
+        response = _post(body, token)
+        if workspace_id and _code(response) == "workspace_not_found":
+            # A stale pick (grant removed, workspace deleted) bills the Default, as the menu shows.
+            response = _post(
+                {k: v for k, v in body.items() if k != "workspace_id"}, token
+            )
         response.raise_for_status()
         key = response.json()["key"]
     except Exception as exc:
@@ -81,8 +93,25 @@ def refresh_inference_key(token: str, organization_id: str) -> None:
             organization_id=organization_id,
             instance_id=instance_id,
             expires_at=expires_at,
+            workspace_id=workspace_id,
         )
     )
+
+
+def _post(body: dict, token: str) -> httpx.Response:
+    return httpx.post(
+        _turn_keys_url(),
+        json=body,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=_TIMEOUT_S,
+    )
+
+
+def _code(response: httpx.Response) -> str | None:
+    try:
+        return response.json().get("code")
+    except Exception:
+        return None
 
 
 def _schedule_retry() -> None:
