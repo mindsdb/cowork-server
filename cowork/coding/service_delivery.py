@@ -22,11 +22,15 @@ class CodingDeliveryOperations:
 
     task_delivery: TaskDeliveryService
 
+    def ensure_workspace(self, session_id: str, *, reserved: bool = False) -> None:  # pragma: no cover - mixin contract
+        raise NotImplementedError
+
     def delivery_plan(
         self,
         session_id: str,
         integrations: DeveloperIntegrationService | None = None,
     ) -> DeliveryPlan:
+        self.ensure_workspace(session_id)
         return self.task_delivery.plan(session_id, integrations)
 
     def create_draft_pull_requests(
@@ -35,6 +39,7 @@ class CodingDeliveryOperations:
         request: DraftPullRequestRequest,
         integrations: DeveloperIntegrationService,
     ) -> list[DeliveryRecord]:
+        self.ensure_workspace(session_id)
         return self.task_delivery.create_drafts(session_id, request, integrations)
 
     def record_delivery(self, session_id: str, delivery: DeliveryRecord) -> DeliveryRecord:
@@ -46,6 +51,7 @@ class CodingDeliveryOperations:
         request: PublishRequest,
         integrations: DeveloperIntegrationService,
     ) -> DeliveryRecord:
+        self.ensure_workspace(session_id)
         return self.task_delivery.publish_update(session_id, request, integrations)
 
     def complete_task_source(
@@ -54,6 +60,7 @@ class CodingDeliveryOperations:
         request: SourceActionRequest,
         integrations: DeveloperIntegrationService,
     ) -> DeliveryRecord:
+        self.ensure_workspace(session_id)
         return self.task_delivery.complete_source(session_id, request, integrations)
 
     def pull_request_action(
@@ -62,4 +69,5 @@ class CodingDeliveryOperations:
         request: PullRequestActionRequest,
         integrations: DeveloperIntegrationService,
     ) -> PullRequestStatus:
+        self.ensure_workspace(session_id)
         return self.task_delivery.pull_request_action(session_id, request, integrations)
