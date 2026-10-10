@@ -717,3 +717,75 @@ def test_openai_compatible_stays_on_chat_completions_unless_switched(
     anton_responses_ready()
     _client, calls = build(_openai_compatible())
     assert all("flavor" not in kw for kw in calls["openai"])
+
+
+def _pin(monkeypatch, *, token="session-jwt", key="mdb_turn_a"):
+    """A desktop that sent its mounted organization and holds a key for it."""
+    from datetime import datetime, timedelta, timezone
+
+    monkeypatch.setattr(runtime_credential, "_minds_credential", token)
+    monkeypatch.setattr(runtime_credential, "_organization_id", "org-a")
+    monkeypatch.setattr(
+        runtime_credential,
+        "_inference_key",
+        runtime_credential.InferenceKey(
+            value=key,
+            organization_id="org-a",
+            instance_id="desktop-1",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+        )
+        if key
+        else None,
+    )
+
+
+def _minds_settings(key="session-jwt"):
+    return UserSettings(
+        planning_provider=Provider.MINDS_CLOUD,
+        coding_provider=Provider.MINDS_CLOUD,
+        minds_api_key=SecretStr(key),
+        minds_url="https://api.mindshub.ai",
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_pinned_desktop_bills_its_turn_key_not_the_session_token(build, monkeypatch):
+    _pin(monkeypatch)
+
+    _client, calls = build(_minds_settings())
+
+    assert all(kw["api_key"] == "mdb_turn_a" for kw in calls["openai"])
+    # A web switch hands over a token for another org; the key doesn't follow it.
+    monkeypatch.setattr(runtime_credential, "_minds_credential", "token-now-org-b")
+    assert [await kw["api_key_provider"]() for kw in calls["openai"]] == ["mdb_turn_a"] * 3
+
+
+def test_a_pinned_desktop_without_a_key_refuses_to_build(build, monkeypatch):
+    _pin(monkeypatch, key=None)
+
+    with pytest.raises(ValueError, match="not configured"):
+        build(_minds_settings())
+
+
+def test_inference_key_str_falls_back_to_settings_without_a_hand_over():
+    from cowork.common.settings.user_settings import inference_api_key_str
+
+    assert inference_api_key_str(_minds_settings("stored-key"), Provider.MINDS_CLOUD) == "stored-key"
+
+
+def test_inference_key_str_pins_only_minds_cloud(monkeypatch):
+    from cowork.common.settings.user_settings import inference_api_key_str
+
+    _pin(monkeypatch)
+    settings = UserSettings(minds_api_key=SecretStr("session-jwt"), openai_api_key=SecretStr("sk-openai"))
+
+    assert inference_api_key_str(settings, Provider.MINDS_CLOUD) == "mdb_turn_a"
+    assert inference_api_key_str(settings, Provider.OPENAI) == "sk-openai"
+
+
+def test_inference_key_str_is_empty_when_pinned_without_a_key(monkeypatch):
+    from cowork.common.settings.user_settings import inference_api_key_str
+
+    _pin(monkeypatch, key=None)
+
+    assert inference_api_key_str(_minds_settings(), Provider.MINDS_CLOUD) == ""
