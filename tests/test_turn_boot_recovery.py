@@ -279,3 +279,57 @@ def test_does_not_attach_orphan_to_a_later_question(svc, conv, session, tmp_path
     assert messages[0].id == first.id and messages[0].pending
     assert messages[1].id == second.id and not messages[1].pending
     assert messages[2].content == "belongs to second"
+
+
+def test_a_turn_numbered_by_the_row_count_recovers_its_own_question(svc, conv, session, tmp_path):
+    """A turn's buffer is named by the conversation's stored row count when
+    the turn starts, and recovery indexes the stored rows with that number.
+    Hidden tool rows, a stranded pending question and two rows sharing a seq
+    (which max(seq) + 1 would undercount) all count."""
+    from cowork.models.message import Message
+    from cowork.schemas.responses import Role
+
+    svc.save_user_message(conv.id, "first")
+    svc.save_assistant_turn(
+        conv.id, "first answer", [{"type": "response.completed"}],
+        tool_rows=[
+            {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "x", "input": {}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "r"}]},
+        ],
+    )
+    svc.save_user_message(conv.id, "stranded", pending=True)
+    stranded_seq = max(m.seq for m in svc.get_ordered_messages(conv.id, include_pending=True))
+    svc.session.add(Message(conversation_id=conv.id, role=Role.assistant, content="same seq", seq=stranded_seq))
+    svc.session.commit()
+
+    turn_id = svc.message_count(svc.get_conversation(conv.id))
+    question = svc.save_user_message(conv.id, "second", pending=True)
+    _write_orphan_buffer(tmp_path, conv.id, turn_id, [DELTA.format("second answer")])
+
+    assert turn_id == 6
+    assert seal_orphan_turns_in_history(ScopedSession(session, SYSTEM_SCOPE), tmp_path) == 1
+    messages = svc.get_ordered_messages(conv.id, include_pending=True)
+    assert messages[turn_id].id == question.id and not messages[turn_id].pending
+    assert messages[turn_id + 1].content == "second answer"
+    assert [m.content for m in messages if m.pending] == ["stranded"]
+
+
+def test_recovery_appends_its_terminal_after_merged_deltas(svc, conv, session, tmp_path):
+    """An answer saved with merged deltas has fewer event rows than frames, and
+    the recovered terminal still lands right after them."""
+    svc.save_user_message(conv.id, "hello", pending=True)
+    deltas = [
+        {"type": "response.output_text.delta", "sequence_number": seq, "item_id": "m", "delta": text}
+        for seq, text in enumerate(("Hi", " there", "!"), start=1)
+    ]
+    reply = svc.save_assistant_turn(conv.id, "Hi there!", [{"type": "response.created"}, *deltas])
+    _write_orphan_buffer(tmp_path, conv.id, 0, [CREATED, *(DELTA.format(d["delta"]) for d in deltas)])
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+
+    assert seal_orphan_turns_in_history(scoped, tmp_path) == 1
+    assert seal_orphan_turns_in_history(scoped, tmp_path) == 0
+    events = sorted(_events_for(session, reply.id), key=lambda e: e.sequence_number)
+    assert [e.sequence_number for e in events] == [0, 1, 2]
+    assert [e.event_data["type"] for e in events] == [
+        "response.created", "response.output_text.delta", "response.failed",
+    ]
