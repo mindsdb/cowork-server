@@ -1092,9 +1092,14 @@ class ConversationService:
         if not messages:
             return ReplayHistory(messages=[], events=[])
         rows = self.session.exec(self._replay_events(conversation_id, event_roles=event_roles)).all()
+        # A channel answer can commit between these reads. Keep its events
+        # out until its message is part of the history we replay with them.
+        message_ids = {message.id for message in messages}
         events = [
             row.event_data for row in rows
-            if isinstance(row.event_data, dict) and row.event_data.get("thought_role") in event_roles
+            if row.message_id in message_ids
+            and isinstance(row.event_data, dict)
+            and row.event_data.get("thought_role") in event_roles
         ]
         return ReplayHistory(messages=messages, events=events)
 

@@ -256,6 +256,49 @@ def test_replay_history_rebuilds_the_same_cells(engine, session, conversation):
     assert [c.code for c in extract_scratchpad_cells(history.events)] == ["second"]
 
 
+@pytest.mark.parametrize("late_events", [
+    [_scratchpad_event("end", {"action": "reset"})],
+    [_exec_end(), _result("late")],
+], ids=["reset", "exec"])
+def test_replay_history_ignores_answer_committed_after_messages_read(engine, session, conversation, late_events):
+    """A channel answer can commit while a UI turn reads its replay history.
+    Its events must not enter the cells until its messages enter the history."""
+    original_events = [_exec_end(), _result("first")]
+    question = _add_message(session, conversation, role=Role.user, content="q", seq=0, events=[])
+    answer = _add_message(
+        session, conversation, role=Role.assistant, content="a", seq=1, events=original_events,
+    )
+    conversation_id = conversation.id
+    expected_ids = [question.id, answer.id]
+    late_ids: list[UUID] = []
+
+    def commit_answer(_conn, _cursor, statement, _parameters, _context, _executemany):
+        if late_ids or "FROM message_events" not in statement:
+            return
+        # The message rows have been materialized; commit a real answer on a
+        # separate connection immediately before the event query executes.
+        with Session(engine) as writer:
+            saved = ConversationService(ScopedSession(writer, LOCAL_SCOPE)).save_assistant_turn(
+                conversation_id, "late answer", late_events,
+            )
+            assert saved is not None
+            late_ids.append(saved.id)
+
+    event.listen(engine, "before_cursor_execute", commit_answer)
+    try:
+        with Session(engine) as reader:
+            history = ConversationService(ScopedSession(reader, LOCAL_SCOPE)).get_replay_history(
+                conversation_id, event_roles=SCRATCHPAD_REPLAY_ROLES,
+            )
+    finally:
+        event.remove(engine, "before_cursor_execute", commit_answer)
+
+    assert len(late_ids) == 1
+    assert [message.id for message in history.messages] == expected_ids
+    assert history.events == original_events
+    assert [cell.code for cell in extract_scratchpad_cells(history.events)] == ["first"]
+
+
 def test_replay_history_reads_an_event_with_a_non_finite_float(session, conversation):
     """json.dumps writes NaN bare and SQLite stores it as written. SQLite's
     JSON functions reject such a row before 3.42, so the replay read, which
