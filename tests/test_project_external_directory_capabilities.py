@@ -7,9 +7,12 @@ folder is kept.
 """
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
+from sqlalchemy import event
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
@@ -139,6 +142,127 @@ def test_an_allocated_project_still_renames(engine, projects_root):
     assert updated.name == "renamed"
     assert stage is not None
     renaming.rollback_project_rename(stage)
+
+
+DRIVER_TEXT = "server closed the connection unexpectedly"
+
+
+class _DatabaseOutage:
+    """Fails every statement once `down` is set, as a dropped connection does,
+    and records each statement tried while down."""
+
+    def __init__(self, engine) -> None:
+        self.down = False
+        self.statements: list[str] = []
+        event.listen(engine, "before_cursor_execute", self._refuse)
+
+    def _refuse(self, conn, cursor, statement, parameters, context, executemany) -> None:
+        if self.down:
+            self.statements.append(statement)
+            raise OperationalError(statement, parameters, Exception(DRIVER_TEXT))
+
+
+@pytest.mark.parametrize("database_down", [False, True], ids=["database-up", "database-down"])
+def test_a_failed_rename_restore_names_the_project_on_its_log_lines(
+    engine, monkeypatch, owned_logger, caplog, database_down
+):
+    """The directory moved, the skill rewrite failed, and moving the directory
+    back failed too. Both lines carry the project id as a record attribute,
+    also when the database is gone: the rollback expired the project, so the
+    id comes from the stage, never from a reload."""
+    from cowork.services import projects as projects_module
+    from cowork.services.skills import SkillService
+
+    svc = _svc(engine)
+    project_id = svc.create_project("notes").id
+    original_rename = ProjectService._rename_in_root
+    renames: list[tuple[Path, Path]] = []
+    outage = _DatabaseOutage(engine)
+
+    def move_then_fail_the_restore(self, old, new):
+        renames.append((old, new))
+        if len(renames) > 1:
+            raise OSError("directory restore failed")
+        original_rename(self, old, new)
+
+    def fail_the_rewrites(self, rewrites):
+        outage.down = database_down
+        raise RuntimeError("skill rewrite failed")
+
+    monkeypatch.setattr(ProjectService, "_rename_in_root", move_then_fail_the_restore)
+    monkeypatch.setattr(SkillService, "apply_project_reference_rewrites", fail_the_rewrites)
+    logged = owned_logger(projects_module.__name__)
+    with pytest.raises(RuntimeError, match="skill rewrite failed"):
+        _svc(engine).stage_project_update(
+            project_id,
+            resolved_name="renamed",
+            is_active=None,
+            display_label="renamed",
+        )
+
+    assert len(renames) == 2  # the move, then the failed move back
+    assert outage.statements == []
+    records = [
+        r for r in caplog.records
+        if r.name == logged.logger.name and r.levelno == logging.ERROR
+    ]
+    assert [r.getMessage() for r in records] == [
+        "Could not restore the directory for the project",
+        "Could not fully restore the project after rename staging failed",
+    ]
+    assert [r.project_id for r in records] == [str(project_id)] * 2
+    assert logged.output().count(f"[Project:{project_id}]: ") == 2
+
+
+def test_a_failed_commit_restore_logs_the_project_without_querying_the_database(
+    engine, monkeypatch, owned_logger, caplog
+):
+    """The commit failed because the database went away, and moving the
+    directory back failed too. The rollback expired the project, so reading
+    its id would query the database that just failed, and that query's error
+    would replace the commit's. Both lines are written, nothing is queried,
+    and the commit's own error reaches the caller."""
+    from cowork.services import projects as projects_module
+
+    svc = _svc(engine)
+    project_id = svc.create_project("notes").id
+    updating = _svc(engine)
+    project, stage = updating.stage_project_update(
+        project_id,
+        resolved_name="renamed",
+        is_active=None,
+        display_label="renamed",
+    )
+    assert stage is not None and stage.directory_moved
+    outage = _DatabaseOutage(engine)
+    commit_error = OperationalError("COMMIT", {}, Exception(DRIVER_TEXT))
+
+    def commit_fails():
+        outage.down = True
+        raise commit_error
+
+    def fail_the_restore(self, old, new):
+        raise OSError("directory restore failed")
+
+    monkeypatch.setattr(updating.session, "commit", commit_fails)
+    monkeypatch.setattr(ProjectService, "_rename_in_root", fail_the_restore)
+    logged = owned_logger(projects_module.__name__)
+    with pytest.raises(OperationalError) as raised:
+        updating.commit_staged_project_update(project, stage)
+
+    assert raised.value is commit_error
+    assert outage.statements == []
+    records = [
+        r for r in caplog.records
+        if r.name == logged.logger.name and r.levelno == logging.ERROR
+    ]
+    # The commit error is in each line's exception chain, so the database
+    # filter replaces both messages; the call site and the id remain.
+    assert [r.funcName for r in records] == ["rollback_project_rename", "_commit_staged_project_update"]
+    assert [r.project_id for r in records] == [str(project_id)] * 2
+    output = logged.output()
+    assert output.count(f"[Project:{project_id}]: Database operation failed") == 2
+    assert DRIVER_TEXT not in output
 
 
 def test_a_label_only_change_is_allowed_on_an_adopted_folder(engine, tmp_path):
