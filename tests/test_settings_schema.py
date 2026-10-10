@@ -33,11 +33,11 @@ def test_migration_env_map_is_derived_from_the_canonical_alias_map():
     assert _ENV_TO_SETTING is ENV_ALIAS_TO_SETTING
 
 
-def test_show_dots_default_is_true():
-    # The client (App.jsx) had seeded show_dots False while the model default
-    # is True — the exact drift ENG-1125 removes. Pin the canonical value so a
-    # future flip has to be deliberate.
-    assert UserSettings.model_fields["show_dots"].get_default() is True
+def test_appearance_extras_default_off():
+    # The animated background and nav counters are opt-in. Pin the canonical
+    # values so a future flip has to be deliberate.
+    assert UserSettings.model_fields["show_dots"].get_default() is False
+    assert UserSettings.model_fields["show_counters"].get_default() is False
 
 
 def test_coding_agent_defaults_are_codex_over_mindshub() -> None:
