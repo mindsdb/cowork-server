@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from anton.utils.datasources import default_user_label, ensure_unique_user_label
+from anton.utils.datasources import ensure_unique_user_label
 
 from cowork.common.settings.app_settings import ConnectorSettings
 from cowork.services.connectors.identity import (
@@ -24,6 +24,10 @@ from cowork.services.connectors.vault_lock import lock_for
 
 if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
+
+
+class ConnectionNotFoundError(LookupError):
+    """An ``extends`` save named a connection that does not exist."""
 
 
 def vault_for_scope(scope: "TenantScope | None" = None):
@@ -47,6 +51,7 @@ def persist_connection(
     label: str | None = None,
     user_label: str | None = None,
     replace_existing: bool = False,
+    extends: bool = False,
     default_label: str | None = None,
     default_fields: dict[str, str] | None = None,
     vault=None,
@@ -67,9 +72,9 @@ def persist_connection(
     ``user_label`` — passed explicitly or as a ``user_label`` / ``_user_label``
     field in ``credentials`` — is the newer, globally-unique, de-duplicated
     replacement for ``label``; stored as ``_user_label`` and carried forward
-    the same way. A brand-new connection that doesn't set one gets a computed
-    default: ``default_label`` if the caller supplied one (e.g. an OAuth
-    connector's fetched account/org/workspace name), else the engine id.
+    the same way. A brand-new connection that doesn't set one gets
+    ``default_label`` when the caller supplied one (e.g. an OAuth connector's
+    fetched account/org/workspace name), and otherwise no label at all.
 
     ``default_label`` only ever applies to a genuinely new connection (see the
     ``existing is None`` branch below) — unlike ``user_label``, it can never
@@ -78,6 +83,11 @@ def persist_connection(
     ``replace_existing`` is reserved for an explicit reconnect of the named
     record. It replaces that record atomically after the caller has validated
     the new credential, while retaining its label and picked-file metadata.
+
+    ``extends`` is a later step of a multi-step connect (credentials first,
+    tokens after an OAuth grant) adding fields to the named record: stored
+    fields this save omits are kept and resubmitted ones are replaced.
+    Raises ``ConnectionNotFoundError`` when no record has that name.
 
     ``default_fields`` generalizes the same "default once, then sticky"
     behavior ``default_label``/``user_label`` already have, for any other
@@ -114,13 +124,22 @@ def persist_connection(
         # updated, so an unchanged secret keeps its stored value instead of
         # persisting the literal sentinel.
         target = vault.read_record(connector_id, base_slug)
+        if extends:
+            if not (name or "").strip() or target is None:
+                raise ConnectionNotFoundError(
+                    f"No {connector_id} connection named {base_slug!r} to add these fields to."
+                )
+            stored = {k: v for k, v in target.get("fields", {}).items() if not k.startswith("_")}
+            cred = {**stored, **cred}
         cred, is_edit = resolve_keep_sentinels(cred, target)
         payload = {**cred, "_connector_id": connector_id}
         if method:
             payload["_method"] = method
+        elif extends and target["fields"].get("_method"):
+            payload["_method"] = target["fields"]["_method"]
         secure_keys = secure_keys_for(connector_id, method, payload)
         reconnecting_named_record = replace_existing and bool((name or "").strip()) and target is not None
-        if is_edit or reconnecting_named_record:
+        if is_edit or reconnecting_named_record or extends:
             slug = base_slug  # an edit targets the named connection — update in place
         else:
             slug = resolve_unique_slug(vault, connector_id, base_slug, payload, secure_keys)
@@ -139,6 +158,10 @@ def persist_connection(
             if key not in payload and existing_fields.get(key):
                 payload[key] = existing_fields[key]
         secure_keys = secure_keys_for(connector_id, method, payload)
+        if extends:
+            # A field the record already held as a secret stays one, even if
+            # this step's method would not classify it that way.
+            secure_keys = sorted(set(secure_keys) | set(target.get("secure_keys") or []))
         if not label:
             label = str((existing or {}).get("fields", {}).get("_label", "")).strip()
         if label:
@@ -146,21 +169,9 @@ def persist_connection(
         if not user_label:
             user_label = str((existing or {}).get("fields", {}).get("_user_label", "")).strip()
         if not user_label and existing is None:
-            # Genuinely new connection — nothing existed at this slug before
-            # this save, nothing explicit was passed, nothing to carry
-            # forward. Compute the same default anton's CLI prompt would show
-            # (engine id, de-duplicated); otherwise a connection created via
-            # cowork without an explicit label ends up with none at all,
-            # while every anton-created connection always gets one.
-            #
-            # Checked against `existing is None`, not `is_edit` — `is_edit`
-            # is only true when the request carried a GUI modify-flow
-            # keep-sentinel; a same-account re-save that reaches this
-            # function some other way (no sentinel) still resolves to the
-            # pre-existing record via `resolve_unique_slug()`'s
-            # `is_same_account()` check, and `existing` correctly reflects
-            # that (non-None) even though `is_edit` would be False.
-            user_label = str(default_label or "").strip() or default_user_label(vault, connector_id)
+            # Only a new connection takes the caller's default. No default
+            # means no label; `_user_label` is never a guess like the engine id.
+            user_label = str(default_label or "").strip()
         if user_label:
             payload["_user_label"] = ensure_unique_user_label(
                 vault, user_label, exclude=(connector_id, slug)
