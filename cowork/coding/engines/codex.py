@@ -40,6 +40,7 @@ from cowork.coding.engines.base import (
 from cowork.coding.engines.codex_extensions import add_extension_response
 from cowork.coding.engines.codex_models import model_catalog
 from cowork.coding.engines.codex_sandbox import windows_sandbox_override
+from cowork.coding.engines.permission_guidance import permission_guidance
 from cowork.coding.processes import (
     TERMINAL_ENV_MARKER,
     executable_name,
@@ -274,6 +275,19 @@ class CodexEngineSession:
             self._register_skill_roots()
             if existing_session_id:
                 response = self._client.thread_resume(existing_session_id, launch.thread_params)
+                # The pinned runtime retains the old developer instructions in
+                # resumed history. Append current guidance so existing tasks
+                # also receive it, including after a permission/mode change.
+                from openai_codex.generated.v2_all import ThreadInjectItemsResponse
+
+                self._client.request(
+                    "thread/inject_items",
+                    {"threadId": response.thread.id, "items": [{
+                        "type": "message", "role": "developer",
+                        "content": [{"type": "input_text", "text": permission_guidance(config)}],
+                    }]},
+                    response_model=ThreadInjectItemsResponse,
+                )
             else:
                 response = self._client.thread_start(launch.thread_params)
         except Exception:
