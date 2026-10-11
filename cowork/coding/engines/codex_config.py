@@ -79,7 +79,7 @@ def turn_input(
 
 
 def approval_policy(permission_mode: PermissionMode) -> str:
-    return "on-request" if permission_mode in {PermissionMode.read_only, PermissionMode.supervised} else "never"
+    return "on-request" if permission_mode == PermissionMode.supervised else "never"
 
 
 def sandbox_mode(permission_mode: PermissionMode) -> str:

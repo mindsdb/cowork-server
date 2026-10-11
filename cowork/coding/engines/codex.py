@@ -39,6 +39,7 @@ from cowork.coding.engines.base import (
 )
 from cowork.coding.engines.codex_extensions import add_extension_response
 from cowork.coding.engines.codex_models import model_catalog
+from cowork.coding.engines.codex_sandbox import windows_sandbox_override
 from cowork.coding.processes import (
     TERMINAL_ENV_MARKER,
     executable_name,
@@ -262,6 +263,14 @@ class CodexEngineSession:
                 )
             self._client.start()
             self._client.initialize()
+            if launch.sandbox_policy["type"] != "dangerFullAccess":
+                sandbox_overrides = windows_sandbox_override(self._client)
+                if sandbox_overrides:
+                    self._client.close()
+                    client_config.config_overrides += sandbox_overrides
+                    self._client = CodexClient(config=client_config, approval_handler=approval_handler)
+                    self._client.start()
+                    self._client.initialize()
             self._register_skill_roots()
             if existing_session_id:
                 response = self._client.thread_resume(existing_session_id, launch.thread_params)
