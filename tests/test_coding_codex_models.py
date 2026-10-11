@@ -139,13 +139,22 @@ def test_catalog_deadline_bounds_a_trickled_response(monkeypatch, catalog):
 
 @pytest.mark.parametrize("existing_session_id", [None, "existing-thread"])
 @pytest.mark.parametrize("remote", [False, True])
-@pytest.mark.parametrize("failure", [None, "start", "initialize", "thread"])
+@pytest.mark.parametrize("needs_windows_sandbox,failure,mode", [
+    (sandbox, failure, PermissionMode.workspace)
+    for sandbox in (False, True)
+    for failure in (None, "start", "initialize", "readiness", "thread")
+] + [
+    (True, "restart", PermissionMode.workspace),
+    (True, "reinitialize", PermissionMode.workspace),
+    (False, None, PermissionMode.full_access),
+])
 def test_session_loads_catalog_before_start_and_cleans_up(
-    monkeypatch, tmp_path, catalog, existing_session_id, remote, failure,
+    monkeypatch, tmp_path, catalog, existing_session_id, remote, needs_windows_sandbox, failure, mode,
 ):
     requests = mock_catalog(monkeypatch, catalog)
     calls = []
     paths = []
+    clients = []
 
     @dataclass
     class FakeConfig:
@@ -159,6 +168,7 @@ def test_session_loads_catalog_before_start_and_cleans_up(
     class FakeClient:
         def __init__(self, config, approval_handler):
             self.config = config
+            clients.append(self)
 
         def start(self):
             overrides = tomllib.loads("\n".join(self.config.config_overrides))
@@ -168,15 +178,16 @@ def test_session_loads_catalog_before_start_and_cleans_up(
             assert overrides["model_auto_compact_token_limit"] == codex_config.auto_compact_token_limit()
             assert "real-secret" not in str(self.config)
             calls.append("start")
-            if failure == "start":
+            if failure == "start" or (failure == "restart" and len(clients) == 2):
                 raise RuntimeError("startup failed")
 
         def initialize(self):
-            if failure == "initialize":
+            if failure == "initialize" or (failure == "reinitialize" and len(clients) == 2):
                 raise RuntimeError("startup failed")
 
         def thread_start(self, params):
             calls.append("thread_start")
+            assert ('windows.sandbox="unelevated"' in self.config.config_overrides) == needs_windows_sandbox
             if failure == "thread":
                 raise RuntimeError("startup failed")
             return SimpleNamespace(thread=SimpleNamespace(id="thread"))
@@ -184,6 +195,7 @@ def test_session_loads_catalog_before_start_and_cleans_up(
         def thread_resume(self, session_id, params):
             assert session_id == existing_session_id
             calls.append("thread_resume")
+            assert ('windows.sandbox="unelevated"' in self.config.config_overrides) == needs_windows_sandbox
             if failure == "thread":
                 raise RuntimeError("startup failed")
             return SimpleNamespace(thread=SimpleNamespace(id=session_id))
@@ -196,12 +208,20 @@ def test_session_loads_catalog_before_start_and_cleans_up(
     sdk.CodexConfig = FakeConfig
     sdk.CodexClient = FakeClient
     monkeypatch.setitem(sys.modules, "openai_codex.client", sdk)
+
+    def sandbox_override(client):
+        assert mode != PermissionMode.full_access
+        if failure == "readiness":
+            raise RuntimeError("startup failed")
+        return ('windows.sandbox="unelevated"',) if needs_windows_sandbox else ()
+
+    monkeypatch.setattr(codex, "windows_sandbox_override", sandbox_override)
     monkeypatch.setattr(codex.CodexEngineSession, "_register_skill_roots", lambda self: None)
     monkeypatch.setattr(codex.CodexEngineSession, "_route_global_notifications", lambda self: None)
     monkeypatch.setattr(codex.CodexEngineSession, "_app_server_pid", lambda self: None)
     monkeypatch.setattr(codex, "terminate_descendants", lambda pid: None)
     config = EngineSessionConfig(
-        model="fable", permission_mode=PermissionMode.workspace,
+        model="fable", permission_mode=mode,
         inference_base_url="https://gateway/inference" if remote else "",
         inference_api_key="scoped-token" if remote else "",
     )
@@ -219,7 +239,9 @@ def test_session_loads_catalog_before_start_and_cleans_up(
     else:
         session = open_session()
         assert paths[0].exists()
-        assert calls == ["start", "thread_resume" if existing_session_id else "thread_start"]
+        expected_calls = ["start", "close", "start"] if needs_windows_sandbox else ["start"]
+        assert calls == [*expected_calls, "thread_resume" if existing_session_id else "thread_start"]
+        assert len(clients) == (2 if needs_windows_sandbox else 1)
         session.close()
         session.close()
     assert calls[-1] == "close"
@@ -263,6 +285,7 @@ def test_session_starts_on_fallback_metadata_for_unlisted_model(monkeypatch, tmp
     sdk.CodexConfig = FakeConfig
     sdk.CodexClient = FakeClient
     monkeypatch.setitem(sys.modules, "openai_codex.client", sdk)
+    monkeypatch.setattr(codex, "windows_sandbox_override", lambda client: ())
     monkeypatch.setattr(codex.CodexEngineSession, "_register_skill_roots", lambda self: None)
     monkeypatch.setattr(codex.CodexEngineSession, "_route_global_notifications", lambda self: None)
     monkeypatch.setattr(codex.CodexEngineSession, "_app_server_pid", lambda self: None)

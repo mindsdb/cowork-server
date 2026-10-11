@@ -29,7 +29,7 @@ def test_mindshub_responses_base_url_is_normalized_once() -> None:
 
 
 def test_permission_mode_maps_to_codex_approval_policy() -> None:
-    assert codex_config.approval_policy(PermissionMode.read_only) == "on-request"
+    assert codex_config.approval_policy(PermissionMode.read_only) == "never"
     assert codex_config.approval_policy(PermissionMode.supervised) == "on-request"
     assert codex_config.approval_policy(PermissionMode.workspace) == "never"
     assert codex_config.approval_policy(PermissionMode.full_access) == "never"
