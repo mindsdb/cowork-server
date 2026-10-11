@@ -289,7 +289,8 @@ def test_codex_launch_policy_is_resolved_once_for_client_and_thread(monkeypatch)
     )
     assert any(item.startswith("mcp_servers.mindshub_code.command=") for item in launch.config_overrides)
     assert any('"cowork.coding.integration_mcp","/cowork-data","task-123"' in item for item in launch.config_overrides)
-    assert launch.thread_params["developerInstructions"] == "Use the project playbook."
+    assert launch.thread_params["developerInstructions"].startswith("Use the project playbook.\n\n")
+    assert "## MindsHub Code permission refusals" in launch.thread_params["developerInstructions"]
     assert launch.thread_params["approvalPolicy"] == launch.approval_policy
     assert launch.thread_params["sandbox"] == "workspace-write"
 

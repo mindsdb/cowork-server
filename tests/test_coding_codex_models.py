@@ -142,7 +142,7 @@ def test_catalog_deadline_bounds_a_trickled_response(monkeypatch, catalog):
 @pytest.mark.parametrize("needs_windows_sandbox,failure,mode", [
     (sandbox, failure, PermissionMode.workspace)
     for sandbox in (False, True)
-    for failure in (None, "start", "initialize", "readiness", "thread")
+    for failure in (None, "start", "initialize", "readiness", "thread", "guidance")
 ] + [
     (True, "restart", PermissionMode.workspace),
     (True, "reinitialize", PermissionMode.workspace),
@@ -187,6 +187,7 @@ def test_session_loads_catalog_before_start_and_cleans_up(
 
         def thread_start(self, params):
             calls.append("thread_start")
+            assert "## MindsHub Code permission refusals" in params["developerInstructions"]
             assert ('windows.sandbox="unelevated"' in self.config.config_overrides) == needs_windows_sandbox
             if failure == "thread":
                 raise RuntimeError("startup failed")
@@ -195,10 +196,31 @@ def test_session_loads_catalog_before_start_and_cleans_up(
         def thread_resume(self, session_id, params):
             assert session_id == existing_session_id
             calls.append("thread_resume")
+            assert "## MindsHub Code permission refusals" in params["developerInstructions"]
             assert ('windows.sandbox="unelevated"' in self.config.config_overrides) == needs_windows_sandbox
             if failure == "thread":
                 raise RuntimeError("startup failed")
             return SimpleNamespace(thread=SimpleNamespace(id=session_id))
+
+        def request(self, method, params, *, response_model):
+            assert existing_session_id
+            assert method == "thread/inject_items"
+            assert params["threadId"] == existing_session_id
+            assert len(params["items"]) == 1
+            item = params["items"][0]
+            assert item["type"] == "message"
+            assert item["role"] == "developer"
+            text = item["content"][0]["text"]
+            assert "These instructions describe this task's current settings" in text
+            if mode == PermissionMode.full_access:
+                assert "Full Access has no runtime filesystem" in text
+                assert "This folder is outside" not in text
+            else:
+                assert "This folder is outside" in text
+            calls.append("inject_guidance")
+            if failure == "guidance":
+                raise RuntimeError("startup failed")
+            return response_model()
 
         def close(self):
             assert paths[0].exists()
@@ -233,14 +255,15 @@ def test_session_loads_catalog_before_start_and_cleans_up(
             existing_session_id=existing_session_id, approval_handler=lambda *args: {},
         )
 
-    if failure:
+    if failure and (failure != "guidance" or existing_session_id):
         with pytest.raises(RuntimeError, match="startup failed"):
             open_session()
     else:
         session = open_session()
         assert paths[0].exists()
         expected_calls = ["start", "close", "start"] if needs_windows_sandbox else ["start"]
-        assert calls == [*expected_calls, "thread_resume" if existing_session_id else "thread_start"]
+        expected_calls += ["thread_resume", "inject_guidance"] if existing_session_id else ["thread_start"]
+        assert calls == expected_calls
         assert len(clients) == (2 if needs_windows_sandbox else 1)
         session.close()
         session.close()
