@@ -7,6 +7,8 @@ publish surface says so instead.
 """
 from __future__ import annotations
 
+import copy
+import pickle
 from pathlib import Path
 from unittest.mock import patch
 
@@ -42,6 +44,9 @@ def test_the_error_carries_the_wire_detail():
     assert isinstance(err, RuntimeError)
     assert str(err) == DETAIL["message"]
     assert err.detail() == DETAIL
+    # Exceptions are rebuilt from their args when pickled or copied.
+    assert pickle.loads(pickle.dumps(err)).detail() == DETAIL
+    assert str(copy.copy(err)) == DETAIL["message"]
 
 
 def test_the_publisher_error_becomes_the_typed_one_and_writes_nothing(tmp_path, monkeypatch):
