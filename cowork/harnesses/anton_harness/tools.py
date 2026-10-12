@@ -400,6 +400,9 @@ async def _cowork_lookup_connector(session: Any, tc_input: dict) -> str:
             "label": connector.get("label"),
             "description": connector.get("description"),
             "category": connector.get("category"),
+            # How to use the service once connected: base URL, auth header,
+            # endpoints. Saved with a custom connector when it was built.
+            "usage_notes": connector.get("usage_notes"),
             "confidence": confidence,
             "stage": stage,
             "form": form_blob,

@@ -13,7 +13,7 @@ import pytest
 from anton.core.datasources.data_vault import LocalDataVault
 from fastapi import HTTPException
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from cowork.api.v1.endpoints.connectors import connections as connections_endpoints
 from cowork.api.v1.endpoints.connectors import oauth as oauth_endpoints
@@ -85,6 +85,18 @@ class TestAgentTools:
         assert result["id"] == "httpbin"
         assert result["form"]["_connector_id"] == "httpbin"
         assert result["form"]["fields"][0]["name"] == "token"
+
+    @pytest.mark.asyncio
+    async def test_lookup_returns_the_saved_usage_notes(self, engine):
+        with Session(engine) as session:
+            row = session.exec(select(CustomConnector).where(CustomConnector.connector_id == "httpbin")).one()
+            row.usage_notes = "Base URL https://httpbin.org; call GET /bearer."
+            session.add(row)
+            session.commit()
+
+        result = json.loads(await tools._cowork_lookup_connector(None, {"id": "httpbin"}))
+
+        assert result["usage_notes"] == "Base URL https://httpbin.org; call GET /bearer."
 
     @pytest.mark.asyncio
     async def test_lookup_by_query_finds_the_custom_connector(self, engine):
