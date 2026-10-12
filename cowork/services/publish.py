@@ -496,6 +496,9 @@ def publish_artifact(
             # Org-keyed: the persisted vault is per organization, and an
             # unscoped lookup would resolve to the shared namespace root.
             vault=vault_for_scope(scope),
+            # While the password is unchanged anton re-sends the hash stored
+            # here, so a content-only re-publish keeps viewers' password grants.
+            previous_access=previous if isinstance(previous, dict) else None,
         )
     except Exception as exc:
         raise_publish_permission_error(exc)
@@ -528,7 +531,9 @@ def publish_artifact(
         # Owner-side only — .published.json never enters the bundle. `owner_side`
         # carries `mode` (+ `access_password`/`pwd_version` for password, or
         # `emails`/`org_allowed`/`access_version` for restricted), and always
-        # `requires_password` for back-compat with older readers.
+        # `requires_password` for back-compat with older readers. Password mode
+        # also keeps the `password_hash` anton sent, handed back as
+        # `previous_access` on the next publish.
         entry: dict[str, Any] = {
             "report_id": returned_report_id,
             "url": view_url,
@@ -548,6 +553,8 @@ def publish_artifact(
             "published": True,
             **owner_side,
         }
+        if owner_side.get("mode") == "password" and result.get("password_hash"):
+            entry["password_hash"] = result["password_hash"]
         published_map[published_key] = entry
         _write_published_map(published_json, published_map)
         state = _load_state()
@@ -564,7 +571,9 @@ def publish_artifact(
         "ownerOnly": bool(owner_side.get("owner_only")),
         # Composite comments scope for the panel (Plan 5).
         "artifactKey": result.get("artifact_key") or canonical_artifact_key or "",
-        "result": {k: v for k, v in result.items() if k != "file_payload"},
+        # `password_hash` is owner-side state for the next publish, not a
+        # response field.
+        "result": {k: v for k, v in result.items() if k not in ("file_payload", "password_hash")},
     }
 
 
