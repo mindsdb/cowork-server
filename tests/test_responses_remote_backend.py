@@ -225,6 +225,34 @@ def test_remote_backend_selected(monkeypatch):
     assert called["buffer"] is kwargs["buffer"]
 
 
+@pytest.mark.parametrize("effort", ["high", None])
+def test_remote_backend_receives_the_selected_reasoning_effort(monkeypatch, effort):
+    monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")
+    called = {}
+    handler = _handler()
+    handler._produce_remote = lambda **kwargs: called.update(kwargs)
+    handler._select_producer(**_kwargs(reasoning_effort=effort))
+    assert called["reasoning_effort"] == effort
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra, expected", [({"reasoning_effort": "low"}, "low"), ({}, None)])
+async def test_produce_remote_passes_reasoning_effort_to_turnqueue(monkeypatch, extra, expected):
+    handler = _remote_handler(monkeypatch, {})
+    captured = {}
+
+    async def fake_replies(**kwargs):
+        captured.update(kwargs)
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi", model="anton",
+        harness_id="anton", buffer=_FakeBuffer(), **extra,
+    )
+    assert captured["reasoning_effort"] == expected
+
+
 def _remote_handler(monkeypatch, saved):
     """Handler wired for _produce_remote with the DB layer faked out."""
     handler = _handler()
