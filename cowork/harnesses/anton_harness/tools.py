@@ -250,12 +250,14 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
         result = _publish_artifact(abs_path, access=access)
     except PublishOwnedByOtherUser as exc:
         # The model can edit files, so spell out that it must not work around
-        # the refusal (e.g. by dropping the stored report_id).
+        # the refusal (e.g. by dropping the stored report_id). Not a ban for the
+        # rest of the conversation: the user may fix the account and ask again.
         logger.info("Cowork publish refused: %s", exc)
         return _fail(
-            f"PUBLISH FAILED: {exc} Do NOT call this tool again for this artifact "
-            "and do not publish it under a new report on your own. Tell the user "
-            "that the existing link belongs to another account.",
+            f"PUBLISH FAILED: {exc} The existing link belongs to another account. "
+            "Do not retry, and do not publish this artifact under a new report on "
+            "your own. Tell the user, and publish again only if they ask after "
+            "resolving it.",
             reason="owned_by_other_user",
         )
     except ValueError as exc:

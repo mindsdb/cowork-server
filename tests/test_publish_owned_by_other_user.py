@@ -8,6 +8,7 @@ publish surface says so instead.
 from __future__ import annotations
 
 import copy
+import json
 import pickle
 from pathlib import Path
 from unittest.mock import patch
@@ -84,6 +85,35 @@ def test_desktop_update_answers_409_with_the_code():
         res = _client().post("/api/v1/publish/update", json={"path": "/some/art"})
     assert res.status_code == 409
     assert res.json()["detail"] == DETAIL
+
+
+def test_update_lets_the_typed_error_through_and_keeps_the_record(tmp_path, monkeypatch):
+    """The real Update path: update_artifact -> publish_artifact -> anton's 409."""
+    from anton.publisher import ArtifactOwnedByOtherUserError
+
+    monkeypatch.setenv("ANTON_COWORK_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(publish_mod, "vault_for_scope", lambda scope: object())
+    page = tmp_path / "report.html"
+    page.write_text("<html><body>hi</body></html>", encoding="utf-8")
+    record = {"report.html": {
+        "report_id": "theirs", "url": "https://view.example/a/theirs", "published": True,
+        "mode": "public", "requires_password": False,
+    }}
+    (tmp_path / ".published.json").write_text(json.dumps(record), encoding="utf-8")
+    monkeypatch.setattr(publish_mod, "desktop_artifact_and_base", lambda raw: (page, tmp_path))
+    monkeypatch.setattr(publish_mod, "desktop_publish_credential", lambda: ("k", "https://view.example"))
+    calls = []
+
+    def reject(path, **kwargs):
+        calls.append(kwargs)
+        raise ArtifactOwnedByOtherUserError()
+
+    monkeypatch.setattr("anton.publisher.publish", reject)
+
+    with pytest.raises(PublishOwnedByOtherUser):
+        publish_mod.update_artifact(str(page))
+    assert [c["report_id"] for c in calls] == ["theirs"]
+    assert json.loads((tmp_path / ".published.json").read_text(encoding="utf-8")) == record
 
 
 def test_other_runtime_errors_still_map_to_502():
