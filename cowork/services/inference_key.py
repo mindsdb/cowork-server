@@ -27,6 +27,9 @@ _TIMEOUT_S = 10.0
 # A failed mint stops the desktop's LLM calls, so retry well before the next hand-over.
 _RETRY_S = 60.0
 _retry_timer: threading.Timer | None = None
+# The hand-over, a workspace switch and the retry timer mint on different threads;
+# without this a slower, older mint could install over a newer one.
+_mint_lock = threading.Lock()
 
 
 def _turn_keys_url() -> str:
@@ -49,6 +52,11 @@ def refresh_inference_key(token: str, organization_id: str) -> None:
     retries in a minute. The old key is never revoked here: the scratchpad and
     coding sessions keep using it until it expires.
     """
+    with _mint_lock:
+        _refresh(token, organization_id)
+
+
+def _refresh(token: str, organization_id: str) -> None:
     current = runtime_credential.get_inference_key()
     workspace_id = desktop_workspace_pick()
     now = datetime.now(timezone.utc)
