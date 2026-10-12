@@ -143,10 +143,12 @@ def _settings(session: Session, scope: TenantScope):
     return SettingService(session, scope).load()
 
 
-def _credentials(settings) -> EngineCredentials:
+def _credentials(settings, *, model_listing: bool = False) -> EngineCredentials:
+    # The gateway's model listing refuses turn keys, so it keeps the session token.
+    key = provider_api_key_str if model_listing else inference_api_key_str
     return EngineCredentials(
         minds_url=settings.minds_url,
-        minds_api_key=inference_api_key_str(settings, Provider.MINDS_CLOUD),
+        minds_api_key=key(settings, Provider.MINDS_CLOUD),
     )
 
 
@@ -232,7 +234,7 @@ def engines():
 @router.get("/models")
 def models(session: SessionDep, scope: ScopeDep, engine_id: str = Query(default="codex", alias="engineId")):
     settings = _settings(session, scope)
-    return {"items": _call(_service().discover_models, engine_id, _credentials(settings))}
+    return {"items": _call(_service().discover_models, engine_id, _credentials(settings, model_listing=True))}
 
 
 @router.post("/runtime/prepare-shutdown")
@@ -285,7 +287,7 @@ def issue_connector_capability(run_id: str, body: ConnectorCapabilityIssueReques
 @router.api_route("/inference/{path:path}", methods=["GET", "POST"])
 async def inference_proxy(path: str, request: Request, session: SessionDep, scope: ScopeDep):
     _require_inference_client(request)
-    credentials = _credentials(_settings(session, scope))
+    credentials = _credentials(_settings(session, scope), model_listing=path == "models")
     return await proxy_inference(request, path, credentials)
 
 
