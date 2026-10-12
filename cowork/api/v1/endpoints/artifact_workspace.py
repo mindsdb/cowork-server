@@ -809,7 +809,7 @@ async def set_artifact_access(
     every turn, with the owner's selection in place of the first-publish default.
     """
     await require_product_permission(session.scope, "artifact.manage")
-    from cowork.services.publish import PublishOwnedByOtherUser, publish_artifact as _publish_bundle
+    from cowork.services.publish import publish_artifact as _publish_bundle
     from cowork.services.artifact_access import ArtifactAccessUnavailable
 
     source, folder, metadata, _capabilities = _owner_workspace(session, project_ref, artifact_id)
@@ -860,8 +860,6 @@ async def set_artifact_access(
     except asyncio.CancelledError:
         publish_abandoned = publish_started
         raise
-    except PublishOwnedByOtherUser as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=exc.detail()) from exc
     except ArtifactAccessUnavailable as exc:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
     except FileNotFoundError as exc:
