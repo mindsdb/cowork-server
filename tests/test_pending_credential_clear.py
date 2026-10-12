@@ -12,6 +12,7 @@ from uvicorn.lifespan.on import LifespanOn
 from cowork import server
 from cowork.api.v1.endpoints.health import health
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.user_settings import invalidate_user_settings_cache
 from cowork.db.migrations import run_schema_migrations
 from cowork.db.session import get_engine
 from cowork.models.setting import Setting
@@ -181,6 +182,8 @@ def app_store():
             if key not in before:
                 session.add(Setting(key=key, value="seeded"))
         session.commit()
+        # Encrypted, as a real saved key is, so the store reads as configured.
+        SettingService(session, None).upsert_setting("anthropic_api_key", "test-key-not-real")
     marker.touch()
     yield database_uri, marker
     marker.unlink(missing_ok=True)
@@ -191,6 +194,7 @@ def app_store():
         for key, value in before.items():
             session.add(Setting(key=key, value=value))
         session.commit()
+    invalidate_user_settings_cache()
 
 
 async def test_startup_clears_after_setup_and_before_anything_else_runs(app_store, monkeypatch):
@@ -199,6 +203,7 @@ async def test_startup_clears_after_setup_and_before_anything_else_runs(app_stor
 
     def recording_setup() -> None:
         seen["marker_during_setup"] = marker.exists()
+        seen["config_ready_before"] = health()["config_ready"]
 
     def stop_after_clear() -> None:
         seen["keys_after_clear"] = _keys(database_uri)
@@ -215,6 +220,7 @@ async def test_startup_clears_after_setup_and_before_anything_else_runs(app_stor
     assert isinstance(keys_after_clear, set)
     assert keys_after_clear.isdisjoint(CREDENTIAL_KEYS)
     assert PREFERENCE_KEY in keys_after_clear
+    assert seen["config_ready_before"] is True
     assert seen["config_ready"] is False
     assert not marker.exists()
 
