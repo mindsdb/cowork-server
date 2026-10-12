@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+from fastapi import HTTPException
 from pydantic import SecretStr
 
 from cowork.common.paths import cowork_home, pod_local_only
@@ -60,30 +61,24 @@ class PublisherUnavailable(RuntimeError):
     """
 
 
-# The upload service's 409 for a report that belongs to another account. The
-# endpoints answer with exactly this pair as `detail`; the renderer matches on
-# the code.
+# The upload service's 409 for a report that belongs to another account; the
+# renderer matches on the code.
 OWNED_BY_OTHER_USER_CODE = "artifact_owned_by_other_user"
 OWNED_BY_OTHER_USER_MESSAGE = "This artifact was published by another owner."
 
 
-class PublishOwnedByOtherUser(RuntimeError):
+class PublishOwnedByOtherUser(HTTPException):
     """The upload service refused the publish: another account owns this report.
 
-    A RuntimeError so every existing catch-all still treats it as a failed
-    publish. Nobody retries it with a fresh report_id, which would publish a
-    copy under a new URL.
+    An HTTPException, like ProductPermissionDenied, so any route that lets it
+    through answers 409 with the code. Nobody retries it with a fresh
+    report_id, which would publish a copy under a new URL.
     """
 
     def __init__(self) -> None:
-        super().__init__(OWNED_BY_OTHER_USER_MESSAGE)
-
-    def __reduce__(self):
-        # pickle and copy rebuild an exception from its args; this one takes none.
-        return (type(self), ())
-
-    def detail(self) -> dict[str, str]:
-        return {"code": OWNED_BY_OTHER_USER_CODE, "message": OWNED_BY_OTHER_USER_MESSAGE}
+        super().__init__(
+            409, detail={"code": OWNED_BY_OTHER_USER_CODE, "message": OWNED_BY_OTHER_USER_MESSAGE},
+        )
 
 
 def raise_publish_permission_error(exc: Exception) -> None:
@@ -548,6 +543,9 @@ def publish_artifact(
         if md_tmp_dir is not None:
             md_tmp_dir.cleanup()
 
+    # Owner-side state for the next publish, stored in the entry below and
+    # never part of the response.
+    password_hash = result.pop("password_hash", None)
     view_url = result.get("view_url", "")
     returned_report_id = result.get("report_id", "")
     if returned_report_id:
@@ -583,8 +581,8 @@ def publish_artifact(
             "published": True,
             **owner_side,
         }
-        if owner_side.get("mode") == "password" and result.get("password_hash"):
-            entry["password_hash"] = result["password_hash"]
+        if password_hash:
+            entry["password_hash"] = password_hash
         published_map[published_key] = entry
         _write_published_map(published_json, published_map)
         state = _load_state()
@@ -601,9 +599,7 @@ def publish_artifact(
         "ownerOnly": bool(owner_side.get("owner_only")),
         # Composite comments scope for the panel (Plan 5).
         "artifactKey": result.get("artifact_key") or canonical_artifact_key or "",
-        # `password_hash` is owner-side state for the next publish, not a
-        # response field.
-        "result": {k: v for k, v in result.items() if k not in ("file_payload", "password_hash")},
+        "result": {k: v for k, v in result.items() if k != "file_payload"},
     }
 
 
