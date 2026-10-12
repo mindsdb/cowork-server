@@ -357,8 +357,13 @@ class ScopedSession:
         self._session.rollback()
 
     def get_bind(self) -> Any:
-        """Return the scoped session's engine for server-owned coordination."""
-        return self._session.get_bind()
+        """Return the scoped session's engine for server-owned coordination.
+
+        A unit's session is bound to one connection (cowork.db.units), and the
+        advisory-lock engine reads its database URL from the engine, which a
+        connection does not carry.
+        """
+        return self._session.get_bind().engine
 
     def close(self) -> None:
         self._session.close()

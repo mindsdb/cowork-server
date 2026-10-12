@@ -28,7 +28,7 @@ from cowork.db.scoped import (
     TenantScope,
     get_tenant_scope,
 )
-from cowork.streaming.registry import registry
+from cowork.streaming.registry import TurnLifecycle, registry
 
 ORG_A = "11111111-1111-1111-1111-111111111111"
 ORG_B = "22222222-2222-2222-2222-222222222222"
@@ -105,6 +105,7 @@ class _FakeHandle:
         self.org_id = org_id
         self.turn_id = 1
         self.buffer = _FakeBuffer()
+        self.lifecycle = TurnLifecycle()
         self._running = running
         self.cancelled = False
 

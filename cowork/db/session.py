@@ -2,8 +2,10 @@
 
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy import create_engine
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.orm import sessionmaker
 from sqlmodel import Session as SQLModelSession
+from starlette.exceptions import HTTPException
 
 from cowork.common.logger import setup_logging
 from cowork.common.settings.app_settings import get_app_settings
@@ -17,29 +19,22 @@ _session_factories = {}
 
 
 
-def _is_client_error(exc: BaseException) -> bool:
-    """True for exceptions answered as 4xx; those are expected outcomes.
-
-    RequestValidationError carries the offending request body, so logging it
-    with a traceback would put a submitted password or DSN in the log.
-    """
+def _is_expected_refusal(exc: BaseException) -> bool:
+    """True for an answer the request was meant to get: a 4xx HTTPException, the
+    422 for a body that failed validation, or the 503 for a pool that freed no
+    connection in time (cowork.server answers it). Another error's status_code,
+    such as a provider SDK's, is not one."""
+    if isinstance(exc, PoolTimeoutError):
+        return True
+    # Its str() and traceback carry the submitted body, a password or a DSN on
+    # a connector form; FastAPI answers it with 422.
     if isinstance(exc, RequestValidationError):
         return True
-    status = getattr(exc, "status_code", None)
-    return isinstance(status, int) and 400 <= status < 500
+    if not isinstance(exc, HTTPException):
+        return False
+    status = exc.status_code
+    return type(status) is int and 400 <= status < 500
 
-
-def _client_error_summary(exc: BaseException) -> str:
-    """Describe a client error without repeating what the caller submitted.
-
-    RequestValidationError's str() embeds the offending request body, which on
-    a connector submission is a password or a DSN, so it is reduced to the
-    locations that failed.
-    """
-    if isinstance(exc, RequestValidationError):
-        locations = [error.get("loc") for error in exc.errors()]
-        return f"invalid request data at {locations}"
-    return str(exc)
 
 def _create_engine(db_uri: str):
     is_sqlite = db_uri.startswith("sqlite")
@@ -48,10 +43,12 @@ def _create_engine(db_uri: str):
             engine = create_engine(
                 db_uri,
                 connect_args={"check_same_thread": False},
+                hide_parameters=True,
             )
         else:
             engine = create_engine(
                 db_uri,
+                hide_parameters=True,
                 pool_size=settings.database.pool_size,
                 max_overflow=settings.database.max_overflow,
                 pool_timeout=settings.database.pool_timeout,
@@ -61,7 +58,7 @@ def _create_engine(db_uri: str):
         return engine
     except Exception as e:
         error_msg = str(e).lower()
-        logger.error(f"Failed to create engine: {error_msg}")
+        logger.error("Failed to create engine: error_type=%s", type(e).__name__)
         raise RuntimeError(f"Engine creation failed: {error_msg}") from e
 
 
@@ -100,12 +97,15 @@ def get_session_factory(engine):
     return _session_factories[engine_id]
 
 
-def get_session(db_uri: str = settings.database.uri):
+def get_session():
     """
     FastAPI dependency that provides a database session with automatic cleanup.
 
     This is a generator-based dependency that ensures sessions are always closed
     after the request completes, preventing database connection leaks.
+
+    It takes no parameters: FastAPI reads a dependency's parameters from the
+    request, so the database URI comes from settings only.
 
     Usage:
         @router.get("/example")
@@ -113,14 +113,11 @@ def get_session(db_uri: str = settings.database.uri):
             # Session will be automatically closed after this function completes
             pass
 
-    Args:
-         db_uri: Database connection URI (defaults to settings value)
-
     Yields:
         SQLModelSession: Database session that will be automatically closed
     """
 
-    engine = get_engine(db_uri=db_uri)
+    engine = get_engine(db_uri=settings.database.uri)
     session_factory = get_session_factory(engine)
 
     db = session_factory()
@@ -129,12 +126,38 @@ def get_session(db_uri: str = settings.database.uri):
         yield db
     except Exception as e:
         # A 4xx HTTPException is the endpoint's intended answer (a 409 for a
-        # steer during an approval, a 404 for a missing task); it still rolls
-        # the transaction back, but it is not an error worth a traceback.
-        if _is_client_error(e):
-            logger.debug(f"Session rolled back after a client error: {_client_error_summary(e)}")
+        # steer during an approval, a 404 for a missing task), and so is the
+        # 503 for a full pool. Each still rolls the transaction back, but none
+        # is an error worth an error-level log. A plain pool timeout carries no
+        # status_code; cowork.server answers it with a 503.
+        # Exception text and tracebacks can expose SQL, credentials or database
+        # error details, even when create_engine hides bound parameters.
+        if _is_expected_refusal(e):
+            logger.debug(
+                "Session rolled back after an expected refusal: error_type=%s status=%s",
+                type(e).__name__,
+                422 if isinstance(e, RequestValidationError) else getattr(e, "status_code", 503),
+            )
+        elif isinstance(e, HTTPException):
+            # Starlette answers an HTTPException (FastAPI's subclasses it)
+            # itself and logs nothing, so this line is the only record of what
+            # caused a 5xx. The cause's traceback goes through the handler
+            # filters, which replace a database or provider chain; the
+            # exception's own detail is the client's answer and stays out.
+            cause = e.__cause__ or (None if e.__suppress_context__ else e.__context__)
+            logger.error(
+                "Session error: error_type=%s status=%d cause=%s",
+                type(e).__name__,
+                e.status_code,
+                type(cause).__name__ if cause is not None else "none",
+                exc_info=cause,
+            )
         else:
-            logger.exception(f"❌ Session error: {str(e)}")
+            # Any other exception goes on to Uvicorn, which logs its traceback
+            # through the same filters, or to an app exception handler that
+            # answers it. That includes an error that carries a status_code
+            # without being an HTTPException, such as a provider SDK's.
+            logger.error("Session error: error_type=%s", type(e).__name__)
         db.rollback()
         raise
     finally:
