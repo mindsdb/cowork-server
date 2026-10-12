@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -23,7 +24,11 @@ logger = logging.getLogger(__name__)
 _TTL = timedelta(minutes=30)
 # More than one missed hand-over of headroom, so a late push never finds it expired.
 _REMINT_WHEN_LEFT = timedelta(minutes=20)
-_TIMEOUT_S = 10.0
+# The whole mint, lock wait included. The hand-over waits on it and the desktop
+# gives that PUT 10s; past this the hand-over confirms and the retry takes over.
+_MINT_BUDGET_S = 6.0
+_CONNECT_S = 1.5
+_REVOKE_TIMEOUT_S = 3.0
 # A failed mint stops the desktop's LLM calls, so retry well before the next hand-over.
 _RETRY_S = 60.0
 _retry_timer: threading.Timer | None = None
@@ -52,11 +57,18 @@ def refresh_inference_key(token: str, organization_id: str) -> None:
     retries in a minute. The old key is never revoked here: the scratchpad and
     coding sessions keep using it until it expires.
     """
-    with _mint_lock:
-        _refresh(token, organization_id)
+    deadline = time.monotonic() + _MINT_BUDGET_S
+    if not _mint_lock.acquire(timeout=_MINT_BUDGET_S):
+        # Another mint is running past the budget; don't hold up the hand-over for it.
+        _schedule_retry()
+        return
+    try:
+        _refresh(token, organization_id, deadline)
+    finally:
+        _mint_lock.release()
 
 
-def _refresh(token: str, organization_id: str) -> None:
+def _refresh(token: str, organization_id: str, deadline: float) -> None:
     current = runtime_credential.get_inference_key()
     workspace_id = desktop_workspace_pick()
     now = datetime.now(timezone.utc)
@@ -79,11 +91,11 @@ def _refresh(token: str, organization_id: str) -> None:
     if workspace_id:
         body["workspace_id"] = workspace_id
     try:
-        response = _post(body, token)
+        response = _post(body, token, deadline)
         if workspace_id and _code(response) == "workspace_not_found":
             # A stale pick (grant removed, workspace deleted) bills the Default, as the menu shows.
             response = _post(
-                {k: v for k, v in body.items() if k != "workspace_id"}, token
+                {k: v for k, v in body.items() if k != "workspace_id"}, token, deadline
             )
         response.raise_for_status()
         key = response.json()["key"]
@@ -107,12 +119,17 @@ def _refresh(token: str, organization_id: str) -> None:
     )
 
 
-def _post(body: dict, token: str) -> httpx.Response:
+def _post(body: dict, token: str, deadline: float) -> httpx.Response:
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("turn-key mint ran out of time")
+    # ponytail: httpx bounds each phase, not their sum, so a slow connect can run
+    # about _CONNECT_S over; still well inside the desktop's 10s.
     return httpx.post(
         _turn_keys_url(),
         json=body,
         headers={"Authorization": f"Bearer {token}"},
-        timeout=_TIMEOUT_S,
+        timeout=httpx.Timeout(left, connect=min(_CONNECT_S, left)),
     )
 
 
@@ -146,7 +163,7 @@ def revoke_inference_key(token: str, key: InferenceKey) -> None:
         httpx.delete(
             f"{_turn_keys_url()}{key.instance_id}/",
             headers={"Authorization": f"Bearer {token}"},
-            timeout=_TIMEOUT_S,
+            timeout=_REVOKE_TIMEOUT_S,
         )
     except Exception as exc:
         logger.info("Could not revoke turn key %s: %s", key.instance_id, exc)

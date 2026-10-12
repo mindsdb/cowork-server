@@ -256,6 +256,43 @@ def test_org_mode_holds_no_org_or_key(monkeypatch):
         get_app_settings.cache_clear()
 
 
+class TestTimeBudget:
+    """The hand-over waits on the mint, and the desktop gives up on it at 10s."""
+
+    def test_each_call_gets_only_the_time_left(self, http):
+        inference_key.refresh_inference_key("jwt", ORG_A)
+
+        left = http.Timeout.call_args.args[0]
+        assert 0 < left <= inference_key._MINT_BUDGET_S
+        assert http.Timeout.call_args.kwargs["connect"] <= inference_key._CONNECT_S
+        assert http.post.call_args.kwargs["timeout"] is http.Timeout.return_value
+
+    def test_a_spent_budget_is_a_failed_mint(self, http, monkeypatch):
+        monkeypatch.setattr(inference_key, "_MINT_BUDGET_S", 0)
+
+        inference_key.refresh_inference_key("jwt", ORG_A)
+
+        http.post.assert_not_called()
+        http.schedule_retry.assert_called_once()
+        assert runtime_credential.get_inference_key() is None
+
+    def test_a_busy_lock_does_not_hold_up_the_hand_over(self, http, monkeypatch):
+        monkeypatch.setattr(inference_key, "_MINT_BUDGET_S", 0.05)
+
+        with inference_key._mint_lock:
+            inference_key.refresh_inference_key("jwt", ORG_A)
+
+        http.post.assert_not_called()
+        http.schedule_retry.assert_called_once()
+
+    def test_revoke_has_a_short_timeout(self, http):
+        inference_key.revoke_inference_key("jwt", _key())
+
+        assert (
+            http.delete.call_args.kwargs["timeout"] == inference_key._REVOKE_TIMEOUT_S
+        )
+
+
 class TestConcurrentMints:
     def test_a_slow_older_mint_cannot_install_over_a_newer_pick(self, http):
         import threading
