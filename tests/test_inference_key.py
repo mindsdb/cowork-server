@@ -256,6 +256,43 @@ def test_org_mode_holds_no_org_or_key(monkeypatch):
         get_app_settings.cache_clear()
 
 
+class TestConcurrentMints:
+    def test_a_slow_older_mint_cannot_install_over_a_newer_pick(self, http):
+        import threading
+
+        pick = {"ws": "ws-1"}
+        first_post_started, release_first = threading.Event(), threading.Event()
+
+        def post(url, json, **kwargs):
+            response = MagicMock()
+            response.json.return_value = {"key": f"mdb_{json.get('workspace_id')}"}
+            if json.get("workspace_id") == "ws-1":
+                first_post_started.set()
+                release_first.wait(5)
+            return response
+
+        http.post.side_effect = post
+        with patch.object(
+            inference_key, "desktop_workspace_pick", side_effect=lambda: pick["ws"]
+        ):
+            old = threading.Thread(
+                target=inference_key.refresh_inference_key, args=("jwt", ORG_A)
+            )
+            old.start()
+            first_post_started.wait(5)
+            pick["ws"] = "ws-2"  # the user switches workspace mid-mint
+            new = threading.Thread(
+                target=inference_key.refresh_inference_key, args=("jwt", ORG_A)
+            )
+            new.start()
+            release_first.set()
+            old.join(5)
+            new.join(5)
+
+        held = runtime_credential.get_inference_key()
+        assert (held.workspace_id, held.value) == ("ws-2", "mdb_ws-2")
+
+
 class TestRetry:
     def test_retries_with_the_latest_hand_over(self):
         runtime_credential.set_minds_credential("jwt-latest")
