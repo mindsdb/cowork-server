@@ -60,6 +60,28 @@ class PublisherUnavailable(RuntimeError):
     """
 
 
+# The upload service's 409 for a report that belongs to another account. The
+# endpoints answer with exactly this pair as `detail`; the renderer matches on
+# the code.
+OWNED_BY_OTHER_USER_CODE = "artifact_owned_by_other_user"
+OWNED_BY_OTHER_USER_MESSAGE = "This artifact was published by another owner."
+
+
+class PublishOwnedByOtherUser(RuntimeError):
+    """The upload service refused the publish: another account owns this report.
+
+    A RuntimeError so every existing catch-all still treats it as a failed
+    publish. Nobody retries it with a fresh report_id, which would publish a
+    copy under a new URL.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(OWNED_BY_OTHER_USER_MESSAGE)
+
+    def detail(self) -> dict[str, str]:
+        return {"code": OWNED_BY_OTHER_USER_CODE, "message": OWNED_BY_OTHER_USER_MESSAGE}
+
+
 def raise_publish_permission_error(exc: Exception) -> None:
     """Preserve the artifact consumer's explicit authority result through wrappers."""
     from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
@@ -432,7 +454,7 @@ def publish_artifact(
         raise ValueError(FULLSTACK_PUBLISH_UNSUPPORTED)
 
     try:
-        from anton.publisher import publish
+        from anton.publisher import ArtifactOwnedByOtherUserError, publish
     except Exception as exc:
         raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
@@ -500,6 +522,10 @@ def publish_artifact(
             # here, so a content-only re-publish keeps viewers' password grants.
             previous_access=previous if isinstance(previous, dict) else None,
         )
+    except ArtifactOwnedByOtherUserError as exc:
+        # Not a failure to log or wrap: the upload service holds this
+        # report_id for another account.
+        raise PublishOwnedByOtherUser() from exc
     except Exception as exc:
         raise_publish_permission_error(exc)
         logger.exception("Publishing failed")

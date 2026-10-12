@@ -14,6 +14,7 @@ from cowork.db.scoped import TenantScope, get_tenant_scope
 
 from cowork.services.publish import (
     PublisherUnavailable,
+    PublishOwnedByOtherUser,
     activate_version as _activate_version,
     desktop_publish_context as _desktop_context,
     list_publishable,
@@ -91,6 +92,8 @@ async def publish_artifact(req: _PublishBody, scope: TenantScope = Depends(get_t
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except PublishOwnedByOtherUser as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=e.detail())
     except PublisherUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
     except RuntimeError as e:
@@ -105,6 +108,8 @@ async def update_artifact(req: _UpdateBody):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except PublishOwnedByOtherUser as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=e.detail())
     except PublisherUnavailable as e:
         raise HTTPException(status_code=503, detail=str(e))
     except RuntimeError as e:
