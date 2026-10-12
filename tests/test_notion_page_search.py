@@ -7,10 +7,21 @@ import pytest
 from fastapi import HTTPException
 
 from anton.core.datasources.data_vault import LocalDataVault
-from cowork.api.v1.endpoints.connectors.notion import NotionSearchRequest, search_notion_pages
+from cowork.api.v1.endpoints.connectors.notion import (
+    NotionFetchRequest,
+    NotionSearchRequest,
+    fetch_notion_page,
+    search_notion_pages,
+)
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.services.connectors.connections import ConnectionsService
-from cowork.services.connectors.notion_pages import MAX_RESULTS, describe_project_pages, parse_search_results
+from cowork.services.connectors.notion_pages import (
+    MAX_PAGE_CHARS,
+    MAX_RESULTS,
+    describe_project_pages,
+    parse_fetched_page,
+    parse_search_results,
+)
 
 SEARCH_RESPONSE = json.dumps({
     "type": "workspace_search",
@@ -141,6 +152,61 @@ async def test_org_mode_takes_the_token_from_auth(monkeypatch, mcp_calls):
     assert seen == {"engine": "notion", "name": "ws-a"}
     assert mcp_calls[0][1] == "tok-auth"
     assert len(out["results"]) == 2
+
+
+FETCH_RESPONSE = json.dumps({
+    "metadata": {"type": "page"},
+    "title": "Getting Started",
+    "url": "https://www.notion.so/p1",
+    "text": "<page>Welcome to Notion</page>",
+    "page_last_edited_at": "2026-10-09T13:25:01.800Z",
+})
+
+
+class TestParseFetchedPage:
+    def test_reads_title_and_text(self):
+        assert parse_fetched_page(FETCH_RESPONSE) == {
+            "title": "Getting Started", "text": "<page>Welcome to Notion</page>", "truncated": False,
+        }
+
+    def test_a_long_page_is_cut_and_flagged(self):
+        out = parse_fetched_page(json.dumps({"title": "Big", "text": "x" * (MAX_PAGE_CHARS + 5)}))
+        assert len(out["text"]) == MAX_PAGE_CHARS
+        assert out["truncated"] is True
+
+    def test_non_json_content_is_used_as_text(self):
+        assert parse_fetched_page("plain page text")["text"] == "plain page text"
+
+
+async def test_fetches_a_page_with_the_connections_stored_token(vault, notion_server, monkeypatch):
+    calls = []
+
+    async def fake_call_mcp_tool(engine, access_token, tool_name, **kwargs):
+        calls.append((engine, access_token, tool_name, kwargs))
+        return FETCH_RESPONSE
+
+    monkeypatch.setattr("anton.core.mcp.wiring.call_mcp_tool", fake_call_mcp_tool)
+    out = await fetch_notion_page(NotionFetchRequest(name="mcp-ws", page=" https://www.notion.so/p1 "), LOCAL_SCOPE, None)
+    assert out["text"] == "<page>Welcome to Notion</page>"
+    assert calls == [("notion", "tok-mcp", "notion-fetch", {"id": "https://www.notion.so/p1"})]
+
+
+async def test_fetching_with_a_rejected_token_asks_for_a_reconnect(vault, notion_server, monkeypatch):
+    from anton.core.mcp.errors import McpPermanentError
+
+    async def rejected(*args, **kwargs):
+        raise McpPermanentError("401")
+
+    monkeypatch.setattr("anton.core.mcp.wiring.call_mcp_tool", rejected)
+    with pytest.raises(HTTPException) as exc:
+        await fetch_notion_page(NotionFetchRequest(name="mcp-ws", page="p1"), LOCAL_SCOPE, None)
+    assert exc.value.status_code == 409
+
+
+async def test_a_non_mcp_connection_cannot_fetch(vault, notion_server):
+    with pytest.raises(HTTPException) as exc:
+        await fetch_notion_page(NotionFetchRequest(name="secret-ws", page="p1"), LOCAL_SCOPE, None)
+    assert exc.value.status_code == 404
 
 
 class TestProjectPages:
