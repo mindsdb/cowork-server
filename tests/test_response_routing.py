@@ -2574,7 +2574,7 @@ async def test_a_remote_turn_gets_the_configured_gate_budget(monkeypatch):
 @pytest.mark.asyncio
 async def test_an_in_process_turn_keeps_the_default_gate_budget(monkeypatch):
     seen = await _route_request_with_budget(monkeypatch, backend="inprocess", budget="2")
-    assert "gate_total_seconds" not in seen
+    assert seen["gate_total_seconds"] is None
 
 
 @pytest.mark.asyncio
