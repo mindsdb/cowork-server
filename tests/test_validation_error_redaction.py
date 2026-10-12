@@ -1,9 +1,10 @@
 """Request validation errors must not repeat the submitted body.
 
-Connector submissions carry passwords, DSNs and CA material. FastAPI's
-default 422 echoes the offending value back in ``input``, and ``get_session``
-logs the same error with ``logger.exception`` when its generator unwinds, so
-a malformed body reaches both the response and the server log verbatim.
+Connector submissions carry passwords, DSNs and CA material, and settings
+carry provider keys. FastAPI's default 422 echoes the offending value back in
+``input``, and a route holding a request session sees the same error in
+``get_session`` when its generator unwinds, so a malformed body could reach
+both the response and the server log verbatim.
 """
 from __future__ import annotations
 
@@ -23,6 +24,11 @@ MALFORMED_BODY = {
     "method": "host-port",
     "values": SENTINEL,
 }
+
+#: The submission route holds no request session, so the session log is read
+#: on a route that does and whose body carries a key: the settings write.
+SESSION_ROUTE = "/api/v1/settings/"
+MALFORMED_SETTINGS_BODY = {"values": SENTINEL}
 
 
 @pytest.fixture(autouse=True)
@@ -81,12 +87,13 @@ def test_malformed_body_is_not_echoed_in_the_response(client):
 
 
 def test_malformed_body_is_not_echoed_in_the_session_log(client, session_log):
-    res = client.post("/api/v1/connectors/submissions/", json=MALFORMED_BODY)
+    res = client.put(SESSION_ROUTE, json=MALFORMED_SETTINGS_BODY)
 
     assert res.status_code == 422
+    assert SENTINEL not in res.text
     # Pin that the line was emitted before asserting what it does not contain,
     # so the check below cannot pass on an empty log.
-    rollback = [r for r in session_log if "rolled back after a client error" in r.getMessage()]
+    rollback = [r for r in session_log if "rolled back after an expected refusal" in r.getMessage()]
     assert len(rollback) == 1
     assert rollback[0].levelname == "DEBUG"
     assert all(SENTINEL not in record.getMessage() for record in session_log)
