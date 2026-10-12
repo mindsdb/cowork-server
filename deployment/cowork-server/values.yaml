@@ -129,6 +129,14 @@ deployment:
   # neither the buffer nor the handle and 404s.
   replicaCount: 2
 
+  # The two switches for cloud datasource turns, templated into
+  # COWORK_TURN_DATASOURCE_ENABLED and COWORK_DATASOURCE_CAPABILITIES below. The
+  # release gate replaces these scalars in values-<env>.yaml, since an extraEnvs
+  # entry would render a second copy of the variable. Off in the base, so a PR
+  # environment, which renders this file alone, stays off.
+  datasourceTurnsEnabled: "false"
+  datasourceCapabilities: ""
+
   image:
     # The build-push-ecr action derives the ECR repo name from the GitHub repo
     # slug, so this must track the GitHub repo name (cowork-server).
@@ -325,6 +333,50 @@ deployment:
     
     - name: COWORK_TURN_TURN_KEY_TTL_SECONDS
       value: "1200"
+
+    # Cloud datasource grants for hosted turns. Off until the release gate; on,
+    # the producer lists the user's verified connections and registers grants
+    # under the producer role of the datasource-service-keys bundle, an identity
+    # distinct from the shared internal secret above. Optional: without the
+    # Secret the producer refuses every datasource turn (ProductPermissionUnavailable),
+    # the same closed door, and a namespace that has no bundle yet still deploys.
+    # Provision the bundle before the flag turns on, not before this deploys.
+    # Read from deployment.datasourceTurnsEnabled, so the gate flips that scalar
+    # per environment; tests/test_chart_values.py pins which environments are on.
+    - name: COWORK_TURN_DATASOURCE_ENABLED
+      value: '{{ $.Values.datasourceTurnsEnabled }}'
+    - name: COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID
+      valueFrom:
+        secretKeyRef:
+          name: datasource-service-keys
+          key: DATASOURCE_PRODUCER_KEY_ID
+          optional: true
+    - name: COWORK_TURN_DATASOURCE_PRODUCER_KEY
+      valueFrom:
+        secretKeyRef:
+          name: datasource-service-keys
+          key: DATASOURCE_PRODUCER_KEY
+          optional: true
+
+    # Which connector methods this deployment may run as a cloud datasource,
+    # as a versioned manifest: {"manifest_version": 1, "enabled": ["postgres:host-port"]}.
+    # Empty means none, which is the released state, and the release gate sets
+    # deployment.datasourceCapabilities per environment. A method whose own spec
+    # says the adapters cannot run it stays unavailable however this reads, so
+    # enabling one here can never get ahead of the adapter work.
+    - name: COWORK_DATASOURCE_CAPABILITIES
+      value: '{{ $.Values.datasourceCapabilities }}'
+
+    # Where this server reaches the datasource gateway to check a connection
+    # someone just saved. The gateway's probe route is cluster-only, so this is
+    # the inference Service by name, resolved namespace-relative exactly as the
+    # auth address above is, and correct in every environment without an
+    # override. Set here rather than left to the release gate because it is an
+    # address and not a permission: it does nothing at all while the feature is
+    # off, and forgetting it later is the confusing failure, a connection that
+    # saves and then waits forever to be checked.
+    - name: COWORK_TURN_DATASOURCE_GATEWAY_BASE_URL
+      value: "http://mindshub-inference"
 
     # Inference base URL the pod's turn calls. MUST be this env's own inference:
     # the turn key is minted by this env's auth, and each inference validates

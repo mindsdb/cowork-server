@@ -4,10 +4,12 @@ import hashlib
 import json
 import logging
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
 
+from cowork.common.logger import log_context
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, scope_of_session
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
@@ -222,16 +224,29 @@ class TaskObjectService:
         # commit a half-applied batch of index rows along with it.
         if rekeys:
             actor = str(self.session.scope.user_id or creator)
+            # Plain values: a failed rekey commit expires every loaded row,
+            # and reading one back needs the session the failure broke.
+            dest_id, dest_name, conversation_id = dest.id, dest.name, conversation.id
             for old_slug, new_slug in rekeys:
                 try:
                     rekey_artifact_owner(
-                        self.session, src_root, old_slug, dest.id, new_slug, actor_id=actor
+                        self.session, src_root, old_slug, dest_id, new_slug, actor_id=actor
                     )
                 except Exception:
+                    # The record names the folder at its new address: a name
+                    # collision gives it a new slug in the destination.
                     logger.warning(
                         "Could not move the owner of artifact %r to project %r",
-                        old_slug, dest.name, exc_info=True,
+                        old_slug,
+                        dest_name,
+                        exc_info=True,
+                        extra=log_context(
+                            project_id=dest_id, conversation_id=conversation_id, artifact_slug=new_slug,
+                        ),
                     )
+                    # The next rekey and the caller's own writes need a
+                    # usable session.
+                    self.session.rollback()
         return moved
 
     @staticmethod
@@ -321,17 +336,66 @@ def _recover_turn_scope(conversation) -> TenantScope | None:
         return None
 
 
+def record_new_artifacts(
+    session: ScopedSession,
+    *,
+    conversation_id,
+    project_id,
+    slugs: list[str],
+    creator: str | None,
+) -> None:
+    """Attribute freshly appeared artifacts to this conversation, in the
+    caller's session. Best-effort.
+
+    Two records: the `task_objects` row, and in org mode (ENG-2961) the owner
+    row naming ``creator``, the conversation's creator, since a project-level
+    root is shared by every member and the owner has to be written down when
+    the turn ends rather than read from the path later. A missed owner write
+    leaves the artifact `unknown`, never fails the turn.
+
+    Each slug's write is tried on its own and rolled back when it fails, so
+    one failure does not drop the slugs after it. A failure is logged at
+    ERROR with the conversation, the project and the slug as record
+    attributes, since the caller never sees it and a database error's
+    sanitized line keeps only those.
+    """
+    org_mode = bool(getattr(session.scope, "org_mode", False))
+    if org_mode and not creator:
+        logger.warning(
+            "artifact owner not recorded: conversation %s has no creator", conversation_id
+        )
+    svc = TaskObjectService(session)
+    # Independent of the owner writes below: a failed index row must not
+    # leave the artifact ownerless as well.
+    for slug in slugs:
+        try:
+            svc.index_artifact(conversation_id, project_id, slug)
+        except Exception:
+            session.rollback()
+            logger.error(
+                "Could not index an artifact",
+                exc_info=True,
+                extra=log_context(project_id=project_id, conversation_id=conversation_id, artifact_slug=slug),
+            )
+    if org_mode and creator and project_id:
+        from cowork.services.artifact_ownership import record_artifact_owner
+
+        for slug in slugs:
+            try:
+                record_artifact_owner(session, project_id, slug, creator, action="create")
+            except Exception:
+                session.rollback()
+                logger.error(
+                    "Could not record the owner of an artifact",
+                    exc_info=True,
+                    extra=log_context(project_id=project_id, conversation_id=conversation_id, artifact_slug=slug),
+                )
+
+
 def _index_new_slugs(
     conversation, conversation_id, project_id, slugs: list[str], scope: TenantScope | None
 ) -> None:
-    """Attribute freshly appeared artifacts to this conversation. Best-effort.
-
-    One session for both records: the `task_objects` row, and in org mode
-    (ENG-2961) the owner row naming the conversation's creator, since a
-    project-level root is shared by every member and the owner has to be
-    written down when the turn ends rather than read from the path later. A
-    missed owner write leaves the artifact `unknown`, never fails the turn.
-    """
+    """record_new_artifacts on a short session of its own. Best-effort."""
     try:
         from cowork.common.settings.app_settings import get_app_settings
         from cowork.db.session import get_open_session
@@ -346,40 +410,38 @@ def _index_new_slugs(
                 )
                 return
             scope = LOCAL_SCOPE
-        owner = getattr(conversation, "created_by", None) if scope.org_mode else None
-        if scope.org_mode and not owner:
-            logger.warning(
-                "artifact owner not recorded: conversation %s has no creator", conversation_id
-            )
         with get_open_session(get_app_settings().database.uri) as session:
-            scoped = ScopedSession(session, scope)
-            svc = TaskObjectService(scoped)
-            # Independent of the owner writes below: a failed index row must
-            # not leave the artifact ownerless as well.
-            try:
-                for slug in slugs:
-                    svc.index_artifact(conversation_id, project_id, slug)
-            except Exception:
-                session.rollback()
-                logger.warning("Could not index artifacts created this turn", exc_info=True)
-            if owner and project_id:
-                from cowork.services.artifact_ownership import record_artifact_owner
-
-                for slug in slugs:
-                    try:
-                        record_artifact_owner(scoped, project_id, slug, owner, action="create")
-                    except Exception:
-                        logger.warning(
-                            "Could not record the owner of artifact %r", slug, exc_info=True
-                        )
+            record_new_artifacts(
+                ScopedSession(session, scope),
+                conversation_id=conversation_id,
+                project_id=project_id,
+                slugs=slugs,
+                creator=getattr(conversation, "created_by", None),
+            )
     except Exception:
-        logger.warning("Could not index artifacts created this turn", exc_info=True)
+        logger.warning(
+            "Could not index artifacts created this turn",
+            exc_info=True,
+            extra=log_context(conversation_id=conversation_id, project_id=project_id, artifact_slugs=slugs or None),
+        )
 
 
-def index_turn_artifacts(
-    conversation,
+@dataclass(frozen=True)
+class ArtifactChanges:
+    """What one turn did to its project's artifacts directory."""
+
+    # Folders the turn created, sorted. Each is indexed as this
+    # conversation's, so it relocates with the task and shows in the
+    # artifacts panel.
+    created: list[str]
+    # The created folders plus pre-existing ones the turn wrote to. The
+    # autopublish reconciler publishes these first.
+    touched: set[str]
+
+
+def turn_artifact_changes(
+    *,
     conversation_id,
-    project_id,
     artifacts_base,
     before: set[str],
     before_mtimes: dict[str, int],
@@ -387,16 +449,12 @@ def index_turn_artifacts(
     tracked_edits: set[str] | None = None,
     attribute_by_provenance: bool = False,
     completed_cleanly: bool = True,
-) -> tuple[list[str], set[str], TenantScope | None]:
-    """End-of-turn artifact bookkeeping.
-
-    Returns (new_slugs, touched_slugs, scope):
-      • new_slugs — artifacts this turn CREATED; each is indexed as owned by
-        this conversation so it relocates with the task and shows in the
-        artifacts panel;
-      • touched_slugs — new_slugs plus pre-existing artifacts this turn WROTE
-        TO. The autopublish reconciler publishes these first;
-      • scope — the tenant scope for post-turn work (see _recover_turn_scope).
+) -> ArtifactChanges:
+    """What the turn created and touched, from the directory as it stands now
+    against ``before``, with an agent revision captured for every touched
+    folder. The filesystem half of the end-of-turn bookkeeping: it reads and
+    writes no database row, so a caller can record the result in a unit of
+    its own (record_new_artifacts).
 
     The two `tracked_*` bounds are what the turn's own artifact tools reported
     touching, and they are what makes attribution correct: every conversation
@@ -427,6 +485,70 @@ def index_turn_artifacts(
     conversation (`artifact_ownership.turn_created_slugs`), and, when the turn
     did not complete cleanly, also if it has no provenance yet. Ignored when
     `tracked_new` is given.
+    """
+    from cowork.services.artifacts import content_mtime_ns
+    from cowork.services.artifact_revisions import (
+        capture_agent_revision,
+        has_queued_agent_repair,
+    )
+
+    base = Path(artifacts_base)
+    after = snapshot_artifact_slugs(base)
+    if tracked_new is None and attribute_by_provenance:
+        from cowork.services.artifact_ownership import turn_created_slugs
+
+        tracked_new = turn_created_slugs(
+            base, before, conversation_id,
+            after=after, accept_unattributed=not completed_cleanly,
+        )
+    appeared = after - set(before or ())
+    # Intersected with `after` throughout, so a slug the agent opened and
+    # then deleted can't produce a card for a folder that is gone.
+    new = sorted(appeared if tracked_new is None else appeared & set(tracked_new))
+    touched = set(new)
+    editable = after if tracked_edits is None else (after & set(tracked_edits))
+    for slug in editable:
+        previous = (before_mtimes or {}).get(slug)
+        if previous is None:
+            continue  # appeared this turn — `new` above already ruled on it
+        try:
+            if content_mtime_ns(base / slug) > previous:
+                touched.add(slug)
+        except OSError:
+            continue
+    for slug in touched:
+        capture_agent_revision(base / slug, conversation_id=str(conversation_id))
+    # A repair turn that makes no source change must still leave the
+    # polling state. Check only artifacts with a handoff explicitly bound
+    # to this conversation; unrelated queued work is never consumed.
+    conversation_key = str(conversation_id)
+    for slug in after - touched:
+        if has_queued_agent_repair(base / slug, conversation_key):
+            capture_agent_revision(base / slug, conversation_id=conversation_key)
+    return ArtifactChanges(created=new, touched=touched)
+
+
+def index_turn_artifacts(
+    conversation,
+    conversation_id,
+    project_id,
+    artifacts_base,
+    before: set[str],
+    before_mtimes: dict[str, int],
+    tracked_new: set[str] | None = None,
+    tracked_edits: set[str] | None = None,
+    attribute_by_provenance: bool = False,
+    completed_cleanly: bool = True,
+) -> tuple[list[str], set[str], TenantScope | None]:
+    """End-of-turn artifact bookkeeping, on a short session of its own.
+
+    Returns (new_slugs, touched_slugs, scope):
+      • new_slugs: artifacts this turn CREATED (ArtifactChanges.created),
+        each indexed as owned by this conversation;
+      • touched_slugs: ArtifactChanges.touched;
+      • scope: the tenant scope for post-turn work (see _recover_turn_scope).
+
+    The bounds and `attribute_by_provenance` are turn_artifact_changes'.
 
     conversation_id/project_id are captured by the caller while the row is
     unambiguously attached, so the ids never depend on the session still being
@@ -438,49 +560,20 @@ def index_turn_artifacts(
     ([], set(), None) and the next turn picks the work up.
     """
     try:
-        from cowork.services.artifacts import content_mtime_ns
-        from cowork.services.artifact_revisions import (
-            capture_agent_revision,
-            has_queued_agent_repair,
+        changes = turn_artifact_changes(
+            conversation_id=conversation_id,
+            artifacts_base=artifacts_base,
+            before=before,
+            before_mtimes=before_mtimes,
+            tracked_new=tracked_new,
+            tracked_edits=tracked_edits,
+            attribute_by_provenance=attribute_by_provenance,
+            completed_cleanly=completed_cleanly,
         )
-
-        base = Path(artifacts_base)
-        after = snapshot_artifact_slugs(base)
-        if tracked_new is None and attribute_by_provenance:
-            from cowork.services.artifact_ownership import turn_created_slugs
-
-            tracked_new = turn_created_slugs(
-                base, before, conversation_id,
-                after=after, accept_unattributed=not completed_cleanly,
-            )
-        appeared = after - set(before or ())
-        # Intersected with `after` throughout, so a slug the agent opened and
-        # then deleted can't produce a card for a folder that is gone.
-        new = sorted(appeared if tracked_new is None else appeared & set(tracked_new))
-        touched = set(new)
-        editable = after if tracked_edits is None else (after & set(tracked_edits))
-        for slug in editable:
-            previous = (before_mtimes or {}).get(slug)
-            if previous is None:
-                continue  # appeared this turn — `new` above already ruled on it
-            try:
-                if content_mtime_ns(base / slug) > previous:
-                    touched.add(slug)
-            except OSError:
-                continue
-        for slug in touched:
-            capture_agent_revision(base / slug, conversation_id=str(conversation_id))
-        # A repair turn that makes no source change must still leave the
-        # polling state. Check only artifacts with a handoff explicitly bound
-        # to this conversation; unrelated queued work is never consumed.
-        conversation_key = str(conversation_id)
-        for slug in after - touched:
-            if has_queued_agent_repair(base / slug, conversation_key):
-                capture_agent_revision(base / slug, conversation_id=conversation_key)
         scope = _recover_turn_scope(conversation)
-        if new:
-            _index_new_slugs(conversation, conversation_id, project_id, new, scope)
-        return new, touched, scope
+        if changes.created:
+            _index_new_slugs(conversation, conversation_id, project_id, changes.created, scope)
+        return changes.created, changes.touched, scope
     except Exception:
         logger.warning("index_turn_artifacts failed", exc_info=True)
         return [], set(), None
@@ -549,11 +642,11 @@ async def publish_and_card_turn_artifacts(
 ) -> list[dict]:
     """Reconcile publishes for this turn, then build the cards to emit.
 
-    The second half of the end-of-turn artifact flow; `index_turn_artifacts` is
-    the first half and produces the three arguments. They are separate because
-    only this half may await: indexing has to run in a turn's `finally` (so an
-    artifact is recorded even on error or Stop), and an `await` there is skipped
-    on cancellation.
+    The second half of the end-of-turn artifact flow. The first half records
+    what the turn created and produces the arguments. The in-process harness
+    protects its cleanup with run_to_completion and records the
+    turn_artifact_changes result in a database unit, including on error or
+    Stop. The remote producer uses the same two artifact helpers.
 
     Shared by both producers. The in-process harness reaches it through
     `AntonHarness.stream_response`; on an org deployment that harness refuses to

@@ -38,8 +38,12 @@ def _conversation_with_turns(svc, turns: list[tuple[str, str]]):
 
 
 def _tool(svc, conv):
-    """The tool as the harness builds it — reading the archive per call."""
-    return build_cowork_recall_history_tool(lambda: svc.archived_messages(conv.id))
+    """The tool as the harness builds it, reading the archive per call."""
+
+    async def load_archive():
+        return svc.archived_messages(conv.id)
+
+    return build_cowork_recall_history_tool(load_archive)
 
 
 def _call(tool, **tc_input) -> str:
