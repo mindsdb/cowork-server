@@ -1625,9 +1625,12 @@ def build_llm_client(
         key = provider_api_key(settings, role)
         if role == Provider.MINDS_CLOUD:
             # The scratchpad keeps this construction-time key, so it must be the pinned one too.
-            key = SecretStr(inference_api_key_str(settings, role)) if key is not None else None
-            if key is None or not key.get_secret_value():
+            if key is None:
                 raise ValueError(f"{role.label} API key is not configured")
+            key = SecretStr(inference_api_key_str(settings, role))
+            if not key.get_secret_value():
+                # Pinned with no live key: the same Reconnect card a mid-turn loss shows.
+                raise _provider_auth_error("The MindsHub credential for this organization is not available.")
             # The runtime credential is local-only by contract. A static
             # settings/env key and every org-mode per-turn credential leave
             # this callback unset and keep their existing lifetime.

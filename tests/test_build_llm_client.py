@@ -763,7 +763,7 @@ async def test_a_pinned_desktop_bills_its_turn_key_not_the_session_token(build, 
 def test_a_pinned_desktop_without_a_key_refuses_to_build(build, monkeypatch):
     _pin(monkeypatch, key=None)
 
-    with pytest.raises(ValueError, match="not configured"):
+    with pytest.raises(ProviderAuthError):
         build(_minds_settings())
 
 
