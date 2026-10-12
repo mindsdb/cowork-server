@@ -3,13 +3,15 @@
 Uploads land under `.cowork/files/<uuid>/<name>` — OUTSIDE the project dir.
 The harness injects their absolute paths into the agent's context so it can
 read them on any turn instead of scanning only the project root and wrongly
-reporting "no files uploaded" (the Cyberdeck bug).
+reporting "no files uploaded" (the Cyberdeck bug). The listing reads in a
+database unit of its own, under the turn's scope.
 """
 from __future__ import annotations
 
 from sqlmodel import Session
 
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.db.session import get_engine
 from cowork.harnesses.anton_harness.harness import _conversation_attachment_context
 from cowork.models.conversation import Conversation
@@ -34,7 +36,7 @@ def _make_conversation(session: Session, project_name: str) -> Conversation:
     return conv
 
 
-def test_context_lists_attached_file_paths(tmp_path):
+async def test_context_lists_attached_file_paths(tmp_path):
     with _session() as session:
         conv = _make_conversation(session, "Cyberdeck-ctx-1")
         purpose = attachment_purpose(str(conv.id))
@@ -48,7 +50,7 @@ def test_context_lists_attached_file_paths(tmp_path):
         session.commit()
         session.refresh(conv)
 
-        ctx = _conversation_attachment_context(conv)
+        ctx = await _conversation_attachment_context(conv, scope=LOCAL_SCOPE)
 
         # Every attached file's absolute path AND name must be surfaced.
         for name, path in files.items():
@@ -58,7 +60,7 @@ def test_context_lists_attached_file_paths(tmp_path):
         assert "OUTSIDE the project" in ctx
 
 
-def test_context_skips_files_missing_from_disk(tmp_path):
+async def test_context_skips_files_missing_from_disk(tmp_path):
     with _session() as session:
         conv = _make_conversation(session, "ctx-miss")
         purpose = attachment_purpose(str(conv.id))
@@ -70,12 +72,12 @@ def test_context_skips_files_missing_from_disk(tmp_path):
         session.commit()
         session.refresh(conv)
 
-        ctx = _conversation_attachment_context(conv)
+        ctx = await _conversation_attachment_context(conv, scope=LOCAL_SCOPE)
         assert "here.md" in ctx
         assert "gone.md" not in ctx
 
 
-def test_context_states_the_attachment_route_when_nothing_is_attached():
+async def test_context_states_the_attachment_route_when_nothing_is_attached():
     # ENG-1357: with no attachments this used to return "", so the agent was
     # told what it may NOT read and never told how the user grants access.
     # Asked to work on an unattached file it had no legitimate move left —
@@ -84,7 +86,7 @@ def test_context_states_the_attachment_route_when_nothing_is_attached():
     # data. The empty case must name attachment as the remedy.
     with _session() as session:
         conv = _make_conversation(session, "Cyberdeck-ctx-2")
-        ctx = _conversation_attachment_context(conv)
+        ctx = await _conversation_attachment_context(conv, scope=LOCAL_SCOPE)
 
     assert ctx != ""
     assert "No files are currently attached" in ctx
@@ -94,22 +96,30 @@ def test_context_states_the_attachment_route_when_nothing_is_attached():
     assert "Do not ask them to type or paste a filesystem path" in ctx
 
 
-def test_context_does_not_claim_emptiness_when_it_could_not_look():
-    # A detached conversation means we FAILED TO LOOK, not that nothing is
-    # attached. Saying "no files are currently attached" here would be the
-    # Cyberdeck bug inverted: the user attached a file and the agent flatly
-    # denies it exists. Affordance yes, emptiness claim no.
+async def test_context_lists_the_files_of_a_detached_conversation(tmp_path):
+    # A turn hands the harness its conversation detached: the unit that read
+    # it has closed its session, so no connection is held while the model
+    # answers. The listing reads in a unit of its own, so it still finds the
+    # files. Treating detachment as a failure to look would hide them.
     with _session() as session:
         conv = _make_conversation(session, "Cyberdeck-ctx-3")
+        attached = tmp_path / "brief.md"
+        attached.write_text("x")
+        session.add(File(
+            filename="brief.md", content_type="text/plain", size=1,
+            purpose=attachment_purpose(str(conv.id)), path=str(attached),
+        ))
+        session.commit()
+        session.refresh(conv)
     session.close()  # detaches conv from its session
 
-    ctx = _conversation_attachment_context(conv)
+    ctx = await _conversation_attachment_context(conv, scope=LOCAL_SCOPE)
 
-    assert "ask them to attach" in ctx
+    assert str(attached) in ctx
     assert "No files are currently attached" not in ctx
 
 
-def test_context_logs_and_keeps_the_affordance_on_error(monkeypatch):
+async def test_context_logs_and_keeps_the_affordance_on_error(monkeypatch):
     # An unexpected failure (e.g. the DB query blows up) must NOT crash the
     # turn — but it must also not fail silently, because a swallowed error
     # looks identical to "no attachments" and reintroduces the Cyberdeck bug.
@@ -129,14 +139,14 @@ def test_context_logs_and_keeps_the_affordance_on_error(monkeypatch):
 
     with _session() as session:
         conv = _make_conversation(session, "Cyberdeck-ctx-err")
-        ctx = _conversation_attachment_context(conv)
+        ctx = await _conversation_attachment_context(conv, scope=LOCAL_SCOPE)
 
     assert "ask them to attach" in ctx  # degrades to guidance, not silence
     assert "No files are currently attached" not in ctx
     assert spy_logger.warning.called, "a failure must be logged, not swallowed silently"
 
 
-def test_context_omits_the_emptiness_claim_when_files_are_listed(monkeypatch, tmp_path):
+async def test_context_omits_the_emptiness_claim_when_files_are_listed(monkeypatch, tmp_path):
     # The positive case must not carry the negative sentence. Guards against a
     # refactor that appends the empty-case text unconditionally.
     with _session() as session:
@@ -148,13 +158,13 @@ def test_context_omits_the_emptiness_claim_when_files_are_listed(monkeypatch, tm
         session.commit()
         session.refresh(conv)
 
-        ctx = _conversation_attachment_context(conv)
+        ctx = await _conversation_attachment_context(conv, scope=LOCAL_SCOPE)
 
     assert "real.csv" in ctx
     assert "No files are currently attached" not in ctx
 
 
-def test_context_skips_one_corrupt_row_keeps_others(tmp_path, monkeypatch):
+async def test_context_skips_one_corrupt_row_keeps_others(tmp_path, monkeypatch):
     # A single unresolvable row (here, a path the OS rejects on stat) must not
     # abort the whole list — every other attachment must still be surfaced.
     import cowork.harnesses.anton_harness.harness as harness_mod
@@ -180,7 +190,7 @@ def test_context_skips_one_corrupt_row_keeps_others(tmp_path, monkeypatch):
         session.commit()
         session.refresh(conv)
 
-        ctx = _conversation_attachment_context(conv)
+        ctx = await _conversation_attachment_context(conv, scope=LOCAL_SCOPE)
 
     assert "good.md" in ctx   # surviving file still listed
     assert "bad.md" not in ctx  # corrupt row skipped, not fatal

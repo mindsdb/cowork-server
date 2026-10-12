@@ -158,6 +158,55 @@ def test_github_enterprise_requests_fall_back_to_the_next_validated_address(tmp_
     assert attempts[:2] == ["2606:4700::6810:1", "140.82.112.3"]
 
 
+def test_github_enterprise_requests_spend_one_short_attempt_on_a_family_that_drops_packets(tmp_path: Path) -> None:
+    def many_record_resolver(_host, _port, **_kwargs):
+        v6 = [(30, 1, 6, "", (f"2606:4700::6810:{index}", 443, 0, 0)) for index in range(1, 9)]
+        v4 = [(2, 1, 6, "", (f"140.82.112.{index}", 443)) for index in range(1, 9)]
+        return v6 + v4
+
+    attempts: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request)
+        if ":" in request.url.host:
+            raise httpx.ConnectTimeout("timed out", request=request)
+        return httpx.Response(200, json=[] if request.url.path.endswith("/comments") else {"title": "Pinned"})
+
+    integration = service(handler, GHE_FIELDS, resolver=many_record_resolver)
+
+    assert integration.read(project(tmp_path), GHE_ISSUE).title == "Pinned"
+    first_request = attempts[:2]
+    assert [request.url.host for request in first_request] == ["2606:4700::6810:1", "140.82.112.1"]
+    assert first_request[0].extensions["timeout"]["connect"] < first_request[0].extensions["timeout"]["read"]
+    assert first_request[0].extensions["sni_hostname"] == "ghe.example.com"
+
+
+def test_github_enterprise_attempts_split_the_client_connect_timeout(tmp_path: Path) -> None:
+    """The last attempt gets what the short ones left of the client's own
+    connect timeout, which is 20 s for this service."""
+    def many_record_resolver(_host, _port, **_kwargs):
+        v6 = [(30, 1, 6, "", (f"2606:4700::6810:{index}", 443, 0, 0)) for index in range(1, 9)]
+        v4 = [(2, 1, 6, "", (f"140.82.112.{index}", 443)) for index in range(1, 9)]
+        return v6 + v4
+
+    attempts: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request)
+        if request.url.host != "140.82.112.2":
+            raise httpx.ConnectTimeout("timed out", request=request)
+        return httpx.Response(200, json=[] if request.url.path.endswith("/comments") else {"title": "Pinned"})
+
+    integration = service(handler, GHE_FIELDS, resolver=many_record_resolver)
+
+    assert integration.read(project(tmp_path), GHE_ISSUE).title == "Pinned"
+    first_request = attempts[:4]
+    assert [request.url.host for request in first_request] == [
+        "2606:4700::6810:1", "140.82.112.1", "2606:4700::6810:2", "140.82.112.2",
+    ]
+    assert [request.extensions["timeout"]["connect"] for request in first_request] == [3.0, 3.0, 3.0, 11.0]
+
+
 def test_github_enterprise_requests_stay_pinned_through_an_environment_proxy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

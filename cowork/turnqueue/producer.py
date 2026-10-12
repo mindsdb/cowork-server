@@ -19,6 +19,7 @@ from cowork.build_info import KEY_ANTON_VERSION, account_ids, build_trace_metada
 from cowork.handlers.turn_errors import (
     RESET_AT_CODES,
     WORKER_UNRESPONSIVE_TYPE_NAME,
+    remote_error_label,
     remote_turn_error,
 )
 from cowork.services.providers import minds_chat_base_url
@@ -32,9 +33,9 @@ from cowork.turnqueue.auth_keys import (
     mint_turn_key_details,
     register_datasource_grants,
 )
-from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnReply
+from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnReply, TurnReplyHeader
 from cowork.streaming.turn_index import record_turn
-from cowork.turnqueue.redis_client import cancel_flag_key, get_redis, reply_stream_key
+from cowork.turnqueue.redis_client import cancel_cause_key, cancel_flag_key, get_redis, reply_stream_key
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host, get_app_settings
 
 logger = logging.getLogger(__name__)
@@ -485,7 +486,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 turn_key_id: str | None = None,
                                 disabled: list[dict] | None = None,
                                 started_at: str | None = None,
-                                interactive: bool = False):
+                                interactive: bool = False,
+                                tool_messages: bool = False):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
 
     Yields turn_delta / turn_step / turn_memory in arrival order and ends with
@@ -494,7 +496,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     when the worker goes quiet past the idle timeout).
     `correlation_id`/`llm` reuse a turn key the routing gate already minted.
     `interactive` tells the pod it may ask `ask_user` questions (web UI turns;
-    channel turns never)."""
+    channel turns never).
+    `tool_messages` tells the pod the client renders a tool's message to the
+    user (the cowork UI does; channel turns never)."""
     settings = TurnQueueSettings()
     scope = TenantScope(org_mode=get_app_settings().tenancy_mode == "org" or bool(org_id), org_id=org_id, user_id=user_id)
     await require_product_permission(scope, "product.execute")
@@ -503,8 +507,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     )
     r = get_redis()
     corr = correlation_id or _new_correlation_id()
-    # A flag left by an earlier turn would cancel this one on its first line.
-    await r.delete(cancel_flag_key(corr))
+    # A flag left by an earlier turn would cancel this one on its first line,
+    # and its cause would turn this turn's own Stop into a stall.
+    await r.delete(cancel_flag_key(corr), cancel_cause_key(corr))
     reply_stream = reply_stream_key(conversation_id)
 
     # No client-picked model → the deployment's resolved default (org mode: the
@@ -590,6 +595,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # Web UI turns only: the pod then registers ask_user and takes
               # answers on stdin, which /answer feeds through Redis.
               "interactive": interactive,
+              # The cowork UI renders a tool's message to the user as an
+              # agent message; without this the pod hands it to the agent.
+              "tool_messages": tool_messages,
               **({"memory": memory_block} if memory_block else {}),
               # Absent entirely (not an empty dict) when there's nothing to
               # offer — see _mint_oauth_block's docstring for why.
@@ -620,6 +628,13 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         project_id=project_id,
         params=params,
     )
+    # Read replies from after the reply stream's newest entry as it is now,
+    # before the job is queued. The controller cannot answer a job that is not
+    # queued yet, so every reply to this turn lands after that entry, and the
+    # earlier turns' replies the stream still holds (until the conversation has
+    # been quiet for an hour) are never read.
+    tail = await r.xrevrange(reply_stream, count=1)
+    last_id = tail[0][0] if tail else "0-0"
     # Registry first: a conversation whose stream exists but isn't registered would
     # be invisible to the controller. The reverse is harmless, it prunes empty queues.
     await r.sadd(f"{settings.jobs_stream}:queues", conversation_id)
@@ -633,12 +648,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         org_id=org_id, user_id=user_id, client=r,
     )
 
-    last_id = "0-0"
     authorized_workspace_mode = None
     idle_timeout = settings.reply_idle_timeout_seconds
     last_reply_at = time.monotonic()
     while True:
-        resp = await r.xread({reply_stream: last_id}, count=10, block=5000)
+        resp = await r.xread({reply_stream: last_id}, count=100, block=5000)
         if not resp:
             # Unbounded, this loop spun forever whenever the worker was down:
             # only a terminal reply ends the turn, so the SSE response never
@@ -656,12 +670,15 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         for _stream, entries in resp:
             for entry_id, fields in entries:
                 last_id = entry_id
-                reply = TurnReply.model_validate_json(fields["payload"])
-                if reply.correlation_id != corr:
-                    # Deliberately does NOT refresh the idle clock: liveness
-                    # means "this turn is progressing", and another turn's
-                    # replies say nothing about ours.
+                if TurnReplyHeader.model_validate_json(fields["payload"]).correlation_id != corr:
+                    # Skipped before its kind is validated: an earlier turn
+                    # still finishing after Stop or the idle timeout can write
+                    # a kind this build does not know, and that must not fail
+                    # this turn. Deliberately does NOT refresh the idle clock:
+                    # liveness means "this turn is progressing", and another
+                    # turn's replies say nothing about ours.
                     continue
+                reply = TurnReply.model_validate_json(fields["payload"])
                 last_reply_at = time.monotonic()
                 kind = reply.kind
                 data = reply.data or {}
@@ -700,8 +717,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                     if reset_at is not None:
                         data["reset_at"] = reset_at
                     logger.warning(
-                        "Remote turn failed conversation=%s correlation_id=%s error=%s",
-                        conversation_id, corr, data.get("error"),
+                        "Remote turn failed conversation=%s correlation_id=%s error_type=%s error_code=%s",
+                        conversation_id, corr, remote_error_label(error=data.get("error")), code,
                     )
                 if kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill",
                             "turn_history", "turn_compaction", "turn_completed", "turn_failed"):

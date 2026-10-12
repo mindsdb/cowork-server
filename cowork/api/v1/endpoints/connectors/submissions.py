@@ -9,24 +9,22 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
-from sqlmodel import Session
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
-from cowork.db.scoped import ScopedSessionDep
-from cowork.db.session import get_session
+from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.handlers.datasource_relay import relay_cloud_submission
 from cowork.handlers.probe import ProbeHandler
 from cowork.schemas.connectors import ConnectorField, SubmitFormRequest
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import missing_required_fields, store
 
-# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
-# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
-# whenever org mode has no org in scope. Declaring it too makes the
-# requirement visible to a route walker instead of something only
-# discoverable by reading scoped.py.
+# AuthenticatedInOrgMode: in org mode a request with no verified principal is
+# refused with 401 before the form is read. The stream holds no request
+# session: the probe handler's and the cloud relay's database units open
+# their own tenant-scoped sessions, so no connection stays checked out while
+# the probe waits on the model or the relay waits on auth.
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
-SessionDep = Annotated[Session, Depends(get_session)]
+TenantScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
 def _resolve_fields(spec, method_id: str | None) -> list:
@@ -63,9 +61,7 @@ def _fields_from_spec_dict(form_spec: dict, method_id: str | None) -> list[Conne
 
 
 @router.post("/")
-async def submit_form(
-    req: SubmitFormRequest, request: Request, session: SessionDep, scoped: ScopedSessionDep
-) -> StreamingResponse:
+async def submit_form(req: SubmitFormRequest, request: Request, scope: TenantScopeDep) -> StreamingResponse:
     try:
         connector_id = req.resolve_connector_id()
     except ValueError as e:
@@ -77,8 +73,8 @@ async def submit_form(
     # comes before anything local — staging, the probe and the vault are all
     # downstream of here. Everything this deployment has not enabled as a
     # cloud method is refused there, not saved by a fallback.
-    if scoped.scope.org_mode:
-        return await relay_cloud_submission(req, connector_id, method, scoped, request)
+    if scope.org_mode:
+        return await relay_cloud_submission(req, connector_id, method, scope, request)
 
     spec = registry.get_connector(connector_id)
     if spec:
@@ -126,7 +122,7 @@ async def submit_form(
         form_spec=req.form_spec,
     )
 
-    handler = ProbeHandler(scoped)
+    handler = ProbeHandler(scope=scope)
     return StreamingResponse(
         handler.run(submission_id, connector_id, method, req.name, req.conversation_id),
         media_type="text/event-stream",

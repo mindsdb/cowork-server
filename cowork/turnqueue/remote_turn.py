@@ -87,7 +87,7 @@ async def remote_turn_events(
                 turn_rows[:] = sanitize_turn_history_rows(data.get("rows"))
             elif kind == "turn_compaction":
                 ResponsesHandler._persist_remote_compaction(
-                    conv_id, data, seed_info, session.scope,
+                    session, conv_id=conv_id, data=data, seed_info=seed_info,
                 )
             elif kind == "turn_skill":
                 for entry in data.get("entries") or []:

@@ -466,8 +466,8 @@ def test_a_desktop_submission_still_stages_and_probes(local_client, monkeypatch)
         return staged["submission_id"]
 
     class FakeProbeHandler:
-        def __init__(self, session):
-            probed["session"] = session
+        def __init__(self, *, scope):
+            probed["scope"] = scope
 
         async def run(self, submission_id, connector_id, method, name, conversation_id):
             probed["submission_id"] = submission_id
@@ -498,7 +498,7 @@ def test_a_desktop_handcrafted_submission_still_stages_its_own_form(local_client
         return real_stage(**kwargs)
 
     class FakeProbeHandler:
-        def __init__(self, session):
+        def __init__(self, *, scope):
             pass
 
         async def run(self, *args):
