@@ -2301,6 +2301,7 @@ def test_postgres_resource_lock_engine_is_unpooled_and_autocommit(monkeypatch):
     assert captured["url"] == bind.url
     assert captured["poolclass"] is NullPool
     assert captured["isolation_level"] == "AUTOCOMMIT"
+    assert captured["hide_parameters"] is True
     assert captured["connect_args"]["connect_timeout"] <= 10
 
 

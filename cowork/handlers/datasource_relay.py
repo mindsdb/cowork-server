@@ -10,8 +10,8 @@ A refusal raises before anything streams, so a client sees an ordinary status
 code rather than a failure buried in a 200 event. The SSE framing is written
 a second time here rather than shared with `probe.py`: there is one round trip
 and nothing to stream incrementally, so every event exists before the response
-starts, which also keeps the database write out of a generator that runs after
-the request's session dependency has exited.
+starts. The turn is written before then as one database unit, so no pooled
+connection is held while auth is called or the stream is read.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ import json
 import logging
 import re
 import uuid
+from functools import partial
 from typing import Any
 from uuid import UUID
 
@@ -28,7 +29,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
 
 from cowork.common.settings.app_settings import OAuthSettings
-from cowork.db.scoped import ScopedSession
+from cowork.db.scoped import ScopedSession, TenantScope
+from cowork.db.units import conversation_writes, run_db
 from cowork.schemas.connectors import DatasourceCreateRequest, SubmitFormRequest
 from cowork.services.connectors.datasource_capabilities import load_datasource_capabilities
 from cowork.services.connectors.datasources import (
@@ -105,19 +107,27 @@ def _to_payload(req: SubmitFormRequest, connector_id: str, method: str, values: 
     return normalize_datasource_input(model)
 
 
-def _save_turn(scoped: ScopedSession, conversation_id: str | None, text: str, events: list[dict]) -> None:
+def _record_turn(session: ScopedSession, *, conversation_id: UUID, text: str, events: list[dict]) -> None:
+    """Save the submission's assistant turn into its conversation, as one unit."""
+    service = ConversationService(session)
+    conversation = service.get_conversation(conversation_id)
+    service.save_assistant_turn(conversation.id, text, events)
+
+
+async def _save_turn(scope: TenantScope, conversation_id: str | None, text: str, events: list[dict]) -> None:
     """Record the turn in the conversation, if this submission came from one.
 
     Best effort on purpose: the credential is already stored in auth by the
-    time this runs, so a conversation that has gone away must not turn a
-    successful save into an error the user can act on.
+    time this runs, so a conversation that has gone away, or a pool with no
+    free connection, must not turn a successful save into an error the user
+    can act on.
     """
     if not conversation_id:
         return
     try:
-        service = ConversationService(scoped)
-        conversation = service.get_conversation(UUID(conversation_id))
-        service.save_assistant_turn(conversation.id, text, events)
+        target = UUID(conversation_id)
+        async with conversation_writes(target):
+            await run_db(partial(_record_turn, conversation_id=target, text=text, events=events), scope=scope)
     except Exception:
         # With the cause: the text and events hold the connection name and the
         # connector id, nothing secret, and a silent loss here would otherwise
@@ -133,7 +143,7 @@ async def relay_cloud_submission(
     req: SubmitFormRequest,
     connector_id: str,
     method: str | None,
-    scoped: ScopedSession,
+    scope: TenantScope,
     request: Request,
 ) -> StreamingResponse:
     """Relay one enabled cloud connector submission and answer with its turn."""
@@ -190,7 +200,7 @@ async def relay_cloud_submission(
     recorded = [{**payload_, "sequence_number": index} for index, (_, payload_) in enumerate(events, start=1)]
     frames = [_sse(kind, recorded[index]) for index, (kind, _) in enumerate(events)]
 
-    _save_turn(scoped, req.conversation_id, text + patch_block, recorded)
+    await _save_turn(scope, req.conversation_id, text + patch_block, recorded)
 
     async def stream():
         for frame in frames:

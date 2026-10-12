@@ -108,7 +108,11 @@ def _turn_cards(monkeypatch, conversation) -> list[dict]:
         ]
 
     monkeypatch.setattr(AntonHarness, "_build_chat_session", _fake_build)
-    monkeypatch.setattr(t, "index_turn_artifacts", lambda *_a, **_k: (["dash"], {"dash"}, None))
+    monkeypatch.setattr(
+        t, "turn_artifact_changes",
+        lambda *_a, **_k: t.ArtifactChanges(created=["dash"], touched={"dash"}),
+    )
+    monkeypatch.setattr(t, "record_new_artifacts", lambda *_a, **_k: None)
     events = asyncio.run(_drain())
     return [event.artifact for event in events if isinstance(event, ArtifactCreated)]
 
