@@ -61,11 +61,12 @@ def refresh_inference_key(token: str, organization_id: str) -> None:
         return
 
     instance_id = f"desktop-{uuid.uuid4()}"
+    # Auth stamps the real expiry on its own clock; this one only decides when to re-mint.
     expires_at = now + _TTL
     body = {
         "organization_id": organization_id,
         "instance_id": instance_id,
-        "expiry_date": expires_at.isoformat(),
+        "ttl_seconds": int(_TTL.total_seconds()),
     }
     if workspace_id:
         body["workspace_id"] = workspace_id

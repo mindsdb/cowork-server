@@ -85,6 +85,9 @@ class TestRefresh:
         assert url.endswith("/v1/turn-keys/")
         assert kwargs["headers"] == {"Authorization": "Bearer jwt"}
         assert kwargs["json"]["organization_id"] == ORG_A
+        # A duration, so auth sets the expiry on its own clock rather than the laptop's.
+        assert kwargs["json"]["ttl_seconds"] == 1800
+        assert "expiry_date" not in kwargs["json"]
         held = runtime_credential.get_inference_key()
         assert held.value == "mdb_new"
         assert held.organization_id == ORG_A
