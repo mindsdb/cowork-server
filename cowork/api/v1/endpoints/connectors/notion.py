@@ -1,4 +1,4 @@
-"""Notion page search for the chat's "Add pages from Notion" picker."""
+"""Notion page search and fetch for the chat's "Add pages from Notion" picker."""
 from __future__ import annotations
 
 import logging
@@ -14,6 +14,7 @@ from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.notion_pages import (
     NotionReconnectRequired,
     NotionSearchUnavailable,
+    fetch_page,
     search_pages,
 )
 from cowork.services.connectors.oauth import auth_proxy
@@ -31,6 +32,12 @@ class NotionSearchRequest(BaseModel):
     query: str = Field(min_length=1, max_length=200)
 
 
+class NotionFetchRequest(BaseModel):
+    name: str = Field(min_length=1)
+    # A page id or URL, as the picker's search returned it.
+    page: str = Field(min_length=1, max_length=2000)
+
+
 async def _access_token(name: str, scope: TenantScope, request: Request) -> str:
     if scope.org_mode:
         token = await auth_proxy.proxy_token("notion", request, OAuthSettings(), name=name)
@@ -39,25 +46,41 @@ async def _access_token(name: str, scope: TenantScope, request: Request) -> str:
     return ConnectionsService(scope).mcp_access_token("notion", name) or ""
 
 
+async def _required_access_token(name: str, scope: TenantScope, request: Request) -> str:
+    access_token = await _access_token(name, scope, request)
+    if not access_token:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="This Notion connection can't read pages. Connect Notion with In-Browser Connect.",
+        )
+    return access_token
+
+
+async def _notion_call(action: str, call):
+    try:
+        return await call
+    except NotionSearchUnavailable as exc:
+        _log.warning("Notion page %s unavailable: %s", action, exc)
+        raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Notion pages aren't available in this build.") from exc
+    except NotionReconnectRequired as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Notion needs to be reconnected.") from exc
+    except Exception as exc:
+        _log.warning("Notion page %s failed: %r", action, exc)
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Could not {action} Notion.") from exc
+
+
 @router.post("/search")
 async def search_notion_pages(body: NotionSearchRequest, scope: ScopeDep, request: Request) -> dict:
     query = body.query.strip()
     if not query:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Type something to search for.")
-    access_token = await _access_token(body.name, scope, request)
-    if not access_token:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="This Notion connection can't search pages. Connect Notion with In-Browser Connect.",
-        )
-    try:
-        pages = await search_pages(access_token, query)
-    except NotionSearchUnavailable as exc:
-        _log.warning("Notion page search unavailable: %s", exc)
-        raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Notion search isn't available in this build.") from exc
-    except NotionReconnectRequired as exc:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Notion needs to be reconnected.") from exc
-    except Exception as exc:
-        _log.warning("Notion page search failed: %r", exc)
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Could not search Notion.") from exc
-    return {"results": pages}
+    access_token = await _required_access_token(body.name, scope, request)
+    return {"results": await _notion_call("search", search_pages(access_token, query))}
+
+
+@router.post("/fetch")
+async def fetch_notion_page(body: NotionFetchRequest, scope: ScopeDep, request: Request) -> dict:
+    """A picked page's text, so the chat can send it with the message rather
+    than relying on the agent to fetch it (some models stall on that call)."""
+    access_token = await _required_access_token(body.name, scope, request)
+    return await _notion_call("read", fetch_page(access_token, body.page.strip()))

@@ -1,5 +1,6 @@
 """Notion pages for the chat's "Add pages from Notion" picker: searching a
-workspace over Notion MCP, and describing a project's added pages to the agent."""
+workspace over Notion MCP, fetching a picked page's text, and describing a
+project's added pages to the agent."""
 from __future__ import annotations
 
 import json
@@ -9,6 +10,9 @@ from typing import Any
 _log = logging.getLogger("cowork.connectors.notion_pages")
 
 MAX_RESULTS = 20
+# A picked page's text rides in the user message and is replayed every turn,
+# so a long page is cut here; the agent is told to fetch the rest itself.
+MAX_PAGE_CHARS = 20_000
 
 
 class NotionSearchUnavailable(Exception):
@@ -67,7 +71,7 @@ def parse_search_results(content: Any) -> list[dict[str, str]]:
     return pages
 
 
-async def search_pages(access_token: str, query: str) -> list[dict[str, str]]:
+async def _call_notion(access_token: str, tool_name: str, **kwargs: Any) -> Any:
     try:
         from anton.core.mcp.errors import McpPermanentError
         from anton.core.mcp.servers import mcp_server_url
@@ -77,10 +81,28 @@ async def search_pages(access_token: str, query: str) -> list[dict[str, str]]:
     if mcp_server_url("notion") is None:
         raise NotionSearchUnavailable("installed anton has no Notion MCP server URL")
     try:
-        content = await call_mcp_tool("notion", access_token, "notion-search", query=query)
+        return await call_mcp_tool("notion", access_token, tool_name, **kwargs)
     except McpPermanentError as exc:
         raise NotionReconnectRequired(str(exc)) from exc
-    return parse_search_results(content)
+
+
+async def search_pages(access_token: str, query: str) -> list[dict[str, str]]:
+    return parse_search_results(await _call_notion(access_token, "notion-search", query=query))
+
+
+def parse_fetched_page(content: Any) -> dict[str, Any]:
+    """Title and text of a `notion-fetch` result, the text cut to
+    MAX_PAGE_CHARS. Content that isn't the expected JSON is used as plain text."""
+    data = _decode(content)
+    if isinstance(data, dict):
+        title, text = _text(data.get("title")), _text(data.get("text"))
+    else:
+        title, text = "", _text(content) if isinstance(content, str) else ""
+    return {"title": title, "text": text[:MAX_PAGE_CHARS], "truncated": len(text) > MAX_PAGE_CHARS}
+
+
+async def fetch_page(access_token: str, page: str) -> dict[str, Any]:
+    return parse_fetched_page(await _call_notion(access_token, "notion-fetch", id=page))
 
 
 def describe_project_pages(pages_by_connection: dict[str, list[dict]]) -> str:
