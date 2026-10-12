@@ -907,7 +907,9 @@ class ResponsesHandler:
                     # decision <-> Jev answer an exact join. Never
                     # turn_id: the gateway renames harness+turn_id traces to
                     # "{harness}:turn-N", which would count these as user turns.
+                    route_started = time.monotonic()
                     binding, turn_llm = await self._router_binding()
+                    binding_ms = round((time.monotonic() - route_started) * 1000)
                     correlation_id = (turn_llm or {}).get("correlation_id")
                     trace_token = set_trace_context(TraceContext(
                         session_id=str(conversation_id),
@@ -919,6 +921,10 @@ class ResponsesHandler:
                         },
                     ))
                     turn_queue_settings = TurnQueueSettings()
+                    # Remote turns only for now: the budget is a measured canary there.
+                    gate_budget = {}
+                    if turn_queue_settings.is_remote:
+                        gate_budget["gate_total_seconds"] = turn_queue_settings.gate_total_timeout_seconds
 
                     gate_started = time.monotonic()
                     decision = await decide_route(
@@ -927,8 +933,11 @@ class ResponsesHandler:
                         has_attachments=has_attachments,
                         has_disabled_connections=has_disabled_connections,
                         binding=binding,
+                        **gate_budget,
                     )
-                    gate_ms = round((time.monotonic() - gate_started) * 1000)
+                    now = time.monotonic()
+                    gate_ms = round((now - gate_started) * 1000)
+                    route_ms = round((now - route_started) * 1000)
                     # warning, not info: this deployment's LOG_LEVEL defaults to
                     # WARNING (app_settings.py's own default too), so an info-level
                     # line here is silently dropped everywhere it would actually
@@ -936,9 +945,10 @@ class ResponsesHandler:
                     # across 8 real requests until this was bumped.
                     logger.warning(
                         "[gate] conversation=%s correlation_id=%s route=%s reason=%s "
-                        "provider=%s model=%s gate_ms=%d",
+                        "provider=%s model=%s gate_ms=%d binding_ms=%d route_ms=%d gate_budget_s=%s",
                         conversation_id, correlation_id, decision.route, decision.reason,
-                        decision.provider, decision.model, gate_ms,
+                        decision.provider, decision.model, gate_ms, binding_ms, route_ms,
+                        gate_budget.get("gate_total_seconds", "default"),
                     )
                     # Detached on purpose: awaiting this (even via asyncio.gather)
                     # would make a ready gate decision wait for Jev, exactly the

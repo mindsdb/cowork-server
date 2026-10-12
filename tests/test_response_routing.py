@@ -78,7 +78,7 @@ async def test_text_context_routes_direct_with_resolved_router(monkeypatch):
 
     client = _Client(_response(content="The result was 42."))
 
-    async def fake_gate(binding, *, history):
+    async def fake_gate(binding, *, history, total_seconds=None):
         assert binding.provider is client
         return "The result was 42."
 
@@ -146,7 +146,7 @@ async def test_gate_runs_on_resolved_gate_model_not_the_router_pick(monkeypatch)
     client.router_model = "opus"  # the user's router pick, as the client sees it
     seen_models = []
 
-    async def fake_gate(binding, *, history):
+    async def fake_gate(binding, *, history, total_seconds=None):
         seen_models.append(binding.model)
         return "The result was 42."
 
@@ -2238,7 +2238,7 @@ def _tool_turn(prompt="pull the sales table", result="rows: 1204", answer="Pulle
 def _no_gate(monkeypatch):
     import cowork.handlers.response_routing as routing
 
-    async def gate_must_not_run(binding, *, history):
+    async def gate_must_not_run(binding, *, history, total_seconds=None):
         raise AssertionError("the gate must not be called")
 
     monkeypatch.setattr(routing, "_gate", gate_must_not_run)
@@ -2272,7 +2272,7 @@ async def test_plain_previous_turn_still_reaches_the_gate(monkeypatch):
 
     seen = []
 
-    async def fake_gate(binding, *, history):
+    async def fake_gate(binding, *, history, total_seconds=None):
         seen.append(history)
         return "Hello!"
 
@@ -2348,7 +2348,7 @@ def _gate_spy(monkeypatch):
 
     seen = []
 
-    async def fake_gate(binding, *, history):
+    async def fake_gate(binding, *, history, total_seconds=None):
         seen.append(history)
         return "Hello!"
 
@@ -2394,3 +2394,182 @@ async def test_only_the_latest_prompt_is_checked_for_file_names(monkeypatch):
     ]
     decision = await _route(history)
     assert decision.route == DIRECT_CONTEXT and seen
+
+
+# --- configurable gate total budget -------------------------------------------
+
+
+def _patch_gate_provider(monkeypatch, provider):
+    import cowork.handlers.response_routing as routing
+
+    monkeypatch.setattr(
+        routing,
+        "get_user_settings",
+        lambda: SimpleNamespace(resolved_router_provider=_Provider(), resolved_gate_model="router-model"),
+    )
+    monkeypatch.setattr(routing, "build_llm_client", lambda: SimpleNamespace(router_provider=provider))
+
+
+async def _route_with_budget(**kwargs):
+    return await decide_route(
+        history=HISTORY, has_non_text_input=False, has_attachments=False,
+        has_disabled_connections=False, **kwargs,
+    )
+
+
+def test_the_default_gate_budget_is_unchanged():
+    import inspect
+
+    import cowork.handlers.response_routing as routing
+
+    assert routing._GATE_TOTAL_SECONDS == 10.0
+    assert inspect.signature(decide_route).parameters["gate_total_seconds"].default is None
+    assert inspect.signature(routing._gate).parameters["total_seconds"].default is None
+
+
+@pytest.mark.asyncio
+async def test_a_shortened_budget_bounds_a_trickling_answer(monkeypatch):
+    import asyncio
+
+    import cowork.handlers.response_routing as routing
+
+    monkeypatch.setattr(routing, "_GATE_IDLE_SECONDS", 1.0)
+    trickle = _StreamProvider([_text(f"w{i} ") for i in range(16)] + [_complete()], gap=0.03)
+    _patch_gate_provider(monkeypatch, trickle)
+    started = asyncio.get_running_loop().time()
+    decision = await _route_with_budget(gate_total_seconds=0.12)
+    assert asyncio.get_running_loop().time() - started < 0.4
+    assert decision.reason == "router_timeout" and decision.fallback
+    assert decision.text == ""
+    assert trickle.closed
+
+
+@pytest.mark.asyncio
+async def test_a_shortened_budget_bounds_reasoning_that_decides_nothing(monkeypatch):
+    import cowork.handlers.response_routing as routing
+    from anton.core.llm.provider import StreamReasoningDelta
+
+    monkeypatch.setattr(routing, "_GATE_IDLE_SECONDS", 1.0)
+    noise = _StreamProvider([StreamReasoningDelta(text="thinking") for _ in range(16)], gap=0.03)
+    _patch_gate_provider(monkeypatch, noise)
+    decision = await _route_with_budget(gate_total_seconds=0.12)
+    assert decision.reason == "router_timeout"
+
+
+@pytest.mark.asyncio
+async def test_a_late_delegation_past_the_budget_leaks_no_preamble(monkeypatch):
+    import cowork.handlers.response_routing as routing
+
+    monkeypatch.setattr(routing, "_GATE_IDLE_SECONDS", 1.0)
+    chunks = [_text(PREAMBLE[i:i + 20]) for i in range(0, len(PREAMBLE), 20)]
+    provider = _StreamProvider(chunks + [_tool()], gap=0.03)
+    _patch_gate_provider(monkeypatch, provider)
+    decision = await _route_with_budget(gate_total_seconds=0.1)
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.reason == "router_timeout"
+    assert decision.text == ""
+
+
+@pytest.mark.asyncio
+async def test_a_fast_direct_answer_still_ships_under_a_short_budget(monkeypatch):
+    provider = _StreamProvider([_text("Forty"), _text("-two."), _complete()])
+    _patch_gate_provider(monkeypatch, provider)
+    decision = await _route_with_budget(gate_total_seconds=0.5)
+    assert decision.route == DIRECT_CONTEXT
+    assert decision.text == "Forty-two."
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("events", [
+    [_tool()],
+    [_text("x"), _complete("max_tokens")],
+    [_text("x"), _complete(tool_calls=[{"name": "delegate"}])],
+])
+async def test_a_short_budget_keeps_every_delegation_shape(monkeypatch, events):
+    provider = _StreamProvider(events)
+    _patch_gate_provider(monkeypatch, provider)
+    decision = await _route_with_budget(gate_total_seconds=0.5)
+    assert decision.reason == "router_declined_direct_response"
+    assert decision.text == ""
+    assert provider.closed
+
+
+@pytest.mark.asyncio
+async def test_a_short_budget_keeps_the_content_guards(monkeypatch):
+    provider = _StreamProvider([_text("You can install the ChatGPT desktop app."), _complete()])
+    _patch_gate_provider(monkeypatch, provider)
+    decision = await _route_with_budget(gate_total_seconds=0.5)
+    assert decision.route == DELEGATED_AGENTIC
+    assert decision.reason == "router_answer_named_foreign_product"
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_gate_closes_its_stream(monkeypatch):
+    import asyncio
+
+    provider = _StreamProvider([_text("x"), _complete()], first_delay=5)
+    _patch_gate_provider(monkeypatch, provider)
+    task = asyncio.create_task(_route_with_budget(gate_total_seconds=2.0))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert provider.closed
+
+
+async def _route_request_with_budget(monkeypatch, *, backend, budget=None, decision=None):
+    import cowork.handlers.responses as responses
+
+    monkeypatch.setenv("COWORK_TURN_BACKEND", backend)
+    if budget is not None:
+        monkeypatch.setenv("COWORK_TURN_GATE_TOTAL_TIMEOUT_SECONDS", budget)
+    handler = _routing_handler(monkeypatch)
+
+    async def no_binding():
+        return None, None
+
+    handler._router_binding = no_binding
+    seen = {}
+
+    async def fake_decide_route(**kwargs):
+        seen.update(kwargs)
+        return decision or RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    monkeypatch.setattr(responses, "decide_route", fake_decide_route)
+    await handler._route_request(
+        conversation_id=None,
+        gate_rows=[],
+        harness_input=[{"type": "text", "text": "Hello"}],
+        has_attachments=False,
+        has_disabled_connections=False,
+    )
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_a_remote_turn_gets_the_configured_gate_budget(monkeypatch):
+    seen = await _route_request_with_budget(monkeypatch, backend="remote", budget="2")
+    assert seen["gate_total_seconds"] == 2.0
+
+
+@pytest.mark.asyncio
+async def test_an_in_process_turn_keeps_the_default_gate_budget(monkeypatch):
+    seen = await _route_request_with_budget(monkeypatch, backend="inprocess", budget="2")
+    assert "gate_total_seconds" not in seen
+
+
+@pytest.mark.asyncio
+async def test_the_gate_log_reports_durations_and_budget_but_no_content(monkeypatch, caplog):
+    import logging
+
+    answer = "The private answer text"
+    decision = RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", text=answer)
+    with caplog.at_level(logging.WARNING, logger="cowork.handlers.responses"):
+        await _route_request_with_budget(monkeypatch, backend="remote", budget="2", decision=decision)
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("[gate]")]
+    assert len(lines) == 1
+    line = lines[0]
+    for key in ("gate_ms=", "binding_ms=", "route_ms=", "gate_budget_s=2.0"):
+        assert key in line
+    assert answer not in line
+    assert "Hello" not in line

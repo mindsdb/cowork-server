@@ -598,6 +598,18 @@ class TurnQueueSettings(Settings):
         gt=0,
         description="Hard wall-clock timeout for the shadow Jev call (enforced via asyncio.timeout, not just httpx's own per-phase timeout). Independent of the gate's own budget, since a slow or hung probe must never hold up the turn it's shadowing.",
     )  # COWORK_TURN_JEV_SHADOW_TIMEOUT_SECONDS
+    gate_total_timeout_seconds: float = Field(
+        default=10.0,
+        gt=0,
+        le=10.0,
+        allow_inf_nan=False,
+        description=(
+            "Wall-clock budget for the routing gate on a remote turn; past it the turn "
+            "delegates to the agent. The first-event and idle bounds still apply inside it. "
+            "Lower it to stop slow gate calls from delaying the first reply; 10 is the "
+            "previous fixed value and the rollback."
+        ),
+    )  # COWORK_TURN_GATE_TOTAL_TIMEOUT_SECONDS
     minds_coding_model: str = Field(
         default="",
         description=(
