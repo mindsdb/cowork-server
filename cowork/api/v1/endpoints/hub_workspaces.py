@@ -11,13 +11,11 @@ The listing is answered whatever its length. Whether a client draws a control
 is the client's decision, and Cowork's is to draw nothing below two rows.
 
 **Which workspace a usage row carries is decided by the credential the turn
-presents, not by this selector directly.** A desktop turn still runs against a
-long-lived key bound to a user and an organization only. A cloud turn now
-carries this stored pick: the remote producer reads `hub_workspace_id` and
-forwards it to the turn-key and artifact-publish-key mints (`cowork/turnqueue/
-producer.py`, `cowork/services/artifact_autopublish.py`), which bind the key's
-`workspace_id` to it. So the desktop path is still workspace-blind; the cloud
-path picks this up as soon as a caller uses the selector below.
+presents, not by this selector directly.** Both paths now carry this stored pick.
+A cloud turn's producer forwards it to the turn-key and artifact-publish-key
+mints (`cowork/turnqueue/producer.py`, `cowork/services/artifact_autopublish.py`).
+A desktop mints its own turn key with it (`cowork/services/inference_key.py`),
+and a switch below re-mints at once.
 
 **The stored key has a second writer, and it grants nothing.**
 ``hub_workspace_id`` is a declared ``UserSettings`` field, so
