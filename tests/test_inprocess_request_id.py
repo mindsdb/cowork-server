@@ -13,6 +13,7 @@ nothing set one, so that placeholder was dead.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 from types import SimpleNamespace
@@ -21,8 +22,10 @@ from uuid import UUID, uuid4
 import pytest
 
 import cowork.handlers.responses as responses_mod
-from cowork.common.logger import CustomFormatter, setup_console_handler
+from cowork.common.logger import _REQUEST_CONTEXT_FIELDS, CustomFormatter, log_context, setup_console_handler
 from cowork.handlers.responses import ResponsesHandler
+
+from _fakes import inline_run_db
 
 
 class _RecBuffer:
@@ -56,14 +59,15 @@ def _failing_handler(monkeypatch, saved: dict, exc: Exception):
             pass
 
         def get_conversation(self, conv_id):
-            return object()
+            return SimpleNamespace(project=None)
 
         def save_user_message(self, conv_id, content, *, created_at=None, pending=False):
             saved["user"] = content
             return SimpleNamespace(id=uuid4())
 
-        def finalize_pending(self, conv_id, message_id=None):
+        def clear_pending(self, conv_id, *, message_id=None):
             saved["finalized"] = True
+            return True
 
         def save_assistant_turn(self, conv_id, text, events, harness=None, tool_rows=None):
             saved["events"] = events
@@ -83,8 +87,7 @@ def _failing_handler(monkeypatch, saved: dict, exc: Exception):
         yield  # pragma: no cover - makes this an async generator
 
     monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
-    monkeypatch.setattr(responses_mod, "ScopedSession", lambda s, scope: FakeSession())
-    monkeypatch.setattr(responses_mod, "get_open_session", lambda: None)
+    monkeypatch.setattr(responses_mod, "run_db", inline_run_db(FakeSession()))
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: None)
     monkeypatch.setattr(responses_mod, "get_harness", lambda name: SimpleNamespace(
         stream_response=lambda **kwargs: None, formatter=formatter,
@@ -92,9 +95,9 @@ def _failing_handler(monkeypatch, saved: dict, exc: Exception):
     return handler
 
 
-def _run(handler, buffer):
+def _run(handler, buffer, *, conv_id: UUID | None = None):
     return asyncio.run(handler._run_turn(
-        conv_id=uuid4(), harness_input=[], original_content="hi", model="anton",
+        conv_id=conv_id or uuid4(), harness_input=[], original_content="hi", model="anton",
         disabled=None, harness_name="anton", harness_id="anton", buffer=buffer,
     ))
 
@@ -131,14 +134,19 @@ def test_inprocess_failure_puts_the_id_on_the_log_record(monkeypatch, caplog):
     # empty and support has nothing structured to filter on.
     saved: dict = {}
     handler = _failing_handler(monkeypatch, saved, RuntimeError("boom"))
+    conv_id = uuid4()
 
     with caplog.at_level(logging.WARNING, logger="cowork.handlers.responses"):
-        _run(handler, _RecBuffer())
+        _run(handler, _RecBuffer(), conv_id=conv_id)
 
     request_id = _failed_payload(saved)["request_id"]
     deployed = _deployed_records(caplog)
     assert deployed
     assert all(getattr(record, "request_id", None) == request_id for record in deployed)
+    # The conversation travels beside the id, so a database error's sanitized
+    # line still names it.
+    [failed] = [record for record in deployed if record.getMessage() == "[responses] turn failed"]
+    assert failed.conversation_id == str(conv_id)
 
 
 def test_a_content_recovery_failure_tags_its_deployed_log_lines(monkeypatch, caplog):
@@ -192,12 +200,22 @@ def test_a_curated_inprocess_failure_carries_the_id_too(monkeypatch):
     ({"request_id": "corr-abc"}, "[Req:corr-abc]"),
     ({}, ""),
     ({"request_id": None}, ""),
+    (
+        {"artifact_slug": "q3-report", "conversation_id": "conv-1", "project_id": "proj-1", "request_id": "corr-abc"},
+        "[Req:corr-abc][Project:proj-1][Conversation:conv-1][Artifact:'q3-report']",
+    ),
+    ({"conversation_id": "conv-1", "project_id": None}, "[Conversation:conv-1]"),
+    # An agent-chosen folder name renders quoted, so it cannot start a new line.
+    ({"artifact_slug": "a]\nforged"}, "[Artifact:'a]\\nforged']"),
+    ({"schedule_id": "sched-1", "conversation_id": "conv-1"}, "[Schedule:sched-1][Conversation:conv-1]"),
+    ({"artifact_slugs": ("a", "b]\nforged")}, "[Artifacts:'a', 'b]\\nforged']"),
 ])
 def test_formatter_renders_the_request_context(attrs, expected):
     # The placeholder has to survive a record that carries no request_id,
     # which is nearly all of them — a plain logging.Formatter would raise.
     # An explicit None is one of those: the seal passes it for a producer
-    # that has no correlation id to offer.
+    # that has no correlation id to offer. The project, conversation and
+    # artifact a call site passes render beside it, in a fixed order.
     formatter = CustomFormatter("%(name)s%(request_context)s %(message)s")
     record = logging.LogRecord(
         name="cowork.test", level=logging.ERROR, pathname=__file__, lineno=1,
@@ -207,6 +225,23 @@ def test_formatter_renders_the_request_context(attrs, expected):
         setattr(record, key, value)
 
     assert formatter.format(record) == f"cowork.test{expected} turn failed"
+
+
+def test_log_context_takes_exactly_the_attributes_the_formatter_renders():
+    # A call site's misspelled key would render nothing; a keyword the
+    # formatter does not know would be dropped the same way.
+    assert set(inspect.signature(log_context).parameters) == {
+        field.attribute for field in _REQUEST_CONTEXT_FIELDS
+    }
+    with pytest.raises(TypeError):
+        log_context(conversaton_id="conv-1")
+
+
+def test_log_context_turns_ids_into_strings_and_leaves_out_none():
+    project_id = uuid4()
+    assert log_context(
+        request_id=None, project_id=project_id, conversation_id=None, artifact_slugs=["a", "b"],
+    ) == {"project_id": str(project_id), "artifact_slugs": ("a", "b")}
 
 
 def test_a_turn_that_escapes_every_except_seals_with_the_same_id(monkeypatch):

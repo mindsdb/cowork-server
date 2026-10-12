@@ -5,6 +5,7 @@ import os
 import shutil
 import stat
 import subprocess
+import sys
 import threading
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -104,6 +105,18 @@ def _truncate_at_file_boundary(patch: Path, limit: int) -> int:
     return kept
 
 
+def _platform_config_args() -> tuple[str, ...]:
+    """Per-invocation Git config the host platform needs.
+
+    Windows paths are limited to 260 characters unless Git opts in, and deep
+    dependency trees in a task worktree routinely exceed that. Passing it per
+    command avoids editing the user's repository or global config.
+    """
+    if sys.platform == "win32":
+        return ("-c", "core.longpaths=true")
+    return ()
+
+
 class GitRunner:
     """Shell-free Git boundary shared by macOS and Windows."""
 
@@ -146,7 +159,7 @@ class GitRunner:
             # such as ``ext`` at the execution boundary.
             child_environment["GIT_ALLOW_PROTOCOL"] = ALLOWED_GIT_PROTOCOLS
             result = subprocess.run(
-                ["git", *args],
+                ["git", *_platform_config_args(), *args],
                 # The directory is an explicit desktop capability selected by
                 # the user and validated above. Git is fixed, arguments are an
                 # argv array, and shell execution is disabled.
