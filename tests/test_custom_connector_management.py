@@ -82,6 +82,21 @@ def test_replace_the_form(engine):
     assert [f.name for f in spec.form.fields] == ["api_key"]
 
 
+def test_a_new_form_color_moves_the_directory_tile(engine):
+    update_custom_connector("httpbin", CustomConnectorUpdate(spec={**FORM, "logo_color": "#33aa77"}), _scoped(engine))
+
+    listed = {c.id: c for c in ConnectorCatalog(_scoped(engine)).list_connectors()}
+    assert listed["httpbin"].logo_color == "#33aa77"
+
+
+def test_a_new_form_without_a_color_keeps_the_tile_color(engine):
+    update_custom_connector("httpbin", CustomConnectorUpdate(spec={**FORM, "logo_color": "#33aa77"}), _scoped(engine))
+    update_custom_connector("httpbin", CustomConnectorUpdate(spec=FORM), _scoped(engine))
+
+    listed = {c.id: c for c in ConnectorCatalog(_scoped(engine)).list_connectors()}
+    assert listed["httpbin"].logo_color == "#33aa77"
+
+
 def test_an_invalid_form_is_a_422(engine):
     with pytest.raises(HTTPException) as exc:
         update_custom_connector(

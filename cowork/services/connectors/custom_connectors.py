@@ -171,6 +171,9 @@ class CustomConnectorService:
             return None
         if "spec" in changes:
             row.spec = stored_form(connector_id, changes["spec"])
+            # The directory tile reads the column, so a new form color moves it too.
+            if changes["spec"].get("logo_color"):
+                row.logo_color = _text(changes["spec"]["logo_color"], 32)
         for key in ("label", "description", "category", "featured"):
             if key in changes:
                 setattr(row, key, changes[key])
