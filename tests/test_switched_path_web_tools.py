@@ -170,13 +170,17 @@ async def _probe_session_config(
     monkeypatch, settings: UserSettings, *, changed_settings: UserSettings | None = None
 ):
     """Drive the real handler through client construction and its probe session."""
-    from unittest.mock import MagicMock
-
+    from cowork.db.scoped import LOCAL_SCOPE
     from cowork.handlers import probe as handler_module
     from cowork.services.connectors import probe as probe_module
 
+    # The handler reads its settings in a unit; anything after it would read
+    # them through get_user_settings. Both answer from `current`.
+    current = {"settings": settings}
+    monkeypatch.setattr(handler_module, "_read_probe_settings", lambda _session: current["settings"])
     monkeypatch.setattr(
-        "cowork.common.settings.user_settings.get_user_settings", lambda *a, **k: settings
+        "cowork.common.settings.user_settings.get_user_settings",
+        lambda *a, **k: current["settings"],
     )
     configs = []
 
@@ -194,7 +198,7 @@ async def _probe_session_config(
             form_id="probe-form", model_dump=lambda: {"form_id": "probe-form"}
         )),
     )
-    handler = handler_module.ProbeHandler(session=MagicMock())
+    handler = handler_module.ProbeHandler(scope=LOCAL_SCOPE)
     async for event in handler.run(
         submission_id="staged", connector_id="postgres", method=None,
         name="test connection", conversation_id=None,
@@ -202,10 +206,7 @@ async def _probe_session_config(
         if changed_settings is not None and "Starting probe" in event:
             # The handler has built its client and yielded to the consumer.
             # A settings write can complete before CredentialProbe.run starts.
-            monkeypatch.setattr(
-                "cowork.common.settings.user_settings.get_user_settings",
-                lambda *a, **k: changed_settings,
-            )
+            current["settings"] = changed_settings
     (config,) = configs
     await config.llm_client.aclose()
     return config

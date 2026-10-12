@@ -686,7 +686,7 @@ async def fetch_org_model_catalog(
 #       (`apply_runtime_settings`),
 #       which raises on any >=400 — every shipped run spec pins a `latest:` alias,
 #       hence the legacy-prefix allowance in model_value_rejection;
-#     - cowork-kinaxis-preview's divergent inline `syncOnboardingModels`;
+#     - a branded preview build's divergent inline `syncOnboardingModels`;
 #     - anything hand-rolled (curl, scripts, a console surface).
 #
 #   GATED FOR SHAPE ONLY: `minds_role_defaults`, the cached role -> model id map

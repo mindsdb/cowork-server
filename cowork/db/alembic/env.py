@@ -70,7 +70,7 @@ def run_migrations_online() -> None:
 
     url = _database_url()
     _ensure_sqlite_dir(url)
-    connectable = create_engine(url, poolclass=pool.NullPool)
+    connectable = create_engine(url, poolclass=pool.NullPool, hide_parameters=True)
 
     with connectable.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata, render_as_batch=True)
