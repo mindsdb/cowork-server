@@ -17,6 +17,7 @@ from typing import Literal
 
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
+from cowork.common.logger import exception_http_status
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.services.providers import build_llm_client
 
@@ -625,22 +626,13 @@ async def decide_route(
     except PoolTimeoutError:
         raise
     except Exception as exc:
-        # The failure is named in the log by class, HTTP status and the
-        # provider error's type, code and param. Never its message: provider
-        # text can quote the request or echo a credential, and this gate runs
-        # upstream of every scrubber. anton re-raises a 400 it cannot name as
-        # the SDK's own error, and raises its typed errors from the SDK's, so
-        # those fields sit on the error or on its cause. Prefer the cause even
-        # when anton retained status_code: its wrapper can normalize code and
-        # omit type/param. WARNING, because the default LOG_LEVEL drops info lines.
-        provider_error = exc.__cause__ if exc.__cause__ is not None else exc
+        # Provider body fields (including type/code/param) can echo private
+        # request content. Only the class and a validated HTTP status are safe.
+        status = exception_http_status(exc=exc)
         logger.warning(
-            "[gate] reason=router_unavailable error=%s status=%s type=%s code=%s param=%s",
+            "[gate] reason=router_unavailable error=%s status=%s",
             type(exc).__name__,
-            getattr(provider_error, "status_code", None),
-            getattr(provider_error, "type", None),
-            getattr(provider_error, "code", None),
-            getattr(provider_error, "param", None),
+            "unknown" if status is None else status,
         )
         # Attribution survives the failure: a 402 on a paid router pick is
         # only diagnosable in the traces if the model that failed is named.
