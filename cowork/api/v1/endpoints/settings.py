@@ -68,6 +68,7 @@ from cowork.common.settings.app_settings import (
 from cowork.common.settings.user_settings import (
     Provider,
     UserSettings,
+    inference_api_key_str,
     minds_role_start_models,
     provider_api_key_str,
     setting_is_org_scoped,
@@ -699,11 +700,10 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
                 org_id=scope.org_id, user_id=scope.user_id, bearer_token=token,
                 refresh=refresh,
             )
-    elif s.minds_api_key is not None and s.minds_url:
-        # Desktop / BYOK: the user's stored key against its configured URL.
-        listing = await fetch_minds_models(
-            s.minds_url, s.minds_api_key.get_secret_value(), force_refresh=refresh
-        )
+    elif (minds_key := inference_api_key_str(s, Provider.MINDS_CLOUD)) and s.minds_url:
+        # Desktop / BYOK: the key turns bill with (the pinned turn key on a
+        # desktop), so the listing answers for the organization being billed.
+        listing = await fetch_minds_models(s.minds_url, minds_key, force_refresh=refresh)
     if listing is not None:
         live = listing.ids
         live_efforts = listing.efforts

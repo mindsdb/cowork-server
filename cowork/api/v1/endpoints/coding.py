@@ -110,7 +110,7 @@ from cowork.coding.workspace_models import (
     WorkspaceResourcePage,
     WorkspaceSearchPage,
 )
-from cowork.common.settings.user_settings import Provider, inference_api_key_str, provider_api_key_str
+from cowork.common.settings.user_settings import Provider, inference_api_key_str
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
 from cowork.services.providers import cached_minds_models
@@ -151,9 +151,9 @@ def _credentials(settings) -> EngineCredentials:
 
 
 def _model_levels(settings):
-    """The cached MindsHub listing fetched with this install's own credential."""
+    """The cached MindsHub listing, fetched with the key turns bill with."""
     return cached_minds_models(
-        settings.minds_url, api_key=provider_api_key_str(settings, Provider.MINDS_CLOUD)
+        settings.minds_url, api_key=inference_api_key_str(settings, Provider.MINDS_CLOUD)
     )
 
 

@@ -788,8 +788,10 @@ async def model_value_rejection(
 
         if getattr(settings, provider_attr, None) != Provider.MINDS_CLOUD:
             return None
-        stored_key = settings.minds_api_key
-        api_key = stored_key.get_secret_value() if stored_key is not None else ""
+        from cowork.common.settings.user_settings import inference_api_key_str
+
+        # The key turns bill with, so validation answers for the billed organization.
+        api_key = inference_api_key_str(settings, Provider.MINDS_CLOUD)
     except Exception:
         # Settings shapes vary across versions/scopes; a resolution failure is
         # not grounds to block a write.
@@ -1043,9 +1045,13 @@ async def warm_enabled_model_map(session, scope=None) -> bool:
 
     scope = scope if scope is not None else LOCAL_SCOPE
     s = SettingService(session, scope).load()
-    if s.minds_api_key is None or not s.minds_url:
+    from cowork.common.settings.user_settings import Provider, inference_api_key_str
+
+    # The key turns bill with, so the stored map is the billed organization's.
+    minds_key = inference_api_key_str(s, Provider.MINDS_CLOUD)
+    if not minds_key or not s.minds_url:
         return False
-    listing = await fetch_minds_models(s.minds_url, s.minds_api_key.get_secret_value())
+    listing = await fetch_minds_models(s.minds_url, minds_key)
     return persist_enabled_model_map(
         session, scope, s.minds_model_enabled, listing.enabled, listing.ids
     )
