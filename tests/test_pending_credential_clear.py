@@ -5,8 +5,12 @@ import logging
 from pathlib import Path
 
 import pytest
+import uvicorn
 from sqlmodel import Session, select
+from uvicorn.lifespan.on import LifespanOn
 
+from cowork import server
+from cowork.api.v1.endpoints.health import health
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.migrations import run_schema_migrations
 from cowork.db.session import get_engine
@@ -147,8 +151,6 @@ def test_failure_log_names_the_store_but_no_credential(store, monkeypatch, caplo
 
 
 def test_health_advertises_the_capability():
-    from cowork.api.v1.endpoints.health import health
-
     assert "pending-credential-clear" in health()["capabilities"]
 
 
@@ -158,9 +160,6 @@ class _StopStartup(Exception):
 
 async def _startup_failed(app) -> bool:
     """Drive the app's lifespan startup as Uvicorn does; True when it failed."""
-    import uvicorn
-    from uvicorn.lifespan.on import LifespanOn
-
     config = uvicorn.Config(app, lifespan="on", log_config=None)
     config.load()
     lifespan = LifespanOn(config)
@@ -170,29 +169,31 @@ async def _startup_failed(app) -> bool:
 
 @pytest.fixture
 def app_store():
-    """The suite's own database, marked, with its credential rows restored after."""
+    """The suite's own database, marked; its global rows for these keys are put
+    back exactly as they were, and no other scope is touched."""
     database_uri = get_app_settings().database.uri
     marker = Path(get_engine(database_uri).url.database).parent / PENDING_CLEAR_MARKER
+    keys = [*CREDENTIAL_KEYS, PREFERENCE_KEY]
+    global_rows = select(Setting).where(Setting.key.in_(keys), Setting.scope.is_(None))
     with Session(get_engine(database_uri)) as session:
-        for key in [*CREDENTIAL_KEYS, PREFERENCE_KEY]:
-            existing = session.exec(
-                select(Setting).where(Setting.key == key, Setting.scope.is_(None))
-            ).first()
-            if existing is None:
+        before = {row.key: row.value for row in session.exec(global_rows).all()}
+        for key in keys:
+            if key not in before:
                 session.add(Setting(key=key, value="seeded"))
         session.commit()
     marker.touch()
     yield database_uri, marker
     marker.unlink(missing_ok=True)
     with Session(get_engine(database_uri)) as session:
-        for row in session.exec(select(Setting).where(Setting.key.in_([*CREDENTIAL_KEYS, PREFERENCE_KEY]))).all():
+        for row in session.exec(global_rows).all():
             session.delete(row)
+        session.flush()
+        for key, value in before.items():
+            session.add(Setting(key=key, value=value))
         session.commit()
 
 
 async def test_startup_clears_after_setup_and_before_anything_else_runs(app_store, monkeypatch):
-    from cowork import server
-
     database_uri, marker = app_store
     seen: dict[str, object] = {}
 
@@ -201,6 +202,7 @@ async def test_startup_clears_after_setup_and_before_anything_else_runs(app_stor
 
     def stop_after_clear() -> None:
         seen["keys_after_clear"] = _keys(database_uri)
+        seen["config_ready"] = health()["config_ready"]
         raise _StopStartup()
 
     monkeypatch.setattr(server, "run_dev_setup", recording_setup)
@@ -213,12 +215,11 @@ async def test_startup_clears_after_setup_and_before_anything_else_runs(app_stor
     assert isinstance(keys_after_clear, set)
     assert keys_after_clear.isdisjoint(CREDENTIAL_KEYS)
     assert PREFERENCE_KEY in keys_after_clear
+    assert seen["config_ready"] is False
     assert not marker.exists()
 
 
 async def test_a_failed_clear_fails_startup(app_store, monkeypatch):
-    from cowork import server
-
     database_uri, marker = app_store
     went_on: list[bool] = []
 
@@ -237,3 +238,27 @@ async def test_a_failed_clear_fails_startup(app_store, monkeypatch):
     assert went_on == []
     assert marker.exists()
     assert set(CREDENTIAL_KEYS) <= _keys(database_uri)
+
+
+async def test_a_fresh_store_is_migrated_before_its_pending_clear(tmp_path, monkeypatch):
+    """An organization store a sign-out marked before its database existed."""
+    database_uri = f"sqlite:///{tmp_path / 'cowork.db'}"
+    marker = tmp_path / PENDING_CLEAR_MARKER
+    marker.touch()
+    reached: list[bool] = []
+
+    def stop_after_clear() -> None:
+        reached.append(True)
+        raise _StopStartup()
+
+    monkeypatch.setenv("DATABASE_URI", database_uri)
+    get_app_settings.cache_clear()
+    try:
+        monkeypatch.setattr(server, "_warm_agent_runtime", stop_after_clear)
+        await _startup_failed(server.create_app())
+    finally:
+        get_app_settings.cache_clear()
+
+    assert reached == [True]
+    assert not marker.exists()
+    assert _keys(database_uri).isdisjoint(CREDENTIAL_KEYS)
