@@ -1,8 +1,8 @@
-"""Cross-tenant behaviour of the swept FileService + harness scope recovery.
+"""Cross-tenant behaviour of the swept FileService + the harness listing's scope.
 
 Files are a root table (own org_id): direct org filtering on every query,
-stamping on writes. The harness attachment listing recovers the ORIGINAL
-scope from the session (never derives one from the conversation row).
+stamping on writes. The harness attachment listing reads under the turn's
+bound scope (never one derived from the conversation row).
 """
 from __future__ import annotations
 
@@ -177,11 +177,21 @@ def test_index_artifact_works_for_own_roots(engine):
     assert raw.exec(select(TaskObject).where(TaskObject.ref == "own-slug")).first() is not None
 
 
-# ── harness attachment listing: scope recovery, never derivation ────────────
+# ── harness attachment listing: the turn's scope, never derivation ─────────
+
+@pytest.fixture()
+def units_read_engine(engine, monkeypatch):
+    """Database units (cowork.db.units) open the app's engine. Point them at
+    this test's in-memory one, where the conversations below live."""
+    import cowork.db.session as db_session
+
+    monkeypatch.setitem(db_session._engines, db_session.settings.database.uri, engine)
+    yield engine
+    db_session._session_factories.pop(id(engine), None)
+
 
 def _conversation_with_file(engine, scope: TenantScope):
-    """A conversation + attached file created under `scope`, returned attached
-    to a scope-wrapped session (like the handler paths produce)."""
+    """A conversation + attached file created under `scope`."""
     raw = Session(engine)
     scoped = ScopedSession(raw, scope)
     project = Project(name=f"p-{uuid4().hex[:6]}", path="/tmp/x")
@@ -198,25 +208,26 @@ def _conversation_with_file(engine, scope: TenantScope):
     return raw, conv
 
 
-def test_harness_lists_attachments_with_recovered_scope(engine, monkeypatch):
+def _logged(caplog) -> list[str]:
+    return [record.getMessage() for record in caplog.records]
+
+
+async def test_harness_lists_attachments_with_the_turns_scope(units_read_engine, monkeypatch):
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
     get_app_settings.cache_clear()
-    _raw, conv = _conversation_with_file(engine, _scope(ORG_A))
-    ctx = _conversation_attachment_context(conv)
+    _raw, conv = _conversation_with_file(units_read_engine, _scope(ORG_A))
+    ctx = await _conversation_attachment_context(conv, scope=_scope(ORG_A))
     assert "doc.txt" in ctx
 
 
-def test_harness_fails_closed_on_scope_mismatch(engine, monkeypatch, caplog):
+async def test_harness_fails_closed_on_scope_mismatch(units_read_engine, monkeypatch, caplog):
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
     get_app_settings.cache_clear()
     # a conversation genuinely owned by org B...
-    _rawb, conv_b = _conversation_with_file(engine, _scope(ORG_B))
-    # ...reached through a session whose recorded scope is org A (wrong routing)
-    raw = Session(engine)
-    ScopedSession(raw, _scope(ORG_A))
-    stray = raw.get(Conversation, conv_b.id)
+    _rawb, conv_b = _conversation_with_file(units_read_engine, _scope(ORG_B))
+    # ...reached by a turn whose bound scope is org A (wrong routing)
     with caplog.at_level("WARNING"):
-        ctx = _conversation_attachment_context(stray)
+        ctx = await _conversation_attachment_context(conv_b, scope=_scope(ORG_A))
     # Fail closed means: leak NOTHING about the other org's files. Assert that
     # property directly rather than `ctx == ""` — since ENG-1357 the helper
     # always returns the generic attachment affordance (org-agnostic constant
@@ -227,35 +238,28 @@ def test_harness_fails_closed_on_scope_mismatch(engine, monkeypatch, caplog):
     # Nor may it claim nothing is attached — a file IS attached, we just
     # refused to look. See test_agent_attachment_context.py.
     assert "No files are currently attached" not in ctx
-    assert "does not match scope org" in caplog.text
+    assert any("does not match scope org" in message for message in _logged(caplog))
 
 
-def test_harness_fails_closed_without_scope_in_org_mode(engine, monkeypatch, caplog):
+async def test_harness_fails_closed_without_scope_in_org_mode(units_read_engine, monkeypatch, caplog):
     monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
     get_app_settings.cache_clear()
-    # conversation loaded through a RAW session — no scope ever recorded
-    raw = Session(engine)
-    project = Project(name="raw-proj", path="/tmp/x", org_id=ORG_A)
-    raw.add(project)
-    raw.commit()
-    conv = Conversation(topic="t", project_id=project.id, org_id=ORG_A)
-    raw.add(conv)
-    raw.commit()
-    raw.refresh(conv)
+    _raw, conv = _conversation_with_file(units_read_engine, _scope(ORG_A))
+    # A turn with no bound scope: nothing to read under.
     with caplog.at_level("WARNING"):
-        ctx = _conversation_attachment_context(conv)
+        ctx = await _conversation_attachment_context(conv, scope=None)
     # Same as above: the guarantee is "no attachment listing", not "empty
     # string". Nothing was looked up, so it must not assert emptiness either.
     assert "doc.txt" not in ctx
     assert "No files are currently attached" not in ctx
-    assert "no tenant scope" in caplog.text
+    assert any("no tenant scope" in message for message in _logged(caplog))
 
 
-def test_harness_works_in_local_mode(engine, monkeypatch):
+async def test_harness_works_in_local_mode(units_read_engine, monkeypatch):
     monkeypatch.delenv("COWORK_TENANCY_MODE", raising=False)
     get_app_settings.cache_clear()
-    _raw, conv = _conversation_with_file(engine, LOCAL_SCOPE)
-    assert "doc.txt" in _conversation_attachment_context(conv)
+    _raw, conv = _conversation_with_file(units_read_engine, LOCAL_SCOPE)
+    assert "doc.txt" in await _conversation_attachment_context(conv, scope=LOCAL_SCOPE)
 
 
 # ── upload safety: untrusted filename + size cap (not tenancy, but this is the
