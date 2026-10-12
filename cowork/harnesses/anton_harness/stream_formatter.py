@@ -26,6 +26,7 @@ from cowork.schemas.responses import (
     ResponseStatus,
     Role,
 )
+from cowork.streaming.liveness import MODEL_WAIT_PHASE, model_wait_sse
 
 
 @dataclass
@@ -385,6 +386,22 @@ async def format_responses_stream(
             # under PROGRESS_THROTTLE — dropping a scratchpad_done
             # would leave the cell stuck in_progress in the UI.
             phase_str = event.phase or ""
+            # A keep-alive from the cloud pod while a model call is quiet.
+            # Never throttled: dropping it lets the idle bounds end a live
+            # turn, and it cannot flood the stream: the pod writes one from
+            # its heartbeat only after MODEL_WAIT_TICK_S (20 s,
+            # anton.core.llm.liveness) of otherwise quiet wire, see
+            # anton.cloud_turn.__main__._model_wait_line. It also stays out
+            # of event_sink and off the throttle anchor: it says the turn is
+            # alive, and a reload has nothing to show for it.
+            if phase_str == MODEL_WAIT_PHASE:
+                seq += 1
+                yield model_wait_sse(
+                    message=event.message or "",
+                    waited_s=getattr(event, "eta_seconds", None),
+                    sequence_number=seq,
+                )
+                continue
             # Latched ahead of the throttling below: this notice is
             # rate-limited like any other, but the reset it implies is not.
             if phase_str == "continuation":

@@ -15,6 +15,9 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal
 
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+from cowork.common.logger import exception_http_status
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.services.providers import build_llm_client
 
@@ -492,6 +495,57 @@ def ineligible_reason(*, has_non_text_input: bool, has_attachments: bool, has_di
     return None
 
 
+
+# Naming a concrete file requires the full agent's file context even when the
+# question is phrased conversationally. This only delegates; it never authorizes
+# file access or fabricates a fast answer. Normal tool and completion checks run.
+_FILE_CONTEXT_RE = re.compile(
+    r"(?<![\w])[^\s<>\"'`/\\]+\.(?:json|csv|tsv|xlsx|xls|parquet|html|htm|md|docx|pdf|pptx|png|jpg|jpeg)(?![\w]|\.[\w])",
+    re.IGNORECASE,
+)
+
+
+def explicit_file_context(history: list[dict]) -> bool:
+    latest = next((m for m in reversed(history) if m.get("role") == "user"), None)
+    if latest is None:
+        return False
+    text = _condense_content(latest.get("content")) or ""
+    return bool(_FILE_CONTEXT_RE.search(text))
+
+
+def _has_block(content, block_type: str) -> bool:
+    return isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") == block_type for block in content
+    )
+
+
+def prior_turn_ran_tools(history: list[dict]) -> bool:
+    """Whether the reply to the previous user prompt used tools.
+
+    The gate prompt already tells the model that a follow-up to an answer that
+    came from live work usually needs the same work again, so it delegates; on
+    those turns the gate call only rediscovers that rule while Anton waits for
+    it (about 1.5-2 s before the agent's first call). This reads the same fact
+    from the persisted rows instead: structural, so it holds in every language,
+    and it only delegates, like ``explicit_file_context``.
+
+    Only the turn immediately before the latest prompt counts, so a conversation
+    that ran tools earlier still gets direct answers once a plain exchange has
+    followed. A window that starts inside that turn (a long tool loop) still
+    sees its tool rows: a tool result alone is evidence of the same work.
+    """
+    rows = [m for m in history if m.get("role") in {"user", "assistant"}]
+    if rows and rows[-1].get("role") == "user" and not _has_block(rows[-1].get("content"), "tool_result"):
+        rows = rows[:-1]  # the latest prompt itself
+    for message in reversed(rows):
+        content = message.get("content")
+        if _has_block(content, "tool_use") or _has_block(content, "tool_result"):
+            return True
+        if message.get("role") == "user":
+            return False  # reached the previous user prompt
+    return False
+
+
 async def decide_route(
     *,
     history: list[dict],
@@ -506,6 +560,9 @@ async def decide_route(
     per-turn key); when None the binding comes from stored settings.
     Gate/provider failures intentionally fail open to Anton.  This boundary must
     never make a chat turn unavailable because the optional fast path is down.
+    A database pool that freed no connection in time is not a gate failure: it
+    propagates, and the request is refused rather than delegated into the same
+    wait.
     """
     reason = ineligible_reason(
         has_non_text_input=has_non_text_input,
@@ -514,6 +571,12 @@ async def decide_route(
     )
     if reason:
         return RouteDecision(route=DELEGATED_AGENTIC, reason=reason)
+
+    if explicit_file_context(history):
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="explicit_file_context")
+
+    if prior_turn_ran_tools(history):
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="prior_turn_ran_tools")
 
     messages = _text_history(history)
     if not messages:
@@ -560,23 +623,16 @@ async def decide_route(
             model=binding.model,
             text=text,
         )
+    except PoolTimeoutError:
+        raise
     except Exception as exc:
-        # The failure is named in the log by class, HTTP status and the
-        # provider error's type, code and param. Never its message: provider
-        # text can quote the request or echo a credential, and this gate runs
-        # upstream of every scrubber. anton re-raises a 400 it cannot name as
-        # the SDK's own error, and raises its typed errors from the SDK's, so
-        # those fields sit on the error or on its cause. Prefer the cause even
-        # when anton retained status_code: its wrapper can normalize code and
-        # omit type/param. WARNING, because the default LOG_LEVEL drops info lines.
-        provider_error = exc.__cause__ if exc.__cause__ is not None else exc
+        # Provider body fields (including type/code/param) can echo private
+        # request content. Only the class and a validated HTTP status are safe.
+        status = exception_http_status(exc=exc)
         logger.warning(
-            "[gate] reason=router_unavailable error=%s status=%s type=%s code=%s param=%s",
+            "[gate] reason=router_unavailable error=%s status=%s",
             type(exc).__name__,
-            getattr(provider_error, "status_code", None),
-            getattr(provider_error, "type", None),
-            getattr(provider_error, "code", None),
-            getattr(provider_error, "param", None),
+            "unknown" if status is None else status,
         )
         # Attribution survives the failure: a 402 on a paid router pick is
         # only diagnosable in the traces if the model that failed is named.
