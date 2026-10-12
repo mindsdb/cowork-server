@@ -683,6 +683,7 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
         fresh = ScheduleService(ScopedSession(check, SYSTEM_SCOPE)).get_schedule(schedule_id)
         run = ScheduleRunService(ScopedSession(check, SYSTEM_SCOPE)).list_runs(schedule_id)[0]
         state = {
+            "schedule_id": schedule_id,
             "run_status": run.status,
             "run_error": run.error,
             "run_conversation_id": run.conversation_id,
@@ -731,6 +732,52 @@ def test_execute_schedule_completed_is_success(monkeypatch):
     assert state["last_error"] is None
     assert state["last_run_at"] is not None
     assert state["next_advanced"] is True
+
+
+def test_a_database_error_in_a_runs_last_writes_logs_its_schedule_and_conversation(
+    monkeypatch, caplog, owned_logger,
+):
+    """The outcome write and the finish write both fail on the database. The
+    database filter replaces each line with its type and call site, and the
+    schedule and conversation it concerned travel as record attributes, so
+    the line still says which schedule wedged."""
+    import logging
+
+    from sqlalchemy.exc import OperationalError
+
+    import cowork.scheduler as scheduler_mod
+
+    driver_text = "server closed the connection unexpectedly"
+
+    def connection_lost(session, **kwargs):
+        raise OperationalError("UPDATE schedule_runs SET private_statement_marker", {}, Exception(driver_text))
+
+    monkeypatch.setattr(scheduler_mod, "_record_turn_outcome", connection_lost)
+    monkeypatch.setattr(scheduler_mod, "_finish_run", connection_lost)
+    logged = owned_logger(scheduler_mod.logger.name)
+
+    state = _execute_with_terminal(monkeypatch, "completed")
+
+    schedule_id, conversation_id = state["schedule_id"], state["run_conversation_id"]
+    assert conversation_id is not None
+    errors = [r for r in caplog.records if r.name == scheduler_mod.logger.name and r.levelno == logging.ERROR]
+    assert len(errors) == 2, [r.getMessage() for r in errors]
+    for record in errors:
+        assert record.getMessage() == (
+            "Database operation failed: error_type=OperationalError sqlstate=unknown "
+            f"site=scheduler.execute_schedule:{record.lineno}"
+        )
+        assert (record.schedule_id, record.conversation_id) == (str(schedule_id), str(conversation_id))
+        assert record.exc_info is None
+        assert driver_text not in repr(record.__dict__)
+    # The run's failure is logged first, then the finish write's.
+    assert errors[0].lineno < errors[1].lineno
+    lines = [line for line in logged.output().splitlines() if "Database operation failed" in line]
+    assert len(lines) == 2
+    for line in lines:
+        assert f"[Schedule:{schedule_id}][Conversation:{conversation_id}]" in line
+    assert driver_text not in logged.output()
+    assert "private_statement_marker" not in logged.output()
 
 
 def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
