@@ -1633,6 +1633,40 @@ def remote_turn_error(error: str | None) -> tuple[str, str]:
     return GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
 
 
+def remote_error_label(*, error: str | None) -> str:
+    """A fixed label for a pod's failure string, for a log line.
+
+    Takes remote_turn_error's branches in its order, plus the two cancel
+    strings, and names the one the string takes. The string can quote the
+    provider, so no part of it is returned: each label is a constant here or
+    a type name the mapping table holds, and ``unmapped`` covers everything
+    else.
+    """
+    text = (error or "").strip()
+    if text in SELF_AUTHORED_TURN_FAILURES:
+        return text.partition(":")[0]
+    if text.startswith(POD_STREAM_ENDED_PREFIX):
+        return "pod_stream_ended"
+    if text.startswith(TURN_ABORTED_TIMEOUT_PREFIX):
+        return "turn_aborted_timeout"
+    if text.startswith(TURN_ABORTED_STALL_PREFIX):
+        return "turn_aborted_stall"
+    if text.startswith(MISSING_ORGANIZATION_PREFIXES) and text.endswith(MISSING_ORGANIZATION_SUFFIX):
+        return "missing_organization"
+    if text.startswith(LIVE_POD_PREFIX) and any(marker in text for marker in LIVE_POD_NEVER_RAN_MARKERS):
+        return "live_pod_never_ran"
+    if text.startswith(POD_IDENTITY_MISMATCH_PREFIX) and POD_IDENTITY_MISMATCH_MARKER in text:
+        return "pod_identity_mismatch"
+    if text in (REMOTE_CANCEL_LITERAL, REMOTE_CANCEL_VIA_FAIL_JOB):
+        return "cancelled"
+    type_name, _, message = text.partition(":")
+    if type_name in _REMOTE_TYPE_MAPPINGS:
+        return type_name
+    if type_name == "ConnectionError" and message.strip().lower().startswith(LEGACY_AUTH_ERROR_MESSAGE_PREFIX):
+        return "ConnectionError"
+    return "unmapped"
+
+
 def response_failed_payload(
     error: str,
     code: str,

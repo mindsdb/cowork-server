@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 from weakref import WeakValueDictionary
 
+from cowork.common.logger import log_context
 from cowork.streaming.buffer import StreamBuffer
 
 logger = logging.getLogger(__name__)
@@ -78,8 +79,7 @@ TURN_SHUTDOWN_GRACE_SECONDS = 5
 class TurnInProgress(Exception):
     """A conversation already has a turn answering, so a new question is refused.
 
-    The app answers it with 409 (cowork.server). ``status_code`` marks it as
-    an expected refusal for code that logs by status (cowork.db.session).
+    The app answers it with 409 (cowork.server), which reads ``status_code``.
     """
 
     status_code = 409
@@ -200,8 +200,8 @@ class RunHandle:
             # is not left hanging; what is lost is whatever persist() or
             # close() was doing, which is worth a log rather than silence.
             logger.exception(
-                "[registry] producer for conversation %s raised while unwinding a cancel",
-                self.conversation_id,
+                "[registry] producer raised while unwinding a cancel",
+                extra=log_context(conversation_id=self.conversation_id),
             )
             return True
         # The task finished without surfacing the cancellation — it either
