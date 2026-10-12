@@ -36,6 +36,7 @@ def custom_connector_spec(row: CustomConnector) -> dict[str, Any]:
         "keywords": [],
         "featured": row.featured,
         "custom": True,
+        "usage_notes": row.usage_notes,
         "form": dict(row.spec),
     }
 
