@@ -75,8 +75,12 @@ class PublishOwnedByOtherUser(RuntimeError):
     copy under a new URL.
     """
 
-    def __init__(self, message: str = OWNED_BY_OTHER_USER_MESSAGE) -> None:
-        super().__init__(message)
+    def __init__(self) -> None:
+        super().__init__(OWNED_BY_OTHER_USER_MESSAGE)
+
+    def __reduce__(self):
+        # pickle and copy rebuild an exception from its args; this one takes none.
+        return (type(self), ())
 
     def detail(self) -> dict[str, str]:
         return {"code": OWNED_BY_OTHER_USER_CODE, "message": OWNED_BY_OTHER_USER_MESSAGE}

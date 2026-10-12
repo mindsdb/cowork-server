@@ -132,5 +132,6 @@ async def test_harness_tells_the_agent_not_to_work_around_another_owner(tmp_path
     assert out.reason == "owned_by_other_user"
     message = json.loads(out.content)["message"]
     assert message.startswith("PUBLISH FAILED: This artifact was published by another owner.")
-    assert "Do NOT call this tool again" in message
-    assert "do not publish it under a new report" in message
+    assert "do not publish this artifact under a new report on your own" in message
+    # Not a ban for the rest of the conversation: the user may fix the account.
+    assert "publish again only if they ask after resolving it" in message
