@@ -18,6 +18,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from cowork.build_info import build_trace_metadata
 from cowork.common.chat_session import in_process_agent_allowed
 from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
+from cowork.common.logger import log_context
 from cowork.common.settings.app_settings import MINDS_FREE_MODEL, TurnQueueSettings, get_app_settings
 from cowork.common.settings.user_settings import (
     Provider,
@@ -90,6 +91,7 @@ from cowork.handlers.turn_errors import (
     gate_reset_at,
     model_unavailable_info,
     provider_overloaded_info,
+    remote_error_label,
     response_failed_payload,
     retry_after_seconds,
     retry_at_instant,
@@ -795,7 +797,7 @@ class ResponsesHandler:
         # turn_id: prior message count. The current user message is NOT
         # persisted yet (deferred to the producer for the streaming path), so
         # this is a stable per-conversation index for the buffer file.
-        turn_id = len(conversation.messages)
+        turn_id = conversation_service.message_count(conversation)
 
         # Shape checks first: a turn the gate cannot route skips the history
         # read, as _route_request skips the gate.
@@ -820,11 +822,13 @@ class ResponsesHandler:
     @staticmethod
     def _read_gate_rows(session: ScopedSession, *, conversation_id: UUID) -> list[Message] | None:
         """The rows decide_route can use: user and assistant messages, at most
-        _MAX_HISTORY_MESSAGES, so scrubbing never pays for the whole
-        conversation. None when the read fails: routing failures send the turn
-        to the agent rather than failing it."""
+        _MAX_HISTORY_MESSAGES, so neither the read nor scrubbing pays for the
+        whole conversation. None when the read fails: routing failures send the
+        turn to the agent rather than failing it."""
         try:
-            rows = ConversationService(session).get_ordered_messages(conversation_id)
+            return ConversationService(session).get_recent_messages(
+                conversation_id, roles=(Role.user, Role.assistant), limit=_MAX_HISTORY_MESSAGES,
+            )
         except PoolTimeoutError:
             raise
         except Exception:
@@ -833,7 +837,6 @@ class ResponsesHandler:
             # loses nothing: creating or relinking above committed already.
             session.rollback()
             return None
-        return [m for m in rows if m.role in {"user", "assistant"}][-_MAX_HISTORY_MESSAGES:]
 
     async def _route_request(
         self,
@@ -1003,6 +1006,8 @@ class ResponsesHandler:
             base_url=block["base_url"],
             flavor=OpenAIProvider.FLAVOR_MINDS_PASSTHROUGH,
         )
+        # Built outside LLMClient, so nothing else names this call's role.
+        provider.trace_role = "router"
         binding = RouterBinding(
             provider=provider,
             model=settings.resolved_gate_model or MINDS_FREE_MODEL,
@@ -1188,7 +1193,7 @@ class ResponsesHandler:
                     conv_id,
                 )
             else:
-                logger.exception("[responses] direct turn failed for conversation %s", conv_id)
+                logger.exception("[responses] direct turn failed", extra=log_context(conversation_id=conv_id))
             await buffer.append("sse", {"sse": _failed_frame_for(exc)})
             await buffer.close("error")
         finally:
@@ -1282,7 +1287,7 @@ class ResponsesHandler:
             stage_project_instructions(project_path, conv_id)
             SkillService(session.scope).ensure_builtin_skills()
         except Exception:
-            logger.exception("[responses] failed to stage workspace files for conversation %s", conv_id)
+            logger.exception("[responses] failed to stage workspace files", extra=log_context(conversation_id=conv_id))
 
     @staticmethod
     def _remote_started_at(session: ScopedSession, conv_id: UUID) -> str | None:
@@ -1296,7 +1301,7 @@ class ResponsesHandler:
             )
             return created_at.isoformat() if created_at is not None else None
         except Exception:
-            logger.exception("[responses] failed to resolve started_at for conversation %s", conv_id)
+            logger.exception("[responses] failed to resolve started_at", extra=log_context(conversation_id=conv_id))
             return None
 
     @staticmethod
@@ -1324,7 +1329,7 @@ class ResponsesHandler:
             rel = Path(conversation.project.path).relative_to(org_root).as_posix()
             return {"project_id": str(conversation.project.id), "workspace_rel_path": rel}
         except Exception:
-            logger.exception("[responses] failed to resolve workspace for conversation %s", conv_id)
+            logger.exception("[responses] failed to resolve workspace", extra=log_context(conversation_id=conv_id))
             return {}
 
     @staticmethod
@@ -1371,7 +1376,7 @@ class ResponsesHandler:
             )
         except Exception:
             logger.exception(
-                "[responses] failed to resolve artifacts context for conversation %s", conv_id)
+                "[responses] failed to resolve artifacts context", extra=log_context(conversation_id=conv_id))
             return None
 
     @staticmethod
@@ -1390,7 +1395,7 @@ class ResponsesHandler:
             project = resolved.get("project")
             return {"project": project} if project else {}
         except Exception:
-            logger.exception("[responses] failed to read memory for conversation %s", conv_id)
+            logger.exception("[responses] failed to read memory", extra=log_context(conversation_id=conv_id))
             return {}
 
     @staticmethod
@@ -1443,7 +1448,7 @@ class ResponsesHandler:
             logger.info("[responses] applied %d memory entr(ies) for conversation %s",
                         applied, conv_id)
         except Exception:
-            logger.exception("[responses] failed to apply memory for conversation %s", conv_id)
+            logger.exception("[responses] failed to apply memory", extra=log_context(conversation_id=conv_id))
 
     def _read_remote_turn_inputs(self, session: ScopedSession, *, conv_id: UUID) -> _RemoteTurnInputs:
         """What a remote turn's pod is seeded with, read as one unit once the
@@ -1567,8 +1572,8 @@ class ResponsesHandler:
             # and a channel turn goes on in the same session.
             session.rollback()
             logger.exception(
-                "[responses] failed to persist history compaction for conversation %s",
-                conv_id,
+                "[responses] failed to persist history compaction",
+                extra=log_context(conversation_id=conv_id),
             )
 
     async def _produce_remote(self, **kwargs) -> None:
@@ -1662,8 +1667,8 @@ class ResponsesHandler:
                 )
             except Exception:
                 logger.exception(
-                    "[responses] failed to apply memory for conversation %s", conv_id,
-                    extra={"request_id": corr},
+                    "[responses] failed to apply memory",
+                    extra=log_context(request_id=corr, conversation_id=conv_id),
                 )
 
         async def save_compaction(data: dict, seed_info: dict | None) -> None:
@@ -1686,8 +1691,8 @@ class ResponsesHandler:
                 )
             except Exception:
                 logger.exception(
-                    "[responses] failed to persist history compaction for conversation %s", conv_id,
-                    extra={"request_id": corr},
+                    "[responses] failed to persist history compaction",
+                    extra=log_context(request_id=corr, conversation_id=conv_id),
                 )
 
         async def record_artifacts(*, completed_cleanly: bool) -> ArtifactChanges | None:
@@ -1746,8 +1751,14 @@ class ResponsesHandler:
                         # backfill runs once, at startup, so they keep no
                         # index row and their owner stays unknown.
                         logger.error(
-                            "[responses] could not record the artifacts remote turn %s created: %s",
-                            conv_id, changes.created, exc_info=True, extra={"request_id": corr},
+                            "[responses] could not record the artifacts a remote turn created",
+                            exc_info=True,
+                            extra=log_context(
+                                request_id=corr,
+                                project_id=directory.project_id,
+                                conversation_id=conv_id,
+                                artifact_slugs=changes.created,
+                            ),
                         )
 
                 # The turn is marked recorded before this unit, so its cancel
@@ -1796,8 +1807,8 @@ class ResponsesHandler:
                 return _SavedAnswer(failure=exc)
             except Exception as exc:
                 logger.exception(
-                    "[responses] failed to persist remote turn for conversation %s", conv_id,
-                    extra={"request_id": corr},
+                    "[responses] failed to persist remote turn",
+                    extra=log_context(request_id=corr, conversation_id=conv_id),
                 )
                 return _SavedAnswer(failure=exc)
 
@@ -2006,7 +2017,7 @@ class ResponsesHandler:
                 # degrades on its own); this is its unit failing to connect or
                 # to commit.
                 logger.exception(
-                    "[responses] failed to stage workspace files for conversation %s", conv_id,
+                    "[responses] failed to stage workspace files", extra=log_context(conversation_id=conv_id),
                 )
             # Save the question (pending) as this producer's first write
             # (ENG-1231); see the note in handle(). Committed before
@@ -2043,7 +2054,7 @@ class ResponsesHandler:
             # or support has nothing to search for.
             logger.warning(
                 "[responses] remote turn reported a failure for conversation %s "
-                "correlation_id=%s code=%s", conv_id, corr, code,
+                "correlation_id=%s error_code=%s", conv_id, corr, code,
                 extra={"request_id": corr},
             )
             # The producer keeps `reset_at` only for RESET_AT_CODES and only as
@@ -2071,15 +2082,18 @@ class ResponsesHandler:
                                 lambda session: ConversationService(session).repair_image_content(conv_id),
                                 scope=scope,
                             )
+                        # A fixed label and the code only: the pod's error
+                        # text can quote the provider.
                         logger.warning(
-                            "[responses] content validation error on remote conversation %s — "
-                            "repaired %d message(s) with image content: %s",
-                            conv_id, len(repaired), failure.get("error"),
+                            "[responses] content validation error; "
+                            "repaired %d message(s) with image content: error_type=%s error_code=%s",
+                            len(repaired), remote_error_label(error=failure.get("error")), code,
+                            extra=log_context(request_id=corr, conversation_id=conv_id),
                         )
                     except Exception:
                         logger.exception(
-                            "[responses] failed to repair conversation %s after remote content "
-                            "validation error", conv_id,
+                            "[responses] failed to repair the conversation after a remote content "
+                            "validation error", extra=log_context(conversation_id=conv_id),
                         )
                 await end_turn("error", lambda message_id: response_failed_sse(
                     message, code, reset_at=reset_at, request_id=corr,
@@ -2130,8 +2144,8 @@ class ResponsesHandler:
             else:
                 code, message, extra = GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE, {}
                 logger.exception(
-                    "[responses] remote turn failed for conversation %s correlation_id=%s",
-                    conv_id, corr, extra={"request_id": corr},
+                    "[responses] remote turn failed",
+                    extra=log_context(request_id=corr, conversation_id=conv_id),
                 )
             collected_events.extend(cancelled_ask_user_retirements(collected_events))
             collected_events.append(response_failed_payload(message, code, request_id=corr, **extra))
@@ -2244,8 +2258,8 @@ class ResponsesHandler:
                 return _SavedAnswer(failure=exc)
             except Exception as exc:
                 logger.exception(
-                    "[responses] failed to persist turn for conversation %s", conv_id,
-                    extra={"request_id": corr},
+                    "[responses] failed to persist turn",
+                    extra=log_context(request_id=corr, conversation_id=conv_id),
                 )
                 return _SavedAnswer(failure=exc)
 
@@ -2407,8 +2421,8 @@ class ResponsesHandler:
                 # nothing — so the id has to survive that level or the
                 # Reference they quote resolves to no line.
                 logger.exception(
-                    "[responses] turn failed for conversation %s correlation_id=%s",
-                    conv_id, corr, extra={"request_id": corr},
+                    "[responses] turn failed",
+                    extra=log_context(request_id=corr, conversation_id=conv_id),
                 )
             # For an auth failure, tell the client which provider failed so it
             # offers the right action: "Reconnect" only for MindsHub (we can
@@ -2556,15 +2570,18 @@ class ResponsesHandler:
                                 lambda session: ConversationService(session).repair_image_content(conv_id),
                                 scope=scope,
                             )
+                        # The class only: the provider filter would replace a
+                        # line that carries the error itself, count included.
                         logger.warning(
-                            "[responses] content validation error on conversation %s — "
-                            "repaired %d message(s) with image content: %s",
-                            conv_id, len(repaired), error, extra={"request_id": corr},
+                            "[responses] content validation error; "
+                            "repaired %d message(s) with image content: error_type=%s",
+                            len(repaired), type(error).__name__,
+                            extra=log_context(request_id=corr, conversation_id=conv_id),
                         )
                     except Exception:
                         logger.exception(
-                            "[responses] failed to repair conversation %s after content validation error",
-                            conv_id, extra={"request_id": corr},
+                            "[responses] failed to repair the conversation after a content validation error",
+                            extra=log_context(request_id=corr, conversation_id=conv_id),
                         )
                 await end_turn("error", lambda message_id: response_failed_sse(
                     message, code, **extra, assistant_message_id=message_id,
@@ -2706,16 +2723,17 @@ class ResponsesHandler:
                                 lambda session: ConversationService(session).repair_image_content(conversation_id),
                                 scope=self.scope,
                             )
+                        # The class only, as in the streaming twin.
                         logger.warning(
-                            "[responses] content validation error on conversation %s — "
-                            "repaired %d message(s) with image content: %s",
-                            conversation_id, len(repaired), exc,
-                            extra={"request_id": corr},
+                            "[responses] content validation error; "
+                            "repaired %d message(s) with image content: error_type=%s",
+                            len(repaired), type(exc).__name__,
+                            extra=log_context(request_id=corr, conversation_id=conversation_id),
                         )
                     except Exception:
                         logger.exception(
-                            "[responses] failed to repair conversation %s after content validation error",
-                            conversation_id, extra={"request_id": corr},
+                            "[responses] failed to repair the conversation after a content validation error",
+                            extra=log_context(request_id=corr, conversation_id=conversation_id),
                         )
                 # The ladder already produced a code; carry it instead of dropping
                 # it here. Same wire shape the streaming twin emits.
@@ -2724,8 +2742,8 @@ class ResponsesHandler:
                     detail=response_failed_payload(message, code, request_id=corr),
                 )
             logger.exception(
-                "[responses] turn failed for conversation %s correlation_id=%s",
-                conversation_id, corr, extra={"request_id": corr},
+                "[responses] turn failed",
+                extra=log_context(request_id=corr, conversation_id=conversation_id),
             )
             # Same shape as the 400 above: one body for every turn failure, so a
             # caller never has to branch on status to know how to read `detail`.

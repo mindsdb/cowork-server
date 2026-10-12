@@ -16,7 +16,7 @@ import cowork.handlers.responses as responses_mod
 from cowork.handlers.response_routing import DELEGATED_AGENTIC, DIRECT_CONTEXT, RouteDecision
 from cowork.server import create_app
 from cowork.streaming import RunRegistry, TurnInProgress, TurnLifecycle, get_streams_dir, registry
-from cowork.streaming.buffer import FileStreamBuffer, read_records, turn_buffer_path
+from cowork.streaming.buffer import FileStreamBuffer, RedisStreamBuffer, read_records, turn_buffer_path
 from cowork.streaming import backend as backend_mod, buffer as buffer_mod
 
 from _fakes import PausedHarness, opens
@@ -508,15 +508,16 @@ async def test_a_follow_up_waits_for_the_redis_terminal_instead_of_being_refused
     monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")
     runs = RunRegistry()
     final_written, release = asyncio.Event(), asyncio.Event()
-    expire = redis.expire
+    close = RedisStreamBuffer.close
 
-    async def held_expiry(key, seconds):
+    async def held_close(self, reason, extra=None):
+        # The final client frame is written; the terminal record is not yet.
         if not final_written.is_set():
             final_written.set()
             await release.wait()
-        return await expire(key, seconds)
+        return await close(self, reason, extra)
 
-    monkeypatch.setattr(redis, "expire", held_expiry)
+    monkeypatch.setattr(RedisStreamBuffer, "close", held_close)
 
     async def refused(buffer):
         await buffer.append("sse", {"sse": f"event: {frame}\ndata: {{}}\n\n"})
