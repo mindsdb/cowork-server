@@ -2417,14 +2417,33 @@ async def _route_with_budget(**kwargs):
     )
 
 
-def test_the_default_gate_budget_is_unchanged():
-    import inspect
-
+def test_the_default_gate_budget_is_ten_seconds():
     import cowork.handlers.response_routing as routing
 
     assert routing._GATE_TOTAL_SECONDS == 10.0
-    assert inspect.signature(decide_route).parameters["gate_total_seconds"].default is None
-    assert inspect.signature(routing._gate).parameters["total_seconds"].default is None
+
+
+@pytest.mark.asyncio
+async def test_without_a_budget_the_gate_uses_the_default_total(monkeypatch):
+    """An answer slower than a short budget still ships when no budget is
+    passed, and the default total still bounds it."""
+    import cowork.handlers.response_routing as routing
+
+    monkeypatch.setattr(routing, "_GATE_IDLE_SECONDS", 1.0)
+    monkeypatch.setattr(routing, "_GATE_TOTAL_SECONDS", 1.0)
+    events = [_text(f"w{i} ") for i in range(5)] + [_complete()]
+
+    _patch_gate_provider(monkeypatch, _StreamProvider(events, gap=0.04))
+    assert (await _route_with_budget(gate_total_seconds=0.1)).reason == "router_timeout"
+
+    _patch_gate_provider(monkeypatch, _StreamProvider(events, gap=0.04))
+    decision = await _route_with_budget()
+    assert decision.route == DIRECT_CONTEXT
+    assert decision.text == "w0 w1 w2 w3 w4"
+
+    monkeypatch.setattr(routing, "_GATE_TOTAL_SECONDS", 0.1)
+    _patch_gate_provider(monkeypatch, _StreamProvider(events, gap=0.04))
+    assert (await _route_with_budget()).reason == "router_timeout"
 
 
 @pytest.mark.asyncio
@@ -2438,7 +2457,7 @@ async def test_a_shortened_budget_bounds_a_trickling_answer(monkeypatch):
     _patch_gate_provider(monkeypatch, trickle)
     started = asyncio.get_running_loop().time()
     decision = await _route_with_budget(gate_total_seconds=0.12)
-    assert asyncio.get_running_loop().time() - started < 0.4
+    assert asyncio.get_running_loop().time() - started < 5, "must not wait for the default budget"
     assert decision.reason == "router_timeout" and decision.fallback
     assert decision.text == ""
     assert trickle.closed
