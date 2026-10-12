@@ -11,6 +11,32 @@ class FakeRequest:
         self.headers = headers or {}
 
 
+class QueuedPipeline:
+    """``pipeline()`` for a hand-written fake Redis client: each command is
+    queued, then run in order against that client's own async method on
+    ``execute()``, so the fake records it as if it were called directly."""
+
+    def __init__(self, client) -> None:
+        self._client = client
+        self._commands: list[tuple[str, tuple, dict]] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc) -> None:
+        return None
+
+    def __getattr__(self, name: str):
+        def queue(*args, **kwargs):
+            self._commands.append((name, args, kwargs))
+            return self
+
+        return queue
+
+    async def execute(self) -> list:
+        return [await getattr(self._client, name)(*args, **kwargs) for name, args, kwargs in self._commands]
+
+
 class PausedHarness:
     """get_harness() stand-in whose answer waits on ``release`` mid-stream.
 

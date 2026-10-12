@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
@@ -13,7 +14,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from cowork.build_info import account_kwargs, supported_kwargs, surface_kwarg
 from cowork.common.chat_session import build_chat_session, close_session_scratchpads
 from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
-from cowork.common.logger import get_logger
+from cowork.common.logger import get_logger, log_context
 from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import current_settings_scope
@@ -22,14 +23,16 @@ from cowork.db.units import run_db, run_to_completion, unit_session
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
 from cowork.models.conversation import Conversation
-from cowork.models.message import Message
 from cowork.models.skill import Skill
-from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
+from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REPLAY_ROLES, extract_scratchpad_cells
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
 from cowork.services.connectors.notion_pages import describe_project_pages
 from cowork.services.projects import display_label
 from cowork.streaming.liveness import ModelWaitTicker
+
+if TYPE_CHECKING:
+    from cowork.services.conversations import ReplayHistory
 
 
 logger = get_logger(__name__)
@@ -362,10 +365,12 @@ def _attached_files(session: ScopedSession, *, conversation_id: UUID) -> list[_A
     return [_AttachedFile(path=row.path or "", filename=row.filename) for row in rows]
 
 
-def _replay_messages(session: ScopedSession, *, conversation_id: UUID) -> list[Message]:
+def _replay_history(session: ScopedSession, *, conversation_id: UUID) -> "ReplayHistory":
     from cowork.services.conversations import ConversationService
 
-    return ConversationService(session).get_replay_messages(conversation_id)
+    return ConversationService(session).get_replay_history(
+        conversation_id, event_roles=SCRATCHPAD_REPLAY_ROLES,
+    )
 
 
 def _archived_messages(session: ScopedSession, *, conversation_id: UUID) -> list[dict]:
@@ -409,10 +414,10 @@ async def _read_attachments(conversation, *, scope: TenantScope | None) -> list[
         # the user no files were uploaded (the Cyberdeck bug this helper
         # exists to fix). Log it so the failure is diagnosable.
         logger.warning(
-            "Failed to build conversation attachment context for conversation %s; "
+            "Failed to build conversation attachment context; "
             "the agent will not see attached files this turn",
-            getattr(conversation, "id", "<unknown>"),
             exc_info=True,
+            extra=log_context(conversation_id=getattr(conversation, "id", None)),
         )
         return None
 
@@ -589,8 +594,8 @@ class AntonHarness:
                     )
                 except Exception:
                     logger.exception(
-                        "[anton_harness] failed to persist history compaction for conversation %s",
-                        conv_id,
+                        "[anton_harness] failed to persist history compaction",
+                        extra=log_context(conversation_id=conv_id),
                     )
             try:
                 changes = turn_artifact_changes(
@@ -614,7 +619,13 @@ class AntonHarness:
                         scope=turn_scope,
                     )
             except Exception:
-                logger.warning("Could not index artifacts created this turn", exc_info=True)
+                logger.warning(
+                    "Could not index artifacts created this turn",
+                    exc_info=True,
+                    extra=log_context(
+                        conversation_id=conv_id, project_id=conv_project_id, artifact_slugs=new_slugs or None,
+                    ),
+                )
             skill_drafts = finalize_turn_skill_drafts(project_path, before_drafts, before_strays)
 
         try:
@@ -1057,11 +1068,13 @@ class AntonHarness:
         )
         # Canonical order (ConversationService._MESSAGE_ORDER: seq, role, id);
         # the bare `conversation.messages` relationship is unordered and would
-        # scramble a turn's tool_use/tool_result block-rows. Each message's
-        # events come loaded with it, for the scratchpad cells replayed below.
-        ordered_messages = await run_db(
-            partial(_replay_messages, conversation_id=conversation.id), scope=_units_scope(),
+        # scramble a turn's tool_use/tool_result block-rows. The same unit
+        # reads the stored scratchpad events the cells below are rebuilt from,
+        # and only those.
+        history = await run_db(
+            partial(_replay_history, conversation_id=conversation.id), scope=_units_scope(),
         )
+        ordered_messages = history.messages
 
         project_context = (
             # Conversational only. The next line hands the agent the real path,
@@ -1232,7 +1245,7 @@ class AntonHarness:
                     service.picked_files_by_project(data_vault, conversation.project.name, engine="notion")
                 )
 
-            cells = extract_scratchpad_cells_from_message_events(ordered_messages)
+            cells = extract_scratchpad_cells(history.events)
             os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
 
             replayable = [m for m in ordered_messages if m.role in {"user", "assistant"}]

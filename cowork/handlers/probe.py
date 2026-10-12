@@ -14,6 +14,7 @@ from uuid import UUID
 
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
+from cowork.common.logger import log_context
 from cowork.common.settings.user_settings import UserSettings
 from cowork.handlers.turn_errors import server_busy_message
 from cowork.schemas.responses import Role
@@ -154,7 +155,7 @@ class ProbeHandler:
                 # Same outcome as a refused save: the form keeps the probe's
                 # result, and only its narrative is missing from the
                 # conversation.
-                logger.exception("Could not save the probe turn for conversation %s", conversation_id)
+                logger.exception("Could not save the probe turn", extra=log_context(conversation_id=conversation_id))
                 return None
 
         async def _completed(conversation_id: UUID | None, response_fields: dict) -> str:

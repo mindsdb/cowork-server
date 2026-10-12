@@ -12,7 +12,7 @@ from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.common.datetime_utils import ensure_utc
-from cowork.common.logger import get_logger
+from cowork.common.logger import get_logger, log_context
 from cowork.db.scoped import (
     SYSTEM_SCOPE,
     MissingTenantScopeError,
@@ -426,7 +426,12 @@ async def execute_schedule(
 
     except Exception as exc:
         error = str(exc)
-        logger.exception(f"Schedule {schedule_id} run failed: {error}")
+        # The ids travel as record attributes: a database error's sanitized
+        # line keeps those and drops the message.
+        logger.exception(
+            "Schedule run failed: %s", error,
+            extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+        )
         try:
             await run_db(
                 partial(_record_schedule_error, schedule_id=schedule_id, error=error), scope=SYSTEM_SCOPE,
@@ -446,7 +451,10 @@ async def execute_schedule(
                 schedule_id=schedule_id,
             )
         except Exception:
-            logger.exception(f"Failed to finish run record for schedule {schedule_id}")
+            logger.exception(
+                "Failed to finish the run record",
+                extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+            )
 
 
 async def _turn_terminal_reason(conversation_id: str) -> str | None:

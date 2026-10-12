@@ -544,10 +544,11 @@ def test_collect_puts_the_same_id_on_the_body_and_the_log_line():
     # it failed with no id at all: the user got the generic message and the log
     # line named neither the turn nor a reference to quote.
     handler = _handler_with_raising_formatter(Exception("kaboom"))
+    conversation_id = uuid4()
     with _records_from("cowork.handlers.responses") as records:
         with pytest.raises(HTTPException) as err:
             asyncio.run(handler._collect(
-                stream=None, conversation_id=uuid4(), model="anton", original_content="hi",
+                stream=None, conversation_id=conversation_id, model="anton", original_content="hi",
             ))
 
     request_id = err.value.detail["request_id"]
@@ -555,6 +556,10 @@ def test_collect_puts_the_same_id_on_the_body_and_the_log_line():
     deployed = [r for r in records if r.levelno >= logging.WARNING]
     assert deployed
     assert all(getattr(r, "request_id", None) == request_id for r in deployed)
+    # The conversation travels beside the id, so a database error's sanitized
+    # line still names it.
+    [failed] = [r for r in deployed if r.getMessage() == "[responses] turn failed"]
+    assert failed.conversation_id == str(conversation_id)
 
 
 def test_collect_raises_500_generic_for_unmapped_error():
