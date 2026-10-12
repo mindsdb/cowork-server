@@ -396,6 +396,85 @@ async def test_stream_remote_replies_forwards_started_at_only_when_known(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_stream_remote_replies_forwards_reasoning_effort_only_when_selected(monkeypatch):
+    """Absent when unset, so a legacy job is unchanged for an older controller."""
+    fake = FakeRedis(replies=[
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+        ("scratchpad:reply:conv-1", _reply("turn_completed", {})),
+    ])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    async def fake_list_active_connections(**kw):
+        return []
+
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        reasoning_effort="some-future-level",
+    ))
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+
+    with_it = json.loads(fake.added[0][1]["payload"])["params"]
+    without = json.loads(fake.added[1][1]["payload"])["params"]
+    assert with_it["reasoning_effort"] == "some-future-level"
+    assert "reasoning_effort" not in without
+
+
+class _PerStreamRedis(FakeRedis):
+    """Answers each conversation's reply stream from its own queue."""
+
+    def __init__(self, replies_by_stream):
+        super().__init__(replies=[], workspace_mode=None)
+        self._by_stream = replies_by_stream
+
+    async def xread(self, streams, count=None, block=None):
+        for stream in streams:
+            if self._by_stream.get(stream):
+                return [[stream, [["9-0", self._by_stream[stream].pop(0)]]]]
+        await asyncio.sleep(0)
+        return None
+
+
+def _reply_for(corr, kind, data):
+    return {"payload": json.dumps({"correlation_id": corr, "kind": kind, "data": data})}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_turns_keep_their_own_reasoning_effort(monkeypatch):
+    authorized = {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+    fake = _PerStreamRedis({
+        f"scratchpad:reply:conv-{c}": [
+            _reply_for(f"r-{c}", "progress", authorized),
+            _reply_for(f"r-{c}", "turn_completed", {}),
+        ]
+        for c in ("a", "b")
+    })
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+
+    async def fake_list_active_connections(**kw):
+        return []
+
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+
+    await asyncio.gather(*(
+        _drain(prod.stream_remote_replies(
+            conversation_id=f"conv-{c}", org_id=f"org-{c}", user_id=f"u-{c}", input_text=c,
+            model="m", correlation_id=f"r-{c}", reasoning_effort=effort,
+        ))
+        for c, effort in (("a", "low"), ("b", "high"))
+    ))
+    by_input = {
+        job["params"]["input"]: job["params"].get("reasoning_effort")
+        for job in (json.loads(fields["payload"]) for _, fields in fake.added)
+    }
+    assert by_input == {"a": "low", "b": "high"}
+
+
+@pytest.mark.asyncio
 async def test_stream_remote_replies_attaches_oauth_block_with_the_llm_turn_key(monkeypatch):
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
     monkeypatch.setattr(prod, "get_redis", lambda: fake)

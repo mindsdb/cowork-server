@@ -487,7 +487,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 disabled: list[dict] | None = None,
                                 started_at: str | None = None,
                                 interactive: bool = False,
-                                tool_messages: bool = False):
+                                tool_messages: bool = False,
+                                reasoning_effort: str | None = None):
     """Mint, enqueue, then yield this turn's replies as (kind, data) tuples.
 
     Yields turn_delta / turn_step / turn_memory in arrival order and ends with
@@ -498,7 +499,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     `interactive` tells the pod it may ask `ask_user` questions (web UI turns;
     channel turns never).
     `tool_messages` tells the pod the client renders a tool's message to the
-    user (the cowork UI does; channel turns never)."""
+    user (the cowork UI does; channel turns never).
+    `reasoning_effort` is the composer's pick for this turn; None leaves the
+    pod's configured default."""
     settings = TurnQueueSettings()
     scope = TenantScope(org_mode=get_app_settings().tenancy_mode == "org" or bool(org_id), org_id=org_id, user_id=user_id)
     await require_product_permission(scope, "product.execute")
@@ -607,6 +610,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # turn and would otherwise stamp today's date into the system
               # prompt, changing the cached prefix at midnight.
               **({"started_at": started_at} if started_at else {}),
+              # Opaque; the pod applies it to the planning model only.
+              **({"reasoning_effort": reasoning_effort} if reasoning_effort else {}),
               # Trace attribution for the pod (ENG-1459). The remote turn runs in
               # a scratchpad pod that has no cowork-server installed, so nothing
               # there can derive the surface, this server's version, or its
