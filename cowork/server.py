@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import ValidationError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.datastructures import MutableHeaders
 
@@ -28,7 +29,7 @@ from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.streaming import TurnInProgress
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import cowork_home
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
 from cowork.dev_setup import run_dev_setup
 from cowork.scheduler import start_scheduler
 
@@ -143,8 +144,24 @@ def _warm_agent_runtime() -> None:
             logger.debug("agent runtime warm-up skipped %s", name, exc_info=True)
 
 
+def _validate_turn_queue_settings() -> None:
+    """Build ``TurnQueueSettings`` once so an invalid env value stops the boot.
+
+    Handlers build these settings per request, so without this a bad value
+    boots healthy and then fails every remote turn. Raises ``RuntimeError``
+    naming the invalid fields only.
+    """
+    try:
+        TurnQueueSettings()
+    except ValidationError as exc:
+        fields = ", ".join(".".join(str(part) for part in err["loc"]) for err in exc.errors())
+        # The pydantic error echoes input values, and some of these fields hold secrets.
+        raise RuntimeError(f"invalid turn-queue settings: {fields}") from None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _validate_turn_queue_settings()
     run_dev_setup()
     # Before the server reports ready, so the first turn does not pay for imports.
     await asyncio.to_thread(_warm_agent_runtime)
