@@ -629,7 +629,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # turn and would otherwise stamp today's date into the system
               # prompt, changing the cached prefix at midnight.
               **({"started_at": started_at} if started_at else {}),
-              # Opaque; the pod applies it to the planning model only.
+              # Already dropped above when the model does not offer it; the pod
+              # applies the rest to the planning model only.
               **({"reasoning_effort": reasoning_effort} if reasoning_effort else {}),
               # Trace attribution for the pod (ENG-1459). The remote turn runs in
               # a scratchpad pod that has no cowork-server installed, so nothing
