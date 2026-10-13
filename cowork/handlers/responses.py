@@ -104,6 +104,12 @@ from cowork.db.scoped import (
     unsafe_unscoped_session,
 )
 from cowork.principal import Principal, identity_trace_metadata
+from cowork.schemas.connectors import DisabledConnection
+from cowork.services.comparisons import (
+    COMPARISON_HARNESS,
+    ComparisonService,
+    blocked_connections,
+)
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
@@ -111,7 +117,7 @@ from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
 )
 from cowork.services.memory import apply_turn_memory, build_turn_memory
-from cowork.services.projects import ProjectService
+from cowork.services.projects import ProjectService, is_comparison_sandbox
 from cowork.services.settings import SettingService
 from cowork.services.skills import SkillService
 from cowork.services.task_objects import ArtifactChanges, remote_skill_draft_result
@@ -369,6 +375,15 @@ class _TurnStart:
     # _MAX_HISTORY_MESSAGES. Empty when the turn's shape skips the gate, and
     # None when the read failed, which sends the turn to the agent.
     gate_rows: list[Message] | None
+    # Set when the conversation is a contained model-comparison side: what it
+    # was set up with, read here because the side row stays in the unit.
+    comparison_pin: "_ComparisonPin | None" = None
+
+
+@dataclass(frozen=True)
+class _ComparisonPin:
+    model: str
+    reasoning_effort: str | None
 
 
 @dataclass(frozen=True)
@@ -586,6 +601,34 @@ class ResponsesHandler:
         self.harness_name = start.harness_name
         self.last_conversation_id = str(start.conversation_id)
 
+        # A model-comparison side runs on what it was set up with, whatever
+        # the client sent: a stale composer pick or a second tab must not
+        # change what is being compared. Its messaging connectors are off, so
+        # two agents doing the same task don't each send the message.
+        if start.comparison_pin is not None:
+            self.harness_name = COMPARISON_HARNESS
+            try:
+                blocked = await blocked_connections(self.scope)
+            except Exception:
+                # Fail closed: running without the list could reach a
+                # messaging app the side must not use.
+                logger.exception(
+                    "[responses] could not list connections for comparison side %s", start.conversation_id
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Couldn't check this comparison's connections. Try again in a moment.",
+                )
+            request = request.model_copy(update={
+                "model": start.comparison_pin.model,
+                "reasoning_effort": start.comparison_pin.reasoning_effort,
+                "disabled_connections": [
+                    *(request.disabled_connections or []),
+                    *(DisabledConnection(**entry) for entry in blocked),
+                ] or None,
+            })
+            disabled = [dc.model_dump() for dc in request.disabled_connections] if request.disabled_connections else None
+
         # Every settings read for this turn, in the gate and in the producer
         # task created below (create_task copies this context), is served from
         # the snapshot the unit loaded.
@@ -596,6 +639,7 @@ class ResponsesHandler:
                 gate_rows=start.gate_rows,
                 has_attachments=bool(request.attachment_ids),
                 has_disabled_connections=bool(disabled),
+                is_comparison_side=start.comparison_pin is not None,
                 trace_metadata=trace_metadata,
             )
             trace_metadata = {
@@ -794,6 +838,8 @@ class ResponsesHandler:
             )
 
         conversation_id = conversation.id
+        side = ComparisonService(session).contained_side(conversation)
+        comparison_pin = _ComparisonPin(side.model, side.reasoning_effort) if side is not None else None
         # turn_id: prior message count. The current user message is NOT
         # persisted yet (deferred to the producer for the streaming path), so
         # this is a stable per-conversation index for the buffer file.
@@ -807,6 +853,7 @@ class ResponsesHandler:
             has_non_text_input=has_non_text_input,
             has_attachments=bool(request.attachment_ids),
             has_disabled_connections=has_disabled_connections,
+            is_comparison_side=comparison_pin is not None,
         ) is None:
             gate_rows = self._read_gate_rows(session, conversation_id=conversation_id)
 
@@ -817,6 +864,7 @@ class ResponsesHandler:
             conversation_id=conversation_id,
             turn_id=turn_id,
             gate_rows=gate_rows,
+            comparison_pin=comparison_pin,
         )
 
     @staticmethod
@@ -846,6 +894,7 @@ class ResponsesHandler:
         gate_rows: list[Message] | None,
         has_attachments: bool,
         has_disabled_connections: bool,
+        is_comparison_side: bool = False,
         trace_metadata: dict[str, str] | None = None,
     ) -> tuple[RouteDecision, dict | None]:
         """Run Cowork's narrow pre-Anton gate with only safe text context.
@@ -865,6 +914,7 @@ class ResponsesHandler:
             has_non_text_input=has_non_text_input,
             has_attachments=has_attachments,
             has_disabled_connections=has_disabled_connections,
+            is_comparison_side=is_comparison_side,
         )
         if reason:
             return RouteDecision(route=DELEGATED_AGENTIC, reason=reason), None
@@ -1438,6 +1488,14 @@ class ResponsesHandler:
                 if project is None:
                     raise ValueError("Project not found")
                 session.refresh(project)
+                if is_comparison_sandbox(getattr(project, "name", None)):
+                    # A comparison side reads memory but never writes it,
+                    # same as the in-process harness's Cortex in "off" mode.
+                    logger.info(
+                        "[responses] dropped %d memory entr(ies) from comparison side %s",
+                        len(entries), conv_id,
+                    )
+                    return
                 applied = apply_turn_memory(
                     session.scope,
                     project.path,
