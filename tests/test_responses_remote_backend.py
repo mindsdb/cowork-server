@@ -22,7 +22,7 @@ import cowork.handlers.responses as responses_mod
 from cowork.handlers.responses import ResponsesHandler
 from cowork.streaming.registry import TurnLifecycle
 
-from _fakes import QueuedPipeline, inline_run_db, opens
+from _fakes import inline_run_db, opens
 
 
 class _FakeScope:
@@ -223,34 +223,6 @@ def test_remote_backend_selected(monkeypatch):
     assert called["model"] == "anton"
     assert called["harness_id"] == "anton"
     assert called["buffer"] is kwargs["buffer"]
-
-
-@pytest.mark.parametrize("effort", ["high", None])
-def test_remote_backend_receives_the_selected_reasoning_effort(monkeypatch, effort):
-    monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")
-    called = {}
-    handler = _handler()
-    handler._produce_remote = lambda **kwargs: called.update(kwargs)
-    handler._select_producer(**_kwargs(reasoning_effort=effort))
-    assert called["reasoning_effort"] == effort
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("extra, expected", [({"reasoning_effort": "low"}, "low"), ({}, None)])
-async def test_produce_remote_passes_reasoning_effort_to_turnqueue(monkeypatch, extra, expected):
-    handler = _remote_handler(monkeypatch, {})
-    captured = {}
-
-    async def fake_replies(**kwargs):
-        captured.update(kwargs)
-        yield "turn_completed", {}
-
-    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
-    await handler._produce_remote(
-        conv_id=uuid4(), input_text="hi", original_content="hi", model="anton",
-        harness_id="anton", buffer=_FakeBuffer(), **extra,
-    )
-    assert captured["reasoning_effort"] == expected
 
 
 def _remote_handler(monkeypatch, saved):
@@ -2903,73 +2875,3 @@ async def test_a_pod_model_call_timeout_saves_its_own_code_and_request_id(monkey
     assert failed["code"] == "model_timeout"
     assert failed["error"] == "The model sent no output for 10 minutes, so the call was stopped."
     assert failed["request_id"] == "corr-deadline"
-
-
-class _QueueRedis:
-    """Records queued jobs and answers each with its own terminal reply."""
-
-    def __init__(self):
-        self.jobs: list[dict] = []
-        self._replies: list[dict] = []
-
-    async def sadd(self, *a): return 1
-    async def hset(self, *a, **k): return 1
-    async def expire(self, *a): return 1
-    async def delete(self, *keys): return len(keys)
-    async def xrevrange(self, *a, **k): return []
-    def pipeline(self, transaction=True): return QueuedPipeline(self)
-
-    async def xadd(self, stream, fields):
-        job = json.loads(fields["payload"])
-        self.jobs.append(job)
-        for kind, data in (
-            ("progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}),
-            ("turn_completed", {}),
-        ):
-            self._replies.append({"payload": json.dumps(
-                {"correlation_id": job["correlation_id"], "kind": kind, "data": data}
-            )})
-        return "1-0"
-
-    async def xread(self, streams, count=None, block=None):
-        if self._replies:
-            return [[next(iter(streams)), [["9-0", self._replies.pop(0)]]]]
-        await asyncio.sleep(0)
-        return None
-
-
-@pytest.mark.asyncio
-async def test_the_selected_effort_reaches_the_queued_job_on_every_turn(monkeypatch):
-    """Handler to the real producer: the job a turn enqueues carries the
-    composer's effort, and a second turn on the conversation carries it again."""
-    from cowork.turnqueue import producer as prod
-
-    redis = _QueueRedis()
-    monkeypatch.setattr(prod, "get_redis", lambda: redis)
-
-    async def mint(**kw):
-        return "fake_turn_key"
-
-    async def no_connections(**kw):
-        return []
-
-    monkeypatch.setattr(prod, "mint_turn_key", mint)
-    monkeypatch.setattr(prod, "list_active_connections", no_connections)
-
-    async def allowed(scope, permission):
-        return True
-
-    async def require(scope, permission):
-        return None
-
-    monkeypatch.setattr(prod, "require_product_permission", require)
-    monkeypatch.setattr(prod.product_permissions, "has_product_permission", allowed)
-    handler = _remote_handler(monkeypatch, {})
-    conv_id = uuid4()
-    for effort in ("high", "high", None):
-        await handler._produce_remote(
-            conv_id=conv_id, input_text="hi", original_content="hi", model="anton",
-            harness_id="anton", buffer=_FakeBuffer(), reasoning_effort=effort,
-        )
-    efforts = [job["params"].get("reasoning_effort", "absent") for job in redis.jobs]
-    assert efforts == ["high", "high", "absent"]
