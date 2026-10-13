@@ -149,6 +149,17 @@ class TestSeedHistory:
         assert "SuperSecret123!" not in initial_history[0]["content"]
         assert "[DS_POSTGRES_ABC12__PASSWORD]" in initial_history[0]["content"]
 
+    def test_summary_is_scrubbed_of_printed_tokens(self):
+        """A summary saved before output scrubbing can hold a token a cell printed; it replays redacted."""
+        token = "opq" + "Z9" * 15
+        messages = _fake_messages(4)
+
+        initial_history, _ = AntonHarness._seed_history(
+            messages, f"Fetched access_token={token} from the API.", messages[1].id, _stamp,
+        )
+
+        assert initial_history[0]["content"] == "Fetched access_token=[REDACTED_TOKEN] from the API."
+
 
 class TestStampMessage:
     """A leaked timestamp bug: an earlier version of `_stamp_message`
