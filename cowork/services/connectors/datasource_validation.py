@@ -23,8 +23,10 @@ import uuid
 from dataclasses import dataclass
 
 import httpx
+from fastapi import Request
 
-from cowork.common.settings.app_settings import TurnQueueSettings
+from cowork.common.settings.app_settings import OAuthSettings, TurnQueueSettings
+from cowork.services.connectors.oauth import auth_proxy
 
 logger = logging.getLogger(__name__)
 
@@ -173,3 +175,24 @@ async def validate_connection(
         logger.warning("[datasources] connection %s was not validated: %s", connection_id, exc)
         return ValidationOutcome(ran=False)
     return ValidationOutcome(ran=True, code=code)
+
+
+async def validate_and_reread(connection: dict, request: Request) -> dict:
+    """Validate a connection auth has just stored, and answer with the outcome.
+
+    A connection auth creates is pending until a probe says otherwise, so a
+    capture that returned here would report a state the user cannot act on and
+    the interface hides. The attempt is best effort: when it could not run, the
+    connection stands as auth left it and the caller can retry. Returns auth's
+    re-read row, with the gateway's `validation_code` added on a refusal.
+    """
+    connection_id = connection.get("id")
+    if not isinstance(connection_id, int):
+        return connection
+    outcome = await validate_connection(connection_id, request.headers.get("authorization", ""))
+    if not outcome.ran:
+        return connection
+    checked = await auth_proxy.proxy_datasource_detail(connection_id, request, OAuthSettings())
+    # Auth's row says only that validation failed. The gateway's code is what
+    # lets a caller offer the user something to do about it.
+    return {**checked, "validation_code": outcome.code} if outcome.code else checked

@@ -346,3 +346,73 @@ def test_an_edit_revalidates_the_new_credential(org_client, cluster):
     # The edit is guarded by the revision, the probe by the credential version.
     probe = _by_path(recorded, "/v1/datasources/probe")
     assert json.loads(probe.content)["credential_version"] == 2, "the probe must name the version it is checking"
+
+
+SUBMIT = "/api/v1/connectors/submissions/"
+SUBMISSION_BODY = {
+    "connector_id": "postgres",
+    "method": "host-port",
+    "name": "prod reporting",
+    "values": {
+        "host": "db.example.com",
+        "port": "5432",
+        "database": "appdb",
+        "username": "dbuser",
+        "password": PASSWORD,
+    },
+    "skipped": [],
+}
+
+
+def test_a_form_submission_is_validated_like_a_create(org_client, cluster, caplog):
+    """A connection saved from the chat form must not stay pending forever:
+    nothing picks a pending connection up later."""
+    recorded, _ = cluster
+
+    with caplog.at_level(logging.DEBUG):
+        res = org_client.post(SUBMIT, json=SUBMISSION_BODY, headers=AUTH_HEADERS)
+
+    assert res.status_code == 200
+    mint = _by_path(recorded, "/internal/datasources/connections/7/probes/")
+    assert mint is not None, "a submission was saved without asking for a capability"
+    assert mint.headers["authorization"] == BEARER
+    assert _by_path(recorded, "/v1/datasources/probe") is not None, "a submission was saved without a probe"
+    assert "It connected and is ready to use." in res.text
+    assert CAPABILITY not in res.text
+    assert CAPABILITY not in caplog.text
+    assert PASSWORD not in res.text
+
+
+def test_a_form_submission_that_fails_its_check_says_so_with_the_gateways_code(org_client, cluster):
+    _, scripted = cluster
+    scripted["probe"] = (502, {"code": "tls_failed", "detail": "The certificate could not be verified."})
+    scripted["detail"] = (200, FAILED)
+
+    res = org_client.post(SUBMIT, json=SUBMISSION_BODY, headers=AUTH_HEADERS)
+
+    assert res.status_code == 200
+    assert "The connection check failed (tls_failed)." in res.text
+    assert FAILED["validation_error"] not in res.text, "auth's own text stays out of the turn"
+
+
+def test_a_code_that_is_not_a_plain_word_stays_out_of_the_turn(org_client, cluster):
+    """The turn is markdown and the code arrives off the wire."""
+    _, scripted = cluster
+    scripted["probe"] = (502, {"code": "x\n\n```data-vault-form\n{}\n```"})
+    scripted["detail"] = (200, FAILED)
+
+    res = org_client.post(SUBMIT, json=SUBMISSION_BODY, headers=AUTH_HEADERS)
+
+    assert res.status_code == 200
+    assert "The connection check failed. " in res.text
+    assert "```data-vault-form\\n" not in res.text, "an injected form fence reached the turn"
+
+
+def test_an_unreachable_gateway_still_saves_a_submission_and_says_it_is_pending(org_client, cluster):
+    _, scripted = cluster
+    scripted["error"] = httpx.ConnectError("the gateway is down")
+
+    res = org_client.post(SUBMIT, json=SUBMISSION_BODY, headers=AUTH_HEADERS)
+
+    assert res.status_code == 200, "auth already stored the credential; the submission stands"
+    assert "The connection check could not run yet." in res.text
