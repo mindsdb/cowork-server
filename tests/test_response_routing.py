@@ -4,7 +4,10 @@ import re
 from types import SimpleNamespace
 
 import pytest
+from anton.core.llm.provider import StreamReasoningDelta
 
+import cowork.handlers.response_routing as routing
+import cowork.handlers.responses as responses
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
@@ -2431,8 +2434,6 @@ async def test_only_the_latest_prompt_is_checked_for_file_names(monkeypatch):
 
 
 def _patch_gate_provider(monkeypatch, provider):
-    import cowork.handlers.response_routing as routing
-
     monkeypatch.setattr(
         routing,
         "get_user_settings",
@@ -2452,8 +2453,6 @@ async def _route_with_budget(**kwargs):
 async def test_without_a_budget_the_gate_uses_the_default_total(monkeypatch):
     """An answer slower than a short budget still ships when no budget is
     passed, and the default total still bounds it."""
-    import cowork.handlers.response_routing as routing
-
     monkeypatch.setattr(routing, "_GATE_IDLE_SECONDS", 1.0)
     monkeypatch.setattr(routing, "_GATE_TOTAL_SECONDS", 1.0)
     events = [_text(f"w{i} ") for i in range(5)] + [_complete()]
@@ -2473,10 +2472,6 @@ async def test_without_a_budget_the_gate_uses_the_default_total(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_shortened_budget_bounds_a_trickling_answer(monkeypatch):
-    import asyncio
-
-    import cowork.handlers.response_routing as routing
-
     monkeypatch.setattr(routing, "_GATE_IDLE_SECONDS", 1.0)
     trickle = _StreamProvider([_text(f"w{i} ") for i in range(16)] + [_complete()], gap=0.03)
     _patch_gate_provider(monkeypatch, trickle)
@@ -2490,9 +2485,6 @@ async def test_a_shortened_budget_bounds_a_trickling_answer(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_a_shortened_budget_bounds_reasoning_that_decides_nothing(monkeypatch):
-    import cowork.handlers.response_routing as routing
-    from anton.core.llm.provider import StreamReasoningDelta
-
     monkeypatch.setattr(routing, "_GATE_IDLE_SECONDS", 1.0)
     noise = _StreamProvider([StreamReasoningDelta(text="thinking") for _ in range(16)], gap=0.03)
     _patch_gate_provider(monkeypatch, noise)
@@ -2502,8 +2494,6 @@ async def test_a_shortened_budget_bounds_reasoning_that_decides_nothing(monkeypa
 
 @pytest.mark.asyncio
 async def test_a_late_delegation_past_the_budget_leaks_no_preamble(monkeypatch):
-    import cowork.handlers.response_routing as routing
-
     monkeypatch.setattr(routing, "_GATE_IDLE_SECONDS", 1.0)
     chunks = [_text(PREAMBLE[i:i + 20]) for i in range(0, len(PREAMBLE), 20)]
     provider = _StreamProvider(chunks + [_tool()], gap=0.03)
@@ -2549,8 +2539,6 @@ async def test_a_short_budget_keeps_the_content_guards(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_cancelling_the_gate_closes_its_stream(monkeypatch):
-    import asyncio
-
     provider = _StreamProvider([_text("x"), _complete()], first_delay=5)
     _patch_gate_provider(monkeypatch, provider)
     task = asyncio.create_task(_route_with_budget(gate_total_seconds=2.0))
@@ -2562,8 +2550,6 @@ async def test_cancelling_the_gate_closes_its_stream(monkeypatch):
 
 
 async def _route_request_with_budget(monkeypatch, *, backend, budget=None, decision=None):
-    import cowork.handlers.responses as responses
-
     monkeypatch.setenv("COWORK_TURN_BACKEND", backend)
     if budget is not None:
         monkeypatch.setenv("COWORK_TURN_GATE_TOTAL_TIMEOUT_SECONDS", budget)
@@ -2604,8 +2590,6 @@ async def test_an_in_process_turn_keeps_the_default_gate_budget(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_the_gate_log_reports_durations_and_budget_but_no_content(monkeypatch, caplog):
-    import logging
-
     answer = "The private answer text"
     decision = RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", text=answer)
     with caplog.at_level(logging.WARNING, logger="cowork.handlers.responses"):
