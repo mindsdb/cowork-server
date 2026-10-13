@@ -364,7 +364,13 @@ class ComparisonService:
         return verdict
 
     def continue_side(
-        self, comparison_id: UUID, label: str, destination_project_id: UUID, *, model_label: str | None = None
+        self,
+        comparison_id: UUID,
+        label: str,
+        destination_project_id: UUID,
+        *,
+        model_label: str | None = None,
+        running_elsewhere: frozenset[str] = frozenset(),
     ) -> ContinuedSide:
         """Turn one side into an ordinary task in a real project.
 
@@ -378,7 +384,6 @@ class ComparisonService:
         project, carries the rest.
         """
         from cowork.services.conversations import ConversationService
-        from cowork.streaming.registry import registry
 
         comparison = self.get_comparison(comparison_id)
         side = self.side(comparison, label)
@@ -388,8 +393,7 @@ class ComparisonService:
         destination = ProjectService(self.session).get_project(destination_project_id)
         if is_comparison_sandbox(destination.name):
             raise ValueError("Continue into a project, not into a comparison")
-        handle = registry.get(str(side.conversation_id))
-        if handle is not None and handle.is_running:
+        if _side_running(side, running_elsewhere):
             raise ComparisonConflictError("Wait for this side to finish its turn, or stop it, then continue")
 
         conversations = ConversationService(self.session)
@@ -486,7 +490,7 @@ class ComparisonService:
         except Exception:
             logger.exception("Could not remove a continued side's sandbox %s", sandbox.id)
 
-    def delete_comparison(self, comparison_id: UUID) -> None:
+    def delete_comparison(self, comparison_id: UUID, *, running_elsewhere: frozenset[str] = frozenset()) -> None:
         """Remove the comparison and the sandboxes of the sides not continued.
 
         A continued side's sandbox is kept if it is still there: Continue removes
@@ -494,12 +498,9 @@ class ComparisonService:
         something could not be carried, which deleting the comparison must not
         destroy.
         """
-        from cowork.streaming.registry import registry
-
         comparison = self.get_comparison(comparison_id)
         for side in comparison.sides:
-            handle = registry.get(str(side.conversation_id))
-            if side.continued_at is None and handle is not None and handle.is_running:
+            if side.continued_at is None and _side_running(side, running_elsewhere):
                 raise ComparisonConflictError("Stop both sides before deleting the comparison")
         project_ids = [side.project_id for side in comparison.sides if side.continued_at is None]
         self.session.delete(comparison)
@@ -522,6 +523,17 @@ class ComparisonService:
 
 
 _FOLDER_UNSAFE = re.compile(r'[\x00-\x1f/\\:*?"<>|]+')
+
+
+def _side_running(side: ComparisonSide, running_elsewhere: frozenset[str]) -> bool:
+    """Whether a turn is running on the side: in this process, or, as the caller
+    found in the shared turn index, on another replica. The registry alone
+    knows only this process's runs."""
+    from cowork.streaming.registry import registry
+
+    conversation_id = str(side.conversation_id)
+    handle = registry.get(conversation_id)
+    return (handle is not None and handle.is_running) or conversation_id in running_elsewhere
 
 
 def _folder_part(text: str, limit: int) -> str:

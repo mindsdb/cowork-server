@@ -1375,6 +1375,124 @@ def test_delete_refuses_while_a_side_is_running(client):
     assert client.get(f"/api/v1/comparisons/{body['id']}").status_code == 200
 
 
+@pytest.fixture()
+def shared_redis(monkeypatch):
+    """One Redis shared by the replicas, and no local run handle: a turn in it
+    was started by the other replica, which this process's registry can't see."""
+    import fakeredis.aioredis
+
+    from cowork.streaming import buffer as buffer_mod
+    from cowork.streaming import turn_index
+    from cowork.streaming.registry import registry
+
+    redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    for mod in (turn_index, buffer_mod):
+        monkeypatch.setattr(mod, "get_redis", lambda: redis)
+    monkeypatch.setattr("cowork.api.v1.endpoints.responses.get_redis", lambda: redis)
+    monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")
+    registry.reset()
+    yield redis
+    registry.reset()
+
+
+def _running_elsewhere(conversation_id: str, *, finished: bool = False) -> None:
+    """A turn another replica runs: recorded in the shared index, its buffer open."""
+    import asyncio
+
+    from cowork.streaming import turn_index
+    from cowork.streaming.buffer import RedisStreamBuffer
+
+    async def record():
+        await turn_index.record_turn(
+            conversation_id, turn_id=1, correlation_id="corr-elsewhere", org_id=None, user_id=None,
+        )
+        buf = RedisStreamBuffer(conversation_id=conversation_id, turn_id=1)
+        await buf.append("sse", {"sse": "event: response.output_text.delta\ndata: {}\n\n"})
+        if finished:
+            await buf.close("completed")
+
+    asyncio.run(record())
+
+
+def test_continue_refuses_while_another_replica_runs_the_side(client, shared_redis):
+    body = _create(client).json()
+    a = body["sides"][0]
+    project = _real_project(client, "busy-elsewhere")
+    _running_elsewhere(a["conversationId"])
+
+    r = client.post(f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": project["id"]})
+
+    assert r.status_code == 409, r.text
+    assert _project(a["projectId"]) is not None
+    assert client.get(f"/api/v1/comparisons/{body['id']}").json()["sides"][0]["continuedAt"] is None
+
+
+def test_delete_refuses_while_another_replica_runs_a_side(client, shared_redis):
+    body = _create(client).json()
+    b = body["sides"][1]
+    _running_elsewhere(b["conversationId"])
+
+    assert client.delete(f"/api/v1/comparisons/{body['id']}").status_code == 409
+    assert client.get(f"/api/v1/comparisons/{body['id']}").status_code == 200
+    assert _project(b["projectId"]) is not None
+
+
+def test_a_turn_another_replica_finished_does_not_hold_continue_or_delete(client, shared_redis):
+    body = _create(client).json()
+    a = body["sides"][0]
+    project = _real_project(client, "finished-elsewhere")
+    _running_elsewhere(a["conversationId"], finished=True)
+
+    r = client.post(f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": project["id"]})
+    assert r.status_code == 200, r.text
+    assert client.delete(f"/api/v1/comparisons/{body['id']}").status_code == 204
+
+
+def test_retrying_a_partial_carry_refuses_while_the_task_runs_on_another_replica(client, shared_redis, monkeypatch):
+    from cowork.services import task_objects
+
+    body = _create(client).json()
+    a = body["sides"][0]
+    sandbox = Path(_project(a["projectId"]).path)
+    _make_artifact(sandbox, "report", a["conversationId"])
+    target = _real_project(client, "retry-elsewhere")
+    url = f"/api/v1/comparisons/{body['id']}/sides/a/continue"
+    real_move = task_objects.shutil.move
+
+    def refuse(src, dst):
+        raise PermissionError(13, "Permission denied", src)
+
+    monkeypatch.setattr(task_objects.shutil, "move", refuse)
+    assert client.post(url, json={"projectId": target["id"]}).json()["carriedAll"] is False
+    monkeypatch.setattr(task_objects.shutil, "move", real_move)
+    _running_elsewhere(a["conversationId"])
+
+    r = client.post(url, json={"projectId": target["id"]})
+
+    assert r.status_code == 409, r.text
+    assert (sandbox / ".anton" / "artifacts" / "report" / "index.html").is_file()
+
+
+def test_continue_and_delete_refuse_when_they_cannot_tell_whether_a_side_is_running(client, shared_redis, monkeypatch):
+    from cowork.streaming import turn_index
+
+    body = _create(client).json()
+    a = body["sides"][0]
+    project = _real_project(client, "unknown-liveness")
+
+    async def unreachable(conversation_id):
+        raise ConnectionError("redis is down")
+
+    monkeypatch.setattr(turn_index, "get_turn", unreachable)
+    monkeypatch.setattr("cowork.api.v1.endpoints.responses.get_turn", unreachable)
+
+    r = client.post(f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": project["id"]})
+    assert r.status_code == 503, r.text
+    assert client.delete(f"/api/v1/comparisons/{body['id']}").status_code == 503
+    assert _project(a["projectId"]) is not None
+    assert client.get(f"/api/v1/comparisons/{body['id']}").status_code == 200
+
+
 def _turn(client, conversation_id, **extra):
     return client.post(
         "/api/v1/responses/",
