@@ -874,6 +874,7 @@ class ResponsesHandler:
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
             ), None
+        attempt_started = time.monotonic()
         try:
             # Scrub credentials: this history bypasses the normal turn's
             # _scrub_user_input/_stamp_message pass. Its DS_* values were
@@ -975,7 +976,10 @@ class ResponsesHandler:
             raise
         except Exception:
             # Non-authorization routing failures may delegate to the agent.
-            logger.exception("[responses] routing gate failed — delegating")
+            logger.exception(
+                "[responses] routing gate failed after route_ms=%d — delegating",
+                round((time.monotonic() - attempt_started) * 1000),
+            )
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
             ), None

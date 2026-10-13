@@ -1,3 +1,6 @@
+import asyncio
+import logging
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -789,6 +792,34 @@ async def test_history_query_failure_fails_open(monkeypatch):
     assert decision.reason == "router_unavailable"
     assert decision.fallback is True
     assert turn_llm is None
+
+
+@pytest.mark.asyncio
+async def test_a_failed_gate_logs_how_long_it_held_the_turn(monkeypatch, caplog):
+    """A binding that stalls and then raises is the slowest gate case, so the
+    fallback line carries its duration too."""
+    handler = _routing_handler(monkeypatch)
+
+    async def stalled_binding():
+        await asyncio.sleep(0.05)
+        raise RuntimeError("mint failed")
+
+    handler._router_binding = stalled_binding
+    with caplog.at_level(logging.ERROR, logger="cowork.handlers.responses"):
+        decision, turn_llm = await handler._route_request(
+            conversation_id=None,
+            harness_input=[{"type": "text", "text": "Hello"}],
+            gate_rows=[],
+            has_attachments=False,
+            has_disabled_connections=False,
+        )
+
+    assert decision.reason == "router_unavailable" and decision.fallback is True
+    assert turn_llm is None
+    lines = [r.getMessage() for r in caplog.records if "routing gate failed" in r.getMessage()]
+    assert len(lines) == 1
+    match = re.search(r"route_ms=(\d+)", lines[0])
+    assert match and int(match.group(1)) >= 50
 
 
 @pytest.mark.asyncio
