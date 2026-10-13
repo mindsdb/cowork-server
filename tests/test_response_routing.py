@@ -818,7 +818,7 @@ async def test_a_failed_gate_logs_how_long_it_held_the_turn(monkeypatch, caplog)
     assert turn_llm is None
     lines = [r.getMessage() for r in caplog.records if "routing gate failed" in r.getMessage()]
     assert len(lines) == 1
-    match = re.search(r"route_ms=(\d+)", lines[0])
+    match = re.search(r"failed_after_ms=(\d+)", lines[0])
     assert match and int(match.group(1)) >= 50
 
 
