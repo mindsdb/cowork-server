@@ -131,6 +131,9 @@ dependencies = [
     # Floor for the Pillow security fixes; the document libraries above only
     # pull it in transitively with no lower bound of their own.
     "pillow>=12.3.0",
+    # Floor for the PyJWT security fixes; redis and mcp (via anton-agent) pull
+    # it in transitively with lower bounds that still allow 2.13.
+    "pyjwt>=2.14.0",
 ]
 
 [project.urls]
