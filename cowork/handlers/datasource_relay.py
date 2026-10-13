@@ -3,8 +3,9 @@
 In org mode a database form never reaches the staging store, the probe or a
 local vault. The submitted values are checked against the capability policy,
 normalized into auth's payload and relayed under the caller's own bearer;
-auth holds the credential encrypted and validates it out of band. What comes
-back is masked metadata, which is all this turn ever says out loud.
+auth holds the credential encrypted, and one validation attempt runs before
+the turn answers, as it does for a management create. What comes back is
+masked metadata and the outcome, which is all this turn ever says out loud.
 
 A refusal raises before anything streams, so a client sees an ordinary status
 code rather than a failure buried in a 200 event. The SSE framing is written
@@ -33,6 +34,7 @@ from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.units import conversation_writes, run_db
 from cowork.schemas.connectors import DatasourceCreateRequest, SubmitFormRequest
 from cowork.services.connectors.datasource_capabilities import load_datasource_capabilities
+from cowork.services.connectors.datasource_validation import validate_and_reread
 from cowork.services.connectors.datasources import (
     InvalidDatasourceInput,
     UnsupportedDatasourceCapability,
@@ -44,6 +46,8 @@ from cowork.services.connectors.submissions import missing_required_fields
 from cowork.services.conversations import ConversationService
 
 logger = logging.getLogger(__name__)
+
+_CODE = re.compile(r"[a-z0-9_]{1,64}")
 
 
 def _rendered(name: str) -> str:
@@ -114,6 +118,29 @@ def _record_turn(session: ScopedSession, *, conversation_id: UUID, text: str, ev
     service.save_assistant_turn(conversation.id, text, events)
 
 
+def _outcome(connection: dict) -> tuple[str, str]:
+    """The turn's sentence and the form's subtitle for a connection's state.
+
+    The gateway's `validation_code` is shown only in its own shape, a snake
+    case word, because the turn is markdown and the code arrives off the wire;
+    auth's `validation_error` is left out of the turn.
+    """
+    status = connection.get("status")
+    if status == "verified":
+        return "It connected and is ready to use.", "Stored encrypted and verified."
+    if status == "failed":
+        code = connection.get("validation_code")
+        reason = f" ({code})" if isinstance(code, str) and _CODE.fullmatch(code) else ""
+        return (
+            f"The connection check failed{reason}. Fix the details from the connections page.",
+            f"Stored encrypted, but the connection check failed{reason}.",
+        )
+    return (
+        "The connection check could not run yet. Retry it from the connections page.",
+        "Stored encrypted. The connection check has not run yet.",
+    )
+
+
 async def _save_turn(scope: TenantScope, conversation_id: str | None, text: str, events: list[dict]) -> None:
     """Record the turn in the conversation, if this submission came from one.
 
@@ -163,16 +190,18 @@ async def relay_cloud_submission(
 
     payload = _to_payload(req, connector_id, method, req.values)
     saved = await auth_proxy.proxy_datasource_create(request, OAuthSettings(), payload)
+    checked = await validate_and_reread(saved, request)
 
-    name = str(saved.get("name") or payload["name"])
+    name = str(checked.get("name") or payload["name"])
     shown = _rendered(name)
+    sentence, subtitle = _outcome(checked)
     response_id = "resp-" + uuid.uuid4().hex[:12]
     message_id = "msg-" + uuid.uuid4().hex[:12]
-    text = f"Saved encrypted draft **{shown}** for {connector_id}. Validation has not run yet.\n\n"
+    text = f"Saved **{shown}** for {connector_id}. {sentence}\n\n"
     patch = {
         "form_id": spec.form.form_id,
         "title": f"Saved — {shown}",
-        "subtitle": "Stored encrypted. Validation runs separately; the connection shows its result when it finishes.",
+        "subtitle": subtitle,
         "status_text": None,
         "_is_probing": False,
         "_is_success": True,
