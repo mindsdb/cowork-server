@@ -137,3 +137,41 @@ def test_count_missed_occurrences_weekdays_does_not_count_weekend():
 
     assert missed == 2  # Friday and Monday; the weekend has no occurrence to miss
     assert nxt == datetime(2026, 1, 20, 9, 0, tzinfo=timezone.utc)  # Tuesday
+
+
+def test_daily_advance_keeps_wall_clock_after_spring_forward_gap():
+    # 02:30 does not exist in New York on 2026-03-08 (02:00 jumps to 03:00).
+    # Landing on 03:30 that day made every later run 03:30 as well.
+    tz = ZoneInfo("America/New_York")
+    before = datetime(2026, 3, 7, 7, 30, tzinfo=timezone.utc)  # 02:30 EST
+    nxt = advance_occurrence(Cadence.daily, before, "America/New_York")
+    after = advance_occurrence(Cadence.daily, nxt, "America/New_York")
+
+    for occurrence in (nxt, after):
+        local = occurrence.astimezone(tz)
+        assert (local.hour, local.minute) == (2, 30)
+    assert nxt.astimezone(tz).date().isoformat() == "2026-03-09"
+    assert after.astimezone(tz).date().isoformat() == "2026-03-10"
+
+
+def test_weekly_advance_keeps_wall_clock_after_spring_forward_gap():
+    tz = ZoneInfo("Europe/Berlin")
+    before = datetime(2026, 3, 22, 1, 30, tzinfo=timezone.utc)  # Sunday 02:30 CET
+    nxt = advance_occurrence(Cadence.weekly, before, "Europe/Berlin")
+
+    local = nxt.astimezone(tz)
+    assert (local.hour, local.minute) == (2, 30)
+    assert local.date().isoformat() == "2026-04-05"  # 03-29 has no 02:30
+
+
+def test_daily_advance_keeps_fall_back_ambiguous_time():
+    # 01:30 happens twice on 2026-11-01 in New York; the run still lands there.
+    tz = ZoneInfo("America/New_York")
+    before = datetime(2026, 10, 31, 5, 30, tzinfo=timezone.utc)  # 01:30 EDT
+    nxt = advance_occurrence(Cadence.daily, before, "America/New_York")
+    after = advance_occurrence(Cadence.daily, nxt, "America/New_York")
+
+    assert nxt.astimezone(tz).date().isoformat() == "2026-11-01"
+    for occurrence in (nxt, after):
+        local = occurrence.astimezone(tz)
+        assert (local.hour, local.minute) == (1, 30)

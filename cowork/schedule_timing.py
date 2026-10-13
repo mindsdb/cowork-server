@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from tzlocal import get_localzone
@@ -47,19 +47,36 @@ def advance_occurrence(cadence: str, at: datetime, timezone_name: str) -> dateti
 
     tz = resolve_timezone(timezone_name)
     local = current.astimezone(tz)
+    next_date = _next_date(cadence, local.date())
+    next_local = datetime.combine(next_date, local.time(), tzinfo=tz)
+    # A wall-clock time inside a spring-forward gap (02:30 on the night the
+    # clocks jump from 02:00 to 03:00) does not exist that day. Converting it
+    # anyway lands on 03:30, and because the next occurrence is derived from
+    # this one's wall clock, the schedule would stay at 03:30 for good. Skip
+    # to the next day the time exists, so the schedule keeps its hour.
+    while not _wall_clock_exists(next_local):
+        next_date = _next_date(cadence, next_date)
+        next_local = datetime.combine(next_date, local.time(), tzinfo=tz)
+    return next_local.astimezone(timezone.utc)
+
+
+def _next_date(cadence: str, after: date) -> date:
     if cadence == Cadence.daily:
-        next_date = local.date() + timedelta(days=1)
-    elif cadence == Cadence.weekdays:
-        next_date = local.date() + timedelta(days=1)
+        return after + timedelta(days=1)
+    if cadence == Cadence.weekdays:
+        next_date = after + timedelta(days=1)
         while next_date.weekday() >= 5:  # Saturday=5, Sunday=6
             next_date += timedelta(days=1)
-    elif cadence == Cadence.weekly:
-        next_date = local.date() + timedelta(weeks=1)
-    else:
-        raise ValueError(f"Unsupported cadence for recurrence: {cadence}")
+        return next_date
+    if cadence == Cadence.weekly:
+        return after + timedelta(weeks=1)
+    raise ValueError(f"Unsupported cadence for recurrence: {cadence}")
 
-    next_local = datetime.combine(next_date, local.time(), tzinfo=tz)
-    return next_local.astimezone(timezone.utc)
+
+def _wall_clock_exists(local: datetime) -> bool:
+    """Whether ``local``'s wall-clock time really occurs in its zone."""
+    round_trip = local.astimezone(timezone.utc).astimezone(local.tzinfo)
+    return round_trip.replace(tzinfo=None) == local.replace(tzinfo=None)
 
 
 def next_future_occurrence(
