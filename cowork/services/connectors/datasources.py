@@ -91,10 +91,11 @@ def require_cloud_method_enabled(connector_id: str | None, method: str | None) -
 def _canonical_host(value: Any) -> str:
     """Normalize a hostname, rejecting multi-host lists, sockets and IPv6 literals.
 
-    An address literal is refused when it points somewhere only the pod can
-    reach: the stored host is dialed from a cluster pod later, where
-    169.254.169.254 is the cloud metadata service. RFC1918 stays allowed
-    because a VPC-peered private address is a legitimate customer database.
+    An address literal is refused unless it is public, by the same rule the
+    datasource gateway dials by: global, and not private, loopback,
+    link-local, multicast, reserved or unspecified. The gateway refuses every
+    other address and no setting widens it, so a private host saved here
+    could never validate; 169.254.169.254 is also the metadata service.
 
     Parsing goes through inet_aton, which is what the resolver itself accepts,
     so the numeric spellings that reach the same address (2852039166 and
@@ -102,28 +103,29 @@ def _canonical_host(value: Any) -> str:
     DNS names, and the literal is stored in its canonical form.
 
     This is an early filter, not the wall. A DNS name that resolves to a
-    link-local address passes here, and no literal check can catch that or
-    DNS rebinding; only resolving at connect time can, and that code lives
-    with whatever dials the connection.
+    private or link-local address passes here, and no literal check can
+    catch that or DNS rebinding; only resolving at connect time can, and
+    that code lives with whatever dials the connection.
     """
     host = str(value or "").strip().rstrip(".").lower()
     if not host or len(host) > 253 or not _HOST_RE.fullmatch(host) or "/" in host or ":" in host:
         raise InvalidDatasourceInput("host must be a single hostname or IP address")
     if host == "localhost" or host.endswith(".localhost"):
-        raise InvalidDatasourceInput("host must be a reachable database server, not a local address")
+        raise InvalidDatasourceInput("host must be a public database server, not a private or local address")
     try:
         packed = socket.inet_aton(host)
     except OSError:
         return host
     address = ipaddress.ip_address(packed)
-    if (
-        address.is_loopback
+    if not address.is_global or (
+        address.is_private
+        or address.is_loopback
         or address.is_link_local
         or address.is_unspecified
         or address.is_reserved
         or address.is_multicast
     ):
-        raise InvalidDatasourceInput("host must be a reachable database server, not a local address")
+        raise InvalidDatasourceInput("host must be a public database server, not a private or local address")
     return str(address)
 
 
