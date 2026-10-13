@@ -40,15 +40,17 @@ async def _running_elsewhere(conversation_ids: list[str], scope: TenantScope) ->
 
     The service's own check sees only this process's runs. With two replicas,
     the one answering may not be the one running the turn, so a side with no
-    local handle is looked up in the shared turn index, as /responses/in-flight
-    does. Not knowing is a refusal: moving or deleting a live side's workspace
-    is not undone by a retry.
+    running local handle is looked up in the shared turn index. A finished
+    handle stays registered after its turn, so it says nothing about a newer
+    turn the other replica may have started. Not knowing is a refusal: moving
+    or deleting a live side's workspace is not undone by a retry.
     """
     from cowork.streaming.registry import registry
 
     running = set()
     for conversation_id in conversation_ids:
-        if registry.get(conversation_id) is not None:
+        handle = registry.get(conversation_id)
+        if handle is not None and handle.is_running:
             continue
         try:
             found = await _shared_turn(conversation_id, scope)
