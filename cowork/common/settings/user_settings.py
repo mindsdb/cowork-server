@@ -692,6 +692,11 @@ class UserSettings(Settings):
         title="Nav Logo",
         description="Sidebar logo image as a data URI. Empty shows no logo.",
     )
+    favicon: str = Field(
+        default="",
+        title="Browser Tab Icon",
+        description="Browser tab icon as a data URI. Empty uses the page's original icon.",
+    )
     show_theme_toggle: bool = Field(
         default=True,
         title="Show Theme Toggle",
