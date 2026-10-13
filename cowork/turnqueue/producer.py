@@ -22,7 +22,8 @@ from cowork.handlers.turn_errors import (
     remote_error_label,
     remote_turn_error,
 )
-from cowork.services.providers import minds_chat_base_url
+from cowork.coding.reasoning import advertised_levels
+from cowork.services.providers import cached_minds_models, minds_chat_base_url
 from cowork.db.scoped import TenantScope
 from cowork.services import product_permissions
 from cowork.services.product_permissions import require_product_permission
@@ -473,6 +474,24 @@ def step_stream_events(data: dict) -> list:
     return []
 
 
+def _offered_effort(model: str, effort: str | None, *, org_id: str | None,
+                    user_id: str | None) -> str | None:
+    """``effort`` when ``model`` advertises it, else None so the pod keeps its default.
+
+    Reads the org's cached model listing, the one the composer offered levels
+    from. Without a listing the effort is kept and the gateway stays the judge,
+    as in ``cowork.coding.reasoning``.
+    """
+    if not effort or not org_id or not user_id:
+        return effort or None
+    url = TurnQueueSettings().minds_base_url or f"{default_turn_minds_api_host()}/v1"
+    offered = advertised_levels(model, cached_minds_models(url, tenant_key=org_id, user_id=user_id))
+    if offered is None or effort in offered:
+        return effort
+    logger.warning("dropping the selected reasoning effort: model %s does not offer it", model)
+    return None
+
+
 async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 user_id: str | None, input_text: str,
                                 model: str | None,
@@ -522,6 +541,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         from cowork.common.settings.user_settings import get_user_settings
         scope = TenantScope(org_mode=get_app_settings().tenancy_mode == "org" or bool(org_id), org_id=org_id, user_id=user_id)
         model = get_user_settings(scope).resolved_planning_model
+    reasoning_effort = _offered_effort(model, reasoning_effort, org_id=org_id, user_id=user_id)
 
     # Independent network round trips (llm's turn-key mint, oauth's active-
     # connections list) — run concurrently rather than paying both latencies

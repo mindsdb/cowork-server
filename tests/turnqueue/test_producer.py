@@ -1,11 +1,13 @@
 import asyncio
 import json
+from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
 from cowork.handlers import turn_errors as te
+from cowork.services import providers as pv
 from cowork.turnqueue import producer as prod
 
 from _fakes import QueuedPipeline
@@ -422,6 +424,65 @@ async def test_stream_remote_replies_forwards_reasoning_effort_only_when_selecte
     without = json.loads(fake.added[1][1]["payload"])["params"]
     assert with_it["reasoning_effort"] == "some-future-level"
     assert "reasoning_effort" not in without
+
+
+def _seed_org_catalog(monkeypatch, rows):
+    """Fill the real org catalog cache for o1/u1 from a faked gateway answer."""
+
+    class _Response:
+        status_code = 200
+
+        def json(self):
+            return {"data": rows}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, headers=None, **kw):
+            return _Response()
+
+    monkeypatch.setattr(pv.httpx, "AsyncClient", lambda *a, **k: _Client())
+    monkeypatch.setattr(pv, "_minds_models_cache", OrderedDict())
+    return pv.fetch_org_model_catalog(org_id="o1", user_id="u1", bearer_token="jwt")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("model", "selected", "queued"), [
+    ("gemini", "max", "absent"),
+    ("gemini", "high", "high"),
+    ("no-levels", "low", "absent"),
+    ("unlisted", "max", "max"),
+])
+async def test_an_effort_the_model_does_not_offer_is_left_out_of_the_job(
+    monkeypatch, model, selected, queued,
+):
+    """The pod would send it on and the provider would refuse the turn, so the
+    job runs at the default. A model missing from the listing leaves the
+    gateway to judge."""
+    await _seed_org_catalog(monkeypatch, [
+        {"id": "gemini", "reasoning_efforts": ["low", "medium", "high"]},
+        {"id": "no-levels"},
+    ])
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    async def fake_list_active_connections(**kw):
+        return []
+
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model=model,
+        reasoning_effort=selected,
+    ))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params.get("reasoning_effort", "absent") == queued
 
 
 class _PerStreamRedis(FakeRedis):
