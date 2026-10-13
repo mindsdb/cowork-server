@@ -874,7 +874,8 @@ class ResponsesHandler:
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
             ), None
-        attempt_started = time.monotonic()
+        # route_ms on both log lines starts here, before the history scrub.
+        route_started = time.monotonic()
         try:
             # Scrub credentials: this history bypasses the normal turn's
             # _scrub_user_input/_stamp_message pass. Its DS_* values were
@@ -908,9 +909,9 @@ class ResponsesHandler:
                     # decision <-> Jev answer an exact join. Never
                     # turn_id: the gateway renames harness+turn_id traces to
                     # "{harness}:turn-N", which would count these as user turns.
-                    route_started = time.monotonic()
+                    binding_started = time.monotonic()
                     binding, turn_llm = await self._router_binding()
-                    binding_ms = round((time.monotonic() - route_started) * 1000)
+                    binding_ms = round((time.monotonic() - binding_started) * 1000)
                     correlation_id = (turn_llm or {}).get("correlation_id")
                     trace_token = set_trace_context(TraceContext(
                         session_id=str(conversation_id),
@@ -976,10 +977,9 @@ class ResponsesHandler:
             raise
         except Exception:
             # Non-authorization routing failures may delegate to the agent.
-            # From the history scrub on, so it also counts time before the binding.
             logger.exception(
-                "[responses] routing gate failed after failed_after_ms=%d — delegating",
-                round((time.monotonic() - attempt_started) * 1000),
+                "[responses] routing gate failed after route_ms=%d — delegating",
+                round((time.monotonic() - route_started) * 1000),
             )
             return RouteDecision(
                 route=DELEGATED_AGENTIC, reason="router_unavailable", fallback=True
