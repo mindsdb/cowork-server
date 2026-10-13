@@ -538,6 +538,27 @@ class TurnQueueSettings(Settings):
             "never blocks another conversation."
         ),
     )
+    pod_prewarm_enabled: bool = Field(
+        default=False,
+        description=(
+            "When backend is 'remote', ask scratchpad-controller for the conversation's pod "
+            "while the router decides, so pod start overlaps the router call. The controller "
+            "must also run with SCRATCHPAD_CONTROLLER__PREWARM_ENABLED."
+        ),
+    )  # COWORK_TURN_POD_PREWARM_ENABLED
+    prewarm_stream: str = Field(
+        default="scratchpad:prewarm",
+        description="Stream for prewarm requests; must match the controller's.",
+    )
+    prewarm_max_in_flight: int = Field(
+        default=8,
+        ge=1,
+        description=(
+            "Prewarms one server process runs at once. Each takes a permission check and a "
+            "database unit, so past this a request skips its prewarm rather than compete "
+            "with real turns for connections."
+        ),
+    )  # COWORK_TURN_PREWARM_MAX_IN_FLIGHT
     reply_idle_timeout_seconds: float = Field(
         default=600.0,
         description=(
