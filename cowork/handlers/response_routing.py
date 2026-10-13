@@ -292,6 +292,7 @@ _drain_tasks: set[asyncio.Task] = set()
 
 async def _drain(events, *, deadline: float, model: str) -> None:
     """Read a delegated gate stream to its end, so the provider sees the call's usage."""
+    # Imported here, as `_gate` imports anton: this module defers loading anton until a gate runs.
     from anton.core.llm.tracing import get_trace_context
 
     try:
