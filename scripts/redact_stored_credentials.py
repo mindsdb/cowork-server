@@ -10,21 +10,35 @@ runs anton's `scrub_output` over what Cowork has already saved:
 - `conversations.history_summary`;
 - file-backed turn buffers under the streams directory.
 
-Code the model wrote (`code` keys and tool_use `input`) and user-typed
-messages are left as they are. A dry run is the default and prints counts
-only, never a value; `--apply` writes the changes.
+Left as written: a cell's `code`, a tool_use block's `input`, the code in a
+tool call event, and messages the user typed. A tool call event cut off at
+its size cap is no longer valid JSON and is scrubbed as plain text, code
+included. Turn buffers kept in Redis are not covered.
 
-Usage (run from cowork-server/, same DATABASE_URI the server itself uses):
+It covers every org in the database: it is an operator tool for one
+deployment's own data. A dry run is the default and prints counts only,
+never a value; `--apply` writes the changes. Stop the server before
+`--apply`: it rewrites turn files the server may be appending to.
+
+Usage, from a cowork-server checkout with the same DATABASE_URI and
+COWORK_HOME the server uses:
 
     uv run python -m scripts.redact_stored_credentials
     uv run python -m scripts.redact_stored_credentials --apply
+
+On an installed deployment, where `scripts/` is not part of the package,
+run this file with the server's Python and environment:
+
+    python redact_stored_credentials.py [--apply]
 """
 from __future__ import annotations
 
 import argparse
 import importlib
 import json
+import os
 import pkgutil
+import tempfile
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,7 +63,7 @@ from cowork.models.message_event import MessageEvent
 from cowork.schemas.responses import Role
 from cowork.streaming.backend import get_streams_dir
 
-_MODEL_WRITTEN_KEYS = frozenset({"code", "input"})
+BATCH_SIZE = 500
 
 
 @dataclass
@@ -60,7 +74,7 @@ class RedactionReport:
     messages: int = 0
     history_summaries: int = 0
     turn_files: int = 0
-    unreadable_turn_files: list[str] = field(default_factory=list)
+    skipped_turn_files: list[str] = field(default_factory=list)
 
 
 def _scrub_string(text: str) -> str:
@@ -91,21 +105,30 @@ def _is_token_value(key: str, value: str) -> bool:
     return scrub_output(json.dumps({key: value})) == json.dumps({key: "[REDACTED_TOKEN]"})
 
 
+def _model_written_key(value: dict) -> str | None:
+    """The key holding code the model wrote, for a cell, a tool call or a tool_use block."""
+    if value.get("type") == "tool_use":
+        return "input"
+    if "code" in value and ("stdout" in value or "action" in value):
+        return "code"
+    return None
+
+
 def scrub_value(value: Any) -> Any:
     """Return ``value`` with every string scrubbed, except code the model wrote.
 
-    Walks dicts and lists; keys in `_MODEL_WRITTEN_KEYS` are left as written.
-    A decoded value has lost the key text that marks it as a token, so each
-    string field is also judged together with its key.
+    Walks dicts and lists. A decoded value has lost the key text that marks
+    it as a token, so each string field is also judged together with its key.
     """
     if isinstance(value, str):
         return _scrub_string(value)
     if isinstance(value, list):
         return [scrub_value(item) for item in value]
     if isinstance(value, dict):
+        keep = _model_written_key(value)
         scrubbed = {}
         for key, item in value.items():
-            if key in _MODEL_WRITTEN_KEYS:
+            if key == keep:
                 scrubbed[key] = item
             elif isinstance(item, str) and _is_token_value(key, item):
                 scrubbed[key] = "[REDACTED_TOKEN]"
@@ -130,6 +153,47 @@ def scrub_message_content(role: str, content: Any) -> Any:
             for block in content
         ]
     return content
+
+
+def _batches(session: Session, model: type, *where: Any) -> Iterator[list[Any]]:
+    """Yield ``model`` rows in id order, ``BATCH_SIZE`` at a time, without holding them all."""
+    last_id = None
+    while True:
+        query = select(model).where(*where).order_by(model.id).limit(BATCH_SIZE)
+        if last_id is not None:
+            query = query.where(model.id > last_id)
+        rows = list(session.exec(query))
+        if not rows:
+            return
+        # Read before yielding: the caller commits and expunges the batch.
+        last_id = rows[-1].id
+        yield rows
+
+
+def _scrub_rows(session: Session, model: type, column: str, scrub: Any, *where: Any, apply: bool) -> int:
+    """Scrub one JSON or text column of ``model`` batch by batch; return how many rows change.
+
+    Each batch is committed and released on its own, so memory stays flat
+    and an interrupted run keeps what it wrote; a rerun finds only the rest.
+    """
+    changed = 0
+    for rows in _batches(session, model, *where):
+        for row in rows:
+            scrubbed = scrub(row)
+            if scrubbed != getattr(row, column):
+                changed += 1
+                if apply:
+                    setattr(row, column, scrubbed)
+                    session.add(row)
+        if apply:
+            session.commit()
+        session.expunge_all()
+    return changed
+
+
+def _message_role(message: Message) -> str:
+    """The message's role as its stored string."""
+    return message.role.value if isinstance(message.role, Role) else str(message.role)
 
 
 def _turn_files(streams_dir: Path) -> Iterator[Path]:
@@ -162,53 +226,46 @@ def _scrub_turn_file(path: Path) -> str | None:
     return None if updated == original else updated
 
 
+def _replace_file(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` through a temp file in the same directory, so a crash leaves the old file."""
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp_name, path)
+    except BaseException:
+        Path(tmp_name).unlink(missing_ok=True)
+        raise
+
+
 def redact_stored_credentials(session: Session, streams_dir: Path, *, apply: bool) -> RedactionReport:
     """Scrub stored history in ``session``'s database and ``streams_dir``.
 
     Counts every row and file that holds something to redact; with
-    ``apply`` it also writes them back and commits. Runs across every org:
-    it is an operator tool for one deployment's own data.
+    ``apply`` it also writes them back. Covers every org in the database.
     """
     report = RedactionReport()
-
-    for event in session.exec(select(MessageEvent)):
-        scrubbed = scrub_value(event.event_data)
-        if scrubbed != event.event_data:
-            report.message_events += 1
-            if apply:
-                event.event_data = scrubbed
-                session.add(event)
-
-    for message in session.exec(select(Message)):
-        role = message.role.value if isinstance(message.role, Role) else str(message.role)
-        scrubbed = scrub_message_content(role, message.content)
-        if scrubbed != message.content:
-            report.messages += 1
-            if apply:
-                message.content = scrubbed
-                session.add(message)
-
-    for conversation in session.exec(select(Conversation).where(Conversation.history_summary.is_not(None))):
-        scrubbed = scrub_output(conversation.history_summary)
-        if scrubbed != conversation.history_summary:
-            report.history_summaries += 1
-            if apply:
-                conversation.history_summary = scrubbed
-                session.add(conversation)
-
-    if apply:
-        session.commit()
+    report.message_events = _scrub_rows(
+        session, MessageEvent, "event_data", lambda e: scrub_value(e.event_data), apply=apply,
+    )
+    report.messages = _scrub_rows(
+        session, Message, "content", lambda m: scrub_message_content(_message_role(m), m.content), apply=apply,
+    )
+    report.history_summaries = _scrub_rows(
+        session, Conversation, "history_summary", lambda c: scrub_output(c.history_summary),
+        Conversation.history_summary.is_not(None), apply=apply,
+    )
 
     for path in _turn_files(streams_dir):
         try:
             updated = _scrub_turn_file(path)
-        except (OSError, UnicodeDecodeError) as exc:
-            report.unreadable_turn_files.append(f"{path.name}: {type(exc).__name__}")
-            continue
-        if updated is not None:
+            if updated is None:
+                continue
             report.turn_files += 1
             if apply:
-                path.write_text(updated, encoding="utf-8")
+                _replace_file(path, updated)
+        except (OSError, UnicodeDecodeError) as exc:
+            report.skipped_turn_files.append(f"{path.name}: {type(exc).__name__}")
 
     return report
 
@@ -226,8 +283,8 @@ def main() -> None:
     verb = "Redacted" if args.apply else "Would redact"
     print(f"{verb}: {report.message_events} message events, {report.messages} messages, "
           f"{report.history_summaries} conversation summaries, {report.turn_files} turn files.")
-    for name in report.unreadable_turn_files:
-        print(f"Skipped unreadable turn file {name}")
+    for name in report.skipped_turn_files:
+        print(f"Skipped turn file {name}")
     if not args.apply:
         print("Dry run: nothing was changed. Run again with --apply to write.")
 
