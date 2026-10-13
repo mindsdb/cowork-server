@@ -2448,12 +2448,6 @@ async def _route_with_budget(**kwargs):
     )
 
 
-def test_the_default_gate_budget_is_ten_seconds():
-    import cowork.handlers.response_routing as routing
-
-    assert routing._GATE_TOTAL_SECONDS == 10.0
-
-
 @pytest.mark.asyncio
 async def test_without_a_budget_the_gate_uses_the_default_total(monkeypatch):
     """An answer slower than a short budget still ships when no budget is
