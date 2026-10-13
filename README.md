@@ -28,6 +28,7 @@ curl http://127.0.0.1:26866/api/v1/health/
 uv run cowork-server
 ```
 
+
 When running alongside the Electron app in dev mode, the app spawns the server automatically — no manual start needed. The Electron app looks for a sibling `cowork-server/` directory by convention (override with `COWORK_SERVER_DIR`).
 
 cowork-server imports anton's artifact folder constants (`anton.core.artifacts.internal_files`) at startup, with no fallback. A local editable anton older than the `anton-agent` floor in `pyproject.toml` makes the server fail to start with `ImportError`.
