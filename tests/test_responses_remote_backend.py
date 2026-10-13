@@ -21,6 +21,7 @@ import pytest
 import cowork.handlers.responses as responses_mod
 from cowork.handlers.responses import ResponsesHandler
 from cowork.streaming.registry import TurnLifecycle
+from cowork.turnqueue import producer as prod
 
 from _fakes import QueuedPipeline, inline_run_db, opens
 
@@ -2942,8 +2943,6 @@ class _QueueRedis:
 async def test_the_selected_effort_reaches_the_queued_job_on_every_turn(monkeypatch):
     """Handler to the real producer: the job a turn enqueues carries the
     composer's effort, and a second turn on the conversation carries it again."""
-    from cowork.turnqueue import producer as prod
-
     redis = _QueueRedis()
     monkeypatch.setattr(prod, "get_redis", lambda: redis)
 
