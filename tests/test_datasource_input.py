@@ -316,8 +316,12 @@ def test_an_omitted_port_falls_back_to_the_connector_default(connector_id, metho
     assert payload["port"] == expected
 
 
-def test_a_vpc_private_address_is_still_accepted():
-    assert normalize_datasource_input(_structured(host="10.0.0.5"))["host"] == "10.0.0.5"
+@pytest.mark.parametrize("host", ["10.0.0.5", "172.16.4.2", "192.168.1.10", "100.64.0.1", "167772165"])
+def test_a_private_address_is_refused_because_the_gateway_never_dials_one(host):
+    """The gateway dials public addresses only, so a private host saved here
+    would hold a stored password and never validate. 167772165 is 10.0.0.5."""
+    with pytest.raises(InvalidDatasourceInput, match="private"):
+        normalize_datasource_input(_structured(host=host))
 
 
 def test_a_name_that_is_only_whitespace_is_refused_before_relay():

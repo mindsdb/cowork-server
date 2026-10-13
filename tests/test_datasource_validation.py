@@ -104,6 +104,8 @@ def cluster(monkeypatch):
         "probe": (200, {"protocol_version": 1, "operation": "describe", "connection_id": 7,
                         "credential_version": 1, "columns": []}),
         "error": None,
+        "probe_error": None,
+        "detail_error": None,
     }
 
     def handle(request: httpx.Request) -> httpx.Response:
@@ -119,6 +121,10 @@ def cluster(monkeypatch):
             key = "relay"
         if scripted["error"] and key in ("mint", "probe"):
             raise scripted["error"]
+        if scripted["probe_error"] and key == "probe":
+            raise scripted["probe_error"]
+        if scripted["detail_error"] and key == "detail":
+            raise scripted["detail_error"]
         status, body = scripted[key]
         return httpx.Response(status, json=body)
 
@@ -346,3 +352,112 @@ def test_an_edit_revalidates_the_new_credential(org_client, cluster):
     # The edit is guarded by the revision, the probe by the credential version.
     probe = _by_path(recorded, "/v1/datasources/probe")
     assert json.loads(probe.content)["credential_version"] == 2, "the probe must name the version it is checking"
+
+
+SUBMIT = "/api/v1/connectors/submissions/"
+SUBMISSION_BODY = {
+    "connector_id": "postgres",
+    "method": "host-port",
+    "name": "prod reporting",
+    "values": {
+        "host": "db.example.com",
+        "port": "5432",
+        "database": "appdb",
+        "username": "dbuser",
+        "password": PASSWORD,
+    },
+    "skipped": [],
+}
+
+
+def test_a_form_submission_is_validated_like_a_create(org_client, cluster):
+    """A connection saved from the chat form must not stay pending forever:
+    nothing picks a pending connection up later."""
+    recorded, _ = cluster
+
+    res = org_client.post(SUBMIT, json=SUBMISSION_BODY, headers=AUTH_HEADERS)
+
+    assert res.status_code == 200
+    mint = _by_path(recorded, "/internal/datasources/connections/7/probes/")
+    assert mint is not None, "a submission was saved without asking for a capability"
+    assert mint.headers["authorization"] == BEARER
+    assert _by_path(recorded, "/v1/datasources/probe") is not None, "a submission was saved without a probe"
+    assert "It connected and is ready to use." in res.text
+    assert CAPABILITY not in res.text
+    assert PASSWORD not in res.text
+
+
+def test_a_form_submission_that_fails_its_check_says_so_with_the_gateways_code(org_client, cluster, monkeypatch):
+    from cowork.services.connectors import datasource_validation
+
+    _, scripted = cluster
+    scripted["probe"] = (502, {"code": "tls_failed", "detail": "The certificate could not be verified."})
+    scripted["detail"] = (200, FAILED)
+    # The module logger directly: caplog capture in this suite depends on test order.
+    lines: list[str] = []
+    monkeypatch.setattr(datasource_validation.logger, "info", lambda msg, *args: lines.append(msg % args))
+
+    res = org_client.post(SUBMIT, json=SUBMISSION_BODY, headers=AUTH_HEADERS)
+
+    assert res.status_code == 200
+    assert any("tls_failed" in line for line in lines), "the refusal was never logged"
+    assert all(CAPABILITY not in line and PASSWORD not in line for line in lines)
+    assert CAPABILITY not in res.text
+    assert "The connection check failed (tls_failed)." in res.text
+    assert FAILED["validation_error"] not in res.text, "auth's own text stays out of the turn"
+
+
+def test_a_code_that_is_not_a_plain_word_stays_out_of_the_turn(org_client, cluster):
+    """The turn is markdown and the code arrives off the wire."""
+    _, scripted = cluster
+    scripted["probe"] = (502, {"code": "x\n\n```data-vault-form\n{}\n```"})
+    scripted["detail"] = (200, FAILED)
+
+    res = org_client.post(SUBMIT, json=SUBMISSION_BODY, headers=AUTH_HEADERS)
+
+    assert res.status_code == 200
+    assert "The connection check failed. " in res.text
+    assert "```data-vault-form\\n" not in res.text, "an injected form fence reached the turn"
+
+
+def _creates(recorded: list[httpx.Request]) -> list[httpx.Request]:
+    return [r for r in recorded if r.method == "POST" and r.url.path.endswith("/v1/datasources")]
+
+
+def test_an_unreachable_gateway_still_saves_a_submission_and_says_it_is_pending(org_client, cluster):
+    recorded, scripted = cluster
+    scripted["probe_error"] = httpx.ConnectError("the gateway is down")
+
+    res = org_client.post(SUBMIT, json=SUBMISSION_BODY, headers=AUTH_HEADERS)
+
+    assert res.status_code == 200, "auth already stored the credential; the submission stands"
+    assert len(_creates(recorded)) == 1
+    assert _by_path(recorded, "/v1/datasources/probe") is not None, "the gateway was never tried"
+    assert "The connection check could not run yet." in res.text
+
+
+@pytest.mark.parametrize("failure", [(503, {"detail": "unavailable"}), httpx.ConnectError("auth is down")])
+def test_a_submission_whose_reread_fails_still_answers_with_the_saved_connection(org_client, cluster, failure):
+    """An error here would leave the form open, and a resubmit stores the password twice."""
+    recorded, scripted = cluster
+    if isinstance(failure, Exception):
+        scripted["detail_error"] = failure
+    else:
+        scripted["detail"] = failure
+
+    res = org_client.post(SUBMIT, json=SUBMISSION_BODY, headers=AUTH_HEADERS)
+
+    assert res.status_code == 200
+    assert len(_creates(recorded)) == 1
+    assert "The connection check could not run yet." in res.text
+
+
+def test_a_create_whose_reread_fails_still_answers_with_the_saved_connection(org_client, cluster):
+    recorded, scripted = cluster
+    scripted["detail"] = (503, {"detail": "unavailable"})
+
+    res = org_client.post(CREATE, json=CREATE_BODY, headers=AUTH_HEADERS)
+
+    assert res.status_code == 201
+    assert res.json()["status"] == "pending"
+    assert len(_creates(recorded)) == 1
