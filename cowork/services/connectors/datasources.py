@@ -111,7 +111,7 @@ def _canonical_host(value: Any) -> str:
     if not host or len(host) > 253 or not _HOST_RE.fullmatch(host) or "/" in host or ":" in host:
         raise InvalidDatasourceInput("host must be a single hostname or IP address")
     if host == "localhost" or host.endswith(".localhost"):
-        raise InvalidDatasourceInput("host must be a reachable database server, not a local address")
+        raise InvalidDatasourceInput("host must be a public database server, not a private or local address")
     try:
         packed = socket.inet_aton(host)
     except OSError:
