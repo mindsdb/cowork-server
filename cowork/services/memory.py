@@ -835,6 +835,13 @@ class MemoryService:
             }
         if project_id is not None:
             stores = {tier_id: store for tier_id, store in stores.items() if tier_id == project_id}
+        else:
+            # The unfiltered list is the Memories screen. A comparison side
+            # never writes memory, so its project has nothing to show there.
+            from cowork.services.projects import is_comparison_sandbox
+
+            sandboxes = {p.id for p in projects if is_comparison_sandbox(p.name)}
+            stores = {tier_id: store for tier_id, store in stores.items() if tier_id not in sandboxes}
 
         for tier_id, store in stores.items():
             for category in PROJECT_SLOTS:
