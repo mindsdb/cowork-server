@@ -976,8 +976,9 @@ class ResponsesHandler:
             raise
         except Exception:
             # Non-authorization routing failures may delegate to the agent.
+            # From the history scrub on, so it also counts time before the binding.
             logger.exception(
-                "[responses] routing gate failed after route_ms=%d — delegating",
+                "[responses] routing gate failed after failed_after_ms=%d — delegating",
                 round((time.monotonic() - attempt_started) * 1000),
             )
             return RouteDecision(
