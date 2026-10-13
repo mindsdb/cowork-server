@@ -1395,7 +1395,7 @@ def shared_redis(monkeypatch):
     registry.reset()
 
 
-def _running_elsewhere(conversation_id: str, *, finished: bool = False) -> None:
+def _running_elsewhere(conversation_id: str, *, finished: bool = False, turn_id: int = 1) -> None:
     """A turn another replica runs: recorded in the shared index, its buffer open."""
     import asyncio
 
@@ -1404,9 +1404,9 @@ def _running_elsewhere(conversation_id: str, *, finished: bool = False) -> None:
 
     async def record():
         await turn_index.record_turn(
-            conversation_id, turn_id=1, correlation_id="corr-elsewhere", org_id=None, user_id=None,
+            conversation_id, turn_id=turn_id, correlation_id="corr-elsewhere", org_id=None, user_id=None,
         )
-        buf = RedisStreamBuffer(conversation_id=conversation_id, turn_id=1)
+        buf = RedisStreamBuffer(conversation_id=conversation_id, turn_id=turn_id)
         await buf.append("sse", {"sse": "event: response.output_text.delta\ndata: {}\n\n"})
         if finished:
             await buf.close("completed")
@@ -1471,6 +1471,83 @@ def test_retrying_a_partial_carry_refuses_while_the_task_runs_on_another_replica
 
     assert r.status_code == 409, r.text
     assert (sandbox / ".anton" / "artifacts" / "report" / "index.html").is_file()
+
+
+def _finished_here(conversation_id: str, tmp_path: Path) -> None:
+    """A turn this replica ran to the end, through the registry every turn
+    starts on. Its handle stays registered once the turn is over."""
+    import asyncio
+
+    from cowork.streaming.buffer import FileStreamBuffer
+    from cowork.streaming.registry import registry
+
+    async def run():
+        async def open_buffer():
+            return FileStreamBuffer(tmp_path / f"{conversation_id}.jsonl")
+
+        async def produce(buffer):
+            await buffer.close("completed")
+
+        handle = await registry.start(
+            conversation_id=conversation_id, turn_id=1, open_buffer=open_buffer, produce=produce,
+        )
+        await handle.task
+
+    asyncio.run(run())
+    handle = registry.get(conversation_id)
+    assert handle is not None and not handle.is_running
+
+
+def test_a_turn_this_replica_finished_does_not_hide_one_the_other_replica_runs(client, shared_redis, tmp_path):
+    """This replica served turn 1 and keeps its finished handle; the other
+    replica runs turn 2. The finished handle is not an answer about turn 2."""
+    body = _create(client).json()
+    a, b = body["sides"]
+    for side in (a, b):
+        _finished_here(side["conversationId"], tmp_path)
+        _running_elsewhere(side["conversationId"], turn_id=2)
+    project = _real_project(client, "served-here-first")
+
+    r = client.post(f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": project["id"]})
+    assert r.status_code == 409, r.text
+    assert client.delete(f"/api/v1/comparisons/{body['id']}").status_code == 409
+    assert _project(a["projectId"]) is not None
+    assert _project(b["projectId"]) is not None
+
+
+def test_retrying_a_carry_refuses_when_only_this_replica_finished_its_turn(client, shared_redis, monkeypatch, tmp_path):
+    from cowork.services import task_objects
+
+    body = _create(client).json()
+    a = body["sides"][0]
+    sandbox = Path(_project(a["projectId"]).path)
+    _make_artifact(sandbox, "report", a["conversationId"])
+    target = _real_project(client, "retry-served-here")
+    url = f"/api/v1/comparisons/{body['id']}/sides/a/continue"
+    real_move = task_objects.shutil.move
+
+    def refuse(src, dst):
+        raise PermissionError(13, "Permission denied", src)
+
+    monkeypatch.setattr(task_objects.shutil, "move", refuse)
+    assert client.post(url, json={"projectId": target["id"]}).json()["carriedAll"] is False
+    monkeypatch.setattr(task_objects.shutil, "move", real_move)
+    _finished_here(a["conversationId"], tmp_path)
+    _running_elsewhere(a["conversationId"], turn_id=2)
+
+    assert client.post(url, json={"projectId": target["id"]}).status_code == 409
+    assert (sandbox / ".anton" / "artifacts" / "report" / "index.html").is_file()
+
+
+def test_a_finished_turn_on_both_replicas_does_not_hold_continue(client, shared_redis, tmp_path):
+    body = _create(client).json()
+    a = body["sides"][0]
+    _finished_here(a["conversationId"], tmp_path)
+    _running_elsewhere(a["conversationId"], turn_id=1, finished=True)
+    project = _real_project(client, "finished-everywhere")
+
+    r = client.post(f"/api/v1/comparisons/{body['id']}/sides/a/continue", json={"projectId": project["id"]})
+    assert r.status_code == 200, r.text
 
 
 def test_continue_and_delete_refuse_when_they_cannot_tell_whether_a_side_is_running(client, shared_redis, monkeypatch):
