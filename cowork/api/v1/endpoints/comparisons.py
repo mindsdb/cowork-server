@@ -1,9 +1,11 @@
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Path, Request, status
+from fastapi.concurrency import run_in_threadpool
 
+from cowork.api.v1.endpoints.responses import _shared_turn
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
-from cowork.db.scoped import ScopedSessionDep
+from cowork.db.scoped import ScopedSessionDep, TenantScope
 from cowork.models.comparison import Comparison
 from cowork.principal import hub_credential
 from cowork.schemas.comparisons import (
@@ -31,6 +33,33 @@ from cowork.services.projects import ProjectNameLockBusyError, ProjectNotFoundEr
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 _SIDE_LABEL = r"^[ab]$"
+
+
+async def _running_elsewhere(conversation_ids: list[str], scope: TenantScope) -> frozenset[str]:
+    """The conversations among these whose turn another replica is running.
+
+    The service's own check sees only this process's runs. With two replicas,
+    the one answering may not be the one running the turn, so a side with no
+    local handle is looked up in the shared turn index, as /responses/in-flight
+    does. Not knowing is a refusal: moving or deleting a live side's workspace
+    is not undone by a retry.
+    """
+    from cowork.streaming.registry import registry
+
+    running = set()
+    for conversation_id in conversation_ids:
+        if registry.get(conversation_id) is not None:
+            continue
+        try:
+            found = await _shared_turn(conversation_id, scope)
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Couldn't check whether this comparison's sides are still working. Try again in a moment.",
+            ) from None
+        if found is not None and found.in_flight:
+            running.add(conversation_id)
+    return frozenset(running)
 
 
 def _response(service: ComparisonService, comparison: Comparison, continued: dict | None = None) -> dict:
@@ -129,10 +158,14 @@ async def get_comparison_usage(comparison_id: UUID, request: Request, scoped: Sc
 
 
 @router.delete("/{comparison_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_comparison(comparison_id: UUID, scoped: ScopedSessionDep):
+async def delete_comparison(comparison_id: UUID, scoped: ScopedSessionDep):
     service = ComparisonService(scoped)
+    comparison = await run_in_threadpool(_get, service, comparison_id)
+    running = await _running_elsewhere(
+        [str(side.conversation_id) for side in comparison.sides if side.continued_at is None], scoped.scope
+    )
     try:
-        service.delete_comparison(comparison_id)
+        await run_in_threadpool(service.delete_comparison, comparison_id, running_elsewhere=running)
     except ComparisonNotFoundError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ComparisonConflictError as e:
@@ -152,15 +185,26 @@ def record_verdict(comparison_id: UUID, turn_index: int, body: ComparisonVerdict
 
 
 @router.post("/{comparison_id}/sides/{label}/continue")
-def continue_side(
+async def continue_side(
     comparison_id: UUID,
     body: ComparisonContinueRequest,
     scoped: ScopedSessionDep,
     label: str = Path(pattern=_SIDE_LABEL),
 ):
     service = ComparisonService(scoped)
+    comparison = await run_in_threadpool(_get, service, comparison_id)
+    running = await _running_elsewhere(
+        [str(side.conversation_id) for side in comparison.sides if side.label == label], scoped.scope
+    )
     try:
-        continued = service.continue_side(comparison_id, label, body.project_id, model_label=body.model_label)
+        continued = await run_in_threadpool(
+            service.continue_side,
+            comparison_id,
+            label,
+            body.project_id,
+            model_label=body.model_label,
+            running_elsewhere=running,
+        )
     except (ComparisonNotFoundError, ProjectNotFoundError) as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except ComparisonConflictError as e:
