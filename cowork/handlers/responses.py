@@ -50,6 +50,7 @@ from cowork.streaming.backend import get_backend
 from cowork.streaming.liveness import ModelWaitTicker
 from cowork.streaming.records import TerminalReason
 from cowork.streaming.turn_index import record_turn
+from cowork.turnqueue.prewarm import send_prewarm
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
 from cowork.turnqueue.redis_client import (
     STALLED_CANCEL_REASON,
@@ -108,7 +109,7 @@ from cowork.services.connectors.vault_secrets import register_vault_secrets
 from cowork.services.conversations import ConversationService
 from cowork.services.files import FileService
 from cowork.services.product_permissions import (
-    ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
+    ProductPermissionDenied, ProductPermissionUnavailable, has_product_permission, require_product_permission,
 )
 from cowork.services.memory import apply_turn_memory, build_turn_memory
 from cowork.services.projects import ProjectService
@@ -126,6 +127,7 @@ logger = logging.getLogger(__name__)
 # that's dropped can be garbage-collected mid-flight. Discarded on completion
 # via the done-callback below.
 _jev_shadow_tasks: set[asyncio.Task] = set()
+_prewarm_tasks: set[asyncio.Task] = set()
 
 
 def _spawn_jev_shadow_probe(
@@ -590,6 +592,8 @@ class ResponsesHandler:
         # task created below (create_task copies this context), is served from
         # the snapshot the unit loaded.
         with use_turn_settings(self.scope, start.settings):
+            if request.stream:
+                self._spawn_pod_prewarm(start.conversation_id)
             route, turn_llm = await self._route_request(
                 conversation_id=start.conversation_id,
                 harness_input=start.harness_input,
@@ -1288,6 +1292,53 @@ class ResponsesHandler:
             SkillService(session.scope).ensure_builtin_skills()
         except Exception:
             logger.exception("[responses] failed to stage workspace files", extra=log_context(conversation_id=conv_id))
+
+    def _spawn_pod_prewarm(self, conv_id: UUID) -> None:
+        """Ask for this conversation's pod while the router decides, so a delegated
+        turn finds it starting or started. Detached: the router never waits for it."""
+        settings = TurnQueueSettings()
+        if not (settings.is_remote and settings.pod_prewarm_enabled and self.scope.org_id):
+            return
+        if len(_prewarm_tasks) >= settings.prewarm_max_in_flight:
+            logger.warning("[prewarm] conversation=%s result=saturated prewarm_ms=0", conv_id)
+            return
+        task = asyncio.create_task(self._prewarm_pod(conv_id))
+        _prewarm_tasks.add(task)
+        task.add_done_callback(_prewarm_tasks.discard)
+
+    async def _prewarm_pod(self, conv_id: UUID) -> None:
+        started = time.monotonic()
+        result = "sent"
+
+        def stage_and_resolve(session: ScopedSession) -> dict:
+            # The pod's subPath mounts need their directories before it starts.
+            # The producer stages again before the turn; staging is idempotent.
+            self._stage_remote_workspace_files(session, conv_id)
+            return self._remote_workspace(session, conv_id)
+
+        try:
+            # Only persistent pods are prewarmed; a turn without artifact.manage
+            # runs ephemeral and would replace the pod.
+            if not await has_product_permission(self.scope, "artifact.manage"):
+                result = "ephemeral"
+                return
+            workspace = await run_db(stage_and_resolve, scope=self.scope)
+            if not workspace:
+                # The turn will fall back to the default project, a different pod.
+                result = "no_workspace"
+                return
+            await send_prewarm(
+                conversation_id=str(conv_id), org_id=self.scope.org_id, user_id=self.scope.user_id, **workspace,
+            )
+        except Exception:
+            result = "failed"
+            logger.warning("[prewarm] conversation=%s failed", conv_id, exc_info=True)
+        finally:
+            # warning, like [gate]: deployed LOG_LEVEL drops info lines.
+            logger.warning(
+                "[prewarm] conversation=%s result=%s prewarm_ms=%d",
+                conv_id, result, round((time.monotonic() - started) * 1000),
+            )
 
     @staticmethod
     def _remote_started_at(session: ScopedSession, conv_id: UUID) -> str | None:
