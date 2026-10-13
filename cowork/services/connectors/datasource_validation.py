@@ -23,7 +23,7 @@ import uuid
 from dataclasses import dataclass
 
 import httpx
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 from cowork.common.settings.app_settings import OAuthSettings, TurnQueueSettings
 from cowork.services.connectors.oauth import auth_proxy
@@ -182,9 +182,10 @@ async def validate_and_reread(connection: dict, request: Request) -> dict:
 
     A connection auth creates is pending until a probe says otherwise, so a
     capture that returned here would report a state the user cannot act on and
-    the interface hides. The attempt is best effort: when it could not run, the
-    connection stands as auth left it and the caller can retry. Returns auth's
-    re-read row, with the gateway's `validation_code` added on a refusal.
+    the interface hides. The attempt is best effort: when it could not run, or
+    auth could not be re-read after it, the connection stands as auth left it
+    and the caller can retry. Returns auth's re-read row, with the gateway's
+    `validation_code` added on a refusal.
     """
     connection_id = connection.get("id")
     if not isinstance(connection_id, int):
@@ -192,7 +193,17 @@ async def validate_and_reread(connection: dict, request: Request) -> dict:
     outcome = await validate_connection(connection_id, request.headers.get("authorization", ""))
     if not outcome.ran:
         return connection
-    checked = await auth_proxy.proxy_datasource_detail(connection_id, request, OAuthSettings())
+    try:
+        checked = await auth_proxy.proxy_datasource_detail(connection_id, request, OAuthSettings())
+    except HTTPException as exc:
+        # The credential is stored either way; answering an error here invites a
+        # resubmit that stores it twice. The detail can carry transport text.
+        logger.warning(
+            "[datasources] connection %s could not be re-read after validation: status %s",
+            connection_id,
+            exc.status_code,
+        )
+        return connection
     # Auth's row says only that validation failed. The gateway's code is what
     # lets a caller offer the user something to do about it.
     return {**checked, "validation_code": outcome.code} if outcome.code else checked
