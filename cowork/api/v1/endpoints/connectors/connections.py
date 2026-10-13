@@ -54,8 +54,16 @@ async def list_connections(scope: ScopeDep, request: Request):
         # data ConnectWorkflowView's org-mode connector list reads), so no
         # separate "list connections" endpoint is needed on auth's side.
         catalogue = await auth_proxy.proxy_catalogue(request, OAuthSettings())
+        # The card reads a missing status as healthy, like the local vault's
+        # list, so only the one actionable state is passed on; auth's
+        # "active" would otherwise render as an unknown status.
         return [
-            ConnectionSummaryResponse(engine=c["engine"], name=c["name"], user_label=c.get("user_label"))
+            ConnectionSummaryResponse(
+                engine=c["engine"],
+                name=c["name"],
+                user_label=c.get("user_label"),
+                status="needs_reconnect" if c.get("status") == "needs_reconnect" else None,
+            )
             for item in catalogue.get("items", [])
             for c in item.get("connections", [])
         ]
