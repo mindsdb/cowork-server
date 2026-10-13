@@ -23,7 +23,7 @@ from cowork.handlers.turn_errors import (
     remote_turn_error,
 )
 from cowork.coding.reasoning import advertised_levels
-from cowork.services.providers import cached_minds_models, minds_chat_base_url
+from cowork.services.providers import cached_org_model_catalog, minds_chat_base_url
 from cowork.db.scoped import TenantScope
 from cowork.services import product_permissions
 from cowork.services.product_permissions import require_product_permission
@@ -479,13 +479,12 @@ def _offered_effort(model: str, effort: str | None, *, org_id: str | None,
     """``effort`` when ``model`` advertises it, else None so the pod keeps its default.
 
     Reads the org's cached model listing, the one the composer offered levels
-    from. Without a listing the effort is kept and the gateway stays the judge,
-    as in ``cowork.coding.reasoning``.
+    from. Without a listing the effort is kept; the pod falls back to its
+    configured effort if the provider refuses it.
     """
     if not effort or not org_id or not user_id:
         return effort or None
-    url = TurnQueueSettings().minds_base_url or f"{default_turn_minds_api_host()}/v1"
-    offered = advertised_levels(model, cached_minds_models(url, tenant_key=org_id, user_id=user_id))
+    offered = advertised_levels(model, cached_org_model_catalog(org_id=org_id, user_id=user_id))
     if offered is None or effort in offered:
         return effort
     logger.warning("dropping the selected reasoning effort: model %s does not offer it", model)
