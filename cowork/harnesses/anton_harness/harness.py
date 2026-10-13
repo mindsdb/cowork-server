@@ -1082,8 +1082,9 @@ class AntonHarness:
             f"You have access to all of the files in the project at {str(base)} except for the .anton/ directory."
             "They are off limits. Do not mention the .anton/ directory in your responses."
             "You can perform operations on these files via the scratchpad."
-            "You can freely read any of these project files."
-            "If you need to perform any actions on these files, ask the user for permission first."
+            # "Ask before any actions" made agents stop to ask before merely searching a file.
+            "You may read, search, extract from and analyse any of these project files without asking."
+            "Ask the user before you change, move or delete existing project files."
             "The only other files that you are allowed to access are any items that are attached to the conversation."
             "Access to any files not attached to the conversation or located outside the project is strictly forbidden."
             "ALWAYS use the scratchpad to interact with files."
