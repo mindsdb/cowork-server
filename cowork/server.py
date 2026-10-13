@@ -26,7 +26,7 @@ from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.streaming import TurnInProgress
-from cowork.common.logger import setup_logging
+from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.dev_setup import run_dev_setup
@@ -259,6 +259,30 @@ async def lifespan(app: FastAPI):
         await close_inference_client()
 
 
+@asynccontextmanager
+async def _lifespan_without_database_text(app: FastAPI):
+    """Run ``lifespan``, keeping a database error's text out of Uvicorn's log.
+
+    Starlette hands a failed startup or shutdown to Uvicorn as
+    ``traceback.format_exc()`` text, and Uvicorn logs that text as a plain
+    message, which no exception filter can read. A migration, the seed rows,
+    or a reboot that starts Cowork before Postgres would print SQL and driver
+    detail on every restart. The owned handlers log the error instead, as its
+    type, SQLSTATE and the cowork frame it failed in, and Uvicorn gets an
+    error that carries no database text.
+    """
+    phase = "startup"
+    try:
+        async with lifespan(app):
+            phase = "shutdown"
+            yield
+    except Exception as exc:
+        if find_database_error(exc=exc) is None:
+            raise
+        logger.error("Server %s failed", phase, exc_info=True, extra=relayed_error())
+        raise RuntimeError(f"Database operation failed during server {phase}") from None
+
+
 class _NoStoreMiddleware:
     """Stamp ``Cache-Control: no-store`` on responses under the given path
     prefixes so API keys those responses carry are never written to a client's
@@ -299,7 +323,7 @@ def create_app() -> FastAPI:
         title="Cowork API",
         description="Cowork server — OpenAI-compatible Responses API with pluggable harness backends",
         version="1.0.0",
-        lifespan=lifespan,
+        lifespan=_lifespan_without_database_text,
     )
 
     # Org-scoped data touched without an org in scope (e.g. audit mode with no
