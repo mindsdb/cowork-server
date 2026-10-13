@@ -78,3 +78,39 @@ def test_scrubbed_openai_dump_forwards_dump_kwargs():
 
     assert leaked not in result["content"]
     assert result["mode_seen"] == {"mode": "json"}
+
+
+TOKEN = "opq" + "Z9" * 15
+
+
+def test_scrubs_a_token_in_a_stored_tool_result_string():
+    """A tool result saved before output scrubbing existed is redacted on replay."""
+    om = {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": f'{{"refresh_token": "{TOKEN}"}}'},
+    ]}
+
+    block = scrub_message_dict(om)["content"][0]
+
+    assert block["content"] == '{"refresh_token": "[REDACTED_TOKEN]"}'
+    assert block["tool_use_id"] == "t1"
+
+
+def test_scrubs_a_token_in_stored_tool_result_text_blocks():
+    """List-shaped tool result content is redacted block by block; other blocks keep their shape."""
+    om = {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "t1", "content": [
+            {"type": "text", "text": f"Authorization: Bearer {TOKEN}"},
+            {"type": "image", "source": {"data": "abc"}},
+        ]},
+    ]}
+
+    inner = scrub_message_dict(om)["content"][0]["content"]
+
+    assert inner[0]["text"] == "Authorization: Bearer [REDACTED_TOKEN]"
+    assert inner[1] == {"type": "image", "source": {"data": "abc"}}
+
+
+def test_text_blocks_keep_the_input_filter():
+    """A text block is user-typed text, so a pasted client secret is not turned into a marker."""
+    om = {"role": "user", "content": [{"type": "text", "text": f"client_secret={TOKEN}"}]}
+    assert scrub_message_dict(om)["content"][0]["text"] == f"client_secret={TOKEN}"

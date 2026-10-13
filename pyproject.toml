@@ -180,7 +180,7 @@ packages = ["cowork"]
 # capability gate) and `handlers/turn_errors.py` (the legacy 401 classifier)
 # predate the `anton-agent` floor above, which no longer admits a release that
 # needs them.
-anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "c66c3ab45c3a739047cbe8c44fb25a1354329de0" }
+anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "b68f93814fc7dde83e060bfb15d9b1fac08f2f1d" }
 
 [dependency-groups]
 dev = [
