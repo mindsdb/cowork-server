@@ -13,7 +13,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.build_info import account_kwargs, supported_kwargs, surface_kwarg
 from cowork.common.chat_session import build_chat_session, close_session_scratchpads
-from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
+from cowork.common.history_scrub import scrub_output, scrubbed_openai_dump
 from cowork.common.logger import get_logger, log_context
 from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
@@ -771,7 +771,8 @@ class AntonHarness:
 
         tail = [stamp(m) for m in ordered_messages[tail_start:]]
         if history_summary:
-            summary_msg = {"role": "user", "content": scrub_credentials(history_summary)}
+            # A summary is model output and can repeat a token a cell printed.
+            summary_msg = {"role": "user", "content": scrub_output(history_summary)}
             if tail and tail[0].get("role") == "user":
                 # Same fix anton's own _summarize_history applies: two
                 # consecutive user messages break/degrade most providers.

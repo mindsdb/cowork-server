@@ -7,7 +7,7 @@ Every caller that replays history from storage must scrub it itself with
 """
 from anton.utils.datasources import scrub_credentials, scrub_output
 
-__all__ = ["scrub_credentials", "scrub_message_dict", "scrubbed_openai_dump"]
+__all__ = ["scrub_credentials", "scrub_message_dict", "scrub_output", "scrubbed_openai_dump"]
 
 
 def _scrub_tool_result(block: dict) -> dict:
@@ -33,19 +33,20 @@ def _scrub_tool_result(block: dict) -> dict:
 def scrub_message_dict(om: dict) -> dict:
     """Scrub credentials from one OpenAI-shaped message dict, in place.
 
-    String content is scrubbed whole. In list content, text/input_text blocks
-    get the input filter (they can carry a secret typed next to a tool call),
-    tool_result blocks get the output filter, and tool_use blocks are left as
-    the model wrote them.
+    Text the user typed gets the input filter, so a pasted secret still
+    reaches connect; assistant text and tool_result blocks are model or tool
+    output and get the output filter. tool_use blocks are left as the model
+    wrote them.
     """
+    scrub_text = scrub_output if om.get("role") == "assistant" else scrub_credentials
     content = om.get("content")
     if isinstance(content, str) and content:
-        om["content"] = scrub_credentials(content)
+        om["content"] = scrub_text(content)
     elif isinstance(content, list):
         scrubbed = []
         for block in content:
             if isinstance(block, dict) and block.get("type") in ("text", "input_text") and block.get("text"):
-                block = {**block, "text": scrub_credentials(block["text"])}
+                block = {**block, "text": scrub_text(block["text"])}
             elif isinstance(block, dict) and block.get("type") == "tool_result":
                 block = _scrub_tool_result(block)
             scrubbed.append(block)

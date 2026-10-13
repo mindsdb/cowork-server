@@ -114,3 +114,24 @@ def test_text_blocks_keep_the_input_filter():
     """A text block is user-typed text, so a pasted client secret is not turned into a marker."""
     om = {"role": "user", "content": [{"type": "text", "text": f"client_secret={TOKEN}"}]}
     assert scrub_message_dict(om)["content"][0]["text"] == f"client_secret={TOKEN}"
+
+
+def test_scrubs_a_token_in_a_stored_assistant_string():
+    """An answer that repeated a printed token is model output, so it gets the output filter."""
+    om = {"role": "assistant", "content": f"Here it is: Bearer {TOKEN}"}
+    assert scrub_message_dict(om)["content"] == "Here it is: Bearer [REDACTED_TOKEN]"
+
+
+def test_scrubs_a_token_in_an_assistant_text_block():
+    """A text block next to a tool call in an assistant row is model output too."""
+    om = {"role": "assistant", "content": [
+        {"type": "text", "text": f"access_token={TOKEN}"},
+        {"type": "tool_use", "id": "t1", "name": "scratchpad", "input": {}},
+    ]}
+    assert scrub_message_dict(om)["content"][0]["text"] == "access_token=[REDACTED_TOKEN]"
+
+
+def test_user_strings_keep_the_input_filter():
+    """A user-typed string keeps the narrower filter, so a pasted client secret still saves."""
+    om = {"role": "user", "content": f"client_secret={TOKEN}"}
+    assert scrub_message_dict(om)["content"] == f"client_secret={TOKEN}"
