@@ -2,22 +2,37 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID
 
 import pytest
 from sqlalchemy import create_engine
-from sqlmodel import Session, SQLModel
+from sqlmodel import Session, SQLModel, select
 
+import scripts.redact_stored_credentials as redact_module
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
 from cowork.schemas.responses import Role
-from scripts.redact_stored_credentials import redact_stored_credentials
+from scripts.redact_stored_credentials import redact_stored_credentials, scrub_value
 
 TOKEN = "opq" + "Z9" * 15
 CELL_CODE = f"headers = {{'Authorization': 'Bearer {TOKEN}'}}"
+
+
+@dataclass
+class Stored:
+    """The seeded database and streams directory, with the ids a test reads back."""
+
+    session: Session
+    streams: Path
+    turn_file: Path
+    messages: dict[str, UUID]
+    cell_event: UUID
+    call_event: UUID
+    conversation: UUID
 
 
 def _cell_event() -> dict:
@@ -50,8 +65,13 @@ def stored(tmp_path):
     }
     session.add_all(rows.values())
     session.flush()
-    event = MessageEvent(message_id=rows["answer"].id, sequence_number=0, event_data=_cell_event())
-    session.add(event)
+    cell_event = MessageEvent(message_id=rows["answer"].id, sequence_number=0, event_data=_cell_event())
+    call_event = MessageEvent(message_id=rows["answer"].id, sequence_number=1, event_data={
+        "type": "response.in_progress",
+        "thought_role": "thought_tool_call_message",
+        "content": json.dumps({"action": "exec", "name": "main", "code": CELL_CODE}),
+    })
+    session.add_all([cell_event, call_event])
     session.commit()
 
     streams = tmp_path / "streams"
@@ -62,59 +82,98 @@ def stored(tmp_path):
         + '{"seq": 2, "type": "resp',
         encoding="utf-8",
     )
-    yield session, streams, rows, event, conversation, turn_file
+    yield Stored(
+        session=session,
+        streams=streams,
+        turn_file=turn_file,
+        messages={name: row.id for name, row in rows.items()},
+        cell_event=cell_event.id,
+        call_event=call_event.id,
+        conversation=conversation.id,
+    )
     session.close()
+
+
+def _counts(report) -> tuple[int, int, int, int]:
+    """The report's per-store counts, in a fixed order."""
+    return report.message_events, report.messages, report.history_summaries, report.turn_files
 
 
 def test_a_dry_run_counts_and_changes_nothing(stored):
     """Without --apply every location is counted and nothing is written."""
-    session, streams, rows, event, conversation, turn_file = stored
-    before = turn_file.read_text(encoding="utf-8")
+    before = stored.turn_file.read_text(encoding="utf-8")
 
-    report = redact_stored_credentials(session, streams, apply=False)
+    report = redact_stored_credentials(stored.session, stored.streams, apply=False)
 
-    assert (report.message_events, report.messages, report.history_summaries, report.turn_files) == (1, 2, 1, 1)
-    session.expire_all()
-    assert TOKEN in session.get(MessageEvent, event.id).event_data["content"]
-    assert TOKEN in session.get(Message, rows["answer"].id).content
-    assert turn_file.read_text(encoding="utf-8") == before
+    assert _counts(report) == (1, 2, 1, 1)
+    assert TOKEN in stored.session.get(MessageEvent, stored.cell_event).event_data["content"]
+    assert TOKEN in stored.session.get(Message, stored.messages["answer"]).content
+    assert stored.turn_file.read_text(encoding="utf-8") == before
 
 
 def test_apply_redacts_output_and_keeps_what_was_written_by_hand(stored):
     """Tool output, answers, summaries and turn files lose the token; user text and code keep theirs."""
-    session, streams, rows, event, conversation, turn_file = stored
+    session = stored.session
+    redact_stored_credentials(session, stored.streams, apply=True)
 
-    redact_stored_credentials(session, streams, apply=True)
-    session.expire_all()
-
-    cell = json.loads(session.get(MessageEvent, event.id).event_data["content"])
+    cell = json.loads(session.get(MessageEvent, stored.cell_event).event_data["content"])
     assert cell["stdout"] == '{"access_token": "[REDACTED_TOKEN]"}\n'
     assert cell["code"] == CELL_CODE
-    assert session.get(Message, rows["tool_result"].id).content[0]["content"] == '{"refresh_token": "[REDACTED_TOKEN]"}'
-    assert session.get(Message, rows["answer"].id).content == "Bearer [REDACTED_TOKEN]"
-    assert session.get(Conversation, conversation.id).history_summary == "Fetched access_token=[REDACTED_TOKEN] earlier."
-    assert session.get(Message, rows["user_text"].id).content == f"my token is {TOKEN}"
-    assert session.get(Message, rows["tool_use"].id).content[0]["input"]["code"] == CELL_CODE
+    assert json.loads(session.get(MessageEvent, stored.call_event).event_data["content"])["code"] == CELL_CODE
+    tool_result = session.get(Message, stored.messages["tool_result"]).content[0]["content"]
+    assert tool_result == '{"refresh_token": "[REDACTED_TOKEN]"}'
+    assert session.get(Message, stored.messages["answer"]).content == "Bearer [REDACTED_TOKEN]"
+    assert session.get(Conversation, stored.conversation).history_summary == "Fetched access_token=[REDACTED_TOKEN] earlier."
+    assert session.get(Message, stored.messages["user_text"]).content == f"my token is {TOKEN}"
+    assert session.get(Message, stored.messages["tool_use"]).content[0]["input"]["code"] == CELL_CODE
 
-    lines = turn_file.read_text(encoding="utf-8").splitlines()
+    lines = stored.turn_file.read_text(encoding="utf-8").splitlines()
     record_cell = json.loads(json.loads(lines[0])["data"]["content"])
     assert record_cell["stdout"] == '{"access_token": "[REDACTED_TOKEN]"}\n'
     assert lines[1] == '{"seq": 2, "type": "resp'
+    assert [p.name for p in stored.turn_file.parent.iterdir()] == [stored.turn_file.name]
 
 
 def test_a_second_run_finds_nothing_left(stored):
     """Applying twice is safe: markers are not redacted again."""
-    session, streams, *_ = stored
-    redact_stored_credentials(session, streams, apply=True)
+    redact_stored_credentials(stored.session, stored.streams, apply=True)
 
-    report = redact_stored_credentials(session, streams, apply=False)
+    report = redact_stored_credentials(stored.session, stored.streams, apply=False)
 
-    assert (report.message_events, report.messages, report.history_summaries, report.turn_files) == (0, 0, 0, 0)
+    assert _counts(report) == (0, 0, 0, 0)
 
 
 def test_a_missing_streams_directory_is_not_an_error(stored, tmp_path):
     """A deployment without file-backed turn buffers still cleans its database."""
-    session, *_ = stored
-    report = redact_stored_credentials(session, tmp_path / "no-such-dir", apply=False)
+    report = redact_stored_credentials(stored.session, tmp_path / "no-such-dir", apply=False)
     assert report.turn_files == 0
     assert report.messages == 2
+
+
+def test_code_and_input_keys_in_printed_output_are_scrubbed():
+    """Only a cell's code and a tool_use input are kept; the same key names in printed API output are not."""
+    printed = {"stdout_obj": {"input": f"Bearer {TOKEN}", "code": f"access_token={TOKEN}"}}
+    assert TOKEN not in json.dumps(scrub_value(printed))
+
+
+def test_small_batches_still_reach_every_row(stored, monkeypatch):
+    """Rows are read and committed in batches; a batch size of one still covers everything."""
+    monkeypatch.setattr(redact_module, "BATCH_SIZE", 1)
+
+    report = redact_stored_credentials(stored.session, stored.streams, apply=True)
+
+    assert _counts(report)[:3] == (1, 2, 1)
+    assert redact_stored_credentials(stored.session, stored.streams, apply=False).messages == 0
+
+
+def test_a_turn_file_that_cannot_be_written_is_reported(stored):
+    """A write failure is reported per file, the old file stays whole, and the database changes still land."""
+    stored.turn_file.parent.chmod(0o500)
+    try:
+        report = redact_stored_credentials(stored.session, stored.streams, apply=True)
+    finally:
+        stored.turn_file.parent.chmod(0o700)
+
+    assert report.skipped_turn_files == [f"{stored.turn_file.name}: PermissionError"]
+    assert TOKEN not in stored.session.get(Message, stored.messages["answer"]).content
+    assert TOKEN in stored.turn_file.read_text(encoding="utf-8")
