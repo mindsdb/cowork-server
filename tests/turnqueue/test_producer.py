@@ -1,10 +1,14 @@
 import asyncio
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from cowork.handlers import turn_errors as te
 from cowork.turnqueue import producer as prod
+
+from _fakes import QueuedPipeline
 
 
 @pytest.fixture(autouse=True)
@@ -37,6 +41,8 @@ class FakeRedis:
     async def hset(self, key, mapping=None): return 1
     async def expire(self, key, seconds): return 1
     async def delete(self, *keys): return len(keys)
+    async def xrevrange(self, key, count=None): return []
+    def pipeline(self, transaction=True): return QueuedPipeline(self)
 
     async def xadd(self, stream, fields):
         self.added.append((stream, fields))
@@ -138,6 +144,39 @@ async def test_turn_failed_yields_classified_code_and_message(monkeypatch):
     assert data["code"] == "provider_overloaded"
     assert "momentarily overloaded" in data["message"]
     assert items == [items[-1]]  # terminal is the only yield, then the generator ends
+
+
+@pytest.mark.asyncio
+async def test_a_pod_model_call_timeout_keeps_its_own_code(monkeypatch):
+    # The pod's _scrub keeps only "TypeName: message", so the name is what
+    # carries anton's model-call deadline across the hop.
+    failed = await _failed_turn(monkeypatch, {
+        "error": "ModelCallTimeoutError: The model sent no output for 10 minutes, so the call was stopped.",
+    })
+    assert failed["code"] == "model_timeout"
+    assert failed["message"] == "The model sent no output for 10 minutes, so the call was stopped."
+
+
+@pytest.mark.asyncio
+async def test_a_stale_cancel_cause_is_cleared_with_the_stale_flag(monkeypatch):
+    # A cause left by an earlier turn that reused the id would turn this
+    # turn's own Stop into a stall.
+    class RecordingRedis(FakeRedis):
+        def __init__(self, replies):
+            super().__init__(replies)
+            self.deleted: list[str] = []
+
+        async def delete(self, *keys):
+            self.deleted.extend(keys)
+            return len(keys)
+
+    fake = RecordingRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m"))
+    assert "cowork:cancel:r" in fake.deleted
+    assert "cowork:cancel_cause:r" in fake.deleted
 
 
 # What anton's worker sends, via scratchpad-controller, for a billing stop the
@@ -412,6 +451,202 @@ async def test_stream_remote_replies_omits_oauth_block_when_no_connections(monke
 
 
 @pytest.mark.asyncio
+async def test_datasource_grants_are_registered_before_refs_are_enqueued(monkeypatch):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    events = []
+
+    async def fake_mint_details(**_kw):
+        events.append("mint")
+        return SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")
+
+    async def fake_list(**kw):
+        events.append("list")
+        assert kw["org_id"] == "o1" and kw["user_id"] == "u1"
+        return [{
+            "id": 7,
+            "connector_id": "postgres",
+            "name": "events",
+            "status": "verified",
+            "credential_version": 3,
+        }]
+
+    async def fake_register(**kw):
+        events.append("register")
+        assert not fake.added
+        assert kw["turn_key_id"] == "mdb_prefix"
+        assert kw["connection_ids"] == [7]
+        return {
+            "user_id": "u1",
+            "organization_id": "o1",
+            "turn_key_id": "mdb_prefix",
+            "correlation_id": "r",
+            "audience": "datasource-gateway",
+            "purpose": "execute",
+            "grants": [{
+                "connection_id": 7,
+                "credential_version": 3,
+                "token": "must-not-cross-the-queue",
+            }],
+        }
+
+    original_xadd = fake.xadd
+
+    async def tracking_xadd(*args, **kwargs):
+        events.append("enqueue")
+        return await original_xadd(*args, **kwargs)
+
+    monkeypatch.setattr(prod, "mint_turn_key_details", fake_mint_details)
+    monkeypatch.setattr(prod, "list_verified_datasource_connections", fake_list)
+    monkeypatch.setattr(prod, "register_datasource_grants", fake_register)
+    monkeypatch.setattr(fake, "xadd", tracking_xadd)
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert events.index("register") < events.index("enqueue")
+    assert params["datasource"] == {
+        "protocol_version": 1,
+        "connections": [{"connection_id": 7, "credential_version": 3}],
+    }
+    assert "must-not-cross-the-queue" not in json.dumps(params)
+    assert set(params["datasource"]) == {"protocol_version", "connections"}
+
+
+@pytest.mark.asyncio
+async def test_datasource_grant_mismatch_fails_before_enqueue(monkeypatch):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    monkeypatch.setattr(
+        prod,
+        "mint_turn_key_details",
+        AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")),
+    )
+    monkeypatch.setattr(
+        prod,
+        "list_verified_datasource_connections",
+        AsyncMock(return_value=[{
+            "id": 7,
+            "connector_id": "postgres",
+            "name": "events",
+            "status": "verified",
+            "credential_version": 3,
+        }]),
+    )
+    monkeypatch.setattr(
+        prod,
+        "register_datasource_grants",
+        AsyncMock(return_value={
+            "user_id": "u1",
+            "organization_id": "o1",
+            "turn_key_id": "mdb_prefix",
+            "correlation_id": "r",
+            "audience": "datasource-gateway",
+            "purpose": "execute",
+            "grants": [{"connection_id": 7, "credential_version": 2}],
+        }),
+    )
+
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+    assert [(kind, data["code"]) for kind, data in items] == [("turn_failed", "permission_unavailable")]
+    assert not fake.added
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field",
+    ["user_id", "organization_id", "turn_key_id", "correlation_id", "audience", "purpose"],
+)
+async def test_datasource_grant_binding_mismatch_fails_before_enqueue(monkeypatch, field):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    monkeypatch.setattr(
+        prod,
+        "mint_turn_key_details",
+        AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")),
+    )
+    monkeypatch.setattr(
+        prod,
+        "list_verified_datasource_connections",
+        AsyncMock(return_value=[{
+            "id": 7,
+            "connector_id": "postgres",
+            "name": "events",
+            "status": "verified",
+            "credential_version": 3,
+        }]),
+    )
+    binding = {
+        "user_id": "u1",
+        "organization_id": "o1",
+        "turn_key_id": "mdb_prefix",
+        "correlation_id": "r",
+        "audience": "datasource-gateway",
+        "purpose": "execute",
+    }
+    binding[field] = "wrong"
+    monkeypatch.setattr(
+        prod,
+        "register_datasource_grants",
+        AsyncMock(return_value={
+            **binding,
+            "grants": [{"connection_id": 7, "credential_version": 3}],
+        }),
+    )
+
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+    assert [(kind, data["code"]) for kind, data in items] == [("turn_failed", "permission_unavailable")]
+    assert not fake.added
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failing", ["mint_turn_key_details", "register_datasource_grants"])
+async def test_an_auth_outage_during_turn_setup_ends_the_turn_as_permission_unavailable(monkeypatch, failing):
+    """Setup runs before anything is queued, so an outage there must still reach the
+    client as permission_unavailable, which the responses producer only keeps when it
+    arrives as a turn_failed; a raised exception becomes a generic error. A listing
+    outage is the exception: the turn runs without databases, tested separately."""
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    calls = {
+        "mint_turn_key_details": AsyncMock(return_value=SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")),
+        "list_verified_datasource_connections": AsyncMock(return_value=[{
+            "id": 7, "connector_id": "postgres", "name": "events", "status": "verified", "credential_version": 3,
+        }]),
+        "register_datasource_grants": AsyncMock(return_value={}),
+    }
+    calls[failing] = AsyncMock(side_effect=ProductPermissionUnavailable())
+    for name, mock in calls.items():
+        monkeypatch.setattr(prod, name, mock)
+
+    items = await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+
+    assert items == [("turn_failed", {
+        "error": "ProductPermissionUnavailable: turn setup could not be authorized",
+        **ProductPermissionUnavailable().detail,
+    })]
+    assert not fake.added
+
+
+@pytest.mark.asyncio
 async def test_llm_mint_and_oauth_connections_fetch_run_concurrently(monkeypatch):
     """Both are independent network round trips (turn-key mint, active-
     connections list) — sequencing them costs an extra full round trip on
@@ -513,6 +748,39 @@ async def test_stream_remote_replies_forwards_the_active_hub_workspace(monkeypat
 
 
 @pytest.mark.asyncio
+async def test_the_active_hub_workspace_binds_the_key_with_datasources_on_too(monkeypatch):
+    """The datasource path mints through mint_turn_key_details, not mint_turn_key;
+    the picked workspace must reach it as well, or turning datasources on would
+    move every hosted turn's spend back to the org Default."""
+    from types import SimpleNamespace
+    from cowork.common.settings import user_settings
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    monkeypatch.setattr(
+        user_settings, "get_user_settings",
+        lambda scope: SimpleNamespace(resolved_planning_model="m", hub_workspace_id="ws-1"),
+    )
+    captured = {}
+
+    async def _fake_mint(**kw):
+        captured.update(kw)
+        return SimpleNamespace(key="mdb_prefix.secret", prefix="mdb_prefix")
+
+    monkeypatch.setattr(prod, "mint_turn_key_details", _fake_mint)
+    monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=[]))
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi",
+        model="mindshub_air",
+    ))
+
+    assert captured["workspace_id"] == "ws-1"
+
+
+@pytest.mark.asyncio
 async def test_stream_remote_replies_omits_workspace_id_when_none_picked(monkeypatch):
     from types import SimpleNamespace
     from cowork.common.settings import user_settings
@@ -604,6 +872,12 @@ class SilentRedis:
 
     async def delete(self, *keys):
         return len(keys)
+
+    async def xrevrange(self, key, count=None):
+        return []
+
+    def pipeline(self, transaction=True):
+        return QueuedPipeline(self)
 
     async def xadd(self, stream, fields):
         self.added.append((stream, fields))
@@ -957,6 +1231,203 @@ async def test_artifact_authority_outage_stops_before_queue_side_effects(monkeyp
     redis.assert_not_called()
 
 
+def _verified(connection_id, connector_id="postgres", name="events", version=3):
+    return {"id": connection_id, "connector_id": connector_id, "name": name, "status": "verified",
+            "credential_version": version}
+
+
+def _echo(refs, **overrides):
+    response = {
+        "user_id": "u1", "organization_id": "o1", "turn_key_id": "mdb_prefix", "correlation_id": "r",
+        "audience": "datasource-gateway", "purpose": "execute",
+        "grants": [{"connection_id": c, "credential_version": v} for c, v in refs],
+    }
+    response.update(overrides)
+    return response
+
+
+@pytest.mark.asyncio
+async def test_a_hosted_turn_registers_grants_against_the_gate_minted_key(monkeypatch):
+    """The path a hosted org runs: the routing gate minted the turn key and hands
+    its prefix through; the producer registers grants against that key and mints
+    no second one."""
+    from cowork.common.settings.app_settings import TurnQueueSettings
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    assert TurnQueueSettings().datasource_enabled is True
+    for name in ("mint_turn_key", "mint_turn_key_details", "_mint_llm_block", "_mint_llm_block_with_turn_key_id"):
+        monkeypatch.setattr(prod, name, AsyncMock(side_effect=AssertionError(f"{name} minted a second key")))
+    monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=[_verified(7)]))
+    register = AsyncMock(return_value=_echo([(7, 3)], turn_key_id="mdb_gate"))
+    monkeypatch.setattr(prod, "register_datasource_grants", register)
+    block = {"provider": "minds-cloud", "api_key": "mdb_gate.secret", "base_url": "https://minds.internal/v1"}
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        correlation_id="r", llm=block, turn_key_id="mdb_gate",
+    ))
+
+    assert register.await_args.kwargs["turn_key_id"] == "mdb_gate"
+    assert register.await_args.kwargs["correlation_id"] == "r"
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params["llm"] == block
+    assert params["datasource"] == {"protocol_version": 1, "connections": [{"connection_id": 7, "credential_version": 3}]}
+
+
+@pytest.mark.asyncio
+async def test_a_listing_auth_cannot_answer_costs_the_turn_its_databases_not_the_turn(monkeypatch):
+    """Auth being unreachable must not fail the turn. With the flag on every
+    hosted turn goes through this call, including the ones that never mention
+    a database, so a raise here took the whole deployment down with it."""
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setenv("COWORK_TURN_DATASOURCE_ENABLED", "true")
+    monkeypatch.setattr(
+        prod, "list_verified_datasource_connections",
+        AsyncMock(side_effect=ProductPermissionUnavailable()),
+    )
+    monkeypatch.setattr(prod, "register_datasource_grants", AsyncMock(side_effect=AssertionError("registered")))
+    # The module logger rather than caplog: this suite's caplog capture is
+    # order dependent, and the point of the branch is that it keeps the cause.
+    warnings: list[tuple] = []
+    monkeypatch.setattr(prod.logger, "warning", lambda *a, **k: warnings.append((a, k)))
+    block = {"provider": "minds-cloud", "api_key": "mdb_gate.secret", "base_url": "https://minds.internal/v1"}
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+        correlation_id="r", llm=block, turn_key_id="mdb_gate",
+    ))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert "datasource" not in params
+    assert params["llm"] == block
+    omitted = [(a, k) for a, k in warnings if "datasource" in str(a[0])]
+    assert omitted and omitted[-1][1].get("exc_info") is True
+
+
+@pytest.mark.asyncio
+async def test_with_the_flag_off_nothing_datasource_related_runs_or_is_queued(monkeypatch):
+    """The rollout's old behaviour, pinned: no listing, no registration, no block."""
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.delenv("COWORK_TURN_DATASOURCE_ENABLED", raising=False)
+    listing = AsyncMock(side_effect=AssertionError("listed with the flag off"))
+    monkeypatch.setattr(prod, "list_verified_datasource_connections", listing)
+    monkeypatch.setattr(prod, "register_datasource_grants", AsyncMock(side_effect=AssertionError("registered")))
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="m",
+    ))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert "datasource" not in params
+    listing.assert_not_awaited()
+
+
+def test_disabled_connections_are_matched_on_the_connector_id_auth_emits():
+    """A conversation's disabled entries carry `engine`; auth's `connector_id` is
+    the same value (`postgres`, `mysql`), and the join is exact."""
+    connections = [_verified(7, "postgres", "events"), _verified(8, "mysql", "orders", version=1)]
+    refs = prod._datasource_connection_refs(connections, [{"engine": "postgres", "name": "events"}])
+    assert refs == [{"connection_id": 8, "credential_version": 1}]
+    untouched = prod._datasource_connection_refs(connections, [{"engine": "postgresql", "name": "events"}])
+    assert [ref["connection_id"] for ref in untouched] == [7, 8]
+
+
+def test_the_connection_cap_applies_to_the_grant_set_not_the_listing():
+    """Auth caps what is registered; a user over the cap only through connections
+    this conversation disabled is still served."""
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+
+    listing = [_verified(i, name=f"c{i}", version=1) for i in range(1, 102)]
+    refs = prod._datasource_connection_refs(listing, [{"engine": "postgres", "name": "c1"}])
+    assert len(refs) == 100
+    with pytest.raises(ProductPermissionUnavailable):
+        prod._datasource_connection_refs(listing, None)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_grant_names_the_failed_check_and_never_a_secret(monkeypatch):
+    """Recorded at the module logger rather than through caplog: another test's
+    logging setup must not decide whether this assertion sees the record."""
+    from cowork.common.settings.app_settings import TurnQueueSettings
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+
+    warnings: list[str] = []
+    monkeypatch.setattr(prod.logger, "warning", lambda msg, *args, **kw: warnings.append(msg % args))
+    monkeypatch.setattr(prod, "list_verified_datasource_connections", AsyncMock(return_value=[_verified(7)]))
+    monkeypatch.setattr(prod, "register_datasource_grants", AsyncMock(return_value=_echo([(7, 3)], turn_key_id="mdb_other")))
+    settings = TurnQueueSettings(
+        datasource_enabled=True, datasource_producer_key_id="producer-v1", datasource_producer_key="producer-secret"
+    )
+    with pytest.raises(ProductPermissionUnavailable):
+        await prod._mint_datasource_block(
+            org_id="o1", user_id="u1", correlation_id="r", turn_key_id="mdb_prefix", disabled=None, settings=settings
+        )
+    assert len(warnings) == 1 and "binding" in warnings[0]
+    assert "producer-secret" not in warnings[0] and "mdb_" not in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_a_datasource_dispatch_without_a_turn_key_prefix_fails_before_any_auth_call(monkeypatch):
+    """A pre-minted llm block without a prefix while the flag is on is a producer
+    misconfiguration; it fails loudly and never reaches auth."""
+    from cowork.common.settings.app_settings import TurnQueueSettings
+    from cowork.services.product_permissions import ProductPermissionUnavailable
+
+    monkeypatch.setattr(
+        prod, "list_verified_datasource_connections", AsyncMock(side_effect=AssertionError("listed without a turn key"))
+    )
+    settings = TurnQueueSettings(
+        datasource_enabled=True, datasource_producer_key_id="producer-v1", datasource_producer_key="producer-secret"
+    )
+    with pytest.raises(ProductPermissionUnavailable):
+        await prod._mint_datasource_block(
+            org_id="o1", user_id="u1", correlation_id="r", turn_key_id=None, disabled=None, settings=settings
+        )
+
+
+@pytest.mark.asyncio
+async def test_the_grant_binding_compares_identifiers_in_canonical_form(monkeypatch):
+    """Auth serialises the echoed ids through UUID fields, lowercase and hyphenated;
+    our own spelling must not fail the compare."""
+    from cowork.common.settings.app_settings import TurnQueueSettings
+
+    org_id = "0F3C2B9A-8D7E-4F6A-9B5C-1D2E3F4A5B6C"
+    user_id = "1A2B3C4D-5E6F-4A7B-8C9D-0E1F2A3B4C5D"
+    monkeypatch.setattr(
+        prod,
+        "list_verified_datasource_connections",
+        AsyncMock(return_value=[{"id": 7, "connector_id": "postgres", "name": "events", "status": "verified",
+                                 "credential_version": 3}]),
+    )
+    monkeypatch.setattr(
+        prod,
+        "register_datasource_grants",
+        AsyncMock(return_value={
+            "user_id": user_id.lower(),
+            "organization_id": org_id.lower(),
+            "turn_key_id": "mdb_prefix",
+            "correlation_id": "r",
+            "audience": "datasource-gateway",
+            "purpose": "execute",
+            "grants": [{"connection_id": 7, "credential_version": 3}],
+        }),
+    )
+    settings = TurnQueueSettings(
+        datasource_enabled=True, datasource_producer_key_id="producer-v1", datasource_producer_key="producer-secret"
+    )
+    block = await prod._mint_datasource_block(
+        org_id=org_id, user_id=user_id, correlation_id="r", turn_key_id="mdb_prefix", disabled=None, settings=settings
+    )
+    assert block == {"protocol_version": 1, "connections": [{"connection_id": 7, "credential_version": 3}]}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("interactive", [True, False])
 async def test_interactive_reaches_the_job_params(monkeypatch, interactive):
@@ -977,3 +1448,176 @@ async def test_interactive_defaults_to_false(monkeypatch):
     await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
                                             input_text="hi", model="m"))
     assert json.loads(fake.added[0][1]["payload"])["params"]["interactive"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_messages", [True, False])
+async def test_tool_messages_reaches_the_job_params(monkeypatch, tool_messages):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m", tool_messages=tool_messages))
+    job = json.loads(fake.added[0][1]["payload"])
+    assert job["params"]["tool_messages"] is tool_messages
+
+
+@pytest.mark.asyncio
+async def test_tool_messages_defaults_to_false(monkeypatch):
+    """Channel turns (turnqueue/remote_turn.py) never pass it: a bot cannot
+    render a tool's message, so the tool hands the content to the agent."""
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
+                                            input_text="hi", model="m"))
+    assert json.loads(fake.added[0][1]["payload"])["params"]["tool_messages"] is False
+
+
+_REPLY_STREAM = "scratchpad:reply:conv-1"
+_AUTHORIZED = ("progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"})
+
+
+def _foreign_reply(kind):
+    """A reply to an earlier turn of the same conversation."""
+    return {"payload": json.dumps({"correlation_id": "an-earlier-turn", "kind": kind, "data": {}})}
+
+
+async def _controller_redis(monkeypatch, *, earlier, answer, before_each_read=None):
+    """A real stream store holding `earlier` replies, whose job XADD has the
+    controller answer this turn ("r") with `answer`. Records each XREAD's
+    start ids, with the block cut short so a quiet read returns quickly."""
+    import fakeredis.aioredis
+
+    client = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    for fields in earlier:
+        await client.xadd(_REPLY_STREAM, fields)
+    xadd, xread = client.xadd, client.xread
+
+    async def answering_xadd(name, fields, *args, **kwargs):
+        entry_id = await xadd(name, fields, *args, **kwargs)
+        if name == "scratchpad:requests:conv-1":
+            for kind, data in answer:
+                await xadd(_REPLY_STREAM, _reply(kind, data))
+        return entry_id
+
+    reads = []
+
+    async def recorded_xread(streams, count=None, block=None):
+        reads.append(dict(streams))
+        if before_each_read is not None:
+            await before_each_read(xadd)
+        return await xread(streams, count=count, block=20)
+
+    monkeypatch.setattr(client, "xadd", answering_xadd)
+    monkeypatch.setattr(client, "xread", recorded_xread)
+    monkeypatch.setattr(prod, "get_redis", lambda: client)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    return client, reads
+
+
+@pytest.mark.asyncio
+async def test_a_turn_reads_only_the_replies_written_after_its_job(monkeypatch):
+    """The reply stream keeps a conversation's earlier turns' replies for an
+    hour. A turn starts reading after the newest one, so it neither re-reads
+    them nor fails on a kind this build does not know."""
+    client, reads = await _controller_redis(
+        monkeypatch,
+        earlier=[_foreign_reply("turn_delta"), _foreign_reply("turn_future"), _foreign_reply("turn_completed")],
+        answer=[_AUTHORIZED, ("turn_delta", {"text": "hi"}), ("turn_completed", {})],
+    )
+    (newest_earlier_id, _fields), = await client.xrevrange(_REPLY_STREAM, count=1)
+
+    items = await asyncio.wait_for(_drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+    ), include_policy=True), timeout=5)
+
+    assert items == [_AUTHORIZED, ("turn_delta", {"text": "hi"}), ("turn_completed", {})]
+    assert reads[0] == {_REPLY_STREAM: newest_earlier_id}
+
+
+@pytest.mark.asyncio
+async def test_a_conversations_first_turn_reads_its_reply_stream_from_the_start(monkeypatch):
+    _client, reads = await _controller_redis(
+        monkeypatch, earlier=[], answer=[_AUTHORIZED, ("turn_completed", {})],
+    )
+
+    items = await asyncio.wait_for(_drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+    )), timeout=5)
+
+    assert items == [("turn_completed", {})]
+    assert reads[0] == {_REPLY_STREAM: "0-0"}
+
+
+@pytest.mark.asyncio
+async def test_an_earlier_turns_late_replies_are_skipped_and_keep_no_turn_alive(monkeypatch):
+    """A previous turn still finishing can write after this turn's start id.
+    Its replies are skipped by correlation id and are not this turn's
+    progress: once they stop, the first quiet read past the idle bound,
+    counted from this turn's start, ends the turn."""
+    monkeypatch.setenv("COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS", "0.3")
+    late_replies = 8
+
+    async def an_earlier_turn_writes(xadd):
+        nonlocal late_replies
+        if late_replies:
+            late_replies -= 1
+            await asyncio.sleep(0.05)
+            await xadd(_REPLY_STREAM, _foreign_reply("turn_delta"))
+
+    _client, reads = await _controller_redis(
+        monkeypatch, earlier=[_foreign_reply("turn_delta")], answer=[],
+        before_each_read=an_earlier_turn_writes,
+    )
+
+    items = await asyncio.wait_for(_drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+    )), timeout=5)
+
+    (kind, data), = items
+    assert kind == "turn_failed"
+    assert data["error"] == prod.UNRESPONSIVE_WORKER_ERROR
+    # Eight reads each returned a late reply, and the first quiet one ended it.
+    assert len(reads) == 9
+
+
+@pytest.mark.asyncio
+async def test_an_earlier_turns_reply_of_an_unknown_kind_after_the_start_id_is_skipped(monkeypatch):
+    """An earlier turn still finishing after Stop can write a kind this build
+    does not know after this turn's start id. It is another turn's reply, so
+    it is skipped before its kind is validated, and this turn completes."""
+    replied = False
+
+    async def an_earlier_turn_then_this_one_replies(xadd):
+        nonlocal replied
+        if not replied:
+            replied = True
+            await xadd(_REPLY_STREAM, _foreign_reply("turn_future"))
+            for kind, data in (_AUTHORIZED, ("turn_completed", {})):
+                await xadd(_REPLY_STREAM, _reply(kind, data))
+
+    _client, _reads = await _controller_redis(
+        monkeypatch, earlier=[], answer=[], before_each_read=an_earlier_turn_then_this_one_replies,
+    )
+
+    items = await asyncio.wait_for(_drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+    )), timeout=5)
+
+    assert items == [("turn_completed", {})]
+
+
+@pytest.mark.asyncio
+async def test_this_turns_own_reply_of_an_unknown_kind_still_fails_it(monkeypatch):
+    """Only another turn's reply is skipped unread. A kind this build does not
+    know on this turn's own reply means the controller and this build
+    disagree, and it fails the turn rather than being ignored."""
+    from pydantic import ValidationError
+
+    await _controller_redis(monkeypatch, earlier=[], answer=[_AUTHORIZED, ("turn_future", {})])
+
+    with pytest.raises(ValidationError, match="kind"):
+        await asyncio.wait_for(_drain(prod.stream_remote_replies(
+            conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+        )), timeout=5)

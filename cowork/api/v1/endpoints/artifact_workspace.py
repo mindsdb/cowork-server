@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 
 from cowork.api.v1.artifact_preview import wants_comment_layer, wants_download
 from cowork.common.paths import (
@@ -70,13 +71,8 @@ _DRAFT_RESPONSE_HEADERS = {
 }
 _LIVE_PUBLISH_TIMEOUT_S = 60.0
 _LIVE_PUBLISH_LOCK_TTL_S = _LIVE_PUBLISH_TIMEOUT_S * 3
-_PRIVATE_DRAFT_ENTRIES = {
-    ".revisions",
-    ".published.json",
-    "metadata.json",
-    "README.md",
-    "backend.log",
-}
+# Matched against the first path component of a draft request.
+_PRIVATE_DRAFT_ENTRIES = NON_CONTENT_NAMES
 
 
 def _attachment_disposition(filename: str) -> str:
@@ -269,9 +265,9 @@ def _editable_source_selector(source, folder: Path, requested: str | None) -> st
         parts = _relative_file_parts(requested.strip())
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid artifact source path") from exc
-    # The journal only, matching the inner gate, and at any depth rather than
-    # just the first component. The private-listing set is a different
-    # question: it hides README.md, which is a source the service itself picks.
+    # Only the journal (any depth), like the inner gate: the private-listing
+    # set is not rejected because `metadata.primary` or an explicit path may
+    # legitimately name README.md or prd.md as the editable source.
     if JOURNAL_DIRNAME in parts:
         raise HTTPException(status_code=422, detail="Invalid artifact source path")
     folder_name = _artifact_folder_component(source, folder)

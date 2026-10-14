@@ -21,7 +21,7 @@ dependencies = [
     "alembic>=1.17.0",
     # First release that keeps DS_* scrub state per request; older ones write
     # it into this process's environment, shared by every org on the server.
-    "anton-agent>=2.26.9.21.1,<3",
+    "anton-agent>=2.26.10.4.1,<3",
     # Floor for GHSA-8bx3-mgpq-m8m9 (IDNA 2003 vs IDNA 2009 host-name encoding
     # mismatch in TLSStream/connect_tcp() lets a hijacked connection to an
     # internationalized domain present a certificate that validates against
@@ -168,15 +168,15 @@ packages = ["cowork"]
 # value or one artifact ends up with two identities. Anton `main` defines all
 # three, and since mindsdb/anton#429 it also carries the typed provider-auth
 # error and the per-request API-key supplier that refresh desktop credentials
-# without rebuilding an active session (ENG-2116). Neither feature needs a rev
-# pin any more, so this tracks the branch and the lockfile records the resolved
-# commit that `uv sync --frozen` installs.
+# without rebuilding an active session (ENG-2116).
+# Pin the tested revision so frozen image builds use the role-aware provider
+# and cached turn setup.
 #
 # The version-skew fallbacks in `services/providers.py` (the live supplier's
 # capability gate) and `handlers/turn_errors.py` (the legacy 401 classifier)
 # predate the `anton-agent` floor above, which no longer admits a release that
 # needs them.
-anton-agent = { git = "https://github.com/mindsdb/anton.git", branch = "main" }
+anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "5b0003aa5fab33e0bac957c30e4881653ba78dfa" }
 
 [dependency-groups]
 dev = [

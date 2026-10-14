@@ -172,6 +172,12 @@ ALLOWLIST = (
         "shell-free local Git operations, refused before spawn by _org_mode()",
     ),
     (
+        "server.py",
+        "_warm_agent_runtime",
+        "importlib.import_module",
+        "imports the fixed AGENT_RUNTIME_MODULES tuple of anton modules at startup; no module name comes from input or files",
+    ),
+    (
         "services/artifacts.py",
         "<module>",
         "subprocess",
