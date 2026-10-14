@@ -324,6 +324,32 @@ def _turn_style_context(channel: ChannelContext | None) -> str:
     )
 
 
+_PROJECT_FILE_READ_RULE = (
+    "You can read, search, extract from and analyse any of these project files without asking. "
+)
+
+
+def _project_file_actions_rule(act_first: bool) -> str:
+    """When the agent must ask before acting on project files.
+
+    Follows the "Act first, ask later" setting: a blanket ask-first rule here
+    outweighs anton's act-first discipline, which sits earlier in the prompt,
+    and the agent then asks before writing a file the user asked it to create.
+    Reading never needs permission, whatever the setting.
+    """
+    if not act_first:
+        return (
+            _PROJECT_FILE_READ_RULE
+            + "Ask the user for permission before you create, change, move or delete any of these files. "
+        )
+    return (
+        _PROJECT_FILE_READ_RULE
+        + "Create the files the user asks for and change the files they ask you to change "
+        "without asking for permission first. "
+        "Ask the user before deleting files or overwriting files they did not ask you to change. "
+    )
+
+
 # How a file the agent cannot reach gets to it. Stated on EVERY turn, not
 # just turns that have attachments — the project context above tells the agent
 # what it may not access and used to say nothing about how access is granted,
@@ -1081,10 +1107,9 @@ class AntonHarness:
             f"You are operating in the project {display_label(conversation.project)}."
             f"You have access to all of the files in the project at {str(base)} except for the .anton/ directory."
             "They are off limits. Do not mention the .anton/ directory in your responses."
-            "You can perform operations on these files via the scratchpad."
-            "You can freely read any of these project files."
-            "If you need to perform any actions on these files, ask the user for permission first."
-            "The only other files that you are allowed to access are any items that are attached to the conversation."
+            "You can perform operations on these files via the scratchpad. "
+            + _project_file_actions_rule(anton_settings.act_first)
+            + "The only other files that you are allowed to access are any items that are attached to the conversation."
             "Access to any files not attached to the conversation or located outside the project is strictly forbidden."
             "ALWAYS use the scratchpad to interact with files."
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
