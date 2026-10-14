@@ -20,6 +20,7 @@ from cowork.build_info import build_trace_metadata
 from cowork.channels.registry import PluginRegistry, get_registry
 from cowork.db.scoped import LOCAL_SCOPE, SYSTEM_SCOPE, ScopedSession, TenantScope, scope_for_background_context, scope_for_org
 from cowork.db.session import get_open_session
+from cowork.db.units import conversation_writes
 from cowork.handlers.responses import ResponsesHandler
 from cowork.harnesses.base import ChannelContext, HarnessProvider, get_harness
 from cowork.models.channel import ChannelBinding, ChannelSession
@@ -532,7 +533,6 @@ class AntonChannelRuntime:
             text = f"{sender_name}: {text}"
         blocks = await self.build_input_blocks(scoped, adapter, event, text)
 
-        _ = conversation.messages
         names = [a.filename for a in (event.message.attachments or [])]
         content = text or (f"[attachments: {', '.join(names)}]" if names else "")
         # Send time captured before the turn
@@ -567,14 +567,21 @@ class AntonChannelRuntime:
             # would replay the message into this turn AND resend it as the live
             # input. In `finally` so a crashed turn still records the inbound
             # message, matching the pre-history-replay behaviour.
-            ConversationService(scoped).save_user_message(
-                conversation.id, content, created_at=sent_at
-            )
+            #
+            # Each save holds the conversation's write lock, as every message
+            # writer in this process does: a turn sent from the UI into this
+            # conversation saves from a worker thread, and two writers
+            # numbering rows at once would give them the same seq.
+            async with conversation_writes(conversation.id):
+                ConversationService(scoped).save_user_message(
+                    conversation.id, content, created_at=sent_at
+                )
 
         reply = remote_failure.message if remote_failure is not None else "".join(collected)
-        ConversationService(scoped).save_assistant_turn(
-            conversation.id, reply, events, harness=harness_id, tool_rows=turn_rows,
-        )
+        async with conversation_writes(conversation.id):
+            ConversationService(scoped).save_assistant_turn(
+                conversation.id, reply, events, harness=harness_id, tool_rows=turn_rows,
+            )
         return reply, turn_used_tools(events)
 
     @staticmethod

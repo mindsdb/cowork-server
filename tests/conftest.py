@@ -5,10 +5,14 @@ module is imported (settings/engine are read at import time), then builds the
 schema directly and seeds the ``general`` project the runtime depends on.
 """
 import importlib
+import io
+import logging
 import os
 import pkgutil
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 TMP = Path(tempfile.mkdtemp(prefix="cowork-chan-test-"))
 # Force isolation (assignment, not setdefault, never touch a real DB).
@@ -222,3 +226,92 @@ def anton_responses_ready(monkeypatch):
         )
 
     return _set
+
+
+@pytest.fixture
+def one_connection_pool(monkeypatch):
+    """Point the app at a pool of one connection, and make POOL_TIMEOUT 2 s.
+
+    The test database is a SQLite file, so SQLAlchemy gives it a QueuePool with
+    the same wait-then-TimeoutError checkout Postgres gets. SQLite engines are
+    built with no pool settings (cowork.db.session), hence the engine built
+    here. POOL_TIMEOUT is set to the engine's own wait, so the refusal's
+    sentence, its Retry-After and the unit-slot wait all match it.
+    """
+    from sqlalchemy import create_engine
+
+    import cowork.db.session as db_session
+
+    uri = db_session.settings.database.uri
+    engine = create_engine(
+        uri, connect_args={"check_same_thread": False},
+        pool_size=1, max_overflow=0, pool_timeout=2,
+    )
+    monkeypatch.setitem(db_session._engines, uri, engine)
+    monkeypatch.setattr(db_session.settings.database, "pool_timeout", 2)
+    yield engine
+    # The cached sessionmaker would keep the disposed engine alive.
+    db_session._session_factories.pop(id(engine), None)
+    engine.dispose()
+
+
+OwnedHandlerKind = Literal["console", "all_file", "error_file"]
+
+
+@dataclass(frozen=True)
+class OwnedLog:
+    """A logger whose records pass through one production handler, then caplog."""
+
+    logger: logging.Logger
+    handler: logging.Handler
+    stream: io.StringIO
+
+    def output(self) -> str:
+        """What the production handler wrote: its stream, or its log file."""
+        self.handler.flush()
+        if isinstance(self.handler, logging.FileHandler):
+            return Path(self.handler.baseFilename).read_text()
+        return self.stream.getvalue()
+
+
+@pytest.fixture
+def owned_logger(monkeypatch, caplog, tmp_path):
+    """Route a logger through one production handler, then caplog.
+
+    The handler's filters rewrite a record before caplog sees it, as the root
+    console handler does in a running server. The logger does not propagate,
+    so a test proves the selected handler owns the filter instead of
+    borrowing the root console's, and its level is set here, so a test does
+    not depend on the level LOG_LEVEL gave root.
+    """
+    from cowork.common import logger as app_logger
+
+    handlers: list[logging.Handler] = []
+    levels: list[tuple[logging.Logger, int]] = []
+
+    def install(name: str, *, kind: OwnedHandlerKind = "console", level: int = logging.ERROR) -> OwnedLog:
+        stream = io.StringIO()
+        if kind == "console":
+            monkeypatch.setenv("RICH_LOGGING", "false")
+            handler = app_logger.setup_console_handler()
+            handler.setStream(stream)
+            handlers.append(handler)
+        else:
+            files = app_logger.setup_file_logging(str(tmp_path / "owned-logs"))
+            handlers.extend(files)
+            handler = files[0 if kind == "all_file" else 1]
+        logger = logging.getLogger(name)
+        monkeypatch.setattr(logger, "handlers", [handler, caplog.handler])
+        monkeypatch.setattr(logger, "propagate", False)
+        monkeypatch.setattr(logger, "disabled", False)
+        # setLevel, not an attribute patch: it also clears the cached
+        # isEnabledFor answers, which would otherwise keep the old level.
+        levels.append((logger, logger.level))
+        logger.setLevel(level)
+        return OwnedLog(logger=logger, handler=handler, stream=stream)
+
+    yield install
+    for logger, level in reversed(levels):
+        logger.setLevel(level)
+    for handler in handlers:
+        handler.close()
