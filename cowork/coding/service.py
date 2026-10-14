@@ -301,7 +301,6 @@ class CodingService(
             project.default_workspace_mode if project else None,
             runs_locally=computer_id in {None, self.control.local_computer.id},
             org_mode=_org_mode(),
-            project_task=project is not None,
         )
 
     def inspect_workspace(self, path: str) -> WorkspaceInspection:
