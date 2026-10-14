@@ -32,9 +32,15 @@ logger = logging.getLogger(__name__)
 
 def _published_state(raw_path: str) -> dict:
     """Delegate to the publish service so the tool and GUI agree on where
-    `.published.json` lives. Imported lazily to avoid a startup import cycle."""
+    `.published.json` lives. Imported lazily to avoid a startup import cycle.
+
+    Every helper here resolves paths in the turn's own scope, the one the
+    producer binds (use_settings_scope): a person's partition where projects
+    are personal. Unbound, the scan refuses on a partitioned deployment.
+    """
+    from cowork.common.settings.user_settings import current_settings_scope
     from cowork.services.publish import published_state
-    return published_state(raw_path)
+    return published_state(raw_path, scope=current_settings_scope())
 
 
 def _publish_artifact(raw_path: str, access: dict | None = None) -> dict:
@@ -43,12 +49,16 @@ def _publish_artifact(raw_path: str, access: dict | None = None) -> dict:
     Resolves the artifact, its root and the credential the same way the HTTP
     endpoints do — `publish_artifact` takes all three explicitly now.
     """
+    from cowork.common.settings.user_settings import current_settings_scope
     from cowork.services.publish import desktop_publish_context, publish_artifact
 
-    artifact, artifacts_base, api_key, publish_url = desktop_publish_context(raw_path)
+    scope = current_settings_scope()
+    artifact, artifacts_base, api_key, publish_url = desktop_publish_context(
+        raw_path, scope=scope
+    )
     return publish_artifact(
         artifact, artifacts_base=artifacts_base,
-        api_key=api_key, publish_url=publish_url, access=access,
+        api_key=api_key, publish_url=publish_url, access=access, scope=scope,
     )
 
 
@@ -56,8 +66,9 @@ def _published_owner_state(raw_path: str) -> dict:
     """Raw owner-side `.published.json` entry (mode/access_password/…) so the
     tool can preserve prior access on re-publish. Lazily imported to avoid a
     startup import cycle."""
+    from cowork.common.settings.user_settings import current_settings_scope
     from cowork.services.publish import published_owner_state
-    return published_owner_state(raw_path)
+    return published_owner_state(raw_path, scope=current_settings_scope())
 
 
 def _access_from_state(entry: dict) -> dict:

@@ -34,7 +34,7 @@ from pathlib import Path
 from uuid import UUID
 
 from cowork.db.personal_resources import PersonalResource
-from cowork.db.scoped import ScopedSession
+from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.services.artifacts import (
     ProjectArtifacts,
     _org_mode,
@@ -242,9 +242,9 @@ def artifacts_sources_for_scope(session: ScopedSession) -> list[ProjectArtifacts
     this falls back to the filesystem scan so the desktop list is unchanged.
     """
     if not (_org_mode() or session.scope.partitioned_for(PersonalResource.PROJECTS)):
-        return artifacts_sources_for_scan() + _sources_outside_the_projects_root(
-            session
-        )
+        return artifacts_sources_for_scan(
+            scope=session.scope
+        ) + _sources_outside_the_projects_root(session)
 
     from cowork.services.projects import ProjectService
 
@@ -327,9 +327,10 @@ def artifacts_sources_for_project(
     )
 
 
-def artifacts_sources_for_scan() -> list[ProjectArtifacts]:
-    """Desktop: the registered `.anton/artifacts` dirs found by scanning the
-    projects root.
+def artifacts_sources_for_scan(*, scope: TenantScope | None) -> list[ProjectArtifacts]:
+    """Desktop: the registered `.anton/artifacts` dirs found by scanning
+    ``scope``'s projects root — the unkeyed root for LOCAL_SCOPE, and a
+    person's partition root where their projects are personal.
 
     `project_id` is None here — desktop cards stay path-addressed. The directory
     name IS the project name: `create_project` builds both from one sanitized
@@ -337,7 +338,7 @@ def artifacts_sources_for_scan() -> list[ProjectArtifacts]:
     (services/projects.py).
     """
     sources: list[ProjectArtifacts] = []
-    for base in _scan_artifact_dirs():
+    for base in _scan_artifact_dirs(scope=scope):
         # ``_scan_artifact_dirs`` historically follows directory links in its
         # ``is_dir`` probe.  Do not let such a root become an authorization
         # source; ordinary desktop directories retain the exact same shape.

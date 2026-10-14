@@ -87,6 +87,9 @@ MODEL_RESOURCE: dict[str, PersonalResource] = {
 
 STORE_RESOURCE: dict[str, PersonalResource] = {
     "projects": PersonalResource.PROJECTS,
+    # Publish history (cowork.services.publish), part of an artifact's
+    # publish state.
+    "publish": PersonalResource.PROJECTS,
     "files": PersonalResource.FILES,
     "skills": PersonalResource.SKILLS,
     "code-skills": PersonalResource.SKILLS,

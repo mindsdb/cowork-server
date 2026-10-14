@@ -584,6 +584,7 @@ def cards_for_slugs(
     artifacts_base,
     slugs: list[str],
     *,
+    scope: TenantScope | None,
     project_id: str | None = None,
     project_name: str = "",
     project_label: str = "",
@@ -603,7 +604,8 @@ def cards_for_slugs(
     from it, and the serve route resolves that segment by name
     (`services.artifacts._project_artifacts_base`). `project_label` is what the
     card shows instead, when the caller has one
-    (`services.projects.display_label`).
+    (`services.projects.display_label`). `scope` is the turn's; it only finds
+    the serve URL's project by scanning when no `project_name` is given.
     """
     from cowork.services.artifacts import card_for_folder
 
@@ -613,6 +615,7 @@ def cards_for_slugs(
         try:
             card = card_for_folder(
                 base / slug, len(cards),
+                scope=scope,
                 project_id=project_id, project_name=project_name,
                 project_label=project_label,
                 # Without this the inline card's serveUrl is rediscovered by
@@ -679,6 +682,7 @@ async def publish_and_card_turn_artifacts(
         carded = set(touched_slugs)
     return cards_for_slugs(
         artifacts_base, sorted(carded),
+        scope=scope,
         project_id=project_id, project_name=project_name, project_label=project_label,
     )
 

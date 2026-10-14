@@ -38,6 +38,20 @@ def vault_for_scope(scope: "TenantScope | None" = None):
     return LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), scope, store="data-vault"))
 
 
+def turn_vault_for_scope(scope: "TenantScope | None"):
+    """The saved connections an in-process turn and an artifact's live backend
+    read for ``scope``.
+
+    That is ``scope``'s own vault (vault_for_scope): the person's where
+    connections are personal, the base vault where they are shared, and a
+    refusal for ``scope=None`` on a partitioned deployment, so an unbound turn
+    reads nobody's connections. It is the one read path both share, kept
+    apart from vault_for_scope, which every save uses, so read-only entries
+    can be layered over the scope's own here without reaching a save.
+    """
+    return vault_for_scope(scope)
+
+
 def persist_connection(
     connector_id: str,
     method: str | None,

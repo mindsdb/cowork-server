@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 import cowork.services.publish as publish_mod
+from cowork.db.scoped import LOCAL_SCOPE
 
 HASH = "pbkdf2_sha256$200000$c2FsdHNhbHRzYWx0c2FsdA==$ZGVyaXZlZGtleQ=="
 PUBLISH_URL = "https://view.example"
@@ -94,10 +95,10 @@ def test_leaving_password_mode_drops_the_stored_hash(page, publish_calls):
 
 def test_update_hands_the_stored_hash_back(page, publish_calls, monkeypatch):
     _publish(page, {"mode": "password", "password": "hunter2"})
-    monkeypatch.setattr(publish_mod, "desktop_artifact_and_base", lambda raw: (page, page.parent))
+    monkeypatch.setattr(publish_mod, "desktop_artifact_and_base", lambda raw, *, scope: (page, page.parent))
     monkeypatch.setattr(publish_mod, "desktop_publish_credential", lambda: ("k", PUBLISH_URL))
 
-    publish_mod.update_artifact(str(page))
+    publish_mod.update_artifact(str(page), scope=LOCAL_SCOPE)
 
     assert publish_calls[1]["access"] == {"mode": "password", "password": "hunter2"}
     assert publish_calls[1]["previous_access"]["password_hash"] == HASH
