@@ -28,6 +28,7 @@ from cowork.harnesses.memory.turn_layout import (
     person_turn_memory,
 )
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
+from cowork.managed import managed_folder
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REPLAY_ROLES, extract_scratchpad_cells
@@ -102,16 +103,25 @@ def _turn_cortex(*, layout: TurnMemoryLayout, mode: str, llm_client):
     """The turn's Cortex over its two learned tiers.
 
     The one place an in-process turn builds its Cortex, so the operator's
-    read-only managed memory layer joins the turn here.
+    read-only managed memory layer joins the turn here: every turn with a
+    managed folder gets its rules and lessons, a turn with no person included.
+    The argument is passed directly, never through supported_kwargs: create_app
+    refuses a managed folder on an anton without it (cortex_takes_managed_layer),
+    and a dropped layer would silently lose the operator's rules.
     """
     from anton.core.memory.cortex import Cortex
     from anton.core.memory.hippocampus import Hippocampus
 
+    managed = managed_folder()
+    managed_layer = (
+        {} if managed is None else {"managed_hc": Hippocampus(managed.memory_dir)}
+    )
     return Cortex(
         global_hc=Hippocampus(layout.global_dir),
         project_hc=Hippocampus(layout.project_dir),
         mode=mode,
         llm_client=llm_client,
+        **managed_layer,
     )
 
 
