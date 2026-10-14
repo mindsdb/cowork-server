@@ -25,7 +25,7 @@ from cowork.common.paths import (
 )
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
-from cowork.db.scoped import ScopedSession, scoped_storage_root, unsafe_unscoped_session
+from cowork.db.scoped import ScopedSession, TenantScope, scoped_storage_root, unsafe_unscoped_session
 from cowork.models.project import Project
 from cowork.services.shared_resources import RESOURCE_LOCK_TIMEOUT_SECONDS
 
@@ -84,6 +84,26 @@ def display_label(project: "Project") -> str:
     # (SimpleNamespace in tests, and any caller predating the column), and a
     # label helper must not be the thing that raises.
     return getattr(project, "display_name", None) or project.name
+
+
+def _rename_rewrites_skill_store(scope: TenantScope) -> bool:
+    """Whether a project rename under ``scope`` rewrites the project names in
+    the scope's skill store.
+
+    Skills name their projects by name, and a name is unique only inside one
+    partition. Where skills stay shared while projects are each person's own,
+    one store's skill names every person's same-named project, so rewriting
+    it for one person's rename would take the skill from everyone else's: the
+    store is left alone, and the renamed project loses the skill until
+    someone scopes it again. Everywhere else the store a rename rewrites is
+    no wider than the project's own partition. With projects shared and
+    skills personal that is the renamer's own store, and other people's
+    skills keep the old project name.
+    """
+    return not (
+        scope.partitioned_for(PersonalResource.PROJECTS)
+        and not scope.partitioned_for(PersonalResource.SKILLS)
+    )
 
 
 class ProjectNotFoundError(ValueError):
@@ -808,14 +828,15 @@ class ProjectService:
         old_path = Path(project.path)
         new_path = self._project_path(final_name)
         skill_service = SkillService(self.session.scope)
-        rewrites = (
-            skill_rewrites
-            if skill_rewrites is not None
-            else skill_service.prepare_project_reference_rewrites(
+        if not _rename_rewrites_skill_store(self.session.scope):
+            rewrites = []
+        elif skill_rewrites is not None:
+            rewrites = skill_rewrites
+        else:
+            rewrites = skill_service.prepare_project_reference_rewrites(
                 old_name,
                 final_name,
             )
-        )
         stage = ProjectRenameStage(
             project_id=project.id,
             old_name=old_name,

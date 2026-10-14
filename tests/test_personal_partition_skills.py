@@ -29,6 +29,7 @@ from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.principal import personal_partition_id
 from cowork.schemas.skills import SkillUpdateRequest
+from cowork.services.projects import ProjectService
 from cowork.services.skill_links import sync_turn_skill_links
 from cowork.services.skills import BUILTIN_SKILL_SLUGS, SkillService, link_turn_skills
 
@@ -345,4 +346,56 @@ async def test_desktop_turns_keep_the_fanned_out_project_folder(monkeypatch, tmp
         get_app_settings.cache_clear()
         with get_open_session() as db:
             db.exec(delete(Project).where(Project.path == str(project)))
+            db.commit()
+
+
+# ── a project rename and the skills that name it ────────────────────────────
+
+
+def _split(*, keep_shared: PersonalResource) -> tuple[TenantScope, TenantScope]:
+    """A and B on a deployment that leaves ``keep_shared`` off the list."""
+    resources = frozenset(ALL_PERSONAL_RESOURCES - {keep_shared})
+    return (
+        _person(partition=PARTITION_A, sub=SUB_A, resources=resources),
+        _person(partition=PARTITION_B, sub=SUB_B, resources=resources),
+    )
+
+
+def test_a_persons_rename_leaves_a_shared_skill_naming_everyones_project(scoped, monkeypatch):
+    """Skills shared, projects personal: A and B each own a `reports`, and the
+    shared skill scoped to `reports` applies to both. Rewriting it for A's
+    rename would take it from B's `reports`."""
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", "projects,conversations,files,pins,schedules")
+    get_app_settings.cache_clear()
+    alice, bob = _split(keep_shared=PersonalResource.SKILLS)
+    a_reports = ProjectService(scoped(alice)).create_project("reports")
+    b_reports = ProjectService(scoped(bob)).create_project("reports")
+    SkillService(alice).create_skill("sales", "Everyone's sales report.", projects=["reports"])
+
+    renamed = ProjectService(scoped(alice)).update_project(a_reports.id, name="q4")
+
+    assert renamed.name == "q4"
+    assert SkillService(bob).get_skill("sales").projects == ["reports"]
+    assert scoped(bob).get(Project, b_reports.id).name == "reports"
+
+
+def test_a_shared_projects_rename_rewrites_the_renamers_own_skills(scoped, monkeypatch):
+    """Projects shared, skills personal: the rename follows into A's own store,
+    and only there; B's skill keeps the old name."""
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", "skills")
+    get_app_settings.cache_clear()
+    alice, bob = _split(keep_shared=PersonalResource.PROJECTS)
+    reports = ProjectService(scoped(alice)).create_project(f"reports-{uuid4().hex[:6]}")
+    try:
+        SkillService(alice).create_skill("a-sales", "Alice's.", projects=[reports.name])
+        SkillService(bob).create_skill("b-sales", "Bob's.", projects=[reports.name])
+        old_name = reports.name
+
+        renamed = ProjectService(scoped(alice)).update_project(reports.id, name=f"q4-{uuid4().hex[:6]}")
+
+        assert SkillService(alice).get_skill("a-sales").projects == [renamed.name]
+        assert SkillService(bob).get_skill("b-sales").projects == [old_name]
+    finally:
+        with get_open_session() as db:
+            db.exec(delete(Project).where(Project.id == reports.id))
             db.commit()
