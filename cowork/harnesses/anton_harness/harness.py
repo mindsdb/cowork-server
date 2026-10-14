@@ -22,6 +22,11 @@ from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_scope_required
 from cowork.db.units import run_db, run_to_completion, unit_session
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
+from cowork.harnesses.memory.turn_layout import (
+    TurnMemoryLayout,
+    empty_turn_memory,
+    person_turn_memory,
+)
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
@@ -66,8 +71,10 @@ def _anton_mcp_wiring():
 
 
 def _vault_scratch_dir() -> Path:
-    """Where the temporary filtered data-vault directory is staged when a
-    turn disables one or more connections (see ``_build_chat_session``).
+    """Where a turn's temporary folder is staged when it needs one: the
+    filtered data vault of a turn that disables one or more connections, and
+    the empty memory tiers of a turn with no person (see
+    ``_new_turn_scratch_dir``).
 
     Local mode: cowork_home()/tmp, unchanged. Org mode: relocated off shared
     EFS storage by pod_local_only (see its docstring), because this directory
@@ -76,6 +83,34 @@ def _vault_scratch_dir() -> Path:
     location.
     """
     return pod_local_only(cowork_home() / "tmp", "tmp")
+
+
+def _new_turn_scratch_dir() -> Path:
+    """A fresh per-turn folder under ``_vault_scratch_dir()``.
+
+    ``_build_chat_session`` returns it, and ``stream_response`` removes it, with
+    everything under it, when the turn ends.
+    """
+    base = _vault_scratch_dir()
+    base.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix="cowork-turn-", dir=base))
+
+
+def _turn_cortex(*, layout: TurnMemoryLayout, mode: str, llm_client):
+    """The turn's Cortex over its two learned tiers.
+
+    The one place an in-process turn builds its Cortex, so the operator's
+    read-only managed memory layer joins the turn here.
+    """
+    from anton.core.memory.cortex import Cortex
+    from anton.core.memory.hippocampus import Hippocampus
+
+    return Cortex(
+        global_hc=Hippocampus(layout.global_dir),
+        project_hc=Hippocampus(layout.project_dir),
+        mode=mode,
+        llm_client=llm_client,
+    )
 
 
 #: Settings copied from the Cowork DB onto anton's own settings object, in
@@ -606,7 +641,7 @@ class AntonHarness:
                 "Turns must run on the remote worker in this deployment; "
                 "in-process execution is disabled."
             )
-        temp_vault_dir: Path | None = None
+        turn_scratch_dir: Path | None = None
         # Attribute + surface any artifact this turn created or edited. Anton's
         # artifact tools record what they touch as they run
         # (ChatSession.artifacts_touched), and that set — not a bare diff of the
@@ -706,7 +741,7 @@ class AntonHarness:
             skill_drafts = finalize_turn_skill_drafts(project_path, before_drafts, before_strays)
 
         try:
-            session, temp_vault_dir, seed_info = await self._build_chat_session(
+            session, turn_scratch_dir, seed_info = await self._build_chat_session(
                 conversation,
                 model=model,
                 reasoning_effort=reasoning_effort,
@@ -759,8 +794,8 @@ class AntonHarness:
         finally:
             if model_wait is not None:
                 model_wait.detach()
-            if temp_vault_dir:
-                shutil.rmtree(temp_vault_dir, ignore_errors=True)
+            if turn_scratch_dir:
+                shutil.rmtree(turn_scratch_dir, ignore_errors=True)
             if session is not None:
                 # Before the steps below, so none of them raising can skip it.
                 # Scheduled rather than awaited; see close_session_scratchpads.
@@ -987,9 +1022,7 @@ class AntonHarness:
         from anton.chat_session import build_runtime_context
         from anton.config.settings import AntonSettings
         from anton.context.self_awareness import SelfAwarenessContext
-        from anton.core.memory.cortex import Cortex
         # from anton.core.memory.episodes import EpisodicMemory
-        from anton.core.memory.hippocampus import Hippocampus
         from anton.core.session import ChatSessionConfig, SystemPromptContext
         # from anton.memory.history_store import HistoryStore
         from anton.tools import CONNECT_DATASOURCE_TOOL
@@ -1100,32 +1133,17 @@ class AntonHarness:
         skill_drafts_dir = anton_dir / "skill_drafts"
         context_dir = _settings_path(getattr(anton_settings, "context_dir", None), anton_dir / "context")
         episodes_dir = anton_dir / "episodes"
-        project_memory_dir = anton_dir / "memory"
-        for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir, project_memory_dir):
+        # The project's .anton/memory is created below only when it is this
+        # turn's project tier (person_turn_memory).
+        for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
         llm_client = self._build_llm_client(effort=reasoning_effort, model=model, settings=user)
         _apply_client_models(anton_settings, llm_client)
         self_awareness = SelfAwarenessContext(context_dir)
 
-        from cowork.common.settings.app_settings import get_app_settings
         from cowork.common.settings.user_settings import current_settings_scope
-        from cowork.db.scoped import scoped_user_storage_root
 
-        # Per-(org, user) via the turn's ambient scope — the in-process harness
-        # must read/write the same global-scope memory the /memory API serves.
-        global_memory_dir = scoped_user_storage_root(
-            Path(get_app_settings().memory.root_dir).expanduser(),
-            current_settings_scope(),
-            store="memory",
-        )
-        global_memory_dir.mkdir(parents=True, exist_ok=True)
-        cortex = Cortex(
-            global_hc=Hippocampus(global_memory_dir),
-            project_hc=Hippocampus(project_memory_dir),
-            mode=anton_settings.memory_mode if anton_settings.memory_enabled else "off",
-            llm_client=llm_client,
-        )
         # TODO: Is episodic memory required given that we are handling history outside of the harness?
         # episodic = EpisodicMemory(episodes_dir, enabled=settings.episodic_memory)
         # episodic.resume_session(conversation_id)
@@ -1213,15 +1231,16 @@ class AntonHarness:
 
         # When connections are disabled, a temporary data vault is created because within Anton,
         # the vault is used to inject a prompt related to the connected data sources.
+        # It lives in the turn's scratch folder, which the turn removes when it ends.
         data_vault = None
-        temp_vault_dir: Path | None = None
+        turn_scratch_dir: Path | None = None
         if LocalDataVault is not None:
             source_vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
             if disabled_connections:
-                _tmp_base = _vault_scratch_dir()
-                _tmp_base.mkdir(parents=True, exist_ok=True)
-                temp_vault_dir = Path(tempfile.mkdtemp(prefix="cowork-vault-", dir=_tmp_base))
-                data_vault = _build_filtered_vault(source_vault, disabled_connections, temp_vault_dir, LocalDataVault)
+                turn_scratch_dir = _new_turn_scratch_dir()
+                data_vault = _build_filtered_vault(
+                    source_vault, disabled_connections, turn_scratch_dir / "vault", LocalDataVault
+                )
             else:
                 data_vault = source_vault
             # Registers this turn's DS_* names and values for scrubbing, and
@@ -1290,11 +1309,45 @@ class AntonHarness:
                 initial_history = [self._stamp_message(m) for m in replayable]
                 seed_info = None
 
+            # The memory of the person who asked: their own tiers, read through
+            # the same resolvers as the /memory API. A turn with no person on a
+            # trusted-identity deployment gets two empty tiers in its scratch
+            # folder, memory off and no background passes, so it reads and
+            # writes nobody's memory.
+            memory_layout = person_turn_memory(
+                scope=current_settings_scope(),
+                project_path=base,
+                project_id=conversation.project_id,
+            )
+            if memory_layout is None:
+                if turn_scratch_dir is None:
+                    turn_scratch_dir = _new_turn_scratch_dir()
+                memory_layout = empty_turn_memory(turn_scratch_dir / "memory")
+                logger.warning(
+                    "memory: conversation %s has no person; the turn reads no "
+                    "learned memory and writes none",
+                    conversation.id,
+                )
+            memory_layout.global_dir.mkdir(parents=True, exist_ok=True)
+            memory_layout.project_dir.mkdir(parents=True, exist_ok=True)
+            cortex = _turn_cortex(
+                layout=memory_layout,
+                mode=(
+                    anton_settings.memory_mode
+                    if anton_settings.memory_enabled and memory_layout.learns
+                    else "off"
+                ),
+                llm_client=llm_client,
+            )
+
             config = ChatSessionConfig(
                 llm_client=llm_client,
                 settings=anton_settings,
                 self_awareness=self_awareness,
                 cortex=cortex,
+                # A turn that may not learn runs no end-of-turn memory pass
+                # either. Dropped by an anton that predates the field.
+                **supported_kwargs(ChatSessionConfig, background_memory=memory_layout.learns),
                 # episodic=episodic,
                 system_prompt_context=SystemPromptContext(
                     runtime_context=build_runtime_context(anton_settings),
@@ -1375,8 +1428,11 @@ class AntonHarness:
             # (tests/test_no_subprocess_static.py) treat any other ChatSession(...)
             # call under cowork/ as a new, unreviewed execution site.
             session = build_chat_session(config)
-            return session, temp_vault_dir, seed_info
+            return session, turn_scratch_dir, seed_info
         except Exception:
+            # The turn never starts, so nothing else removes its scratch folder.
+            if turn_scratch_dir is not None:
+                shutil.rmtree(turn_scratch_dir, ignore_errors=True)
             # Mirrors anton's own build_cloud_chat_session fix (ENG-1816
             # code review): ChatSession.close() is what closes mcp_sessions,
             # so a failure ANYWHERE below MCP discovery — not just
