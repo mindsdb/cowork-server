@@ -74,6 +74,9 @@ def http():
     ):
         mock.post.return_value.json.return_value = {"key": "mdb_new"}
         mock.schedule_retry = retry
+        # A live hand-over for ORG_A, as the mint expects to find when it installs.
+        runtime_credential.set_minds_credential("jwt")
+        runtime_credential.set_organization(ORG_A)
         yield mock
 
 
@@ -112,6 +115,7 @@ class TestRefresh:
 
     def test_an_org_change_mints_at_once(self, http):
         runtime_credential.set_inference_key(_key(org=ORG_A, minutes_left=29))
+        runtime_credential.set_organization(ORG_B)
 
         inference_key.refresh_inference_key("jwt", ORG_B)
 
@@ -145,6 +149,22 @@ class TestRefresh:
 
         assert runtime_credential.get_inference_key() is None
         http.schedule_retry.assert_called_once()
+
+    def test_a_key_minted_after_sign_out_is_revoked_not_installed(self, http):
+        runtime_credential.clear_minds_credential()
+
+        inference_key.refresh_inference_key("jwt", ORG_A)
+
+        assert runtime_credential.get_inference_key() is None
+        http.delete.assert_called_once()
+
+    def test_a_key_minted_for_an_org_left_meanwhile_is_revoked(self, http):
+        runtime_credential.set_organization(ORG_B)
+
+        inference_key.refresh_inference_key("jwt", ORG_A)
+
+        assert runtime_credential.get_inference_key() is None
+        http.delete.assert_called_once()
 
     def test_mints_for_the_desktop_workspace_pick(self, http):
         with patch.object(inference_key, "desktop_workspace_pick", return_value="ws-1"):
