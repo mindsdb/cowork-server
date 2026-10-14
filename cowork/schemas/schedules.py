@@ -53,6 +53,13 @@ class RunStatus(str, Enum):
     cancelled = "cancelled"
 
 
+class OccurrenceStatus(str, Enum):
+    active = "active"
+    success = "success"
+    failed = "failed"
+    cancelled = "cancelled"
+
+
 class ScheduleCreateRequest(CamelRequest):
     title: str
     prompt: str
@@ -106,4 +113,6 @@ class ScheduleRunResponse(CamelResponse):
     error: str | None
     conversation_id: UUID | None
     is_manual: bool
+    occurrence_id: UUID | None = None
+    attempt: int | None = None
     created_at: datetime | None

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 import sqlalchemy as sa
@@ -9,8 +9,8 @@ from sqlalchemy.exc import IntegrityError
 from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
-from cowork.models.schedule import Schedule, ScheduleRun
-from cowork.schemas.schedules import RunStatus
+from cowork.models.schedule import Schedule, ScheduleOccurrence, ScheduleRun
+from cowork.schemas.schedules import OccurrenceStatus, RunStatus
 
 
 class ScheduleService:
@@ -332,6 +332,13 @@ class ScheduleRunService:
             run.status = RunStatus.failed
             run.error = error
             self.session.add(run)
+            # Settle the occurrence too, without a retry: a run cut off by a
+            # quit may be resumed days later, and replaying a stale slot then
+            # would surprise more than it helps.
+            if run.occurrence_id is not None:
+                ScheduleOccurrenceService(self.session).settle(
+                    run.occurrence_id, OccurrenceStatus.failed, error=error
+                )
         self.session.commit()
         return len(runs)
 
@@ -350,3 +357,174 @@ class ScheduleRunService:
                 .limit(limit)
             ).all()
         )
+
+
+def _utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+class ScheduleOccurrenceService:
+    """Claims, attempts and settles schedule occurrences.
+
+    Runs on the scheduler's unscoped session: an occurrence has no org column
+    and is only ever reached through its schedule, which the scheduler has
+    already resolved.
+    """
+
+    def __init__(self, session: ScopedSession) -> None:
+        self.session = session
+
+    def claim(
+        self,
+        schedule_id: UUID,
+        *,
+        occurrence_key: str,
+        trigger_source: str,
+        scheduled_for: datetime,
+        max_attempts: int,
+        lease_seconds: float,
+    ) -> ScheduleOccurrence | None:
+        """Insert the occurrence and commit it with whatever the caller staged.
+
+        Returns None when the key was already claimed or the schedule already
+        has an active occurrence; the caller's staged changes are rolled back
+        with the losing insert, so a slot advanced alongside a failed claim
+        stays where the winner left it.
+
+        The claim holds a lease from the start, so an occurrence whose process
+        dies before its first attempt is reaped like one that died mid-run.
+        """
+        now = datetime.now(timezone.utc)
+        occurrence = ScheduleOccurrence(
+            schedule_id=schedule_id,
+            occurrence_key=occurrence_key,
+            trigger_source=trigger_source,
+            scheduled_for=scheduled_for,
+            status=OccurrenceStatus.active,
+            max_attempts=max_attempts,
+            next_attempt_at=now,
+            lease_expires_at=now + timedelta(seconds=lease_seconds),
+        )
+        self.session.add(occurrence)
+        try:
+            self.session.commit()
+        except IntegrityError:
+            self.session.rollback()
+            return None
+        self.session.refresh(occurrence)
+        return occurrence
+
+    def get(self, occurrence_id: UUID) -> ScheduleOccurrence | None:
+        return self.session.get(ScheduleOccurrence, occurrence_id)
+
+    def has_active(self, schedule_id: UUID) -> bool:
+        return self.session.exec(
+            self.session.select(ScheduleOccurrence)
+            .where(ScheduleOccurrence.schedule_id == schedule_id)
+            .where(ScheduleOccurrence.status == OccurrenceStatus.active)
+            .limit(1)
+        ).first() is not None
+
+    def start_attempt(
+        self, occurrence_id: UUID, *, is_manual: bool, lease_seconds: float
+    ) -> ScheduleRun | None:
+        """Number and record the next attempt, or None when there is none to
+        start: the occurrence settled, an attempt is already running, or
+        another poller started this same attempt first."""
+        occurrence = self.get(occurrence_id)
+        now = datetime.now(timezone.utc)
+        if (
+            occurrence is None
+            or occurrence.status != OccurrenceStatus.active
+            or occurrence.next_attempt_at is None
+            or _utc(occurrence.next_attempt_at) > now
+        ):
+            return None
+        occurrence.attempts += 1
+        occurrence.next_attempt_at = None
+        occurrence.lease_expires_at = now + timedelta(seconds=lease_seconds)
+        run = ScheduleRun(
+            schedule_id=occurrence.schedule_id,
+            started_at=now,
+            status=RunStatus.running,
+            is_manual=is_manual,
+            occurrence_id=occurrence.id,
+            attempt=occurrence.attempts,
+        )
+        self.session.add(occurrence)
+        self.session.add(run)
+        try:
+            self.session.commit()
+        except IntegrityError:
+            # (occurrence_id, attempt) is taken: another poller won the race.
+            self.session.rollback()
+            return None
+        self.session.refresh(run)
+        return run
+
+    def settle(self, occurrence_id: UUID, status: str, *, error: str | None = None) -> None:
+        """Stage the occurrence's final status. The caller commits."""
+        occurrence = self.get(occurrence_id)
+        if occurrence is None or occurrence.status != OccurrenceStatus.active:
+            return
+        occurrence.status = status
+        occurrence.error = error
+        occurrence.next_attempt_at = None
+        occurrence.lease_expires_at = None
+        occurrence.settled_at = datetime.now(timezone.utc)
+        self.session.add(occurrence)
+
+    def fail_attempt(
+        self, occurrence_id: UUID, *, error: str, retry_delay: float | None
+    ) -> bool:
+        """Stage a failed attempt: schedule the next one after ``retry_delay``
+        seconds, or settle failed when the delay is None or the attempts are
+        spent. Returns True when a retry was scheduled. The caller commits."""
+        occurrence = self.get(occurrence_id)
+        if occurrence is None or occurrence.status != OccurrenceStatus.active:
+            return False
+        if retry_delay is None or occurrence.attempts >= occurrence.max_attempts:
+            self.settle(occurrence_id, OccurrenceStatus.failed, error=error)
+            return False
+        occurrence.error = error
+        occurrence.lease_expires_at = None
+        occurrence.next_attempt_at = datetime.now(timezone.utc) + timedelta(seconds=retry_delay)
+        self.session.add(occurrence)
+        return True
+
+    def ready_for_attempt(self, now: datetime) -> list[UUID]:
+        """Cron occurrences whose next attempt is due, oldest first. A manual
+        occurrence is started by the request that claimed it, never here."""
+        return list(
+            self.session.exec(
+                self.session.select(ScheduleOccurrence.id)
+                .where(ScheduleOccurrence.status == OccurrenceStatus.active)
+                .where(ScheduleOccurrence.trigger_source != "manual")
+                .where(ScheduleOccurrence.next_attempt_at.is_not(None))  # type: ignore[union-attr]
+                .where(ScheduleOccurrence.next_attempt_at <= now)  # type: ignore[operator]
+                .order_by(ScheduleOccurrence.next_attempt_at)  # type: ignore[arg-type]
+            ).all()
+        )
+
+    def expired_leases(self, now: datetime) -> list[ScheduleOccurrence]:
+        """Active occurrences that outlived their lease: the process holding
+        them died before or during an attempt, or its last writes never
+        landed. An occurrence waiting for a retry holds no lease."""
+        return list(
+            self.session.exec(
+                self.session.select(ScheduleOccurrence)
+                .where(ScheduleOccurrence.status == OccurrenceStatus.active)
+                .where(ScheduleOccurrence.lease_expires_at.is_not(None))  # type: ignore[union-attr]
+                .where(ScheduleOccurrence.lease_expires_at < now)  # type: ignore[operator]
+            ).all()
+        )
+
+    def running_attempt(self, occurrence_id: UUID) -> ScheduleRun | None:
+        return self.session.exec(
+            self.session.select(ScheduleRun)
+            .where(ScheduleRun.occurrence_id == occurrence_id)
+            .where(ScheduleRun.status == RunStatus.running)
+            .limit(1)
+        ).first()
