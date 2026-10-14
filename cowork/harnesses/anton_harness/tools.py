@@ -843,9 +843,12 @@ async def _cowork_label_connection(session: Any, tc_input: dict) -> str:
     if not engine or not name or not label:
         return "label_connection: `engine`, `name`, and `label` are all required."
     try:
+        from cowork.common.settings.user_settings import current_settings_scope
         from cowork.services.connectors.persist import set_connection_label
 
-        stored = set_connection_label(engine, name, label)
+        # The turn's own vault: the label lands on the asker's connection, and
+        # an unbound turn on a partitioned deployment is refused.
+        stored = set_connection_label(engine, name, label, scope=current_settings_scope())
     except Exception as exc:
         logger.exception("Cowork label_connection failed")
         return f"label_connection: could not set label ({exc})"

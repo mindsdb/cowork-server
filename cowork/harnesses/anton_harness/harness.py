@@ -1227,15 +1227,19 @@ class AntonHarness:
             "The staged skill surfaces as a card the user explicitly saves or downloads; it is not saved until they do."
         )
 
-        from cowork.common.settings.app_settings import get_app_settings
-
         # When connections are disabled, a temporary data vault is created because within Anton,
         # the vault is used to inject a prompt related to the connected data sources.
         # It lives in the turn's scratch folder, which the turn removes when it ends.
         data_vault = None
         turn_scratch_dir: Path | None = None
         if LocalDataVault is not None:
-            source_vault = LocalDataVault(Path(get_app_settings().connector.vault_dir))
+            from cowork.services.connectors.persist import turn_vault_for_scope
+
+            # The asker's own connections, from the turn's bound scope
+            # (use_settings_scope), never the operator view _units_scope falls
+            # back to: an unbound turn on a partitioned deployment is refused
+            # here rather than handed the base vault.
+            source_vault = turn_vault_for_scope(current_settings_scope())
             if disabled_connections:
                 turn_scratch_dir = _new_turn_scratch_dir()
                 data_vault = _build_filtered_vault(

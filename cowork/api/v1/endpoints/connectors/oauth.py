@@ -63,6 +63,19 @@ async def start_oauth(service: str, request: Request, scope: ScopeDep,
             service, request, OAuthSettings(),
             {"client_id": body.client_id, "client_secret": body.client_secret, "extra_fields": body.extra_fields},
         )
+    if scope.personal:
+        # The local flow carries no person: OAuthStateStore keeps one pending
+        # start per service for the whole deployment, and the callback saves
+        # with no scope, which a deployment that trusts identity headers
+        # refuses (scoped_storage_root). A person's sign-in could only fail
+        # there or land outside their own vault, so it is refused up front.
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Signing in to a service from here is not available on this deployment. "
+                "Connect it with its credentials instead."
+            ),
+        )
     return oauth_service.start(service, OAuthSettings(), client_id=body.client_id, client_secret=body.client_secret, extra_fields=body.extra_fields)
 
 
