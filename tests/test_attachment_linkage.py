@@ -198,7 +198,7 @@ def test_upload_rejects_colon_bearing_session_ids():
 
     async def flow():
         transport = httpx.ASGITransport(app=create_app())
-        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             r = await client.post(
                 "/api/v1/attachments/general/bad:id/upload",
                 files={"files": ("a.txt", b"hi", "text/plain")},
@@ -221,7 +221,7 @@ def test_generic_files_endpoint_rejects_reserved_attachment_namespace():
 
     async def flow():
         transport = httpx.ASGITransport(app=create_app())
-        async with httpx.AsyncClient(transport=transport, base_url="http://t") as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             r = await client.post(
                 "/api/v1/files/",
                 data={"purpose": "attachment:room:42"},

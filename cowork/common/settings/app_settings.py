@@ -685,6 +685,17 @@ class AppSettings(Settings):
             ]
         return self
 
+    allowed_hosts: list[str] = Field(
+        default=[],
+        validation_alias=AliasChoices("COWORK_ALLOWED_HOSTS"),
+        description=(
+            "Extra Host names accepted when COWORK_REQUIRE_AUTH is off in local "
+            "tenancy (JSON array). localhost and IP addresses are always accepted; "
+            "any other name, e.g. a domain, a tunnel or a Docker service name, "
+            "must be listed here."
+        ),
+    )
+
     require_auth: bool = Field(
         default=False,
         validation_alias=AliasChoices("COWORK_REQUIRE_AUTH"),
