@@ -30,6 +30,7 @@ from pathlib import Path
 
 from cowork.common.paths import dir_rmdir, dir_unlink, pinned_dir, safe_join_lexical
 from cowork.common.settings import get_app_settings
+from cowork.db.scoped import tenant_scope_required
 from cowork.models.skill import Skill
 
 logger = logging.getLogger(__name__)
@@ -70,10 +71,10 @@ def _external_project_dirs() -> dict[str, Path]:
     A failure degrades to the scan alone, which is the behaviour before
     adopted folders existed, so it is logged rather than raised.
     """
-    if get_app_settings().tenancy_mode == "org":
-        # LOCAL_SCOPE below disables org filtering, so this query would read
-        # every tenant's rows. A folder can only be adopted on a local
-        # deployment, so there is nothing here to find.
+    if tenant_scope_required():
+        # LOCAL_SCOPE below disables partition filtering, so this query would
+        # read every org's or person's rows. A folder can only be adopted on an
+        # unpartitioned deployment, so there is nothing here to find.
         return {}
     try:
         from cowork.db.scoped import LOCAL_SCOPE, ScopedSession

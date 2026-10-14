@@ -18,7 +18,7 @@ from cowork.common.logger import get_logger, log_context
 from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import current_settings_scope
-from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_scope_required
 from cowork.db.units import run_db, run_to_completion, unit_session
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
@@ -453,16 +453,16 @@ async def _read_attachments(conversation, *, scope: TenantScope | None) -> list[
     they could not be looked up.
 
     ``scope`` is the turn's bound scope (use_settings_scope), never one derived
-    from the row. No scope in org mode is an invariant violation, and so is a
-    conversation of another org: both log and list nothing. A failed read logs
-    too. A wait for a connection that runs out is the turn's failure, not a
-    missing listing, so it propagates.
+    from the row. No scope on a partitioned deployment (tenant_scope_required)
+    is an invariant violation, and so is a conversation of another org: both
+    log and list nothing. A failed read logs too. A wait for a connection that
+    runs out is the turn's failure, not a missing listing, so it propagates.
     """
     try:
         if scope is None:
-            if get_app_settings().tenancy_mode == "org":
+            if tenant_scope_required():
                 logger.warning(
-                    "attachments: no tenant scope is bound in org mode; "
+                    "attachments: no tenant scope is bound on a partitioned deployment; "
                     "listing skipped (conversation %s)", conversation.id,
                 )
                 return None
