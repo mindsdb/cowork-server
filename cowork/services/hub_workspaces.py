@@ -30,6 +30,8 @@ from typing import Any, Optional
 import httpx
 from pydantic import BaseModel, Field
 
+from cowork.common.settings import runtime_credential
+
 logger = logging.getLogger(__name__)
 
 # Same split-TTL shape as the model catalog: a reachable listing is cached long
@@ -176,9 +178,9 @@ async def _get_json(path: str, bearer_token: str) -> Optional[Any]:
 
 
 async def fetch_hub_workspaces(*, bearer_token: str, org_id: str, user_id: str) -> HubWorkspaceListing:
-    """The workspaces this caller may use in their active organization.
+    """The workspaces this caller may use in their active organization, or a desktop's pinned one.
 
-    Reads ``GET /v1/organizations/current/workspaces/``, which auth gates on the
+    Reads ``GET /v1/organizations/current/workspaces/`` (``<id>`` for a pinned desktop), which auth gates on the
     role catalog rather than the relationship engine, so it answers in an
     environment with no OpenFGA configured. Every route under
     ``/v1/workspaces/<id>/`` does not, and would answer 503 there.
@@ -197,6 +199,12 @@ async def fetch_hub_workspaces(*, bearer_token: str, org_id: str, user_id: str) 
     if not bearer_token:
         return HubWorkspaceListing()
 
+    # A desktop lists the organization it bills, not the one Keycloak has active,
+    # which follows a switch on the web. None in org mode.
+    pinned = runtime_credential.get_organization()
+    org_id = pinned or org_id
+    path = f"/organizations/{pinned}/workspaces/" if pinned else "/organizations/current/workspaces/"
+
     cache_key = _cache_key(org_id=org_id, user_id=user_id, bearer_token=bearer_token)
     cached = _listing_cache.get(cache_key)
     if cached:
@@ -204,7 +212,7 @@ async def fetch_hub_workspaces(*, bearer_token: str, org_id: str, user_id: str) 
         if (time.monotonic() - stamped) < (_TTL_OK if value.reachable else _TTL_FAIL):
             return value
 
-    payload = await _get_json("/organizations/current/workspaces/", bearer_token)
+    payload = await _get_json(path, bearer_token)
     listing = _parse_listing(payload)
     _sweep(_listing_cache)
     _listing_cache[cache_key] = (time.monotonic(), listing)
