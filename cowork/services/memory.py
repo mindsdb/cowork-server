@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import stat
 from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Iterator, Literal
 from uuid import UUID
@@ -15,6 +17,8 @@ from pydantic import (
     field_validator,
 )
 
+from cowork.common.paths import dir_lstat, dir_rmtree, dir_unlink, pinned_dir
+from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.harnesses.memory.store import (
@@ -22,6 +26,7 @@ from cowork.harnesses.memory.store import (
     PROJECT_SLOTS,
     ProjectMemoryStore,
     SlotRead,
+    project_memory_store,
 )
 from cowork.models.project import Project
 from cowork.principal import Principal
@@ -66,10 +71,19 @@ def _project_slot_coordination(
             raise ValueError(f"Project {project_id} not found.")
         if session.scope.org_mode:
             session.refresh(project)
-        store = ProjectMemoryStore(Path(project.path))
+        store = _project_store(scope=session.scope, project=project)
         key = project_memory_resource_key(project.id, category.value)
         with access.coordination_lock(PROJECT_MEMORY, key):
             yield project, store, key
+
+
+def _project_store(*, scope: TenantScope, project: Project) -> ProjectMemoryStore:
+    """The project tier ``scope`` reads and writes for ``project``: a person's
+    own tier in a personal partition, the project's ``.anton/memory`` elsewhere
+    (project_memory_store)."""
+    return project_memory_store(
+        scope=scope, project_path=Path(project.path), project_id=project.id
+    )
 
 
 def _slot_holds_content(state: SlotRead) -> bool:
@@ -440,6 +454,55 @@ def _apply_project_engram(
     return True
 
 
+class PersonMemoryResetError(ValueError):
+    """A reset named no person whose memory is their own to remove."""
+
+
+@dataclass(frozen=True)
+class PersonMemoryReset:
+    """What ``reset_person_memory`` removed."""
+
+    # The person's global tier, which holds every project tier of theirs in a
+    # personal partition.
+    root: Path
+    # False when the person had no memory yet, so nothing was there to remove.
+    removed: bool
+
+
+def reset_person_memory(scope: TenantScope) -> PersonMemoryReset:
+    """Remove all of one person's learned memory.
+
+    Keyed by ``scope`` alone, so an operator command and a later self-service
+    route reach the same folder. A personal partition keeps every project tier
+    under the person's global tier (project_memory_store), so removing that
+    one folder clears both tiers. In org mode the person's own memory is the
+    global tier; project memory there is shared per project and stays.
+
+    Refuses a scope whose memory is not one person's: no user in scope, the
+    operator view, the desktop, or a deployment that keeps memory shared,
+    where the folder below would be everyone's base tier.
+    """
+    if not (scope.partitioned_for(PersonalResource.MEMORY) and scope.user_id):
+        raise PersonMemoryResetError(
+            "Memory reset needs a person whose memory is kept per person"
+        )
+    root = GlobalMemoryStore(scope=scope).root
+    try:
+        # Pinned without following a link at `users`, then removed by name
+        # under that handle: a link planted at the person's own folder is
+        # unlinked, never followed into another tier.
+        with pinned_dir(root.parent, nofollow_base=True) as users:
+            entry = dir_lstat(users, root.name)
+            if stat.S_ISDIR(entry.st_mode):
+                dir_rmtree(users, root.name)
+            else:
+                dir_unlink(users, root.name)
+    except FileNotFoundError:
+        return PersonMemoryReset(root=root, removed=False)
+    logger.info("memory: removed a person's memory at %s", root)
+    return PersonMemoryReset(root=root, removed=True)
+
+
 class MemoryService:
     def __init__(
         self,
@@ -538,8 +601,10 @@ class MemoryService:
         if project_id is not None:
             projects = [p for p in projects if p.id == project_id]
 
+        # In a personal partition each project tier is the caller's own
+        # (project_memory_store), so the listing holds nothing of anyone else.
         for project in projects:
-            store = ProjectMemoryStore(Path(project.path))
+            store = _project_store(scope=self.session.scope, project=project)
             for category in PROJECT_SLOTS:
                 state = store.read_state(category)
                 items.append(
@@ -567,7 +632,7 @@ class MemoryService:
         if scope == MemoryScope.global_:
             return self._global_store.read(category)
         project = self._resolve_project(project_id)
-        return ProjectMemoryStore(Path(project.path)).read(category)
+        return _project_store(scope=self.session.scope, project=project).read(category)
 
     def _read_for_response(
         self,
@@ -582,7 +647,7 @@ class MemoryService:
         # An unreadable slot keeps the historical fail-soft read body, but the
         # response must not advertise a mutation capability when authorization
         # could not establish whether a legacy shared slot exists.
-        return ProjectMemoryStore(Path(project.path)).read_state(category)
+        return _project_store(scope=self.session.scope, project=project).read_state(category)
 
     def _write(
         self,
@@ -808,7 +873,7 @@ class MemoryService:
         if project_id is None:
             raise ValueError("project_id is required for project-scoped memory.")
         key = project_memory_resource_key(project_id, category.value)
-        store = ProjectMemoryStore(Path(self._resolve_project(project_id).path))
+        store = _project_store(scope=self.session.scope, project=self._resolve_project(project_id))
 
         if (
             self.session.scope.org_mode
