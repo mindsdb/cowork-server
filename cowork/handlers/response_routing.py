@@ -15,6 +15,9 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal
 
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+from cowork.common.logger import exception_http_status
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.services.providers import build_llm_client
 
@@ -208,12 +211,27 @@ _DENIES_PRODUCT_RE = re.compile(
     rf"|{_DENIAL_ADJ_ATTRIBUTIVE}"
 )
 
+# A direct answer is persisted as history, so one naming the gate's own tool
+# teaches the agent that tool exists. Two shapes reach here as text: a call the
+# endpoint failed to parse (local servers stream it as content), and a small
+# model describing its one visible tool. Whole word, because the paraphrases
+# vary far more than the name does; a false positive costs one hop. Only letters
+# and digits bound the name, so `delegate-tool` and `delegate_tool` still match.
+_TEXT_TOOL_CALL_MARKERS = (
+    r"<tool_call>", r"<\|tool_call\|>", r"\[TOOL_CALLS\]", r"<function=", r"tool▁call▁begin",
+)
+_GATE_TOOL_RE = re.compile(
+    r"(?<![A-Za-z0-9])%s(?![A-Za-z0-9])|%s"
+    % (re.escape(_DELEGATE_TOOL["name"]), "|".join(_TEXT_TOOL_CALL_MARKERS)),
+    re.IGNORECASE,
+)
+
 
 class _RejectedAnswer(Exception):
     """The gate produced an answer we will not ship; delegate instead.
 
-    ``reason`` is the delegation reason the decision carries, so the two
-    rejection shapes stay countable apart in traces.
+    ``reason`` is the delegation reason the decision carries, so each
+    rejection shape stays countable apart in traces.
     """
 
     def __init__(self, reason: str, evidence: str) -> None:
@@ -239,6 +257,15 @@ def denies_our_product(text: str) -> str | None:
     """
     match = _DENIES_PRODUCT_RE.search(text or "")
     return " ".join(match.group(0).split())[:120] if match else None
+
+
+def names_gate_tool(text: str) -> str | None:
+    """The gate's tool name or a text tool-call marker found in ``text``, or None.
+
+    Exported for the same reason as :func:`names_foreign_product`.
+    """
+    match = _GATE_TOOL_RE.search(text or "")
+    return match.group(0) if match else None
 
 
 @dataclass(frozen=True)
@@ -269,7 +296,7 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
     denying that our own product can be identified or exists (ENG-2423): also
     delegations, but raised rather than returned as None so the decision can
     carry its own reason instead of reporting that the model declined, which it
-    did not.
+    did not. An answer naming the gate's own tool raises it the same way.
 
     Streaming is what makes the budget meetable: the delegate decision is the
     first event, so the ~100% delegate path pays only
@@ -330,7 +357,10 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
     answer = text.strip()
     if not answer:
         return None
-    # The fifth discard condition (ENG-2423).  An answer that names another AI
+    if names_gate_tool(answer) is not None:
+        logger.info("[gate] discarding direct answer naming the gate's own tool; delegating")
+        raise _RejectedAnswer("router_answer_named_gate_tool", "gate tool")
+    # An answer that names another AI
     # product is, on this gate, overwhelmingly the model describing itself as
     # that product — telling a user to install the ChatGPT desktop app when they
     # asked how to install Cowork.  Discarding here rather than post-hoc is what
@@ -465,6 +495,57 @@ def ineligible_reason(*, has_non_text_input: bool, has_attachments: bool, has_di
     return None
 
 
+
+# Naming a concrete file requires the full agent's file context even when the
+# question is phrased conversationally. This only delegates; it never authorizes
+# file access or fabricates a fast answer. Normal tool and completion checks run.
+_FILE_CONTEXT_RE = re.compile(
+    r"(?<![\w])[^\s<>\"'`/\\]+\.(?:json|csv|tsv|xlsx|xls|parquet|html|htm|md|docx|pdf|pptx|png|jpg|jpeg)(?![\w]|\.[\w])",
+    re.IGNORECASE,
+)
+
+
+def explicit_file_context(history: list[dict]) -> bool:
+    latest = next((m for m in reversed(history) if m.get("role") == "user"), None)
+    if latest is None:
+        return False
+    text = _condense_content(latest.get("content")) or ""
+    return bool(_FILE_CONTEXT_RE.search(text))
+
+
+def _has_block(content, block_type: str) -> bool:
+    return isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") == block_type for block in content
+    )
+
+
+def prior_turn_ran_tools(history: list[dict]) -> bool:
+    """Whether the reply to the previous user prompt used tools.
+
+    The gate prompt already tells the model that a follow-up to an answer that
+    came from live work usually needs the same work again, so it delegates; on
+    those turns the gate call only rediscovers that rule while Anton waits for
+    it (about 1.5-2 s before the agent's first call). This reads the same fact
+    from the persisted rows instead: structural, so it holds in every language,
+    and it only delegates, like ``explicit_file_context``.
+
+    Only the turn immediately before the latest prompt counts, so a conversation
+    that ran tools earlier still gets direct answers once a plain exchange has
+    followed. A window that starts inside that turn (a long tool loop) still
+    sees its tool rows: a tool result alone is evidence of the same work.
+    """
+    rows = [m for m in history if m.get("role") in {"user", "assistant"}]
+    if rows and rows[-1].get("role") == "user" and not _has_block(rows[-1].get("content"), "tool_result"):
+        rows = rows[:-1]  # the latest prompt itself
+    for message in reversed(rows):
+        content = message.get("content")
+        if _has_block(content, "tool_use") or _has_block(content, "tool_result"):
+            return True
+        if message.get("role") == "user":
+            return False  # reached the previous user prompt
+    return False
+
+
 async def decide_route(
     *,
     history: list[dict],
@@ -479,6 +560,9 @@ async def decide_route(
     per-turn key); when None the binding comes from stored settings.
     Gate/provider failures intentionally fail open to Anton.  This boundary must
     never make a chat turn unavailable because the optional fast path is down.
+    A database pool that freed no connection in time is not a gate failure: it
+    propagates, and the request is refused rather than delegated into the same
+    wait.
     """
     reason = ineligible_reason(
         has_non_text_input=has_non_text_input,
@@ -487,6 +571,12 @@ async def decide_route(
     )
     if reason:
         return RouteDecision(route=DELEGATED_AGENTIC, reason=reason)
+
+    if explicit_file_context(history):
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="explicit_file_context")
+
+    if prior_turn_ran_tools(history):
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="prior_turn_ran_tools")
 
     messages = _text_history(history)
     if not messages:
@@ -533,7 +623,17 @@ async def decide_route(
             model=binding.model,
             text=text,
         )
-    except Exception:
+    except PoolTimeoutError:
+        raise
+    except Exception as exc:
+        # Provider body fields (including type/code/param) can echo private
+        # request content. Only the class and a validated HTTP status are safe.
+        status = exception_http_status(exc=exc)
+        logger.warning(
+            "[gate] reason=router_unavailable error=%s status=%s",
+            type(exc).__name__,
+            "unknown" if status is None else status,
+        )
         # Attribution survives the failure: a 402 on a paid router pick is
         # only diagnosable in the traces if the model that failed is named.
         return RouteDecision(

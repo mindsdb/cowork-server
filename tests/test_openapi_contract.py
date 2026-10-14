@@ -51,7 +51,7 @@ def test_task_aliases_advertise_their_json_responses():
                 "ConversationDeleteResponse",
             ),
             (
-                f"{base}/{{conversation_id}}/turns/{{turn_index}}",
+                f"{base}/{{conversation_id}}/turns/{{message_id}}",
                 "delete",
                 200,
                 "ConversationTurnDeleteResponse",
@@ -69,8 +69,11 @@ def test_task_aliases_advertise_their_json_responses():
             "get",
             200,
         )
-        assert message_list["type"] == "array"
-        _assert_ref(message_list["items"], "ConversationMessageResponse")
+        # A bare list without `limit`/`before`, the cursor page with either.
+        full_history, page = message_list["anyOf"]
+        assert full_history["type"] == "array"
+        _assert_ref(full_history["items"], "ConversationMessageResponse")
+        _assert_ref(page, "ConversationItemsPage")
 
     item = schema["components"]["schemas"]["ConversationListItem"]
     assert {"projectId", "projectPath", "reasoningEffort"} <= set(

@@ -21,15 +21,14 @@ class HubWorkspaceRow(CamelResponse):
 class HubWorkspaceView(CamelResponse):
     """Everything the selector needs from one request.
 
-    One response rather than three so a menu open costs one round trip, and so
-    the client cannot render a list against a gate answer from a different
-    moment.
+    One response rather than three so a menu open costs one round trip.
 
-    ``enabled`` and ``reachable`` are separate answers to separate questions, and
-    collapsing them loses the distinction that matters. ``enabled`` false means
-    the surface is switched off, so render nothing. ``reachable`` false means the
-    surface is on but auth could not be asked, so say so rather than showing an
-    empty list, which reads as an organization with one workspace.
+    ``enabled`` always answers true now: the selector's own kill switch,
+    `authorization_ui`, was retired once its surfaces had been live in
+    production long enough to trust. Kept on the wire rather than dropped, so an
+    older client build reading it does not need to change on the same day.
+    ``reachable`` false means auth could not be asked, so say so rather than
+    showing an empty list, which reads as an organization with one workspace.
     """
 
     enabled: bool = False

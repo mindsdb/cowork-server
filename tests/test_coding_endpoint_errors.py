@@ -7,7 +7,7 @@ import pytest
 from fastapi import HTTPException
 
 from cowork.api.v1.endpoints import coding
-from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, StateConflict
+from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, ModelDiscoveryUnavailableError, StateConflict
 from cowork.coding.run_recovery import NoEligibleComputer
 from cowork.coding.run_state import InvalidRunTransition
 from cowork.coding.workspace import GitIdentityMissingError, WorkspaceError
@@ -49,6 +49,14 @@ def test_model_authentication_failure_has_actionable_copy_and_stable_code() -> N
     assert error.status_code == 401
     assert error.detail == "Sign in again"
     assert error.headers == {"X-MindsHub-Error-Code": "coding_model_authentication_failed"}
+
+
+def test_unreadable_model_list_is_a_bad_gateway_with_plain_copy() -> None:
+    error = coding._http_error(ModelDiscoveryUnavailableError("Couldn't load models from MindsHub. Try again."))
+
+    assert error.status_code == 502
+    assert error.detail == "Couldn't load models from MindsHub. Try again."
+    assert error.headers == {"X-MindsHub-Error-Code": "coding_model_list_unreadable"}
 
 
 def test_unknown_upstream_failure_remains_a_safe_500() -> None:
@@ -93,7 +101,7 @@ LEVELS = SimpleNamespace(ids=["gemini"], efforts={"gemini": {"efforts": ["low", 
 
 def _settings_with(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(coding, "_settings", lambda _session, _scope: SimpleNamespace(minds_url="https://api.mindshub.ai/v1", coding_agent_model="gpt"))
-    monkeypatch.setattr(coding, "cached_minds_models", lambda _url: LEVELS)
+    monkeypatch.setattr(coding, "cached_minds_models", lambda _url, **_kw: LEVELS)
 
 
 def test_a_project_default_effort_its_model_lacks_is_refused_before_saving(monkeypatch: pytest.MonkeyPatch) -> None:

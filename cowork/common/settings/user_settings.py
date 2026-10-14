@@ -1,6 +1,7 @@
 import logging
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 import json
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -23,6 +24,7 @@ from cowork.common.settings.app_settings import (
     default_minds_url,
     get_app_settings,
 )
+from cowork.common.settings.runtime_credential import get_minds_credential
 
 
 class Provider(str, Enum):
@@ -498,6 +500,10 @@ def normalize_provider_value(val: str, *, minds_key_present: bool) -> str:
 
 
 class UserSettings(Settings):
+    # A runtime token must disappear from a turn snapshot when the desktop
+    # clears it. Stored keys keep their normal snapshot semantics.
+    _runtime_minds_credential: bool = PrivateAttr(default=False)
+    _stored_minds_api_key: SecretStr | None = PrivateAttr(default=None)
     # The recommended-model catalog and per-provider model defaults are
     # global, application-level config and live in app_settings
     # (RECOMMENDED_MODELS / RECOMMENDED_PAIR / *_MODEL_DEFAULTS).
@@ -596,6 +602,21 @@ class UserSettings(Settings):
             "model's default. Only meaningful for models that advertise effort levels."
         ),
     )
+    router_reasoning_effort: str | None = Field(
+        default=None,
+        title="Routing & Summarization Reasoning Effort",
+        description=(
+            "Opaque reasoning-effort level for the router model, which runs "
+            "history summarization. The composer's per-task pick never applies "
+            "to it. None or empty sends no effort, which a model that doesn't "
+            "reason needs: it refuses any reasoning_effort. The route gate "
+            "shares the router's provider but runs resolved_gate_model, so the "
+            "effort is sent only while that is the router model: always on "
+            "openai-compatible, elsewhere only at the provider's default router "
+            "model. On openai-compatible, a router model that reasons by default "
+            "takes the gate's function tool on chat completions only at 'none'."
+        ),
+    )
     # Router role: the cheap front-model that runs history summarization (and
     # later gates each turn, respond-vs-delegate). Selectable so a user can
     # point routing + summarization at a cheap model independently of the
@@ -670,6 +691,11 @@ class UserSettings(Settings):
         default="",
         title="Nav Logo",
         description="Sidebar logo image as a data URI. Empty shows no logo.",
+    )
+    favicon: str = Field(
+        default="",
+        title="Browser Tab Icon",
+        description="Browser tab icon as a data URI. Empty uses the page's original icon.",
     )
     show_theme_toggle: bool = Field(
         default=True,
@@ -842,10 +868,11 @@ class UserSettings(Settings):
         title="Max Tokens per Task",
         description=(
             "The most tokens the agent may spend on one request before it "
-            "pauses and checks in with you. Tokens are the unit your plan's "
-            "monthly allowance is measured in — including tokens re-read from "
-            "cache — so a task that gets stuck can burn a large share of the "
-            "month without finishing. Raise it if you routinely give the agent "
+            "pauses and checks in with you. On MindsHub, every token the agent "
+            "reads or writes counts against your credits or your free MindsHub "
+            "Air allowance, including tokens re-read from cache, so a task that "
+            "gets stuck can use up a large share of either without finishing. "
+            "Raise it if you routinely give the agent "
             "big jobs; lower it to cap what any single request can cost. "
             "Applies to the Anton agent and, for Cowork sessions, replaces the "
             "ANTON_MAX_TURN_TOKENS environment variable."
@@ -922,7 +949,26 @@ class UserSettings(Settings):
             "JSON-encoded map of MindsHub model id → enabled flag, cached from "
             "/v1/models whenever recommended-models fetches it live. Lets model "
             "defaults avoid locked models (wallet can't pay / free allowance "
-            "spent) without a network call in the turn path."
+            "spent) without a network call in the turn path. In org mode it "
+            "holds only what is the same for every member; the models a "
+            "member's model rules restrict are in minds_model_restricted."
+        ),
+    )
+    # Untagged, so it writes per person: `SettingService._new_row` files it at
+    # (org, user) scope in org mode. Auth resolves the org, workspace and team
+    # model rules for each caller, so one member's restricted models are not
+    # another's, and the org-wide `minds_model_enabled` above leaves them out.
+    # Only the org-mode listing writes it (`persist_org_model_availability`); a
+    # desktop install has one member and keeps its restrictions in
+    # `minds_model_enabled`.
+    minds_model_restricted: str = Field(
+        default="[]",
+        title="MindsHub Models Restricted For You",
+        description=(
+            "JSON-encoded list of the MindsHub model ids your organization's "
+            "model rules restrict for you, cached from /v1/models whenever "
+            "recommended-models fetches it live. Model resolution treats them "
+            "as unavailable for you alone."
         ),
     )
 
@@ -983,7 +1029,9 @@ class UserSettings(Settings):
         recommended-models endpoint refreshes from ``/v1/models`` on every
         settings load — so it tracks availability changes (e.g. adding credits
         re-enables a locked model on the next fetch) without any network call
-        here.
+        here. The models this member's model rules restrict
+        (``_minds_restricted_ids``) read as ``False`` on top of it, which is how
+        an org-wide map that leaves them out still locks them for this member.
 
         Parsed once per instance and memoized: this is called from
         ``apply_model_defaults`` and both ``resolved_*_model`` properties.
@@ -1003,8 +1051,30 @@ class UserSettings(Settings):
             if isinstance(raw, dict)
             else {}
         )
+        # Only ids the map lists are overridden, in place, so map order is kept
+        # and a restriction on an id the catalogue no longer serves cannot make
+        # it read as served.
+        restricted = self._minds_restricted_ids()
+        if restricted:
+            result = {k: (False if k in restricted else v) for k, v in result.items()}
         self._enabled_map_cache = result
         return result
+
+    def _minds_restricted_ids(self) -> frozenset[str]:
+        """The model ids this member's model rules restrict, or an empty set.
+
+        Sourced from ``minds_model_restricted``, which only the org-mode listing
+        writes. A value that is not a JSON list of non-empty strings reads as
+        empty: an unreadable restriction list must not lock models it never
+        named.
+        """
+        try:
+            raw = json.loads(self.minds_model_restricted or "[]")
+        except (ValueError, TypeError):
+            return frozenset()
+        if not isinstance(raw, list):
+            return frozenset()
+        return frozenset(v for v in raw if isinstance(v, str) and v)
 
     def _minds_role_default_map(self) -> dict[str, str]:
         """The cached agent-role -> model-id map MindsHub's catalog declares, or {}.
@@ -1340,13 +1410,61 @@ def current_settings_scope() -> "TenantScope | None":
     return _current_scope.get()
 
 
+@dataclass(frozen=True)
+class _TurnSettings:
+    """The settings a turn loaded once, and the scope they were loaded for."""
+
+    scope: "TenantScope"
+    settings: UserSettings
+
+
+_turn_settings: ContextVar["_TurnSettings | None"] = ContextVar("turn_settings", default=None)
+
+
+@contextmanager
+def use_turn_settings(scope: "TenantScope", settings: UserSettings):
+    """Serve ``settings`` to get_user_settings() calls for ``scope`` made in
+    this context, instead of reading the database again.
+
+    A turn loads its settings once, in its first database unit, and binds them
+    on the event loop around its gate and its producer's creation.
+    asyncio.create_task copies the context, so the producer task and the
+    worker threads it starts read the same snapshot. Bind it on the loop: a
+    worker thread runs in a copy of the context, so whatever it binds is gone
+    when it returns.
+
+    The one value not frozen is the MindsHub credential the desktop app hands
+    over at runtime: it is a short-lived token the desktop refreshes while a
+    turn runs, so each read overlays the current one, as a load does
+    (SettingService._raw_data).
+    """
+    token = _turn_settings.set(_TurnSettings(scope=scope, settings=settings))
+    try:
+        yield
+    finally:
+        _turn_settings.reset(token)
+
+
 def get_user_settings(scope: "TenantScope | None" = None) -> UserSettings:
     """Resolved settings for a scope: explicit arg, else ambient
     (use_settings_scope), else LOCAL_SCOPE. Unscoped resolves global rows only,
-    never another org's data. Loads fresh every call — no process-global cache."""
+    never another org's data. Loads fresh every call, except inside
+    use_turn_settings, which answers for its own scope with a copy of the
+    turn's snapshot. There is no process-global cache."""
     from cowork.db.scoped import LOCAL_SCOPE
 
     scope = scope or _current_scope.get() or LOCAL_SCOPE
+    turn = _turn_settings.get()
+    if turn is not None and turn.scope == scope:
+        # A copy, as a fresh load would be: a caller that changes the object
+        # it gets must not change what the next caller reads.
+        settings = turn.settings.model_copy()
+        live_minds_key = get_minds_credential()
+        if live_minds_key:
+            settings.minds_api_key = SecretStr(live_minds_key)
+        elif turn.settings._runtime_minds_credential:
+            settings.minds_api_key = turn.settings._stored_minds_api_key
+        return settings
     return _load_from_db(scope)
 
 
