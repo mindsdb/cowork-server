@@ -53,13 +53,14 @@ def desktop_workspace_pick() -> str | None:
 def refresh_inference_key(token: str, organization_id: str) -> None:
     """Mint a key for ``organization_id`` and the desktop's workspace pick, unless a fresh one is held.
 
-    A failed mint keeps a still-valid key for the same organization and
-    retries in a minute. The old key is never revoked here: the scratchpad and
-    coding sessions keep using it until it expires.
+    A failed mint keeps a still-valid key only for the same organization and
+    workspace, and retries in a minute. The old key is never revoked here: the
+    scratchpad and coding sessions keep using it until it expires.
     """
     deadline = time.monotonic() + _MINT_BUDGET_S
     if not _mint_lock.acquire(timeout=_MINT_BUDGET_S):
         # Another mint is running past the budget; don't hold up the hand-over for it.
+        _drop_key_unless_for(organization_id)
         _schedule_retry()
         return
     try:
@@ -103,8 +104,7 @@ def _refresh(token: str, organization_id: str, deadline: float) -> None:
         logger.warning(
             "Could not mint a turn key for organization %s: %s", organization_id, exc
         )
-        if current and current.organization_id != organization_id:
-            runtime_credential.set_inference_key(None)
+        _drop_key_unless_for(organization_id)
         _schedule_retry()
         return
 
@@ -117,6 +117,16 @@ def _refresh(token: str, organization_id: str, deadline: float) -> None:
             workspace_id=workspace_id,
         )
     )
+
+
+def _drop_key_unless_for(organization_id: str) -> None:
+    # A key for another org or workspace would bill the wrong one while the menu shows the new pick.
+    current = runtime_credential.get_inference_key()
+    if current and (current.organization_id, current.workspace_id) != (
+        organization_id,
+        desktop_workspace_pick(),
+    ):
+        runtime_credential.set_inference_key(None)
 
 
 def _post(body: dict, token: str, deadline: float) -> httpx.Response:

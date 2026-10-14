@@ -135,6 +135,16 @@ class TestRefresh:
         assert runtime_credential.get_inference_key() is None
         http.schedule_retry.assert_called_once()
 
+    def test_a_failed_mint_drops_a_key_for_another_workspace(self, http):
+        runtime_credential.set_inference_key(_key(minutes_left=29))
+        http.post.side_effect = RuntimeError("auth down")
+
+        with patch.object(inference_key, "desktop_workspace_pick", return_value="ws-2"):
+            inference_key.refresh_inference_key("jwt", ORG_A)
+
+        assert runtime_credential.get_inference_key() is None
+        http.schedule_retry.assert_called_once()
+
     def test_mints_for_the_desktop_workspace_pick(self, http):
         with patch.object(inference_key, "desktop_workspace_pick", return_value="ws-1"):
             inference_key.refresh_inference_key("jwt", ORG_A)
@@ -284,6 +294,18 @@ class TestTimeBudget:
 
         http.post.assert_not_called()
         http.schedule_retry.assert_called_once()
+
+    def test_a_busy_lock_drops_a_key_for_another_workspace(self, http, monkeypatch):
+        monkeypatch.setattr(inference_key, "_MINT_BUDGET_S", 0.05)
+        runtime_credential.set_inference_key(_key(minutes_left=29))
+
+        with (
+            inference_key._mint_lock,
+            patch.object(inference_key, "desktop_workspace_pick", return_value="ws-2"),
+        ):
+            inference_key.refresh_inference_key("jwt", ORG_A)
+
+        assert runtime_credential.get_inference_key() is None
 
     def test_revoke_has_a_short_timeout(self, http):
         inference_key.revoke_inference_key("jwt", _key())
