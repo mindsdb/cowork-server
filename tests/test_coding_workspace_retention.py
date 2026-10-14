@@ -36,7 +36,7 @@ def ref_exists(repo: Path, ref: str) -> bool:
 def test_released_worktree_restores_commits_uncommitted_and_untracked_changes(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("task-1", str(repo), allow_direct_folder=False)
+    prepared = manager.prepare("task-1", str(repo), allow_folder_copy=False)
     worktree = prepared.workspace_path
     (worktree / "committed.txt").write_text("committed\n", encoding="utf-8")
     git(worktree, "add", "committed.txt")
@@ -62,7 +62,7 @@ def test_released_worktree_restores_commits_uncommitted_and_untracked_changes(tm
 def test_a_worktree_is_kept_when_its_source_repository_is_gone(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    prepared = manager.prepare("task-2", str(repo), allow_direct_folder=False)
+    prepared = manager.prepare("task-2", str(repo), allow_folder_copy=False)
 
     released = manager.release(
         "task-2", str(tmp_path / "moved-away"), str(prepared.workspace_path), WorkspaceKind.git_worktree
@@ -77,7 +77,7 @@ def test_a_folder_copy_is_never_released(tmp_path: Path) -> None:
     source.mkdir()
     (source / "edit.txt").write_text("before\n", encoding="utf-8")
     manager = WorkspaceManager(tmp_path / "coding")
-    copy = manager.prepare("task-3", str(source), allow_direct_folder=True).workspace_path
+    copy = manager.prepare("task-3", str(source), allow_folder_copy=True).workspace_path
     (copy / "edit.txt").write_text("after\n", encoding="utf-8")
 
     assert manager.release("task-3", str(source), str(copy), WorkspaceKind.local_copy) is False
@@ -91,7 +91,7 @@ def test_a_folder_copy_is_never_released(tmp_path: Path) -> None:
 def test_a_worktree_with_a_task_created_repository_is_kept(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    worktree = manager.prepare("task-4", str(repo), allow_direct_folder=False).workspace_path
+    worktree = manager.prepare("task-4", str(repo), allow_folder_copy=False).workspace_path
     nested = worktree / "vendor" / "lib"
     nested.mkdir(parents=True)
     git(nested, "init", "-q")
@@ -107,7 +107,7 @@ def test_a_worktree_with_a_task_created_repository_is_kept(tmp_path: Path) -> No
 def test_a_repository_initialized_inside_a_tracked_directory_is_kept(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    worktree = manager.prepare("task-6", str(repo), allow_direct_folder=False).workspace_path
+    worktree = manager.prepare("task-6", str(repo), allow_folder_copy=False).workspace_path
     (worktree / "src").mkdir()
     (worktree / "src" / "lib.py").write_text("tracked\n", encoding="utf-8")
     git(worktree, "add", "src/lib.py")
@@ -125,7 +125,7 @@ def test_a_repository_initialized_inside_a_tracked_directory_is_kept(tmp_path: P
 def test_a_task_created_repository_staged_in_the_parent_is_kept(tmp_path: Path, commit_in_parent: bool) -> None:
     repo = repository(tmp_path)
     manager = WorkspaceManager(tmp_path / "coding")
-    worktree = manager.prepare("task-8", str(repo), allow_direct_folder=False).workspace_path
+    worktree = manager.prepare("task-8", str(repo), allow_folder_copy=False).workspace_path
     private = worktree / "private"
     private.mkdir()
     git(private, "init", "-q")
@@ -147,7 +147,7 @@ def test_restore_replaces_a_folder_left_partly_removed_by_a_release(tmp_path: Pa
     source = repository(tmp_path)
     edited = "README.md"
     manager = WorkspaceManager(tmp_path / "coding")
-    workspace = manager.prepare("task-7", str(source), allow_direct_folder=False).workspace_path
+    workspace = manager.prepare("task-7", str(source), allow_folder_copy=False).workspace_path
     (workspace / edited).write_text("task change\n", encoding="utf-8")
     (workspace / "locked.txt").write_text("locked\n", encoding="utf-8")
     assert manager.release("task-7", str(source), str(workspace), kind) is True
