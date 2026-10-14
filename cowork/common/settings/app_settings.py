@@ -689,7 +689,7 @@ class AppSettings(Settings):
         default=[],
         validation_alias=AliasChoices("COWORK_ALLOWED_HOSTS"),
         description=(
-            "Extra Host names accepted when COWORK_REQUIRE_AUTH is off in local "
+            "Extra Host names accepted whenever token auth is off in local "
             "tenancy (JSON array). localhost and IP addresses are always accepted; "
             "any other name, e.g. a domain, a tunnel or a Docker service name, "
             "must be listed here."
