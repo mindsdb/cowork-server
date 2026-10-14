@@ -18,14 +18,14 @@
     "productivity",
     "workspace"
   ],
-  "description": "Read and write Notion pages, databases, and blocks from your workspace.",
+  "description": "Read Notion pages, databases, and blocks in your workspace, and edit them once you allow it.",
   "category": "productivity",
   "logo": "doc",
   "logo_color": "#000000",
   "form": {
     "form_id": "notion-connector",
     "title": "Connect Notion",
-    "subtitle": "Authorize Anton to read and write pages and databases in your Notion workspace.",
+    "subtitle": "Authorize Anton to read pages and databases in your Notion workspace. Editing stays off until you allow it.",
     "logo": "doc",
     "logo_color": "#000000",
     "methods": [
