@@ -610,10 +610,19 @@ class ProjectService:
         A folder can only be adopted where projects are not partitioned, so a
         path outside the partition-keyed root there is a stale or
         pre-partition row -- `_repoint_if_stale`'s job, not a chosen folder.
+
+        False too for any row with an org_id, whatever the scope reading it.
+        Such a row was created in an org or a person's partition, where
+        adoption is refused (`_adopt_project_dir`), so the operator view
+        (LOCAL_SCOPE) sees its directory under that partition's own root, not
+        a folder somebody chose; reading it as one would list that person's
+        artifacts in the operator view's list
+        (`artifact_roots._sources_outside_the_projects_root`).
         """
         if (
             get_app_settings().tenancy_mode == "org"
             or self.session.scope.partitioned_for(PersonalResource.PROJECTS)
+            or project.org_id is not None
         ):
             return False
         try:

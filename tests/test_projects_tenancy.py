@@ -685,3 +685,35 @@ def test_a_partition_still_takes_the_process_name_lock(db, personal_deployment, 
             _svc(db, _person(partition=PARTITION_A, sub=SUB_A)).create_project("busy")
     finally:
         projects_module._LOCAL_NAME_LOCK.release()
+
+
+def test_a_partition_refuses_adoption_before_touching_the_filesystem(db, personal_deployment, tmp_path):
+    """Refused before any stat: a path that does not exist gets the same
+    refusal as one that does, never "Choose an existing local folder", so the
+    answer says nothing about the server's filesystem."""
+    from cowork.services.projects import ProjectPathNotAllowedError
+
+    missing = tmp_path / "no" / "such" / "folder"
+    with pytest.raises(ProjectPathNotAllowedError):
+        _svc(db, _person(partition=PARTITION_A, sub=SUB_A)).create_project("notes", path=missing)
+    assert not missing.exists()
+
+
+def test_a_partition_row_is_no_adopted_folder_to_the_operator_view(db, personal_deployment, tmp_path):
+    """The operator view reads every row unfiltered. A person's project lives
+    under their partition, outside the unkeyed root, which would read as a
+    folder somebody chose; a row with an org_id never is one."""
+    alice = _svc(db, _person(partition=PARTITION_A, sub=SUB_A))
+    theirs = alice.create_project("reports")
+    operator = _svc(db, LOCAL_SCOPE)
+
+    assert operator.directory_is_external(operator.get_project(theirs.id)) is False
+
+    # A NULL-org row outside the root is still an adopted folder there.
+    chosen = tmp_path / "outside" / "chosen"
+    chosen.mkdir(parents=True)
+    raw = _raw(db)
+    adopted = Project(name="chosen", path=str(chosen), is_active=True)
+    raw.add(adopted)
+    raw.commit()
+    assert operator.directory_is_external(operator.get_project(adopted.id)) is True
