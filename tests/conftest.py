@@ -205,12 +205,10 @@ def managed_dir(monkeypatch, tmp_path):
     """An operator's managed folder (COWORK_MANAGED_DIR) for one test.
 
     ``memory/`` holds one rule and one lesson and an empty profile, as the
-    image bakes them; ``skills/`` and ``data-vault/`` start empty. anton's
-    Cortex is swapped for one that takes the read-only ``managed_hc`` layer,
-    the anton change this server needs, and records it. Yields the
-    cowork.managed.ManagedFolder.
+    image bakes them; ``skills/`` and ``data-vault/`` start empty. Turns read
+    it through the installed anton's Cortex and its read-only ``managed_hc``
+    layer. Yields the cowork.managed.ManagedFolder.
     """
-    from anton.core.memory import cortex as anton_cortex
     from anton.core.memory.hippocampus import Hippocampus
 
     from cowork.common.settings.app_settings import get_app_settings
@@ -225,12 +223,6 @@ def managed_dir(monkeypatch, tmp_path):
     managed_hc.encode_lesson(MANAGED_LESSON, topic="data", source="user")
     (folder.memory_dir / "profile.md").write_text("", encoding="utf-8")
 
-    class CortexWithManagedLayer(anton_cortex.Cortex):
-        def __init__(self, *args, managed_hc=None, **kwargs):
-            super().__init__(*args, **kwargs)
-            self.managed_hc = managed_hc
-
-    monkeypatch.setattr(anton_cortex, "Cortex", CortexWithManagedLayer)
     monkeypatch.setenv("COWORK_MANAGED_DIR", str(folder.root))
     get_app_settings.cache_clear()
     yield folder
