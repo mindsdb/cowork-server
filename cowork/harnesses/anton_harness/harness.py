@@ -27,6 +27,7 @@ from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REPLAY_ROLES, extract_scratchpad_cells
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
+from cowork.services.connectors.specs._registry import registry
 from cowork.services.projects import display_label
 from cowork.streaming.liveness import ModelWaitTicker
 
@@ -257,6 +258,49 @@ def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_d
     return filtered
 
 
+def _picked_files_guidance(picked_by_connection: dict[str, list[dict]]) -> str:
+    """Prompt text naming the Google-Picker-granted Drive files, or "".
+
+    A plain files.list()/files.search() call does NOT return these files (the
+    google_drive connector's drive.file scope only covers files the app
+    created itself, plus these specifically granted ones), so the agent has
+    to be told about them by name. The general Drive API rules
+    (supportsAllDrives, corpora) are not here: they apply to every Drive
+    connection and come from google_drive.json's usage_notes.
+    """
+    if not picked_by_connection:
+        return ""
+
+    def _describe(f: dict, conn_name: str) -> str:
+        line = f"- {f.get('name', 'untitled')} (id: {f.get('id')}, connection: {conn_name}"
+        resource_key = f.get("resourceKey") or f.get("resource_key")
+        if resource_key:
+            line += f", resourceKey: {resource_key}"
+        return line + ")"
+
+    picked_lines = [
+        _describe(f, conn_name)
+        for conn_name, files in picked_by_connection.items()
+        for f in files
+    ]
+    return (
+        "\n\nIMPORTANT — additional Google Drive files the user has explicitly granted "
+        "access to via the Google Picker, which a plain files.list()/files.search() call "
+        "will NOT return (the google_drive connector's scope only covers files this app "
+        "created itself, plus these specifically granted ones):\n"
+        + "\n".join(picked_lines)
+        + "\nWhenever you list, search, or enumerate Drive files for the user, you MUST "
+        "include every file above IN ADDITION to whatever files.list()/files.search() "
+        "returns — do not report only the API call's results. To read one of these "
+        "files' content, call files.get(fileId=...) directly with its id above; do not "
+        "expect it to appear in a files.list() response first. If a file above has a "
+        "resourceKey listed, you MUST send it or the call will fail with a 404 notFound "
+        "even though access was actually granted — either add header "
+        "'X-Goog-Drive-Resource-Keys: <id>/<resourceKey>' to the request, or pass "
+        "resourceKey=<resourceKey> as a query parameter."
+    )
+
+
 def _turn_style_context(channel: ChannelContext | None) -> str:
     """Lead block of the system-prompt suffix: desktop guidance for UI turns,
     support-chat guidance for channel turns.
@@ -321,6 +365,32 @@ def _turn_style_context(channel: ChannelContext | None) -> str:
         "your reply — tell the user you're sending the file rather than describing where it "
         "lives.\n"
         f"{operator}"
+    )
+
+
+_PROJECT_FILE_READ_RULE = (
+    "You can read, search, extract from and analyse any of these project files without asking. "
+)
+
+
+def _project_file_actions_rule(act_first: bool) -> str:
+    """When the agent must ask before acting on project files.
+
+    Follows the "Act first, ask later" setting: a blanket ask-first rule here
+    outweighs anton's act-first discipline, which sits earlier in the prompt,
+    and the agent then asks before writing a file the user asked it to create.
+    Reading never needs permission, whatever the setting.
+    """
+    if not act_first:
+        return (
+            _PROJECT_FILE_READ_RULE
+            + "Ask the user for permission before you create, change, move or delete any of these files. "
+        )
+    return (
+        _PROJECT_FILE_READ_RULE
+        + "Create the files the user asks for and change the files they ask you to change "
+        "without asking for permission first. "
+        "Ask the user before deleting files or overwriting files they did not ask you to change. "
     )
 
 
@@ -1081,10 +1151,9 @@ class AntonHarness:
             f"You are operating in the project {display_label(conversation.project)}."
             f"You have access to all of the files in the project at {str(base)} except for the .anton/ directory."
             "They are off limits. Do not mention the .anton/ directory in your responses."
-            "You can perform operations on these files via the scratchpad."
-            "You can freely read any of these project files."
-            "If you need to perform any actions on these files, ask the user for permission first."
-            "The only other files that you are allowed to access are any items that are attached to the conversation."
+            "You can perform operations on these files via the scratchpad. "
+            + _project_file_actions_rule(anton_settings.act_first)
+            + "The only other files that you are allowed to access are any items that are attached to the conversation."
             "Access to any files not attached to the conversation or located outside the project is strictly forbidden."
             "ALWAYS use the scratchpad to interact with files."
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
@@ -1169,76 +1238,31 @@ class AntonHarness:
         # that predate the MCP client, and promoting it to anton's `main` is
         # a separate release step (ENG-1816). An unguarded import would turn
         # that window into a failure on EVERY turn, not just MCP ones.
+        # This turn's connections, listed once for MCP discovery and the usage notes.
+        vault_connections = data_vault.list_connections() if data_vault is not None else []
         mcp_tool_defs: list = []
         mcp_sessions: list = []
         mcp_wiring = _anton_mcp_wiring() if data_vault is not None else None
         if mcp_wiring is not None:
             mcp_tool_defs, mcp_sessions = await mcp_wiring.discover_mcp_tools_async(
-                data_vault, data_vault.list_connections()
+                data_vault, vault_connections
             )
 
         try:
-            # TODO: Add guidance for integrations
-
-            # Google Drive's google_drive connector uses the drive.file OAuth
-            # scope, which only covers files the app created itself, plus files
-            # the user explicitly granted access to via the Google Picker
-            # (persisted as a `_picked_files` vault field — see
-            # cowork/services/connectors/connections.py). A plain
-            # files.list()/files.search() call does NOT return the latter, so
-            # without calling them out by name here the agent has no way to
-            # know they're reachable at all — the scratchpad's env carries only the
-            # raw JSON, which isn't enough for the agent to notice or act on.
-            #
-            # Parsing `_picked_files` and applying the project-scoping rule is
-            # connector logic, not agent logic, so it lives in
-            # ConnectionsService.picked_files_by_project().
+            # Google Drive: Picker-granted files are per-project connection data
+            # (ConnectionsService.picked_files_by_project), so they are rendered
+            # here rather than from the connector spec.
             integration_guidance = ""
-            picked_by_connection: dict[str, list[dict]] = {}
+            connector_usage_notes: dict[str, str] = {}
             if data_vault is not None:
-                picked_by_connection = service.picked_files_by_project(data_vault, conversation.project.name)
-
-                if picked_by_connection:
-                    def _describe(f: dict, conn_name: str) -> str:
-                        line = f"- {f.get('name', 'untitled')} (id: {f.get('id')}, connection: {conn_name}"
-                        resource_key = f.get("resourceKey") or f.get("resource_key")
-                        if resource_key:
-                            line += f", resourceKey: {resource_key}"
-                        return line + ")"
-
-                    picked_lines = [
-                        _describe(f, conn_name)
-                        for conn_name, files in picked_by_connection.items()
-                        for f in files
-                    ]
-                    integration_guidance = (
-                        "\n\nIMPORTANT — additional Google Drive files the user has explicitly granted "
-                        "access to via the Google Picker, which a plain files.list()/files.search() call "
-                        "will NOT return (the google_drive connector's scope only covers files this app "
-                        "created itself, plus these specifically granted ones):\n"
-                        + "\n".join(picked_lines)
-                        + "\nWhenever you list, search, or enumerate Drive files for the user, you MUST "
-                        "include every file above IN ADDITION to whatever files.list()/files.search() "
-                        "returns — do not report only the API call's results. To read one of these "
-                        "files' content, call files.get(fileId=...) directly with its id above; do not "
-                        "expect it to appear in a files.list() response first. If a file above has a "
-                        "resourceKey listed, you MUST send it or the call will fail with a 404 notFound "
-                        "even though access was actually granted — either add header "
-                        "'X-Goog-Drive-Resource-Keys: <id>/<resourceKey>' to the request, or pass "
-                        "resourceKey=<resourceKey> as a query parameter. Some of these files may live in "
-                        "a Shared Drive rather than the user's My Drive — Drive API calls silently return "
-                        "404 notFound for Shared Drive items unless you pass supportsAllDrives=true (and, "
-                        "for files.list()/files.search(), also includeItemsFromAllDrives=true). Always "
-                        "include both params on any Drive API call touching these files; they're no-ops "
-                        "for regular files, so there's no downside to always sending them. CRITICAL: when "
-                        "calling files.list()/files.search(), do NOT pass corpora='allDrives' — unlike "
-                        "supportsAllDrives/includeItemsFromAllDrives, that parameter is NOT properly scoped "
-                        "by this connector's restricted OAuth grant and will return files across the user's "
-                        "entire Google account that this app was never actually given access to. Omit "
-                        "corpora entirely (or use corpora='user') — combined with "
-                        "includeItemsFromAllDrives=true and supportsAllDrives=true, that already correctly "
-                        "surfaces every file this app can legitimately see, Shared Drive items included."
-                    )
+                integration_guidance = _picked_files_guidance(
+                    service.picked_files_by_project(data_vault, conversation.project.name)
+                )
+                # Agent-facing API notes for this turn's connected engines.
+                # `data_vault` is already filtered by `disabled_connections`.
+                connector_usage_notes = registry.usage_notes_for(
+                    c["engine"] for c in vault_connections
+                )
 
             cells = extract_scratchpad_cells(history.events)
             os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
@@ -1276,6 +1300,10 @@ class AntonHarness:
                 ),
                 workspace=workspace,
                 data_vault=data_vault,
+                # Dropped, not raised, on an anton that predates the field: the
+                # uv.lock pin and the anton-agent floor must include it, or the
+                # Drive API rules are lost.
+                **supported_kwargs(ChatSessionConfig, connector_usage_notes=connector_usage_notes),
                 **overlay_kwargs,
                 initial_history=initial_history,
                 # history_store=history_store,
