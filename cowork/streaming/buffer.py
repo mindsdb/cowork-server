@@ -321,14 +321,18 @@ class RedisStreamBuffer(StreamBuffer):
                 self._finishing = True
             seq = self._next_seq
             self._next_seq += 1
-            r = get_redis()
-            await r.xadd(self.key, {
-                "seq": str(seq),
-                "ts": now_iso(),
-                "type": type_,
-                "data": json.dumps(data or {}),
-            })
-            await r.expire(self.key, REDIS_BUFFER_TTL_SECONDS)
+            # One round trip per frame, with the TTL refresh in the same
+            # transaction as the write, so a connection lost mid-append cannot
+            # leave a stream with no TTL.
+            async with get_redis().pipeline(transaction=True) as pipe:
+                pipe.xadd(self.key, {
+                    "seq": str(seq),
+                    "ts": now_iso(),
+                    "type": type_,
+                    "data": json.dumps(data or {}),
+                })
+                pipe.expire(self.key, REDIS_BUFFER_TTL_SECONDS)
+                await pipe.execute()
             return seq
 
     async def close(self, reason: TerminalReason, extra: dict | None = None) -> None:

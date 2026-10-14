@@ -653,13 +653,14 @@ async def test_handle_registers_vault_secrets_before_routing(monkeypatch):
 
     handler = _routing_handler(monkeypatch)
     conv_id = uuid4()
-    conversation = SimpleNamespace(id=conv_id, messages=[])
+    conversation = SimpleNamespace(id=conv_id)
     monkeypatch.setattr(
         responses,
         "ConversationService",
         lambda scoped: SimpleNamespace(
             get_conversation=lambda _cid: conversation,
-            get_ordered_messages=lambda _cid: [],
+            message_count=lambda _conversation: 0,
+            get_recent_messages=lambda *_args, **_kwargs: [],
         ),
     )
     calls = []
@@ -729,6 +730,9 @@ async def test_ineligible_route_skips_the_history_query(monkeypatch):
         def get_ordered_messages(self, *args, **kwargs):
             raise AssertionError("must not read the gate's history")
 
+        def get_recent_messages(self, *args, **kwargs):
+            raise AssertionError("must not read the gate's history")
+
     handler = _routing_handler(monkeypatch)
     monkeypatch.setattr(responses, "ConversationService", _NoHistory)
 
@@ -763,7 +767,7 @@ async def test_history_query_failure_fails_open(monkeypatch):
         responses,
         "ConversationService",
         lambda scoped: SimpleNamespace(
-            get_ordered_messages=lambda _cid: (_ for _ in ()).throw(RuntimeError("db down")),
+            get_recent_messages=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("db down")),
         ),
     )
     rolled_back = []
@@ -785,6 +789,76 @@ async def test_history_query_failure_fails_open(monkeypatch):
     assert decision.reason == "router_unavailable"
     assert decision.fallback is True
     assert turn_llm is None
+
+
+@pytest.mark.asyncio
+async def test_turn_start_counts_every_stored_row(monkeypatch):
+    """turn_id names the turn's stream buffer, and boot recovery indexes the
+    stored rows with it, so it counts every row: hidden tool rows and a
+    stranded pending question too. The gate reads the tail of the replayed
+    history. Neither read loads every stored row to get there."""
+    from functools import partial
+
+    from sqlalchemy import event
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.db.session import get_engine
+    from cowork.db.units import run_db
+    from cowork.handlers.response_routing import _MAX_HISTORY_MESSAGES
+    from cowork.schemas.responses import ResponsesRequest
+    from cowork.services.conversations import ConversationService
+    from cowork.services.projects import GENERAL_PROJECT_ID
+
+    tool_rows = [
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "t1", "name": "x", "input": {}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "r"}]},
+    ]
+
+    def seed(session):
+        service = ConversationService(session)
+        conversation = service.create_conversation("topic", project_id=GENERAL_PROJECT_ID)
+        for turn in range(6):
+            service.save_user_message(conversation.id, f"question {turn}")
+            service.save_assistant_turn(conversation.id, f"answer {turn}", [], tool_rows=tool_rows)
+        service.save_user_message(conversation.id, "stranded", pending=True)
+        return conversation.id
+
+    def read_back(session, *, conversation_id):
+        service = ConversationService(session)
+        stored = service.get_ordered_messages(conversation_id, include_pending=True)
+        replayed = service.get_ordered_messages(conversation_id)
+        tail = [m.id for m in replayed if m.role in {"user", "assistant"}][-_MAX_HISTORY_MESSAGES:]
+        return len(stored), tail
+
+    conversation_id = await run_db(seed, scope=LOCAL_SCOPE)
+    handler = _routing_handler(monkeypatch)
+    engine = get_engine(get_app_settings().database.uri)
+    statements: list[str] = []
+
+    def record(_conn, _cursor, statement, _parameters, _context, _executemany):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        start = await run_db(
+            partial(
+                handler._read_turn_start,
+                request=ResponsesRequest(input="Hello", conversation=str(conversation_id)),
+                has_disabled_connections=False,
+            ),
+            scope=LOCAL_SCOPE,
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+    stored, tail = await run_db(partial(read_back, conversation_id=conversation_id), scope=LOCAL_SCOPE)
+
+    assert start.turn_id == stored == 6 * 4 + 1
+    assert [m.id for m in start.gate_rows] == tail
+    assert len(tail) == _MAX_HISTORY_MESSAGES
+    message_reads = [s for s in statements if "FROM messages" in s]
+    assert message_reads
+    assert [s for s in message_reads if "count(" not in s and "LIMIT" not in s] == []
 
 
 @pytest.mark.asyncio
@@ -817,6 +891,12 @@ async def test_pre_minted_binding_skips_settings_and_is_used(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch):
+    import json
+
+    import httpx2 as httpx
+    import openai
+    from anton.core.llm.tracing import TraceContext, reset_trace_context, set_trace_context
+
     import cowork.handlers.responses as responses
     import cowork.turnqueue.producer as producer
     from cowork.common.settings.user_settings import Provider
@@ -835,8 +915,28 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
             hub_workspace_id="ws-1",
         ),
     )
-    block = {"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "http://gw/v1"}
+    block = {"provider": "minds-cloud", "api_key": "mdb_test", "base_url": "https://llm.mdb.ai/v1"}
     minted = {}
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        chunk = {
+            "id": "chatcmpl-router", "object": "chat.completion.chunk", "created": 0,
+            "model": "mindshub_air",
+            "choices": [{"index": 0, "delta": {"content": "Hello."}, "finish_reason": "stop"}],
+        }
+        return httpx.Response(
+            200, headers={"content-type": "text/event-stream"},
+            content=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    real_client = openai.AsyncOpenAI
+    monkeypatch.setattr(
+        openai, "AsyncOpenAI",
+        lambda **kwargs: real_client(http_client=http_client, max_retries=0, **kwargs),
+    )
 
     async def fake_mint(*, org_id, user_id, correlation_id, settings, workspace_id=None):
         minted["corr"] = correlation_id
@@ -845,12 +945,31 @@ async def test_router_binding_mints_per_turn_key_in_hosted_org_mode(monkeypatch)
 
     monkeypatch.setattr(producer, "_mint_llm_block", fake_mint)
 
-    binding, turn_llm = await handler._router_binding()
+    trace_token = set_trace_context(TraceContext(session_id="conv-router"))
+    try:
+        binding, turn_llm = await handler._router_binding()
+        decision = await decide_route(
+            history=[{"role": "user", "content": "Hello"}],
+            has_non_text_input=False,
+            has_attachments=False,
+            has_disabled_connections=False,
+            binding=binding,
+        )
+    finally:
+        reset_trace_context(trace_token)
+        await http_client.aclose()
 
     assert binding is not None
     assert binding.label == "minds_cloud"
     assert binding.model == "mindshub_air"
     assert type(binding.provider).__name__ == "OpenAIProvider"
+    assert decision.route == DIRECT_CONTEXT
+    assert len(requests) == 1
+    assert requests[0].headers["Langfuse-Session-Id"] == "conv-router"
+    # Exercise the installed Anton: assigning the attribute alone also passes
+    # with an older dependency that never reads it when building headers.
+    metadata = json.loads(requests[0].headers["Langfuse-Metadata"])
+    assert metadata["role"] == "router"
     assert turn_llm == {"correlation_id": minted["corr"], "llm": block}
     # The routing gate's own pre-mint must carry the caller's picked workspace
     # too — this key is what a delegated remote turn ends up reusing as its
@@ -1285,9 +1404,8 @@ def _gate_warnings(caplog):
 @pytest.mark.asyncio
 async def test_router_unavailable_logs_the_refusal_without_its_message(monkeypatch, caplog):
     """OpenAI refuses the gate's function tool on chat completions when the
-    router model reasons. The [gate] line names that refusal by class, status,
-    type and param. It leaves the message out: provider text can quote the
-    request or echo a credential."""
+    router model reasons. The [gate] line names that refusal by class and
+    status. Provider text can quote the request or echo a credential."""
     import logging
 
     from anton.core.llm import provider as anton_provider
@@ -1327,17 +1445,17 @@ async def test_router_unavailable_logs_the_refusal_without_its_message(monkeypat
     )
     assert f"error={expected_error}" in line
     assert "status=400" in line
-    assert "type=invalid_request_error" in line
-    assert "param=reasoning_effort" in line
+    assert "type=" not in line
+    assert "param=" not in line
+    assert "code=" not in line
     assert echoed_key not in line
     assert "Function tools" not in line
     assert record.exc_info is None
 
 
 @pytest.mark.asyncio
-async def test_router_unavailable_keeps_sdk_fields_under_a_status_bearing_wrapper(monkeypatch, caplog):
-    """A typed anton wrapper can retain the HTTP status but normalize its code
-    and omit type/param. Exercise that contract even with an older anton lock."""
+async def test_router_unavailable_keeps_only_status_under_a_status_bearing_wrapper(monkeypatch, caplog):
+    """A wrapper can retain HTTP status while its cause holds private body fields."""
     import logging
 
     import httpx
@@ -1356,9 +1474,9 @@ async def test_router_unavailable_keeps_sdk_fields_under_a_status_bearing_wrappe
             400, request=httpx.Request("POST", "https://example.com/v1/chat/completions")
         ),
         body={
-            "type": "invalid_request_error",
-            "code": "unsupported_value",
-            "param": "reasoning_effort",
+            "type": secret + "-type",
+            "code": secret + "-code",
+            "param": secret + "-param",
         },
     )
 
@@ -1372,17 +1490,54 @@ async def test_router_unavailable_keeps_sdk_fields_under_a_status_bearing_wrappe
     assert decision.reason == "router_unavailable"
     (record,) = _gate_warnings(caplog)
     assert record.getMessage() == (
-        "[gate] reason=router_unavailable error=RequestRefusedError status=400 "
-        "type=invalid_request_error code=unsupported_value param=reasoning_effort"
+        "[gate] reason=router_unavailable error=RequestRefusedError status=400"
     )
-    assert secret not in record.getMessage()
+    assert secret not in repr(record.__dict__)
+    assert record.args == ("RequestRefusedError", 400)
     assert record.exc_info is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [True, 99, 600, "400", "private_status_marker", None])
+async def test_router_unavailable_drops_arbitrary_status_and_provider_body_fields(monkeypatch, caplog, status):
+    import logging
+
+    import httpx
+    import openai
+
+    from cowork.handlers import response_routing as routing
+
+    private = "router_private_request_marker"
+    error = openai.BadRequestError(
+        private,
+        response=httpx.Response(400, request=httpx.Request("POST", "https://example.com/" + private)),
+        body={"type": private, "code": private, "param": private},
+    )
+    error.status_code = status
+
+    async def failed_gate(*args, **kwargs):
+        raise error
+
+    monkeypatch.setattr(routing, "_gate", failed_gate)
+    with caplog.at_level(logging.WARNING, logger=routing.__name__):
+        decision = await _route_on(None)
+
+    assert decision.reason == "router_unavailable"
+    assert decision.fallback is True
+    (record,) = _gate_warnings(caplog)
+    assert record.getMessage() == "[gate] reason=router_unavailable error=BadRequestError status=unknown"
+    assert record.args == ("BadRequestError", "unknown")
+    assert record.exc_info is None
+    assert private not in repr(record.__dict__)
+    assert "private_status_marker" not in repr(record.__dict__)
+    assert error.status_code == status
+    assert error.body == {"type": private, "code": private, "param": private}
 
 
 @pytest.mark.asyncio
 async def test_router_unavailable_logs_the_status_under_antons_own_error(monkeypatch, caplog):
     """anton raises its own error from the SDK's for the statuses it names, so
-    the line reads the status and the provider's code from that cause. Here,
+    the line reads only the status from that cause. Here,
     an Azure deployment that doesn't exist."""
     import logging
 
@@ -1402,7 +1557,7 @@ async def test_router_unavailable_logs_the_status_under_antons_own_error(monkeyp
     line = record.getMessage()
     assert "error=NotFoundError" not in line  # the class is anton's, not the SDK's
     assert "status=404" in line
-    assert "code=DeploymentNotFound" in line
+    assert "code=" not in line
     assert "does not exist" not in line
 
 

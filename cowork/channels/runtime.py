@@ -533,7 +533,6 @@ class AntonChannelRuntime:
             text = f"{sender_name}: {text}"
         blocks = await self.build_input_blocks(scoped, adapter, event, text)
 
-        _ = conversation.messages
         names = [a.filename for a in (event.message.attachments or [])]
         content = text or (f"[attachments: {', '.join(names)}]" if names else "")
         # Send time captured before the turn

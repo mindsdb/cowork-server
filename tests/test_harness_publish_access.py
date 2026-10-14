@@ -1,11 +1,13 @@
 """Harness publish tool forwards access + preserves previous (ENG-322 follow-up)."""
 
+import json
 from pathlib import Path
 from unittest import mock
 
 import pytest
 
 from cowork.harnesses.anton_harness import tools as htools
+from cowork.services.publish import PublishOwnedByOtherUser
 
 
 def _artifact(tmp_path: Path) -> Path:
@@ -113,3 +115,23 @@ async def test_harness_restricted_invalid_email_returns_error(tmp_path):
     assert "colleague@corp" in text
     assert "INVALID" in text
     fake.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_harness_tells_the_agent_not_to_work_around_another_owner(tmp_path):
+    f = _artifact(tmp_path)
+    fake = mock.Mock(side_effect=PublishOwnedByOtherUser())
+    with mock.patch.object(htools, "_publish_artifact", fake):
+        out = await htools._cowork_publish_or_preview(
+            _session(tmp_path),
+            {"file_path": str(f), "action": "publish", "access_mode": "public"},
+        )
+
+    fake.assert_called_once()
+    assert out.ok is False
+    assert out.reason == "owned_by_other_user"
+    message = json.loads(out.content)["message"]
+    assert message.startswith("PUBLISH FAILED: This artifact was published by another owner.")
+    assert "do not publish this artifact under a new report on your own" in message
+    # Not a ban for the rest of the conversation: the user may fix the account.
+    assert "publish again only if they ask after resolving it" in message

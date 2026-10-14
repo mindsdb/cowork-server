@@ -25,7 +25,7 @@ from fastapi.testclient import TestClient
 
 from cowork.api.v1.endpoints import publish as publish_ep
 from cowork.services import publish
-from cowork.services.publish import PublisherUnavailable
+from cowork.services.publish import PublisherUnavailable, PublishOwnedByOtherUser
 
 
 def _client() -> TestClient:
@@ -65,6 +65,22 @@ def test_upstream_runtime_error_always_maps_to_502(exc):
         res = _client().post("/api/v1/publish/", json={"path": "/some/art"})
     assert res.status_code == 502
     assert res.json()["detail"] == str(exc)
+
+
+@pytest.mark.parametrize("route, target", [
+    ("/api/v1/publish/", "_publish"),
+    ("/api/v1/publish/update", "_update"),
+])
+def test_a_report_owned_by_another_account_is_409_with_its_code(route, target):
+    """An HTTPException passes the RuntimeError -> 502 ladder untouched, so the
+    client gets the code it matches on instead of a 502."""
+    with _patch_context(), patch.object(publish_ep, target, side_effect=PublishOwnedByOtherUser()):
+        res = _client().post(route, json={"path": "/some/art"})
+    assert res.status_code == 409
+    assert res.json()["detail"] == {
+        "code": "artifact_owned_by_other_user",
+        "message": "This artifact was published by another owner.",
+    }
 
 
 def test_publisher_unavailable_maps_to_503():
