@@ -1,5 +1,6 @@
 """The turn key that pins the desktop's LLM billing to its mounted organization."""
 
+import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
@@ -285,6 +286,17 @@ class TestTimeBudget:
         http.post.assert_not_called()
         http.schedule_retry.assert_called_once()
         assert runtime_credential.get_inference_key() is None
+
+    def test_a_slow_response_is_cut_off_at_the_budget(self, http, monkeypatch):
+        monkeypatch.setattr(inference_key, "_MINT_BUDGET_S", 0.2)
+        http.post.side_effect = lambda *a, **k: time.sleep(2)
+
+        started = time.monotonic()
+        inference_key.refresh_inference_key("jwt", ORG_A)
+
+        assert time.monotonic() - started < 1
+        assert runtime_credential.get_inference_key() is None
+        http.schedule_retry.assert_called_once()
 
     def test_a_busy_lock_does_not_hold_up_the_hand_over(self, http, monkeypatch):
         monkeypatch.setattr(inference_key, "_MINT_BUDGET_S", 0.05)
