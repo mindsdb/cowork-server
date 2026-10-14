@@ -32,6 +32,7 @@ from cowork.common.paths import (
 from cowork.common.settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import TenantScope, scoped_storage_root
+from cowork.managed import MANAGED_SKILL_REFUSAL, managed_folder
 from cowork.models.skill import (
     META_CREATED_AT,
     META_DISPLAY_NAME,
@@ -285,7 +286,7 @@ def link_turn_skills(
     (skill_links.links_apply_to). The packaged builtins are seeded into the
     store first, read-only wherever it is partitioned, as a remote turn's
     staging seeds them (ensure_builtin_skills), so a person's first turn
-    already has them. Selection is select_turn_skills's, as for a remote turn.
+    already has them. Selection is linked_turn_skills's.
     """
     service = SkillService(scope)
     service.ensure_builtin_skills()
@@ -293,9 +294,30 @@ def link_turn_skills(
         skills_dir=skills_dir,
         wanted={
             skill.slug: skill.path
-            for skill in select_turn_skills(service=service, project_name=project_name)
+            for skill in linked_turn_skills(service=service, project_name=project_name)
         },
     )
+
+
+def linked_turn_skills(
+    *, service: SkillService, project_name: str | None
+) -> list[TurnSkill]:
+    """The store's skills link_turn_skills links into a turn's skills folder.
+
+    select_turn_skills's selection, without a slug the managed folder holds:
+    anton ranks the turn's skills folder above every read-only root, so a
+    linked same-named skill would hide the operator's.
+    """
+    managed = service.managed_skill_dirs()
+    return [
+        skill
+        for skill in select_turn_skills(service=service, project_name=project_name)
+        if skill.slug not in managed
+    ]
+
+
+def _newest_first(skills: list[Skill]) -> list[Skill]:
+    return sorted(skills, key=lambda s: (s.created_at is None, s.created_at), reverse=True)
 
 
 def _skill_from_dir(
@@ -436,6 +458,33 @@ class SkillService:
         )
         return bool(protected and slug in self.packaged_builtin_slugs)
 
+    def managed_skill_dirs(self) -> dict[str, Path]:
+        """The operator's managed skills this store reserves, by slug.
+
+        None without a managed folder (cowork.managed), and none for a store
+        other than the general one: the managed skills sit beside the general
+        catalogue in every turn, never beside the Code store.
+        """
+        managed = managed_folder()
+        if managed is None or self.store_name != "skills":
+            return {}
+        return managed.skill_dirs()
+
+    def is_managed_skill(self, slug: str) -> bool:
+        return slug in self.managed_skill_dirs()
+
+    def _refuse_if_reserved(self, slug: str) -> None:
+        """Refuse a change that would write, rename into or remove ``slug``.
+
+        A slug the managed folder holds is refused in every mode and scope,
+        with MANAGED_SKILL_REFUSAL. A packaged builtin slug is refused wherever
+        builtins are immutable (_is_immutable_builtin).
+        """
+        if self.is_managed_skill(slug):
+            raise SkillImmutableError(MANAGED_SKILL_REFUSAL)
+        if self._is_immutable_builtin(slug):
+            raise SkillImmutableError(builtin_skill_refusal(slug))
+
     def _ensure_root(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
 
@@ -564,8 +613,33 @@ class SkillService:
                 skill = _skill_from_dir(entry, canonicalize_name=True)
                 if skill is not None:
                     skills.append(skill)
-        skills.sort(key=lambda s: (s.created_at is None, s.created_at), reverse=True)
-        return skills
+        return _newest_first(skills)
+
+    def _managed_skills(self) -> dict[str, Skill]:
+        managed: dict[str, Skill] = {}
+        for slug, skill_dir in self.managed_skill_dirs().items():
+            skill = _skill_from_dir(skill_dir, canonicalize_name=True)
+            if skill is not None and self.allows_skill(slug):
+                managed[slug] = skill
+        return managed
+
+    def list_visible_skills(self) -> list[Skill]:
+        """The skills this store's owner sees: the managed skills, and the
+        store's own except one whose slug a managed skill holds.
+
+        For the skills listing only. list_skills and get_skill stay store-only,
+        so the project-rename cascade and the link reconciliation, which write
+        what they read back into the store, never reach a managed skill.
+        """
+        managed = self._managed_skills()
+        own = [skill for skill in self.list_skills() if skill.name not in managed]
+        return _newest_first([*managed.values(), *own])
+
+    def get_visible_skill(self, slug: str) -> Skill:
+        """The skill ``slug`` names for its owner: the managed one when the
+        managed folder holds it, else the store's own (get_skill)."""
+        managed = self._managed_skills().get(slug)
+        return managed if managed is not None else self.get_skill(slug)
 
     def get_skill(self, slug: str) -> Skill:
         if not self.allows_skill(slug):
@@ -645,8 +719,7 @@ class SkillService:
         projects: list[str] | None = None,
     ) -> Skill:
         label = self._slug_from_label(label)
-        if self._is_immutable_builtin(label):
-            raise SkillImmutableError(builtin_skill_refusal(label))
+        self._refuse_if_reserved(label)
         if not self.allows_skill(label):
             raise ValueError(f"Skill name {label!r} is reserved for MindsHub Code.")
         if self._skill_dir(label).exists():
@@ -678,13 +751,11 @@ class SkillService:
         enabled: bool | None = None,
         projects: list[str] | None = None,
     ) -> Skill:
-        if self._is_immutable_builtin(skill_id):
-            raise SkillImmutableError(builtin_skill_refusal(skill_id))
+        self._refuse_if_reserved(skill_id)
         skill = self.get_skill(skill_id)
         # ``skill_id`` may be a same-root alias, so the reservation is
         # re-checked against the directory this edit would rewrite.
-        if self._is_immutable_builtin(skill.name):
-            raise SkillImmutableError(builtin_skill_refusal(skill.name))
+        self._refuse_if_reserved(skill.name)
         original_state = (
             skill.name,
             skill.display_name,
@@ -699,8 +770,7 @@ class SkillService:
         new_slug = skill.name
         if label is not None:
             new_slug = self._slug_from_label(label)
-            if self._is_immutable_builtin(new_slug):
-                raise SkillImmutableError(builtin_skill_refusal(new_slug))
+            self._refuse_if_reserved(new_slug)
 
         if name is not None:
             if name and name != new_slug:
@@ -842,8 +912,7 @@ class SkillService:
             raise ValueError("Could not find a parseable SKILL.md in the upload.")
         if not skill.name:
             raise ValueError("Skill name is missing or invalid.")
-        if self._is_immutable_builtin(skill.name):
-            raise SkillImmutableError(builtin_skill_refusal(skill.name))
+        self._refuse_if_reserved(skill.name)
         if not self.allows_skill(skill.name):
             raise ValueError(
                 f"Skill name {skill.name!r} is reserved for MindsHub Code."
@@ -932,15 +1001,13 @@ class SkillService:
             raise ValueError("Uploaded file is not a valid zip archive.")
 
     def delete_skill(self, slug: str) -> bool:
-        if self._is_immutable_builtin(slug):
-            raise SkillImmutableError(builtin_skill_refusal(slug))
+        self._refuse_if_reserved(slug)
         skill_dir = self._skill_dir(slug)
         if not skill_dir.exists():
             return False
         # A same-root alias resolves to another slug's directory, so the
         # reservation is re-checked against the directory actually removed.
-        if self._is_immutable_builtin(skill_dir.name):
-            raise SkillImmutableError(builtin_skill_refusal(skill_dir.name))
+        self._refuse_if_reserved(skill_dir.name)
         self._rmtree_direct_child(self.root, skill_dir.name)
         if self._link_projects:
             remove_skill_links(slug)
@@ -948,15 +1015,13 @@ class SkillService:
 
     def stage_delete(self, slug: str) -> Path | None:
         """Atomically hide a skill while its deletion audit is committed."""
-        if self._is_immutable_builtin(slug):
-            raise SkillImmutableError(builtin_skill_refusal(slug))
+        self._refuse_if_reserved(slug)
         skill_dir = self._skill_dir(slug)
         if not skill_dir.exists():
             return None
         # A same-root alias resolves to another slug's directory, so the
         # reservation is re-checked against the directory actually staged.
-        if self._is_immutable_builtin(skill_dir.name):
-            raise SkillImmutableError(builtin_skill_refusal(skill_dir.name))
+        self._refuse_if_reserved(skill_dir.name)
         trash = self._delete_staging_root()
         trash.mkdir(parents=True, exist_ok=True)
         staged = trash / f"{skill_dir.name}-{uuid4()}"

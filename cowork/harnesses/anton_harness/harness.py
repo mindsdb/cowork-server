@@ -73,6 +73,11 @@ def _anton_mcp_wiring():
     return wiring
 
 
+#: Skills this harness ships for its own tools, read-only: the first of
+#: anton's extra skill roots on every turn.
+HOST_SKILLS_DIR = Path(__file__).parent / "skills"
+
+
 def _vault_scratch_dir() -> Path:
     """Where a turn's temporary folder is staged when it needs one: the
     filtered data vault of a turn that disables one or more connections, and
@@ -1083,9 +1088,15 @@ class AntonHarness:
 
         # Host skills: read-only, they back
         # the deferred tool bundles (e.g. `connect-datasource` unlocks the
-        # interactive connection tools). Path relative to this module.
-        host_skills_dir = Path(__file__).parent / "skills"
-        anton_settings.skills_extra_roots = [host_skills_dir]
+        # interactive connection tools). The operator's managed skills follow
+        # them, so a host skill keeps its name; anton ranks every read-only
+        # root below the turn's own skills folder, which never links a slug a
+        # managed skill holds (link_turn_skills).
+        managed = managed_folder()
+        anton_settings.skills_extra_roots = [
+            HOST_SKILLS_DIR,
+            *([] if managed is None else [managed.skills_dir]),
+        ]
 
         user = get_user_settings()
         _overlay_user_settings(anton_settings, user)
