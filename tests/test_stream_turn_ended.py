@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
+from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 import pytest
 
@@ -80,3 +84,44 @@ async def test_formatter_survives_anton_without_turn_ended(monkeypatch):
     resp = (await _final(StreamTextDelta(text="hello")))["response"]
     assert resp["status"] == "completed"
     assert resp["output"][0]["content"][0]["text"] == "hello"
+
+
+def _collect_handler():
+    from cowork.handlers.responses import ResponsesHandler
+
+    handler = object.__new__(ResponsesHandler)
+    handler.principal = None
+
+    class _Harness:
+        id = "anton"
+        formatter = staticmethod(format_responses_stream)
+
+    handler.harness = _Harness()
+    handler.scope = None
+    return handler
+
+
+def _run_collect(*items):
+    @contextlib.asynccontextmanager
+    async def _no_lock(_conversation_id):
+        yield
+
+    with patch("cowork.handlers.responses.run_db", AsyncMock(return_value=uuid4())), \
+         patch("cowork.handlers.responses.conversation_writes", _no_lock):
+        return asyncio.run(_collect_handler()._collect(
+            stream=_events(*items), conversation_id=uuid4(), model="m", original_content="hi",
+        ))
+
+
+@needs_turn_ended
+def test_non_streaming_response_carries_the_reason():
+    resp = _run_collect(StreamTextDelta(text="Stopped."), StreamTurnEnded(ended_by="handback_stuck"))
+    assert resp.status.value == "incomplete"
+    assert resp.incomplete_details.reason == "handback_stuck"
+    assert resp.output[0].content[0].text == "Stopped."
+
+
+def test_non_streaming_finished_response_carries_no_reason():
+    resp = _run_collect(StreamTextDelta(text="Hello."))
+    assert resp.status.value == "completed"
+    assert resp.incomplete_details is None

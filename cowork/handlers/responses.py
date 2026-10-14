@@ -2773,8 +2773,15 @@ class ResponsesHandler:
         async with conversation_writes(conversation_id):
             anchor_id = await run_db(save_turn, scope=self.scope)
 
+        # Same status and reason as the streamed response.completed.
+        final = next(
+            (e.get("response") for e in reversed(collected_events) if e.get("type") == "response.completed"),
+            None,
+        ) or {}
+        incomplete = final.get("incomplete_details")
         return Response(
-            status=ResponseStatus.completed,
+            status=ResponseStatus.incomplete if incomplete else ResponseStatus.completed,
+            incomplete_details=incomplete,
             model=model,
             output=[self._build_output(str(anchor_id), assistant_text)],
         )
