@@ -112,12 +112,16 @@ def close_coding_services():
 @pytest.fixture(scope="session", autouse=True)
 def trust_test_client_host():
     """Starlette's TestClient sends ``Host: testserver``; only tests trust it."""
+    from cowork import host_middleware
     from cowork.api.v1.endpoints import guards
 
     production = guards._TRUSTED_LOOPBACK_HOSTS
+    production_hosts = host_middleware._TRUSTED_HOSTS
     guards._TRUSTED_LOOPBACK_HOSTS = production | {"testserver"}
+    host_middleware._TRUSTED_HOSTS = production_hosts | {"testserver"}
     yield
     guards._TRUSTED_LOOPBACK_HOSTS = production
+    host_middleware._TRUSTED_HOSTS = production_hosts
 
 
 @pytest.fixture

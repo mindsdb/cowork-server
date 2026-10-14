@@ -114,7 +114,7 @@ def test_telegram_end_to_end(monkeypatch):
 
     async def flow():
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             r = await client.put("/api/v1/channels/telegram/config", json={"values": {"bot_token": "T:tok"}})
             assert r.status_code == 200
 
@@ -1199,7 +1199,7 @@ def test_binding_instructions_roundtrip():
 
     async def flow():
         transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             r = await client.post("/api/v1/channels/bindings", json={
                 "channel_type": "telegram",
                 "external_group_id": "-400500",
