@@ -298,3 +298,34 @@ async def test_owner_reads_back_an_owner_only_artifact(as_owner):
 
     assert out["ownerOnly"] is True
     assert out["accessEmails"] == []
+
+
+async def test_share_of_a_report_owned_by_another_account_is_409(as_owner, publish_context, monkeypatch):
+    """The org Share path says so instead of publishing a copy under a new URL."""
+    from anton.publisher import ArtifactOwnedByOtherUserError
+
+    calls = []
+
+    def reject(*args, **kwargs):
+        calls.append(kwargs)
+        raise ArtifactOwnedByOtherUserError()
+
+    monkeypatch.setattr("anton.publisher.publish", reject)
+    monkeypatch.setattr("cowork.services.publish.vault_for_scope", lambda scope: object())
+    monkeypatch.setattr(
+        "cowork.services.artifact_authorization_identity.publish_authorization_key",
+        lambda *args: "owner/artifact",
+    )
+    with pytest.raises(HTTPException) as error:
+        await aw.set_artifact_access(
+            "proj", ARTIFACT_ID, aw._AccessBody(access={"mode": "public"}), _Session(),
+        )
+    assert error.value.status_code == 409
+    assert error.value.detail == {
+        "code": "artifact_owned_by_other_user",
+        "message": "This artifact was published by another owner.",
+    }
+    assert len(calls) == 1
+    assert not (as_owner / ".published.json").exists()
+    assert artifact_locks.acquire(as_owner.parent, as_owner.name, ttl_s=60) is True
+    artifact_locks.release(as_owner.parent, as_owner.name)
