@@ -268,7 +268,13 @@ def require_local_for_chosen_folder(
     """
     if body.path is None:
         return
-    require_local(request)
+    try:
+        require_local(request)
+    except HTTPException as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail="a chosen project folder needs a request over loopback",
+        ) from exc
 
 
 @router.post(

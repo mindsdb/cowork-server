@@ -7,6 +7,7 @@ create_app() so the real middleware registration is what is under test.
 """
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -16,7 +17,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from cowork.auth_middleware import _read_token
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.host_middleware import TrustedHostMiddleware
+from cowork.host_middleware import RebindingHostMiddleware
 
 FOREIGN_HOST = "rebind.attacker-controlled.example:26866"
 ATTACKER_ORIGIN = f"http://{FOREIGN_HOST}"
@@ -121,6 +122,26 @@ def test_foreign_host_changes_no_setting(auth_off):
     assert client.get("/api/v1/settings/", headers=local).json() == before
 
 
+def test_foreign_host_writes_no_project_file(auth_off):
+    client = TestClient(auth_off, client=("127.0.0.1", 50000))
+    local = {"host": "127.0.0.1:26866"}
+    projects = client.get("/api/v1/projects/", headers=local).json()
+    target = Path(next(p["path"] for p in projects if p["name"] == "general")) / "rebound-check.txt"
+    url = "/api/v1/projects/general/files/rebound-check.txt"
+
+    resp = client.put(url, json={"content": "pwned"}, headers={"host": FOREIGN_HOST})
+
+    assert resp.status_code == 403
+    assert not target.exists()
+
+    # The same write from the desktop lands, so the path checked above is the real one.
+    try:
+        assert client.put(url, json={"content": "ok"}, headers=local).status_code == 200
+        assert target.read_text() == "ok"
+    finally:
+        target.unlink(missing_ok=True)
+
+
 @pytest.mark.parametrize(
     "host",
     [
@@ -174,6 +195,32 @@ def test_configured_hostnames_are_accepted(monkeypatch, tmp_path):
     assert client.get("/api/v1/conversations/", headers={"host": "other.example.com"}).status_code == 403
 
 
+def test_configured_hostnames_accept_a_plain_list(monkeypatch, tmp_path):
+    app = _app(
+        monkeypatch,
+        tmp_path,
+        COWORK_REQUIRE_AUTH="false",
+        COWORK_ALLOWED_HOSTS="my-tunnel.example, cowork:9010",
+    )
+    client = TestClient(app)
+
+    for host in ("my-tunnel.example", "cowork:9010"):
+        assert client.get("/api/v1/conversations/", headers={"host": host}).status_code == 200
+
+
+def test_public_base_url_host_is_accepted(monkeypatch, tmp_path):
+    app = _app(
+        monkeypatch,
+        tmp_path,
+        COWORK_REQUIRE_AUTH="false",
+        COWORK_PUBLIC_BASE_URL="https://abc.ngrok.app",
+    )
+    client = TestClient(app)
+
+    assert client.get("/api/v1/conversations/", headers={"host": "abc.ngrok.app"}).status_code == 200
+    assert client.get("/api/v1/conversations/", headers={"host": "ngrok.app"}).status_code == 403
+
+
 def test_forwarded_host_does_not_override_host(auth_off):
     client = TestClient(auth_off, client=("127.0.0.1", 50000))
     resp = client.get(
@@ -220,7 +267,7 @@ def _tiny_app(exempt=()):
         await websocket.send_text("hi")
         await websocket.close()
 
-    app.add_middleware(TrustedHostMiddleware, exempt_paths=set(exempt))
+    app.add_middleware(RebindingHostMiddleware, exempt_paths=set(exempt))
     return app
 
 
