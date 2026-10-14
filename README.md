@@ -48,68 +48,48 @@ uv run pytest
 
 Tests use an isolated in-memory database and temporary directories — no side effects on your local `~/.cowork/` data.
 
-Post-deploy integration runs use the target cluster's self-hosted runner. Dev
-and staging obtain the fixed `cowork` test suite through auth's cluster-only
-service URL. Production must not mutate that shared `@emailsink.dev` identity
-while the fixed password remains committed. The production test path therefore
-accepts a dedicated `COWORK_TEST_API_KEY` secret, a reviewed
-`COWORK_TEST_USER_EMAIL` variable on the non-staff `@mindshub.ai` domain, and
-the immutable dedicated organization id in `COWORK_TEST_ORG_ID`. The suite
-resolves and matches that principal and organization through production auth,
-and refuses an employee-classified or Hub-admin identity before testing. A
-missing or mismatched identity fails the required prod run instead of falling
-back to provisioning or reporting skipped tests. Standing-identity mode also
-requires the test target to be exactly `https://cowork.mindshub.ai` before the
-first network call, so a changed environment file or workflow cannot send the
-production key to another origin.
+Post-deploy integration runs use the target cluster's self-hosted runner. PR environments mint a fresh throwaway tenant on every run through auth's `/dev/mint-test-user/`. Dev and staging obtain the fixed `cowork` test suite through auth's cluster-only service URL, which mints a fresh key on every run. Auth refuses that provisioner in production: it answers 403 outside dev and staging, and it only provisions `@emailsink.dev` addresses, a domain whose password-reset mailbox MindsDB does not control. Production therefore runs as a dedicated standing identity until auth can provision a controlled-domain suite there.
 
-Do not store or use `COWORK_TEST_API_KEY` yet, or configure its paired email and
-organization id for a production run. The live `prod` GitHub Environment has no
-protection rules or deployment-branch policy. Although `publish.yml` refuses to
-enter its production build/deploy job from a non-main ref, a manually selected
-branch runs that branch's workflow text and can remove the check. Workflow code
-is therefore defense in depth, not the authority that protects an Environment
-secret.
+The production test path reads three inputs from the `prod` GitHub Environment: the `COWORK_TEST_API_KEY` secret and the `COWORK_TEST_USER_EMAIL` and `COWORK_TEST_ORG_ID` variables. The suite resolves the key through production auth and refuses to test unless auth returns that email and organization, a user API key, no Hub admin entitlement, and a `free` or `paid` billing segment. A missing or mismatched identity fails the required prod run instead of falling back to provisioning or reporting skipped tests. Standing-identity mode also requires the test target to be exactly `https://cowork.mindshub.ai` before the first network call, so a changed environment file or workflow cannot send the production key to another origin.
 
-Before `COWORK_TEST_API_KEY` is stored or used, or any production evidence run
-starts, the `prod` Environment must have a nonempty required-reviewer rule with
-`prevent_self_review: true`, `can_admins_bypass: false`, and a selected-branches
-deployment policy whose only entry is the `main` branch, created as an exact
-Branch rule (no tag, wildcard, or second branch rule). Verify the live settings
-without reading any secret value:
+The identity is a dedicated account, never a person's:
+
+- **A MindsDB-controlled `@mindshub.ai` mailbox with 2FA**, not a `+` alias of someone's inbox, so verification and password-reset mail stay with MindsDB. Every prod run prints the email and organization id in the public job log; only the key is masked. `mindshub.ai` is a staff domain in auth, but auth grants the `staff` role only to staff-roster entries, and the roster accepts only `mindsdb.com`. Never add the address to the staff roster, and never grant it the `staff` or `mindsdb-admin` realm role: either one fails the Hub admin or billing-segment check.
+- **Its own personal organization**, created by its first login. `COWORK_TEST_ORG_ID` is that organization's UUID as `/v1/authenticate/` returns it in `organization_id`, not its name.
+- **A user API key** minted on the console's API-keys page while that organization is active.
+
+Check the key before storing it. The output must show `valid: true`, `key_type: "user"`, the dedicated email, a UUID `organization_id`, `hub_admin: false`, and an `x-billing-segment` of `free` or `paid`. Auth sits behind Cloudflare bot rules that refuse a default client User-Agent, so the call sends a browser one:
+
+```sh
+read -rs COWORK_KEY
+curl -sS -D - -o auth.json https://auth.mindshub.ai/v1/authenticate/ \
+  -H @<(printf 'Authorization: Bearer %s' "$COWORK_KEY") \
+  -H 'X-MindsDB-Product: hub' \
+  -H 'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36' \
+  | grep -i '^x-billing-segment'
+jq '{valid, key_type, email, organization_id, hub_admin: .entitlements.permissions.admin.hub}' auth.json
+rm auth.json
+unset COWORK_KEY
+```
+
+Then store the three inputs. Each command prompts for its value:
+
+```sh
+gh secret set COWORK_TEST_API_KEY --repo mindsdb/cowork-server --env prod
+gh variable set COWORK_TEST_USER_EMAIL --repo mindsdb/cowork-server --env prod
+gh variable set COWORK_TEST_ORG_ID --repo mindsdb/cowork-server --env prod
+```
+
+The `prod` Environment disables administrator bypass and allows deployments from one exact `main` Branch rule. `mindsdb/terraform` declares both in `github_environment_protections` (`newprod/us-east-1/mindsdb/terraform.tfvars`), so a change made in the GitHub UI is reverted by the next apply. It has no required-reviewer rule, deliberately. Although `publish.yml` refuses to enter its production build/deploy job from a non-main ref, a manually selected branch runs that branch's workflow text and can remove the check. Workflow code is therefore defense in depth, not the authority that protects an Environment secret. Verify the live policy without reading any secret value:
 
 ```sh
 gh api repos/mindsdb/cowork-server/environments/prod \
-  --jq '
-    [.protection_rules[]?
-      | select(.type == "required_reviewers")
-      | {
-          prevent_self_review,
-          reviewers: [.reviewers[]?
-            | {type, name: (.reviewer.login // .reviewer.slug)}]
-        }] as $required_reviewers
-    | {
-        can_admins_bypass,
-        required_reviewers: $required_reviewers,
-        deployment_branch_policy
-      }
-  '
+  --jq '{can_admins_bypass, deployment_branch_policy}'
 gh api 'repos/mindsdb/cowork-server/environments/prod/deployment-branch-policies?per_page=100' \
   --jq '[.branch_policies[] | {name, type}]'
 ```
 
-The first command must show exactly one required-reviewer rule with at least one
-named reviewer and `prevent_self_review: true`, plus `can_admins_bypass: false`,
-`protected_branches: false`, and `custom_branch_policies: true`. The second must
-print exactly `[{"name":"main","type":"branch"}]`. Only after both checks pass
-may an operator store `COWORK_TEST_API_KEY`, `COWORK_TEST_USER_EMAIL`, and
-`COWORK_TEST_ORG_ID` on that Environment. Evidence must come from a fresh
-main-branch run started after the
-protection was active, with `run_attempt: 1`; an eligible reviewer other than the
-run's `actor` and `triggering_actor` must approve its `prod` Environment gate. A
-rerun of an attempt that began before protection does not count. Keeping the
-values at Environment scope prevents non-prod jobs from receiving them, but that
-scope is safe only when these Environment controls are active.
+The first command must show `can_admins_bypass: false`, `protected_branches: false`, and `custom_branch_policies: true`. The second must print exactly `[{"name":"main","type":"branch"}]`: the deployment policy's only entry is the `main` branch, as an exact Branch rule with no tag, wildcard, or second branch rule. Keeping the inputs at Environment scope prevents non-prod jobs from receiving them.
 
 #### Nightly production read-only smoke
 
@@ -129,14 +109,7 @@ The nightly is an alert, not a release gate. Review any new endpoint in
 `tests/test_production_read_only_workflow.py`, which rejects mutating HTTP calls
 and pins the complete request list.
 
-The unattended nightly cannot reference the existing `prod` Environment.
-That Environment must retain its required-reviewer gate for production deploys,
-and GitHub pauses every job that references such an Environment until a reviewer
-approves it. The monitor instead uses a dedicated `prod-read-only` Environment
-with unique `COWORK_PROD_READ_ONLY_API_KEY`,
-`COWORK_PROD_READ_ONLY_USER_EMAIL`, and
-`COWORK_PROD_READ_ONLY_ORG_ID` inputs. Unique names prevent a missing
-Environment value from falling back to a repository or organization credential.
+The unattended nightly cannot reference the existing `prod` Environment. That Environment holds the mutating post-deploy suite's key and the production database URI, and a read-only monitor should receive neither. The monitor instead uses a dedicated `prod-read-only` Environment with unique `COWORK_PROD_READ_ONLY_API_KEY`, `COWORK_PROD_READ_ONLY_USER_EMAIL`, and `COWORK_PROD_READ_ONLY_ORG_ID` inputs. Unique names prevent a missing Environment value from falling back to a repository or organization credential.
 
 Before promoting this workflow to `main`, an operator must create
 `prod-read-only` with no required-reviewer or wait-timer rule and a custom
