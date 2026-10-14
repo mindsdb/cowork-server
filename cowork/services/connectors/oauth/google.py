@@ -37,6 +37,7 @@ _SERVICE_CREDENTIAL_ATTRS: dict[str, tuple[str, str | None]] = {
     "github":           ("github_client_id",            "github_client_secret"),
     "supabase":         ("supabase_client_id",          "supabase_client_secret"),
     "posthog":          ("posthog_client_id",           None),
+    "figma":            ("figma_client_id",             "figma_client_secret"),
     "hubspot":          ("hubspot_client_id",           "hubspot_client_secret"),
 }
 
@@ -222,6 +223,19 @@ def _fetch_userinfo_github(access_token: str) -> dict[str, Any]:
     return {"email": email or login, "name": name or login}
 
 
+def _fetch_userinfo_figma(access_token: str) -> dict[str, Any]:
+    """One token covers every team and organization the user can see, so the
+    identity is the user alone, like GitHub's. `handle` is the fallback if
+    `email` is ever missing."""
+    result = _json_request(
+        "https://api.figma.com/v1/me",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    handle = str(result.get("handle") or "").strip()
+    email = str(result.get("email") or "").strip()
+    return {"email": email or handle, "name": email or handle}
+
+
 def _fetch_userinfo_supabase(access_token: str) -> dict[str, Any]:
     """Resolve a Supabase OAuth grant to a stable organization identity."""
     headers = {"Authorization": f"Bearer {access_token}"}
@@ -258,6 +272,7 @@ _USERINFO_FETCHERS: dict[str, Callable[[str], dict[str, Any]]] = {
     "github": _fetch_userinfo_github,
     "supabase": _fetch_userinfo_supabase,
     "posthog": _fetch_userinfo_posthog,
+    "figma": _fetch_userinfo_figma,
 }
 
 

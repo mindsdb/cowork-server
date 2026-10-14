@@ -30,6 +30,35 @@
     "logo_color": "#F24E1E",
     "methods": [
       {
+        "id": "browser_oauth_builtin",
+        "label": "In-Browser Connect",
+        "description": "Opens Figma sign-in in your browser. No credentials required — just click Connect. Gives read-only access to the files you can see in Figma.",
+        "recommended": true,
+        "hidden": true,
+        "fields": [],
+        "oauth": {
+          "auth_url": "https://www.figma.com/oauth",
+          "token_url": "https://api.figma.com/v1/oauth/token",
+          "scopes": [
+            "current_user:read",
+            "file_content:read",
+            "file_metadata:read",
+            "file_versions:read",
+            "file_comments:read",
+            "library_content:read",
+            "library_assets:read",
+            "team_library_content:read",
+            "file_dev_resources:read"
+          ],
+          "extra_auth_params": {},
+          "service_id": "figma",
+          "supports_refresh": true,
+          "supports_revoke": false,
+          "token_auth_style": "basic",
+          "redirect_port": 47295
+        }
+      },
+      {
         "id": "personal-access-token",
         "label": "Personal Access Token",
         "description": "Generate a token in Figma Settings → Personal access tokens and paste it here. No OAuth setup required — the fastest way to connect.",
@@ -82,7 +111,8 @@
             "placeholder": "your-figma-client-secret",
             "description": "From Figma Developer Console → your app → Client secret. Keep this private."
           }
-        ]
+        ],
+        "hidden": true
       }
     ],
     "logo_url": "logos/figma.svg"
