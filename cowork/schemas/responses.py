@@ -77,6 +77,13 @@ class ResponseStatus(str, Enum):
     created = "created"
     in_progress = "in_progress"
     completed = "completed"
+    # Answered, but the turn stopped early (a limit or another hand-back).
+    incomplete = "incomplete"
+
+
+class IncompleteDetails(BaseModel):
+    # anton's `ended_by`, e.g. "spend_ceiling" or "round_cap".
+    reason: str
 
 
 class ResponseOutput(BaseModel):
@@ -95,6 +102,8 @@ class Response(BaseModel):
     created_at: int = Field(default_factory=lambda: int(time.time()))
     status: ResponseStatus
     error: str | None = None
+    # Always present, null unless status is incomplete — as in OpenAI's schema.
+    incomplete_details: IncompleteDetails | None = None
     model: str | None = None  # The model can be set to None here because of the reasons mentioned in the request schema.
     output: list[ResponseOutput] = Field(default_factory=list)
     # TODO: There are some other that have not been included here. Are they needed?
