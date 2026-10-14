@@ -11,6 +11,8 @@ from cowork.services.connectors.identity import (
     VAULT_KEEP_SENTINEL as _SENTINEL,
     connection_display_name,
 )
+from cowork.services.connectors.layered_vault import LayeredDataVault
+from cowork.services.connectors.persist import with_managed_connections
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.vault_lock import discard_lock, lock_for
 
@@ -23,6 +25,10 @@ class ConnectionsService:
     must be supplied by the caller (a request's ``TenantScope``, not
     recovered from anywhere else). The module-level ``service`` singleton
     below is LOCAL-MODE ONLY and must never be used to serve an org request.
+
+    The operator's managed connections are layered over the scope's own
+    (with_managed_connections): listed and read with them, marked
+    ``managed``, and every write to one raises ManagedConnectionError.
     """
 
     def __init__(self, scope: TenantScope | None = None) -> None:
@@ -31,7 +37,17 @@ class ConnectionsService:
     def _vault(self):
         from pathlib import Path
         from anton.core.datasources.data_vault import LocalDataVault
-        return LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), self.scope, store="data-vault"))
+        return with_managed_connections(
+            LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), self.scope, store="data-vault"))
+        )
+
+    @staticmethod
+    def _is_managed_in(vault, engine: str, name: str) -> bool:
+        return isinstance(vault, LayeredDataVault) and vault.is_managed(engine, name)
+
+    def is_managed(self, engine: str, name: str) -> bool:
+        """Whether the operator's managed folder provides this connection."""
+        return self._is_managed_in(self._vault(), engine, name)
 
     def _read_record(self, vault, engine: str, name: str) -> dict | None:
         """Full on-disk record via read_record() when the vault supports
@@ -75,6 +91,7 @@ class ConnectionsService:
                 logo=spec.logo if spec else None,
                 logo_color=spec.logo_color if spec else None,
                 status=(fields or {}).get("status"),
+                managed=self._is_managed_in(vault, engine, name),
             ))
         return result
 
@@ -121,6 +138,7 @@ class ConnectionsService:
             method=fields.pop("_method", None),
             fields=fields,
             secure_keys=masked_keys,
+            managed=self._is_managed_in(vault, engine, name),
         )
 
     def runtime_fields(self, engine: str, name: str) -> dict | None:

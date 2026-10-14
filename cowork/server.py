@@ -24,7 +24,12 @@ from cowork.db.personal_resources import check_personal_resource_dependencies
 from cowork.db.scoped import MissingTenantScopeError
 from cowork.db.units import DatabaseBusy, busy_retry_seconds
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
-from cowork.managed import cortex_takes_managed_layer, managed_folder
+from cowork.managed import (
+    MANAGED_CONNECTION_REFUSAL,
+    ManagedConnectionError,
+    cortex_takes_managed_layer,
+    managed_folder,
+)
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.streaming import TurnInProgress
@@ -355,6 +360,13 @@ def create_app() -> FastAPI:
     @app.exception_handler(TurnInProgress)
     async def _turn_in_progress(request, exc):
         return JSONResponse(TURN_IN_PROGRESS.model_dump(), status_code=exc.status_code)
+
+    # A save or delete that reached a connection the operator's managed folder
+    # provides (LayeredDataVault). The connections routes refuse one up front;
+    # this answers the same for a save whose derived name lands on one.
+    @app.exception_handler(ManagedConnectionError)
+    async def _managed_connection(request, exc):
+        return JSONResponse({"detail": MANAGED_CONNECTION_REFUSAL}, status_code=403)
 
     # Bearer-token auth. On by default in local mode (see AppSettings.
     # require_auth). Token is auto-generated on first startup when

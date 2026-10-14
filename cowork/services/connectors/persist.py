@@ -14,19 +14,22 @@ from typing import TYPE_CHECKING
 from anton.utils.datasources import default_user_label, ensure_unique_user_label
 
 from cowork.common.settings.app_settings import ConnectorSettings
+from cowork.managed import managed_folder
 from cowork.services.connectors.identity import (
     derive_connection_name,
     resolve_keep_sentinels,
     resolve_unique_slug,
     secure_keys_for,
 )
+from cowork.services.connectors.layered_vault import LayeredDataVault
 from cowork.services.connectors.vault_lock import lock_for
 
 if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
 
 
-def vault_for_scope(scope: "TenantScope | None" = None):
+def own_vault_for_scope(scope: "TenantScope | None" = None):
+    """The vault ``scope`` saves into, without the operator's managed entries."""
     from anton.core.datasources.data_vault import LocalDataVault
     from cowork.db.scoped import scoped_storage_root
 
@@ -38,16 +41,39 @@ def vault_for_scope(scope: "TenantScope | None" = None):
     return LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), scope, store="data-vault"))
 
 
+def with_managed_connections(own):
+    """``own`` with the operator's managed connections layered over it while
+    COWORK_MANAGED_DIR is set (LayeredDataVault), else ``own`` itself.
+
+    In the layered vault a managed entry reads first, and a save or delete of
+    one raises ManagedConnectionError. Every vault a scope reads or saves
+    through goes through here.
+    """
+    managed = managed_folder()
+    if managed is None:
+        return own
+    from anton.core.datasources.data_vault import LocalDataVault
+
+    return LayeredDataVault(managed=LocalDataVault(managed.vault_dir), own=own)
+
+
+def vault_for_scope(scope: "TenantScope | None" = None):
+    """``scope``'s saved connections, for reading and for saving: its own
+    vault (own_vault_for_scope) with the managed ones over it
+    (with_managed_connections)."""
+    return with_managed_connections(own_vault_for_scope(scope))
+
+
 def turn_vault_for_scope(scope: "TenantScope | None"):
     """The saved connections an in-process turn and an artifact's live backend
     read for ``scope``.
 
-    That is ``scope``'s own vault (vault_for_scope): the person's where
-    connections are personal, the base vault where they are shared, and a
-    refusal for ``scope=None`` on a partitioned deployment, so an unbound turn
-    reads nobody's connections. It is the one read path both share, kept
-    apart from vault_for_scope, which every save uses, so read-only entries
-    can be layered over the scope's own here without reaching a save.
+    That is vault_for_scope's: the person's own where connections are
+    personal, the base vault where they are shared, the operator's managed
+    connections over either, and a refusal for ``scope=None`` on a
+    partitioned deployment, so an unbound turn reads nobody's connections.
+    A save through it, such as the agent's own in a turn, lands in the
+    scope's own vault and outlives the turn.
     """
     return vault_for_scope(scope)
 

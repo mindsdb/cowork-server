@@ -306,8 +306,15 @@ def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_d
     filtered = LocalDataVault(temp_dir)
     for conn in source_vault.list_connections():
         if (conn["engine"], conn["name"]) not in disabled_keys:
-            creds = source_vault.load(conn["engine"], conn["name"]) or {}
-            filtered.save(conn["engine"], conn["name"], creds)
+            # The whole record, so each copy keeps its own secret classification
+            # (secure_keys) rather than falling back to the name heuristic.
+            record = source_vault.read_record(conn["engine"], conn["name"]) or {}
+            filtered.save(
+                conn["engine"],
+                conn["name"],
+                record.get("fields") or {},
+                secure_keys=record.get("secure_keys"),
+            )
     return filtered
 
 
@@ -1258,10 +1265,12 @@ class AntonHarness:
         if LocalDataVault is not None:
             from cowork.services.connectors.persist import turn_vault_for_scope
 
-            # The asker's own connections, from the turn's bound scope
-            # (use_settings_scope), never the operator view _units_scope falls
-            # back to: an unbound turn on a partitioned deployment is refused
-            # here rather than handed the base vault.
+            # The asker's own connections, with the operator's managed ones
+            # over them, from the turn's bound scope (use_settings_scope),
+            # never the operator view _units_scope falls back to: an unbound
+            # turn on a partitioned deployment is refused here rather than
+            # handed the base vault. A connection the agent saves through it
+            # lands in the asker's own vault.
             source_vault = turn_vault_for_scope(current_settings_scope())
             if disabled_connections:
                 turn_scratch_dir = _new_turn_scratch_dir()
