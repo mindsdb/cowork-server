@@ -572,7 +572,7 @@ SUB_A = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
 SUB_B = "8a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
 
 
-def _person(partition: str, sub: str, *, resources=None) -> TenantScope:
+def _person(*, partition: str, sub: str, resources=None) -> TenantScope:
     from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
 
     return TenantScope(
@@ -584,8 +584,8 @@ def _person(partition: str, sub: str, *, resources=None) -> TenantScope:
 
 
 def test_every_person_gets_their_own_general(db, personal_deployment, tmp_path):
-    alice = _svc(db, _person(PARTITION_A, SUB_A))
-    bob = _svc(db, _person(PARTITION_B, SUB_B))
+    alice = _svc(db, _person(partition=PARTITION_A, sub=SUB_A))
+    bob = _svc(db, _person(partition=PARTITION_B, sub=SUB_B))
 
     ga = alice.ensure_general_for_scope()
     gb = bob.ensure_general_for_scope()
@@ -602,7 +602,7 @@ def test_every_person_gets_their_own_general(db, personal_deployment, tmp_path):
 
 
 def test_a_person_with_shared_projects_uses_the_seeded_general(db, personal_deployment):
-    shared = _person(PARTITION_A, SUB_A, resources=frozenset())
+    shared = _person(partition=PARTITION_A, sub=SUB_A, resources=frozenset())
     general = _svc(db, shared).ensure_general_for_scope()
     assert general is not None and general.id == GENERAL_PROJECT_ID
     assert general.org_id is None
@@ -614,21 +614,21 @@ def test_a_partition_refuses_to_adopt_a_server_folder(db, personal_deployment, t
     chosen = tmp_path / "outside" / "notes"
     chosen.mkdir(parents=True)
     with pytest.raises(ProjectPathNotAllowedError):
-        _svc(db, _person(PARTITION_A, SUB_A)).create_project("notes", path=chosen)
+        _svc(db, _person(partition=PARTITION_A, sub=SUB_A)).create_project("notes", path=chosen)
     assert _raw(db).exec(select(Project).where(Project.name == "notes")).first() is None
 
 
 def test_a_person_with_shared_projects_may_still_adopt_a_folder(db, personal_deployment, tmp_path):
     chosen = tmp_path / "outside" / "notes"
     chosen.mkdir(parents=True)
-    shared = _svc(db, _person(PARTITION_A, SUB_A, resources=frozenset()))
+    shared = _svc(db, _person(partition=PARTITION_A, sub=SUB_A, resources=frozenset()))
     project = shared.create_project("notes", path=chosen)
     assert Path(project.path) == chosen.resolve()
     assert shared.directory_is_external(project) is True
 
 
 def test_no_partition_project_reads_as_an_adopted_folder(db, personal_deployment):
-    alice = _svc(db, _person(PARTITION_A, SUB_A))
+    alice = _svc(db, _person(partition=PARTITION_A, sub=SUB_A))
     project = alice.create_project("reports")
     # Even a row whose path sits outside the partition root is a stale row here,
     # not a chosen folder.
@@ -650,8 +650,8 @@ def test_partition_creates_and_renames_link_no_skills(db, personal_deployment, m
         "cowork.services.skill_links.reconcile_project",
         lambda *args, **kwargs: calls.append(kwargs.get("project_name")),
     )
-    alice = _svc(db, _person(PARTITION_A, SUB_A))
-    bob = _svc(db, _person(PARTITION_B, SUB_B))
+    alice = _svc(db, _person(partition=PARTITION_A, sub=SUB_A))
+    bob = _svc(db, _person(partition=PARTITION_B, sub=SUB_B))
     bob.create_project("notes")
     mine = alice.create_project("notes")
     alice.update_project(mine.id, name="notes-renamed")
@@ -665,7 +665,7 @@ def test_shared_projects_and_skills_keep_todays_links(db, personal_deployment, m
         "cowork.services.skill_links.reconcile_project",
         lambda *args, **kwargs: calls.append(kwargs.get("project_name")),
     )
-    shared = _svc(db, _person(PARTITION_A, SUB_A, resources=frozenset()))
+    shared = _svc(db, _person(partition=PARTITION_A, sub=SUB_A, resources=frozenset()))
     project = shared.create_project("notes")
     shared.update_project(project.id, name="notes-renamed")
 
@@ -682,6 +682,6 @@ def test_a_partition_still_takes_the_process_name_lock(db, personal_deployment, 
     assert projects_module._LOCAL_NAME_LOCK.acquire(timeout=1)
     try:
         with pytest.raises(projects_module.ProjectNameLockBusyError):
-            _svc(db, _person(PARTITION_A, SUB_A)).create_project("busy")
+            _svc(db, _person(partition=PARTITION_A, sub=SUB_A)).create_project("busy")
     finally:
         projects_module._LOCAL_NAME_LOCK.release()

@@ -362,7 +362,7 @@ PARTITION_A = "44e92829-e701-599b-88f9-69f5bf1165eb"
 PARTITION_B = "55e92829-e701-599b-88f9-69f5bf1165eb"
 
 
-def _personal(partition: str, user: str, *, resources=None) -> TenantScope:
+def _personal(*, partition: str, user: str, resources=None) -> TenantScope:
     from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
 
     return TenantScope(
@@ -385,7 +385,7 @@ def test_sources_for_scope_lists_only_the_persons_own_projects(session, tmp_path
     mine = _project(session, tmp_path, name="alice-notes", org_id=PARTITION_A)
     _project(session, tmp_path, name="bob-notes", org_id=PARTITION_B)
 
-    sources = artifacts_sources_for_scope(ScopedSession(session, _personal(PARTITION_A, USER_A)))
+    sources = artifacts_sources_for_scope(ScopedSession(session, _personal(partition=PARTITION_A, user=USER_A)))
 
     assert [s.project_name for s in sources] == ["alice-notes"]
     # The in-process layout: one project-wide root, no conversation segment.
@@ -409,6 +409,6 @@ def test_sources_for_scope_scans_when_projects_are_shared(session, monkeypatch):
         lambda _session: called.append("adopted") or [],
     )
 
-    scope = _personal(PARTITION_A, USER_A, resources=frozenset())
+    scope = _personal(partition=PARTITION_A, user=USER_A, resources=frozenset())
     assert artifacts_sources_for_scope(ScopedSession(session, scope)) == []
     assert called == ["scan", "adopted"]

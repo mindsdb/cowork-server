@@ -314,7 +314,7 @@ PARTITION_A = "44e92829-e701-599b-88f9-69f5bf1165eb"
 PARTITION_B = "55e92829-e701-599b-88f9-69f5bf1165eb"
 
 
-def _person(partition: str | None, user: str | None, *, resources=None) -> TenantScope:
+def _person(*, partition: str | None, user: str | None, resources=None) -> TenantScope:
     from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
 
     return TenantScope(
@@ -350,8 +350,8 @@ def test_operator_pinned_keys_are_the_model_endpoint_memory_and_cost():
 
 
 def test_personal_keys_are_per_person(engine):
-    alice = _person(PARTITION_A, "alice")
-    bob = _person(PARTITION_B, "bob")
+    alice = _person(partition=PARTITION_A, user="alice")
+    bob = _person(partition=PARTITION_B, user="bob")
     _svc(engine, alice).upsert_setting("tone", "spicy")
     _svc(engine, alice).upsert_setting("harness", "anton")
 
@@ -369,7 +369,7 @@ def test_pinned_key_ignores_a_persons_own_row(engine, monkeypatch):
     # A stray row in a person's partition (the agent's code can write the
     # database) must not turn memory off for that person.
     monkeypatch.setenv("MEMORY_MODE", "autopilot")
-    alice = _person(PARTITION_A, "alice")
+    alice = _person(partition=PARTITION_A, user="alice")
     with Session(engine) as s:
         s.add(Setting(key="memory_mode", value="off", scope="user", org_id=PARTITION_A, user_id="alice"))
         s.add(Setting(key="max_tool_rounds", value="7", scope="org", org_id=PARTITION_A))
@@ -389,8 +389,8 @@ def test_pinned_key_ignores_a_persons_own_row(engine, monkeypatch):
 
 
 def test_pinned_key_write_in_a_partition_lands_on_the_global_row(engine):
-    alice = _person(PARTITION_A, "alice")
-    bob = _person(PARTITION_B, "bob")
+    alice = _person(partition=PARTITION_A, user="alice")
+    bob = _person(partition=PARTITION_B, user="bob")
     _svc(engine, alice).upsert_setting("max_turn_tokens", "2000000")
 
     with Session(engine) as s:
@@ -404,8 +404,8 @@ def test_pinned_key_write_in_a_partition_lands_on_the_global_row(engine):
 
 
 def test_personal_scope_with_shared_settings_keeps_todays_global_rows(engine):
-    alice = _person(PARTITION_A, "alice", resources=frozenset())
-    bob = _person(PARTITION_B, "bob", resources=frozenset())
+    alice = _person(partition=PARTITION_A, user="alice", resources=frozenset())
+    bob = _person(partition=PARTITION_B, user="bob", resources=frozenset())
     _svc(engine, alice).upsert_setting("tone", "spicy")
     assert _svc(engine, bob).get_setting("tone").value == "spicy"
     with Session(engine) as s:
@@ -417,7 +417,7 @@ def test_personal_partition_without_an_id_fails_closed_on_write(engine):
     from cowork.db.scoped import MissingTenantScopeError
 
     with pytest.raises(MissingTenantScopeError):
-        _svc(engine, _person(None, "alice")).upsert_setting("tone", "spicy")
+        _svc(engine, _person(partition=None, user="alice")).upsert_setting("tone", "spicy")
 
 
 def test_org_mode_still_keys_pinned_keys_by_org_and_user(engine):

@@ -332,7 +332,7 @@ PARTITION_A = "44e92829-e701-599b-88f9-69f5bf1165eb"
 PARTITION_B = "55e92829-e701-599b-88f9-69f5bf1165eb"
 
 
-def _person(partition: str = PARTITION_A, user: str = "alice", *, resources=None) -> TenantScope:
+def _person(*, partition: str = PARTITION_A, user: str = "alice", resources=None) -> TenantScope:
     from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
 
     return TenantScope(
@@ -344,7 +344,7 @@ def _person(partition: str = PARTITION_A, user: str = "alice", *, resources=None
 
 
 def test_every_person_gets_their_own_builtin_copies(skills_root, personal_deployment, tmp_path):
-    alice, bob = _person(PARTITION_A, "alice"), _person(PARTITION_B, "bob")
+    alice, bob = _person(partition=PARTITION_A, user="alice"), _person(partition=PARTITION_B, user="bob")
 
     assert ensure_builtin_skills(alice) is True
     assert SkillService(alice).root == tmp_path / PARTITION_A / "skills"

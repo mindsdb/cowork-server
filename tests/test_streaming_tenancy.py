@@ -256,7 +256,7 @@ PARTITION_B = "55e92829-e701-599b-88f9-69f5bf1165eb"
 
 
 def _personal_scope(
-    org_id: str | None, user_id: str | None, *, resources=None
+    *, org_id: str | None, user_id: str | None, resources=None
 ) -> TenantScope:
     from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
 
@@ -272,7 +272,7 @@ def test_personal_scope_hides_and_refuses_another_persons_turn(client):
     # Two people, each in their own partition: B cannot list, probe, tail,
     # cancel or answer A's running answer, and A's turn keeps running.
     handle_a = _register(CID_A, PARTITION_A, user_id="alice")
-    client.set_scope(_personal_scope(PARTITION_B, "bob"))
+    client.set_scope(_personal_scope(org_id=PARTITION_B, user_id="bob"))
 
     listed = client.get("/api/v1/responses/in-flight-list").json()["in_flight"]
     assert listed == []
@@ -288,7 +288,7 @@ def test_personal_scope_hides_and_refuses_another_persons_turn(client):
     assert answer.status_code == 404
     assert handle_a.cancelled is False
 
-    client.set_scope(_personal_scope(PARTITION_A, "alice"))
+    client.set_scope(_personal_scope(org_id=PARTITION_A, user_id="alice"))
     ids = {r["conversation_id"] for r in client.get("/api/v1/responses/in-flight-list").json()["in_flight"]}
     assert ids == {CID_A}
     resp = client.post("/api/v1/responses/cancel", json={"conversation_id": CID_A})
@@ -309,7 +309,7 @@ def test_personal_scope_with_shared_conversations_keeps_todays_behavior(client):
     # Conversations left off the personal list stay shared: every person sees
     # and can stop every running answer, as on today's shared stack.
     handle_a = _register(CID_A, PARTITION_A, user_id="alice")
-    client.set_scope(_personal_scope(PARTITION_B, "bob", resources=frozenset()))
+    client.set_scope(_personal_scope(org_id=PARTITION_B, user_id="bob", resources=frozenset()))
     ids = {r["conversation_id"] for r in client.get("/api/v1/responses/in-flight-list").json()["in_flight"]}
     assert ids == {CID_A}
     resp = client.post("/api/v1/responses/cancel", json={"conversation_id": CID_A})
@@ -318,6 +318,6 @@ def test_personal_scope_with_shared_conversations_keeps_todays_behavior(client):
 
 def test_personal_scope_without_partition_fails_closed():
     with pytest.raises(MissingTenantScopeError):
-        _require_streaming_scope(_personal_scope(None, "alice"))
+        _require_streaming_scope(_personal_scope(org_id=None, user_id="alice"))
     # Shared conversations have nothing to key, so nothing to refuse.
-    _require_streaming_scope(_personal_scope(None, "alice", resources=frozenset()))
+    _require_streaming_scope(_personal_scope(org_id=None, user_id="alice", resources=frozenset()))
