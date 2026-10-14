@@ -35,6 +35,8 @@ from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.projects import display_label
+from cowork.services.skill_links import links_apply_to
+from cowork.services.skills import link_turn_skills
 from cowork.streaming.liveness import ModelWaitTicker
 
 if TYPE_CHECKING:
@@ -1343,6 +1345,29 @@ class AntonHarness:
                 ),
                 llm_client=llm_client,
             )
+
+            # Skills. Where nothing fans links into this turn's project
+            # (skill_links.links_apply_to), the turn links its own from the
+            # asker's store, builtins seeded first. A project that is the
+            # asker's alone takes them in its skills folder; a shared project's
+            # folder is every person's at once, so the turn's scratch folder
+            # takes them instead.
+            turn_scope = current_settings_scope()
+            if not links_apply_to(turn_scope):
+                if turn_scope is not None and turn_scope.partitioned_for(
+                    PersonalResource.PROJECTS
+                ):
+                    turn_skills_dir = project_skills_dir
+                else:
+                    if turn_scratch_dir is None:
+                        turn_scratch_dir = _new_turn_scratch_dir()
+                    turn_skills_dir = turn_scratch_dir / "skills"
+                link_turn_skills(
+                    scope=turn_scope,
+                    project_name=conversation.project.name,
+                    skills_dir=turn_skills_dir,
+                )
+                anton_settings.skills_root = turn_skills_dir
 
             config = ChatSessionConfig(
                 llm_client=llm_client,

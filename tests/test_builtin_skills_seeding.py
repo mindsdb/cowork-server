@@ -380,17 +380,33 @@ def test_a_person_with_shared_skills_keeps_the_desktop_store(skills_root, person
     assert SkillService(shared).delete_skill(victim) is True
 
 
-def test_skill_links_run_only_where_skills_and_projects_are_shared(skills_root, personal_deployment):
+def test_skill_links_run_only_where_skills_and_projects_are_shared(
+    skills_root, personal_deployment, monkeypatch
+):
+    from cowork.common.settings.app_settings import get_app_settings
     from cowork.db.personal_resources import PersonalResource
 
+    projects_only = frozenset({
+        PersonalResource.PROJECTS, PersonalResource.CONVERSATIONS, PersonalResource.FILES,
+        PersonalResource.PINS, PersonalResource.SCHEDULES,
+    })
+
+    # Skills personal on the deployment: the unkeyed store is the operator
+    # view's alone, so nothing fans it out, the operator view included.
     assert SkillService(_person())._link_projects is False
     assert SkillService(_person(resources=frozenset({PersonalResource.SKILLS})))._link_projects is False
-    assert SkillService(
-        _person(resources=frozenset({
-            PersonalResource.PROJECTS, PersonalResource.CONVERSATIONS, PersonalResource.FILES,
-            PersonalResource.PINS, PersonalResource.SCHEDULES,
-        }))
-    )._link_projects is False
+    assert SkillService(LOCAL_SCOPE)._link_projects is False
+
+    # Skills shared, projects personal: a person's projects get no fan-out,
+    # while the operator view's unkeyed projects still do.
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", ",".join(sorted(projects_only)))
+    get_app_settings.cache_clear()
+    assert SkillService(_person(resources=projects_only))._link_projects is False
+    assert SkillService(LOCAL_SCOPE)._link_projects is True
+
+    # Both shared: today's stack.
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", "")
+    get_app_settings.cache_clear()
     assert SkillService(_person(resources=frozenset()))._link_projects is True
     assert SkillService(LOCAL_SCOPE)._link_projects is True
     assert SkillService(_org())._link_projects is False

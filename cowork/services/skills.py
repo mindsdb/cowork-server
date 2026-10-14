@@ -44,6 +44,7 @@ from cowork.services.skill_links import (
     links_apply_to,
     reconcile_skill_links,
     remove_skill_links,
+    sync_turn_skill_links,
 )
 
 logger = logging.getLogger(__name__)
@@ -186,38 +187,33 @@ def _skill_wire_files(skill_dir: Path, root: Path) -> dict[str, str] | None:
     return files
 
 
-def build_turn_skills(
-    scope: TenantScope | None, project_path: str | None = None
-) -> dict[str, dict]:
-    """Skills for a remote turn: ``{slug: {"files": {relpath: text}}}``.
+@dataclass(frozen=True)
+class TurnSkill:
+    """One skill a turn may use: its slug and its directory in the store."""
 
-    Org-keyed through the passed `scope` (the producer binds no ambient scope).
+    slug: str
+    path: Path
+
+
+def select_turn_skills(
+    *, service: SkillService, project_name: str | None
+) -> list[TurnSkill]:
+    """The skills of ``service``'s store that a turn in ``project_name`` uses.
+
     Selection mirrors skill_links: enabled skills whose ``metadata.projects`` is
-    empty or names this project's folder.
+    empty or names this project.
 
     Slug and files both come from the DIRECTORY, not frontmatter ``name`` — the
     two can drift on a hand-edited store, and resolving by frontmatter could
     ship another (e.g. disabled) skill's files. Every drop is logged.
     """
-    svc = SkillService(scope)
-    # A fresh org's store starts empty and there is no org-creation hook, so the
-    # builtins are seeded on first read. This function has no production caller
-    # today — cloud turns read skills off the shared mount directly rather than
-    # through this payload (see `_stage_remote_workspace_files`, which is the
-    # actual seed trigger for a chat-first org) — but it seeds too, so it stays
-    # correct if a future caller reappears. No-op after the first run, and in
-    # local mode.
-    svc.ensure_builtin_skills()
-
-    project_name = Path(project_path).name if project_path else None
-
-    out: dict[str, dict] = {}
-    if not svc.root.exists():
-        return out
-    root = svc.root
+    root = service.root
+    if not root.exists():
+        return []
+    selected: list[TurnSkill] = []
     for skill_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         slug = skill_dir.name
-        if not svc.allows_skill(slug):
+        if not service.allows_skill(slug):
             continue
         if skill_dir.is_symlink():
             # is_dir() follows the link, so a symlinked dir could point into
@@ -243,14 +239,63 @@ def build_turn_skills(
             project_name is None or project_name not in skill.projects
         ):
             continue
-        files = _skill_wire_files(skill_dir, root)
+        selected.append(TurnSkill(slug=slug, path=skill_dir))
+    return selected
+
+
+def build_turn_skills(
+    scope: TenantScope | None, project_path: str | None = None
+) -> dict[str, dict]:
+    """Skills for a remote turn: ``{slug: {"files": {relpath: text}}}``.
+
+    Org-keyed through the passed `scope` (the producer binds no ambient scope).
+    Selection is select_turn_skills's, by this project's folder name.
+    """
+    svc = SkillService(scope)
+    # A fresh org's store starts empty and there is no org-creation hook, so the
+    # builtins are seeded on first read. This function has no production caller
+    # today — cloud turns read skills off the shared mount directly rather than
+    # through this payload (see `_stage_remote_workspace_files`, which is the
+    # actual seed trigger for a chat-first org) — but it seeds too, so it stays
+    # correct if a future caller reappears. No-op after the first run, and in
+    # local mode.
+    svc.ensure_builtin_skills()
+
+    project_name = Path(project_path).name if project_path else None
+
+    out: dict[str, dict] = {}
+    for skill in select_turn_skills(service=svc, project_name=project_name):
+        files = _skill_wire_files(skill.path, svc.root)
         if files is None:
             logger.warning(
-                "turn skills: dropping %r (no SKILL.md within size bounds)", slug
+                "turn skills: dropping %r (no SKILL.md within size bounds)", skill.slug
             )
             continue
-        out[slug] = {"files": files}
+        out[skill.slug] = {"files": files}
     return out
+
+
+def link_turn_skills(
+    *, scope: TenantScope | None, project_name: str, skills_dir: Path
+) -> None:
+    """Link the skills one in-process turn uses into ``skills_dir``, from the
+    asker's own store.
+
+    For a turn whose project receives no fanned-out links
+    (skill_links.links_apply_to). The packaged builtins are seeded into the
+    store first, read-only wherever it is partitioned, as a remote turn's
+    staging seeds them (ensure_builtin_skills), so a person's first turn
+    already has them. Selection is select_turn_skills's, as for a remote turn.
+    """
+    service = SkillService(scope)
+    service.ensure_builtin_skills()
+    sync_turn_skill_links(
+        skills_dir=skills_dir,
+        wanted={
+            skill.slug: skill.path
+            for skill in select_turn_skills(service=service, project_name=project_name)
+        },
+    )
 
 
 def _skill_from_dir(

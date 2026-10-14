@@ -660,6 +660,10 @@ def test_partition_creates_and_renames_link_no_skills(db, personal_deployment, m
 
 
 def test_shared_projects_and_skills_keep_todays_links(db, personal_deployment, monkeypatch):
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", "")
+    get_app_settings.cache_clear()
     calls = []
     monkeypatch.setattr(
         "cowork.services.skill_links.reconcile_project",
