@@ -46,6 +46,13 @@ class WorkspaceMode(str, Enum):
     worktree = "worktree"
 
 
+class WorkspaceModeOptions(BaseModel):
+    """The modes a new task could run in, and the one it gets if it asks for none."""
+
+    supported: list[WorkspaceMode]
+    default: WorkspaceMode
+
+
 class PermissionMode(str, Enum):
     read_only = "read_only"
     supervised = "supervised"

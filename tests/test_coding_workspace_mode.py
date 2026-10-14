@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -116,3 +117,24 @@ def test_a_task_saved_before_modes_existed_still_loads(tmp_path: Path) -> None:
 
     assert legacy.workspace_mode is None
     assert legacy.workspace_kind == WorkspaceKind.git_worktree
+
+
+def test_the_composer_learns_which_modes_a_new_task_can_use(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(ProjectCreateRequest(
+        name="Modes",
+        folders=[ProjectFolder(id="app", name="App", path=str(repo))],
+        default_engine_id="fake",
+        default_model="fake-model",
+    ))
+
+    monkeypatch.setattr("cowork.coding.workspace_mode._IN_PLACE_PLATFORMS", frozenset({sys.platform}))
+    folder = service.workspace_mode_options(None, None)
+    assert folder.supported == [WorkspaceMode.worktree, WorkspaceMode.in_place]
+    assert folder.default == WorkspaceMode.worktree
+    assert service.workspace_mode_options(project.id, None).supported == [WorkspaceMode.worktree]
+    assert service.workspace_mode_options(None, "another-computer").supported == [WorkspaceMode.worktree]
+
+    monkeypatch.setattr("cowork.coding.workspace_mode._IN_PLACE_PLATFORMS", frozenset())
+    assert service.workspace_mode_options(None, None).supported == [WorkspaceMode.worktree]
