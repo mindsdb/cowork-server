@@ -354,3 +354,61 @@ def test_the_unfiltered_scan_yields_nothing_for_an_org_project(session, tmp_path
     assert [s.base for s in artifacts_sources_for_scan()] == [
         Path(project.path).resolve() / ".anton" / "artifacts"
     ]
+
+
+# ─── personal partitions ───────────────────────────────────────────────────
+
+PARTITION_A = "44e92829-e701-599b-88f9-69f5bf1165eb"
+PARTITION_B = "55e92829-e701-599b-88f9-69f5bf1165eb"
+
+
+def _personal(partition: str, user: str, *, resources=None) -> TenantScope:
+    from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
+
+    return TenantScope(
+        personal=True,
+        org_id=partition,
+        user_id=user,
+        personal_resources=ALL_PERSONAL_RESOURCES if resources is None else resources,
+    )
+
+
+def test_sources_for_scope_lists_only_the_persons_own_projects(session, tmp_path, monkeypatch):
+    """A person's projects live under their partition, which the scan of the
+    unkeyed root never sees, so the list reads their rows instead. Another
+    person's project is not among them."""
+    monkeypatch.setattr("cowork.services.artifact_roots._org_mode", lambda: False)
+    monkeypatch.setattr(
+        "cowork.services.artifact_roots.artifacts_sources_for_scan",
+        lambda: pytest.fail("a personal partition must not fall back to the unkeyed scan"),
+    )
+    mine = _project(session, tmp_path, name="alice-notes", org_id=PARTITION_A)
+    _project(session, tmp_path, name="bob-notes", org_id=PARTITION_B)
+
+    sources = artifacts_sources_for_scope(ScopedSession(session, _personal(PARTITION_A, USER_A)))
+
+    assert [s.project_name for s in sources] == ["alice-notes"]
+    # The in-process layout: one project-wide root, no conversation segment.
+    assert [s.base for s in sources] == [_project_base(mine)]
+    assert sources[0].project_id == str(mine.id)
+
+
+def test_sources_for_scope_scans_when_projects_are_shared(session, monkeypatch):
+    """Projects left off the personal list stay in the unkeyed root, so the
+    person's list is the desktop scan, as on today's shared stack."""
+    monkeypatch.setattr("cowork.services.artifact_roots._org_mode", lambda: False)
+    called = []
+    monkeypatch.setattr(
+        "cowork.services.artifact_roots.artifacts_sources_for_scan",
+        lambda: called.append("scan") or [],
+    )
+    # Earlier tests leave project rows behind in the shared database; the
+    # adopted-folder half of the desktop path is not what this pins.
+    monkeypatch.setattr(
+        "cowork.services.artifact_roots._sources_outside_the_projects_root",
+        lambda _session: called.append("adopted") or [],
+    )
+
+    scope = _personal(PARTITION_A, USER_A, resources=frozenset())
+    assert artifacts_sources_for_scope(ScopedSession(session, scope)) == []
+    assert called == ["scan", "adopted"]

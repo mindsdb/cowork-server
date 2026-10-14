@@ -562,3 +562,126 @@ def test_delete_project_cascades_all_members_conversations(db):
     with Session(db) as s:
         remaining = s.exec(_select(Conversation).where(Conversation.project_id == proj.id)).all()
     assert remaining == []
+
+
+# ── personal partitions (local tenancy with trusted identity headers) ──────
+
+PARTITION_A = "44e92829-e701-599b-88f9-69f5bf1165eb"
+PARTITION_B = "55e92829-e701-599b-88f9-69f5bf1165eb"
+SUB_A = "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
+SUB_B = "8a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
+
+
+def _person(partition: str, sub: str, *, resources=None) -> TenantScope:
+    from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
+
+    return TenantScope(
+        personal=True,
+        org_id=partition,
+        user_id=sub,
+        personal_resources=ALL_PERSONAL_RESOURCES if resources is None else resources,
+    )
+
+
+def test_every_person_gets_their_own_general(db, personal_deployment, tmp_path):
+    alice = _svc(db, _person(PARTITION_A, SUB_A))
+    bob = _svc(db, _person(PARTITION_B, SUB_B))
+
+    ga = alice.ensure_general_for_scope()
+    gb = bob.ensure_general_for_scope()
+
+    assert ga is not None and gb is not None
+    assert ga.id != gb.id and GENERAL_PROJECT_ID not in {ga.id, gb.id}
+    assert (ga.org_id, ga.created_by) == (PARTITION_A, SUB_A)
+    assert (gb.org_id, gb.created_by) == (PARTITION_B, SUB_B)
+    assert Path(ga.path) == tmp_path / PARTITION_A / "projects" / GENERAL_PROJECT
+    assert alice.ensure_general_for_scope().id == ga.id
+    assert [p.id for p in alice.list_projects()] == [ga.id]
+    # The operator view still has the seeded deployment row.
+    assert _svc(db, LOCAL_SCOPE).ensure_general_for_scope().id == GENERAL_PROJECT_ID
+
+
+def test_a_person_with_shared_projects_uses_the_seeded_general(db, personal_deployment):
+    shared = _person(PARTITION_A, SUB_A, resources=frozenset())
+    general = _svc(db, shared).ensure_general_for_scope()
+    assert general is not None and general.id == GENERAL_PROJECT_ID
+    assert general.org_id is None
+
+
+def test_a_partition_refuses_to_adopt_a_server_folder(db, personal_deployment, tmp_path):
+    from cowork.services.projects import ProjectPathNotAllowedError
+
+    chosen = tmp_path / "outside" / "notes"
+    chosen.mkdir(parents=True)
+    with pytest.raises(ProjectPathNotAllowedError):
+        _svc(db, _person(PARTITION_A, SUB_A)).create_project("notes", path=chosen)
+    assert _raw(db).exec(select(Project).where(Project.name == "notes")).first() is None
+
+
+def test_a_person_with_shared_projects_may_still_adopt_a_folder(db, personal_deployment, tmp_path):
+    chosen = tmp_path / "outside" / "notes"
+    chosen.mkdir(parents=True)
+    shared = _svc(db, _person(PARTITION_A, SUB_A, resources=frozenset()))
+    project = shared.create_project("notes", path=chosen)
+    assert Path(project.path) == chosen.resolve()
+    assert shared.directory_is_external(project) is True
+
+
+def test_no_partition_project_reads_as_an_adopted_folder(db, personal_deployment):
+    alice = _svc(db, _person(PARTITION_A, SUB_A))
+    project = alice.create_project("reports")
+    # Even a row whose path sits outside the partition root is a stale row here,
+    # not a chosen folder.
+    assert alice.directory_is_external(project) is False
+    raw = _raw(db)
+    row = raw.get(Project, project.id)
+    row.path = "/somewhere/else/reports"
+    raw.add(row)
+    raw.commit()
+    assert alice.directory_is_external(alice.get_project(project.id)) is False
+
+
+def test_partition_creates_and_renames_link_no_skills(db, personal_deployment, monkeypatch):
+    """Skill links point from the unkeyed store into the unkeyed projects root,
+    found by name. Two people who both own `notes` must not receive each
+    other's links, so a partition distributes none."""
+    calls = []
+    monkeypatch.setattr(
+        "cowork.services.skill_links.reconcile_project",
+        lambda *args, **kwargs: calls.append(kwargs.get("project_name")),
+    )
+    alice = _svc(db, _person(PARTITION_A, SUB_A))
+    bob = _svc(db, _person(PARTITION_B, SUB_B))
+    bob.create_project("notes")
+    mine = alice.create_project("notes")
+    alice.update_project(mine.id, name="notes-renamed")
+
+    assert calls == []
+
+
+def test_shared_projects_and_skills_keep_todays_links(db, personal_deployment, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        "cowork.services.skill_links.reconcile_project",
+        lambda *args, **kwargs: calls.append(kwargs.get("project_name")),
+    )
+    shared = _svc(db, _person(PARTITION_A, SUB_A, resources=frozenset()))
+    project = shared.create_project("notes")
+    shared.update_project(project.id, name="notes-renamed")
+
+    assert calls == ["notes", "notes-renamed"]
+
+
+def test_a_partition_still_takes_the_process_name_lock(db, personal_deployment, monkeypatch):
+    """The distributed lock that lets org mode skip this one does nothing
+    outside org mode, so a partition's creates and renames must still queue on
+    the process-local lock."""
+    from cowork.services import projects as projects_module
+
+    monkeypatch.setattr(projects_module, "_NAME_LOCK_TIMEOUT_SECONDS", 0.01)
+    assert projects_module._LOCAL_NAME_LOCK.acquire(timeout=1)
+    try:
+        with pytest.raises(projects_module.ProjectNameLockBusyError):
+            _svc(db, _person(PARTITION_A, SUB_A)).create_project("busy")
+    finally:
+        projects_module._LOCAL_NAME_LOCK.release()

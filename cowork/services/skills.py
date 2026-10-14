@@ -30,6 +30,7 @@ from cowork.common.paths import (
     safe_join,
 )
 from cowork.common.settings import get_app_settings
+from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import TenantScope, scoped_storage_root
 from cowork.models.skill import (
     META_CREATED_AT,
@@ -39,7 +40,11 @@ from cowork.models.skill import (
     META_UPDATED_AT,
     Skill,
 )
-from cowork.services.skill_links import reconcile_skill_links, remove_skill_links
+from cowork.services.skill_links import (
+    links_apply_to,
+    reconcile_skill_links,
+    remove_skill_links,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -281,8 +286,11 @@ class ProjectReferenceRewrite:
 class SkillService:
     """File-backed skill store using the agentskills.io ``SKILL.md`` format.
 
-    Org mode keys the store per org (``<shared_root>/<org_id>/skills``); local
-    mode uses the shared root unchanged."""
+    Org mode keys the store per org (``<shared_root>/<org_id>/skills``), and a
+    personal scope that keeps skills per person keys it per partition the same
+    way; local mode uses the shared root unchanged. Wherever the store is
+    partitioned, the packaged builtins are seeded into it lazily and stay
+    immutable."""
 
     store_name = "skills"
     seed_builtins_in_local_mode = False
@@ -295,12 +303,15 @@ class SkillService:
         if self.store_name != "skills":
             base = base.parent / self.store_name
         self.root = scoped_storage_root(base, scope, store=self.store_name)
-        # Symlink distribution is desktop-only (skill_links resolves the unkeyed
-        # root and scans all project dirs). Keyed on deployment mode, not just
-        # scope — an unscoped service (migration, seeding) must not fan symlinks
-        # out of the unkeyed root in org mode either.
-        self._link_projects = self.store_name == "skills" and settings.tenancy_mode != "org" and (
-            scope is None or not scope.org_mode
+        # Symlink distribution resolves the unkeyed root and scans all project
+        # dirs, so it runs only where skills and projects stay unpartitioned
+        # (links_apply_to). Keyed on deployment mode too, not just scope — an
+        # unscoped service (migration, seeding) must not fan symlinks out of
+        # the unkeyed root in org mode either.
+        self._link_projects = (
+            self.store_name == "skills"
+            and settings.tenancy_mode != "org"
+            and links_apply_to(scope)
         )
 
     @property
@@ -375,7 +386,8 @@ class SkillService:
 
     def _is_immutable_builtin(self, slug: str) -> bool:
         protected = self.immutable_builtins_in_local_mode or (
-            self._scope is not None and self._scope.org_mode
+            self._scope is not None
+            and self._scope.partitioned_for(PersonalResource.SKILLS)
         )
         return bool(protected and slug in self.packaged_builtin_slugs)
 
@@ -1138,8 +1150,10 @@ class SkillService:
     def ensure_builtin_skills(self) -> bool:
         """Seed this product-specific skill store with its packaged builtins.
 
-        Cowork seeds lazily only in org mode; desktop Cowork still seeds once at
-        boot via ``migrations.seed_builtin_skills``. Code uses a separate store and
+        Cowork seeds lazily wherever the store is partitioned (org mode, and a
+        personal scope that keeps skills per person); desktop Cowork, and a
+        shared store, still seed once at boot via
+        ``migrations.seed_builtin_skills``. Code uses a separate store and
         seeds lazily in both local and org mode so its engineering catalogue never
         depends on, or leaks into, the general Cowork catalogue.
 
@@ -1155,7 +1169,10 @@ class SkillService:
         """
         if (
             not self.seed_builtins_in_local_mode
-            and (self._scope is None or not self._scope.org_mode)
+            and (
+                self._scope is None
+                or not self._scope.partitioned_for(PersonalResource.SKILLS)
+            )
         ):
             return False
         try:

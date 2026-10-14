@@ -24,6 +24,7 @@ from cowork.common.paths import (
     safe_join,
 )
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import ScopedSession, scoped_storage_root, unsafe_unscoped_session
 from cowork.models.project import Project
 from cowork.services.shared_resources import RESOURCE_LOCK_TIMEOUT_SECONDS
@@ -123,12 +124,15 @@ class ProjectService:
         """The caller's default project, provisioned on demand.
 
         Desktop keeps the seeded GENERAL row, re-pointed when the projects root
-        has moved since it was seeded. Org mode gives each org its own row
-        and directory: one seeded id can't serve N tenants (the first org claimed
-        it, the rest got None → 404). Idempotent — called on every request.
+        has moved since it was seeded, and so does a personal scope that keeps
+        projects shared. Org mode gives each org its own row and directory, and
+        a personal scope that keeps projects per person gives each person's
+        partition its own: one seeded id can't serve N tenants (the first org
+        claimed it, the rest got None → 404). `uq_projects_default_per_org`
+        holds one per org_id. Idempotent — called on every request.
         """
         scope = self.session.scope
-        if not scope.org_mode or scope.org_id is None:
+        if not scope.partitioned_for(PersonalResource.PROJECTS) or scope.org_id is None:
             project = self.session.get(Project, GENERAL_PROJECT_ID)
             if project is not None:
                 # Defensive, and keyed off the deployment rather than this
@@ -602,11 +606,15 @@ class ProjectService:
         distribution and rename all find projects by scanning that root, so
         they need this to know when to consult the row instead.
 
-        Always False in org mode. A folder can only be adopted on a local
-        deployment, so a path outside the org-keyed root there is a stale or
-        pre-org-keyed row -- `_repoint_if_stale`'s job, not a chosen folder.
+        Always False in org mode and inside a personal partition's projects.
+        A folder can only be adopted where projects are not partitioned, so a
+        path outside the partition-keyed root there is a stale or
+        pre-partition row -- `_repoint_if_stale`'s job, not a chosen folder.
         """
-        if get_app_settings().tenancy_mode == "org" or self.session.scope.org_mode:
+        if (
+            get_app_settings().tenancy_mode == "org"
+            or self.session.scope.partitioned_for(PersonalResource.PROJECTS)
+        ):
             return False
         try:
             # `.parent` first, then resolve: `Path.resolve()` resolves the
@@ -643,9 +651,14 @@ class ProjectService:
 
         The tenancy refusal comes before any filesystem access on purpose: an
         org deployment does not run on the caller's machine, so statting a
-        path it chose would answer whether that server path exists.
+        path it chose would answer whether that server path exists. A person's
+        partition refuses for the same reason, and because an adopted server
+        folder would sit outside that person's projects root.
         """
-        if get_app_settings().tenancy_mode == "org":
+        if (
+            get_app_settings().tenancy_mode == "org"
+            or self.session.scope.partitioned_for(PersonalResource.PROJECTS)
+        ):
             raise ProjectPathNotAllowedError(
                 "Choosing a project folder is not available on this deployment"
             )
@@ -726,8 +739,11 @@ class ProjectService:
             self.session.add(project)
             self.session.commit()
 
-        # Skill symlink distribution is desktop-only (see SkillService).
-        if not self.session.scope.org_mode:
+        # Skill symlink distribution only runs where skills and projects stay
+        # unpartitioned (skill_links.links_apply_to; see SkillService).
+        from cowork.services.skill_links import links_apply_to
+
+        if links_apply_to(self.session.scope):
             try:
                 from cowork.services.skill_links import reconcile_project
                 from cowork.services.skills import SkillService
@@ -979,8 +995,12 @@ class ProjectService:
         Separate from the commit so a caller holding the name lock can release
         it first. This walks every project row and writes a symlink per enabled
         skill, none of which needs the name reserved once the row is committed.
+        Skipped wherever skills or projects are partitioned
+        (skill_links.links_apply_to).
         """
-        if stage is None or self.session.scope.org_mode:
+        from cowork.services.skill_links import links_apply_to
+
+        if stage is None or not links_apply_to(self.session.scope):
             return
         # These links are derived desktop state, so a reconciliation failure
         # is logged after the canonical project/skill commit rather than

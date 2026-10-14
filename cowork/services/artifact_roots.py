@@ -33,6 +33,7 @@ import stat
 from pathlib import Path
 from uuid import UUID
 
+from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import ScopedSession
 from cowork.services.artifacts import (
     ProjectArtifacts,
@@ -231,13 +232,16 @@ def _sources_for(
 def artifacts_sources_for_scope(session: ScopedSession) -> list[ProjectArtifacts]:
     """Every artifacts root the caller can read, across their organization's
     projects. In org mode that is each project's shared base (ENG-2056) plus the
-    caller's own legacy conversation workspaces.
+    caller's own legacy conversation workspaces. In a person's partition it is
+    each of that person's projects, read from the database like org mode: the
+    filesystem scan sees only the unkeyed projects root, which holds no
+    partition's projects.
 
     Used by the unparameterized artifacts list, which the frontend calls with no
-    project filter. In local mode this falls back to the filesystem scan so the
-    desktop list is unchanged.
+    project filter. In local mode, and for a scope that keeps projects shared,
+    this falls back to the filesystem scan so the desktop list is unchanged.
     """
-    if not _org_mode():
+    if not (_org_mode() or session.scope.partitioned_for(PersonalResource.PROJECTS)):
         return artifacts_sources_for_scan() + _sources_outside_the_projects_root(
             session
         )

@@ -43,6 +43,7 @@ from cowork.common.paths import (
     read_bounded,
     safe_join,
 )
+from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import (
     ScopedSession,
     ScopedSessionDep,
@@ -129,8 +130,11 @@ class _PreviewMount:
     expires_at: float
 
     def readable_by(self, scope: TenantScope) -> bool:
-        """Desktop has one user and no organization, so nothing to compare."""
-        if not scope.org_mode:
+        """Desktop has one user and no organization, so nothing to compare, and
+        neither does a scope that keeps projects shared. Where projects are
+        partitioned (org mode, or a person's partition) the reader must be the
+        minter, in the org or partition it was minted in."""
+        if not scope.partitioned_for(PersonalResource.PROJECTS):
             return True
         return self.org_id == scope.org_id and self.user_id == scope.user_id
 
@@ -198,6 +202,9 @@ def _register_preview_mount(target: Path, base: Path, scope: TenantScope) -> str
         )
         _PROJECT_PREVIEW_MOUNTS.pop(oldest, None)
     token = secrets.token_urlsafe(32)
+    # Bound to the scope the project itself is read under: a person whose
+    # projects are shared mints a mount as the desktop does, with no owner.
+    owner = scope.for_resource(PersonalResource.PROJECTS)
     # `target` is already fully resolved by `_safe_relpath`, so its parent is too.
     # Resolving again would be a no-op, and it reads as a containment check that
     # has in fact already happened one frame up.
@@ -205,8 +212,8 @@ def _register_preview_mount(target: Path, base: Path, scope: TenantScope) -> str
         parent=target.parent,
         project_base=base.resolve(),
         workspace=_mount_workspace(target, base),
-        org_id=scope.org_id,
-        user_id=scope.user_id,
+        org_id=owner.org_id,
+        user_id=owner.user_id,
         expires_at=now + PREVIEW_TOKEN_TTL_SECONDS,
     )
     return token

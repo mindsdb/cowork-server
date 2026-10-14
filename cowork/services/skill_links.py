@@ -30,7 +30,8 @@ from pathlib import Path
 
 from cowork.common.paths import dir_rmdir, dir_unlink, pinned_dir, safe_join_lexical
 from cowork.common.settings import get_app_settings
-from cowork.db.scoped import tenant_scope_required
+from cowork.db.personal_resources import PersonalResource
+from cowork.db.scoped import TenantScope, tenant_scope_required
 from cowork.models.skill import Skill
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,26 @@ _IS_WINDOWS = os.name == "nt"
 
 if _IS_WINDOWS:
     import _winapi  # Windows-only stdlib; provides CreateJunction.
+
+
+def links_apply_to(scope: TenantScope | None) -> bool:
+    """Whether a skill or project change under ``scope`` redistributes links.
+
+    Every link points from the unkeyed skills root into a project folder found
+    under the unkeyed projects root, so distribution belongs only to a scope
+    that keeps both skills and projects unpartitioned: the desktop, the
+    operator view of a trusted-identity deployment, and a personal scope that
+    leaves both shared. Under a scope that partitions either one, a link would
+    name another person's or org's skill, or land in a project that is not the
+    caller's. ``None`` is an unscoped boot or migration path; its caller keeps
+    its own deployment check.
+    """
+    if scope is None:
+        return True
+    return not (
+        scope.partitioned_for(PersonalResource.SKILLS)
+        or scope.partitioned_for(PersonalResource.PROJECTS)
+    )
 
 
 def _canon_root() -> Path:

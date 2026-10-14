@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import (
     ScopedSession,
     ScopedSessionDep,
@@ -65,6 +66,12 @@ def _require_known_projects(scoped: ScopedSessionDep, project_names: list[str]) 
         )
 
 
+def _builtins_immutable(scope: TenantScope) -> bool:
+    """Packaged builtins are read-only wherever the skill store is partitioned:
+    each org, or each person, gets its own seeded copy (SkillService)."""
+    return scope.partitioned_for(PersonalResource.SKILLS)
+
+
 def _skill_response(skill: Skill, access: SharedResourceAccess) -> dict:
     if access.org_mode and access.has_trusted_actor:
         service = SkillService(access.session.scope)
@@ -80,7 +87,7 @@ def _skill_response(skill: Skill, access: SharedResourceAccess) -> dict:
     builtin = is_builtin_skill(skill.name)
     can_change = (
         not pending
-        and not (builtin and access.org_mode)
+        and not (builtin and _builtins_immutable(access.session.scope))
         and access.can_change(creator_id)
     )
     return SkillResponse(
@@ -382,25 +389,27 @@ def update_skill(
             if scoped.scope.org_mode and body.projects is not None:
                 _require_known_projects(scoped, body.projects)
             current = service.get_skill(skill_id)
+            # Every scope needs the target: the rename checks below run wherever
+            # builtins are immutable, not only where the locks are taken.
+            target_slug = (
+                service._slug_from_label(body.label)
+                if body.label is not None
+                else current.name
+            )
             if scoped.scope.org_mode:
-                target_slug = (
-                    service._slug_from_label(body.label)
-                    if body.label is not None
-                    else current.name
-                )
                 for slug in sorted({current.name, target_slug}):
                     resource_coordination.enter_context(
                         access.coordination_lock(SKILL, slug)
                     )
                 _recover_stale_skill_claim(access, service, current.name)
             creator_id = access.creator_id(SKILL, current.name)
-            if scoped.scope.org_mode and is_builtin_skill(current.name):
+            if _builtins_immutable(scoped.scope) and is_builtin_skill(current.name):
                 raise PermissionError(builtin_skill_refusal(current.name))
             access.require_change(
                 creator_id,
                 detail="Only the skill creator or an organization admin can edit this skill",
             )
-            if scoped.scope.org_mode and target_slug != current.name:
+            if _builtins_immutable(scoped.scope) and target_slug != current.name:
                 if is_builtin_skill(target_slug):
                     raise PermissionError(builtin_skill_refusal(target_slug))
                 _recover_stale_skill_claim(access, service, target_slug)
@@ -522,7 +531,7 @@ def delete_skill(
             resource_coordination = access.coordination_lock(SKILL, skill.name)
             resource_coordination.__enter__()
             _recover_stale_skill_claim(access, service, skill.name)
-        if scoped.scope.org_mode and is_builtin_skill(skill.name):
+        if _builtins_immutable(scoped.scope) and is_builtin_skill(skill.name):
             raise PermissionError(builtin_skill_refusal(skill.name))
         creator_id = access.creator_id(SKILL, skill.name)
         access.require_change(

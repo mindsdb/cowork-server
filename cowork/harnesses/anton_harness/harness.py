@@ -18,6 +18,7 @@ from cowork.common.logger import get_logger, log_context
 from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import current_settings_scope
+from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_scope_required
 from cowork.db.units import run_db, run_to_completion, unit_session
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
@@ -454,9 +455,13 @@ async def _read_attachments(conversation, *, scope: TenantScope | None) -> list[
 
     ``scope`` is the turn's bound scope (use_settings_scope), never one derived
     from the row. No scope on a partitioned deployment (tenant_scope_required)
-    is an invariant violation, and so is a conversation of another org: both
-    log and list nothing. A failed read logs too. A wait for a connection that
-    runs out is the turn's failure, not a missing listing, so it propagates.
+    is an invariant violation, and so is a conversation of another org or
+    person, wherever the scope partitions conversations: both log and list
+    nothing. The check keys on conversations, not files: a conversation shared
+    across persons carries no org_id, while each person's attachments to it
+    are still filtered by the files partition in the read below. A failed read
+    logs too. A wait for a connection that runs out is the turn's failure, not
+    a missing listing, so it propagates.
     """
     try:
         if scope is None:
@@ -467,7 +472,10 @@ async def _read_attachments(conversation, *, scope: TenantScope | None) -> list[
                 )
                 return None
             scope = LOCAL_SCOPE
-        if scope.org_mode and conversation.org_id != scope.org_id:
+        if (
+            scope.partitioned_for(PersonalResource.CONVERSATIONS)
+            and conversation.org_id != scope.org_id
+        ):
             logger.warning(
                 "attachments: conversation %s org %r does not match scope org %r — listing skipped",
                 conversation.id, conversation.org_id, scope.org_id,

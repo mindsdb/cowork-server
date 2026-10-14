@@ -465,3 +465,73 @@ def test_the_project_directory_is_real(tree):
     """Guards the fixture itself: every refusal above would also be produced by a
     project whose files were never written."""
     assert Path(tree["workspace"] / "report.txt").is_file()
+
+
+# ── preview mounts in personal partitions ──────────────────────────────────
+
+PARTITION_A = "44e92829-e701-599b-88f9-69f5bf1165eb"
+PARTITION_B = "55e92829-e701-599b-88f9-69f5bf1165eb"
+
+
+def _person(partition: str, user: str, *, resources=None):
+    from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
+    from cowork.db.scoped import TenantScope
+
+    return TenantScope(
+        personal=True,
+        org_id=partition,
+        user_id=user,
+        personal_resources=ALL_PERSONAL_RESOURCES if resources is None else resources,
+    )
+
+
+def _mount_page(tmp_path, scope) -> str:
+    from cowork.api.v1.endpoints.project_files import _register_preview_mount
+
+    base = tmp_path / "proj"
+    base.mkdir(exist_ok=True)
+    (base / "page.html").write_text("<p>hi</p>")
+    return _register_preview_mount((base / "page.html").resolve(), base, scope)
+
+
+def _preview(token: str, scope):
+    from cowork.api.v1.endpoints.project_files import preview_asset
+
+    return preview_asset(token, "page.html", scope=scope)
+
+
+def test_another_person_cannot_use_a_preview_token(tmp_path):
+    from fastapi import HTTPException
+
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    token = _mount_page(tmp_path, _person(PARTITION_A, USER_A))
+
+    with pytest.raises(HTTPException) as refused:
+        _preview(token, _person(PARTITION_B, USER_B))
+    assert refused.value.status_code == 404
+    assert _preview(token, _person(PARTITION_A, USER_A)).status_code == 200
+    # The operator view keeps the desktop's single-user reading.
+    assert _preview(token, LOCAL_SCOPE).status_code == 200
+
+
+def test_a_preview_token_is_shared_where_projects_are(tmp_path):
+    shared = frozenset()
+    token = _mount_page(tmp_path, _person(PARTITION_A, USER_A, resources=shared))
+    assert _preview(token, _person(PARTITION_B, USER_B, resources=shared)).status_code == 200
+
+
+def test_desktop_and_org_preview_tokens_keep_their_owner_rules(tmp_path):
+    from fastapi import HTTPException
+
+    from cowork.db.scoped import LOCAL_SCOPE, TenantScope
+
+    desktop = _mount_page(tmp_path, LOCAL_SCOPE)
+    assert _preview(desktop, LOCAL_SCOPE).status_code == 200
+
+    owner = TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A)
+    token = _mount_page(tmp_path, owner)
+    assert _preview(token, owner).status_code == 200
+    with pytest.raises(HTTPException) as refused:
+        _preview(token, TenantScope(org_mode=True, org_id=ORG_A, user_id=USER_A2))
+    assert refused.value.status_code == 404
