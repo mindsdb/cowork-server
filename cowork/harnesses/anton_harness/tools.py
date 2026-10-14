@@ -244,8 +244,22 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             return message
         return SideEffectResult.failed(message, reason=reason)
 
+    from cowork.services.publish import OWNED_BY_OTHER_USER_MESSAGE, PublishOwnedByOtherUser
+
     try:
         result = _publish_artifact(abs_path, access=access)
+    except PublishOwnedByOtherUser:
+        # The model can edit files, so spell out that it must not work around
+        # the refusal (e.g. by dropping the stored report_id). Not a ban for the
+        # rest of the conversation: the user may fix the account and ask again.
+        logger.info("Cowork publish refused: %s", OWNED_BY_OTHER_USER_MESSAGE)
+        return _fail(
+            f"PUBLISH FAILED: {OWNED_BY_OTHER_USER_MESSAGE} The existing link belongs "
+            "to another account. Do not retry, and do not publish this artifact under "
+            "a new report on your own. Tell the user, and publish again only if they "
+            "ask after resolving it.",
+            reason="owned_by_other_user",
+        )
     except ValueError as exc:
         # The service raises ValueError for several distinct reasons. Only the
         # missing-API-key case warrants the STOP/"go configure a key" directive;
