@@ -8,6 +8,8 @@ from urllib.parse import urlparse
 from fastapi import HTTPException, Request, status
 
 _TRUSTED_LOOPBACK_HOSTS = frozenset({"localhost"})
+# The detail of a refusal by network position (client or socket address).
+LOCAL_REQUESTS_ONLY = "local requests only"
 
 
 def _trusted_loopback_host(value: str) -> bool:
@@ -45,13 +47,13 @@ def require_local(request: Request) -> None:
     """
     client = request.client.host if request.client else ""
     if client not in {"127.0.0.1", "::1"}:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="local requests only")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=LOCAL_REQUESTS_ONLY)
 
     # The client address follows X-Forwarded-For wherever uvicorn trusts it
     # (any peer in the Docker image), so the accepted socket must be loopback too.
     server = request.scope.get("server") or ()
     if not _is_loopback_address(server[0] if server else None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="local requests only")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=LOCAL_REQUESTS_ONLY)
 
     # A loopback TCP peer is not sufficient in a browser: DNS rebinding can
     # make an attacker-controlled hostname resolve to 127.0.0.1. Browsers set
