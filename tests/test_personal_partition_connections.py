@@ -17,9 +17,13 @@ from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
+from fastapi.testclient import TestClient
 from pydantic import SecretStr
 from sqlalchemy import delete
 
+# Imported at module scope on purpose: cowork.server builds an app at import
+# time (see tests/test_trusted_identity_local.py).
+import cowork.server as cowork_server
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import Provider, UserSettings, use_settings_scope
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
@@ -32,11 +36,14 @@ from cowork.models.project import Project
 from cowork.principal import personal_partition_id
 from cowork.services.connectors.persist import turn_vault_for_scope, vault_for_scope
 
+TOKEN = "partition-connections-test-token"
 DEPLOYMENT = "5f0c7d2e-8b1a-4c3e-9d4f-2a6b8c0e1f3a"
 SUB_A = "11111111-1111-4111-8111-111111111111"
 SUB_B = "22222222-2222-4222-8222-222222222222"
 PARTITION_A = personal_partition_id(DEPLOYMENT, SUB_A)
 PARTITION_B = personal_partition_id(DEPLOYMENT, SUB_B)
+BEARER = {"Authorization": f"Bearer {TOKEN}"}
+A = {**BEARER, "X-User-Id": SUB_A, "X-Organization-Id": DEPLOYMENT}
 
 
 def _person(*, partition: str, sub: str, resources=ALL_PERSONAL_RESOURCES) -> TenantScope:
@@ -307,6 +314,77 @@ async def test_local_oauth_start_is_refused_for_a_person(stack, monkeypatch):
         await oauth.start_oauth("gmail", MagicMock(), ALICE, OAuthStartRequest())
 
     assert refused.value.status_code == 403
+
+
+async def test_local_oauth_start_runs_for_a_person_whose_connections_are_shared(stack, monkeypatch):
+    """A resource left off the list stays shared, as with the setting off."""
+    from cowork.api.v1.endpoints.connectors import oauth
+    from cowork.schemas.connectors import OAuthStartRequest
+
+    started = []
+    monkeypatch.setattr(oauth.oauth_service, "start", lambda service, *_a, **_k: started.append(service) or "ok")
+    shared = frozenset(ALL_PERSONAL_RESOURCES - {PersonalResource.CONNECTIONS})
+    alice = _person(partition=PARTITION_A, sub=SUB_A, resources=shared)
+
+    assert await oauth.start_oauth("gmail", MagicMock(), alice, OAuthStartRequest()) == "ok"
+    assert started == ["gmail"]
+
+
+@pytest.fixture
+def pending_gmail_sign_in(stack, monkeypatch):
+    """A trusted stack create_app accepts, with a Gmail sign-in pending as
+    start_oauth leaves it and the provider's side stubbed."""
+    from datetime import datetime, timezone
+
+    from cowork.common.settings.app_settings import OAuthSettings
+    from cowork.services.connectors.oauth import google
+
+    monkeypatch.setenv("COWORK_HOME", str(stack / "home"))
+    monkeypatch.setenv("COWORK_AUTH_TOKEN", TOKEN)
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "audit")
+    get_app_settings.cache_clear()
+    google.oauth_service._store(OAuthSettings()).set_pending(
+        "gmail",
+        state="s-1",
+        verifier="verifier",
+        redirect_uri="http://cowork.example/callback",
+        started_at=datetime.now(timezone.utc).isoformat(),
+        client_id="cid",
+        client_secret="csecret",
+    )
+    monkeypatch.setattr(
+        google.OAuthService, "_exchange_code", lambda self, **_kw: {"access_token": "at-1", "expires_in": 3600}
+    )
+    monkeypatch.setitem(google._USERINFO_FETCHERS, "gmail", lambda _token: {"email": "team@example.com"})
+
+
+def _finish_gmail_sign_in(headers: dict) -> str:
+    # No `with`: skipping the lifespan skips boot migrations and workers.
+    page = TestClient(cowork_server.create_app()).get(
+        "/api/v1/connectors/oauth/gmail/callback", params={"code": "c", "state": "s-1"}, headers=headers
+    )
+    assert page.status_code == 200
+    return page.text
+
+
+def test_a_shared_connections_sign_in_saves_into_the_shared_vault(pending_gmail_sign_in, monkeypatch):
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", "memory")
+    get_app_settings.cache_clear()
+
+    page = _finish_gmail_sign_in(A)
+
+    assert "Gmail connected" in page
+    assert {engine for engine, _name in _names(vault_for_scope(LOCAL_SCOPE))} == {"gmail"}
+
+
+def test_the_operator_views_sign_in_saves_into_the_base_vault(pending_gmail_sign_in):
+    """Every resource personal: the operator view (no person) still finishes
+    its own sign-in, into the base vault, which no person's turn reads."""
+    page = _finish_gmail_sign_in(BEARER)
+
+    assert "Gmail connected" in page
+    assert {engine for engine, _name in _names(vault_for_scope(LOCAL_SCOPE))} == {"gmail"}
+    assert _names(vault_for_scope(ALICE)) == set()
 
 
 async def test_local_oauth_start_still_runs_without_a_person(monkeypatch):

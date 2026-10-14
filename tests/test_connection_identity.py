@@ -11,6 +11,7 @@ from pathlib import Path
 from anton.core.datasources.data_vault import LocalDataVault
 
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.oauth import google as oauth_google
 from cowork.services.connectors.identity import (
@@ -558,7 +559,7 @@ class TestOAuthCallbackDedup:
             oauth_google._USERINFO_FETCHERS, "google_drive",
             lambda access_token: {"email": email, "name": "User"},
         )
-        svc.callback("google-drive", code="authcode", state=state, error="", settings=settings)
+        svc.callback("google-drive", code="authcode", state=state, error="", settings=settings, scope=LOCAL_SCOPE)
 
     def test_repeat_connection_same_account_dedups(self, monkeypatch, tmp_path):
         self._connect(monkeypatch, tmp_path, state="state-1", access_token="tok1", email="user@gmail.com")

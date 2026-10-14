@@ -6,7 +6,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from textwrap import dedent
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -24,6 +24,9 @@ from cowork.services.connectors.persist import persist_connection
 from cowork.services.connectors.specs._registry import registry as spec_registry
 
 import logging as _logging
+
+if TYPE_CHECKING:
+    from cowork.db.scoped import TenantScope
 
 _log = _logging.getLogger("cowork.oauth")
 
@@ -427,7 +430,10 @@ class OAuthService:
 
         return OAuthStartResponse(auth_url=auth_url, redirect_uri=redirect_uri, started_at=started_at, state=state)
 
-    def callback(self, service: str, code: str, state: str, error: str, settings: OAuthSettings) -> str:
+    def callback(self, service: str, code: str, state: str, error: str, settings: OAuthSettings,
+                 *, scope: "TenantScope | None") -> str:
+        """Finish a local sign-in started by ``start`` and save the connection
+        into ``scope``'s vault."""
         cfg = OAUTH_SERVICES[service]
         store = self._store(settings)
         service_label = service.replace("-", " ").title()
@@ -572,6 +578,7 @@ class OAuthService:
             connection_name = persist_connection(
                 cfg.engine, "browser_oauth_builtin", "", new_fields,
                 default_label=oauth_default_label(new_fields, cfg.engine),
+                scope=scope,
             )
         except HTTPException as exc:
             err_msg = str(exc.detail)

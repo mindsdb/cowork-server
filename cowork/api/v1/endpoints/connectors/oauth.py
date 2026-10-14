@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackOnly, OpenByDesign, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
+from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.connectors import OAuthStartRequest, OAuthStartResponse, PickerTokenResponse
 from cowork.services.connectors.oauth import auth_proxy
@@ -63,12 +64,13 @@ async def start_oauth(service: str, request: Request, scope: ScopeDep,
             service, request, OAuthSettings(),
             {"client_id": body.client_id, "client_secret": body.client_secret, "extra_fields": body.extra_fields},
         )
-    if scope.personal:
+    if scope.partitioned_for(PersonalResource.CONNECTIONS):
         # The local flow carries no person: OAuthStateStore keeps one pending
-        # start per service for the whole deployment, and the callback saves
-        # with no scope, which a deployment that trusts identity headers
-        # refuses (scoped_storage_root). A person's sign-in could only fail
-        # there or land outside their own vault, so it is refused up front.
+        # start per service for the whole deployment, so two people's
+        # sign-ins would clobber each other's. Where a person keeps their own
+        # connections it is refused up front. Where connections are shared it
+        # runs as on the desktop, and oauth_callback saves into the shared
+        # vault.
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
@@ -243,10 +245,16 @@ async def oauth_status(request: Request, scope: ScopeDep, state: str = Query(...
 # — there is no principal to check by construction, same as auth's own
 # OAuthCallbackView.
 @router.get("/{service}/callback", response_class=HTMLResponse, dependencies=[Depends(require(OpenByDesign))])
-def oauth_callback(service: str, code: str = "", state: str = "", error: str = ""):
+def oauth_callback(service: str, scope: ScopeDep, code: str = "", state: str = "", error: str = ""):
     if service not in OAUTH_SERVICES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown OAuth service: {service!r}")
-    html = oauth_service.callback(service, code, state, error, OAuthSettings())
+    # The vault for_resource names: the shared one for every caller
+    # start_oauth lets start, on the desktop and wherever connections are
+    # shared. An org scope with no org fails closed when it saves.
+    html = oauth_service.callback(
+        service, code, state, error, OAuthSettings(),
+        scope=scope.for_resource(PersonalResource.CONNECTIONS),
+    )
     return HTMLResponse(content=html)
 
 
