@@ -117,5 +117,6 @@
     ],
     "logo_url": "logos/figma.svg"
   },
-  "logo_url": "logos/figma.svg"
+  "logo_url": "logos/figma.svg",
+  "featured": true
 }
