@@ -19,6 +19,7 @@ from starlette.responses import JSONResponse
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
 from cowork.common.logger import setup_logging
 from cowork.common.settings.app_settings import TurnQueueSettings
+from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import (
     MissingTenantScopeError,
     TenantScope,
@@ -61,13 +62,13 @@ TenantScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 def _require_streaming_scope(scope: TenantScope) -> None:
     """Fail closed BEFORE any registry access.
 
-    In org mode a caller with no org in scope (e.g. audit mode with no
-    identity headers) gets 401 — exactly like every ScopedSession-backed
-    endpoint. Checked up front, independent of whether the target turn
-    exists, so an empty list or an unknown conversation_id can't mask the
-    missing-identity case behind a 200/404.
+    Where conversations are partitioned (org mode, or a personal scope that
+    keeps them per person) a caller with no org in scope gets 401 — exactly
+    like every ScopedSession-backed endpoint. Checked up front, independent of
+    whether the target turn exists, so an empty list or an unknown
+    conversation_id can't mask the missing-identity case behind a 200/404.
     """
-    if scope.org_mode and scope.org_id is None:
+    if scope.partitioned_for(PersonalResource.CONVERSATIONS) and scope.org_id is None:
         raise MissingTenantScopeError("streaming access requires an org in scope")
 
 
@@ -90,13 +91,16 @@ def _authorized_handle(
 def _owner_matches(org_id: str | None, user_id: str | None, scope: TenantScope) -> bool:
     """Whether the caller may touch a turn owned by (org_id, user_id).
 
-    Turns are personal — a conversation belongs to its creator — so in org mode
-    BOTH the org and the owning user must match. Matching the org alone let any
-    member tail/cancel/answer a teammate's live turn and read its prompts and
-    output (staging audit P0). Local mode never filters (single user). Shared by
-    the local-handle check and the Redis turn index so the two can't disagree.
+    Turns are personal — a conversation belongs to its creator — so wherever
+    conversations are partitioned BOTH the org (or person's partition) and the
+    owning user must match. Matching the org alone let any member tail/cancel/
+    answer a teammate's live turn and read its prompts and output (staging
+    audit P0). Local mode never filters (single user), and neither does a
+    personal scope that keeps conversations shared, nor the operator view of a
+    trusted-identity deployment (LOCAL_SCOPE). Shared by the local-handle check
+    and the Redis turn index so the two can't disagree.
     """
-    if not scope.org_mode:
+    if not scope.partitioned_for(PersonalResource.CONVERSATIONS):
         return True   # today's single-user behavior
     return org_id == scope.org_id and user_id == scope.user_id
 
