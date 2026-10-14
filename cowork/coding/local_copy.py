@@ -11,7 +11,7 @@ import os
 import shutil
 import stat
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass
@@ -245,7 +245,7 @@ class LocalCopyManager:
                 shutil.copy2(desired_path, temp)
                 os.replace(temp, target)
 
-    def cleanup(self, key: str, workspace: Path) -> None:
+    def cleanup(self, key: str, workspace: Path, before_remove: Callable[[Path], None] | None = None) -> None:
         relative = managed_key(key)
         actual = workspace.resolve()
         expected_roots = (self.copies_root, self.legacy_copies_root)
@@ -261,16 +261,26 @@ class LocalCopyManager:
                 self._copy_tree(workspace, recovery)
             except OSError as exc:
                 raise self._copy_failure("The task copy could not be saved for recovery", exc) from exc
+        if before_remove is not None and workspace.exists():
+            before_remove(workspace)
         shutil.rmtree(workspace, ignore_errors=True)
         shutil.rmtree(baseline, ignore_errors=True)
 
-    def release(self, key: str, workspace: Path) -> bool:
+    def release(
+        self,
+        key: str,
+        workspace: Path,
+        before_remove: Callable[[Path], None] | None = None,
+        worktrees: frozenset[str] = frozenset(),
+    ) -> bool:
         """Remove a task copy and its baseline, keeping only the task's changes.
 
         The saved state is the pre-task and task versions of each changed path,
         so a restore can rebuild both trees from the then-current source and
         the task's diff and handoff checks behave as before. Returns False,
         leaving everything in place, when the copy cannot be released safely.
+        ``worktrees`` are the relative paths of worktree checkouts whose
+        commits the caller keeps.
         """
         relative = managed_key(key)
         actual = workspace.resolve()
@@ -278,7 +288,7 @@ class LocalCopyManager:
             raise LocalCopyError("Refusing to release an unmanaged task copy")
         # Repository metadata is not part of the saved changes, so commits made
         # in a copied or task-created repository would be lost.
-        if not actual.is_dir() or self._has_repository(actual):
+        if not actual.is_dir() or self._has_repository(actual, worktrees):
             return False
         baseline = self._baseline_for(actual)
         before, after = self._manifests(baseline, actual)
@@ -301,12 +311,23 @@ class LocalCopyManager:
             raise self._copy_failure("The task changes could not be saved before releasing the copy", exc) from exc
         _force_remove(release)
         os.replace(staging, release)
+        if before_remove is not None:
+            before_remove(actual)
         _force_remove(actual)
         _force_remove(baseline)
         return True
 
-    def restore(self, key: str, source: Path, workspace: Path) -> None:
-        """Rebuild a released copy from the current source plus its saved changes."""
+    def restore(
+        self,
+        key: str,
+        source: Path,
+        workspace: Path,
+        prepare: Callable[[str, Path], PreparedLocalCopy] | None = None,
+    ) -> None:
+        """Rebuild a released copy from the current source plus its saved changes.
+
+        ``prepare`` builds the fresh copy; it defaults to a plain folder copy.
+        """
         relative = managed_key(key)
         release = self._release_dir(relative)
         changes = release / "changes.json"
@@ -322,7 +343,7 @@ class LocalCopyManager:
             _force_remove(leftover)
             if leftover.exists():
                 raise LocalCopyError("Part of this task's old copy is still in use. Close programs using it and try again")
-        prepared = self.prepare(key, source)
+        prepared = (prepare or self.prepare)(key, source)
         try:
             self._replace_changed(prepared.baseline, release / "before", changed)
             self._replace_changed(prepared.workspace, release / "after", changed)
@@ -335,6 +356,11 @@ class LocalCopyManager:
     def is_released(self, key: str) -> bool:
         return (self._release_dir(managed_key(key)) / "changes.json").is_file()
 
+    def match(self, target: Path, desired: Path) -> None:
+        """Make ``target``'s reviewable content identical to ``desired``'s."""
+        current, wanted = self._manifests(target, desired)
+        self._replace_changed(target, desired, self._changed(target, current, desired, wanted))
+
     def discard_release(self, key: str) -> None:
         _force_remove(self._release_dir(managed_key(key)))
 
@@ -342,18 +368,21 @@ class LocalCopyManager:
         return self.recovery_root / relative / "local-release"
 
     @staticmethod
-    def _has_repository(root: Path) -> bool:
-        pending = [root]
+    def _has_repository(root: Path, worktrees: frozenset[str] = frozenset()) -> bool:
+        pending: list[tuple[str, str]] = [(str(root), "")]
         while pending:
+            directory, prefix = pending.pop()
             try:
-                entries = list(os.scandir(pending.pop()))
+                entries = list(os.scandir(directory))
             except OSError:
                 return True
             for entry in entries:
                 if entry.name == ".git":
+                    if prefix.rstrip("/") in worktrees and entry.is_file(follow_symlinks=False):
+                        continue
                     return True
                 if entry.is_dir(follow_symlinks=False):
-                    pending.append(Path(entry.path))
+                    pending.append((entry.path, prefix + entry.name + "/"))
         return False
 
     @staticmethod
