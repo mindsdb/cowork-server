@@ -30,6 +30,8 @@ uv run cowork-server
 
 When running alongside the Electron app in dev mode, the app spawns the server automatically — no manual start needed. The Electron app looks for a sibling `cowork-server/` directory by convention (override with `COWORK_SERVER_DIR`).
 
+cowork-server imports anton's artifact folder constants (`anton.core.artifacts.internal_files`) at startup, with no fallback. A local editable anton older than the `anton-agent` floor in `pyproject.toml` makes the server fail to start with `ImportError`.
+
 ### Dev setup helper
 
 ```sh
@@ -209,7 +211,19 @@ same change; a contract test fails if only one of the two happens.
 
 ### Logging
 
-Set `LOG_LEVEL` (default `INFO`) to control verbosity. Enable file logging with `ENABLE_FILE_LOGGING=true` (writes to `LOG_DIR`, defaults to `~/.cowork/logs/`).
+Set `LOG_LEVEL` (default `WARNING`) to control verbosity. Enable file logging with `ENABLE_FILE_LOGGING=true` (writes to `LOG_DIR`, defaults to `~/.cowork/logs/`).
+
+Database exception records omit SQL, parameter values, driver details and tracebacks, in the owned console and file handlers and in everything Uvicorn logs. `setup_logging()` attaches the database and provider filters to the `uvicorn`, `uvicorn.error`, `uvicorn.access` and `uvicorn.asgi` loggers, and to any handler a launcher already installed on them, so the policy holds under every launcher: the `cowork-server` CLI, `python -m uvicorn cowork.server:app`, or `uvicorn spa_wrapper:app` with Uvicorn's default log config. Uvicorn's levels stay as the launcher set them, so lifecycle lines such as `Finished server process` still print. The shared filter replaces each such record with `Database operation failed: error_type=<class> sqlstate=<code or unknown> site=<module>.<function>:<line>`, keeping only valid driver SQLSTATE codes. `site` names the logging call. When that call only relays the error, as Uvicorn's request runner and the server's lifespan guard do, `site` names the deepest Cowork frame the error passed through outside the session wrappers (`cowork.db.scoped`, `cowork.db.session` and `cowork.db.units`), such as the service line that ran a route's failing statement. Session logs retain error types and client HTTP status, including the 503 for a full pool. A 5xx `HTTPException` logs its status. Its own detail is not logged, but its cause's class, message and traceback are, unless the cause chain holds a database or provider error, which the filters replace. Any other error, including one that carries a `status_code` without being an `HTTPException`, logs only its type in the session line, then reaches Uvicorn, which logs it through the same filters. Exceptions and HTTP errors returned to callers stay unchanged.
+
+A database error while the server starts or stops (a migration, the seed rows, or Postgres not yet reachable after a reboot) logs that safe line through the owned handlers. Uvicorn then prints only `RuntimeError: Database operation failed during server startup` (or `shutdown`), because Starlette hands it the failure as plain traceback text, which no filter can read. Other startup errors keep their traceback.
+
+A call site passes the ids that locate a failure as `extra=log_context(...)` from `cowork.common.logger`, which sets record attributes: `request_id`, `project_id`, `schedule_id`, `conversation_id`, and `artifact_slug` for one artifact or `artifact_slugs` for several. The filters never change them, and the console and file formatters render them before the message, for example `[Req:<id>][Project:<id>][Schedule:<id>][Conversation:<id>][Artifact:'<slug>']` or `[Artifacts:'<slug>', '<slug>']`. Artifact slugs are folder names, so they render quoted. A site that carries only a request id passes `extra={"request_id": ...}` directly.
+
+OpenAI and Anthropic SDK errors (any `OpenAIError` or `AnthropicError`) and Anton's typed provider errors are found, in the same handlers and Uvicorn loggers, through each exception's cause, then its context (even a suppressed one), then its exception group members. The record becomes `Provider operation failed: error_type=<the record's exception class> provider_error=<the first provider error's class> status=<that provider error's HTTP status or unknown>`; a wrapper's own status is never used. Cowork's request ID (`[Req:<id>]`) stays on the line; the provider's own request ID is not logged. Provider messages, bodies, requests and tracebacks are omitted. Routing failure warnings also omit body-derived type, code and parameter fields. Original exceptions, probe verdicts and client HTTP/SSE errors stay unchanged.
+
+Uvicorn's access line keeps each request's method, path and status, and `setup_logging()` replaces its query with `?[redacted]`, because a query can carry an OAuth callback's code or a webhook's verify token.
+
+SQLAlchemy query and connection diagnostics stay at `WARNING`, even when application logging is set to `DEBUG`. SDK request diagnostics and HTTP client logging stay at `ERROR`, including Anthropic, `httpx2` and the whole `httpcore` and `httpcore2` namespaces, because they can include request bodies, URLs or response headers such as `set-cookie`.
 
 ## Releasing
 
@@ -242,6 +256,8 @@ then reports a failure or the first recovery through the shared
 engineering-channel notifier. It is a standalone monitor and never gates a
 publish, release, or deployment.
 
+**The nightly runs staging's copy of the tests, not main's.** GitHub starts every scheduled run on the default branch, so the checkout would otherwise take `main`. `main` trails `staging` by every commit waiting for the weekly release. Any behavior change among those commits fails `main`'s tests against staging's pods, even though staging works as intended. So the job passes `ref: staging`, and `tests-integration.yml` hands that input to `actions/checkout`. The deploy callers leave `ref` empty and keep testing the commit they just deployed. [`test_nightly_integration_workflow.py`](tests/test_nightly_integration_workflow.py) fails if a scheduled caller's `ref` differs from its `deploy-env`.
+
 The suite may create and delete test conversations, schedules, files, and agent
 turns in staging. The fixed test tenant is reserved for the `cowork` suite, and
 the workflow sets `COWORK_REQUIRE_INTEGRATION=true` for staging so a missing
@@ -269,11 +285,25 @@ The server is designed to be **agent-agnostic** — core features (projects, con
 
 A **harness** adapts an external agent library (Anton today) to the cowork-server interface. All harnesses implement the `HarnessProvider` protocol (`harnesses/base.py`), which exposes streaming responses, skill sync, and memory operations. The active harness is selected via the `harness` user setting. To add a new agent, implement the protocol and register it with the `@register` decorator.
 
+**Each turn's scratchpads exit when the turn ends.** The Anton harness builds a fresh `ChatSession` for every turn, and each scratchpad that session starts is a child process of the server. When the turn completes, fails or is stopped, `close_session_scratchpads` (`cowork/common/chat_session.py`) kills those processes. A Stop pressed while a cell is running does not end the turn yet: anton kills that cell's scratchpad and the turn carries on until it ends by itself, which ENG-3078 tracks. The next turn starts a new process, which reloads the variables the old one saved to the conversation's namespace snapshot after every cell. Only the scratchpads close: full-stack backends the agent launched keep running. Anything a cell starts in the scratchpad's process group, such as a default `subprocess.Popen` child or a thread, dies with it, so a long-lived service belongs in `launch_backend`. A child started with `start_new_session=True` or `setsid` escapes: it keeps running and holds two of the server's pipe descriptors until it exits. The connector probe closes its scratchpads the same way, and shutdown waits up to 5 seconds for closes still running. A scratchpad runs as `python <tmp>/anton_scratchpad_<random>.py`, so `pgrep -f anton_scratchpad_` counts the live ones; it should drop to 0 once no turn is running.
+
 ### Streaming & scheduling
 
 Agent responses stream to clients via **Server-Sent Events** (SSE) on `POST /responses/`. The server tracks in-flight streams and supports cancellation (`/responses/cancel`) and late-join tailing (`/responses/tail`).
 
-A background **scheduler** loop polls the database every 30 seconds for due schedules, supporting `once`, `hourly`, `daily`, and `weekly` cadences. Each run creates a conversation and is tracked in `schedule_runs`. Deleting that conversation does not delete the run: the run keeps its status, timings, and error as audit history, and only its link to the conversation is released. A channel binding pinned to the conversation is released the same way, so the external chat stays bound to its project and the next inbound message starts a fresh conversation.
+`/responses/cancel` takes an optional `reason`. The UI sends `"stalled"` when it heard nothing for its idle window, and the turn then saves as a `response.failed` with code `stalled`, so a reload shows the stall card. Without a reason, or with any other value, the cancel is a Stop and keeps the partial answer with no error row. While anton waits on a model call that sends no output, the server (in cloud, the anton pod) writes a `model_wait` progress frame every 20 to 25 seconds so the turn's idle bounds do not end it. A model call that sends no output for 600 seconds ends the turn with code `model_timeout`; anton's `ANTON_MODEL_CALL_IDLE_TIMEOUT_S` sets that limit, and 0 or less turns it off. [Turn liveness and idle bounds](docs/DESIGN.md#turn-liveness-and-idle-bounds) lists every bound a quiet turn meets and what happens when each one fires.
+
+`POST /responses/` reads what it needs (the turn's settings, its attachments, the conversation and the routing gate's history) as one short database unit in a worker thread (`run_db` in `cowork/db/units.py`). The request holds no pooled connection while the gate or the stream runs, and a wait for one never stalls the event loop. When no connection frees within `POOL_TIMEOUT` (5 s by default), the request is refused with `503`, a `Retry-After` header and `{"detail": "Cowork is busy. Try again in about 5 seconds.", "code": "server_busy"}`. An answer that meets the same wait after its stream started ends with one `response.failed` frame with code `server_busy` and the `retry_after` and `retry_at` fields `rate_limited` carries. The question sent again after that frame gets a stream of its own.
+
+An answer produced in this process (`COWORK_TURN_BACKEND=inprocess`, the default) runs its own database work as units too. One at the start saves the question (pending) and loads the conversation. The harness reads the history, the attachments and each `recall_history` lookup in units of its own. One at the end saves the answer and clears the question's pending flag in one commit. Both hold a per-conversation lock that keeps a conversation's message writes in order. So such an answer holds no pooled connection while the model answers or the stream runs. A save that fails at the end of a finished or stopped answer ends the stream with `response.failed` (`server_busy` when no connection freed in time), never `response.completed`. An interrupted or failed answer whose save fails keeps its own `response.failed` frame, and the next boot's recovery seals an interrupted one into history. A Stop, a second Stop or a shutdown that arrives while a turn saves its question or its answer waits for that save, so the stream's last frame always matches what the database holds. The compacted history summary and new artifact index are database units too. The harness waits for its cleanup through `run_to_completion`, so Stop and shutdown cannot abandon these writes, and a full pool never blocks the event loop. When the pool stays full, a Stop waits up to `POOL_TIMEOUT` for each pending write (the answer, a compacted summary and a new artifact's row), so `/responses/cancel` can take up to three times `POOL_TIMEOUT`. A Stop during a running cell returns within 5 s only while the pool frees connections. An answer produced by the remote backend (`COWORK_TURN_BACKEND=remote`) works the same way. Staging the pod's workspace, saving the question, reading what the pod is seeded with, saving the memory and the compacted summary the pod reports, indexing the artifacts it created and saving the answer are each a unit, and the artifacts' owners are looked up in a unit before they are published. So it holds no pooled connection while the pod answers, and its settings come from the snapshot the request loaded. The turn indexes the artifacts the pod created once, however it ends. A Stop waits for that write and then for the answer's save, so with the pool full `/responses/cancel` can take up to twice `POOL_TIMEOUT`. A memory or summary save that is still waiting for a connection when a Stop lands is dropped.
+
+The connector form's stream (`POST /api/v1/connectors/submissions/`) reads its conversation and the settings that build the probe's model client, and saves the probe's narrative, as units too. So it holds no connection while the credential probe waits on the model, and it never waits for one on the event loop. When no connection frees in time for the conversation read or the settings read, the form shows `Cowork is busy. Try again in about 5 seconds.` and the probe does not start. The stream ends at that refusal and saves nothing to the conversation. A save of the probe's narrative that fails still ends the stream with `response.completed`, because the form carries the probe's outcome.
+
+A question sent into a conversation whose streamed turn is still answering is refused with `409` and `{"detail": "Another question is still being answered in this conversation. Wait for it to finish, then send yours again.", "code": "turn_in_progress"}`. It is refused before anything reads or saves it, and the running answer goes on. A turn whose stream has already ended counts as finished, so a question queued behind it is accepted. The check runs before any database read, and `RunRegistry.start` repeats it under a lock for that conversation before it opens the new turn's buffer. Two questions racing through the gate read the same history, so both compute the same turn number, which names the turn's buffer and which boot recovery reads as the question's position in the history. Once a turn saves its question, the registry refuses a later start at that turn's number or an earlier one, even after that turn has ended. So the second of two racing questions is refused with the same `409` whether it reaches the registry before or after the first turn ends, and two questions never share a buffer. A question that follows a turn that saved nothing (refused for a full pool, say) keeps that turn's number and is accepted. A queued follow-up waits for the preceding turn's internal terminal record once its final client frame is being written; slow buffer creation for one conversation does not hold up other conversations. It covers the turns running on the replica that receives the question: with several replicas, a duplicate send that reaches another replica is not refused there.
+
+A turn that fails ends with one `response.failed` frame carrying a stable `code` and the user-facing `error` (`cowork/handlers/turn_errors.py`), and the conversation's saved events keep the same payload, so a reload shows the same card. For `included_allowance_exhausted` and `free_serving_paused` the frame also carries `reset_at`, the instant the free way forward comes back. An in-process turn passes the gate's `X-MindsHub-Reset-At` header through as sent. A hosted turn takes it from the anton worker's `turn_failed` reply, which scratchpad-controller forwards beside `error`. The producer keeps it only for those two codes and only when it parses as an ISO-8601 instant with a UTC offset. An older worker sends none, and its frame has no `reset_at`.
+
+A background **scheduler** loop polls the database every 30 seconds for due schedules, supporting `once`, `hourly`, `daily`, and `weekly` cadences. The poll and each run's reads and writes are database units, so a full pool refuses them after `POOL_TIMEOUT` rather than stalling the server. A run whose first write is refused does not start, and a cron slot then stays due for the next poll. A run's last two writes, its outcome and its finish, try again while the pool stays full, for up to 10 minutes, so a busy moment never leaves a run at `running` or its slot due. Each run creates a conversation and is tracked in `schedule_runs`. Deleting that conversation does not delete the run: the run keeps its status, timings, and error as audit history, and only its link to the conversation is released. A channel binding pinned to the conversation is released the same way, so the external chat stays bound to its project and the next inbound message starts a fresh conversation.
 
 ## Data Layer
 
@@ -364,9 +394,9 @@ gateway 401 that looked like a dead account. `build_llm_client` now passes an
 reads the current in-memory value. Two limits are deliberate. Static
 organization-mode and user-supplied keys keep their construction-time value,
 because nothing rotates them. And the **scratchpad subprocess keeps the token it
-was started with** — `export_connection_info()` hands it a string once and it
-has no supplier, so a pad-side model call still runs on that value. Refreshing
-it needs a pad IPC contract, which ENG-2116 scoped out.
+was started with** for the rest of its turn: `export_connection_info()` hands it
+a string once and it has no supplier, so a pad-side model call still runs on
+that value. Refreshing it needs a pad IPC contract, which ENG-2116 scoped out.
 
 `build_llm_client` capability-gates the kwarg on `inspect.signature`, so an
 older Anton keeps the static key and logs the degradation rather than failing
@@ -387,12 +417,12 @@ All endpoints live under `/api/v1/`. Key resource groups:
 | `/skills` | Agent skill definitions |
 | `/memory` | Persistent agent memory |
 | `/artifacts` | Agent-produced file previews |
-| `/publish` | Publish HTML artifacts to 4nton.ai |
+| `/publish` | Publish artifacts to MindsHub (view.mindshub.ai in prod) |
 | `/connectors` | Third-party service connections and OAuth |
 | `/settings` | User preferences and API keys |
 | `/runtime-credential` | Desktop hand-over of the MindsHub credential (write-only, loopback, local mode) |
 | `/hub/workspaces` | Which MindsHub workspace this person is working in |
-| `/hub/usage` | The caller's free Air allowance (as a proportion), balance, auto top up and credit spend, for the desktop's usage warnings |
+| `/hub/usage` | The caller's free Air allowance (as a proportion), balance, auto top up and credit spend, for the desktop's usage warnings. An organization with no free grant reads `freeTokens.limit` 0 and `freeTokens.resetsAt` null, since nothing refills |
 
 ### Declaring who may call a route
 
@@ -436,7 +466,13 @@ resources (API keys, artifacts, model entitlements) and lives in the auth
 service. It has nothing to do with the filesystem directories this repo calls
 workspaces, which is why the stored key is `hub_workspace_id`.
 
-Five things about it are worth knowing before changing it.
+The selector used to be switched by auth's `authorization_ui` Statsig gate,
+read out of the entitlements payload: no local Statsig client, one gate
+governing the console and Cowork alike. It was retired once its surfaces had
+been live in production long enough to trust (ENG-2043), so the selector is
+unconditionally on now and this service no longer calls entitlements at all.
+
+Four things about it are worth knowing before changing it.
 
 **The sidecar makes the call, not the renderer.** Auth's ingress allows three
 console origins per environment and no Cowork host, and a per-PR Cowork host
@@ -459,32 +495,22 @@ scopes to the loopback origin. `hub_credential` reads both, and it is
 deliberately a different function from `caller_bearer` so a client cannot steer
 the credential on the org model-catalog fetch by setting a header.
 
-**The switch is auth's Statsig gate, not a local setting.** Auth declares
-`authorization_ui` in its `configs/statsig_gates.json`, evaluates it with its
-server SDK, and reports the verdict in the entitlements payload; this service
-reads it from there. One gate governs the console and Cowork rather than two that
-can disagree, and Cowork holds no Statsig client and no SDK key. Every answer
-short of a definite yes reads as off: no bearer, auth unreachable, a version of
-auth with no gates field, or the gate off. `COWORK_HUB_WORKSPACES_FORCE_ON` is an
-ON-only development override for walking the surface where no rule targets you;
-it cannot switch the surface off, so it cannot escape the kill switch.
-
-**Both caches are keyed on the credential, not just the caller.** Auth answers
-the listing and the gate per caller: an owner or admin sees every workspace in
-the organization, a member only the ones they hold a grant on, and
-`authorization_ui` declares `idType: userID`. So an organization-keyed cache
-served one admin's menu to every member for the whole TTL, and the grant check on
-`PUT /active` reads the same entry. The key is
+**The listing cache is keyed on the credential, not just the caller.** Auth
+answers the listing per caller: an owner or admin sees every workspace in the
+organization, a member only the ones they hold a grant on. So an
+organization-keyed cache served one admin's menu to every member for the whole
+TTL, and the grant check on `PUT /active` reads the same entry. The key is
 `(auth host, organization, user, credential digest)`. The digest is not
 belt-and-braces: `user_id` comes from the gateway-set principal and is `None` on
 every desktop request, because `scope_from_principal` returns `LOCAL_SCOPE`
 outside org mode, so identity alone collapses to one shared entry and a
 sign-out/sign-in as another account would be served the previous one's
 workspaces. A new session means a new token means a new entry. Entries are swept
-on write, since nothing re-reads a departed caller's key and the dicts would
+on write, since nothing re-reads a departed caller's key and the dict would
 otherwise grow for the process lifetime. The TTL follows whether **auth
-answered**, not what it said: a gate auth evaluated as off is a real answer and
-keeps the long TTL, which matters because off is the state this ships in.
+answered**, not what it said: a reachable listing keeps the long TTL, and an
+unreachable one the short failure budget, so a degraded auth does not add a
+round trip to every menu open without also going stale for a long stretch.
 
 **Two refusals on `PUT /active`, and neither may read the stored pick.** A
 workspace missing from the caller's listing is a 403; one in the listing but
@@ -572,9 +598,13 @@ tenancy alone. It reports `enabled: true` when those hold and
 
 `COWORK_ORGANIZATION_SWITCH_ENABLED` is the product enable for the picker, not a
 safety switch, and it is the lever to reach for to hide the picker without a
-rebuild. `COWORK_IDENTITY_ENFORCE=audit` hides it too, by dropping
+code change. `COWORK_IDENTITY_ENFORCE=audit` hides it too, by dropping
 `expectedOrganizationEnforced`, but it reopens the no-principal path and leaves
 the boundary refusing anyway.
+
+Backing enforcement out needs the code and values from before cowork-server#524.
+[deployment/cowork-server/README.md](deployment/cowork-server/README.md#back-out-enforcement)
+records the procedure and why a Helm rollback cannot do it.
 
 Inside one organization, two different rules apply, and which one you get
 depends on the resource:
@@ -689,7 +719,7 @@ Every minds-cloud role defaults to `mindshub_air`, for all three roles: planning
 coding and router. **MindsHub's catalog declares it**, in the
 `mindshub_model_policy_v1` config that already owns the alias registry, and the
 declaration arrives as a `default_for` list on each `/v1/models` row. So moving a
-default is a config edit plus an apply, not a release. MindsHub Air's usage draws the monthly included allowance, so a user who has
+default is a config edit plus an apply, not a release. MindsHub Air's usage draws the included allowance, so a user who has
 picked no model can finish a whole turn without the wallet being charged for any
 part of it.
 
@@ -721,6 +751,12 @@ Two cases share that path and should not be confused. A pin the map flags
 `false` is a real MindsHub model that is merely unaffordable right now. A pin
 **absent** from a non-empty map is foreign or retired, so it would 404 on every
 turn rather than 402, and it is healed the same way with no route back.
+
+`enabled: false` has one more cause: an admin in the organization restricted the model. `/v1/models` names the lock on each disabled row in `disabled_reason` (`model_restricted`, `wallet_empty` or `included_allowance_exhausted`), and `GET /settings/recommended-models` relays it as `modelDisabledReasons`, so the picker shows a restricted model as restricted and offers no credits for it. The map comes from the MindsHub listing only. A custom openai-compatible endpoint's `disabled_reason` is dropped, because a BYO endpoint must not be able to claim an admin restricted a model. Resolution treats a restricted pin like any other `false` one and swaps it, for the members the rule restricts and no one else. A turn that still reaches the gateway on a restricted model fails with the `model_restricted` code: the gateway keeps the 403's `permission_denied` reason and names the rule on its `X-MindsHub-Deny-Detail` header and in the body's `error.deny_detail`, trusted by the same origin rules as the reason.
+
+A restriction belongs to one member, so it is stored per member. Auth applies the model rules for each caller's org, workspace and team, so two members of one org get different listings, and `fetch_org_model_catalog` caches one listing per org and member. `minds_model_enabled` is an org row that every member's resolution reads. So in org mode `recommended_models` leaves the caller's `model_restricted` models out of it: each keeps the flag the org map already held for it, or `true` when it held none. The caller's restricted ids go to their own `minds_model_restricted` row instead, an untagged setting that `SettingService` files at the caller's user scope, and `UserSettings._minds_enabled_map` reads them as `false` over the org map. One member's restriction therefore never swaps another member off a model, and another member's load never lifts it. A member's restrictions reach resolution when that member's own settings load writes them. A listing that publishes no `enabled` flags leaves the stored list alone, the same evidence rule the org map follows. A desktop install has one member, so it keeps restrictions in `minds_model_enabled`.
+
+The listing cache (`_minds_models_cache` in `cowork/services/providers.py`) drops expired entries on every write and holds at most `_MINDS_MODELS_CACHE_MAX` listings, evicting the least recently used, so keeping one entry per member does not grow it for the life of the pod. An entry with no organization in its key, which includes every desktop fetch, is keyed by the credential it was fetched with, held as a pydantic `SecretStr` so it prints as asterisks in any repr or log, so an account switch in the running app is never served the previous account's restricted or locked rows. Nothing is hashed from it.
 
 The desktop closes the loop at the other end: a model the map locks is not
 offered in either picker, so a swap only ever applies to a pin that was
@@ -760,7 +796,7 @@ when the gateway published defaults, the cached one when it did not.
 Why a probe sends a model at all: MindsHub bills per model, so a model the wallet
 cannot pay for is denied, and that denial is indistinguishable from a bad key.
 Probing a paid model tells an account with an empty wallet that its working key is
-invalid. `MINDS_PROBE_MODEL` (`mindshub_air`) draws the monthly included allowance
+invalid. `MINDS_PROBE_MODEL` (`mindshub_air`) draws the included allowance
 instead of the wallet, so the result reports reachability and key validity, which
 is what these endpoints are for.
 
@@ -799,6 +835,10 @@ guard. A key the caller supplied may go anywhere, since nothing stored is at ris
 A refused provider comes back `fail` with its reason and is never pinged, rather
 than failing the whole request. Callers send every configured provider in one call,
 so refusing the request would blank the other providers' dots over one bad URL.
+
+Each card in the body is a `ProviderProbeCard` (`cowork/schemas/settings.py`), which declares the four fields the ping reads, `type`, `apiKey`, `baseUrl` and `mindsUrl`, as strings. A card whose `type` or URL is not a string fails the whole request with a 422 before any key is resolved. The Settings UI does not hit this: it sends the cards it saved itself, with `type` normalized to a string by `backfillProviders` in cowork's `settingsTransform.js`. Every other field the UI holds on a card, such as `isDefault` or `name`, is ignored, so a renderer that adds one keeps getting its status dots.
+
+When the MindsHub gateway refuses a `minds-cloud` probe with a named reason, the response carries it in `providerStatusReasons`, keyed by provider type: `{"minds-cloud": {"code": "free_air_daily_spend_fuse_exceeded", "resetAt": "<ISO instant or null>"}}`. The code is the gateway's own `X-MindsHub-Reason` word, one of `wallet_empty`, `included_allowance_exhausted`, `free_air_daily_spend_fuse_exceeded`, `rate_limited` and `policy_unavailable`, so the Settings notice can tell a velocity limit or the free-Air fuse from an empty wallet instead of matching on `HTTP 429` in the detail string. When a proxy strips that header, the probe reads the same word from the body `code`, which the gateway sets to match. `resetAt` carries the gate's `X-MindsHub-Reset-At`, which it sends on the allowance and fuse denials. The body `code` counts only when the probe's response came from the configured `minds_url` host. The header counts unless the response provably came from another host. These are the origin rules the turn-failure mapping applies (`gateway_denial` in `cowork/handlers/turn_errors.py`), so a probe aimed at any other host names no reason. A refused provider was never pinged, so it has no entry. `providerStatus` and `providerStatusDetails` keep their shape.
 
 Every MindsHub-bound chat probe caps the completion at `max_tokens: 20`, not 1:
 some models refuse a 1-token budget and fail the probe for a perfectly good key
@@ -861,11 +901,39 @@ and the publisher's artifact-only authentication path before this server change.
 Keep these admission checks in place during rollback while restrictive custom
 roles remain assigned. No new customer or staff permission grants are introduced.
 
+### Datasource grants on cloud turns
+
+`COWORK_TURN_DATASOURCE_ENABLED` (default `false`) lets a hosted turn query the
+user's verified PostgreSQL and MySQL connections in the organization. When it
+is on, the producer lists them from auth under the dedicated
+producer service role (`COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID` and
+`COWORK_TURN_DATASOURCE_PRODUCER_KEY`), bound to the turn key it has just
+minted, registers one grant per connection before enqueueing, and puts only
+connection ids and credential versions on the queue. No capability or
+password crosses Redis; the pod reaches the gateway on the inference host the
+turn's `llm` block already names. A listing or registration failure fails the
+dispatch as `permission_unavailable` instead of silently dropping the
+datasources.
+
+Turn the flag on only after auth serves the datasource producer and resolver
+endpoints, the inference deployment serves `/v1/datasources/`, the
+scratchpad-controller passes the `datasource` block on, and the scratchpad image
+includes the typed helper that reads the gateway from the turn's inference host,
+with live pods from an older image recycled first. With the flag off nothing
+in this path runs, so the flag is also the rollback.
+
 ## Configuration
 
 Configuration is read from the database (`UserSettings` table) and can be managed through the Settings UI in the desktop app or via `PUT /api/v1/settings/`.
 
-Environment variables fall into two namespaces:
+The `favicon` setting stores a browser tab icon as a data URI, separately from
+the sidebar's `nav_logo`. It defaults to an empty string, which keeps the
+page's original icon. Saving an empty string restores that default. Like the sidebar
+logo, this is a personal preference scoped to each member within an
+organization; local tenancy uses the instance's shared setting. `GET /api/v1/settings/`
+returns the data URI without masking it.
+
+Environment variables fall into these groups:
 
 **Server-level** (`COWORK_*`) — control the cowork-server process itself:
 
@@ -882,15 +950,29 @@ Environment variables fall into two namespaces:
 | `COWORK_SKILLS_DIR` | `~/.cowork/skills` | Skills store root (local mode only) |
 | `COWORK_MEMORY_DIR` | `~/.cowork/memory` | Memory store root (local mode only) |
 | `COWORK_VAULT_DIR` | `~/.cowork/data-vault` | Connector credential vault |
-| `COWORK_HUB_WORKSPACES_FORCE_ON` | `false` | Development override that turns the MindsHub workspace surfaces on where no Statsig rule targets you. ON only, so it can never switch them off and never escape the kill switch. The switch itself is auth's `authorization_ui` gate; see "The MindsHub workspace selector" above. Never set in a deployed environment. |
+| `COWORK_OPENAI_COMPATIBLE_API` | `chat_completions` | The API an `openai_compatible` provider's planning and coding roles call. `responses` moves them to `{base}/responses` through anton's openai flavor, where OpenAI and Azure accept function tools together with a reasoning effort. It needs an anton that reports `RESPONSES_TRANSPORT_READY`; with an older anton both roles stay on chat completions, and Cowork logs one warning that says so. On the Responses path the agent loop runs without web tools, because OpenAI's hosted `web_search` reads the web from the provider's side, outside the deployment's egress controls. A Python cell's `web_search()` is separate and unchanged. The router and Gemini stay on chat completions. Read once at start. |
+
+**Database pool**: these read their bare names, with no `DATABASE_` prefix. A SQLite engine is built without them and waits SQLAlchemy's 30 s for a connection outside a database unit; its database units run one at a time, and `POOL_TIMEOUT` still bounds a unit's waits.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `POOL_SIZE` | `20` | Connections the pool keeps open. |
+| `MAX_OVERFLOW` | `20` | Connections the pool may open beyond `POOL_SIZE` under load. Database units take one of `POOL_SIZE` plus `MAX_OVERFLOW` slots before they ask the pool. A negative value means no limit, for the pool and for units. |
+| `POOL_TIMEOUT` | `5` | Seconds a database unit may wait in all, for a slot and then for a connection, before it is refused: a request with `503` and a `Retry-After` of the same number of seconds, a streamed answer with `server_busy`. On Postgres it is also the pool's own wait, so every route that reads the database answers `503` with `Retry-After` once it passes, `/api/v1/health/` included. `/api/v1/health/live` reads no database and keeps answering. It must be at least `1`; a lower value stops the server at startup. |
 
 **Harness-level** (`ANTON_*`) — configure a specific agent harness. These are read by the harness adapter, not by cowork-server core. They use the harness prefix because the upstream agent library (anton) defines them:
 
 | Variable | Harness | Description |
 |----------|---------|-------------|
-| `ANTON_PUBLISH_URL` | Anton | Artifact publish endpoint |
+| `ANTON_PUBLISH_URL` | Anton | Artifact publish endpoint. Pointed anywhere but MindsHub's service, it takes HTML and Markdown only: sharing a full-stack app is refused before anything is uploaded, because that upload carries the app's connection credentials |
 | `ANTON_SKILLS_ROOT_DIR` | Anton | Skill file storage |
 | `ANTON_GLOBAL_MEMORY_ROOT_DIR` | Anton | Global memory files |
+
+**By field name** (local tenancy only): every `UserSettings` field also reads the environment variable named after it, and a stored row wins over the variable. The router's reasoning effort is set this way, beside `PLANNING_REASONING_EFFORT` and `CODING_REASONING_EFFORT`:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ROUTER_REASONING_EFFORT` | unset | The router model's reasoning effort. The router's provider serves anton's history summaries and the route gate, so the effort reaches both. On `openai_compatible` the gate runs `ROUTER_MODEL`. On other providers the gate runs the provider's default router model, so the effort is sent only while `ROUTER_MODEL` is that default. Unset or empty sends no effort, which a model that doesn't reason needs, because it refuses any effort. On `openai_compatible`, a router model that reasons by default, such as `gpt-5.6-luna`, needs `none` to take the gate's function tool on chat completions. The composer's per-task effort never applies to the router. |
 
 In Docker/Lightsail deployments, the container also receives `ANTON_MINDS_API_KEY`, `ANTON_OPENAI_API_KEY`, etc. — these are consumed by the Anton agent library directly (not by cowork-server settings), and are injected by the provisioning lambda via cloud-init user-data.
 

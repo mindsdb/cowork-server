@@ -1,5 +1,5 @@
 #!make
-.PHONY: help test test/unit test/integration test/integration-production-read-only test/unit/coverage coverage/html
+.PHONY: help test test/unit test/integration test/integration-production-read-only test/unit/coverage coverage/html check/wheels
 
 .DEFAULT_GOAL := help
 
@@ -17,6 +17,7 @@ help: ## Display this help message
 	@echo "  \033[36mtest/integration-production-read-only\033[0m  Run the production GET-only smoke"
 	@echo "  \033[36mtest/unit/coverage\033[0m     Run unit tests with coverage"
 	@echo "  \033[36mcoverage/html\033[0m          Generate HTML coverage report"
+	@echo "  \033[36mcheck/wheels\033[0m           Check every shipped platform resolves to versions with wheels"
 
 test/unit: ## Run unit tests
 	$(PYTEST) $(TESTS)
@@ -34,3 +35,6 @@ test/unit/coverage: ## Run unit tests with coverage
 
 coverage/html: ## Generate HTML coverage report
 	$(PYTEST) --cov=cowork $(TESTS) --cov-report=html
+
+check/wheels: ## Check every shipped platform resolves to versions with wheels
+	bash scripts/check_wheels_available.sh

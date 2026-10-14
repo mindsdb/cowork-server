@@ -11,7 +11,7 @@ from cowork.models.base import BaseSQLModel
 class MessageEvent(BaseSQLModel, table=True):
     __tablename__ = "message_events"
 
-    message_id: UUID = Field(..., foreign_key="messages.id")
+    message_id: UUID = Field(..., foreign_key="messages.id", index=True)
     sequence_number: int = Field(..., description="Sequence number of the event")
     event_data: dict[str, Any] | BaseModel | str | list[Any] = Field(
         default_factory=dict,

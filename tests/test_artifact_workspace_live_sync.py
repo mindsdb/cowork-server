@@ -70,7 +70,7 @@ async def test_manual_save_synchronizes_an_existing_live_artifact(artifact, monk
         lambda *_args: (_source_for(folder), folder, metadata, {}),
     )
 
-    async def fake_sync(session, live_folder):
+    async def fake_sync(session, live_folder, **_kwargs):
         synced.append((session, live_folder))
         return True
 
@@ -140,7 +140,7 @@ async def test_restore_synchronizes_an_existing_live_artifact(artifact, monkeypa
         lambda *_args: (_source_for(folder), folder, metadata, {}),
     )
 
-    async def fake_sync(session, live_folder):
+    async def fake_sync(session, live_folder, **_kwargs):
         synced.append((session, live_folder))
         return True
 
@@ -157,6 +157,22 @@ async def test_restore_synchronizes_an_existing_live_artifact(artifact, monkeypa
 
     assert restored["content"] == "<html>before</html>"
     assert synced == [(session, folder)]
+
+
+def test_owner_publish_context_threads_the_active_workspace(artifact, monkeypatch):
+    """The manual/live-sync publish path must bind its key to the caller's picked
+    workspace too, not just the autopublish reconciler — the live-editing route and
+    the explicit Publish button both go through this context builder."""
+    import cowork.services.artifact_autopublish as autopublish
+
+    folder, _metadata = artifact
+    monkeypatch.setattr(autopublish, "_active_workspace_id", lambda scope: "ws-1")
+    monkeypatch.setattr(autopublish, "_publish_url", lambda scope: "https://api.staging.example")
+
+    _base, publish_url, key = workspace._owner_publish_context(_Session(), folder)
+
+    assert publish_url == "https://api.staging.example"
+    assert key._workspace_id == "ws-1"
 
 
 @pytest.mark.asyncio
@@ -190,7 +206,7 @@ async def test_org_sync_preserves_audience_and_reuses_live_publish(artifact, mon
 
     monkeypatch.setattr("cowork.services.publish.publish_artifact", fake_publish)
 
-    result = await workspace._sync_live_artifact(_Session(), folder)
+    result = await workspace._sync_live_artifact(_Session(), folder, project_id="project-1")
 
     assert result is True
     assert calls[0][0] == folder
@@ -205,6 +221,7 @@ async def test_org_sync_preserves_audience_and_reuses_live_publish(artifact, mon
     }
     assert calls[0][1]["scope"] is ORG_SCOPE
     assert revoked == [True]
+    assert calls[0][1]["project_id"] == "project-1"
 
 
 @pytest.mark.asyncio
@@ -293,7 +310,7 @@ async def test_publish_failure_does_not_undo_the_source_save(artifact, monkeypat
         lambda *_args: (_source_for(folder), folder, metadata, {}),
     )
 
-    async def failed_sync(*_args):
+    async def failed_sync(*_args, **_kwargs):
         return False
 
     monkeypatch.setattr(workspace, "_sync_live_artifact", failed_sync)
@@ -344,3 +361,31 @@ async def test_source_save_survives_live_publish_authority_failure(artifact, mon
 
 
 pytestmark = pytest.mark.usefixtures("granted_product_permissions")
+
+
+@pytest.mark.asyncio
+async def test_another_owners_report_fails_the_sync_without_a_traceback(artifact, monkeypatch, caplog):
+    """The edit stays saved, and a refusal that repeats on every save logs no stack."""
+    import logging
+
+    from cowork.services.publish import PublishOwnedByOtherUser
+
+    folder, _metadata = artifact
+    _publish(folder, {"mode": "public"})
+    monkeypatch.setattr(
+        "cowork.services.publish.desktop_publish_credential",
+        lambda: ("desktop-key", "https://api.desktop.example"),
+    )
+
+    def owned_elsewhere(*_args, **_kwargs):
+        raise PublishOwnedByOtherUser()
+
+    monkeypatch.setattr("cowork.services.publish.publish_artifact", owned_elsewhere)
+
+    with caplog.at_level(logging.WARNING, logger=workspace.logger.name):
+        assert await workspace._sync_live_artifact(_Session(LOCAL_SCOPE), folder) is False
+
+    record = next(r for r in caplog.records if "Could not synchronize live artifact" in r.getMessage())
+    assert "another account owns its report" in record.getMessage()
+    assert record.exc_info is None
+    assert artifact_locks.acquire(folder.parent, folder.name, ttl_s=60) is True

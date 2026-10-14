@@ -21,9 +21,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
+from weakref import WeakValueDictionary
 
+from cowork.common.logger import log_context
 from cowork.streaming.buffer import StreamBuffer
 
 logger = logging.getLogger(__name__)
@@ -62,14 +65,38 @@ _MAX_TURN_IDLE_SECONDS = _idle_bound_seconds()
 # fully wedged producer is at most _MAX_TURN_IDLE_SECONDS + this.
 _IDLE_POLL_SECONDS = 15
 
+# Bound on RunRegistry.shutdown()'s wait for in-flight turns to persist their
+# partial answer before the process exits. The container's stop deadline must
+# cover Uvicorn's earlier request-drain budget (2s), this wait, and teardown.
+#
+# A turn's end-of-turn save waits for a database connection only when the pool
+# is exhausted. If that happens during shutdown, the save can wait up to
+# POOL_TIMEOUT (5 s by default) and so use this whole grace; a turn still
+# saving when the grace runs out is left for the next boot's recovery.
+TURN_SHUTDOWN_GRACE_SECONDS = 5
+
+
+class TurnInProgress(Exception):
+    """A conversation already has a turn answering, so a new question is refused.
+
+    The app answers it with 409 (cowork.server), which reads ``status_code``.
+    """
+
+    status_code = 409
+
+    def __init__(self, *, conversation_id: str, turn_id: int) -> None:
+        super().__init__(f"conversation {conversation_id} is still answering turn {turn_id}")
+        self.conversation_id = conversation_id
+        self.turn_id = turn_id
+
 
 @dataclass
 class TurnLifecycle:
     """One bit of shared state between a producer coroutine and its handle.
 
-    Exists because of an ordering problem: ``registry.start()`` is handed an
-    already-constructed producer coroutine, so the coroutine cannot reach the
-    ``RunHandle`` that will own it. The caller creates one of these, passes it
+    Exists because of an ordering problem: ``registry.start()`` builds the
+    producer coroutine before the ``RunHandle`` that will own it exists, so the
+    coroutine cannot reach its handle. The caller creates one of these, passes it
     into the producer AND into ``start()``, and both sides then look at the
     same object — no registry lookup, which would be ambiguous (a discarded
     handle and a handle replaced by the next turn are both "not the one I
@@ -79,9 +106,29 @@ class TurnLifecycle:
     under it". Set from ``RunRegistry.discard``, which runs in a threadpool
     thread (the delete endpoint is a sync ``def``); a plain attribute write is
     safe there, unlike ``Task.cancel()``.
+
+    ``shutting_down`` means "the server is exiting, not the user's own Stop".
+    Set BEFORE the cancel, same ordering as ``discarded``: a producer's
+    ``CancelledError`` handler checks it to persist an interrupted turn.
+
+    ``stalled`` means "the UI heard nothing for its idle window and gave up",
+    not the user's own Stop. Set BEFORE the cancel, same ordering again: the
+    producer's ``CancelledError`` handler checks it to persist a stall record.
+    ``shutting_down`` and ``timed_out`` win over it.
+
+    ``saved_question`` means "this turn's question is in the conversation".
+    The producer sets it once its first unit saves the question. From then on
+    a request that reads the history counts that row, so only a request that
+    read it earlier can still name this turn's number; ``RunRegistry.start``
+    refuses that request.
     """
 
     discarded: bool = False
+    shutting_down: bool = False
+    # Watchdog expiry is an interruption, separate from deliberate user Stop.
+    timed_out: bool = False
+    saved_question: bool = False
+    stalled: bool = False
 
 
 @dataclass
@@ -112,6 +159,19 @@ class RunHandle:
     def is_running(self) -> bool:
         return not self.task.done()
 
+    @property
+    def is_answering(self) -> bool:
+        """Whether the turn can still write to its stream.
+
+        The web UI sends a queued question on its final client frame. Once
+        that frame starts writing, start() waits for the internal terminal
+        record instead of refusing the question.
+        """
+        return (
+            self.is_running and not self.buffer.is_closed
+            and not getattr(self.buffer, "is_finishing", False)
+        )
+
     async def cancel(self) -> bool:
         """Request cancellation of the producer task. Returns True if a
         cancel was issued, False if the turn had already finished.
@@ -140,8 +200,8 @@ class RunHandle:
             # is not left hanging; what is lost is whatever persist() or
             # close() was doing, which is worth a log rather than silence.
             logger.exception(
-                "[registry] producer for conversation %s raised while unwinding a cancel",
-                self.conversation_id,
+                "[registry] producer raised while unwinding a cancel",
+                extra=log_context(conversation_id=self.conversation_id),
             )
             return True
         # The task finished without surfacing the cancellation — it either
@@ -158,32 +218,75 @@ class RunRegistry:
     def __init__(self) -> None:
         self._by_cid: dict[str, RunHandle] = {}
         self._lock = asyncio.Lock()
+        self._start_locks: WeakValueDictionary[str, asyncio.Lock] = WeakValueDictionary()
 
     async def start(
         self,
         *,
         conversation_id: str,
         turn_id: int,
-        buffer: StreamBuffer,
-        producer_coro,
+        open_buffer: Callable[[], Awaitable[StreamBuffer]],
+        produce: Callable[[StreamBuffer], Coroutine[Any, Any, None]],
         org_id: str | None = None,
         user_id: str | None = None,
         lifecycle: TurnLifecycle | None = None,
     ) -> RunHandle:
-        """Spawn the producer as a detached task and register it. A
-        duplicate start for an already-in-flight conversation returns the
-        existing handle (the renderer's queue should prevent dupes)."""
+        """Open the turn's buffer, spawn ``produce(buffer)`` as a detached task
+        and register it.
+
+        Raises TurnInProgress when the conversation already has a turn
+        answering. The check runs under the lock and before ``open_buffer``:
+        a buffer is named by conversation and turn number, and two requests
+        that read the history at the same moment compute the same turn number,
+        so opening one for a refused request would write into the running
+        turn's file or stream.
+
+        Also raises TurnInProgress when the current turn has saved its
+        question and this start names that turn's number or an earlier one,
+        even if that turn has ended. Such a request read the history before
+        that question was saved: its routing gate outlasted the whole earlier
+        turn. Admitting it would truncate the earlier turn's buffer under a
+        reader still behind, and boot recovery reads a buffer's turn number as
+        its question's position in the history, which this question does not
+        hold. A start after a turn that saved nothing keeps the number.
+
+        A refused start creates no buffer and no producer coroutine. An
+        accepted one opens its buffer clear of the records of an earlier turn
+        at the same number (backend.new_buffer).
+        """
         loop = asyncio.get_running_loop()
-        async with self._lock:
+        lock = self._start_locks.get(conversation_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._start_locks[conversation_id] = lock
+        async with lock:
             existing = self._by_cid.get(conversation_id)
-            if existing is not None and existing.is_running:
+            if existing is not None and existing.is_answering:
                 logger.info(
-                    "Duplicate turn start for conversation %s; returning existing handle (turn %d).",
+                    "Refused a second turn for conversation %s; turn %d is still answering.",
                     conversation_id, existing.turn_id,
                 )
-                return existing
+                raise TurnInProgress(conversation_id=conversation_id, turn_id=existing.turn_id)
+            if (
+                existing is not None and existing.lifecycle.saved_question
+                and turn_id <= existing.turn_id
+            ):
+                logger.info(
+                    "Refused turn %d for conversation %s; it read the history before "
+                    "turn %d saved its question.",
+                    turn_id, conversation_id, existing.turn_id,
+                )
+                raise TurnInProgress(conversation_id=conversation_id, turn_id=existing.turn_id)
+            if existing is not None and existing.is_running and not existing.buffer.is_closed:
+                # A final client frame is being written. Its reader can send
+                # the next question before the separate terminal record lands.
+                # Wait rather than refuse, and keep the old terminal out of a
+                # successor's buffer when a refused turn reused its number.
+                await asyncio.shield(asyncio.gather(existing.task, return_exceptions=True))
+            buffer = await open_buffer()
+            lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
             task = asyncio.create_task(
-                self._run_bounded(producer_coro, buffer, conversation_id, turn_id),
+                self._run_bounded(produce(buffer), buffer, conversation_id, turn_id, lifecycle),
                 name=f"turn[{conversation_id}/{turn_id}]",
             )
             handle = RunHandle(
@@ -196,20 +299,22 @@ class RunRegistry:
                 user_id=user_id,
                 # The SAME object the producer coroutine closed over, so
                 # discard() can tell it to drop the turn on the floor.
-                lifecycle=lifecycle if lifecycle is not None else TurnLifecycle(),
+                lifecycle=lifecycle,
             )
             self._by_cid[conversation_id] = handle
             return handle
 
     async def _run_bounded(
         self, producer_coro, buffer: StreamBuffer, conversation_id: str, turn_id: int,
+        lifecycle: TurnLifecycle,
     ) -> None:
         """Run a producer under the idle bound (see module comment).
 
-        On reap the producer is cancelled; its CancelledError handler seals the
-        buffer with a terminal record (the user-Stop path), so the tail ends and
-        the client releases its slot. An external cancel/discard cancels this
-        wrapper and ``await task`` forwards it into the producer, so
+        On reap the producer is marked interrupted before cancellation. Its
+        CancelledError handler persists a failure and seals the buffer, so a
+        stalled answer never looks like a deliberate user Stop. An external
+        cancel/discard cancels this wrapper and ``await task`` forwards it into
+        the producer, so
         ``RunHandle.cancel``/``discard`` still work; a producer that raises on
         its own propagates unchanged.
         """
@@ -232,6 +337,7 @@ class RunRegistry:
                         last_seq, last_progress = seq, loop.time()
                     elif loop.time() - last_progress >= _MAX_TURN_IDLE_SECONDS:
                         reaped = True
+                        lifecycle.timed_out = True
                         logger.warning(
                             "Turn for conversation %s (turn %d) made no progress for %ss; "
                             "producer cancelled and its buffer sealed.",
@@ -317,6 +423,37 @@ class RunRegistry:
                 "Could not cancel the discarded producer for conversation %s",
                 conversation_id, exc_info=True,
             )
+
+    async def shutdown(self, timeout_seconds: float = TURN_SHUTDOWN_GRACE_SECONDS) -> int:
+        """Cancel every running turn so its partial answer persists instead of
+        vanishing under a SIGKILL. Marks ``shutting_down`` before cancelling,
+        same ordering rule as ``discard``. Bounded by ``timeout_seconds``;
+        a turn still unwinding past it is left for the next boot's seal.
+        """
+        handles = self.in_flight()
+        if not handles:
+            return 0
+        for handle in handles:
+            handle.lifecycle.shutting_down = True
+        for handle in handles:
+            handle.task.cancel()
+        done, pending = await asyncio.wait(
+            [h.task for h in handles], timeout=timeout_seconds
+        )
+        if pending:
+            logger.warning(
+                "%d turn(s) still unwinding past the %ss shutdown budget; "
+                "left for boot recovery to seal.", len(pending), timeout_seconds,
+            )
+        for task in done:
+            if task.cancelled():
+                continue
+            exc = task.exception()
+            if exc is not None:
+                logger.error(
+                    "Turn raised while unwinding for shutdown", exc_info=exc,
+                )
+        return len(handles)
 
     def reset(self) -> None:
         """Forget every handle without touching the producer tasks.

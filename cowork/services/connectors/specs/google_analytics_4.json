@@ -38,7 +38,7 @@
         "description": "Opens Google sign-in in your browser. No credentials required — just click Connect.",
         "recommended": true,
         "fields": [],
-        "hidden": true,
+        "hidden": false,
         "oauth": {
           "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
           "token_url": "https://oauth2.googleapis.com/token",
@@ -123,5 +123,6 @@
     ],
     "logo_url": "logos/google_analytics_4.svg"
   },
-  "logo_url": "logos/google_analytics_4.svg"
+  "logo_url": "logos/google_analytics_4.svg",
+  "featured": true
 }

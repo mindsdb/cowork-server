@@ -16,9 +16,9 @@ from cowork.services.artifact_publish_key import MAX_PUBLISH_KEY_TTL_S, PublishK
 def mint_calls(monkeypatch):
     calls = []
 
-    async def fake_mint(*, user_id, org_id, correlation_id, ttl_seconds, settings, purpose):
-        calls.append({"user_id": user_id, "org_id": org_id,
-                      "instance_id": correlation_id, "ttl_seconds": ttl_seconds, "purpose": purpose})
+    async def fake_mint(*, user_id, org_id, correlation_id, ttl_seconds, settings, purpose, workspace_id=None):
+        calls.append({"user_id": user_id, "org_id": org_id, "instance_id": correlation_id,
+                      "ttl_seconds": ttl_seconds, "purpose": purpose, "workspace_id": workspace_id})
         return "turnkey-1"
 
     monkeypatch.setattr("cowork.services.artifact_publish_key.mint_turn_key", fake_mint)
@@ -58,6 +58,20 @@ async def test_mint_carries_user_and_org_from_scope(mint_calls):
     assert mint_calls[0]["user_id"] == "u-1"
     assert mint_calls[0]["org_id"] == "o-1"
     assert mint_calls[0]["purpose"] == "artifact_publish"
+
+
+async def test_workspace_id_is_forwarded_to_the_mint(mint_calls):
+    key = PublishKey("u-1", "o-1", min_ttl_s=60, workspace_id="ws-1")
+    await key.get()
+
+    assert mint_calls[0]["workspace_id"] == "ws-1"
+
+
+async def test_no_workspace_id_omits_it_from_the_mint(mint_calls):
+    key = PublishKey("u-1", "o-1", min_ttl_s=60)
+    await key.get()
+
+    assert mint_calls[0]["workspace_id"] is None
 
 
 async def test_instance_id_is_a_fresh_uuid_not_a_turn_id(mint_calls):

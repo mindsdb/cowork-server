@@ -19,7 +19,9 @@ def validate_git_source(value: str) -> str:
     source = value.strip()
     if not source or source.startswith("-") or "\x00" in source or "\n" in source or "\r" in source:
         raise ValueError("repository URL is invalid")
-    if "::" in source:
+    # Remote helpers use a transport:: prefix. Colons inside an IPv6 HTTPS/SSH
+    # authority are not a helper invocation.
+    if re.match(r"^[A-Za-z0-9+.-]+::", source):
         raise ValueError("repository URL uses an unsupported Git transport")
 
     if source.startswith("/") or _WINDOWS_ABSOLUTE.match(source):

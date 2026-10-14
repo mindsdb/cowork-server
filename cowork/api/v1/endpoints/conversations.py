@@ -11,6 +11,7 @@ from cowork.models.project import Project
 from cowork.schemas.conversations import (
     ConversationCreateRequest,
     ConversationDeleteResponse,
+    ConversationItemsPage,
     ConversationListItem,
     ConversationListResponse,
     ConversationMessageResponse,
@@ -18,7 +19,7 @@ from cowork.schemas.conversations import (
     ConversationTurnDeleteResponse,
     ConversationUpdateRequest,
 )
-from cowork.services.conversations import ConversationService
+from cowork.services.conversations import ConversationService, InvalidPaginationParams
 from cowork.services.task_objects import TaskObjectService
 
 # AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
@@ -165,13 +166,34 @@ def move_conversation(conversation_id: UUID, body: ConversationMoveRequest, sess
 
 @router.get(
     "/{conversation_id}/items",
-    responses={status.HTTP_200_OK: {"model": list[ConversationMessageResponse]}},
+    responses={
+        status.HTTP_200_OK: {"model": list[ConversationMessageResponse] | ConversationItemsPage},
+    },
 )
-def get_messages(conversation_id: UUID, scoped: ScopedSessionDep):
+def get_messages(
+    conversation_id: UUID,
+    scoped: ScopedSessionDep,
+    limit: int | None = None,
+    before: str | None = None,
+):
+    """Omitting both `limit` and `before` returns the full, unbounded
+    history as a bare list — unchanged from before this endpoint supported
+    pagination, so an existing caller that doesn't pass either param (e.g.
+    cowork_evals, outside this repo) keeps working exactly as today. Passing
+    either opts into the cursor-paginated envelope."""
+    svc = ConversationService(scoped)
     try:
-        return ConversationService(scoped).get_messages(conversation_id)
+        if limit is None and before is None:
+            return svc.get_messages(conversation_id)
+        page_kwargs = {"before": before}
+        if limit is not None:
+            page_kwargs["limit"] = limit
+        page = svc.get_messages_page(conversation_id, **page_kwargs)
+    except InvalidPaginationParams as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    return page.model_dump(by_alias=True)
 
 
 @router.delete(
@@ -186,17 +208,23 @@ def delete_conversation(conversation_id: UUID, scoped: ScopedSessionDep):
 
 
 @router.delete(
-    "/{conversation_id}/turns/{turn_index}",
+    "/{conversation_id}/turns/{message_id}",
     responses={status.HTTP_200_OK: {"model": ConversationTurnDeleteResponse}},
 )
-def delete_conversation_turn(conversation_id: UUID, turn_index: int, scoped: ScopedSessionDep):
+def delete_conversation_turn(conversation_id: UUID, message_id: UUID, scoped: ScopedSessionDep):
     """Delete a turn (user+assistant exchange) and everything after it.
 
-    turn_index is the 0-based index counting only assistant messages.
+    message_id anchors the turn: the visible assistant message it produced,
+    or (for a turn stopped/failed before any answer) the opening user
+    message itself. A positional index doesn't survive lazy-loaded/
+    paginated history, so this took over from an earlier
+    `turn_index: int` path param — an old client still sending an int 422s
+    here, and a new client sending a UUID would have 422d against the old
+    route, so the break is fail-closed both directions.
     """
     svc = ConversationService(scoped)
     try:
-        deleted = svc.delete_turn(conversation_id, turn_index)
+        deleted = svc.delete_turn(conversation_id, message_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     return {"ok": True, "deleted": deleted}
