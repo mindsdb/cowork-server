@@ -377,3 +377,14 @@ def test_openai_compatible_api_rejects_any_other_value(monkeypatch, value):
 
     with pytest.raises(ValidationError):
         AppSettings(_env_file=None)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("1", True), (" ON ", True), ("", False), ("0", False), ("enabled", False)],
+)
+def test_usage_log_reads_its_variable_as_anton_does(monkeypatch, value, expected):
+    # A blank line in a desktop .env must not stop the server from starting.
+    monkeypatch.setenv("ANTON_USAGE_LOG", value)
+
+    assert AppSettings(_env_file=None).usage_log is expected

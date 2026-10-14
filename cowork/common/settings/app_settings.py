@@ -832,6 +832,14 @@ class AppSettings(Settings):
         description="Read delegated gate streams to their end so the call's usage is recorded.",
     )
 
+    @field_validator("usage_log", mode="before")
+    @classmethod
+    def _read_usage_log_as_anton_does(cls, v: object) -> object:
+        # anton reads any other value as off; failing startup here would split the two.
+        if isinstance(v, str):
+            return v.strip().lower() in {"1", "true", "yes", "on"}
+        return v
+
     master_key: str = Field(
         default="",
         validation_alias=AliasChoices("COWORK_MASTER_KEY"),
