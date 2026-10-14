@@ -6,24 +6,37 @@ the same request the same way, and a client can leave the mode unset.
 
 from __future__ import annotations
 
+import sys
+
 from cowork.coding.contracts import WorkspaceMode
 
-# In-place tasks need the user's own checkout, which only this computer has.
-# The mode is part of the contract already, but preparation cannot run a task
-# in place yet, so no computer offers it.
-_LOCAL_MODES: tuple[WorkspaceMode, ...] = (WorkspaceMode.worktree,)
-_RUNTIME_MODES: tuple[WorkspaceMode, ...] = (WorkspaceMode.worktree,)
+# An in-place task relies on Codex's sandbox to keep writes inside the user's
+# folder: Seatbelt on macOS and Landlock on Linux. Its Windows sandbox has not
+# been verified for a task in the user's own folder, so Windows keeps
+# worktrees until it is.
+_IN_PLACE_PLATFORMS = frozenset({"darwin", "linux"})
+# In place stays opt-in until users have tried it; a computer that offers it
+# still isolates a task that does not ask for it.
 _LOCAL_DEFAULT = WorkspaceMode.worktree
 _RUNTIME_DEFAULT = WorkspaceMode.worktree
 
 
-def supported_workspace_modes(*, runs_locally: bool, org_mode: bool) -> tuple[WorkspaceMode, ...]:
-    """Modes the computer running a task can prepare.
+def supported_workspace_modes(
+    *,
+    runs_locally: bool,
+    org_mode: bool,
+    project_task: bool = False,
+    platform: str | None = None,
+) -> tuple[WorkspaceMode, ...]:
+    """Modes the computer running a task can prepare for it.
 
     A web runtime computer has no user checkout to work in, and on a local
-    computer org mode refuses local workspaces altogether.
+    computer org mode refuses local workspaces altogether. Code Project tasks
+    are always isolated for now.
     """
-    return _LOCAL_MODES if runs_locally and not org_mode else _RUNTIME_MODES
+    if runs_locally and not org_mode and not project_task and (platform or sys.platform) in _IN_PLACE_PLATFORMS:
+        return (WorkspaceMode.worktree, WorkspaceMode.in_place)
+    return (WorkspaceMode.worktree,)
 
 
 def resolve_workspace_mode(
@@ -32,6 +45,8 @@ def resolve_workspace_mode(
     *,
     runs_locally: bool,
     org_mode: bool,
+    project_task: bool = False,
+    platform: str | None = None,
 ) -> WorkspaceMode:
     """Return the mode for a new task.
 
@@ -39,19 +54,25 @@ def resolve_workspace_mode(
     preference, so a computer that cannot honour it falls back to its own
     default.
     """
-    supported = supported_workspace_modes(runs_locally=runs_locally, org_mode=org_mode)
+    supported = supported_workspace_modes(
+        runs_locally=runs_locally, org_mode=org_mode, project_task=project_task, platform=platform,
+    )
     if requested is not None:
         if requested not in supported:
-            raise ValueError(_unsupported_message(requested, runs_locally=runs_locally, org_mode=org_mode))
+            raise ValueError(_unsupported_message(
+                requested, runs_locally=runs_locally, org_mode=org_mode, project_task=project_task,
+            ))
         return requested
     if project_default is not None and project_default in supported:
         return project_default
     return _LOCAL_DEFAULT if runs_locally and not org_mode else _RUNTIME_DEFAULT
 
 
-def _unsupported_message(mode: WorkspaceMode, *, runs_locally: bool, org_mode: bool) -> str:
+def _unsupported_message(mode: WorkspaceMode, *, runs_locally: bool, org_mode: bool, project_task: bool) -> str:
     if mode == WorkspaceMode.in_place:
         if org_mode or not runs_locally:
             return "Tasks on another computer run in an isolated worktree; choose Worktree"
-        return "Running a task in the original folder is not available yet; choose Worktree"
+        if project_task:
+            return "Code Project tasks cannot run in their original folders yet; choose Worktree"
+        return "Running a task in the original folder is not available on this platform yet; choose Worktree"
     return f"This computer cannot prepare a {mode.value} workspace"
