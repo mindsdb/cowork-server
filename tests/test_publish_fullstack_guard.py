@@ -97,6 +97,8 @@ def publisher(monkeypatch):
     [
         "https://4nton.ai",
         "https://4nton.ai/",
+        "https://4nton.ai.",
+        "https://view.mindshub.ai",
         "https://api.staging.mindshub.ai",
         "https://api-ns1.dev.mindshub.ai",
         "https://api.mindshub.ai",
@@ -113,6 +115,7 @@ def test_mindshub_publish_hosts_are_recognised(url):
         "https://publish.customer.example",
         # A lookalike that only starts with our host must not pass.
         "https://4nton.ai.customer.example",
+        "https://cw-abc.4nton.ai",
         "https://mindshub.ai.customer.example",
         "",
         None,
