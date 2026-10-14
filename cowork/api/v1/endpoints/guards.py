@@ -21,6 +21,17 @@ def _trusted_loopback_host(value: str) -> bool:
         return False
 
 
+def _is_loopback_address(host: str | None) -> bool:
+    """Whether an address literal names the loopback interface."""
+    value = (host or "").strip().strip("[]").casefold()
+    if value in _TRUSTED_LOOPBACK_HOSTS:
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
 def require_local(request: Request) -> None:
     """Reject the request unless it originates from loopback.
 
@@ -34,6 +45,12 @@ def require_local(request: Request) -> None:
     """
     client = request.client.host if request.client else ""
     if client not in {"127.0.0.1", "::1"}:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="local requests only")
+
+    # The client address follows X-Forwarded-For wherever uvicorn trusts it
+    # (any peer in the Docker image), so the accepted socket must be loopback too.
+    server = request.scope.get("server") or ()
+    if not _is_loopback_address(server[0] if server else None):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="local requests only")
 
     # A loopback TCP peer is not sufficient in a browser: DNS rebinding can
