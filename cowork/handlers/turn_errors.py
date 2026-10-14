@@ -1694,7 +1694,8 @@ def response_failed_payload(
     every remote-backend and in-process failure regardless of code, including
     the fully generic ``anton_error`` bucket, so a user report of "An
     unexpected error occurred" can still be pinned to this turn's server-side
-    logs. The direct and channel producers have none to offer and omit it.
+    logs. Every producer that builds this payload sets one. Boot recovery,
+    which seals a turn a restart killed, has none to offer and omits it.
 
     ``assistant_message_id`` is the persisted assistant Message's
     id when the failed turn still produced one (e.g. partial text before an

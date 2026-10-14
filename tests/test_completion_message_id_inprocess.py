@@ -211,6 +211,7 @@ async def _run_direct(*, assistant_message_id, route_text="ok", user_message_id=
             original_content="hi",
             route=route,
             buffer=buffer,
+            request_id="direct-test",
         )
     return buffer
 
