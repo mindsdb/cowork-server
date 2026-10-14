@@ -87,6 +87,60 @@ async def test_every_write_refreshes_the_ttl(fake_redis):
 
 
 @pytest.mark.asyncio
+async def test_each_write_is_one_transaction(fake_redis, monkeypatch):
+    """A frame's write and its TTL refresh go in one MULTI round trip, never
+    as separate calls on the client."""
+    opened = []
+    pipeline = fake_redis.pipeline
+
+    def recorded_pipeline(transaction=True, shard_hint=None):
+        opened.append(transaction)
+        return pipeline(transaction=transaction, shard_hint=shard_hint)
+
+    async def bare(*_args, **_kwargs):
+        raise AssertionError("a buffer write must not call the client directly")
+
+    monkeypatch.setattr(fake_redis, "pipeline", recorded_pipeline)
+    monkeypatch.setattr(fake_redis, "xadd", bare)
+    monkeypatch.setattr(fake_redis, "expire", bare)
+    buf = RedisStreamBuffer(conversation_id="c1", turn_id=1)
+
+    await buf.append("Delta", {"text": "a"})
+    await buf.close("completed")
+
+    assert opened == [True, True]
+    entries = await fake_redis.xrange(stream_key("c1", 1))
+    assert [fields["type"] for _id, fields in entries] == ["Delta", "Done"]
+    assert 0 < await fake_redis.ttl(stream_key("c1", 1)) <= REDIS_BUFFER_TTL_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_a_failed_terminal_write_raises_and_leaves_the_buffer_open(fake_redis, monkeypatch):
+    """The seal backstop trusts is_closed as proof a terminal exists, so a
+    Redis error on the terminal write must reach close()'s caller."""
+    import redis.exceptions
+
+    pipeline = fake_redis.pipeline
+
+    def failing_pipeline(transaction=True, shard_hint=None):
+        pipe = pipeline(transaction=transaction, shard_hint=shard_hint)
+
+        async def lost(*_args, **_kwargs):
+            raise redis.exceptions.ConnectionError("connection lost")
+
+        pipe.execute = lost
+        return pipe
+
+    buf = RedisStreamBuffer(conversation_id="c1", turn_id=1)
+    await buf.append("Delta", {"text": "a"})
+    monkeypatch.setattr(fake_redis, "pipeline", failing_pipeline)
+
+    with pytest.raises(redis.exceptions.ConnectionError):
+        await buf.close("completed")
+    assert buf.is_closed is False
+
+
+@pytest.mark.asyncio
 async def test_tail_replays_then_stops_at_the_terminal(fake_redis):
     writer = RedisStreamBuffer(conversation_id="c2", turn_id=1)
     await writer.append("Delta", {"text": "a"})

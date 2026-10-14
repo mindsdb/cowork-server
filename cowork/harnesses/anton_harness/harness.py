@@ -1,24 +1,37 @@
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from functools import partial
 import inspect
 import os
 from pathlib import Path
 import shutil
 import tempfile
+from typing import TYPE_CHECKING
+from uuid import UUID
+
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.build_info import account_kwargs, supported_kwargs, surface_kwarg
 from cowork.common.chat_session import build_chat_session, close_session_scratchpads
 from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
-from cowork.common.logger import get_logger
+from cowork.common.logger import get_logger, log_context
 from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.user_settings import current_settings_scope
+from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
+from cowork.db.units import run_db, run_to_completion, unit_session
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
-from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
+from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REPLAY_ROLES, extract_scratchpad_cells
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
 from cowork.services.projects import display_label
+from cowork.streaming.liveness import ModelWaitTicker
+
+if TYPE_CHECKING:
+    from cowork.services.conversations import ReplayHistory
 
 
 logger = get_logger(__name__)
@@ -259,10 +272,11 @@ def _turn_style_context(channel: ChannelContext | None) -> str:
     if channel is None:
         return (
             "The Anton CoWork desktop UI displays progress, tool usage, and actions "
-            "as separate structured activity rows. Keep assistant text focused on the "
-            "user-facing answer; do not narrate internal work with status phrases like "
-            "\"I'll check\", \"let me query\", or \"I have access\" unless that wording "
-            "is itself the final answer the user needs. "
+            "as separate structured activity rows, so do not narrate each step "
+            "(\"let me check\", \"now I'll query\"). When a request needs tool work, "
+            "open your reply with one short sentence telling the user what you are "
+            "about to do; after that, keep assistant text focused on the user-facing "
+            "answer. "
             "Files you create as artifacts appear automatically in the Live Artifacts "
             "panel beside the chat, where the user previews them and uses the Download "
             "control (and Open, on desktop). When a file is ready, tell the user it is "
@@ -328,7 +342,86 @@ _ATTACHMENT_AFFORDANCE = (
 )
 
 
-def _conversation_attachment_context(conversation) -> str:
+def _units_scope() -> TenantScope:
+    """The scope a turn's own database units run under: the one its settings
+    resolve against (use_settings_scope). stream_response runs only in local
+    mode, where an unbound scope is LOCAL_SCOPE, as get_user_settings has it."""
+    return current_settings_scope() or LOCAL_SCOPE
+
+
+@dataclass(frozen=True)
+class _AttachedFile:
+    """An attachment's stored path and file name, as a database unit read them."""
+
+    path: str
+    filename: str
+
+
+def _attached_files(session: ScopedSession, *, conversation_id: UUID) -> list[_AttachedFile]:
+    from cowork.services.files import FileService, attachment_purpose
+
+    rows = FileService(session).list_file_rows(purpose=attachment_purpose(str(conversation_id)))
+    return [_AttachedFile(path=row.path or "", filename=row.filename) for row in rows]
+
+
+def _replay_history(session: ScopedSession, *, conversation_id: UUID) -> "ReplayHistory":
+    from cowork.services.conversations import ConversationService
+
+    return ConversationService(session).get_replay_history(
+        conversation_id, event_roles=SCRATCHPAD_REPLAY_ROLES,
+    )
+
+
+def _archived_messages(session: ScopedSession, *, conversation_id: UUID) -> list[dict]:
+    from cowork.services.conversations import ConversationService
+
+    return ConversationService(session).archived_messages(conversation_id)
+
+
+async def _read_attachments(conversation, *, scope: TenantScope | None) -> list[_AttachedFile] | None:
+    """The conversation's attachments, read in a database unit, or None when
+    they could not be looked up.
+
+    ``scope`` is the turn's bound scope (use_settings_scope), never one derived
+    from the row. No scope in org mode is an invariant violation, and so is a
+    conversation of another org: both log and list nothing. A failed read logs
+    too. A wait for a connection that runs out is the turn's failure, not a
+    missing listing, so it propagates.
+    """
+    try:
+        if scope is None:
+            if get_app_settings().tenancy_mode == "org":
+                logger.warning(
+                    "attachments: no tenant scope is bound in org mode; "
+                    "listing skipped (conversation %s)", conversation.id,
+                )
+                return None
+            scope = LOCAL_SCOPE
+        if scope.org_mode and conversation.org_id != scope.org_id:
+            logger.warning(
+                "attachments: conversation %s org %r does not match scope org %r — listing skipped",
+                conversation.id, conversation.org_id, scope.org_id,
+            )
+            return None
+        return await run_db(partial(_attached_files, conversation_id=conversation.id), scope=scope)
+    except PoolTimeoutError:
+        raise
+    except Exception:
+        # Never crash a turn over attachment context — but don't fail
+        # silently either. A swallowed error here is indistinguishable from
+        # "no attachments", which is exactly how the agent ends up telling
+        # the user no files were uploaded (the Cyberdeck bug this helper
+        # exists to fix). Log it so the failure is diagnosable.
+        logger.warning(
+            "Failed to build conversation attachment context; "
+            "the agent will not see attached files this turn",
+            exc_info=True,
+            extra=log_context(conversation_id=getattr(conversation, "id", None)),
+        )
+        return None
+
+
+async def _conversation_attachment_context(conversation, *, scope: TenantScope | None) -> str:
     """Prompt fragment telling the agent which files are attached to this
     conversation, and how the user can attach more.
 
@@ -344,94 +437,45 @@ def _conversation_attachment_context(conversation) -> str:
 
     * **Known-empty** (no rows, or none still on disk) — say so, and name
       attachment as the remedy.
-    * **Unknown** (detached session, no tenant scope, org mismatch, or a
-      swallowed exception) — emit the affordance ALONE. Asserting "no files
-      are attached" here would turn a failure to look into a confident false
-      negative, which is the Cyberdeck bug in the other direction: the user
-      attached a file and the agent flatly denies it exists.
+    * **Unknown** (no tenant scope in org mode, org mismatch, or a failed
+      read; see _read_attachments): emit the affordance ALONE. Asserting
+      "no files are attached" here would turn a failure to look into a
+      confident false negative, which is the Cyberdeck bug in the other
+      direction: the user attached a file and the agent flatly denies it
+      exists.
     """
-    try:
-        from sqlalchemy.orm import object_session
-        from cowork.common.settings.app_settings import get_app_settings
-        from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, scope_of_session
-        from cowork.services.files import FileService, attachment_purpose
-
-        db_session = object_session(conversation)
-        if db_session is None:
-            return _ATTACHMENT_AFFORDANCE
-        # Re-wrap with the ORIGINAL scope the conversation was loaded under —
-        # never derived from the row itself. No recorded scope in org mode is
-        # an invariant violation: log it and list nothing.
-        scope = scope_of_session(db_session)
-        if scope is None:
-            if get_app_settings().tenancy_mode == "org":
-                logger.warning(
-                    "attachments: session carries no tenant scope in org mode — "
-                    "listing skipped (conversation %s)", conversation.id,
-                )
-                return _ATTACHMENT_AFFORDANCE
-            scope = LOCAL_SCOPE
-        if scope.org_mode and conversation.org_id != scope.org_id:
-            logger.warning(
-                "attachments: conversation %s org %r does not match scope org %r — listing skipped",
-                conversation.id, conversation.org_id, scope.org_id,
-            )
-            return _ATTACHMENT_AFFORDANCE
-        rows = FileService(ScopedSession(db_session, scope)).list_file_rows(
-            purpose=attachment_purpose(str(conversation.id))
-        )
-        # Only list files that still exist on disk — a row whose file was
-        # deleted would otherwise hand the agent a dead path to chase.
-        # Resolve one row at a time: a single bad row (e.g. a path the OS
-        # rejects) must not abort the whole list and hide every OTHER
-        # attachment — skip the bad one and keep going.
-        attached: list[str] = []
-        for r in rows:
-            try:
-                path = getattr(r, "path", "")
-                if path and Path(path).exists():
-                    attached.append(f"  - {r.path}  ({r.filename})")
-            except Exception:
-                logger.warning(
-                    "Skipping unresolvable attachment row (file id=%s) while "
-                    "building context for conversation %s",
-                    getattr(r, "id", "<unknown>"),
-                    getattr(conversation, "id", "<unknown>"),
-                    exc_info=True,
-                )
-        if not attached:
-            return (
-                " No files are currently attached to this conversation."
-                + _ATTACHMENT_AFFORDANCE
-            )
-        return (
-            " The user has attached the following files to THIS conversation. "
-            "They live OUTSIDE the project directory, so a project-only scan will "
-            "miss them — read them directly from these absolute paths whenever the "
-            "user refers to uploaded or reference materials, and never report them "
-            "missing just because they aren't in the project folder:\n"
-            + "\n".join(attached)
-        )
-    except Exception:
-        # Never crash a turn over attachment context — but don't fail
-        # silently either. A swallowed error here is indistinguishable from
-        # "no attachments", which is exactly how the agent ends up telling
-        # the user no files were uploaded (the Cyberdeck bug this helper
-        # exists to fix). Log it so the failure is diagnosable; the agent
-        # still degrades gracefully to "".
-        try:
-            # A broken session state can make even attribute access raise —
-            # the log line must never re-crash the handler it protects.
-            conv_id = getattr(conversation, "id", "<unknown>")
-        except Exception:
-            conv_id = "<unknown>"
-        logger.warning(
-            "Failed to build conversation attachment context for conversation %s; "
-            "the agent will not see attached files this turn",
-            conv_id,
-            exc_info=True,
-        )
+    rows = await _read_attachments(conversation, scope=scope)
+    if rows is None:
         return _ATTACHMENT_AFFORDANCE
+    # Only list files that still exist on disk — a row whose file was
+    # deleted would otherwise hand the agent a dead path to chase.
+    # Resolve one row at a time: a single bad row (e.g. a path the OS
+    # rejects) must not abort the whole list and hide every OTHER
+    # attachment — skip the bad one and keep going.
+    attached: list[str] = []
+    for row in rows:
+        try:
+            if row.path and Path(row.path).exists():
+                attached.append(f"  - {row.path}  ({row.filename})")
+        except Exception:
+            logger.warning(
+                "Skipping unresolvable attachment %r while building context for conversation %s",
+                row.filename, getattr(conversation, "id", "<unknown>"),
+                exc_info=True,
+            )
+    if not attached:
+        return (
+            " No files are currently attached to this conversation."
+            + _ATTACHMENT_AFFORDANCE
+        )
+    return (
+        " The user has attached the following files to THIS conversation. "
+        "They live OUTSIDE the project directory, so a project-only scan will "
+        "miss them — read them directly from these absolute paths whenever the "
+        "user refers to uploaded or reference materials, and never report them "
+        "missing just because they aren't in the project folder:\n"
+        + "\n".join(attached)
+    )
 
 
 @register
@@ -460,6 +504,9 @@ class AntonHarness:
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
         channel_context: ChannelContext | None = None,
+        tool_messages: bool = False,
+        # Keeps the turn alive while a model call is quiet (see HarnessProvider).
+        model_wait: ModelWaitTicker | None = None,
     ) -> AsyncIterator[str]:
         if get_app_settings().tenancy_mode == "org":
             # Org-mode turns must run on the remote worker, never in this
@@ -492,7 +539,8 @@ class AntonHarness:
         # still taken, to tell CREATED from EDITED within that set.
         from cowork.services.task_objects import (
             finalize_turn_skill_drafts,
-            index_turn_artifacts,
+            record_new_artifacts,
+            turn_artifact_changes,
             publish_and_card_turn_artifacts,
             snapshot_artifact_state,
             snapshot_skill_drafts,
@@ -507,13 +555,14 @@ class AntonHarness:
         # end-of-turn finally must not depend on the session still being live.
         conv_id = conversation.id
         conv_project_id = conversation.project_id
-        # Same reason: the card carries the project name to the client, and reading
-        # the relation after the turn could hit an expired session.
-        # The artifact card's label, sent beside project_id which carries the
-        # identity - so this is a display value (ENG-1676).
+        # Same reason: reading the relation after the turn could hit an expired
+        # session, so both of the card's project values are read now. The label
+        # is what the card shows, beside project_id which carries the identity
+        # (ENG-1676). The name addresses the card's serve URL, because
+        # serve_artifact_file (GET /api/v1/artifacts/serve/{project_name}/...)
+        # resolves that segment by name, through
+        # services.artifacts._project_artifacts_base.
         conv_project_label = display_label(conversation.project)
-        # The serve route resolves the project by this name, so the card's
-        # serve URL carries it and never the label.
         conv_project_name = conversation.project.name
         # Skill drafts surface as cards (never auto-saved). Anton has no
         # skill-draft tool (it runs anton-core's own registry), so routing is
@@ -530,6 +579,54 @@ class AntonHarness:
         turn_rows: list[dict] | None = None
         session = None
         seed_info: dict | None = None
+
+        async def record_turn_cleanup():
+            nonlocal new_slugs, touched_slugs, turn_scope, skill_drafts
+            if session is not None and seed_info is not None and getattr(session, "last_compaction", None) is not None:
+                # Best-effort: a missing compaction does not lose the answer.
+                try:
+                    await run_db(
+                        lambda db: self._persist_history_compaction(
+                            conversation, session, seed_info, database_session=db,
+                        ),
+                        scope=_units_scope(),
+                    )
+                except Exception:
+                    logger.exception(
+                        "[anton_harness] failed to persist history compaction",
+                        extra=log_context(conversation_id=conv_id),
+                    )
+            try:
+                changes = turn_artifact_changes(
+                    conversation_id=conv_id,
+                    artifacts_base=artifacts_base,
+                    before=before_slugs,
+                    before_mtimes=before_mtimes,
+                    tracked_new=getattr(session, "artifacts_touched", None),
+                    tracked_edits=getattr(session, "artifacts_touched", None),
+                )
+                new_slugs, touched_slugs, turn_scope = changes.created, changes.touched, _units_scope()
+                if new_slugs:
+                    await run_db(
+                        partial(
+                            record_new_artifacts,
+                            conversation_id=conv_id,
+                            project_id=conv_project_id,
+                            slugs=new_slugs,
+                            creator=getattr(conversation, "created_by", None),
+                        ),
+                        scope=turn_scope,
+                    )
+            except Exception:
+                logger.warning(
+                    "Could not index artifacts created this turn",
+                    exc_info=True,
+                    extra=log_context(
+                        conversation_id=conv_id, project_id=conv_project_id, artifact_slugs=new_slugs or None,
+                    ),
+                )
+            skill_drafts = finalize_turn_skill_drafts(project_path, before_drafts, before_strays)
+
         try:
             session, temp_vault_dir, seed_info = await self._build_chat_session(
                 conversation,
@@ -537,7 +634,10 @@ class AntonHarness:
                 reasoning_effort=reasoning_effort,
                 disabled_connections=disabled_connections or [],
                 channel_context=channel_context,
+                tool_messages=tool_messages,
             )
+            if model_wait is not None:
+                model_wait.attach(session=session)
             # Length of the seeded history — everything anton appends past this
             # index is this turn's block-messages (tool_use / tool_result / text).
             # Guarded: an anton build (or test double) without `.history` simply
@@ -579,41 +679,17 @@ class AntonHarness:
                     turn_slice = turn_slice[1:]
                 turn_rows = _split_turn_into_rows(turn_slice) or None
         finally:
+            if model_wait is not None:
+                model_wait.detach()
             if temp_vault_dir:
                 shutil.rmtree(temp_vault_dir, ignore_errors=True)
             if session is not None:
                 # Before the steps below, so none of them raising can skip it.
                 # Scheduled rather than awaited; see close_session_scratchpads.
                 close_session_scratchpads(session, owner=f"conversation {conv_id}")
-            if session is not None and seed_info is not None:
-                # Best-effort — must never mask the turn's real outcome.
-                try:
-                    self._persist_history_compaction(conversation, session, seed_info)
-                except Exception:
-                    logger.exception(
-                        "[anton_harness] failed to persist history compaction for conversation %s",
-                        conv_id,
-                    )
-            # One dir diff → index the new artifacts and work out what this turn
-            # touched. Runs on every exit (success, error, cancel), so an artifact
-            # is always indexed. Synchronous by design: an `await` here would be
-            # skipped on cancellation, so anything awaited would silently not run.
-            new_slugs, touched_slugs, turn_scope = index_turn_artifacts(
-                conversation, conv_id, conv_project_id, artifacts_base,
-                before_slugs, before_mtimes,
-                # Anton reports both: `create_artifact` and `open_artifact`
-                # (the only way to get a path to write into) both record, so
-                # the same set bounds created AND edited. Read defensively —
-                # on an early failure `session` is None, and an anton build
-                # predating the field has no `artifacts_touched`; both degrade
-                # to the pre-existing diff-only behaviour rather than dropping
-                # the turn's cards entirely.
-                tracked_new=getattr(session, "artifacts_touched", None),
-                tracked_edits=getattr(session, "artifacts_touched", None),
-            )
-            skill_drafts = finalize_turn_skill_drafts(
-                project_path, before_drafts, before_strays,
-            )
+            # Every exit records its artifacts. Repeated Stop/shutdown cancels
+            # wait for this step, while each database wait runs off the loop.
+            await run_to_completion(record_turn_cleanup())
         # Autopublish and cards live in the normal-completion path, matching what
         # cards already did: on Stop/cancel neither runs, and the next turn in this
         # project heals it (if there is one — an abandoned conversation never does).
@@ -724,12 +800,10 @@ class AntonHarness:
         """The archive-search tool for this turn, or None when there is nothing
         to search (ENG-735).
 
-        Withheld in three cases:
+        Withheld in two cases:
         - no summary saved yet — the whole history is still replayed, so the
           tool's description and prompt would be dead prompt weight
         - compaction switched off — nothing will ever be archived
-        - the conversation is detached from its DB session, so the archive
-          cannot be read at all
 
         The DB stays on this side of the boundary: the tool receives a callable
         that returns the archive, so its handler holds no session and the
@@ -740,22 +814,18 @@ class AntonHarness:
         if not conversation.history_summary_cutoff_id:
             return None
 
-        from sqlalchemy.orm import object_session
-
-        from cowork.db.scoped import adopt_scoped_session
-        from cowork.services.conversations import ConversationService
-
         from .tools import build_cowork_recall_history_tool
 
-        db_session = object_session(conversation)
-        if db_session is None:
-            return None
+        conversation_id = conversation.id
+        scope = _units_scope()
+
         # Read per call, not here: most turns never call the tool, and the
-        # archive only changes when a compaction lands at turn end.
-        service = ConversationService(adopt_scoped_session(db_session))
-        return build_cowork_recall_history_tool(
-            lambda: service.archived_messages(conversation.id)
-        )
+        # archive only changes when a compaction lands at turn end. Each call
+        # is its own unit, so no connection is held while the agent works.
+        async def load_archive() -> list[dict]:
+            return await run_db(partial(_archived_messages, conversation_id=conversation_id), scope=scope)
+
+        return build_cowork_recall_history_tool(load_archive)
 
     @staticmethod
     def compaction_cutoff_index(seed_info: dict, covered_through: int, total: int) -> int | None:
@@ -778,7 +848,10 @@ class AntonHarness:
         return idx if 0 <= idx < total else None
 
     @staticmethod
-    def _persist_history_compaction(conversation: Conversation, session, seed_info: dict) -> None:
+    def _persist_history_compaction(
+        conversation: Conversation, session, seed_info: dict,
+        *, database_session: ScopedSession | None = None,
+    ) -> None:
         """Save anton's compacted summary + cutoff if it compacted this turn.
 
         `getattr` (not `session.last_compaction` directly): an anton build
@@ -794,16 +867,17 @@ class AntonHarness:
         )
         if idx is None:
             return
-        from sqlalchemy.orm import object_session
-        from cowork.db.scoped import adopt_scoped_session
         from cowork.services.conversations import ConversationService
 
-        db_session = object_session(conversation)
-        if db_session is None:
+        if database_session is not None:
+            ConversationService(database_session).update_history_compaction(
+                conversation.id, compaction["summary"], ordered_messages[idx].id,
+            )
             return
-        ConversationService(adopt_scoped_session(db_session)).update_history_compaction(
-            conversation.id, compaction["summary"], ordered_messages[idx].id,
-        )
+        with unit_session(scope=_units_scope()) as session:
+            ConversationService(session).update_history_compaction(
+                conversation.id, compaction["summary"], ordered_messages[idx].id,
+            )
 
     @staticmethod
     def _to_anton_input(input_blocks: list[dict]) -> str | list[dict]:
@@ -829,6 +903,7 @@ class AntonHarness:
         reasoning_effort: str | None = None,
         disabled_connections: list[dict] | None = None,
         channel_context: ChannelContext | None = None,
+        tool_messages: bool = False,
     ):
         """Build the same core runtime the Anton CLI uses, scoped to one project."""
         from anton.chat_session import build_runtime_context
@@ -979,11 +1054,26 @@ class AntonHarness:
         # history_store = HistoryStore(episodes_dir)
         # initial_history = history_store.load(conversation_id)
 
+        # What the conversation has stored, each read in a database unit of its
+        # own, before anything below opens a connector: no pooled connection is
+        # held past these reads, and the conversation may be detached.
+        #
         # Conversation-attached uploads land in the files dir
         # (.cowork/files/<uuid>/<name>), OUTSIDE the project directory — so
         # the agent must be told their exact paths or it scans only the
         # project root and wrongly reports "no files uploaded" (Cyberdeck bug).
-        attachment_context = _conversation_attachment_context(conversation)
+        attachment_context = await _conversation_attachment_context(
+            conversation, scope=current_settings_scope(),
+        )
+        # Canonical order (ConversationService._MESSAGE_ORDER: seq, role, id);
+        # the bare `conversation.messages` relationship is unordered and would
+        # scramble a turn's tool_use/tool_result block-rows. The same unit
+        # reads the stored scratchpad events the cells below are rebuilt from,
+        # and only those.
+        history = await run_db(
+            partial(_replay_history, conversation_id=conversation.id), scope=_units_scope(),
+        )
+        ordered_messages = history.messages
 
         project_context = (
             # Conversational only. The next line hands the agent the real path,
@@ -1150,27 +1240,7 @@ class AntonHarness:
                         "surfaces every file this app can legitimately see, Shared Drive items included."
                     )
 
-            # Canonical order (ConversationService._MESSAGE_ORDER: seq, role, id);
-            # the bare `conversation.messages`
-            # relationship is unordered and would scramble a turn's tool_use/tool_result
-            # block-rows. Ordering needs the DB session, so the conversation must be
-            # attached — callers always pass an attached instance; fail fast rather
-            # than silently fall back to a scrambled, replay-breaking history.
-            from sqlalchemy.orm import object_session
-            from cowork.db.scoped import adopt_scoped_session
-            from cowork.services.conversations import ConversationService
-
-            db_session = object_session(conversation)
-            if db_session is None:
-                raise RuntimeError(
-                    f"Conversation {conversation.id} is detached from its Session; "
-                    "cannot resolve ordered history for replay."
-                )
-            ordered_messages = ConversationService(
-                adopt_scoped_session(db_session)
-            ).get_ordered_messages(conversation.id)
-
-            cells = extract_scratchpad_cells_from_message_events(ordered_messages)
+            cells = extract_scratchpad_cells(history.events)
             os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
 
             replayable = [m for m in ordered_messages if m.role in {"user", "assistant"}]
@@ -1224,6 +1294,13 @@ class AntonHarness:
                 # MindsHub JWT only; {} when there is none or the pinned anton
                 # predates the fields.
                 **account_kwargs(ChatSessionConfig),
+                # This harness rebuilds the session every message, so the verifier
+                # latch has to outlive it or a persistent failure diagnoses each time.
+                **supported_kwargs(ChatSessionConfig, shared_verifier_latch=True),
+                # Whether the client renders a tool's message to the user (the
+                # brief when the agent acts first); without it the tool hands
+                # the content to the agent. Dropped by an anton without the field.
+                **supported_kwargs(ChatSessionConfig, tool_messages=tool_messages),
                 proactive_dashboards=anton_settings.proactive_dashboards,
                 act_first=anton_settings.act_first,
                 # Hosted web search stays off when COWORK_OPENAI_COMPATIBLE_API
@@ -1269,8 +1346,8 @@ class AntonHarness:
             # so a failure ANYWHERE below MCP discovery — not just
             # build_chat_session's own construction — would otherwise leak
             # every MCP transport this turn opened (found in review: the
-            # original narrower try/except here missed object_session()/
-            # _seed_history() raising before build_chat_session is ever called).
+            # original narrower try/except here missed _seed_history() raising
+            # before build_chat_session is ever called).
             # A non-empty mcp_sessions implies mcp_wiring resolved above, so
             # no second import and no second capability check is needed here.
             if mcp_sessions:

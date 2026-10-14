@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.datastructures import MutableHeaders
 
 from cowork.api.v1.route_walker import contradictory_routes, route_key, undeclared_routes
@@ -20,8 +21,12 @@ from starlette.responses import JSONResponse
 from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token, sync_auth_token
 from cowork.coding.inference_proxy import INFERENCE_PATHS
 from cowork.db.scoped import MissingTenantScopeError
+from cowork.db.units import DatabaseBusy, busy_retry_seconds
+from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
 from cowork.principal import TrustedHeaderMiddleware
-from cowork.common.logger import setup_logging
+from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
+from cowork.streaming import TurnInProgress
+from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.dev_setup import run_dev_setup
@@ -116,9 +121,33 @@ async def _run_artifact_owner_backfill() -> None:
         logger.exception("artifact owner backfill failed (non-fatal)")
 
 
+# Imported lazily by the first agent turn otherwise, adding their import time to
+# that turn's time to first text.
+AGENT_RUNTIME_MODULES = (
+    "anton.core.llm.openai",
+    "anton.core.llm.anthropic",
+    "anton.minds_client",
+    "anton.core.session",
+    "anton.core.tools.tool_handlers",
+)
+
+
+def _warm_agent_runtime() -> None:
+    """Import the agent runtime at startup. A module that fails is left for the turn."""
+    import importlib
+
+    for name in AGENT_RUNTIME_MODULES:
+        try:
+            importlib.import_module(name)
+        except Exception:
+            logger.debug("agent runtime warm-up skipped %s", name, exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_dev_setup()
+    # Before the server reports ready, so the first turn does not pay for imports.
+    await asyncio.to_thread(_warm_agent_runtime)
     # History recovery also retries buffers sealed by an earlier failed sweep.
     try:
         from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
@@ -230,6 +259,30 @@ async def lifespan(app: FastAPI):
         await close_inference_client()
 
 
+@asynccontextmanager
+async def _lifespan_without_database_text(app: FastAPI):
+    """Run ``lifespan``, keeping a database error's text out of Uvicorn's log.
+
+    Starlette hands a failed startup or shutdown to Uvicorn as
+    ``traceback.format_exc()`` text, and Uvicorn logs that text as a plain
+    message, which no exception filter can read. A migration, the seed rows,
+    or a reboot that starts Cowork before Postgres would print SQL and driver
+    detail on every restart. The owned handlers log the error instead, as its
+    type, SQLSTATE and the cowork frame it failed in, and Uvicorn gets an
+    error that carries no database text.
+    """
+    phase = "startup"
+    try:
+        async with lifespan(app):
+            phase = "shutdown"
+            yield
+    except Exception as exc:
+        if find_database_error(exc=exc) is None:
+            raise
+        logger.error("Server %s failed", phase, exc_info=True, extra=relayed_error())
+        raise RuntimeError(f"Database operation failed during server {phase}") from None
+
+
 class _NoStoreMiddleware:
     """Stamp ``Cache-Control: no-store`` on responses under the given path
     prefixes so API keys those responses carry are never written to a client's
@@ -270,7 +323,7 @@ def create_app() -> FastAPI:
         title="Cowork API",
         description="Cowork server — OpenAI-compatible Responses API with pluggable harness backends",
         version="1.0.0",
-        lifespan=lifespan,
+        lifespan=_lifespan_without_database_text,
     )
 
     # Org-scoped data touched without an org in scope (e.g. audit mode with no
@@ -278,6 +331,28 @@ def create_app() -> FastAPI:
     @app.exception_handler(MissingTenantScopeError)
     async def _missing_tenant_scope(request, exc):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+
+    # No database connection freed within POOL_TIMEOUT. DatabaseBusy, a unit
+    # that waited for its slot or its connection, subclasses the pool timeout,
+    # so this answers both. The web UI waits for Retry-After before it offers
+    # a retry, and the sentence names the wait for clients that don't read it.
+    @app.exception_handler(PoolTimeoutError)
+    async def _database_busy(request, exc):
+        retry_after = busy_retry_seconds()
+        logger.warning(
+            "%s %s refused with 503: no database connection freed in time",
+            request.method, request.url.path,
+        )
+        return JSONResponse(
+            Refusal(detail=server_busy_message(retry_after), code=SERVER_BUSY_CODE).model_dump(),
+            status_code=DatabaseBusy.status_code,
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    # A second question into a conversation whose turn is still answering.
+    @app.exception_handler(TurnInProgress)
+    async def _turn_in_progress(request, exc):
+        return JSONResponse(TURN_IN_PROGRESS.model_dump(), status_code=exc.status_code)
 
     # Bearer-token auth. On by default in local mode (see AppSettings.
     # require_auth). Token is auto-generated on first startup when

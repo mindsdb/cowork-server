@@ -686,7 +686,7 @@ async def fetch_org_model_catalog(
 #       (`apply_runtime_settings`),
 #       which raises on any >=400 — every shipped run spec pins a `latest:` alias,
 #       hence the legacy-prefix allowance in model_value_rejection;
-#     - cowork-kinaxis-preview's divergent inline `syncOnboardingModels`;
+#     - a branded preview build's divergent inline `syncOnboardingModels`;
 #     - anything hand-rolled (curl, scripts, a console surface).
 #
 #   GATED FOR SHAPE ONLY: `minds_role_defaults`, the cached role -> model id map
@@ -1722,18 +1722,23 @@ def build_llm_client(
         # base is None for anthropic/openai → SDK default host (OpenAIProvider
         # accepts base_url=None; AnthropicProvider takes no base_url kwarg).
         #
-        # Direct OpenAI deliberately keeps the default (generic) flavor. The
-        # flavor that would enable OpenAI's native web tools, FLAVOR_OPENAI,
-        # also switches the whole transport from chat.completions to the
-        # Responses API, whose path in anton does not yet:
-        # - report truncation (no `response.incomplete` handler, so
-        #   stop_reason and token usage stay unset and truncation recovery
-        #   never fires),
-        # - forward images returned inside a tool_result,
-        # - attach Langfuse trace headers.
-        # Native web search here waits on those gaps being closed in anton.
+        # Direct OpenAI uses its own transport, the Responses API
+        # (FLAVOR_OPENAI), which also enables OpenAI's native web tools and is
+        # the only transport on which some models (gpt-6.1-sol) accept tools
+        # with a reasoning effort. Gated on the installed anton (pinned to a
+        # branch): before RESPONSES_TRANSPORT_READY its Responses path did not
+        # report truncation, forward tool_result images or attach Langfuse
+        # trace headers, so an older anton keeps the generic chat.completions
+        # flavor. `is True`: a stand-in class must not opt in by accident.
         if cls is OpenAIProvider:
-            return cls(api_key=key.get_secret_value(), base_url=base, **effort_kw)
+            flavor_kw = (
+                {"flavor": cls.FLAVOR_OPENAI}
+                if getattr(cls, "RESPONSES_TRANSPORT_READY", False) is True
+                else {}
+            )
+            return cls(
+                api_key=key.get_secret_value(), base_url=base, **flavor_kw, **effort_kw
+            )
         return cls(api_key=key.get_secret_value(), **effort_kw)
 
     # A reasoning-effort level is chosen in the Settings UI for a specific

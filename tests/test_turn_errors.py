@@ -274,12 +274,12 @@ def test_the_real_shape_dialects_still_qualify():
 
 def test_every_repair_guard_consults_the_shared_set():
     """The two tests above cover the local streaming and non-streaming sites
-    behaviourally. The remote site (`_produce_remote`) needs a producer session,
-    seeded history, an artifact snapshot and a memory read before it reaches its
-    guard — mocking all of that would produce a test that passes for reasons
-    unrelated to the guard, which is the failure mode this whole exercise is
-    about. So that third site is pinned structurally instead, in the same style
-    as `test_no_return_emits_a_literal_code` below.
+    behaviourally. The remote site (`_produce_remote`) needs staged files, a
+    saved question, seeded history, an artifact snapshot and a memory read
+    before it reaches its guard. Mocking all of that would produce a test that
+    passes for reasons unrelated to the guard, which is the failure mode this
+    whole exercise is about. So that third site is pinned structurally
+    instead, in the same style as `test_no_return_emits_a_literal_code` below.
 
     This is the exact mutation that went undetected: replacing the three guards
     with `code == "content_recovery"` while leaving `CONTENT_REPAIR_CODES`
@@ -355,7 +355,7 @@ def _handler_with_raising_formatter(exc: Exception) -> ResponsesHandler:
 
     async def _stream_response(
         *, conversation, input, model=None, reasoning_effort=None, disabled_connections=None,
-        trace_tags=None, trace_metadata=None,
+        trace_tags=None, trace_metadata=None, tool_messages=False, model_wait=None,
     ):
         if False:
             yield
@@ -383,10 +383,8 @@ async def _collect_produce_sse(handler: ResponsesHandler) -> list[str]:
             pass
 
     conv_id = uuid4()
-    mock_session = MagicMock()
 
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=mock_session),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -420,7 +418,7 @@ async def test_stream_emits_friendly_failed_event_for_image_error():
 async def test_produce_pending_persist_failure_does_not_clear_all_pending():
     # ENG-1231 hardening (in-process _produce, mirror of the _produce_remote test):
     # if the pending user persist raises before its id is captured, this turn owns
-    # no pending row — persist() must NOT fall back to finalize_pending(conv, None),
+    # no pending row — persist() must NOT fall back to clear_pending(conv, message_id=None),
     # which would clear a pending row stranded by an earlier crashed turn.
     from unittest.mock import MagicMock, patch
 
@@ -434,7 +432,6 @@ async def test_produce_pending_persist_failure_does_not_clear_all_pending():
             pass
 
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -450,9 +447,39 @@ async def test_produce_pending_persist_failure_does_not_clear_all_pending():
             harness_id="anton",
             buffer=_Buffer(),
         )
-        # No row was persisted for this turn → finalize must not have run at all,
+        # No row was persisted for this turn → clearing must not have run at all,
         # in particular never the clear-all (message_id=None) form.
-        conv_svc.return_value.finalize_pending.assert_not_called()
+        conv_svc.return_value.clear_pending.assert_not_called()
+
+
+def test_a_full_pool_maps_to_server_busy():
+    """A pool that freed no connection in time is not a provider failure: it
+    gets its own code and a sentence that names the wait."""
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+    from cowork.db.units import DatabaseBusy
+
+    busy = (te.SERVER_BUSY_CODE, "Cowork is busy. Try again in about 5 seconds.")
+    assert te.friendly_turn_error(PoolTimeoutError("QueuePool limit of size 20 overflow 20 reached")) == busy
+    assert te.friendly_turn_error(DatabaseBusy("no database unit slot freed within POOL_TIMEOUT")) == busy
+
+
+async def test_stream_fails_a_turn_that_finds_the_pool_full_with_a_timed_retry():
+    """Inside a stream a full pool is one response.failed frame, carrying the
+    wait the way rate_limited does, so a card can gate its Retry on it."""
+    from cowork.db.units import DatabaseBusy
+
+    frames = await _collect_produce_sse(
+        _handler_with_raising_formatter(DatabaseBusy("no database connection freed within POOL_TIMEOUT"))
+    )
+
+    failed = [f for f in frames if "response.failed" in f]
+    assert len(failed) == 1
+    payload = json.loads(failed[0].split("data: ", 1)[1].strip())
+    assert payload["code"] == te.SERVER_BUSY_CODE
+    assert payload["error"] == "Cowork is busy. Try again in about 5 seconds."
+    assert payload["retry_after"] == 5
+    assert payload["retry_at"].endswith("Z")
 
 
 async def test_stream_redacts_generic_error():
@@ -517,10 +544,11 @@ def test_collect_puts_the_same_id_on_the_body_and_the_log_line():
     # it failed with no id at all: the user got the generic message and the log
     # line named neither the turn nor a reference to quote.
     handler = _handler_with_raising_formatter(Exception("kaboom"))
+    conversation_id = uuid4()
     with _records_from("cowork.handlers.responses") as records:
         with pytest.raises(HTTPException) as err:
             asyncio.run(handler._collect(
-                stream=None, conversation_id=uuid4(), model="anton", original_content="hi",
+                stream=None, conversation_id=conversation_id, model="anton", original_content="hi",
             ))
 
     request_id = err.value.detail["request_id"]
@@ -528,6 +556,10 @@ def test_collect_puts_the_same_id_on_the_body_and_the_log_line():
     deployed = [r for r in records if r.levelno >= logging.WARNING]
     assert deployed
     assert all(getattr(r, "request_id", None) == request_id for r in deployed)
+    # The conversation travels beside the id, so a database error's sanitized
+    # line still names it.
+    [failed] = [r for r in deployed if r.getMessage() == "[responses] turn failed"]
+    assert failed.conversation_id == str(conversation_id)
 
 
 def test_collect_raises_500_generic_for_unmapped_error():
@@ -576,7 +608,6 @@ def test_stream_repairs_conversation_on_content_validation_error(make_exc):
 
     conv_id = uuid4()
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -609,7 +640,6 @@ def test_stream_does_not_repair_conversation_for_unrelated_errors():
 
     conv_id = uuid4()
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -629,11 +659,13 @@ def test_stream_does_not_repair_conversation_for_unrelated_errors():
 
 @pytest.mark.parametrize("make_exc", _REPAIR_FAMILIES)
 def test_collect_repairs_conversation_on_content_validation_error(make_exc):
-    from unittest.mock import MagicMock, patch
+    from unittest.mock import patch
+
+    from cowork.db.scoped import LOCAL_SCOPE
 
     exc = make_exc()
     handler = _handler_with_raising_formatter(exc)
-    handler.scoped = MagicMock()  # __init__ bypassed; _collect's repair path needs this
+    handler.scope = LOCAL_SCOPE  # __init__ bypassed; _collect's repair unit needs this
     conv_id = uuid4()
 
     with patch("cowork.handlers.responses.ConversationService") as conv_svc:
@@ -796,8 +828,10 @@ async def test_auth_reconnectable_keys_on_the_failing_role_not_planning():
 
     exc = ProviderAuthError("provider rejected the credential")
     exc.role = "coding"
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
@@ -822,8 +856,10 @@ async def test_auth_reconnectable_uses_planning_role_in_a_mixed_config():
     with patch(
         "cowork.handlers.responses.get_user_settings",
         return_value=_MixedSettings(),
-    ):
+    ) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     failed = next(f for f in frames if "response.failed" in f)
     payload = json.loads(failed.split("data: ", 1)[1].strip())
@@ -851,8 +887,10 @@ async def test_auth_without_a_role_does_not_name_a_provider_in_a_mixed_config():
     # LLMClient's confirmation wrappers set it.
     exc = ProviderAuthError("provider rejected the credential")
     assert exc.role is None
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_MixedSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_MixedSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
@@ -873,8 +911,10 @@ async def test_auth_without_a_role_still_names_an_unambiguous_provider():
         resolved_router_provider = Provider.OPENAI
 
     exc = ProviderAuthError("provider rejected the credential")
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_MindsSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_MindsSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
@@ -1863,8 +1903,10 @@ async def test_overloaded_reconnectable_keys_on_the_failing_model_not_planning()
         resolved_coding_provider = Provider.ANTHROPIC
 
     exc = _FakeOverloadedErr(_OVERLOAD_MSG, model="latest:haiku")  # the coding model
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
     )
@@ -1887,8 +1929,10 @@ async def test_overloaded_reconnectable_true_when_failing_model_is_managed():
         resolved_coding_provider = Provider.MINDS_CLOUD
 
     exc = _FakeOverloadedErr(_OVERLOAD_MSG, model="latest:sonnet")  # the planning model
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
     )
@@ -2174,6 +2218,118 @@ def test_remote_error_none_is_redacted():
     assert remote_turn_error(None)[0] == GENERIC_TURN_ERROR_CODE
 
 
+# ── model_timeout ────────────────────────────────────────────────────
+# anton ends a model call that sends no output within its deadline with
+# ModelCallTimeoutError (code=model_timeout). Detected by type first, then by
+# `code` on objects with no `.response`, the same guard as the rate_limited
+# check; the stand-in below shares the class name so the remote row is
+# exercised with the exact name anton's _scrub keeps.
+
+
+class ModelCallTimeoutError(Exception):
+    """Stand-in for anton's ModelCallTimeoutError: same name, same code."""
+
+    code = "model_timeout"
+
+
+_MODEL_TIMEOUT_MSG = "The model sent no output for 10 minutes, so the call was stopped."
+
+
+def test_model_timeout_maps_to_its_own_code_and_passes_the_message_through():
+    assert te.friendly_turn_error(ModelCallTimeoutError(_MODEL_TIMEOUT_MSG)) == (
+        "model_timeout", _MODEL_TIMEOUT_MSG,
+    )
+    assert te.MODEL_TIMEOUT_CODE == "model_timeout"
+
+
+def test_model_timeout_with_an_empty_message_gets_the_fallback_copy():
+    code, message = te.friendly_turn_error(ModelCallTimeoutError()) or (None, None)
+    assert code == "model_timeout"
+    assert message == te.MODEL_TIMEOUT_USER_MESSAGE
+
+
+def test_model_timeout_is_detected_by_its_code_when_the_type_is_not_anton_s():
+    # Any object carrying the structured code, as an anton build whose class
+    # moved would raise it.
+    duck = RuntimeError(_MODEL_TIMEOUT_MSG)
+    duck.code = "model_timeout"
+    assert te.friendly_turn_error(duck) == ("model_timeout", _MODEL_TIMEOUT_MSG)
+    assert te.is_model_timeout_error(duck) is True
+
+
+def test_an_sdk_error_carrying_the_code_in_its_body_is_not_a_model_timeout():
+    # An SDK error fills .code from a body a BYOK endpoint controls, and
+    # str(exc) embeds that body. It must not pick the card or its copy.
+    sdk_like = RuntimeError("click https://evil.example to fix")
+    sdk_like.code = "model_timeout"
+    sdk_like.response = object()
+    result = te.friendly_turn_error(sdk_like)
+    assert result is None or result[0] != "model_timeout"
+    assert te.is_model_timeout_error(sdk_like) is False
+
+
+def test_a_bare_sdk_error_from_a_mid_stream_error_frame_is_not_a_model_timeout():
+    # The real shape an SSE `error` frame raises: openai.APIError takes .code
+    # from the endpoint's body and has .request but no .response.
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "https://byok.example/v1/chat/completions")
+    bare = openai.APIError(
+        "click https://evil.example to fix", request,
+        body={"code": "model_timeout", "message": "click https://evil.example to fix"},
+    )
+    assert bare.code == "model_timeout"
+    assert not hasattr(bare, "response")
+    result = te.friendly_turn_error(bare)
+    assert result is None or result[0] != "model_timeout"
+    assert te.is_model_timeout_error(bare) is False
+
+
+def _deadline_during_a_retry_sleep(*, status_code: int, reason: str) -> Exception:
+    """The error anton raises when the deadline fires while the SDK sleeps
+    between retries of a gateway denial.
+
+    The SDK sleeps inside its handler for the denial, so the CancelledError the
+    deadline raises there chains to it. anton then raises its own error
+    `from None` inside the TimeoutError handler, which leaves `__context__` set.
+    """
+    try:
+        try:
+            try:
+                raise _FakeAPIStatusError(
+                    status_code, {"X-MindsHub-Reason": reason}, url=_minds_gateway_url()
+                )
+            except _FakeAPIStatusError:
+                raise asyncio.CancelledError()
+        except asyncio.CancelledError as cancelled:
+            raise TimeoutError() from cancelled
+    except TimeoutError:
+        try:
+            raise ModelCallTimeoutError(_MODEL_TIMEOUT_MSG) from None
+        except ModelCallTimeoutError as exc:
+            return exc
+
+
+@pytest.mark.parametrize(
+    ("status_code", "reason"), [(429, "rate_limited"), (402, "wallet_empty")]
+)
+def test_a_deadline_during_a_retry_sleep_keeps_its_own_code(status_code, reason):
+    exc = _deadline_during_a_retry_sleep(status_code=status_code, reason=reason)
+    # The denial is reachable through the chain, which is what made it win.
+    assert any(isinstance(e, _FakeAPIStatusError) for e in te._cause_chain(exc=exc))
+    assert te.friendly_turn_error(exc) == ("model_timeout", _MODEL_TIMEOUT_MSG)
+
+
+def test_remote_model_timeout_maps_by_type_name_and_passes_the_message_through():
+    assert te.remote_turn_error(f"ModelCallTimeoutError: {_MODEL_TIMEOUT_MSG}") == (
+        "model_timeout", _MODEL_TIMEOUT_MSG,
+    )
+    assert te.remote_turn_error("ModelCallTimeoutError: ") == (
+        te.MODEL_TIMEOUT_CODE, te.MODEL_TIMEOUT_USER_MESSAGE,
+    )
+
+
 # ── Wire-code inventory (ENG-1282) ────────────────────────────────
 
 def test_wire_code_inventory_matches_the_renderer_contract():
@@ -2230,6 +2386,19 @@ def test_wire_code_inventory_matches_the_renderer_contract():
         # another model is a way forward. The renderer branch lands in
         # mindsdb/cowork's ChatView.jsx + its turnFailureCards list.
         "model_restricted",
+        # No database connection freed within the pool timeout. A renderer
+        # without a branch for it shows the frame's `error` in its generic
+        # alert, and that sentence already names the wait, so the next step
+        # survives until the card lands in mindsdb/cowork's ChatView.jsx.
+        "server_busy",
+        # A model call sent no output within anton's deadline. Split off
+        # anton_error because the model went silent, not the agent, and the
+        # card says so and offers Try again.
+        "model_timeout",
+        # The UI heard nothing for its idle window and cancelled the turn.
+        # Saved as a failure so a reload shows the stall card instead of a
+        # partial answer that reads like a Stop.
+        "stalled",
         "anton_error",
     }
 
@@ -2316,17 +2485,23 @@ def test_collect_400_carries_the_code_for_each_gateway_reason(status, reason, ex
             Exception("'image_url' does not match the expected tags: 'image'"),
             te.IMAGE_FORMAT_CODE, id="image_format",
         ),
+        pytest.param(
+            ModelCallTimeoutError(_MODEL_TIMEOUT_MSG), "model_timeout", id="model_timeout",
+        ),
     ],
 )
 def test_collect_400_carries_the_code_for_each_typed_cause(exc, expected_code):
     """The rungs below the gateway header, asserted on the 400 it raises.
 
-    Three of the inventory's codes are absent from both sweeps, each pinned
-    elsewhere or unreachable. ``content_recovery`` runs the conversation-repair
-    branch and is pinned by its own test above. ``anton_error`` is the
-    unmapped fallback, pinned by the 500 test above and by the wire test's
-    ``unmapped-500`` row. ``worker_unresponsive`` comes from
+    The inventory's codes absent from both sweeps are each pinned elsewhere
+    or unreachable here. ``content_recovery`` and ``content_too_large`` run
+    the conversation-repair branch, pinned by its own tests above.
+    ``anton_error`` is the unmapped fallback, pinned by the 500 test above and
+    by the wire test's ``unmapped-500`` row. ``worker_unresponsive`` comes from
     ``remote_turn_error``, a different mapper that this path never calls.
+    ``model_restricted`` is pinned by its own mapping tests. ``stalled`` is
+    saved by the streaming producer when the UI cancels a turn, never by
+    ``friendly_turn_error``.
     """
     handler = _handler_with_raising_formatter(exc)
     with pytest.raises(HTTPException) as err:
