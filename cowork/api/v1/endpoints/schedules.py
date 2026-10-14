@@ -107,8 +107,17 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
-    from cowork.scheduler import execute_schedule
+    from cowork.scheduler import claim_manual_run, run_occurrence
     from cowork.services.conversations import ConversationService
+
+    # Claim before creating anything: a schedule already running (or waiting
+    # to retry) refuses a second run rather than overlapping it.
+    occurrence_id = claim_manual_run(scoped, schedule.id)
+    if occurrence_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This task is already running. Wait for it to finish, then run it again.",
+        )
 
     conversation = ConversationService(scoped).create_conversation(
         topic=schedule.title,
@@ -119,7 +128,7 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     scoped.close()
 
     background_tasks.add_task(
-        execute_schedule, schedule_id, is_manual=True,
+        run_occurrence, occurrence_id, is_manual=True,
         conversation_id=conversation.id,
     )
     return {"detail": "Run triggered", "conversation_id": str(conversation.id)}

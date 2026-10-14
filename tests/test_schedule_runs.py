@@ -483,8 +483,9 @@ def test_execute_schedule_disables_corrupt_org_row_instead_of_looping(monkeypatc
     from cowork.common.settings.app_settings import get_app_settings
     from cowork.db.scoped import ScopedSession, TenantScope
     from cowork.db.session import get_open_session
-    from cowork.models.schedule import ScheduleRun
+    from cowork.models.schedule import ScheduleOccurrence, ScheduleRun
     from cowork.scheduler import execute_schedule
+    from cowork.schemas.schedules import OccurrenceStatus
     from cowork.services.schedules import ScheduleService
 
     org_id = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
@@ -528,13 +529,19 @@ def test_execute_schedule_disables_corrupt_org_row_instead_of_looping(monkeypatc
         s = get_open_session()
         after = s.get(Schedule, schedule_id)
         assert after.enabled is False, "corrupt row must be disabled, not left due"
-        # Not advanced — disabling is what stops the re-fire, not a moved slot.
-        assert ensure_utc(after.next_run_at) == original_next_run
+        # The claim consumed the slot before the run found the row corrupt.
+        assert ensure_utc(after.next_run_at) > original_next_run
         runs = s.exec(
             select(ScheduleRun).where(ScheduleRun.schedule_id == schedule_id)
         ).all()
-        assert runs, "the attempt must still record a run"
-        assert all(r.status == RunStatus.failed for r in runs)
+        assert len(runs) == 1, "the attempt must still record a run"
+        assert runs[0].status == RunStatus.failed
+        # A row that can never resolve an identity is not worth retrying.
+        occurrence = s.exec(
+            select(ScheduleOccurrence).where(ScheduleOccurrence.schedule_id == schedule_id)
+        ).one()
+        assert occurrence.status == OccurrenceStatus.failed
+        assert occurrence.attempts == 1
         s.close()
     finally:
         s = get_open_session()
@@ -765,7 +772,7 @@ def test_a_database_error_in_a_runs_last_writes_logs_its_schedule_and_conversati
     for record in errors:
         assert record.getMessage() == (
             "Database operation failed: error_type=OperationalError sqlstate=unknown "
-            f"site=scheduler.execute_schedule:{record.lineno}"
+            f"site=scheduler._run_attempt:{record.lineno}"
         )
         assert (record.schedule_id, record.conversation_id) == (str(schedule_id), str(conversation_id))
         assert record.exc_info is None
@@ -1005,19 +1012,16 @@ def _file_engine(tmp_path):
 
 @pytest.mark.parametrize(("cadence", "reason"), [("daily", "cancelled"), ("once", "error")])
 def test_a_poll_skips_a_slot_its_run_used_up_after_the_poll_read_it(tmp_path, monkeypatch, cadence, reason):
-    """The run records its outcome and its finish after the poll has read the
-    schedule and before the poll asks whether a run is active. The poll then
-    sees the slot as used: a Stopped daily run does not start again, and
-    neither does a one-off its failed run disabled."""
-    from cowork.scheduler import _finish_run, _poll, _record_turn_outcome
+    """Another poller claims the slot, runs it and records how it went after
+    this poll has read the schedule and before it asks whether a run is
+    active. The poll then sees the slot as used: a Stopped daily run does not
+    start again, and neither does a one-off whose claim disabled it."""
+    from cowork.scheduler import _claim_slot, _finish_run, _poll, _record_turn_outcome, _start_attempt
 
     engine = _file_engine(tmp_path)
     with Session(engine) as session:
         schedule_id = _schedule(
             session, cadence=cadence, next_run_at=datetime.now(timezone.utc) - timedelta(minutes=1)
-        ).id
-        run_id = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE)).create_run(
-            schedule_id, is_manual=False
         ).id
 
     has_active_run = ScheduleRunService.has_active_run
@@ -1028,10 +1032,15 @@ def test_a_poll_skips_a_slot_its_run_used_up_after_the_poll_read_it(tmp_path, mo
             ended.append(asked_id)
             with Session(engine) as run_session:
                 scoped = ScopedSession(run_session, SYSTEM_SCOPE)
+                occurrence_id = _claim_slot(scoped, scoped.get(Schedule, schedule_id))
+                attempt = _start_attempt(scoped, occurrence_id=occurrence_id, is_manual=False)
                 outcome = _record_turn_outcome(
-                    scoped, schedule_id=schedule_id, reason=reason, is_manual=False, conversation_id=None,
+                    scoped, schedule_id=schedule_id, reason=reason, conversation_id=None,
+                    occurrence_id=occurrence_id, attempt=attempt.number,
                 )
-                _finish_run(scoped, run_id=run_id, conversation_id=None, error=outcome.error, status=outcome.status)
+                _finish_run(
+                    scoped, run_id=attempt.run_id, conversation_id=None, error=outcome.error, status=outcome.status,
+                )
         return has_active_run(self, asked_id)
 
     monkeypatch.setattr(ScheduleRunService, "has_active_run", the_run_ends_first)
@@ -1072,7 +1081,11 @@ def test_a_poll_skips_a_schedule_deleted_after_the_poll_read_it(tmp_path, monkey
         due = _poll(ScopedSession(poll_session, SYSTEM_SCOPE))
 
     assert len(deleted) == 1
-    assert due == list(schedule_ids - set(deleted))
+    from cowork.models.schedule import ScheduleOccurrence
+
+    with Session(engine) as check:
+        claimed_for = [check.get(ScheduleOccurrence, o).schedule_id for o in due]
+    assert claimed_for == list(schedule_ids - set(deleted))
 
 
 # --- ENG-769: reap orphaned `running` runs left by a crash/restart.
