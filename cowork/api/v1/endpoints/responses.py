@@ -27,7 +27,13 @@ from cowork.db.scoped import (
 )
 from cowork.handlers.responses import ResponsesHandler, sse_from_buffer
 from cowork.principal import Principal, get_principal
-from cowork.schemas.responses import ResponsesRequest
+from cowork.schemas.responses import (
+    CancelResponse,
+    InFlightListResponse,
+    InFlightStatusResponse,
+    Response as ResponseSchema,
+    ResponsesRequest,
+)
 from cowork.streaming import RunHandle, TurnInProgress, registry
 from cowork.streaming.answers import SubmitResult, broker
 from cowork.streaming.backend import get_backend
@@ -228,7 +234,16 @@ def _refuse_while_answering(*, conversation: str | None, scope: TenantScope) -> 
         raise TurnInProgress(conversation_id=conversation_id, turn_id=handle.turn_id)
 
 
-@router.post("/", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+@router.post(
+    "/",
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+    responses={
+        200: {
+            "model": ResponseSchema,
+            "content": {"text/event-stream": {"schema": {"type": "string"}}},
+        }
+    },
+)
 async def responses(
     responses_request: ResponsesRequest,
     principal: Principal | None = Depends(get_principal),
@@ -247,7 +262,11 @@ async def responses(
     return result
 
 
-@router.get("/in-flight-list", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+@router.get(
+    "/in-flight-list",
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+    responses={200: {"model": InFlightListResponse}},
+)
 async def in_flight_list(scope: TenantScopeDep):
     """Conversations with a turn running. The renderer uses it to sync stream
     state across clients/boots. Scoped to the caller's org so it can't
@@ -281,7 +300,11 @@ async def in_flight_list(scope: TenantScopeDep):
     return {"in_flight": out}
 
 
-@router.get("/in-flight", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+@router.get(
+    "/in-flight",
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+    responses={200: {"model": InFlightStatusResponse}},
+)
 async def in_flight(scope: TenantScopeDep, conversation_id: str | None = None):
     """Probe so the renderer can decide whether to open a /tail on mount.
 
@@ -321,7 +344,11 @@ class CancelRequest(BaseModel):
     reason: str | None = None
 
 
-@router.post("/cancel", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+@router.post(
+    "/cancel",
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+    responses={200: {"model": CancelResponse}},
+)
 async def cancel_response(req: CancelRequest, scope: TenantScopeDep):
     """Halt the in-flight producer (Stop button). Fetch-abort / tab-close
     does NOT cancel — only this does.
@@ -474,7 +501,16 @@ async def answer_question(req: AnswerRequest, scope: TenantScopeDep):
     return _answer_response(broker.submit(req.conversation_id, req.question_id, payload))
 
 
-@router.get("/tail", dependencies=[Depends(require(AuthenticatedInOrgMode))])
+@router.get(
+    "/tail",
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "content": {"text/event-stream": {"schema": {"type": "string"}}}
+        }
+    },
+)
 async def tail_response(
     scope: TenantScopeDep,
     conversation_id: str = Query(..., description="Conversation to tail."),
