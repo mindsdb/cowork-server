@@ -54,6 +54,7 @@ class CodeProjectService:
             default_model=request.default_model,
             default_reasoning_effort=request.default_reasoning_effort,
             permission_mode=request.permission_mode,
+            default_workspace_mode=request.default_workspace_mode,
         )
         return self.store.create(self._validated(project))
 

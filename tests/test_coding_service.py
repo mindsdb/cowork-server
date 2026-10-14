@@ -1261,7 +1261,7 @@ def test_non_git_session_reports_its_isolated_local_copy(tmp_path: Path) -> None
         SessionCreateRequest(
             path=str(folder),
             prompt="Use the folder",
-            allow_direct_folder=True,
+            allow_folder_copy=True,
         ),
         CREDS,
         "fake",
