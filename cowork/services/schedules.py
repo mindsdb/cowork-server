@@ -419,6 +419,19 @@ class ScheduleOccurrenceService:
     def get(self, occurrence_id: UUID) -> ScheduleOccurrence | None:
         return self.session.get(ScheduleOccurrence, occurrence_id)
 
+    def pending_retry_at(self, schedule_id: UUID) -> datetime | None:
+        """When the schedule's active occurrence will try again, or None when
+        nothing is waiting to retry (idle, or an attempt is running)."""
+        occurrence = self.session.exec(
+            self.session.select(ScheduleOccurrence)
+            .where(ScheduleOccurrence.schedule_id == schedule_id)
+            .where(ScheduleOccurrence.status == OccurrenceStatus.active)
+            .where(ScheduleOccurrence.attempts > 0)
+            .where(ScheduleOccurrence.next_attempt_at.is_not(None))  # type: ignore[union-attr]
+            .limit(1)
+        ).first()
+        return _utc(occurrence.next_attempt_at) if occurrence else None
+
     def has_active(self, schedule_id: UUID) -> bool:
         return self.session.exec(
             self.session.select(ScheduleOccurrence)

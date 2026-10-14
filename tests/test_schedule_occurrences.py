@@ -426,3 +426,53 @@ async def test_run_now_refuses_while_the_schedule_has_an_occurrence_in_flight():
             answered = await client.post(f"/api/v1/schedules/{schedule_id}/run-now")
 
     assert answered.status_code == 409, answered.text
+
+
+def test_a_schedule_waiting_to_retry_reports_when(tmp_path):
+    from cowork.api.v1.endpoints.schedules import _serialize
+
+    engine = _engine(tmp_path)
+    schedule_id = _schedule(engine)
+    occurrence_id = _claim(engine, schedule_id, "slot:a")
+    with Session(engine) as session:
+        scoped = _scoped(session)
+        assert _serialize(session.get(Schedule, schedule_id), scoped)["retryAt"] is None
+        occurrences = ScheduleOccurrenceService(scoped)
+        run = occurrences.start_attempt(occurrence_id, is_manual=False, lease_seconds=60)
+        assert _serialize(session.get(Schedule, schedule_id), scoped)["retryAt"] is None
+        occurrences.fail_attempt(occurrence_id, error="boom", retry_delay=60)
+        session.commit()
+        ScheduleRunService(scoped).finish_run(run.id, error="boom")
+
+        data = _serialize(session.get(Schedule, schedule_id), scoped)
+
+    assert data["retryAt"] is not None
+    assert data["running"] is False
+
+
+async def test_run_now_says_so_when_the_schedule_is_waiting_to_retry():
+    import test_turn_pool_connections as turn_pool
+
+    from cowork.db.session import get_open_session
+    from cowork.scheduler import _claim_slot
+
+    with turn_pool._a_daily_schedule(due=DUE) as schedule_id:
+        session = get_open_session()
+        scoped = _scoped(session)
+        occurrence_id = _claim_slot(scoped, session.get(Schedule, schedule_id))
+        occurrences = ScheduleOccurrenceService(scoped)
+        occurrences.start_attempt(occurrence_id, is_manual=False, lease_seconds=60)
+        occurrences.fail_attempt(occurrence_id, error="boom", retry_delay=60)
+        session.commit()
+        # The attempt's run would be finished by the executor; settle it here.
+        for run in session.exec(select(ScheduleRun).where(ScheduleRun.occurrence_id == occurrence_id)).all():
+            run.status = RunStatus.failed
+            session.add(run)
+        session.commit()
+        session.close()
+
+        async with turn_pool._client() as client:
+            answered = await client.post(f"/api/v1/schedules/{schedule_id}/run-now")
+
+    assert answered.status_code == 409
+    assert "waiting to try again" in answered.json()["detail"]
