@@ -4,7 +4,7 @@ A DNS-rebound page reaches the server under the attacker's own hostname, and
 the browser sends that name as Host. With no token in front of the API, the
 Host is the only part of such a request that gives it away, so only names a
 page cannot be served from are accepted: localhost, IP literals, and the
-names an operator lists in COWORK_ALLOWED_HOSTS.
+names an operator configures (COWORK_ALLOWED_HOSTS, COWORK_PUBLIC_BASE_URL).
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ def _is_ip_literal(hostname: str) -> bool:
     return True
 
 
-class TrustedHostMiddleware:
+class RebindingHostMiddleware:
     """Refuse requests whose Host a rebinding page could have sent.
 
     Registered in create_app() only in local tenancy with COWORK_REQUIRE_AUTH
