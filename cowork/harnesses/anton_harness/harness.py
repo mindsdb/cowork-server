@@ -27,6 +27,7 @@ from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REPLAY_ROLES, extract_scratchpad_cells
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
+from cowork.services.conversation_folders import ConversationFolderService, folder_refusal
 from cowork.services.projects import display_label
 from cowork.streaming.liveness import ModelWaitTicker
 
@@ -475,6 +476,79 @@ async def _conversation_attachment_context(conversation, *, scope: TenantScope |
         "user refers to uploaded or reference materials, and never report them "
         "missing just because they aren't in the project folder:\n"
         + "\n".join(attached)
+    )
+
+
+def _stored_folder_paths(session: ScopedSession, *, conversation_id: UUID) -> list[str]:
+    _conversation, rows = ConversationFolderService(session).list_folders(conversation_id)
+    return [row.path for row in rows]
+
+
+async def _working_folder_paths(conversation, channel_context: ChannelContext | None) -> list[str]:
+    """The chat's working folders the agent may use this turn, as absolute paths.
+
+    Read in a database unit of its own, since the harness gets the conversation
+    detached. Empty for a channel turn: the people in a Slack or Telegram chat
+    are not the desktop user who added the folders. Each folder is checked
+    again, so one that vanished or now resolves into Cowork's own data is left
+    out. Fails closed: an error offers no folders and is logged. A wait for a
+    connection that runs out is the turn's failure, so it propagates.
+    """
+    if channel_context is not None:
+        return []
+    try:
+        scope = _units_scope()
+        if scope.org_mode:
+            return []
+        paths = await run_db(
+            partial(_stored_folder_paths, conversation_id=conversation.id), scope=scope,
+        )
+        project_path = conversation.project.path if conversation.project else None
+        return [path for path in paths if folder_refusal(path, project_path) is None]
+    except PoolTimeoutError:
+        raise
+    except Exception:
+        logger.warning(
+            "Failed to load working folders for conversation %s; none are offered this turn",
+            getattr(conversation, "id", "<unknown>"),
+            exc_info=True,
+        )
+        return []
+
+
+def _file_access_rules(folder_paths: list[str]) -> str:
+    """The prompt sentences that say which files outside the project are allowed.
+
+    Without working folders this is exactly the text every turn carried before
+    them, so a chat that never adds one sends an unchanged prompt.
+    """
+    if folder_paths:
+        return (
+            "The only other files that you are allowed to access are any items that are attached to the conversation and the files in the working folders below."
+            "Access to any files not attached to the conversation and located outside both the project and the working folders is strictly forbidden."
+        )
+    return (
+        "The only other files that you are allowed to access are any items that are attached to the conversation."
+        "Access to any files not attached to the conversation or located outside the project is strictly forbidden."
+    )
+
+
+def _working_folders_context(paths: list[str]) -> str:
+    """Prompt fragment granting the agent the chat's working folders, or "" for none."""
+    if not paths:
+        return ""
+    listed = "\n".join(f"  - {path}" for path in paths)
+    return (
+        " The user has also added these working folders to THIS conversation:\n"
+        + listed
+        + "\nYou may read and write files in them through the scratchpad, using these absolute paths."
+        " Before you change, move or delete any file in a working folder, ask the user for permission first."
+        " Keep creating artifacts in the project as usual."
+        " Leave any .anton/ directory inside a working folder alone."
+        " To find a file in a working folder, list or search the folder in the scratchpad;"
+        " do not use select_path for it, because select_path only sees the project."
+        " When the user names a file without saying which folder, search the project and every working folder"
+        " before saying it is missing. If it is not found, say so and ask; never answer about a different file instead."
     )
 
 
@@ -1074,6 +1148,7 @@ class AntonHarness:
             partial(_replay_history, conversation_id=conversation.id), scope=_units_scope(),
         )
         ordered_messages = history.messages
+        folder_paths = await _working_folder_paths(conversation, channel_context)
 
         project_context = (
             # Conversational only. The next line hands the agent the real path,
@@ -1084,9 +1159,8 @@ class AntonHarness:
             "You can perform operations on these files via the scratchpad."
             "You can freely read any of these project files."
             "If you need to perform any actions on these files, ask the user for permission first."
-            "The only other files that you are allowed to access are any items that are attached to the conversation."
-            "Access to any files not attached to the conversation or located outside the project is strictly forbidden."
-            "ALWAYS use the scratchpad to interact with files."
+            + _file_access_rules(folder_paths)
+            + "ALWAYS use the scratchpad to interact with files."
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
             # Each turn's scratchpad processes are killed when the turn ends
             # (close_session_scratchpads), with their whole process group.
@@ -1094,6 +1168,7 @@ class AntonHarness:
             "variables carry over to the next turn, running servers do not. "
             "For a service that must keep running, build a full-stack artifact and start it with `launch_backend`."
             + attachment_context
+            + _working_folders_context(folder_paths)
         )
         output_context = (
             # Artifacts now live in their own visible folder at the
