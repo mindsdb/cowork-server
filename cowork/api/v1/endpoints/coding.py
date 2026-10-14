@@ -45,6 +45,7 @@ from cowork.coding.contracts import (
     TurnRequest,
     GitIdentity,
     GitIdentityRequest,
+    WorkspaceModeOptions,
     WorkspaceUsagePage,
 )
 from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, ModelDiscoveryUnavailableError, StateConflict
@@ -241,6 +242,15 @@ def workspace_usage(session_id: str | None = Query(default=None, min_length=1, m
     Passing the task being looked at measures again if the last measurement predates it.
     """
     return _service().workspace_usage_page(session_id)
+
+
+@router.get("/workspace-modes", response_model=WorkspaceModeOptions)
+def workspace_modes(
+    project_id: str | None = Query(default=None, min_length=1, max_length=128),
+    computer_id: str | None = Query(default=None, min_length=1, max_length=128),
+):
+    """Which workspace modes the composer may offer for a new task."""
+    return _call(_service().workspace_mode_options, project_id, computer_id)
 
 
 @router.get("/models")
