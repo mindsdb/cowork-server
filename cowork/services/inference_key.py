@@ -133,14 +133,30 @@ def _post(body: dict, token: str, deadline: float) -> httpx.Response:
     left = deadline - time.monotonic()
     if left <= 0:
         raise TimeoutError("turn-key mint ran out of time")
-    # ponytail: httpx bounds each phase, not their sum, so a slow connect can run
-    # about _CONNECT_S over; still well inside the desktop's 10s.
-    return httpx.post(
-        _turn_keys_url(),
-        json=body,
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=httpx.Timeout(left, connect=min(_CONNECT_S, left)),
-    )
+    # httpx restarts its read timeout on every chunk, so a slow-dripping auth could
+    # outlast it; the join is what holds the whole request to the time left.
+    # A daemon thread, so an abandoned request can't hold up shutdown.
+    result: dict = {}
+
+    def call() -> None:
+        try:
+            result["response"] = httpx.post(
+                _turn_keys_url(),
+                json=body,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=httpx.Timeout(left, connect=min(_CONNECT_S, left)),
+            )
+        except Exception as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=call, daemon=True)
+    thread.start()
+    thread.join(left)
+    if thread.is_alive():
+        raise TimeoutError("turn-key mint ran out of time")
+    if "error" in result:
+        raise result["error"]
+    return result["response"]
 
 
 def _code(response: httpx.Response) -> str | None:
