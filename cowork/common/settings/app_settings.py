@@ -3,13 +3,14 @@ import re
 import tempfile
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from dotenv import dotenv_values
 from pydantic import AliasChoices, Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from cowork.common.paths import cowork_home
+from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 
 
 # ── Global model catalog ───────────────────────────────────────────────
@@ -803,6 +804,44 @@ class AppSettings(Settings):
             "closed one."
         ),
     )
+    trust_identity_headers: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("COWORK_TRUST_IDENTITY_HEADERS"),
+        description=(
+            "Local tenancy only. Read X-User-Id and X-Organization-Id on a "
+            "request that passed the bearer token, and give each (organization, "
+            "user) pair its own partition, keyed by "
+            "cowork.principal.personal_partition_id. Only for a deployment "
+            "behind a proxy that verifies each person and strips client copies "
+            "of those headers. create_app refuses it in org tenancy and when "
+            "COWORK_REQUIRE_AUTH is off. COWORK_IDENTITY_ENFORCE applies: "
+            "'enforce' answers 401 without a valid pair, and 'audit' serves "
+            "the request with no person, as the operator view."
+        ),
+    )
+    personal_resources: Annotated[frozenset[PersonalResource], NoDecode] = Field(
+        default=ALL_PERSONAL_RESOURCES,
+        validation_alias=AliasChoices("COWORK_PERSONAL_RESOURCES"),
+        description=(
+            "Comma-separated resources each person keeps in their own "
+            "partition while COWORK_TRUST_IDENTITY_HEADERS is on: "
+            "conversations, projects, files, skills, connections, schedules, "
+            "pins, memory, settings. Default: all of them. Blank: none. A "
+            "resource left off stays shared across the deployment, as with the "
+            "setting off. An unknown name fails settings load. create_app "
+            "refuses a list that breaks a dependency: projects requires "
+            "conversations, and conversations requires files, pins and "
+            "schedules. Ignored while COWORK_TRUST_IDENTITY_HEADERS is off."
+        ),
+    )
+
+    @field_validator("personal_resources", mode="before")
+    @classmethod
+    def _split_personal_resources(cls, value: object) -> object:
+        if isinstance(value, str):
+            return frozenset(name.strip() for name in value.split(",") if name.strip())
+        return value
+
     organization_switch_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("COWORK_ORGANIZATION_SWITCH_ENABLED"),
