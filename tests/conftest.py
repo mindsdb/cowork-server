@@ -170,6 +170,37 @@ def cleanup_tmp_projects(tmp_path):
 
 
 @pytest.fixture
+def org_deployment(monkeypatch):
+    """Hosted org tenancy for one test, through the real AppSettings."""
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    yield
+    get_app_settings.cache_clear()
+
+
+@pytest.fixture
+def personal_deployment(monkeypatch):
+    """A local deployment that trusts identity headers, for one test.
+
+    Local tenancy with COWORK_TRUST_IDENTITY_HEADERS and COWORK_REQUIRE_AUTH
+    on, and every resource personal (the setting's default). A test that
+    leaves a resource shared sets COWORK_PERSONAL_RESOURCES and clears the
+    settings cache itself.
+    """
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "true")
+    monkeypatch.setenv("COWORK_REQUIRE_AUTH", "true")
+    monkeypatch.delenv("COWORK_PERSONAL_RESOURCES", raising=False)
+    get_app_settings.cache_clear()
+    yield
+    get_app_settings.cache_clear()
+
+
+@pytest.fixture
 def granted_product_permissions(monkeypatch):
     """Model built-in Member grants only for suites testing resource ownership.
 
