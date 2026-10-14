@@ -5,6 +5,7 @@ import ctypes.util
 import difflib
 import errno
 import hashlib
+import json
 import logging
 import os
 import shutil
@@ -262,6 +263,106 @@ class LocalCopyManager:
                 raise self._copy_failure("The task copy could not be saved for recovery", exc) from exc
         shutil.rmtree(workspace, ignore_errors=True)
         shutil.rmtree(baseline, ignore_errors=True)
+
+    def release(self, key: str, workspace: Path) -> bool:
+        """Remove a task copy and its baseline, keeping only the task's changes.
+
+        The saved state is the pre-task and task versions of each changed path,
+        so a restore can rebuild both trees from the then-current source and
+        the task's diff and handoff checks behave as before. Returns False,
+        leaving everything in place, when the copy cannot be released safely.
+        """
+        relative = managed_key(key)
+        actual = workspace.resolve()
+        if actual not in {(root / relative).resolve() for root in (self.copies_root, self.legacy_copies_root)}:
+            raise LocalCopyError("Refusing to release an unmanaged task copy")
+        # Repository metadata is not part of the saved changes, so commits made
+        # in a copied or task-created repository would be lost.
+        if not actual.is_dir() or self._has_repository(actual):
+            return False
+        baseline = self._baseline_for(actual)
+        before, after = self._manifests(baseline, actual)
+        changed = self._changed(baseline, before, actual, after)
+        if any(entry.kind == "unreadable" for entry in (*before.values(), *after.values())):
+            return False
+        release = self._release_dir(relative)
+        staging = release.with_name(f"{release.name}.tmp")
+        _force_remove(staging)
+        try:
+            staging.mkdir(parents=True)
+            for source_root, side in ((baseline, "before"), (actual, "after")):
+                manifest = before if side == "before" else after
+                for path in changed:
+                    if path in manifest:
+                        self._copy_entry(self._safe_child(source_root, path), self._safe_child(staging / side, path))
+            (staging / "changes.json").write_text(json.dumps({"paths": changed}), encoding="utf-8")
+        except OSError as exc:
+            _force_remove(staging)
+            raise self._copy_failure("The task changes could not be saved before releasing the copy", exc) from exc
+        _force_remove(release)
+        os.replace(staging, release)
+        _force_remove(actual)
+        _force_remove(baseline)
+        return True
+
+    def restore(self, key: str, source: Path, workspace: Path) -> None:
+        """Rebuild a released copy from the current source plus its saved changes."""
+        relative = managed_key(key)
+        release = self._release_dir(relative)
+        changes = release / "changes.json"
+        if not changes.is_file():
+            raise LocalCopyError("This task's copy was removed and has no saved changes to restore")
+        expected = (self.copies_root / relative).resolve()
+        if workspace.resolve() != expected:
+            raise LocalCopyError("Refusing to restore an unmanaged task copy")
+        changed = list(json.loads(changes.read_text(encoding="utf-8"))["paths"])
+        # An interrupted release can leave part of the copy behind. The saved
+        # changes are complete, so the leftover is replaced.
+        for leftover in (workspace, self.baselines_root / relative):
+            _force_remove(leftover)
+            if leftover.exists():
+                raise LocalCopyError("Part of this task's old copy is still in use. Close programs using it and try again")
+        prepared = self.prepare(key, source)
+        try:
+            self._replace_changed(prepared.baseline, release / "before", changed)
+            self._replace_changed(prepared.workspace, release / "after", changed)
+        except (OSError, LocalCopyError):
+            _force_remove(prepared.workspace)
+            _force_remove(prepared.baseline)
+            raise
+        _force_remove(release)
+
+    def is_released(self, key: str) -> bool:
+        return (self._release_dir(managed_key(key)) / "changes.json").is_file()
+
+    def discard_release(self, key: str) -> None:
+        _force_remove(self._release_dir(managed_key(key)))
+
+    def _release_dir(self, relative: Path) -> Path:
+        return self.recovery_root / relative / "local-release"
+
+    @staticmethod
+    def _has_repository(root: Path) -> bool:
+        pending = [root]
+        while pending:
+            try:
+                entries = list(os.scandir(pending.pop()))
+            except OSError:
+                return True
+            for entry in entries:
+                if entry.name == ".git":
+                    return True
+                if entry.is_dir(follow_symlinks=False):
+                    pending.append(Path(entry.path))
+        return False
+
+    @staticmethod
+    def _copy_entry(source: Path, target: Path) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_symlink():
+            target.symlink_to(os.readlink(source))
+        else:
+            shutil.copy2(source, target)
 
     def _baseline_for(self, workspace: Path) -> Path:
         actual = workspace.resolve()

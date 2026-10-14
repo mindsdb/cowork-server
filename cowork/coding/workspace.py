@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import json
 import os
 import shutil
 import stat
@@ -59,6 +60,12 @@ SNAPSHOT_TRUNCATED_MARKER = (
     "Snapshot truncated because this task has a large combined patch. Open the worktree to recover the rest.\n"
 )
 _TASK_ROOT_METADATA = (".DS_Store", "Thumbs.db", "desktop.ini")
+# A released worktree's uncommitted changes are kept whole so the task can be
+# restored exactly. Anything larger stays on disk rather than risk a partial
+# snapshot.
+MAX_RELEASE_PATCH_BYTES = 256 * 1024 * 1024
+_RELEASE_METADATA = "release.json"
+_RELEASE_PATCH = "release.patch"
 
 
 def _org_mode() -> bool:
@@ -752,6 +759,147 @@ class WorkspaceManager:
                     shutil.rmtree(actual)
             if source.is_dir():
                 self.git.run(source, "worktree", "prune")
+
+    def release(
+        self,
+        key: str,
+        source_path: str,
+        workspace_path: str,
+        kind: WorkspaceKind,
+    ) -> bool:
+        """Remove a task workspace to reclaim disk, keeping what restores it.
+
+        Returns False, leaving the workspace untouched, when it cannot be
+        released safely. Committed work stays reachable through a ref in the
+        source repository; uncommitted work is kept as a full patch.
+        """
+        with self._mutation_lock:
+            if kind == WorkspaceKind.local_copy:
+                try:
+                    return self.local_copies.release(key, Path(workspace_path))
+                except LocalCopyError as exc:
+                    raise WorkspaceError(str(exc)) from exc
+            if kind != WorkspaceKind.git_worktree:
+                return False
+            actual = self._managed_worktree(key, workspace_path)
+            source = Path(source_path)
+            if not actual.exists() or not source.is_dir():
+                return False
+            head = self._head_revision(actual)
+            if head is None or self._has_nested_repository(actual):
+                return False
+            release_dir = self.snapshots_root / managed_key(key)
+            release_dir.mkdir(parents=True, exist_ok=True)
+            patch = self._snapshot_changes(key, actual, "HEAD", _RELEASE_PATCH)
+            if patch is not None and patch.stat().st_size > MAX_RELEASE_PATCH_BYTES:
+                patch.unlink()
+                return False
+            self.git.run(source, "update-ref", self._release_ref(key), head)
+            (release_dir / _RELEASE_METADATA).write_text(
+                json.dumps({"kind": kind.value, "head": head, "patch": patch is not None}),
+                encoding="utf-8",
+            )
+            self.git.run(source, "worktree", "remove", "--force", str(actual))
+            self.git.run(source, "worktree", "prune", check=False)
+            return True
+
+    def restore(
+        self,
+        key: str,
+        source_path: str,
+        workspace_path: str,
+        kind: WorkspaceKind,
+    ) -> None:
+        """Recreate a released workspace at its original path with its changes."""
+        with self._mutation_lock:
+            if kind == WorkspaceKind.local_copy:
+                try:
+                    self.local_copies.restore(key, Path(source_path), Path(workspace_path))
+                except LocalCopyError as exc:
+                    raise WorkspaceError(str(exc)) from exc
+                return
+            if kind != WorkspaceKind.git_worktree:
+                return
+            actual = self._managed_worktree(key, workspace_path)
+            release_dir = self.snapshots_root / managed_key(key)
+            metadata_path = release_dir / _RELEASE_METADATA
+            if not metadata_path.is_file():
+                raise WorkspaceError("This task's workspace was removed and has no saved copy to restore")
+            source = Path(source_path)
+            if not source.is_dir():
+                raise WorkspaceError("The task's source folder is unavailable, so its workspace cannot be restored")
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            # An interrupted release can leave part of the folder behind. The
+            # saved state is complete, so the leftover is replaced.
+            if actual.exists():
+                self.git.run(source, "worktree", "remove", "--force", str(actual), check=False)
+                shutil.rmtree(actual, ignore_errors=True)
+            if actual.exists():
+                raise WorkspaceError("Part of this task's old workspace is still in use. Close programs using it and try again")
+            self.git.run(source, "worktree", "prune", check=False)
+            actual.parent.mkdir(parents=True, exist_ok=True)
+            self.git.run(source, "worktree", "add", "--detach", str(actual), str(metadata["head"]))
+            try:
+                if metadata.get("patch"):
+                    self._apply_patch(actual, release_dir / _RELEASE_PATCH)
+            except Exception:
+                self.git.run(source, "worktree", "remove", "--force", str(actual), check=False)
+                self.git.run(source, "worktree", "prune", check=False)
+                raise
+            self.git.run(source, "update-ref", "-d", self._release_ref(key), check=False)
+            metadata_path.unlink()
+            (release_dir / _RELEASE_PATCH).unlink(missing_ok=True)
+
+    def is_released(self, key: str, kind: WorkspaceKind) -> bool:
+        """Whether saved state exists to rebuild this workspace from."""
+        if kind == WorkspaceKind.local_copy:
+            return self.local_copies.is_released(key)
+        return (self.snapshots_root / managed_key(key) / _RELEASE_METADATA).is_file()
+
+    def discard_release(self, key: str, source_path: str) -> None:
+        """Forget a released workspace's saved state once its task is deleted."""
+        with self._mutation_lock:
+            release_dir = self.snapshots_root / managed_key(key)
+            (release_dir / _RELEASE_METADATA).unlink(missing_ok=True)
+            (release_dir / _RELEASE_PATCH).unlink(missing_ok=True)
+            source = Path(source_path)
+            if source.is_dir() and self._git_root(source) is not None:
+                self.git.run(source, "update-ref", "-d", self._release_ref(key), check=False)
+            self.local_copies.discard_release(key)
+
+    def _has_nested_repository(self, worktree: Path) -> bool:
+        """Whether a repository inside the worktree holds history a patch cannot carry.
+
+        A nested repository's files and commits would be lost when the worktree
+        is removed. One can sit anywhere, including in a tracked directory the
+        parent still sees as clean, so every path Git lists and its parents are
+        checked. A staged or committed nested repository is listed as a single
+        gitlink path. Ignored directories are not checked, as their contents
+        are never saved.
+        """
+        untracked = [path for status, path in self._status_entries(worktree) if status == "??"]
+        tracked = [path for path in self.git.run(worktree, "ls-files", "-z").stdout.split("\0") if path]
+        directories: set[PurePosixPath] = set()
+        for path in (*untracked, *tracked):
+            directories.add(PurePosixPath(path))
+            directories.update(PurePosixPath(path).parents)
+        directories.discard(PurePosixPath("."))
+        return any((worktree / directory / ".git").exists() for directory in directories)
+
+    def _managed_worktree(self, key: str, workspace_path: str) -> Path:
+        relative = managed_key(key)
+        expected = {
+            (self.worktrees_root / relative).resolve(),
+            (self.legacy_worktrees_root / relative).resolve(),
+        }
+        actual = Path(workspace_path).resolve()
+        if actual not in expected:
+            raise WorkspaceError("Refusing to change an unmanaged worktree path")
+        return actual
+
+    @staticmethod
+    def _release_ref(key: str) -> str:
+        return "refs/cowork/released/" + managed_key(key).as_posix()
 
     def prune_task_root(self, session_id: str) -> None:
         """Remove an empty project-task parent without discarding task files."""
