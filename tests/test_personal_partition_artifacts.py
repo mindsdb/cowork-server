@@ -322,13 +322,17 @@ def test_the_operator_view_lists_no_persons_artifacts(two_people):
     """A call with no person (audit mode) is the operator view, LOCAL_SCOPE. It
     reads every project row unfiltered, and a person's project sits outside the
     unkeyed root, but a row with an org_id is never an adopted folder, so the
-    operator view's list does not reach into anyone's partition."""
+    operator view's list does not reach into anyone's partition. (Rows other
+    modules leave behind can list their own artifacts here.)"""
+    dash, notes = two_people
     client = _client()
 
     listed = client.get("/api/v1/artifacts/", headers=BEARER)
 
     assert listed.status_code == 200
-    assert listed.json() == []
+    folders = {Path(card["folder"]).resolve() for card in listed.json()}
+    assert dash.resolve() not in folders and notes.resolve() not in folders
+    assert not any(PARTITION_A in str(folder) for folder in folders)
 
 
 # ── live backends ───────────────────────────────────────────────────────────
