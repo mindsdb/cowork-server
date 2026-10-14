@@ -108,15 +108,21 @@ def _refresh(token: str, organization_id: str, deadline: float) -> None:
         _schedule_retry()
         return
 
-    runtime_credential.set_inference_key(
-        InferenceKey(
-            value=key,
-            organization_id=organization_id,
-            instance_id=instance_id,
-            expires_at=expires_at,
-            workspace_id=workspace_id,
-        )
+    minted = InferenceKey(
+        value=key,
+        organization_id=organization_id,
+        instance_id=instance_id,
+        expires_at=expires_at,
+        workspace_id=workspace_id,
     )
+    # Sign-out doesn't wait for this lock, so the hand-over may be gone by now.
+    if (
+        not runtime_credential.get_minds_credential()
+        or runtime_credential.get_organization() != organization_id
+    ):
+        revoke_inference_key(token, minted)
+        return
+    runtime_credential.set_inference_key(minted)
 
 
 def _drop_key_unless_for(organization_id: str) -> None:
