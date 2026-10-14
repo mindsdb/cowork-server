@@ -16,7 +16,7 @@ from cowork.schemas.projects import (
     ProjectUpdateRequest,
 )
 from cowork.schemas.shared_resources import ProjectCapabilities
-from cowork.api.v1.endpoints.guards import require_local
+from cowork.api.v1.endpoints.guards import LOCAL_REQUESTS_ONLY, require_local
 from cowork.services.projects import (
     GENERAL_PROJECT,
     ProjectNameLockBusyError,
@@ -271,6 +271,10 @@ def require_local_for_chosen_folder(
     try:
         require_local(request)
     except HTTPException as exc:
+        # Host and Origin refusals keep their own detail; only the network
+        # position one gets the wording the folder picker shows.
+        if exc.detail != LOCAL_REQUESTS_ONLY:
+            raise
         raise HTTPException(
             status_code=exc.status_code,
             detail="a chosen project folder needs a request over loopback",
