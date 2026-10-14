@@ -875,3 +875,35 @@ def test_a_failed_clear_does_not_raise(monkeypatch):
     monkeypatch.setattr("cowork.db.session.get_open_session", broken_session)
 
     svc.forget_stale_hub_workspace(org_id=ORG_A, user_id=USER_A, workspace_id=WS_CLIENT_A)
+
+
+def test_a_pinned_desktop_lists_its_own_org_not_the_active_one(session, calls, monkeypatch):
+    monkeypatch.setattr(ep.runtime_credential, "get_organization", lambda: ORG_B)
+    calls.answers[f"/organizations/{ORG_B}/workspaces/"] = _rows()
+
+    view = _view(session, _scope(ORG_A))
+
+    assert calls.asked == [f"/organizations/{ORG_B}/workspaces/"]
+    assert view.reachable is True
+
+
+def test_a_pinned_desktop_mints_for_the_new_workspace_at_once(session, calls, monkeypatch):
+    calls.answers[f"/organizations/{ORG_A}/workspaces/"] = _rows()
+    monkeypatch.setattr(ep.runtime_credential, "get_minds_credential", lambda: "jwt")
+    monkeypatch.setattr(ep.runtime_credential, "get_organization", lambda: ORG_A)
+    minted = []
+    monkeypatch.setattr(ep, "refresh_inference_key", lambda *args: minted.append(args))
+
+    _activate(session, _scope(), WS_CLIENT_A)
+
+    assert minted == [("jwt", ORG_A)]
+
+
+def test_a_switch_without_a_pinned_org_mints_nothing(session, calls, monkeypatch):
+    calls.answers[WORKSPACES] = _rows()
+    minted = []
+    monkeypatch.setattr(ep, "refresh_inference_key", lambda *args: minted.append(args))
+
+    _activate(session, _scope(), WS_CLIENT_A)
+
+    assert minted == []

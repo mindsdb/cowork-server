@@ -155,10 +155,10 @@ async def _current_runtime_minds_credential() -> str:
     the seed captured when the chat session was created. That seed can be an
     expired access token after the desktop refreshes or signs out.
     """
-    credential = runtime_credential.get_minds_credential()
+    credential = runtime_credential.get_inference_credential()
     if credential is None:
         raise _provider_auth_error(
-            "The MindsHub session credential is no longer available."
+            "The MindsHub credential for this organization is not available."
         )
     return credential
 
@@ -788,8 +788,10 @@ async def model_value_rejection(
 
         if getattr(settings, provider_attr, None) != Provider.MINDS_CLOUD:
             return None
-        stored_key = settings.minds_api_key
-        api_key = stored_key.get_secret_value() if stored_key is not None else ""
+        from cowork.common.settings.user_settings import inference_api_key_str
+
+        # The key turns bill with, so validation answers for the billed organization.
+        api_key = inference_api_key_str(settings, Provider.MINDS_CLOUD)
     except Exception:
         # Settings shapes vary across versions/scopes; a resolution failure is
         # not grounds to block a write.
@@ -1043,9 +1045,13 @@ async def warm_enabled_model_map(session, scope=None) -> bool:
 
     scope = scope if scope is not None else LOCAL_SCOPE
     s = SettingService(session, scope).load()
-    if s.minds_api_key is None or not s.minds_url:
+    from cowork.common.settings.user_settings import Provider, inference_api_key_str
+
+    # The key turns bill with, so the stored map is the billed organization's.
+    minds_key = inference_api_key_str(s, Provider.MINDS_CLOUD)
+    if not minds_key or not s.minds_url:
         return False
-    listing = await fetch_minds_models(s.minds_url, s.minds_api_key.get_secret_value())
+    listing = await fetch_minds_models(s.minds_url, minds_key)
     return persist_enabled_model_map(
         session, scope, s.minds_model_enabled, listing.enabled, listing.ids
     )
@@ -1554,6 +1560,7 @@ def build_llm_client(
     from cowork.common.settings.user_settings import (
         Provider,
         get_user_settings,
+        inference_api_key_str,
         provider_api_key,
     )
 
@@ -1617,8 +1624,13 @@ def build_llm_client(
         # or misroute another's key.
         key = provider_api_key(settings, role)
         if role == Provider.MINDS_CLOUD:
+            # The scratchpad keeps this construction-time key, so it must be the pinned one too.
             if key is None:
                 raise ValueError(f"{role.label} API key is not configured")
+            key = SecretStr(inference_api_key_str(settings, role))
+            if not key.get_secret_value():
+                # Pinned with no live key: the same Reconnect card a mid-turn loss shows.
+                raise _provider_auth_error("The MindsHub credential for this organization is not available.")
             # The runtime credential is local-only by contract. A static
             # settings/env key and every org-mode per-turn credential leave
             # this callback unset and keep their existing lifetime.

@@ -26,7 +26,7 @@ from cowork.coding.runtime_protocol import (
     RuntimeLeaseRequest,
 )
 from cowork.coding.service import get_coding_service
-from cowork.common.settings.user_settings import Provider, provider_api_key_str
+from cowork.common.settings.user_settings import Provider, inference_api_key_str
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session as get_db_session
 from cowork.services.settings import SettingService
@@ -266,6 +266,6 @@ async def runtime_inference_proxy(
     settings = SettingService(session, scope).load()
     credentials = EngineCredentials(
         minds_url=settings.minds_url,
-        minds_api_key=provider_api_key_str(settings, Provider.MINDS_CLOUD),
+        minds_api_key=inference_api_key_str(settings, Provider.MINDS_CLOUD),
     )
     return await proxy_inference(request, path, credentials)
