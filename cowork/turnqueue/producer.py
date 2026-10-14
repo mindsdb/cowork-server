@@ -23,7 +23,7 @@ from cowork.handlers.turn_errors import (
     remote_turn_error,
 )
 from cowork.services.providers import minds_chat_base_url
-from cowork.db.scoped import TenantScope
+from cowork.db.scoped import scope_for_identity
 from cowork.services import product_permissions
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.product_permissions import require_product_permission
@@ -37,7 +37,7 @@ from cowork.turnqueue.auth_keys import (
 from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnReply, TurnReplyHeader
 from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.redis_client import cancel_cause_key, cancel_flag_key, get_redis, reply_stream_key
-from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host, get_app_settings
+from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host
 
 logger = logging.getLogger(__name__)
 
@@ -516,7 +516,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     `tool_messages` tells the pod the client renders a tool's message to the
     user (the cowork UI does; channel turns never)."""
     settings = TurnQueueSettings()
-    scope = TenantScope(org_mode=get_app_settings().tenancy_mode == "org" or bool(org_id), org_id=org_id, user_id=user_id)
+    scope = scope_for_identity(org_id=org_id, user_id=user_id)
     await require_product_permission(scope, "product.execute")
     workspace_mode = (
         "persistent" if await product_permissions.has_product_permission(scope, "artifact.manage") else "ephemeral"
@@ -533,7 +533,6 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # a valid minds alias, independent of any harness's built-in default.
     if not model:
         from cowork.common.settings.user_settings import get_user_settings
-        scope = TenantScope(org_mode=get_app_settings().tenancy_mode == "org" or bool(org_id), org_id=org_id, user_id=user_id)
         model = get_user_settings(scope).resolved_planning_model
 
     # Independent network round trips (llm's turn-key mint, oauth's active-

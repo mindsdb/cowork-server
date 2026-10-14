@@ -18,7 +18,7 @@ from anton.core.dispatch import OutboundMessage
 from cowork.handlers._turn_history import reject_unreplayable_tool_rows
 from cowork.build_info import build_trace_metadata
 from cowork.channels.registry import PluginRegistry, get_registry
-from cowork.db.scoped import LOCAL_SCOPE, SYSTEM_SCOPE, ScopedSession, TenantScope, scope_for_background_context, scope_for_org
+from cowork.db.scoped import LOCAL_SCOPE, SYSTEM_SCOPE, ScopedSession, scope_for_background_context, scope_for_org
 from cowork.db.session import get_open_session
 from cowork.db.units import conversation_writes
 from cowork.handlers.responses import ResponsesHandler
@@ -299,7 +299,8 @@ class AntonChannelRuntime:
             # One scope per turn. org_id comes from the webhook's own org
             # resolution (resolve_bridge) — None means local mode, or (in org
             # mode) a genuinely unresolved org, which still fails closed below.
-            scope = TenantScope(org_mode=True, org_id=org_id) if org_id else scope_for_background_context()
+            # An org_id alone never turns org mode on in local tenancy.
+            scope = scope_for_org(org_id) if org_id else scope_for_background_context()
             scoped = ScopedSession(session, scope)
             binding = self._resolve_or_create_binding(scoped, channel_type, event)
             log.info(
