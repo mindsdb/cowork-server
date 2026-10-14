@@ -59,7 +59,7 @@ def worktrees(repository: Path) -> list[str]:
 def test_inner_repositories_become_worktrees_inside_the_folder_copy(tmp_path: Path, folder: Path) -> None:
     manager = WorkspaceManager(tmp_path / "coding")
 
-    prepared = manager.prepare("task", str(folder), allow_direct_folder=True)
+    prepared = manager.prepare("task", str(folder), allow_folder_copy=True)
     workspace = prepared.workspace_path
 
     assert prepared.kind == WorkspaceKind.local_copy
@@ -80,7 +80,7 @@ def test_inner_repositories_become_worktrees_inside_the_folder_copy(tmp_path: Pa
 
 def test_changes_in_repositories_and_loose_files_review_and_apply_back(tmp_path: Path, folder: Path) -> None:
     manager = WorkspaceManager(tmp_path / "coding")
-    workspace = manager.prepare("task", str(folder), allow_direct_folder=True).workspace_path
+    workspace = manager.prepare("task", str(folder), allow_folder_copy=True).workspace_path
     (workspace / "services" / "api" / "server.py").write_text("serve(port=8080)\n", encoding="utf-8")
     (workspace / "plan.md").write_text("plan v2\n", encoding="utf-8")
 
@@ -101,8 +101,8 @@ def test_cleanup_and_release_forget_only_their_own_worktrees(tmp_path: Path, fol
     stale = tmp_path / "someone-elses-worktree"
     git(folder / "app", "worktree", "add", "--detach", str(stale))
     subprocess.run(["rm", "-rf", str(stale)], check=True)
-    first = manager.prepare("first", str(folder), allow_direct_folder=True).workspace_path
-    second = manager.prepare("second", str(folder), allow_direct_folder=True).workspace_path
+    first = manager.prepare("first", str(folder), allow_folder_copy=True).workspace_path
+    second = manager.prepare("second", str(folder), allow_folder_copy=True).workspace_path
     assert len(worktrees(folder / "app")) == 4
 
     manager.cleanup("first", str(folder), str(first), WorkspaceKind.local_copy, None)
@@ -114,7 +114,7 @@ def test_cleanup_and_release_forget_only_their_own_worktrees(tmp_path: Path, fol
 
 def test_a_released_repository_folder_restores_as_worktrees_with_its_changes(tmp_path: Path, folder: Path) -> None:
     manager = WorkspaceManager(tmp_path / "coding")
-    workspace = manager.prepare("task", str(folder), allow_direct_folder=True).workspace_path
+    workspace = manager.prepare("task", str(folder), allow_folder_copy=True).workspace_path
     (workspace / "app" / "src" / "main.py").write_text("print('task')\n", encoding="utf-8")
     (workspace / "docs" / "new.md").write_text("new\n", encoding="utf-8")
     before = {(item.path, item.status) for item in manager.diff(str(workspace), None)}
@@ -129,7 +129,7 @@ def test_a_released_repository_folder_restores_as_worktrees_with_its_changes(tmp
 
 def test_commits_in_an_inner_worktree_survive_release_and_restore(tmp_path: Path, folder: Path) -> None:
     manager = WorkspaceManager(tmp_path / "coding")
-    workspace = manager.prepare("task", str(folder), allow_direct_folder=True).workspace_path
+    workspace = manager.prepare("task", str(folder), allow_folder_copy=True).workspace_path
     api = workspace / "services" / "api"
     (api / "server.py").write_text("serve(port=8080)\n", encoding="utf-8")
     git(api, "commit", "-qam", "task commit")
@@ -149,7 +149,7 @@ def test_commits_in_an_inner_worktree_survive_release_and_restore(tmp_path: Path
 
 def test_deleting_a_released_repository_folder_forgets_its_pinned_commits(tmp_path: Path, folder: Path) -> None:
     manager = WorkspaceManager(tmp_path / "coding")
-    workspace = manager.prepare("task", str(folder), allow_direct_folder=True).workspace_path
+    workspace = manager.prepare("task", str(folder), allow_folder_copy=True).workspace_path
     assert manager.release("task", str(folder), str(workspace), WorkspaceKind.local_copy) is True
     assert git(folder / "app", "for-each-ref", "refs/cowork")
 
@@ -161,7 +161,7 @@ def test_deleting_a_released_repository_folder_forgets_its_pinned_commits(tmp_pa
 
 def test_a_repository_folder_is_kept_when_a_checkout_holds_a_nested_repository(tmp_path: Path, folder: Path) -> None:
     manager = WorkspaceManager(tmp_path / "coding")
-    workspace = manager.prepare("task", str(folder), allow_direct_folder=True).workspace_path
+    workspace = manager.prepare("task", str(folder), allow_folder_copy=True).workspace_path
     git(workspace / "app" / "src", "init", "-q")
 
     assert manager.release("task", str(folder), str(workspace), WorkspaceKind.local_copy) is False
@@ -171,7 +171,7 @@ def test_a_repository_folder_is_kept_when_a_checkout_holds_a_nested_repository(t
 
 def test_a_fork_gets_its_own_worktrees_and_inherits_the_parent_changes(tmp_path: Path, folder: Path) -> None:
     manager = WorkspaceManager(tmp_path / "coding")
-    parent = manager.prepare("parent", str(folder), allow_direct_folder=True).workspace_path
+    parent = manager.prepare("parent", str(folder), allow_folder_copy=True).workspace_path
     (parent / "services" / "api" / "server.py").write_text("forked()\n", encoding="utf-8")
 
     child = manager.fork("child", str(folder), str(parent), WorkspaceKind.local_copy, None).workspace_path
@@ -193,7 +193,7 @@ def test_a_repository_whose_changes_cannot_be_carried_is_copied_instead(
     monkeypatch.setattr(source_changes, "copy_source_changes", refuse)
     manager = WorkspaceManager(tmp_path / "coding")
 
-    workspace = manager.prepare("task", str(folder), allow_direct_folder=True).workspace_path
+    workspace = manager.prepare("task", str(folder), allow_folder_copy=True).workspace_path
 
     assert (workspace / "app" / ".git").is_dir()
     assert (workspace / "app" / "src" / "main.py").read_text(encoding="utf-8") == "print('dirty')\n"
@@ -211,7 +211,7 @@ def test_without_git_a_repository_folder_is_copied_as_before(
 
     monkeypatch.setattr(manager.git, "run", no_git)
 
-    workspace = manager.prepare("task", str(folder), allow_direct_folder=True).workspace_path
+    workspace = manager.prepare("task", str(folder), allow_folder_copy=True).workspace_path
 
     assert (workspace / "app" / ".git").is_dir()
     assert (workspace / "node_modules").is_dir()
@@ -225,7 +225,7 @@ def test_a_repository_folder_with_a_copied_repository_is_kept(
 
     monkeypatch.setattr(source_changes, "copy_source_changes", refuse)
     manager = WorkspaceManager(tmp_path / "coding")
-    workspace = manager.prepare("task", str(folder), allow_direct_folder=True).workspace_path
+    workspace = manager.prepare("task", str(folder), allow_folder_copy=True).workspace_path
     assert (workspace / "app" / ".git").is_dir()
 
     assert manager.release("task", str(folder), str(workspace), WorkspaceKind.local_copy) is False
