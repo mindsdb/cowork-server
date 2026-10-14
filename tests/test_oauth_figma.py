@@ -71,16 +71,23 @@ def test_credentials_resolve_from_figma_settings():
 
 
 def test_spec_uses_basic_auth_and_no_revoke():
-    method = _builtin_method()
-    oauth = method["oauth"]
+    oauth = _builtin_method()["oauth"]
 
-    assert method["hidden"] is True
     assert oauth["token_url"] == "https://api.figma.com/v1/oauth/token"
     assert oauth["token_auth_style"] == "basic"
     assert oauth["supports_revoke"] is False
     assert "revoke_url" not in oauth
     assert oauth["service_id"] == "figma"
     assert oauth["redirect_port"] == 47295
+
+
+def test_oauth_is_the_recommended_visible_method_with_a_notice():
+    spec = json.loads(_SPEC.read_text())
+    visible = [m for m in spec["form"]["methods"] if not m.get("hidden")]
+
+    assert [m["id"] for m in visible if m.get("recommended")] == ["browser_oauth_builtin"]
+    assert spec["featured"] is True
+    assert "approval" in spec["notice"]
 
 
 def test_spec_requests_only_read_scopes():
