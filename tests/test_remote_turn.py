@@ -7,6 +7,7 @@ from uuid import uuid4
 import pytest
 
 import cowork.turnqueue.remote_turn as remote_turn_mod
+from cowork.harnesses.anton_harness.stream_formatter import TurnQuestion
 from cowork.turnqueue.remote_turn import RemoteTurnFailed, remote_turn_events
 
 
@@ -37,13 +38,35 @@ def _fake_handler(
 
 
 async def _drain(gen):
+    """The turn's events after the question every turn opens with, which
+    test_the_turn_opens_with_its_question pins."""
     events = []
     try:
         async for event in gen:
-            events.append(event)
+            if not isinstance(event, TurnQuestion):
+                events.append(event)
     except RemoteTurnFailed as exc:
         return events, exc
     return events, None
+
+
+@pytest.mark.asyncio
+async def test_the_turn_opens_with_its_question(monkeypatch):
+    _fake_handler(monkeypatch)
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "There are 250."}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    events = [event async for event in remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="How many at S1?", model="anton", turn_rows=[],
+    )]
+
+    assert events[0] == TurnQuestion(text="How many at S1?")
+    assert not any(isinstance(event, TurnQuestion) for event in events[1:])
 
 
 @pytest.mark.asyncio

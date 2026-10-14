@@ -7,6 +7,7 @@ Emits typed events:
     response.output_text.delta  (assistant text deltas)
     response.answer_reset       (drop the answer so far; the next delta replaces it)
     response.answer_restore     (a hand-back gives back the answer a reset dropped)
+    response.figure_sources     (each figure in the answer and the steps it came from)
     response.completed          (final response object)
     response.failed             (error)
 """
@@ -14,11 +15,13 @@ Emits typed events:
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 from dataclasses import dataclass
 from typing import AsyncIterator, Callable, Optional
 
+from cowork.harnesses.anton_harness.figure_sources import TurnStep, find_figure_sources
 from cowork.schemas.responses import (
     Response,
     ResponseOutput,
@@ -27,6 +30,8 @@ from cowork.schemas.responses import (
     Role,
 )
 from cowork.streaming.liveness import MODEL_WAIT_PHASE, model_wait_sse
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -50,6 +55,16 @@ class TurnHistory:
     existing thought events, so these rows are for LLM-history replay only."""
 
     rows: list
+
+
+@dataclass
+class TurnQuestion:
+    """Synthetic pre-turn event: the text of the question the turn answers.
+    Every producer of a turn's stream yields it first. Never emitted as SSE:
+    the formatter keeps it so that a figure the answer repeats from the
+    question is marked as the question's rather than as having no source."""
+
+    text: str
 
 
 @dataclass
@@ -226,6 +241,11 @@ async def format_responses_stream(
     # arrives. Every other generic tool keeps falling through to the plain
     # thought.progress role, unchanged.
     progress_tool_ids: set[str] = set()
+    # Each tool call's arguments and each result, kept to find where the
+    # answer's figures came from once the answer is final.
+    tool_inputs: dict[str, str] = {}
+    turn_steps: list[TurnStep] = []
+    question = ""
 
     resp = Response(id=resp_id, model=model, status=ResponseStatus.created)
     seq += 1
@@ -318,6 +338,7 @@ async def format_responses_stream(
             name = tool_names.get(event.id, "")
             parts = tool_json_parts.pop(event.id, [])
             accumulated = "".join(parts)
+            tool_inputs[event.id] = accumulated
             if "scratchpad" in name:
                 role = Role.thought_scratchpad_end.value
             elif "memorize" in name:
@@ -363,6 +384,14 @@ async def format_responses_stream(
             })
 
         elif isinstance(event, StreamToolResult):
+            tool_use_id = getattr(event, "id", None) or ""
+            turn_steps.append(TurnStep(
+                tool_use_id=tool_use_id,
+                tool_name=getattr(event, "name", "") or "",
+                action=getattr(event, "action", "") or "",
+                tool_input=tool_inputs.get(tool_use_id, ""),
+                content=event.content,
+            ))
             seq += 1
             yield _event("response.in_progress", {
                 "type": "response.in_progress",
@@ -600,6 +629,9 @@ async def format_responses_stream(
                 except Exception:
                     pass
 
+        elif isinstance(event, TurnQuestion):
+            question = event.text
+
         elif isinstance(event, SkillCreated):
             seq += 1
             yield _event("response.skill_created", {
@@ -633,6 +665,21 @@ async def format_responses_stream(
             round_had_text = False
 
     full_text = "".join(collected_text)
+    try:
+        figures = find_figure_sources(answer=full_text, question=question, steps=turn_steps)
+    except Exception:
+        # The sources annotate an answer that is already whole; failing to
+        # find them must not fail the answer.
+        logger.exception("[stream_formatter] could not find the answer's figure sources")
+        figures = []
+    if figures:
+        seq += 1
+        yield _event("response.figure_sources", {
+            "type": "response.figure_sources",
+            "sequence_number": seq,
+            "item_id": msg_id,
+            "figures": [figure.model_dump(mode="json") for figure in figures],
+        })
     resp_completed = Response(
         id=resp_id,
         model=model,

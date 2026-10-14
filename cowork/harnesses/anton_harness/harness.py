@@ -21,7 +21,14 @@ from cowork.common.settings.user_settings import current_settings_scope
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.units import run_db, run_to_completion, unit_session
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
-from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
+from cowork.harnesses.anton_harness.figure_sources import question_text
+from cowork.harnesses.anton_harness.stream_formatter import (
+    ArtifactCreated,
+    SkillCreated,
+    TurnHistory,
+    TurnQuestion,
+    format_responses_stream,
+)
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
 from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REPLAY_ROLES, extract_scratchpad_cells
@@ -725,6 +732,7 @@ class AntonHarness:
                 turn_kwargs["trace_tags"] = trace_tags
             if "trace_metadata" in _turn_params:
                 turn_kwargs["trace_metadata"] = trace_metadata
+            yield TurnQuestion(text=question_text(list(input)))
             async for event in session.turn_stream(self._to_anton_input(input), **turn_kwargs):
                 # Under context pressure anton summarizes history mid-turn,
                 # reassigning session.history and invalidating seed_len.

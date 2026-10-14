@@ -41,7 +41,8 @@ from cowork.handlers.response_routing import (
     decide_route,
     ineligible_reason,
 )
-from cowork.harnesses.anton_harness.stream_formatter import SkillCreated, format_responses_stream
+from cowork.harnesses.anton_harness.figure_sources import question_text
+from cowork.harnesses.anton_harness.stream_formatter import SkillCreated, TurnQuestion, format_responses_stream
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.streaming import StreamBuffer, TurnLifecycle, new_buffer, registry, sse_frame
@@ -1881,6 +1882,8 @@ class ResponsesHandler:
                 publish_and_card_turn_artifacts,
                 snapshot_artifact_state,
             )
+
+            yield TurnQuestion(text=question_text(original_content))
 
             # Read once and held for the whole turn: the pod counts its
             # compaction against exactly the history seeded here, so
