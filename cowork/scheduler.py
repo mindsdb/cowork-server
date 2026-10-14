@@ -320,7 +320,18 @@ def _claim_slot(session: ScopedSession, schedule: Schedule) -> UUID | None:
 
 
 def claim_manual_run(session: ScopedSession, schedule_id: UUID) -> UUID | None:
-    """Claim a run-now occurrence, or None while the schedule is busy."""
+    """Claim a run-now occurrence, or None while the schedule is busy.
+
+    Running a one-off now uses it up: it is disabled in the same commit as the
+    claim, so its scheduled slot does not fire a second time. A refused claim
+    rolls that back and leaves the one-off as it was. A recurring schedule
+    keeps its slot; the freshness guard skips a slot due right after a manual
+    success.
+    """
+    schedule = session.get(Schedule, schedule_id)
+    if schedule is not None and schedule.cadence == Cadence.once and schedule.enabled:
+        schedule.enabled = False
+        session.add(schedule)
     occurrence = ScheduleOccurrenceService(session).claim(
         schedule_id,
         occurrence_key=f"manual:{uuid4()}",

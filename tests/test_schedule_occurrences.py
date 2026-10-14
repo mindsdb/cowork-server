@@ -734,3 +734,49 @@ def test_resume_clears_the_auto_pause_and_keeps_the_history(tmp_path):
 
     assert len(_runs(engine, schedule_id)) == _MAX_FAILED_OCCURRENCES
     assert len(_occurrences(engine, schedule_id)) == _MAX_FAILED_OCCURRENCES
+
+
+# --- Run now on a one-off -----------------------------------------------------
+
+
+def test_running_a_one_off_now_uses_it_up(tmp_path):
+    """Its scheduled slot must not fire a second time after a manual run."""
+    from cowork.scheduler import _due_schedules, claim_manual_run
+
+    engine = _engine(tmp_path)
+    schedule_id = _schedule(engine, cadence="once", next_run_at=datetime.now(timezone.utc) + timedelta(days=1))
+
+    with Session(engine) as session:
+        assert claim_manual_run(_scoped(session), schedule_id) is not None
+    with Session(engine) as session:
+        assert session.get(Schedule, schedule_id).enabled is False
+        later = datetime.now(timezone.utc) + timedelta(days=2)
+        assert _due_schedules(_scoped(session), later) == []
+
+
+def test_a_refused_run_now_leaves_the_one_off_enabled(tmp_path):
+    from cowork.scheduler import claim_manual_run
+
+    engine = _engine(tmp_path)
+    schedule_id = _schedule(engine, cadence="once", next_run_at=datetime.now(timezone.utc) + timedelta(days=1))
+    _claim(engine, schedule_id, "slot:busy")
+
+    with Session(engine) as session:
+        assert claim_manual_run(_scoped(session), schedule_id) is None
+    with Session(engine) as session:
+        assert session.get(Schedule, schedule_id).enabled is True
+
+
+def test_running_a_recurring_schedule_now_keeps_its_slot(tmp_path):
+    from cowork.scheduler import claim_manual_run
+
+    engine = _engine(tmp_path)
+    slot = datetime.now(timezone.utc) + timedelta(hours=3)
+    schedule_id = _schedule(engine, cadence="daily", next_run_at=slot)
+
+    with Session(engine) as session:
+        assert claim_manual_run(_scoped(session), schedule_id) is not None
+    with Session(engine) as session:
+        schedule = session.get(Schedule, schedule_id)
+        assert schedule.enabled is True
+        assert schedule.next_run_at.replace(tzinfo=timezone.utc) == slot
