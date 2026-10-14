@@ -1,0 +1,116 @@
+from datetime import datetime
+from typing import Literal
+from uuid import UUID
+
+from pydantic import Field, field_validator
+
+from cowork.schemas.base import CamelRequest, CamelResponse
+
+# Longer than the folder name keeps (see `_carried_folder_name`).
+_MODEL_LABEL_MAX = 80
+
+
+class ComparisonSideRequest(CamelRequest):
+    model: str = Field(min_length=1, max_length=255)
+    reasoning_effort: str | None = Field(default=None, max_length=32)
+
+
+class ComparisonCreateRequest(CamelRequest):
+    title: str = Field(default="", max_length=2000, description="The first prompt; shortened for the history list")
+    sides: list[ComparisonSideRequest] = Field(min_length=2, max_length=2)
+    source_project_id: UUID | None = Field(
+        default=None, description="Copy this project's files into both sides; omit for an empty start"
+    )
+
+
+class ComparisonVerdictRequest(CamelRequest):
+    winner: Literal["a", "b", "tie", "neither"]
+
+
+class ComparisonContinueRequest(CamelRequest):
+    project_id: UUID
+    #: The model's name as the screen shows it, for the folder the side's work
+    #: lands in. Only a name: it is cleaned and shortened before it touches a
+    #: path, so a long one is shortened here rather than refused.
+    model_label: str | None = None
+
+    @field_validator("model_label", mode="before")
+    @classmethod
+    def _shorten_model_label(cls, value: object) -> object:
+        return value[:_MODEL_LABEL_MAX] if isinstance(value, str) else value
+
+
+class ComparisonSideResponse(CamelResponse):
+    label: str
+    model: str
+    reasoning_effort: str | None = None
+    project_id: UUID
+    conversation_id: UUID
+    turn_count: int
+    continued_at: datetime | None = None
+    continued_turn_count: int | None = None
+    #: Continue left some of the side's work behind; continuing again into
+    #: `continued_project_id` carries the rest.
+    carry_incomplete: bool = False
+    #: The project the continued side's task is in; None until continued.
+    continued_project_id: UUID | None = None
+    #: The side's cost as last read, for the history list; None until it has been.
+    usage: "SideUsageSnapshot | None" = None
+
+
+class SideUsageSnapshot(CamelResponse):
+    estimated_cost_usd: float | None = None
+    tokens: int = 0
+    #: The figure leaves something out (unpriced calls, the gateway's cap).
+    partial: bool = False
+
+
+class ComparisonVerdictResponse(CamelResponse):
+    turn_index: int
+    winner: str
+    modified_at: datetime | None = None
+
+
+class ComparisonResponse(CamelResponse):
+    id: UUID
+    title: str
+    created_at: datetime | None
+    source_project_id: UUID | None = None
+    source_project_label: str | None = None
+    sides: list[ComparisonSideResponse]
+    verdicts: list[ComparisonVerdictResponse]
+    #: The latest judged turn's winner, or None before the first verdict.
+    verdict: str | None = None
+
+
+class TurnUsage(CamelResponse):
+    turn: int
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_write_tokens: int = 0
+    #: List-price estimate over this turn's priced calls; None when none were priced.
+    estimated_cost_usd: float | None = None
+    unpriced_calls: int = 0
+
+
+class SideUsage(CamelResponse):
+    #: False when the gateway had nothing for this side: no MindsHub calls (a
+    #: BYOK model), a gateway without the usage route, or a failed read.
+    available: bool
+    turns: list[TurnUsage] = Field(default_factory=list)
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_write_tokens: int = 0
+    estimated_cost_usd: float | None = None
+    unpriced_calls: int = 0
+    #: The gateway stopped at its row cap, so the totals are a floor.
+    truncated: bool = False
+
+
+class ComparisonUsageResponse(CamelResponse):
+    sides: dict[str, SideUsage]
+
+
+ComparisonSideResponse.model_rebuild()
