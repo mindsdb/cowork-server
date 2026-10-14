@@ -92,6 +92,18 @@ def test_refused_on_an_anton_without_the_managed_memory_layer(managed_dir, monke
         cowork_server.create_app()
 
 
+def test_the_installed_anton_takes_the_managed_memory_layer():
+    """Unstubbed on purpose: every other managed-folder test swaps in a Cortex
+    that takes managed_hc (the managed_dir fixture), so only this one sees the
+    anton the lockfile installs. A stack that sets COWORK_MANAGED_DIR refuses
+    to start on an anton without it, so a stale pin must fail here first."""
+    assert cortex_takes_managed_layer(), (
+        "the pinned anton-agent's Cortex takes no managed_hc: move the anton pin "
+        "(the pyproject.toml floor, its [tool.uv.sources] rev and uv.lock) to a "
+        "release that has it"
+    )
+
+
 def test_a_complete_folder_starts_and_says_what_it_holds(managed_dir, caplog, owned_logger):
     (managed_dir.skills_dir / "team-report").mkdir()
     (managed_dir.skills_dir / "team-report" / "SKILL.md").write_text(
