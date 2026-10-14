@@ -99,6 +99,8 @@ class ScheduleResponse(CamelResponse):
     # Not a Schedule column — endpoints fill it from ScheduleRunService so the
     # UI can show an in-flight run (manual or cron).
     running: bool = False
+    # Also filled by the endpoints: when a failed run will be tried again.
+    retry_at: datetime | None = None
     created_at: datetime | None
     modified_at: datetime | None
 

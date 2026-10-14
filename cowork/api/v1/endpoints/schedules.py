@@ -13,7 +13,7 @@ from cowork.schemas.schedules import (
     ScheduleRunResponse,
     ScheduleUpdateRequest,
 )
-from cowork.services.schedules import ScheduleRunService, ScheduleService
+from cowork.services.schedules import ScheduleOccurrenceService, ScheduleRunService, ScheduleService
 
 # AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
 # closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
@@ -25,9 +25,11 @@ router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
 def _serialize(schedule, scoped) -> dict:
-    """ScheduleResponse plus the live `running` flag (any in-flight run)."""
+    """ScheduleResponse plus the live state: `running` (any in-flight run) and
+    `retryAt` (a failed run waiting to be tried again)."""
     data = ScheduleResponse.serialize(schedule)
     data["running"] = ScheduleRunService(scoped).has_active_run(schedule.id)
+    data["retryAt"] = ScheduleOccurrenceService(scoped).pending_retry_at(schedule.id)
     return data
 
 
@@ -114,9 +116,14 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     # to retry) refuses a second run rather than overlapping it.
     occurrence_id = claim_manual_run(scoped, schedule.id)
     if occurrence_id is None:
+        retrying = ScheduleOccurrenceService(scoped).pending_retry_at(schedule.id) is not None
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="This task is already running. Wait for it to finish, then run it again.",
+            detail=(
+                "This task's last run failed and is waiting to try again. Run it after that retry finishes."
+                if retrying
+                else "This task is already running. Wait for it to finish, then run it again."
+            ),
         )
 
     conversation = ConversationService(scoped).create_conversation(
