@@ -6,6 +6,8 @@ See also: the [Cowork Server API for Agents](https://docs.google.com/document/d/
 
 ## Architecture
 
+> Note (2026-09-10, ENG-2608): the Hermes harness described below was removed; Anton is the only shipped harness. Kept as historical rationale for the harness abstraction.
+
 The core idea: decouple the agent from the application. The server defines a harness-agnostic API contract, and each agent (Anton, Hermes, etc.) is a concrete `HarnessProvider` registered via a decorator. The server handles conversations, projects, settings, schedules, and pins as **app components**. The harness is responsible only for streaming responses, memory, and skills.
 
 `HarnessProvider` (`harnesses/base.py`) is a Protocol defining `stream_response()`, `sync_skills()`, `overwrite_memory()`, `retrieve_memory()`, `delete_memory()`, and `list_memory()`. Harnesses register with `@register` and are instantiated by name via `get_harness()`.
@@ -42,7 +44,7 @@ Key structural API changes from the design doc:
 - Connectors/data vault — `LocalDataVault` from Anton core, filesystem-based encrypted credentials.
 
 **Rethought:**
-- **Conversations and messages** — previously stored as episodes on the filesystem by Anton's `HistoryStore`. Now first-class DB entities. Messages are persisted during streaming with a companion `message_events` table that stores the raw SSE event log for replay.
+- **Conversations and messages** — previously stored as episodes on the filesystem by Anton's `HistoryStore`. Now first-class DB entities. Messages are persisted during streaming with a companion `message_events` table that stores the SSE event log for replay, with each run of adjacent text deltas stored as one merged delta.
 - **Settings** — previously `~/.anton/.env` parsed by both Electron and the Python server. Now a DB `settings` table with encryption for sensitive values. A one-time migration reads the old `.env` and seeds the DB (read-only, non-destructive).
 - **Memory** — the design doc noted memory is harness-specific. `MemoryService` is a pass-through that delegates to whichever `HarnessProvider` is active. Anton uses its `Cortex`/`Hippocampus` system with files on disk; Hermes has its own implementation. No shared DB table.
 - **Skills** — canonical `SKILL.md` files (`~/.cowork/skills/<slug>/`) so they can be edited, uploaded, and distributed per project via symlinks. 

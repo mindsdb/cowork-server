@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import importlib.util
+import logging
 import os
 import re
 import sys
@@ -25,7 +26,7 @@ from cowork.coding.contracts import (
     RuntimePlatformStatus,
     TerminalShellPreference,
 )
-from cowork.coding.control_errors import ModelDiscoveryAuthenticationError
+from cowork.coding.control_errors import ModelDiscoveryAuthenticationError, ModelDiscoveryUnavailableError
 from cowork.coding.engines import codex_config, codex_events
 from cowork.coding.engines.base import (
     ApprovalHandler,
@@ -37,6 +38,7 @@ from cowork.coding.engines.base import (
     TerminalOutputHandler,
 )
 from cowork.coding.engines.codex_extensions import add_extension_response
+from cowork.coding.engines.codex_models import model_catalog
 from cowork.coding.processes import (
     TERMINAL_ENV_MARKER,
     executable_name,
@@ -47,6 +49,7 @@ from cowork.coding.processes import (
 from cowork.coding.redaction import redact_text, sanitize
 from cowork.common.settings.app_settings import get_app_settings
 
+logger = logging.getLogger(__name__)
 ADAPTER_VERSION = "1"
 
 _EXPECTED_ACTIVE_TURN = re.compile(r"expected active turn id `([^`]+)`")
@@ -95,6 +98,8 @@ class CodexEngine:
                 "terminal": "supported",
                 "goals": "supported",
                 "forking": "supported",
+                "planning": "supported",
+                "questions": "supported",
             },
             commands=[
                 EngineCommand(name="goal", label="Goal", description="View it alone, or set, edit, pause, resume, or clear a durable objective", argument_hint="set|edit|pause|resume|clear", action="goal"),
@@ -149,12 +154,24 @@ class CodexEngine:
                         "or switch back to the environment you signed into."
                     ) from exc
                 raise
-            payload = response.json()
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                # A decode error names bytes, not a cause the user can act on.
+                # Keep the transport details for diagnosis instead.
+                logger.warning(
+                    "MindsHub model list was not JSON (status %s, content-type %r, content-encoding %r, first bytes %r)",
+                    response.status_code,
+                    response.headers.get("content-type"),
+                    response.headers.get("content-encoding"),
+                    response.content[:8],
+                )
+                raise ModelDiscoveryUnavailableError("Couldn't load models from MindsHub. Try again.") from exc
         models: list[str] = []
         for row in payload.get("data", []) if isinstance(payload, dict) else []:
             if not isinstance(row, dict) or not isinstance(row.get("id"), str):
                 continue
-            if row.get("embedding") is True:
+            if row.get("kind") == "decision" or row.get("embedding") is True:
                 continue
             # Discovery describes what the MindsHub Responses API can run, not
             # what the current wallet can start right now. Keep disabled rows
@@ -212,6 +229,7 @@ class CodexEngineSession:
         )
         self._skill_roots = None if config.skill_roots is None else tuple(config.skill_roots)
         self._model = config.model
+        self._task_mode = config.task_mode
         self._reasoning_effort = config.reasoning_effort
         self._service_tier = config.service_tier
         self._personality = config.personality
@@ -230,8 +248,19 @@ class CodexEngineSession:
         # a turn-completion reap recognises terminal tabs by it.
         self._terminal_commands: set[tuple[str, ...]] = set()
         self._goal_states: dict[str, Any] = {}
-        self._client.start()
+        self._catalog_resources = contextlib.ExitStack()
         try:
+            catalog_path = self._catalog_resources.enter_context(model_catalog(
+                endpoint,
+                config.inference_api_key or codex_config.LOCAL_PROXY_TOKEN,
+                client_config.client_version,
+                config.model,
+            ))
+            if catalog_path:
+                client_config.config_overrides += (
+                    f"model_catalog_json={codex_config.toml_string(str(catalog_path))}",
+                )
+            self._client.start()
             self._client.initialize()
             self._register_skill_roots()
             if existing_session_id:
@@ -239,7 +268,10 @@ class CodexEngineSession:
             else:
                 response = self._client.thread_start(launch.thread_params)
         except Exception:
-            self._client.close()
+            try:
+                self._client.close()
+            finally:
+                self._catalog_resources.close()
             raise
         self._session_id = response.thread.id
         self._notification_thread = threading.Thread(
@@ -275,6 +307,14 @@ class CodexEngineSession:
                 "approvalsReviewer": "user",
                 "sandboxPolicy": self._sandbox_policy,
                 "summary": "concise",
+                "collaborationMode": {
+                    "mode": "plan" if self._task_mode == "plan" else "default",
+                    "settings": {
+                        "model": self._model,
+                        "reasoning_effort": self._reasoning_effort,
+                        "developer_instructions": None,
+                    },
+                },
             },
         )
         return response.turn.id
@@ -713,7 +753,10 @@ class CodexEngineSession:
         try:
             terminate_descendants(self._app_server_pid())
         finally:
-            self._client.close()
+            try:
+                self._client.close()
+            finally:
+                self._catalog_resources.close()
 
     def _cancel_watchdog(self, watch: _CancelWatch) -> None:
         if not self._settled(watch.acknowledged, _CANCEL_WATCHDOG_TIMEOUT_SECONDS):

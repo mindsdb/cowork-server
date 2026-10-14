@@ -23,6 +23,8 @@ SMOKE_SOURCE = (
     ROOT / "tests/integration/test_production_read_only.py"
 ).read_text()
 README = (ROOT / "README.md").read_text()
+NIGHTLY_CRON = "43 7 * * *"
+SCHEDULE_HOLD = "The nightly schedule is held out of the workflow until those checks pass."
 EXPECTED_SMOKE_ENV = {
     "COWORK_BASE_URL": "https://cowork.mindshub.ai",
     "COWORK_REQUIRE_INTEGRATION": "true",
@@ -49,13 +51,35 @@ class _Response:
         return self._payload
 
 
-def test_workflow_is_nightly_manual_and_prod_scoped() -> None:
+def test_the_schedule_is_live_exactly_when_the_readme_says_it_is() -> None:
+    """The trigger and the prose that governs it move together, or neither does.
+
+    GitHub arms a `schedule:` trigger the moment the file reaches the default
+    branch. This workflow shipped to `main` carrying one while the README still
+    forbade enabling it and nobody had provisioned `prod-read-only`, so the
+    monitor's only run in its first ten days was a failure against an Environment
+    GitHub auto-created, empty, one second after the run began.
+
+    Whoever turns the schedule on has to delete the hold paragraph, and whoever
+    deletes the paragraph has to turn the schedule on. Both directions fail here.
+    """
     workflow = yaml.safe_load(WORKFLOW)
     triggers = workflow.get("on", workflow.get(True))
-    assert triggers == {
-        "schedule": [{"cron": "43 7 * * *"}],
-        "workflow_dispatch": None,
-    }
+    held = SCHEDULE_HOLD in " ".join(README.split())
+    assert ("schedule" in triggers) is not held, (
+        "The workflow's schedule and the README's hold paragraph disagree. "
+        "Restore the cron and delete the paragraph in one change, or keep both."
+    )
+    assert "workflow_dispatch" in triggers, (
+        "An operator has to be able to dispatch this by hand to verify a freshly "
+        "provisioned Environment before the unattended run starts."
+    )
+    if not held:
+        assert triggers["schedule"] == [{"cron": NIGHTLY_CRON}]
+
+
+def test_workflow_is_manual_and_prod_scoped() -> None:
+    workflow = yaml.safe_load(WORKFLOW)
     assert workflow["concurrency"] == {
         "group": "nightly-production-read-only",
         "cancel-in-progress": False,

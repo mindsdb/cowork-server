@@ -83,7 +83,7 @@ def run_dev_setup() -> None:
             session.commit()
 
     # Migrate .env settings to DB (one-time, idempotent).
-    from cowork.migrations import backfill_minds_url
+    from cowork.migrations import backfill_minds_url, normalize_retired_harness_rows
 
     with SQLSession(engine) as session:
         _migrate_env_to_db_if_local(session)
@@ -92,11 +92,14 @@ def run_dev_setup() -> None:
         # runs every boot (not gated by the env-migration sentinel, since
         # affected users already passed it).
         backfill_minds_url(session)
+        # Repair settings rows naming a harness we no longer ship, so the
+        # read-side tolerance in UserSettings is a fallback, not the norm.
+        normalize_retired_harness_rows(session)
 
-    # Migrate harness-local memory into ~/.cowork/memory, then wire runtime
-    # symlinks. Desktop-only: both write the unkeyed root; org-mode memory is
-    # org-first under the shared root and created on demand.
-    import cowork.harnesses  # noqa: F401 — registers memory adapters
+    # Migrate harness-local memory into ~/.cowork/memory, then create the
+    # canonical slot files. Desktop-only: both write the unkeyed root; org-mode
+    # memory is org-first under the shared root and created on demand.
+    import cowork.harnesses  # noqa: F401 — registers harnesses and any memory adapters
 
     if settings.tenancy_mode != "org":
         from cowork.harnesses.memory.migration import migrate_harness_memory_to_shared

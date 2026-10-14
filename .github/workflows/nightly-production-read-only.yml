@@ -1,9 +1,19 @@
 name: Nightly Production Read-only Smoke
 
+# The schedule is held. GitHub arms a `schedule:` trigger the moment the file is
+# on the default branch, and this monitor's `prod-read-only` Environment has
+# never been provisioned, so every nightly run fails on the missing identity and
+# pages as though production were down. `workflow_dispatch` stays so an operator
+# can verify a freshly provisioned Environment by hand before the unattended run
+# starts. Restoring the schedule means adding back:
+#
+#   schedule:
+#     # Off the hour so this monitor does not join the busiest Actions queue.
+#     - cron: "43 7 * * *"
+#
+# and deleting the hold paragraph in README.md in the same change. A contract
+# test fails if only one of the two happens.
 on:
-  schedule:
-    # Off the hour so this monitor does not join the busiest Actions queue.
-    - cron: "43 7 * * *"
   workflow_dispatch:
 
 concurrency:

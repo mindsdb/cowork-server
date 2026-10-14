@@ -29,6 +29,8 @@ class Role(str, Enum):
     thought_tool_call_start = "thought.tool_call.start"
     thought_tool_call_progress = "thought.tool_call.progress"
     thought_tool_call_end = "thought.tool_call.end"
+    # A tool's message to the user, rendered as an agent message between steps.
+    thought_tool_call_message = "thought.tool_call.message"
 
 
 class ContentType(str, Enum):
@@ -162,7 +164,7 @@ class ResponsesRequest(BaseModel):
     # `model` above. Silently ignored (falls back to the account default) if
     # it doesn't name a harness this account currently has registered/
     # available (see ResponsesHandler.handle); an invalid transient value
-    # (e.g. a stale client cache after Hermes gets uninstalled) must never
+    # (e.g. a stale client cache after a harness is removed) must never
     # fail the turn. Persisted onto the new conversation's Conversation.harness
     # so a reopened task remembers the pick, same as `model`.
     harness: str | None = Field(
