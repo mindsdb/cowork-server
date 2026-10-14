@@ -48,7 +48,8 @@
             "library_content:read",
             "library_assets:read",
             "team_library_content:read",
-            "file_dev_resources:read"
+            "file_dev_resources:read",
+            "folders:read"
           ],
           "extra_auth_params": {},
           "service_id": "figma",
