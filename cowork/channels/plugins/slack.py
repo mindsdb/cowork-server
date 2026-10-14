@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import aiohttp
 import httpx
 from anton.core.dispatch import Attachment, InboundEvent, InboundMessage, PlatformAddress
 
@@ -164,8 +165,6 @@ class SlackBridge:
         it returns. Each envelope must be ACKed by echoing its ``envelope_id``
         or Slack retries it. Bound onto the instance only when ``app_token`` is
         set (see __init__). Dedupe absorbs any replays across reconnects."""
-        import aiohttp
-
         app_token = (self._secrets.get("app_token") or "").strip()
         if not app_token:
             return

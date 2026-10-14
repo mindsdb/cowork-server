@@ -44,10 +44,11 @@ MAX_PUBLISH_KEY_TTL_S = 3600
 
 
 class PublishKey:
-    def __init__(self, user_id: str, org_id: str, *, min_ttl_s: float) -> None:
+    def __init__(self, user_id: str, org_id: str, *, min_ttl_s: float, workspace_id: str | None = None) -> None:
         self._user_id = user_id
         self._org_id = org_id
         self._min_ttl_s = min_ttl_s
+        self._workspace_id = workspace_id
         self._instance_id = str(uuid.uuid4())
         self._key: str | None = None
         self._attempted = False
@@ -78,6 +79,7 @@ class PublishKey:
                 ttl_seconds=ttl,
                 settings=settings,
                 purpose="artifact_publish",
+                workspace_id=self._workspace_id,
             )
         except (ProductPermissionDenied, ProductPermissionUnavailable) as exc:
             self._permission_error = exc

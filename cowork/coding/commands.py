@@ -117,21 +117,25 @@ class CodingCommandHandler:
         intent: CommandIntent,
         display_prompt: str,
         credentials: EngineCredentials,
+        *,
+        announced: bool = False,
     ) -> CodingSession:
         with self._runtimes.session_lock(session_id):
             with self._state_lock:
                 session = self._get_session(session_id)
                 if intent.name == "compact" and self._is_running(session_id):
                     raise RuntimeError("Wait for the active turn to finish before compacting this task")
-                self._emit(
-                    session_id,
-                    CodingEvent(
-                        type=EventType.user_message,
-                        title="You",
-                        text=display_prompt,
-                        phase="completed",
-                    ),
-                )
+                # A new task's first prompt is already in its timeline.
+                if not announced:
+                    self._emit(
+                        session_id,
+                        CodingEvent(
+                            type=EventType.user_message,
+                            title="You",
+                            text=display_prompt,
+                            phase="completed",
+                        ),
+                    )
             runtime = self._runtimes.open_locked(session, credentials)
             if intent.name == "compact":
                 runtime.compact()

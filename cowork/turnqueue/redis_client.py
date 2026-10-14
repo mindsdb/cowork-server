@@ -30,6 +30,44 @@ def cancel_flag_key(correlation_id: str) -> str:
     return f"cowork:cancel:{correlation_id}"
 
 
+# The one cancel reason that changes what a turn saves: the UI cancelled it
+# after hearing nothing for its idle window, so it saves as a stall, not a Stop.
+STALLED_CANCEL_REASON = "stalled"
+
+
+def cancel_cause_key(correlation_id: str) -> str:
+    """Why a ``/cancel`` asked this turn to stop, when the reason matters.
+
+    Separate from ``cancel_flag_key`` because scratchpad-controller's
+    ``_clear_cancel`` deletes the flag right after it publishes the cancelled
+    reply, so the flag may be gone when the replica that owns the turn hears
+    of the cancel. Only this server reads and writes it: the replica that
+    takes the ``/cancel`` sets or clears it in one transaction with the flag
+    (``_request_cancel``), the owner reads it when the cancel comes back, and
+    the producer clears a stale one before each turn.
+    """
+    return f"cowork:cancel_cause:{correlation_id}"
+
+
+def answer_queue_key(correlation_id: str) -> str:
+    """The list /answer pushes a remote turn's ask_user answers onto.
+
+    scratchpad-controller's ``answers.answer_key`` rebuilds the same name and
+    pops it on the replica running the turn; kept here for the same reason as
+    ``cancel_flag_key``.
+    """
+    return f"cowork:answer:{correlation_id}"
+
+
+def reply_stream_key(conversation_id: str) -> str:
+    """The stream scratchpad-controller relays a turn's replies onto.
+
+    Both the producer (writing the job) and ``turnqueue/answers.py`` (reading
+    the pod's verdict) need this name; kept here so the two cannot drift.
+    """
+    return f"scratchpad:reply:{conversation_id}"
+
+
 def get_redis() -> aioredis.Redis:
     global _client
     if _client is None:

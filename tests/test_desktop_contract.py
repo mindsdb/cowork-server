@@ -51,7 +51,9 @@ _PASSTHROUGH_ENV = (
 )
 
 
-def _spawn_like_desktop(tmp_path, port: int, owner: str, port_var: str) -> tuple[subprocess.Popen, "os.PathLike[str]"]:
+def _spawn_like_desktop(
+    tmp_path, port: int, owner: str | None, port_var: str
+) -> tuple[subprocess.Popen, "os.PathLike[str]"]:
     # Mirror the env block the desktop app builds before spawning the
     # sidecar. DATABASE_URI is pinned to a fresh SQLite file so the spawned
     # process cannot touch the shared test DB conftest.py points at.
@@ -60,12 +62,14 @@ def _spawn_like_desktop(tmp_path, port: int, owner: str, port_var: str) -> tuple
         {
             port_var: str(port),
             "COWORK_SERVER_HOST": "127.0.0.1",
-            "COWORK_SERVER_OWNER": owner,
             "COWORK_HOME": str(tmp_path / "home"),
             "DATABASE_URI": f"sqlite:///{tmp_path / 'contract.db'}",
             "PYTHONUNBUFFERED": "1",
         }
     )
+    # Desktop builds before 2026-07-05 pass no owner.
+    if owner is not None:
+        env["COWORK_SERVER_OWNER"] = owner
     # Server output goes to a file, not a PIPE: nobody drains a pipe while
     # we poll /health, so chatty startup logging could fill the pipe buffer
     # and block the child. The file doubles as failure diagnostics.
@@ -141,5 +145,20 @@ def test_desktop_spawn_contract(tmp_path, port_var):
         # The About panel folds these into the unified version display.
         assert payload["server_version"]
         assert payload["anton_version"]
+    finally:
+        _stop(proc)
+
+
+# Pre-token desktop builds still auto-update this server but never send the
+# bearer token, so they must be served without it; owner-stamped builds send
+# it and must be refused without it.
+@pytest.mark.parametrize(("owner", "expected_status"), [(None, 200), ("owner-token", 401)])
+def test_desktop_spawn_auth_without_token(tmp_path, owner, expected_status):
+    port = _free_port()
+    proc, log_path = _spawn_like_desktop(tmp_path, port, owner, "COWORK_SERVER_PORT")
+    try:
+        _wait_for_health(proc, port, log_path)
+        response = httpx.get(f"http://127.0.0.1:{port}/api/v1/settings/", timeout=5.0)
+        assert response.status_code == expected_status
     finally:
         _stop(proc)

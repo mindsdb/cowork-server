@@ -55,6 +55,7 @@ class ConnectorSpecRegistry:
                 logo_color=c.get("logo_color"),
                 aliases=c.get("aliases", []),
                 featured=c.get("featured", False),
+                notice=c.get("notice"),
             )
             for c in self.get_connectors().values()
         ]
@@ -72,6 +73,7 @@ class ConnectorSpecRegistry:
             logo_color=c.get("logo_color"),
             aliases=c.get("aliases", []),
             featured=c.get("featured", False),
+            notice=c.get("notice"),
             keywords=c.get("keywords", []),
             form=c.get("form", {}),
         )

@@ -26,6 +26,7 @@ from cowork.schemas.responses import (
     ResponseStatus,
     Role,
 )
+from cowork.streaming.liveness import MODEL_WAIT_PHASE, model_wait_sse
 
 
 @dataclass
@@ -340,6 +341,27 @@ async def format_responses_stream(
                 "tool_use_id": event.id,
             })
 
+        elif (
+            isinstance(event, StreamToolResult)
+            and getattr(event, "action", None) == "message"
+            # A scratchpad result carries the model's own `action`.
+            and getattr(event, "name", "") != "scratchpad"
+        ):
+            # A tool's message to the user (generate_artifact's brief when the
+            # agent acts first). Its own role rather than the scratchpad
+            # result's: a client that predates it ignores it instead of
+            # patching it into the last scratchpad cell. Not answer text, so
+            # it stays out of the persisted assistant message and the history.
+            seq += 1
+            yield _event("response.in_progress", {
+                "type": "response.in_progress",
+                "sequence_number": seq,
+                "thought_role": Role.thought_tool_call_message.value,
+                "content": event.content[:65536],
+                "tool_name": getattr(event, "name", "") or "",
+                "tool_use_id": getattr(event, "id", None) or "",
+            })
+
         elif isinstance(event, StreamToolResult):
             seq += 1
             yield _event("response.in_progress", {
@@ -364,6 +386,22 @@ async def format_responses_stream(
             # under PROGRESS_THROTTLE — dropping a scratchpad_done
             # would leave the cell stuck in_progress in the UI.
             phase_str = event.phase or ""
+            # A keep-alive from the cloud pod while a model call is quiet.
+            # Never throttled: dropping it lets the idle bounds end a live
+            # turn, and it cannot flood the stream: the pod writes one from
+            # its heartbeat only after MODEL_WAIT_TICK_S (20 s,
+            # anton.core.llm.liveness) of otherwise quiet wire, see
+            # anton.cloud_turn.__main__._model_wait_line. It also stays out
+            # of event_sink and off the throttle anchor: it says the turn is
+            # alive, and a reload has nothing to show for it.
+            if phase_str == MODEL_WAIT_PHASE:
+                seq += 1
+                yield model_wait_sse(
+                    message=event.message or "",
+                    waited_s=getattr(event, "eta_seconds", None),
+                    sequence_number=seq,
+                )
+                continue
             # Latched ahead of the throttling below: this notice is
             # rate-limited like any other, but the reset it implies is not.
             if phase_str == "continuation":
@@ -406,13 +444,20 @@ async def format_responses_stream(
                 # on nothing.
                 pass
             else:
-                # First tool_progress for a given id must never be dropped
-                # by throttling — losing it would mean the lazily-created
-                # step in the renderer is never created, and a later
-                # tool_done for the same id would then have nothing to
-                # close (thought.tool_call.end on the frontend is a no-op
-                # when there's no matching step).
-                is_first_progress_for_id = is_tool_progress and event.id not in progress_tool_ids
+                # Every tool_progress line is a step announcement and is
+                # never throttled (ENG-2981): reasoning_start from a tool's
+                # own LLM calls lands in the same window, and dropping the
+                # line loses a pipeline step from the chat. Losing the FIRST
+                # line would also leave the renderer's lazily-created tool
+                # step missing, so a later tool_done would close nothing.
+                #
+                # Invariant: a tool emits a handful of these per run (today
+                # only anton's generate_artifact, one line per pipeline
+                # step). A tool that streams many lines must not use
+                # tool_progress — the live tail has its own tool_peek phase,
+                # relayed only to hosts that set live_tool_peek (this server
+                # does not). If that ever changes, revisit this exemption,
+                # e.g. drop only a repeat of the same line for the same id.
                 if is_tool_progress:
                     progress_tool_ids.add(event.id)
 
@@ -423,7 +468,7 @@ async def format_responses_stream(
                 never_throttle = (
                     is_scratchpad_phase
                     or is_tool_done
-                    or is_first_progress_for_id
+                    or is_tool_progress
                     or is_rate_limited_notice
                     or is_skill_draft_notice
                 )
@@ -483,10 +528,10 @@ async def format_responses_stream(
 
         elif isinstance(event, StreamReasoningDelta):
             # The model's own reasoning text — NOT part of the final answer.
-            # Shape matches hermes_harness's existing thought.progress +
-            # subtype convention exactly, so the frontend's ephemeral
-            # "current thought" handling (responseStreamAdapter.js) picks
-            # this up identically without any client-side change.
+            # Shape follows the thought.progress + subtype convention the
+            # frontend's ephemeral "current thought" handling
+            # (responseStreamAdapter.js) already understands, so no
+            # client-side change is needed.
             seq += 1
             yield _event("response.in_progress", {
                 "type": "response.in_progress",

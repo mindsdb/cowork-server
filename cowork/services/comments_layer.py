@@ -61,6 +61,10 @@ import re
 # the iframe's entry-document URL, so ordinary previews are untouched.
 ACTIVATION_PARAM = "__antonComments"
 
+# The overlays load no web font: Inter is used when the page or the OS already
+# has it, system fonts otherwise. On web the preview is a srcdoc that inherits
+# the app shell's CSP, which blocks remote stylesheets and fonts, and the
+# preview shim would report that block as the artifact's own error.
 FONT_STACK = "'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif"
 
 # NewShadow/modal-sm — dropdown menu
@@ -340,12 +344,6 @@ LAYER_JS = r"""
   var mode = false, comments = [], hoverEl = null, pop = null, menu = null;
   var meViewer = null;  // parent-echoed {user_id,email}; gates edit/delete UI
 
-  // Inter for our overlays (the artifact page may not load it).
-  if (!document.querySelector('link[href*="family=Inter"]')) {
-    var fl = document.createElement('link'); fl.rel = 'stylesheet';
-    fl.href = 'https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap';
-    document.head.appendChild(fl);
-  }
   var css = document.createElement('style');
   css.textContent = __LAYER_CSS__;
   document.head.appendChild(css);
@@ -1079,9 +1077,18 @@ LAYER_JS = (LAYER_JS
             .replace("__LAYER_CSS__", json.dumps(_LAYER_CSS)))
 
 
-# Precomputed once: the JS is a constant blob, and a literal ``</script>`` in it
-# would break out of the injected tag.
-_SCRIPT_TAG = "<script>%s</script>" % LAYER_JS.replace("</script>", "<\\/script>")
+def script_tag(js: str) -> str:
+    """Wrap ``js`` in a ``<script>`` element safe to splice into a document.
+
+    A literal ``</script>`` in the payload would break out of the injected tag,
+    so it is escaped. Shared with preview_shim: the escaping rule is a
+    boundary, and both injected scripts must apply the same one.
+    """
+    return "<script>%s</script>" % js.replace("</script>", "<\\/script>")
+
+
+# Precomputed once: the JS is a constant blob.
+_SCRIPT_TAG = script_tag(LAYER_JS)
 # Case-insensitive so we anchor to the real body close in mixed-case documents,
 # without allocating a full lowercased copy of the (possibly large) HTML.
 _BODY_CLOSE_RE = re.compile(r"</body\s*>", re.IGNORECASE)

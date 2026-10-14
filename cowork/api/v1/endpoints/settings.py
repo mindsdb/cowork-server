@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Annotated, Any, Optional
+from urllib.parse import urlsplit
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel
 from sqlmodel import Session
@@ -33,6 +34,9 @@ from cowork.db.session import get_session
 from cowork.principal import Principal, caller_bearer, can_manage_org, get_principal
 from cowork.schemas.base import CamelRequest
 from cowork.schemas.settings import (
+    ProviderPingResponse,
+    ProviderProbeCard,
+    ProviderProbeDenial,
     SettingResponse,
     SettingsBulkUpsertRequest,
     SettingUpsertRequest,
@@ -44,6 +48,7 @@ from cowork.services.providers import (
     fetch_org_model_catalog,
     model_value_rejection,
     persist_enabled_model_map,
+    persist_org_model_availability,
     persist_role_defaults_map,
     ping_providers,
     resolve_stored_key,
@@ -58,6 +63,7 @@ from cowork.common.settings.app_settings import (
     DIRECT_EFFORT_CATALOG,
     RECOMMENDED_MODELS,
     RECOMMENDED_PAIR,
+    default_minds_api_host,
 )
 from cowork.common.settings.user_settings import (
     Provider,
@@ -165,7 +171,8 @@ async def _reject_unservable_models(
     this is an HTTP-layer check. ``SettingService.upsert_setting`` / ``save_all``
     / ``bulk_upsert`` called IN-PROCESS bypass it. No in-process caller writes a
     model key today (``channels.py`` writes ``channels_harness``,
-    ``recommended_models`` writes ``minds_model_enabled``); moving the check down
+    ``recommended_models`` writes ``minds_model_enabled`` and, in org mode,
+    ``minds_model_restricted``); moving the check down
     would need those sync methods to become async.
 
     Resolution uses ``load_pending`` — the state the write PRODUCES, not the one
@@ -188,6 +195,7 @@ async def _reject_unservable_models(
             key,
             value,
             org_id=scope.org_id if scope and scope.org_mode else None,
+            user_id=scope.user_id if scope and scope.org_mode else None,
             bearer_token=caller_bearer(request),
         )
         if rejection:
@@ -361,7 +369,7 @@ def reveal_key(name: str, session: SessionDep, scope: ScopeDep):
 
 
 class _TestProvidersBody(BaseModel):
-    providers: Optional[list[dict[str, Any]]] = None
+    providers: Optional[list[ProviderProbeCard]] = None
 
 
 #: Provider types whose ping target comes out of the request body instead of
@@ -371,7 +379,48 @@ class _TestProvidersBody(BaseModel):
 _BODY_SUPPLIED_URL_FIELD = {"openai-compatible": "baseUrl", "minds-cloud": "mindsUrl"}
 
 
-def _stored_urls_for(settings: UserSettings, ptype: str) -> set[str]:
+def _origin(url: object) -> str:
+    """``scheme://host[:port]`` for ``url``, or ``""`` when it names no host.
+
+    The guard below compares origins rather than whole URL strings, because
+    the question it asks is which party receives the key, and that is the
+    host. Comparing whole strings refused hosts this deployment does reach:
+    a stored URL may carry a path where the body sends the host alone, which
+    is what ``minds_url`` does whenever no row was written and
+    ``default_minds_url`` supplies ``<host>/v1``. ``minds_chat_base_url``
+    (cowork/services/providers.py) resolves both spellings to the same
+    request, so they were never two targets. Parsing also defeats a userinfo
+    prefix, where ``https://api.mindshub.ai@evil.test`` reads as host
+    ``evil.test``; ``is_minds_host`` in the same module parses for that
+    reason.
+
+    Answers ``""`` for anything it cannot parse, because both callers hand it
+    untrusted text and neither can absorb an exception. The body field is
+    whatever the caller sent; a ``providers_json`` card holds whatever was
+    stored. Four shapes reach here that ``urlsplit`` will not take: a
+    non-string, an unbalanced ``[``, a port that is not an integer in range,
+    and a netloc that NFKC-normalizes into a delimiter. Each has to read as
+    "no origin", which refuses a caller's URL and drops a stored one from the
+    allowlist instead of 500-ing the whole batch. ``is_minds_host`` guards the
+    same call for the same reason and says so.
+    """
+    if not isinstance(url, str):
+        return ""
+    try:
+        parts = urlsplit(url.strip())
+        hostname = parts.hostname
+        port = parts.port
+    except ValueError:
+        return ""
+    if not hostname:
+        return ""
+    # `is not None`, not truthiness: port 0 names a different listener from a
+    # URL that carries no port at all.
+    suffix = f":{port}" if port is not None else ""
+    return f"{parts.scheme.lower()}://{hostname}{suffix}"
+
+
+def _stored_origins_for(settings: UserSettings, ptype: str) -> set[str]:
     """Every ping target this deployment has actually stored for ``ptype``.
 
     The provider cards in ``providers_json`` are what the Settings UI edits
@@ -380,32 +429,53 @@ def _stored_urls_for(settings: UserSettings, ptype: str) -> set[str]:
     included too, since a config written before the cards existed only has
     those.
     """
-    urls = set()
+    origins = set()
     try:
         cards = json.loads(settings.providers_json or "[]")
     except (ValueError, TypeError):
+        cards = []
+    # Decoding is not the same as getting a list to walk: `json.loads("null")`
+    # succeeds and hands back None, and a bare number decodes to an int. Both
+    # are storable, because providers_json is a plain string setting with no
+    # shape validation on write.
+    if not isinstance(cards, list):
         cards = []
     field = _BODY_SUPPLIED_URL_FIELD.get(ptype)
     for card in cards:
         if not isinstance(card, dict):
             continue
-        if card.get("type", "").replace("_", "-") != ptype:
+        # `.get(key, "")` hands back a stored null rather than the default,
+        # and a card carrying `"type": null` is storable: providers_json is a
+        # plain string setting with no shape validation on write.
+        if (card.get("type") or "").replace("_", "-") != ptype:
             continue
-        urls.add((card.get(field) or "").strip().rstrip("/"))
+        # Parse on the way in, not on the way out: a card's URL is whatever
+        # was stored, and an unhashable one never even reaches a set.
+        origins.add(_origin(card.get(field)))
     if ptype == "openai-compatible":
-        urls.add((settings.openai_base_url or "").strip().rstrip("/"))
+        origins.add(_origin(settings.openai_base_url))
     if ptype == "minds-cloud":
-        urls.add((settings.minds_url or "").strip().rstrip("/"))
-    return {u for u in urls if u}
+        origins.add(_origin(settings.minds_url))
+        # A minds-cloud ping that omits mindsUrl goes here (``ping_provider``,
+        # cowork/services/providers.py), so naming this host is a destination
+        # the caller already reaches, not a new one.
+        origins.add(_origin(default_minds_api_host()))
+    return {o for o in origins if o}
 
 
 # AuthenticatedInOrgMode, and a URL check underneath it. The permission stops
 # an anonymous caller spending the deployment's stored keys on probes;
-# _reject_foreign_ping_url below stops ANY caller, member included, choosing
+# _foreign_ping_url_field below stops ANY caller, member included, choosing
 # the host a stored key is sent to. Two layers because they answer different
 # questions and the second one is the one that was missing.
-@router.post("/test-providers", dependencies=[Depends(require(AuthenticatedInOrgMode))])
-async def test_providers(session: SessionDep, scope: ScopeDep, body: _TestProvidersBody | None = None):
+@router.post(
+    "/test-providers",
+    response_model=ProviderPingResponse,
+    dependencies=[Depends(require(AuthenticatedInOrgMode))],
+)
+async def test_providers(
+    session: SessionDep, scope: ScopeDep, body: _TestProvidersBody | None = None
+) -> dict[str, Any]:
     """Ping the given (or all stored) providers and return connectivity results.
 
     Read-only: a test is a point-in-time check and no longer writes to the DB.
@@ -417,6 +487,14 @@ async def test_providers(session: SessionDep, scope: ScopeDep, body: _TestProvid
     how the Settings UI re-tests a provider it only ever received masked. That
     substitution is what makes the URL check below load-bearing: without it a
     caller who never knew the key could still choose the host it is sent to.
+
+    ``providerStatusReasons`` names why the MindsHub gateway refused a
+    minds-cloud probe, in the gateway's own reason words, so the Settings
+    notice can tell a velocity limit or the free-Air fuse from an empty wallet.
+    A refused provider was never pinged, so it gets no reason.
+
+    Returns the dumped model rather than the model, so a direct caller can
+    still subscript the result by its wire keys.
     """
     s = SettingService(session, scope).load()
 
@@ -426,44 +504,75 @@ async def test_providers(session: SessionDep, scope: ScopeDep, body: _TestProvid
         # Build a minimal providers list from stored keys
         providers = []
         if s.anthropic_api_key is not None:
-            providers.append({"type": "anthropic", "apiKey": ""})
+            providers.append(ProviderProbeCard(type="anthropic", api_key=""))
         if s.openai_api_key is not None:
-            providers.append({"type": "openai", "apiKey": ""})
+            providers.append(ProviderProbeCard(type="openai", api_key=""))
         if s.minds_api_key is not None:
-            providers.append({"type": "minds-cloud", "apiKey": "", "mindsUrl": s.minds_url})
+            providers.append(ProviderProbeCard(type="minds-cloud", api_key="", minds_url=s.minds_url))
 
-    for p in providers:
-        if p.get("apiKey") not in ("***", ""):
-            continue
-        _reject_foreign_ping_url(s, p)
-        p["apiKey"] = resolve_stored_key(s, p.get("type", ""))
+    pingable: list[ProviderProbeCard] = []
+    refused: dict[str, str] = {}
+    for card in providers:
+        if card.api_key in ("***", ""):
+            field = _foreign_ping_url_field(s, card)
+            if field is not None:
+                # Refusing the request outright would blank every other
+                # provider's status dot, because both callers send the whole
+                # configured list in one call. ping_provider already reports
+                # per provider, so this joins its results as an ordinary
+                # failure and the refused provider is never pinged at all.
+                refused[card.type] = (
+                    f"cannot test a stored key against a {field} this deployment has not saved"
+                )
+                continue
+            card = card.model_copy(update={"api_key": resolve_stored_key(s, card.type)})
+        pingable.append(card)
 
-    statuses, details = await ping_providers(providers)
-    return {"providerStatus": statuses, "providerStatusDetails": details}
+    # ping_provider still reads the card's wire keys from a plain dict.
+    results = await ping_providers([card.model_dump(by_alias=True) for card in pingable])
+    statuses, details = results.statuses, results.details
+    for ptype, reason in refused.items():
+        # setdefault, not update: ping_providers keys by type, so two cards of
+        # one type collapse into a single slot. Overwriting would report a card
+        # that pinged perfectly well as failed.
+        statuses.setdefault(ptype, "fail")
+        details.setdefault(ptype, reason)
+    return ProviderPingResponse(
+        provider_status=statuses,
+        provider_status_details=details,
+        provider_status_reasons={
+            t: ProviderProbeDenial(code=d.reason, reset_at=d.reset_at)
+            for t, d in results.denials.items()
+        },
+    ).model_dump(by_alias=True)
 
 
-def _reject_foreign_ping_url(settings: UserSettings, provider: dict[str, Any]) -> None:
-    """Refuse to send a STORED key to a host the caller named.
+def _foreign_ping_url_field(settings: UserSettings, provider: ProviderProbeCard) -> str | None:
+    """The body field aiming a STORED key at a host this deployment never saved.
 
-    ``settings`` rows are deployment-global (``settings`` is in
+    Returns the field name to refuse on, or ``None`` when the ping may go
+    ahead. ``settings`` rows are deployment-global (``settings`` is in
     ``_TENANCY_DEFERRED_TABLES``, cowork/db/scoped.py), so the key being
     substituted is the whole deployment's. Sending it to an arbitrary
     ``baseUrl``/``mindsUrl`` would hand it to whoever asked. Omitting the URL
     is fine and keeps the ``/test-providers`` body the Settings UI already
-    sends working: the ping then falls back to the stored value or the vendor
-    default.
+    sends working: ``ping_provider`` then sends a minds-cloud probe to the
+    vendor host, and answers ``missing base URL`` for an openai-compatible one
+    rather than reaching for the stored value. A URL that is present but names
+    no host is refused, since there is nothing to compare.
     """
-    ptype = (provider.get("type") or "").replace("_", "-")
+    ptype = provider.type.replace("_", "-")
     field = _BODY_SUPPLIED_URL_FIELD.get(ptype)
     if field is None:
-        return
-    supplied = (provider.get(field) or "").strip().rstrip("/")
-    if not supplied or supplied in _stored_urls_for(settings, ptype):
-        return
-    raise HTTPException(
-        status_code=status.HTTP_400_BAD_REQUEST,
-        detail=f"cannot test a stored key against a {field} this deployment has not saved",
-    )
+        return None
+    # By wire name, the way `_BODY_SUPPLIED_URL_FIELD` and the stored cards
+    # spell it. ProviderProbeCard has already refused a URL that is not a string.
+    supplied = provider.model_dump(by_alias=True)[field]
+    if supplied is None or supplied == "":
+        return None
+    if _origin(supplied) in _stored_origins_for(settings, ptype):
+        return None
+    return field
 
 
 class _ValidateProviderBody(CamelRequest):
@@ -498,7 +607,8 @@ def _fill_missing(target: dict, extra: dict, *, skip: Optional[set[str]] = None)
 
 
 # AuthenticatedInOrgMode, not OpenByDesign: the MindsHub overlay does need
-# the caller's own bearer and scope.org_id (fetch_org_model_catalog below),
+# the caller's own bearer, scope.org_id and scope.user_id
+# (fetch_org_model_catalog below),
 # but the openai-compatible overlay further down does not — it resolves the
 # stored key and fetches the stored baseUrl on any caller's behalf, and
 # `?refresh=true` bypasses its cache every time. So this is not a static
@@ -536,6 +646,15 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
     # alongside modelEfforts — consumers that ignore it keep working.
     model_enabled: dict[str, bool] = {}
 
+    # `modelDisabledReasons` maps a model id that `modelEnabled` marks false to
+    # the gateway's reason for it: "model_restricted" (an admin in the org
+    # restricted it, so credits cannot unlock it), "wallet_empty" or
+    # "included_allowance_exhausted". Filled from the MindsHub listing only,
+    # never from a custom endpoint: a BYO base URL must not be able to label a
+    # model "restricted by your admin". A model absent from this map keeps
+    # today's locked, add-credits treatment.
+    model_disabled_reasons: dict[str, str] = {}
+
     # `modelLabels` maps a model id → MindsHub's human-readable display label.
     # Display-only: the picker uses this to render the option text, but the id
     # remains the value used for selection/storage/resolution everywhere else.
@@ -570,13 +689,15 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
     s = SettingService(session, scope).load()
     listing = None
     if scope.org_mode:
-        # Org catalog: operator endpoint + the caller's own bearer, per org.
-        # Never the stored key or s.minds_url (both tenant-settable), or a
-        # member's JWT could be forwarded to an admin-chosen host.
+        # Org catalog: operator endpoint + the caller's own bearer, cached per
+        # org and caller. Never the stored key or s.minds_url (both
+        # tenant-settable), or a member's JWT could be forwarded to an
+        # admin-chosen host.
         token = caller_bearer(request)
-        if token and scope.org_id:
+        if token and scope.org_id and scope.user_id:
             listing = await fetch_org_model_catalog(
-                org_id=scope.org_id, bearer_token=token, refresh=refresh
+                org_id=scope.org_id, user_id=scope.user_id, bearer_token=token,
+                refresh=refresh,
             )
     elif s.minds_api_key is not None and s.minds_url:
         # Desktop / BYOK: the user's stored key against its configured URL.
@@ -609,7 +730,16 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
             # system-derived (MindsHub, via admin-set key/URL), so a member can
             # trigger this refresh but can't steer what's stored — and gating it
             # would leave the map stale.
-            persist_enabled_model_map(session, scope, s.minds_model_enabled, live_enabled, live)
+            #
+            # Org mode splits the write. The listing is the caller's own (auth
+            # applies the model rules for their org, workspace and team), and the
+            # map is an org row every member's resolution reads, so the caller's
+            # restricted models are stored for the caller alone. A desktop
+            # install has one member and keeps them in the map.
+            if scope.org_mode:
+                persist_org_model_availability(session, scope, prior=s, listing=listing)
+            else:
+                persist_enabled_model_map(session, scope, s.minds_model_enabled, live_enabled, live)
         # Cache the catalog's declared per-role defaults, so a default moved in
         # the config reaches this install on its next settings load with no client
         # release (UserSettings._minds_role_default_map).
@@ -644,6 +774,7 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
             )
         model_efforts.update(live_efforts)
         model_enabled.update(live_enabled)
+        model_disabled_reasons.update(listing.disabled_reasons)
         model_labels.update(live_labels)
         model_providers.update(listing.providers)
         model_families.update(listing.families)
@@ -692,6 +823,8 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         _fill_missing(model_efforts, live_efforts)
         _fill_missing(model_enabled, live_enabled)
         _fill_missing(model_labels, live_labels)
+        # modelDisabledReasons is left alone on purpose: only MindsHub may say
+        # an admin restricted a model (see where it is declared above).
         # Same precedence for the grouping metadata, for the same reason: a BYO
         # endpoint must not be able to move a MindsHub model into another vendor's
         # section or relabel it as an old version of something. But here the
@@ -742,6 +875,7 @@ async def recommended_models(request: Request, session: SessionDep, scope: Scope
         "recommendedPair": pair,
         "modelEfforts": model_efforts,
         "modelEnabled": model_enabled,
+        "modelDisabledReasons": model_disabled_reasons,
         "modelLabels": model_labels,
         "modelProviders": model_providers,
         "modelFamilies": model_families,

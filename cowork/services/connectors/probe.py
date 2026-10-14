@@ -16,12 +16,15 @@ import os
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from anton.core.datasources.data_vault import LocalDataVault
 from cowork.build_info import surface_kwarg
-from cowork.common.chat_session import build_chat_session
+from cowork.common.chat_session import build_chat_session, close_session_scratchpads
 from cowork.common.paths import cowork_home, pod_local_only
+
+if TYPE_CHECKING:
+    from cowork.services.providers import WebToolKwargs
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +89,7 @@ class CredentialProbe:
         form_spec: dict | None = None,
         skipped: list[str] | None = None,
         timeout_seconds: float = 90.0,
+        web_tool_kwargs: WebToolKwargs | None = None,
     ) -> None:
         self.engine = engine
         self.credentials = credentials
@@ -94,6 +98,9 @@ class CredentialProbe:
         self.form_spec = form_spec or {}
         self.skipped = list(skipped or [])
         self.timeout_seconds = timeout_seconds
+        # The caller captures this alongside llm_client. Never re-read settings
+        # here: the provider may have changed since the client was constructed.
+        self.web_tool_kwargs: WebToolKwargs = {**(web_tool_kwargs or {})}
         self._outcome = ProbeOutcome()
         self._pending: list[tuple[str, Any]] = []
 
@@ -477,6 +484,10 @@ class CredentialProbe:
                 REPORT_FAILURE_TOOL,
                 REQUEST_EXTRA_FIELD_TOOL,
             ],
+            # The same planning role as a UI turn, so the same rule: hosted web
+            # search stays off when COWORK_OPENAI_COMPATIBLE_API puts planning
+            # on the Responses API.
+            **self.web_tool_kwargs,
         )
 
         try:
@@ -593,6 +604,9 @@ class CredentialProbe:
                 # plaintext credentials file is worth an operator's attention,
                 # not a debug line nobody has turned on.
                 logger.warning("Could not delete probe env file %s", env_path, exc_info=True)
+            # The cells the prompt asks for run in a scratchpad process, and
+            # no later turn reuses it.
+            close_session_scratchpads(probe_session, owner="connector probe")
 
         if self._outcome.status == "unresolved":
             self._outcome.status = "failure"

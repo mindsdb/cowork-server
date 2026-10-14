@@ -75,6 +75,139 @@ async def test_list_returns_every_recorded_turn(fake_redis):
     assert turns["c2"]["org_id"] == "o2"
 
 
+@pytest.mark.asyncio
+async def test_list_pairs_each_turn_with_its_own_conversation_and_prunes_only_expired_ones(fake_redis):
+    for n in range(6):
+        await turn_index.record_turn(
+            f"c{n}", turn_id=n, correlation_id=f"corr-{n}", org_id=f"o{n}", user_id=None)
+    for gone in ("c1", "c4"):
+        await fake_redis.delete(f"cowork:turn:{gone}")   # stands in for TTL expiry
+
+    turns = await turn_index.list_turns()
+
+    assert sorted((t["conversation_id"], t["turn_id"], t["correlation_id"]) for t in turns) == [
+        (f"c{n}", str(n), f"corr-{n}") for n in (0, 2, 3, 5)
+    ]
+    assert await fake_redis.smembers("cowork:turns") == {"c0", "c2", "c3", "c5"}
+
+
+@pytest.mark.asyncio
+async def test_list_of_no_turns_removes_nothing(fake_redis, monkeypatch):
+    async def no_srem(*_args):
+        raise AssertionError("SREM with no members is a Redis error")
+
+    monkeypatch.setattr(fake_redis, "srem", no_srem)
+
+    assert await turn_index.list_turns() == []
+
+
+@pytest.mark.asyncio
+async def test_list_reads_every_turn_in_one_round_trip(fake_redis, monkeypatch):
+    """/in-flight-list runs this every few seconds per open client, so it
+    reads every member's hash in one pipeline, not one call each."""
+    for n in range(3):
+        await turn_index.record_turn(
+            f"c{n}", turn_id=n, correlation_id=f"corr-{n}", org_id=None, user_id=None)
+
+    async def per_member(*_args):
+        raise AssertionError("list_turns must not read one hash per call")
+
+    monkeypatch.setattr(fake_redis, "hgetall", per_member)
+
+    assert {t["conversation_id"] for t in await turn_index.list_turns()} == {"c0", "c1", "c2"}
+
+
+@pytest.mark.asyncio
+async def test_a_turn_is_recorded_in_one_transaction(fake_redis, monkeypatch):
+    """Sent command by command, the DELETE leaves the hash empty until the
+    HSET lands, and a /in-flight-list read in that gap sees an expired turn."""
+    pipeline = fake_redis.pipeline
+    transactions = []
+
+    def recorded_pipeline(*args, transaction=True, **kwargs):
+        transactions.append(transaction)
+        return pipeline(*args, transaction=transaction, **kwargs)
+
+    async def separate_call(*_args, **_kwargs):
+        raise AssertionError("record_turn must write in one MULTI, not one command at a time")
+
+    monkeypatch.setattr(fake_redis, "pipeline", recorded_pipeline)
+    for command in ("delete", "hset", "expire", "sadd"):
+        monkeypatch.setattr(fake_redis, command, separate_call)
+
+    await turn_index.record_turn(
+        "c1", turn_id=3, correlation_id="corr-3", org_id=None, user_id=None)
+
+    assert transactions == [True]
+    assert (await turn_index.get_turn("c1"))["correlation_id"] == "corr-3"
+    assert 0 < await fake_redis.ttl("cowork:turn:c1") <= turn_index.TURN_INDEX_TTL_SECONDS
+    assert await fake_redis.sismember("cowork:turns", "c1") == 1
+
+
+def _run_once_after(fake_redis, monkeypatch, *, in_transaction: bool, command: str, step):
+    """Run `step` once, right after the first ``command`` awaited on a
+    pipeline with ``transaction=in_transaction`` returns."""
+    pipeline = fake_redis.pipeline
+    pending = [step]
+
+    def hooked_pipeline(*args, transaction=True, **kwargs):
+        pipe = pipeline(*args, transaction=transaction, **kwargs)
+        if transaction == in_transaction:
+            original = getattr(pipe, command)
+
+            async def then_step(*command_args, **command_kwargs):
+                reply = await original(*command_args, **command_kwargs)
+                if pending:
+                    await pending.pop()()
+                return reply
+
+            setattr(pipe, command, then_step)
+        return pipe
+
+    monkeypatch.setattr(fake_redis, "pipeline", hooked_pipeline)
+
+
+@pytest.mark.asyncio
+async def test_a_turn_recorded_after_the_read_keeps_its_member(fake_redis, monkeypatch):
+    """A turn starts on a conversation whose last hash expired, just after
+    list_turns read that hash. Its SADD is a no-op on a member still in the
+    set, so a prune that removed the member anyway would hide the running
+    turn from /in-flight-list until the conversation's next turn."""
+    for conversation_id in ("c1", "c2"):
+        await turn_index.record_turn(
+            conversation_id, turn_id=1, correlation_id=f"old-{conversation_id}", org_id=None, user_id=None)
+        await fake_redis.delete(f"cowork:turn:{conversation_id}")   # stands in for TTL expiry
+
+    async def c1_starts_a_turn():
+        await turn_index.record_turn("c1", turn_id=2, correlation_id="new-c1", org_id=None, user_id=None)
+
+    _run_once_after(fake_redis, monkeypatch, in_transaction=False, command="execute", step=c1_starts_a_turn)
+
+    assert await turn_index.list_turns() == []
+    assert await fake_redis.sismember("cowork:turns", "c1") == 1
+    # The prune that skipped c1 left c2 too; the next list removes it.
+    assert [t["correlation_id"] for t in await turn_index.list_turns()] == ["new-c1"]
+    assert await fake_redis.smembers("cowork:turns") == {"c1"}
+
+
+@pytest.mark.asyncio
+async def test_a_turn_recorded_after_the_prune_checked_its_hash_keeps_its_member(fake_redis, monkeypatch):
+    """The prune checks that the hash is still missing before it removes the
+    member. Its WATCH aborts the removal when a turn is recorded between the
+    check and the SREM."""
+    await turn_index.record_turn("c1", turn_id=1, correlation_id="old-c1", org_id=None, user_id=None)
+    await fake_redis.delete("cowork:turn:c1")   # stands in for TTL expiry
+
+    async def c1_starts_a_turn():
+        await turn_index.record_turn("c1", turn_id=2, correlation_id="new-c1", org_id=None, user_id=None)
+
+    _run_once_after(fake_redis, monkeypatch, in_transaction=True, command="exists", step=c1_starts_a_turn)
+
+    assert await turn_index.list_turns() == []
+    assert await fake_redis.sismember("cowork:turns", "c1") == 1
+    assert [t["correlation_id"] for t in await turn_index.list_turns()] == ["new-c1"]
+
+
 def test_discard_conversation_forgets_the_turn(monkeypatch, tmp_path):
     """Truncating a conversation deletes its buffers. Leaving the index entry
     behind would have /in-flight keep naming a turn with nothing behind it."""

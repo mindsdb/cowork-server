@@ -34,6 +34,10 @@ def test_a_rewritten_credit_rejection_is_classified_from_its_error_code() -> Non
         ("unexpected status 403 Forbidden: denied, url: http://x", "model_authentication_failed"),
         ("unexpected status 404 Not Found: The model 'gpt-5.6-sol' does not exist or you do not have access to it., url: http://x", "model_unavailable"),
         ('unexpected status 400 Bad Request: {"error": {"code": "model_authentication_failed", "message": "Invalid API key"}}', "model_authentication_failed"),
+        ("exceeded retry limit, last status: 429 Too Many Requests", "rate_limited"),
+        ('unexpected status 400 Bad Request: {"error": {"code": "rate_limited", "message": "Rate limit exceeded"}}', "rate_limited"),
+        ('unexpected status 400 Bad Request: {"error": {"code": "included_allowance_exhausted", "message": "x"}}', "included_allowance_exhausted"),
+        ('unexpected status 400 Bad Request: {"error": {"code": "free_air_daily_spend_fuse_exceeded", "message": "x"}}', "free_air_daily_spend_fuse_exceeded"),
     ],
 )
 def test_status_line_and_embedded_json_shapes_are_classified(message: str, code: str) -> None:

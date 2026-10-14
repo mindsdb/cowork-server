@@ -37,6 +37,8 @@ import os
 import time
 from pathlib import Path
 
+from cowork.common.paths import open_fd
+
 logger = logging.getLogger(__name__)
 
 LOCKS_DIRNAME = ".locks"
@@ -48,7 +50,7 @@ def _lock_path(artifacts_base: Path, slug: str) -> Path:
 
 def _create_exclusive(path: Path) -> bool:
     try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        fd = open_fd(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     except FileExistsError:
         return False
     except OSError:

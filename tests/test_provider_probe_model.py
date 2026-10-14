@@ -9,13 +9,21 @@ validation (`validate_minds`) used to POST `CODING_MODEL_DEFAULTS["minds_cloud"]
 """
 import asyncio
 
+import httpx
+import pytest
+
 import cowork.services.providers as providers
+from cowork.handlers import turn_errors as te
+from cowork.schemas.settings import ProbeDenialCode
 from cowork.services.providers import (
     MINDS_PROBE_MODEL,
     MINDS_REQUEST_KIND_HEADER,
     MINDS_REQUEST_KIND_PROBE,
+    GatewayDenial,
+    ProviderPing,
     is_minds_host,
     ping_provider,
+    ping_providers,
     validate_minds,
     validate_provider,
 )
@@ -63,7 +71,7 @@ def test_probe_model_is_tier_universal():
 
 def test_ping_provider_probes_universal_model(monkeypatch):
     _patch(monkeypatch)
-    status, _ = asyncio.run(ping_provider({"type": "minds-cloud", "apiKey": "mdb_x"}))
+    status = asyncio.run(ping_provider({"type": "minds-cloud", "apiKey": "mdb_x"})).status
     assert status == "ok"
     assert _CapturingClient.captured["json"]["model"] == "mindshub_air"
 
@@ -85,7 +93,8 @@ def test_validate_minds_probes_universal_model(monkeypatch):
 
 def test_ping_provider_missing_key_still_fails_fast(monkeypatch):
     _patch(monkeypatch)
-    status, detail = asyncio.run(ping_provider({"type": "minds-cloud", "apiKey": ""}))
+    ping = asyncio.run(ping_provider({"type": "minds-cloud", "apiKey": ""}))
+    status, detail = ping.status, ping.detail
     assert status == "fail" and "key" in detail.lower()
 
 
@@ -114,7 +123,8 @@ def test_ping_minds_cloud_surfaces_provider_message(monkeypatch):
             return _FailResp()
 
     monkeypatch.setattr(providers.httpx, "AsyncClient", _FailClient)
-    status, detail = asyncio.run(ping_provider({"type": "minds-cloud", "apiKey": "mdb_x"}))
+    ping = asyncio.run(ping_provider({"type": "minds-cloud", "apiKey": "mdb_x"}))
+    status, detail = ping.status, ping.detail
     assert status == "fail"
     assert "HTTP 429" in detail
     assert "Wallet allowance exhausted" in detail
@@ -266,3 +276,214 @@ def test_non_minds_probe_does_not_stamp_probe_kind_header(monkeypatch):
     _patch(monkeypatch)
     asyncio.run(validate_provider("openai-compatible", "sk_x", "https://api.openai.com/v1", "gpt-4o"))
     assert MINDS_REQUEST_KIND_HEADER not in _CapturingClient.captured["headers"]
+
+
+# ── The probe names the gateway's reason ────────────────────────────────────
+#
+# The probe used to keep only "HTTP <status>: <message>" and drop the response
+# headers, so the Settings notice matched on "429" and called a velocity limit,
+# the free-Air fuse and a spent allowance all "No credits available". The probe
+# now carries the reason the gateway named, origin-checked by turn_errors.
+
+_RESET_AT = "2026-09-25T00:00:00Z"
+_GATEWAY_MESSAGE = "The gateway refused this request."
+
+
+def _serve_gateway(monkeypatch, status_code, response_headers, *, content=None, body=None):
+    """A client whose POST answers with a real httpx.Response.
+
+    The response carries a request built from the URL the probe actually
+    posted to, as httpx's own does, so the origin check sees the probe's host.
+    ``body`` replaces the default JSON error body, and ``content`` sends raw
+    bytes instead of JSON.
+    """
+    if content is None:
+        payload = {"json": body if body is not None else {"error": {"message": _GATEWAY_MESSAGE}}}
+    else:
+        payload = {"content": content}
+
+    class _Client:
+        def __init__(self, *a, **k):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, headers=None, json=None):
+            return httpx.Response(
+                status_code,
+                headers=response_headers,
+                request=httpx.Request("POST", url),
+                **payload,
+            )
+
+    monkeypatch.setattr(providers.httpx, "AsyncClient", _Client)
+
+
+def _gateway_base() -> str:
+    """The MindsHub URL this install treats as its gateway."""
+    return f"https://{te._configured_minds_host()}"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "reason", "extra_headers", "reset_at"),
+    [
+        (429, "rate_limited", {"Retry-After": "12"}, None),
+        (429, "free_air_daily_spend_fuse_exceeded", {"X-MindsHub-Reset-At": _RESET_AT}, _RESET_AT),
+        (429, "included_allowance_exhausted", {"X-MindsHub-Reset-At": _RESET_AT}, _RESET_AT),
+        (402, "wallet_empty", {}, None),
+        (503, "policy_unavailable", {}, None),
+    ],
+)
+def test_a_gateway_refusal_carries_its_reason(monkeypatch, status_code, reason, extra_headers, reset_at):
+    _serve_gateway(monkeypatch, status_code, {"X-MindsHub-Reason": reason, **extra_headers})
+
+    ping = asyncio.run(
+        ping_provider({"type": "minds-cloud", "apiKey": "mdb_x", "mindsUrl": _gateway_base()})
+    )
+
+    assert ping.status == "fail"
+    assert ping.detail == f"HTTP {status_code}: {_GATEWAY_MESSAGE}"
+    assert ping.denial == GatewayDenial(reason=reason, reset_at=reset_at)
+
+
+def test_a_reason_from_another_host_is_not_trusted(monkeypatch):
+    # Anyone can send X-MindsHub-Reason. Only the configured gateway's counts,
+    # so a probe aimed elsewhere keeps its detail and names no reason.
+    _serve_gateway(
+        monkeypatch, 429,
+        {"X-MindsHub-Reason": "free_air_daily_spend_fuse_exceeded", "X-MindsHub-Reset-At": _RESET_AT},
+    )
+
+    ping = asyncio.run(
+        ping_provider(
+            {"type": "minds-cloud", "apiKey": "mdb_x", "mindsUrl": "https://attacker.example"}
+        )
+    )
+
+    assert ping.denial is None
+    assert ping.status == "fail"
+    assert ping.detail == f"HTTP 429: {_GATEWAY_MESSAGE}"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "reason"),
+    [
+        (429, "included_allowance_exhausted"),
+        (429, "free_air_daily_spend_fuse_exceeded"),
+        (402, "wallet_empty"),
+    ],
+)
+def test_a_gateway_refusal_with_its_reason_header_stripped_classifies_from_the_body_code(
+    monkeypatch, status_code, reason
+):
+    # A proxy on the way can drop X-MindsHub-Reason. The gateway sets its body
+    # `code` to the same value, so the probe still names the reason from the
+    # configured gateway host's body.
+    _serve_gateway(
+        monkeypatch, status_code, {},
+        body={"error": {"message": _GATEWAY_MESSAGE, "code": reason}},
+    )
+
+    ping = asyncio.run(
+        ping_provider({"type": "minds-cloud", "apiKey": "mdb_x", "mindsUrl": _gateway_base()})
+    )
+
+    assert ping.status == "fail"
+    assert ping.detail == f"HTTP {status_code}: {_GATEWAY_MESSAGE}"
+    assert ping.denial == GatewayDenial(reason=reason, reset_at=None)
+
+
+def test_a_body_code_from_another_host_is_not_trusted(monkeypatch):
+    # The body is the other host's to write, and unlike the header it counts
+    # only from the configured gateway host.
+    _serve_gateway(
+        monkeypatch, 429, {},
+        body={"error": {"message": _GATEWAY_MESSAGE, "code": "included_allowance_exhausted"}},
+    )
+
+    ping = asyncio.run(
+        ping_provider(
+            {"type": "minds-cloud", "apiKey": "mdb_x", "mindsUrl": "https://attacker.example"}
+        )
+    )
+
+    assert ping.denial is None
+    assert ping.status == "fail"
+    assert ping.detail == f"HTTP 429: {_GATEWAY_MESSAGE}"
+
+
+def test_a_non_json_body_still_classifies_from_the_reason_header(monkeypatch):
+    # An HTML error page cannot be parsed for a body code. The probe must
+    # still read the reason header rather than lose the denial altogether.
+    _serve_gateway(
+        monkeypatch, 429, {"X-MindsHub-Reason": "rate_limited"},
+        content=b"<html><body>Too Many Requests</body></html>",
+    )
+
+    ping = asyncio.run(
+        ping_provider({"type": "minds-cloud", "apiKey": "mdb_x", "mindsUrl": _gateway_base()})
+    )
+
+    assert ping.status == "fail"
+    assert ping.denial == GatewayDenial(reason="rate_limited", reset_at=None)
+
+
+def test_a_passing_probe_names_no_reason(monkeypatch):
+    _patch(monkeypatch)
+    ping = asyncio.run(ping_provider({"type": "minds-cloud", "apiKey": "mdb_x"}))
+    assert ping == ProviderPing(status="ok", detail="HTTP 200", denial=None)
+
+
+def test_ping_providers_reports_denials_only_for_the_types_that_have_one(monkeypatch):
+    async def _fake_ping(p):
+        if p["type"] == "minds-cloud":
+            return ProviderPing(
+                status="fail", detail="HTTP 429",
+                denial=GatewayDenial(reason="rate_limited", reset_at=None),
+            )
+        return ProviderPing(status="ok", detail="HTTP 200")
+
+    monkeypatch.setattr(providers, "ping_provider", _fake_ping)
+
+    results = asyncio.run(ping_providers([{"type": "minds-cloud"}, {"type": "anthropic"}]))
+
+    assert results.statuses == {"minds-cloud": "fail", "anthropic": "ok"}
+    assert results.details == {"minds-cloud": "HTTP 429", "anthropic": "HTTP 200"}
+    assert results.denials == {"minds-cloud": GatewayDenial(reason="rate_limited", reset_at=None)}
+
+
+def test_the_last_card_of_a_type_decides_its_denial_too(monkeypatch):
+    # Two cards of one type share one slot and the last status wins it. An
+    # earlier card's reason left behind would sit beside a status it does not
+    # explain, and the Settings notice would name a stop that did not happen.
+    answers = iter([
+        ProviderPing(
+            status="fail", detail="HTTP 429",
+            denial=GatewayDenial(reason="free_air_daily_spend_fuse_exceeded", reset_at=_RESET_AT),
+        ),
+        ProviderPing(status="fail", detail="HTTP 500"),
+    ])
+
+    async def _fake_ping(p):
+        return next(answers)
+
+    monkeypatch.setattr(providers, "ping_provider", _fake_ping)
+
+    results = asyncio.run(ping_providers([{"type": "minds-cloud"}, {"type": "minds-cloud"}]))
+
+    assert results.statuses == {"minds-cloud": "fail"}
+    assert results.details == {"minds-cloud": "HTTP 500"}
+    assert results.denials == {}
+
+
+def test_the_probe_vocabulary_matches_the_wire_contract():
+    # The classifier's allowlist and the response model's Literal are written
+    # twice, in two layers. A reason in one and not the other would either be
+    # dropped silently or fail validation and 500 the whole Settings probe.
+    from typing import get_args
+
+    assert set(get_args(ProbeDenialCode)) == te.PROBE_DENIAL_REASONS

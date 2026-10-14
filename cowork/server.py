@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.datastructures import MutableHeaders
 
 from cowork.api.v1.route_walker import contradictory_routes, route_key, undeclared_routes
@@ -18,9 +19,14 @@ from cowork.api.v1.router import api_router as v1_router
 from starlette.responses import JSONResponse
 
 from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token, sync_auth_token
+from cowork.coding.inference_proxy import INFERENCE_PATHS
 from cowork.db.scoped import MissingTenantScopeError
+from cowork.db.units import DatabaseBusy, busy_retry_seconds
+from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
 from cowork.principal import TrustedHeaderMiddleware
-from cowork.common.logger import setup_logging
+from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
+from cowork.streaming import TurnInProgress
+from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.dev_setup import run_dev_setup
@@ -94,9 +100,68 @@ async def _warm_model_map_on_boot() -> bool:
         warm_session.close()
 
 
+async def _cancel_and_wait(task: asyncio.Task | None) -> None:
+    """Stop one background task at shutdown and wait for it to finish."""
+    if task is None:
+        return
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+async def _run_artifact_owner_backfill() -> None:
+    """Background, one-time owner backfill (ENG-2961). Never affects startup."""
+    try:
+        from cowork.services.artifact_owner_backfill import run_artifact_owner_backfill
+
+        await asyncio.to_thread(run_artifact_owner_backfill)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("artifact owner backfill failed (non-fatal)")
+
+
+# Imported lazily by the first agent turn otherwise, adding their import time to
+# that turn's time to first text.
+AGENT_RUNTIME_MODULES = (
+    "anton.core.llm.openai",
+    "anton.core.llm.anthropic",
+    "anton.minds_client",
+    "anton.core.session",
+    "anton.core.tools.tool_handlers",
+)
+
+
+def _warm_agent_runtime() -> None:
+    """Import the agent runtime at startup. A module that fails is left for the turn."""
+    import importlib
+
+    for name in AGENT_RUNTIME_MODULES:
+        try:
+            importlib.import_module(name)
+        except Exception:
+            logger.debug("agent runtime warm-up skipped %s", name, exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_dev_setup()
+    # Before the server reports ready, so the first turn does not pay for imports.
+    await asyncio.to_thread(_warm_agent_runtime)
+    # History recovery also retries buffers sealed by an earlier failed sweep.
+    try:
+        from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
+        from cowork.db.session import get_open_session
+        from cowork.streaming import get_streams_dir
+        from cowork.streaming.recovery import seal_orphan_turns_in_history
+
+        history_session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
+        try:
+            seal_orphan_turns_in_history(history_session, get_streams_dir())
+        finally:
+            history_session.close()
+    except Exception:
+        logger.exception("turn-history boot recovery failed (non-fatal)")
     # Seal any turn buffers left open by a previous process (crash/restart)
     # so reconnecting clients get a clean Interrupted end-of-stream rather
     # than hanging. GC of old buffers happens lazily; cheap no-op when none.
@@ -148,34 +213,74 @@ async def lifespan(app: FastAPI):
     start_scheduler()
     await _start_channels(app)
     app.state.channel_ingress_reconciler = None
+    app.state.artifact_owner_backfill = None
     if get_app_settings().tenancy_mode == "org":
         from cowork.channels.ingress import start_reconciler
 
         app.state.channel_ingress_reconciler = start_reconciler(
             app.state.channel_ingress, app.state.channel_adapters
         )
+        # Background so the port binds without waiting for an EFS walk.
+        app.state.artifact_owner_backfill = asyncio.create_task(
+            _run_artifact_owner_backfill()
+        )
     try:
         yield
     finally:
         from cowork.channels.webhooks import drain_background_tasks
+        from cowork.common.chat_session import drain_scratchpad_closes
         from cowork.common.http_client import close_proxy_client
+        from cowork.coding.inference_proxy import close_inference_client
         from cowork.services.artifacts import shutdown_launched_backends
         from cowork.services.scratchpad_runtime import close_all as close_scratchpads
         from cowork.coding.service import get_coding_service
+        from cowork.streaming.registry import registry
 
-        reconciler = getattr(app.state, "channel_ingress_reconciler", None)
-        if reconciler is not None:
-            reconciler.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await reconciler
+        # Uvicorn's request drain is bounded by the image command. Persist
+        # interrupted turns before their database and runtime resources close.
+        cancelled = await registry.shutdown()
+        if cancelled:
+            logger.warning("Cancelled %d in-flight turn(s) for shutdown", cancelled)
+
+        await _cancel_and_wait(getattr(app.state, "channel_ingress_reconciler", None))
+        await _cancel_and_wait(getattr(app.state, "artifact_owner_backfill", None))
 
         await app.state.channel_ingress.stop_all()
         await drain_background_tasks()
+        # After both turn drains above: each turn they unwound has queued the
+        # close of its scratchpad processes, and those must finish before the
+        # event loop stops.
+        await drain_scratchpad_closes()
         await app.state.channel_adapters.shutdown()
         get_coding_service().close_all()
         shutdown_launched_backends()
         await close_scratchpads()
         await close_proxy_client()
+        await close_inference_client()
+
+
+@asynccontextmanager
+async def _lifespan_without_database_text(app: FastAPI):
+    """Run ``lifespan``, keeping a database error's text out of Uvicorn's log.
+
+    Starlette hands a failed startup or shutdown to Uvicorn as
+    ``traceback.format_exc()`` text, and Uvicorn logs that text as a plain
+    message, which no exception filter can read. A migration, the seed rows,
+    or a reboot that starts Cowork before Postgres would print SQL and driver
+    detail on every restart. The owned handlers log the error instead, as its
+    type, SQLSTATE and the cowork frame it failed in, and Uvicorn gets an
+    error that carries no database text.
+    """
+    phase = "startup"
+    try:
+        async with lifespan(app):
+            phase = "shutdown"
+            yield
+    except Exception as exc:
+        if find_database_error(exc=exc) is None:
+            raise
+        logger.error("Server %s failed", phase, exc_info=True, extra=relayed_error())
+        raise RuntimeError(f"Database operation failed during server {phase}") from None
 
 
 class _NoStoreMiddleware:
@@ -218,7 +323,7 @@ def create_app() -> FastAPI:
         title="Cowork API",
         description="Cowork server — OpenAI-compatible Responses API with pluggable harness backends",
         version="1.0.0",
-        lifespan=lifespan,
+        lifespan=_lifespan_without_database_text,
     )
 
     # Org-scoped data touched without an org in scope (e.g. audit mode with no
@@ -227,10 +332,32 @@ def create_app() -> FastAPI:
     async def _missing_tenant_scope(request, exc):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
 
-    # Optional bearer-token auth.  Off by default; enabled when
-    # COWORK_REQUIRE_AUTH=true.  Token is auto-generated on first startup
-    # when COWORK_AUTH_TOKEN is not set, then persisted to <cowork_home>/.env
-    # so the desktop app and subsequent server runs share the same secret.
+    # No database connection freed within POOL_TIMEOUT. DatabaseBusy, a unit
+    # that waited for its slot or its connection, subclasses the pool timeout,
+    # so this answers both. The web UI waits for Retry-After before it offers
+    # a retry, and the sentence names the wait for clients that don't read it.
+    @app.exception_handler(PoolTimeoutError)
+    async def _database_busy(request, exc):
+        retry_after = busy_retry_seconds()
+        logger.warning(
+            "%s %s refused with 503: no database connection freed in time",
+            request.method, request.url.path,
+        )
+        return JSONResponse(
+            Refusal(detail=server_busy_message(retry_after), code=SERVER_BUSY_CODE).model_dump(),
+            status_code=DatabaseBusy.status_code,
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    # A second question into a conversation whose turn is still answering.
+    @app.exception_handler(TurnInProgress)
+    async def _turn_in_progress(request, exc):
+        return JSONResponse(TURN_IN_PROGRESS.model_dump(), status_code=exc.status_code)
+
+    # Bearer-token auth. On by default in local mode (see AppSettings.
+    # require_auth). Token is auto-generated on first startup when
+    # COWORK_AUTH_TOKEN is not set, then persisted to <cowork_home>/.env so
+    # the desktop app and subsequent server runs share the same secret.
     #
     # Registered BEFORE CORS so CORS ends up the outer layer (Starlette applies
     # the last-added middleware outermost): a 401 from the auth layer still
@@ -250,13 +377,11 @@ def create_app() -> FastAPI:
             TrustedHeaderMiddleware,
             exempt_paths=channel_webhook_paths,
             enforce=enforce,
-            organization_boundary_mode=settings.organization_boundary_mode,
         )
         logger.info(
             "auth: org tenancy mode — principal middleware enabled "
-            "(identity=%s, organization-boundary=%s)",
+            "(identity=%s)",
             settings.identity_enforce,
-            settings.organization_boundary_mode,
         )
         # No explicit shared root → org data sits on the ephemeral pod FS.
         # Warn, don't fail: dev deployments predate the mount. model_fields_set
@@ -286,6 +411,13 @@ def create_app() -> FastAPI:
         env_path = cowork_home() / ".env"
         token = settings.auth_token or ensure_auth_token(env_path)
         sync_auth_token(env_path, token)
+        # Codex has a separate, process-local inference credential, not the
+        # desktop's API token. These exact routes retain their own constant-time
+        # credential check and LoopbackDesktopOnly guard. Do not exempt the
+        # coding prefix: that would expose task/filesystem APIs to the agent.
+        channel_webhook_paths.update(
+            f"/api/v1/coding/inference/{path}" for path in INFERENCE_PATHS
+        )
         app.add_middleware(
             BearerTokenMiddleware, token=token, exempt_paths=channel_webhook_paths
         )

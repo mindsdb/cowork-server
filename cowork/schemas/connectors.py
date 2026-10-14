@@ -23,6 +23,9 @@ class ConnectorField(BaseModel):
     description: str | None = None
     default: Any = None
     options: list[dict[str, Any]] | None = None
+    #: A checkbox reads as a sentence beside the box, which is longer than the
+    #: label the field is listed under. Only a boolean field uses it.
+    checkbox_label: str | None = None
 
 
 class OAuthConfig(BaseModel):
@@ -52,7 +55,8 @@ class OAuthConfig(BaseModel):
             raise ValueError("redirect_host must be a loopback hostname")
         return v
 
-    # Only set on the `browser_oauth_builtin` method — the service-id slug
+    # Set on the zero-field OAuth method (`browser_oauth_builtin`, or `mcp`
+    # for HubSpot) — the service-id slug
     # (e.g. "google-drive") used in the /connectors/oauth/{service}/... web
     # fallback routes. The engine name and this slug have already diverged
     # historically (e.g. engine google_analytics_4 -> service
@@ -71,6 +75,33 @@ class OAuthConfig(BaseModel):
     token_auth_style: str = "body"
 
 
+class CloudMethod(BaseModel):
+    """What a method collects and whether it runs when the deployment is hosted.
+
+    A method without one of these is desktop-only. Clients render a method's
+    cloud form as submittable only when both flags hold: the connector's
+    `ConnectorMetadataResponse.cloud_available`, computed per request from
+    auth's catalogue, and this method's static `available`. Neither overrides
+    the other, and no server path enforces `available` yet.
+    """
+
+    # False while the hosted path can accept the form but not yet execute
+    # against it. An available form has never been proof of execution
+    # support, so this stays False until adapter tests establish the
+    # driver/server/method row it depends on.
+    available: bool = False
+    # Cloud copy, never inherited from the desktop method. The desktop text
+    # documents an SSL on/off toggle and a CA field the cloud form does not
+    # offer, and a localhost server the hosted path refuses, so rendering it
+    # to a cloud user would describe a form that cannot be submitted.
+    description: str | None = None
+    how_to: str | None = None
+    # The COMPLETE cloud field list, not a delta on the desktop `fields`.
+    # Two independent lists is what keeps the desktop form fixed while this
+    # one changes.
+    fields: list[ConnectorField] = []
+
+
 class ConnectorMethod(BaseModel):
     id: str
     label: str
@@ -82,6 +113,7 @@ class ConnectorMethod(BaseModel):
     how_to: str | None = None
     help_url: str | None = None
     fields: list[ConnectorField] = []
+    cloud: CloudMethod | None = None
 
     @field_validator("id")
     @classmethod
@@ -113,6 +145,11 @@ class ConnectorMetadataResponse(BaseModel):
     logo_color: str | None = None
     aliases: list[str] = []
     featured: bool = False
+    # A short caveat the directory shows as a badge + tooltip on the tile —
+    # something true about connecting that the user is better off knowing
+    # before they start, not a status field. Set only where there is one;
+    # None renders no badge at all.
+    notice: str | None = None
     # Org (cloud) mode only: False marks a connector the hosted build can't
     # run yet, so the directory can list it under a desktop-only group instead
     # of hiding it. Always True on desktop, where the whole registry works.

@@ -2,9 +2,10 @@
 
 import json
 import os
+import sys
 from pathlib import Path
 
-from cowork.services.artifacts import _content_mtime
+from cowork.services.artifacts import _content_mtime, _user_files_with_mtimes
 
 
 def _touch(path: Path, mtime: float) -> None:
@@ -33,6 +34,86 @@ def test_content_mtime_empty_folder_is_zero(tmp_path: Path):
         json.dumps({"id": "a", "type": "mixed"}), encoding="utf-8"
     )
     assert _content_mtime(tmp_path) == 0
+
+
+def _rmtree_iterative(root: Path) -> None:
+    """Non-recursive rmtree: `shutil.rmtree` itself recurses per directory
+    level, so it blows the same limit on a tree deep enough to test _walk."""
+    dirs = [root]
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        for entry in os.scandir(current):
+            if entry.is_dir(follow_symlinks=False):
+                child = Path(entry.path)
+                stack.append(child)
+                dirs.append(child)
+            else:
+                os.remove(entry.path)
+    for d in reversed(dirs):
+        os.rmdir(d)
+
+
+def test_user_files_with_mtimes_survives_a_deep_tree(tmp_path: Path):
+    """ENG-2436 follow-up: a folder deep enough to exceed the recursion limit
+    must not 500 the whole artifact list. `Path.mkdir(parents=True)` is itself
+    recursive and would blow up building the fixture, so build depth-first with
+    one `os.mkdir` per level instead. Torn down the same way afterwards —
+    pytest's own tmp_path cleanup uses `shutil.rmtree`, which would otherwise
+    hit the very RecursionError this test exists to rule out.
+    """
+    depth = sys.getrecursionlimit() + 200
+    root = tmp_path / "deep"
+    root.mkdir()
+    current = root
+    for _ in range(depth):
+        # A single-char component name keeps the path well under PATH_MAX at
+        # this depth; the tree's depth is what matters here, not its names.
+        current = current / "d"
+        os.mkdir(current)
+    bottom_file = current / "index.html"
+    bottom_file.write_text("<h1>deep</h1>", encoding="utf-8")
+
+    try:
+        files = [p for p, _ in _user_files_with_mtimes(root)]
+        assert bottom_file in files
+    finally:
+        _rmtree_iterative(root)
+
+
+def test_prepare_artifact_card_walks_folder_once(tmp_path: Path, monkeypatch):
+    """the card builder must walk an artifact's folder exactly once,
+    not once per helper (files, mtime, is_live) it used to call separately."""
+    import cowork.services.artifacts as artifacts_mod
+
+    artifact_id = "12345678-1234-5678-1234-567812345678"
+    (tmp_path / "index.html").write_text("<h1>hi</h1>", encoding="utf-8")
+    meta = {"id": artifact_id, "type": "html-app", "primary": "index.html"}
+    (tmp_path / "metadata.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    calls = []
+    original = artifacts_mod._user_files_with_mtimes
+
+    def counting_walker(folder):
+        calls.append(folder)
+        return original(folder)
+
+    monkeypatch.setattr(artifacts_mod, "_user_files_with_mtimes", counting_walker)
+
+    prepared = artifacts_mod._prepare_artifact_card(
+        tmp_path,
+        0,
+        artifact_id=artifact_id,
+        meta=meta,
+        published_map={},
+        project_id=None,
+        project_name="proj",
+        pinned_folder=None,
+        pinned_root=None,
+    )
+
+    assert prepared is not None
+    assert len(calls) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -485,11 +566,13 @@ def test_publish_bundle_md5_is_time_independent(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Task 2: backend.log excluded from the mtime gate
+# Non-content files excluded from the mtime gate
 # ---------------------------------------------------------------------------
 
-from cowork.services.artifacts import _HOUSEKEEPING_FILES
+from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 from anton.publisher import _FULLSTACK_EXCLUDED
+from cowork.api.v1.endpoints.artifact_workspace import _PRIVATE_DRAFT_ENTRIES
+from cowork.services.artifacts import _user_files, content_mtime_ns
 
 
 def _publish_fullstack(tmp_path: Path) -> Path:
@@ -515,11 +598,53 @@ def test_fullstack_modified_false_when_only_backend_log_changes(tmp_path: Path):
     assert card["modified"] is False
 
 
-def test_housekeeping_lists_consistent(tmp_path: Path):
-    """backend.log must be excluded both from the mtime gate (cowork-server)
-    and from the published bundle (anton publisher)."""
-    assert "backend.log" in _HOUSEKEEPING_FILES
-    assert "backend.log" in _FULLSTACK_EXCLUDED
+def test_housekeeping_lists_consistent():
+    """The mtime walk and the draft deny-list share anton's set, and the
+    publisher bundle excludes the same names."""
+    assert _PRIVATE_DRAFT_ENTRIES is NON_CONTENT_NAMES
+    assert _FULLSTACK_EXCLUDED == NON_CONTENT_NAMES
+    assert {"backend.log", ".revisions"} <= NON_CONTENT_NAMES
+
+
+def test_state_and_generation_files_are_not_content(tmp_path: Path):
+    """STATE driver files and generation inputs must not show on the card,
+    move the mtime gate, or count as a turn's edit."""
+    index = tmp_path / "index.html"
+    index.write_text("<h1>hi</h1>", encoding="utf-8")
+    _touch(index, 1000.0)
+    noise = [
+        ".anton_state.db", ".anton_state.db-wal", ".anton_state.db-shm",
+        ".state_manifest.published.json", "prd.md", "spec.md",
+        "openapi.json", "discovery.json", ".revisions/r1.json",
+    ]
+    for rel in noise:
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x", encoding="utf-8")
+        _touch(p, 9999.0)
+
+    assert _user_files(tmp_path) == [index]
+    assert _content_mtime(tmp_path) == 1000
+    assert content_mtime_ns(tmp_path) == 1000 * 10**9
+
+
+def test_nested_names_matching_non_content_names_are_content(tmp_path: Path):
+    """Only the first path component decides: nested files are content."""
+    prd = tmp_path / "static" / "prd.md"
+    log = tmp_path / "static" / "backend.log"
+    prd.parent.mkdir()
+    prd.write_text("x", encoding="utf-8")
+    log.write_text("x", encoding="utf-8")
+
+    assert sorted(_user_files(tmp_path)) == [log, prd]
+
+
+def test_state_manifest_is_content(tmp_path: Path):
+    """The publisher bundles state_manifest.json, so it is a deliverable."""
+    manifest = tmp_path / "state_manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+
+    assert _user_files(tmp_path) == [manifest]
 
 
 # ---------------------------------------------------------------------------

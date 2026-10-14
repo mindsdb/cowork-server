@@ -3,8 +3,20 @@ import logging
 # Add logging import for rotating file handler
 import logging.handlers
 import os
+import re
 import sys
+import traceback
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import dataclass
 from pathlib import Path
+from sqlite3 import Error as SQLiteError
+from typing import Any
+from uuid import UUID
+
+from anton.core.llm.provider import CURATED_PROVIDER_ERRORS
+from psycopg import Error as PsycopgError
+from psycopg2 import Error as Psycopg2Error
+from sqlalchemy.exc import SQLAlchemyError, StatementError
 
 try:
     import colorlog
@@ -22,6 +34,227 @@ except ImportError:
     HAS_RICH = False
 
 
+_DATABASE_ERROR_TYPES = (SQLAlchemyError, SQLiteError, PsycopgError, Psycopg2Error)
+
+# The cowork package directory. A logging call whose file is outside it, such
+# as Uvicorn's request runner, only relays the error it logs.
+_COWORK_DIR = os.path.dirname(os.path.dirname(__file__)) + os.sep
+
+# Session and unit-of-work wrappers that every query passes through. Their
+# frames name the wrapper, never the code that ran the query.
+_DATABASE_PLUMBING_MODULES = frozenset({"cowork.db.scoped", "cowork.db.session", "cowork.db.units"})
+
+# The record attribute relayed_error() sets.
+_RELAYS_ERROR = "relays_error"
+
+
+def _exception_chain(*, exc: BaseException) -> Iterator[BaseException]:
+    """Yield ``exc``, then its cause, its context and its group members, depth first.
+
+    Each exception is yielded once, so a cycle ends the walk. ``__context__`` is
+    followed even when ``__suppress_context__`` is set: a wrapper raised
+    ``from None`` can still repeat the original error's text in its own message.
+    """
+    pending = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        # Pushed in reverse, so the walk pops the cause first and the members last.
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(reversed(current.exceptions))
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+
+
+def find_database_error(*, exc: BaseException) -> SQLAlchemyError | SQLiteError | PsycopgError | Psycopg2Error | None:
+    """The first database error in ``exc``'s chain, even when an application exception wraps it."""
+    return next((error for error in _exception_chain(exc=exc) if isinstance(error, _DATABASE_ERROR_TYPES)), None)
+
+
+def _exception_candidates(*, record: logging.LogRecord) -> list[BaseException]:
+    """The exceptions a record carries: its exc_info, then its message, then its arguments."""
+    candidates: list[BaseException] = []
+    # asyncio logs a context without an exception with exc_info=False.
+    if record.exc_info and record.exc_info[1] is not None:
+        candidates.append(record.exc_info[1])
+    if isinstance(record.msg, BaseException):
+        candidates.append(record.msg)
+    args = record.args.values() if isinstance(record.args, dict) else (record.args or ())
+    candidates.extend(arg for arg in args if isinstance(arg, BaseException))
+    return candidates
+
+
+def _replace_record(*, record: logging.LogRecord, msg: str, args: tuple[object, ...]) -> None:
+    """Swap a record's message for safe metadata and drop everything that repeats the error.
+
+    A handler without these filters may have formatted the record already,
+    caching its text in ``message`` and its traceback in ``exc_text``; a later
+    formatter would print that cached traceback, so both are reset too.
+    """
+    record.msg = msg
+    record.args = args
+    record.message = record.getMessage()
+    record.exc_info = None
+    record.exc_text = None
+    record.stack_info = None
+
+
+def relayed_error() -> dict[str, bool]:
+    """The ``extra=`` for a logging call that only relays an error raised elsewhere.
+
+    The database line then names where the error failed, as it does for a
+    logging call outside cowork, instead of the relaying call.
+    """
+    return {_RELAYS_ERROR: True}
+
+
+def _failure_site(*, record: logging.LogRecord, error: BaseException) -> str:
+    """Where a database error failed, as ``<module>.<function>:<line>``.
+
+    That is the logging call, unless the call is outside cowork (Uvicorn's
+    request runner) or marked with relayed_error(). Then it is the deepest
+    frame of the error's own traceback in a cowork module outside the session
+    plumbing, or still the logging call when there is none. walk_tb reads only
+    each frame's module, function and line, never its source or locals.
+    """
+    site = f"{record.module}.{record.funcName}:{record.lineno}"
+    if record.pathname.startswith(_COWORK_DIR) and not getattr(record, _RELAYS_ERROR, False):
+        return site
+    for frame, lineno in traceback.walk_tb(error.__traceback__):
+        module = frame.f_globals.get("__name__", "")
+        if module.startswith("cowork.") and module not in _DATABASE_PLUMBING_MODULES:
+            site = f"{module.rsplit('.', 1)[-1]}.{frame.f_code.co_name}:{lineno}"
+    return site
+
+
+class DatabaseErrorFilter(logging.Filter):
+    """Replace database exception records before a handler formats them.
+
+    hide_parameters on an engine protects bound values, but not SQL literals,
+    driver error details or a caller that already interpolated the exception
+    into its message. Replace the entire message and clear the traceback;
+    the propagated exception and any response built from it stay unchanged.
+    The replacement names the call site (see _failure_site). A caller's ids
+    travel as record attributes (see CustomFormatter), which this filter
+    leaves alone.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        for exc in _exception_candidates(record=record):
+            error = find_database_error(exc=exc)
+            if error is None:
+                continue
+            driver_error = error.orig if isinstance(error, StatementError) else error
+            sqlstate = getattr(driver_error, "sqlstate", None) or getattr(driver_error, "pgcode", None)
+            # Driver SQLSTATE is a five-character code, never its DETAIL or text.
+            if not isinstance(sqlstate, str) or re.fullmatch(r"[A-Z0-9]{5}", sqlstate) is None:
+                sqlstate = "unknown"
+            _replace_record(
+                record=record,
+                msg="Database operation failed: error_type=%s sqlstate=%s site=%s",
+                args=(type(error).__name__, sqlstate, _failure_site(record=record, error=error)),
+            )
+            break
+        return True
+
+
+def _own_http_status(*, error: BaseException) -> int | None:
+    """``error``'s own ``status_code`` when it is an actual HTTP status, else None.
+
+    Only an exact int counts: an int subclass can render any text.
+    """
+    status = getattr(error, "status_code", None)
+    return status if type(status) is int and 100 <= status <= 599 else None
+
+
+def exception_http_status(*, exc: BaseException) -> int | None:
+    """Return an actual HTTP status, never a provider body field coerced to text."""
+    for error in _exception_chain(exc=exc):
+        status = _own_http_status(error=error)
+        if status is not None:
+            return status
+    return None
+
+
+def _provider_status(*, error: BaseException) -> int | str:
+    """The provider error's own HTTP status, or ``unknown`` when it has no real one."""
+    status = _own_http_status(error=error)
+    return "unknown" if status is None else status
+
+
+def _provider_error(*, exc: BaseException) -> BaseException | None:
+    """The first provider error in ``exc``'s chain, found by type alone."""
+    # Imported on first use, not with this module: the two SDKs take most of
+    # a second to load, and a process such as cowork-code-runtime otherwise
+    # never loads them. cowork-server does not declare anthropic or openai
+    # itself: both arrive as anton-agent dependencies.
+    from anthropic import AnthropicError
+    from openai import OpenAIError
+
+    # The SDK base classes, not only their APIError: an OpenAIError such as
+    # LengthFinishReasonError carries provider text without being an APIError.
+    provider_types = (OpenAIError, AnthropicError, *CURATED_PROVIDER_ERRORS)
+    return next((error for error in _exception_chain(exc=exc) if isinstance(error, provider_types)), None)
+
+
+class ProviderErrorFilter(logging.Filter):
+    """Keep SDK bodies and typed provider error text out of owned log handlers.
+
+    A provider may echo prompts or credentials in its message, body or request.
+    Replace the entire record, including already interpolated wrapper messages,
+    while leaving the original exception and client response unchanged.
+
+    The replacement names the record's own exception class, the first provider
+    error in its chain and that provider error's own HTTP status, never a
+    wrapper's. Mirrors anton.core.llm.provider.ProviderErrorFilter; replace it
+    with an import once that release is pinned.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        for exc in _exception_candidates(record=record):
+            provider_error = _provider_error(exc=exc)
+            if provider_error is None:
+                continue
+            _replace_record(
+                record=record,
+                msg="Provider operation failed: error_type=%s provider_error=%s status=%s",
+                args=(type(exc).__name__, type(provider_error).__name__, _provider_status(error=provider_error)),
+            )
+            break
+        return True
+
+
+def _add_privacy_filters(*, target: logging.Filterer) -> None:
+    """Attach the database and provider filters to a handler or logger, once each."""
+    for filter_type in (DatabaseErrorFilter, ProviderErrorFilter):
+        if not any(isinstance(existing, filter_type) for existing in target.filters):
+            target.addFilter(filter_type())
+
+
+class AccessQueryFilter(logging.Filter):
+    """Keep the path and redact the query in Uvicorn's access line.
+
+    Uvicorn logs each request at INFO, whatever LOG_LEVEL says, with the
+    arguments (client, method, path?query, HTTP version, status). A query can
+    carry an OAuth callback's code or a webhook's verify token. Uvicorn
+    percent-encodes a ``?`` inside the path, so the first one starts the query.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) == 5 and isinstance(args[2], str):
+            path, separator, _ = args[2].partition("?")
+            if separator:
+                record.args = (args[0], args[1], f"{path}?[redacted]", args[3], args[4])
+        return True
+
+
 class EventLoopClosedFilter(logging.Filter):
     """Filter out 'Event loop is closed' errors that occur during cleanup"""
 
@@ -34,13 +267,71 @@ class EventLoopClosedFilter(logging.Filter):
         )
 
 
-class CustomFormatter(logging.Formatter):
-    """Formatter that renders the optional ``user_id`` / ``request_id`` a call
-    site may attach via ``extra=``.
+@dataclass(frozen=True)
+class _ContextField:
+    """One id a call site may attach via ``extra=``, and how it renders."""
 
-    Both render as an empty string when absent, which is what lets a format
+    attribute: str
+    label: str
+    render: Callable[[Any], str] = str
+
+
+def _quoted_slugs(slugs: Sequence[str]) -> str:
+    return ", ".join(repr(slug) for slug in slugs)
+
+
+# Rendered in this order into ``%(request_context)s``. The database and
+# provider filters replace a record's message but never these attributes, so
+# a sanitized line still names the request, project, schedule, conversation
+# and artifacts it came from. Call sites build them with log_context.
+_REQUEST_CONTEXT_FIELDS = (
+    _ContextField("request_id", "Req"),
+    _ContextField("project_id", "Project"),
+    _ContextField("schedule_id", "Schedule"),
+    _ContextField("conversation_id", "Conversation"),
+    # Folder names the agent chose: quoted, as the messages quoted them with
+    # %r, so a newline or bracket in one cannot pass for another line or field.
+    _ContextField("artifact_slug", "Artifact", repr),
+    _ContextField("artifact_slugs", "Artifacts", _quoted_slugs),
+)
+
+
+def log_context(
+    *,
+    request_id: str | None = None,
+    project_id: UUID | str | None = None,
+    schedule_id: UUID | str | None = None,
+    conversation_id: UUID | str | None = None,
+    artifact_slug: str | None = None,
+    artifact_slugs: Sequence[str] | None = None,
+) -> dict[str, str | tuple[str, ...]]:
+    """The ``extra=`` mapping for the ids that locate a failure.
+
+    Each keyword is one of the record attributes in _REQUEST_CONTEXT_FIELDS,
+    so a misspelled name fails at the call instead of rendering nothing. Ids
+    become strings. ``artifact_slug`` names one folder and ``artifact_slugs``
+    several, as a tuple. A None value is left out.
+    """
+    ids = {
+        "request_id": request_id,
+        "project_id": project_id,
+        "schedule_id": schedule_id,
+        "conversation_id": conversation_id,
+        "artifact_slug": artifact_slug,
+    }
+    context: dict[str, str | tuple[str, ...]] = {name: str(value) for name, value in ids.items() if value is not None}
+    if artifact_slugs is not None:
+        context["artifact_slugs"] = tuple(artifact_slugs)
+    return context
+
+
+class CustomFormatter(logging.Formatter):
+    """Formatter that renders the optional ``user_id`` and the
+    _REQUEST_CONTEXT_FIELDS ids a call site may attach via ``extra=``.
+
+    Each renders as an empty string when absent, which is what lets a format
     string reference ``%(request_context)s`` unconditionally — the vast
-    majority of records carry neither. An explicitly ``None`` value counts as
+    majority of records carry none. An explicitly ``None`` value counts as
     absent.
     """
 
@@ -50,8 +341,11 @@ class CustomFormatter(logging.Formatter):
         user_id = getattr(record, "user_id", None)
         record.user_context = f"[User:{user_id}]" if user_id is not None else ""
 
-        request_id = getattr(record, "request_id", None)
-        record.request_context = f"[Req:{request_id}]" if request_id is not None else ""
+        record.request_context = "".join(
+            f"[{field.label}:{field.render(value)}]"
+            for field in _REQUEST_CONTEXT_FIELDS
+            if (value := getattr(record, field.attribute, None)) is not None
+        )
 
         return super().format(record)
 
@@ -122,6 +416,7 @@ def setup_file_logging(log_dir: str = "logs", max_bytes: int = 10485760, backup_
             datefmt="%Y-%m-%d %H:%M:%S",
         )
     )
+    _add_privacy_filters(target=all_logs_handler)
     handlers.append(all_logs_handler)
 
     # Error logs file
@@ -136,6 +431,7 @@ def setup_file_logging(log_dir: str = "logs", max_bytes: int = 10485760, backup_
             datefmt="%Y-%m-%d %H:%M:%S",
         )
     )
+    _add_privacy_filters(target=error_handler)
     handlers.append(error_handler)
 
     return handlers
@@ -161,6 +457,7 @@ def setup_console_handler():
         handler = logging.StreamHandler(sys.stdout)
         handler.setFormatter(get_colored_formatter())
 
+    _add_privacy_filters(target=handler)
     return handler
 
 
@@ -232,12 +529,39 @@ def setup_logging():
     # Configure root logger
     logging.basicConfig(level=log_level, handlers=handlers, force=True)
 
+    # Uvicorn's handlers come from whichever log config the launcher chose: the
+    # cowork-server CLI, `python -m uvicorn` in this repo's image, or `uvicorn
+    # spa_wrapper:app` in the web image. Uvicorn's default config gives the
+    # `uvicorn` logger its own unfiltered handler and no propagation to root.
+    # A filter on each logger Uvicorn writes to runs before any of those
+    # handlers, and a later dictConfig keeps it. The levels stay as the
+    # launcher set them, so lifecycle lines such as "Finished server process"
+    # still print. A logger filter misses a record that a child logger
+    # propagates, so when the launcher configured Uvicorn first, each handler
+    # it already installed gets the filters too.
+    for logger_name in ("uvicorn", "uvicorn.error", "uvicorn.access", "uvicorn.asgi"):
+        uvicorn_logger = logging.getLogger(logger_name)
+        _add_privacy_filters(target=uvicorn_logger)
+        for handler in uvicorn_logger.handlers:
+            _add_privacy_filters(target=handler)
+
+    # Uvicorn logs access lines straight to `uvicorn.access`, so its logger
+    # filter sees every one.
+    access_logger = logging.getLogger("uvicorn.access")
+    if not any(isinstance(existing, AccessQueryFilter) for existing in access_logger.filters):
+        access_logger.addFilter(AccessQueryFilter())
+
     # Suppress verbose logging from third-party libraries
     third_party_loggers = [
-        "httpcore.http11",
+        # The whole transport namespaces: at DEBUG, httpcore and httpcore2
+        # (httpx2's transport, which both provider SDKs use) log every
+        # response's headers, set-cookie included.
+        "httpcore",
+        "httpcore2",
         "openai._base_client",
-        "httpcore.connection",
+        "anthropic._base_client",
         "httpx",
+        "httpx2",
         "urllib3",
         "faiss",
         "asyncio",
@@ -253,6 +577,12 @@ def setup_logging():
 
     for logger_name in third_party_loggers:
         logging.getLogger(logger_name).setLevel(logging.ERROR)
+
+    # SQLAlchemy diagnostic logs can contain SQL literals, result rows and
+    # connection representations. Keep them off even when another logger
+    # config enables diagnostics on the sqlalchemy parent namespace.
+    for logger_name in ("sqlalchemy.engine", "sqlalchemy.pool"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
 
     # Add filter to suppress "Event loop is closed" errors during cleanup
     event_loop_filter = EventLoopClosedFilter()

@@ -18,6 +18,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, 
 from fastapi.responses import FileResponse
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, OpenByDesign, require
+from cowork.common.logger import log_context
 from cowork.db.scoped import MissingTenantScopeError, ScopedSessionDep
 from cowork.services.artifact_roots import CONVERSATIONS_DIRNAME
 
@@ -128,8 +129,9 @@ async def upload_attachment(
             # validation — see the files.purpose width fix). Log the real
             # cause and return an actionable error instead of a bare crash.
             logger.exception(
-                "Attachment upload failed (project=%s session=%s file=%s)",
-                project_name, session_id, getattr(f, "filename", "?"),
+                "Attachment upload failed (project=%s file=%s)",
+                project_name, getattr(f, "filename", "?"),
+                extra=log_context(conversation_id=session_id),
             )
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
