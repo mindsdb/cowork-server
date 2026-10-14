@@ -193,6 +193,53 @@ def test_preview_mount_and_its_assets_reach_only_the_owner(two_people):
     assert client.get(asset, headers=A).status_code == 200
 
 
+class _Upstream:
+    status_code = 200
+    headers = {"content-type": "application/json"}
+
+    async def aiter_raw(self):
+        yield b"{}"
+
+    async def aclose(self):
+        pass
+
+
+def test_a_backend_preview_token_forwards_only_for_the_owner(two_people, monkeypatch):
+    """The proxy token is a hash of A's artifact root, as stable as the asset
+    one, and A's backend runs with A's connection secrets: holding the token
+    must not forward B's request to it."""
+    from cowork.services import artifacts, preview_proxy
+
+    dash, _notes = two_people
+    meta = json.loads((dash / "metadata.json").read_text())
+    (dash / "metadata.json").write_text(json.dumps({**meta, "port": 4242}))
+    forwarded: list[str] = []
+
+    class _Client:
+        def build_request(self, method, url, headers, content):
+            forwarded.append(url)
+            return (method, url)
+
+        async def send(self, upstream_req, stream):
+            return _Upstream()
+
+    async def running(_root, port, *, scope):
+        return True, "already_running", port
+
+    monkeypatch.setattr(artifacts, "_ensure_backend_running", running)
+    monkeypatch.setattr(preview_proxy, "get_proxy_client", _Client)
+    client = _client()
+
+    mounted = client.post("/api/v1/artifacts/preview-mount", json={"path": str(dash / "index.html")}, headers=A)
+    assert mounted.status_code == 200 and mounted.json()["kind"] == "proxy"
+    url = f"/api/v1/artifacts/proxy/{mounted.json()['token']}/data"
+
+    assert client.get(url, headers=B).status_code == 404
+    assert forwarded == []
+    assert client.get(url, headers=A).status_code == 200
+    assert forwarded == ["http://127.0.0.1:4242/data"]
+
+
 def test_serve_by_project_name_reads_the_callers_own_project(two_people):
     url = "/api/v1/artifacts/serve/general/dash/index.html"
     client = _client()
@@ -442,7 +489,72 @@ def test_the_scratchpad_cap_counts_each_project_on_its_own(tmp_path, monkeypatch
         fake_pads.get_or_create("other", workspace_path=str(a_project))
 
 
-async def test_a_backend_launches_only_inside_the_callers_projects(stack, monkeypatch):
+class _LiveProc:
+    returncode = None
+
+
+async def test_another_persons_backend_on_the_port_is_not_the_callers(stack, monkeypatch):
+    """Ports are reused: by the time B previews, the port in B's metadata.json
+    can belong to A's backend. Only a backend this server launched for B's
+    project and slug, on that port, counts as B's running backend."""
+    from cowork.services import artifacts
+
+    a_app = _artifact(_general(ALICE), "app", title="A app")
+    b_app = _artifact(_general(BOB), "app", title="B app")
+    launched: list[Path] = []
+
+    async def fake_launch(*, slug, artifact_folder, scratchpad_pool, tracked_backends, ds_env, health_timeout):
+        port = 5000 + len(launched)
+        launched.append(artifact_folder)
+        tracked_backends[slug] = {"proc": _LiveProc(), "port": port, "pid": port, "log_path": ""}
+        return {"port": port, "pid": port}
+
+    monkeypatch.setattr("anton.core.artifacts.backend_launcher.launch_artifact_backend", fake_launch)
+    # Every port answers, as A's backend would on the port B's metadata names.
+    monkeypatch.setattr(artifacts, "_probe_port", lambda _port, **_kw: True)
+    monkeypatch.setattr(artifacts, "_LAUNCHED_BACKENDS", {})
+    monkeypatch.setattr(artifacts, "_BACKEND_LAUNCH_LOCKS", {})
+
+    a_first = await artifacts._ensure_backend_running(a_app, 5000, scope=ALICE)
+    b_open = await artifacts._ensure_backend_running(b_app, 5000, scope=BOB)
+    a_again = await artifacts._ensure_backend_running(a_app, 5000, scope=ALICE)
+
+    assert a_first == (True, "launched", 5000)
+    assert b_open == (True, "launched", 5001)
+    assert a_again == (True, "already_running", 5000)
+    assert launched == [a_app, b_app]
+
+
+async def test_desktop_counts_any_listener_as_the_artifacts_backend(monkeypatch, tmp_path):
+    """The agent's own launch_backend tool starts backends this server never
+    tracks, so on the desktop a listener on the artifact's port is its own."""
+    from cowork.db.scoped import LOCAL_SCOPE
+    from cowork.services import artifacts
+
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "false")
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+    try:
+        app = _artifact(tmp_path / "projects" / "proj", "app", title="Desktop app")
+        monkeypatch.setattr(
+            "anton.core.artifacts.backend_launcher.launch_artifact_backend",
+            lambda **_kw: pytest.fail("the agent's backend is already running"),
+        )
+        monkeypatch.setattr(artifacts, "_probe_port", lambda _port, **_kw: True)
+        monkeypatch.setattr(artifacts, "_LAUNCHED_BACKENDS", {})
+
+        result = await artifacts._ensure_backend_running(app, 4242, scope=LOCAL_SCOPE)
+    finally:
+        get_app_settings.cache_clear()
+
+    assert result == (True, "already_running", 4242)
+
+
+@pytest.mark.parametrize("listening", [False, True])
+async def test_a_backend_launches_only_inside_the_callers_projects(stack, monkeypatch, listening):
+    """Refused before the port is probed: a live port is no reason to report
+    another person's artifact as running."""
     from cowork.services import artifacts
 
     a_app = _artifact(_general(ALICE), "app", title="A app")
@@ -450,7 +562,7 @@ async def test_a_backend_launches_only_inside_the_callers_projects(stack, monkey
         "anton.core.artifacts.backend_launcher.launch_artifact_backend",
         lambda **_kw: pytest.fail("B must not start A's backend"),
     )
-    monkeypatch.setattr(artifacts, "_probe_port", lambda _port, **_kw: False)
+    monkeypatch.setattr(artifacts, "_probe_port", lambda _port, **_kw: listening)
 
     running, detail, _port = await artifacts._ensure_backend_running(a_app, 1, scope=BOB)
 

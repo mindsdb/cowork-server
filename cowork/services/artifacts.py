@@ -39,6 +39,7 @@ from cowork.common.paths import (
     dir_unlink,
 )
 from cowork.common.settings.app_settings import get_app_settings
+from cowork.db.personal_resources import PersonalResource
 from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
 
 if TYPE_CHECKING:
@@ -1690,10 +1691,6 @@ async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
     }
 
 
-def get_preview_mount(token: str) -> Path | None:
-    return _PREVIEW_MOUNTS.get(token)
-
-
 def preview_mount_for(token: str, *, scope: TenantScope | None) -> Path | None:
     """The directory ``token`` mounts, only when it lies inside one of
     ``scope``'s artifacts roots; None otherwise, the same answer as an unknown
@@ -1803,6 +1800,31 @@ def _probe_port(port: int, *, timeout: float = 0.3) -> bool:
         return False
 
 
+def _backend_answers(
+    *, project_root: Path, slug: str, port: int, scope: TenantScope | None
+) -> bool:
+    """Whether the artifact's own backend already listens on ``port``.
+
+    On the desktop a listener on the port is enough: the agent's own
+    `launch_backend` tool starts backends this server never tracks. Where
+    projects are partitioned it is not, because ports are reused: by the time
+    a person previews, the port in their metadata.json can belong to another
+    person's backend, which runs with that person's connection secrets. There
+    only a live backend this server launched for that project root and slug,
+    on that port, counts; any other listener gets a backend of the caller's
+    own started beside it.
+    """
+    if not _probe_port(port):
+        return False
+    if scope is None or not scope.partitioned_for(PersonalResource.PROJECTS):
+        return True
+    entry = _LAUNCHED_BACKENDS.get(str(project_root), {}).get(slug)
+    if entry is None or entry.get("port") != port:
+        return False
+    proc = entry.get("proc")
+    return proc is not None and proc.returncode is None
+
+
 def _resolve_project_root(artifact_dir: Path, *, scope: TenantScope | None) -> Path | None:
     """The registered project root of ``scope`` that owns this artifact dir.
 
@@ -1842,18 +1864,19 @@ async def _ensure_backend_running(
         return False, _NO_EXEC_DETAIL, 0
 
     slug = artifact_dir.name
-    if _probe_port(port):
-        return True, "already_running", port
-
+    # The project root first, so nothing about the port is reported for an
+    # artifact outside the caller's own projects.
     project_root = _resolve_project_root(artifact_dir, scope=scope)
     if project_root is None:
         return False, "Artifact is not in a registered project.", 0
+    if _backend_answers(project_root=project_root, slug=slug, port=port, scope=scope):
+        return True, "already_running", port
 
     # Serialize launches per project root and slug: two partitions can each
     # hold an artifact with the same slug. Whichever request wins the lock
     # does the actual work; the rest just re-probe after it releases.
     async with _launch_lock(project_root=project_root, slug=slug):
-        if _probe_port(port):
+        if _backend_answers(project_root=project_root, slug=slug, port=port, scope=scope):
             return True, "already_running", port
         return await _launch_backend_locked(
             artifact_dir, project_root=project_root, scope=scope

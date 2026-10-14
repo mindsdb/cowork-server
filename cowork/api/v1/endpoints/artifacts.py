@@ -1122,7 +1122,7 @@ async def reveal_artifact(req: _PathBody, session: ScopedSessionDep):
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
     dependencies=[Depends(require(OpenByDesign))],
 )
-async def proxy(token: str, rel_path: str, request: Request):
+async def proxy(token: str, rel_path: str, request: Request, scope: ScopeDep):
     """HTTP forwarder for fullstack-artifact previews.
 
     Streams the request to the artifact's backend running on
@@ -1131,13 +1131,14 @@ async def proxy(token: str, rel_path: str, request: Request):
 
     OpenByDesign, not `DesktopOnly` like its siblings: the token is the
     real guard here, not tenancy. `_PREVIEW_MOUNTS` (see
-    `cowork.services.artifacts.get_preview_mount`) is only ever populated by
+    `cowork.services.artifacts.preview_mount_for`) is only ever populated by
     `/preview-mount`, which IS `DesktopOnly` — so in org mode
     this dict is permanently empty and any token 404s here regardless, by
-    construction rather than by a declared guard.
+    construction rather than by a declared guard. The token resolves only
+    inside the caller's own artifacts roots, as on `/preview-asset`.
     """
     from cowork.services.preview_proxy import proxy_artifact_request
-    return await proxy_artifact_request(token, rel_path, request)
+    return await proxy_artifact_request(token, rel_path, request, scope=scope)
 
 
 @router.delete("/", status_code=status.HTTP_204_NO_CONTENT, dependencies=[Depends(require(DesktopOnly))])

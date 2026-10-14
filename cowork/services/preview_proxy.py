@@ -28,7 +28,8 @@ from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response, StreamingResponse
 
 from cowork.common.http_client import get_proxy_client
-from cowork.services.artifacts import _NO_EXEC_DETAIL, _org_mode, get_preview_mount
+from cowork.db.scoped import TenantScope
+from cowork.services.artifacts import _NO_EXEC_DETAIL, _org_mode, preview_mount_for
 from cowork.services.comments_layer import ACTIVATION_PARAM
 from cowork.services.preview_html import prepare_preview_html
 
@@ -108,13 +109,19 @@ def _build_upstream_headers(req: Request, backend_port: int) -> list[tuple[str, 
 
 
 async def proxy_artifact_request(
-    token: str, rel_path: str, request: Request
+    token: str, rel_path: str, request: Request, *, scope: TenantScope | None
 ) -> Response:
     """Forward an iframe request to the artifact's backend.
 
     `rel_path` is the path *after* `/proxy/{token}/`, e.g. an empty
     string for the index page, or `static/foo.js` for a relative asset
     the artifact's HTML loaded. It's joined onto the backend's root.
+
+    The token resolves only inside ``scope``'s own artifacts roots
+    (`preview_mount_for`), as on `/preview-asset`: a token is a stable
+    hash of the artifact's path, so presenting another person's must not
+    forward a request to their live backend, which runs with their
+    connection secrets.
     """
     cors = _cors_headers(request)
 
@@ -139,7 +146,7 @@ async def proxy_artifact_request(
     if request.method == "OPTIONS":
         return Response(status_code=204, headers=cors)
 
-    artifact_dir = get_preview_mount(token)
+    artifact_dir = preview_mount_for(token, scope=scope)
     if artifact_dir is None:
         return PlainTextResponse(
             "Preview mount has expired or is unknown",

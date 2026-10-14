@@ -38,12 +38,17 @@ async def test_backend_launch_refused_in_org_mode(org_mode, tmp_path, monkeypatc
 async def test_backend_launch_still_works_on_desktop(monkeypatch, tmp_path):
     """Desktop keeps the launcher. Guard against the kill switch being unconditional."""
     monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    # The artifact sits in a registered project: the launcher resolves that
+    # first, before it probes the port.
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
     from cowork.common.settings.app_settings import get_app_settings
     get_app_settings.cache_clear()
     monkeypatch.setattr(artifacts, "_probe_port", lambda _p: True)
+    artifact_dir = tmp_path / "projects" / "proj" / ".anton" / "artifacts" / "slug"
+    artifact_dir.mkdir(parents=True)
 
     running, detail, port = await artifacts._ensure_backend_running(
-        tmp_path / "slug", 8000, scope=LOCAL_SCOPE
+        artifact_dir, 8000, scope=LOCAL_SCOPE
     )
 
     assert running is True
@@ -295,7 +300,7 @@ async def test_proxy_artifact_request_refused_in_org_mode(org_mode, tmp_path):
         }
         request = StarletteRequest(scope)
 
-        response = await preview_proxy.proxy_artifact_request(token, "", request)
+        response = await preview_proxy.proxy_artifact_request(token, "", request, scope=LOCAL_SCOPE)
 
         assert response.status_code == 403
     finally:
