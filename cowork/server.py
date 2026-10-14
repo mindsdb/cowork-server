@@ -20,6 +20,7 @@ from starlette.responses import JSONResponse
 
 from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token, sync_auth_token
 from cowork.coding.inference_proxy import INFERENCE_PATHS
+from cowork.db.personal_resources import check_personal_resource_dependencies
 from cowork.db.scoped import MissingTenantScopeError
 from cowork.db.units import DatabaseBusy, busy_retry_seconds
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
@@ -369,15 +370,43 @@ def create_app() -> FastAPI:
     # layer lets them through.
     channel_webhook_paths: set[str] = set()
 
-    # Org mode: build a per-request Principal from gateway-injected identity
-    # headers. Added first so it sits inner of the bearer/CORS layers.
-    if settings.tenancy_mode == "org":
+    # Trusted identity headers name a person in local tenancy. Only a request
+    # that already passed the bearer token may name one, and each person's
+    # partition needs every resource its rows point at.
+    if settings.trust_identity_headers:
+        if settings.tenancy_mode == "org":
+            raise RuntimeError(
+                "COWORK_TRUST_IDENTITY_HEADERS is not supported in org tenancy mode: "
+                "org deployments already build each request's principal from the "
+                "gateway's identity headers."
+            )
+        if not settings.require_auth:
+            raise RuntimeError(
+                "COWORK_TRUST_IDENTITY_HEADERS requires COWORK_REQUIRE_AUTH: without the "
+                "bearer token check, any caller could name any person in the identity headers."
+            )
+        check_personal_resource_dependencies(settings.personal_resources)
+
+    # Org mode, or local tenancy that trusts identity headers: build a
+    # per-request Principal from the identity headers. Added first so it sits
+    # inner of the bearer/CORS layers: in local tenancy it reads the headers
+    # only on a request that passed the bearer token.
+    if settings.tenancy_mode == "org" or settings.trust_identity_headers:
         enforce = settings.identity_enforce == "enforce"
         app.add_middleware(
             TrustedHeaderMiddleware,
             exempt_paths=channel_webhook_paths,
             enforce=enforce,
+            personal_partitions=settings.trust_identity_headers,
         )
+    if settings.trust_identity_headers:
+        logger.info(
+            "auth: local tenancy, trusted identity headers enabled "
+            "(identity=%s, personal resources=%s)",
+            settings.identity_enforce,
+            ",".join(sorted(settings.personal_resources)) or "none",
+        )
+    elif settings.tenancy_mode == "org":
         logger.info(
             "auth: org tenancy mode — principal middleware enabled "
             "(identity=%s)",
