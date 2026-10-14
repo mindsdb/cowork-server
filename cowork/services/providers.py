@@ -642,6 +642,20 @@ async def fetch_minds_models(
     )
 
 
+def _org_catalog_url() -> str:
+    """The operator endpoint the org catalog is fetched from and cached under."""
+    from cowork.common.settings.app_settings import (
+        TurnQueueSettings,
+        default_turn_minds_api_host,
+    )
+    return TurnQueueSettings().minds_base_url or f"{default_turn_minds_api_host()}/v1"
+
+
+def cached_org_model_catalog(*, org_id: str, user_id: str) -> MindsModelListing | None:
+    """The org catalog ``fetch_org_model_catalog`` last cached for this member, or None."""
+    return cached_minds_models(_org_catalog_url(), tenant_key=org_id, user_id=user_id)
+
+
 async def fetch_org_model_catalog(
     *, org_id: str, user_id: str, bearer_token: str, refresh: bool = False
 ) -> MindsModelListing:
@@ -658,13 +672,8 @@ async def fetch_org_model_catalog(
         raise ValueError("org catalog requires an organization id")
     if not user_id:
         raise ValueError("org catalog requires the caller's user id")
-    from cowork.common.settings.app_settings import (
-        TurnQueueSettings,
-        default_turn_minds_api_host,
-    )
-    url = TurnQueueSettings().minds_base_url or f"{default_turn_minds_api_host()}/v1"
     return await fetch_minds_models(
-        url, bearer_token, force_refresh=refresh, tenant_key=org_id, user_id=user_id
+        _org_catalog_url(), bearer_token, force_refresh=refresh, tenant_key=org_id, user_id=user_id
     )
 
 
