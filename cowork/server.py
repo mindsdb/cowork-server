@@ -424,8 +424,8 @@ def create_app() -> FastAPI:
         )
         logger.info("auth: bearer-token authentication enabled")
 
-    # Configure CORS outside the authentication and principal layers. The
-    # no-store wrapper added below remains outermost.
+    # Configure CORS outside the authentication and principal layers. Only the
+    # no-store wrapper and, when present, the Host check sit outside it.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,

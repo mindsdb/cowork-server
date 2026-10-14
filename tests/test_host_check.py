@@ -21,8 +21,8 @@ from cowork.host_middleware import TrustedHostMiddleware
 FOREIGN_HOST = "rebind.attacker-controlled.example:26866"
 ATTACKER_ORIGIN = f"http://{FOREIGN_HOST}"
 
-# The ticket's matrix: secret routes, conversations, project files, settings
-# mutation, and response creation.
+# One route per kind of data a rebound page must not reach: secrets,
+# conversations, project files, settings mutation, and response creation.
 SENSITIVE_REQUESTS = [
     ("GET", "/api/v1/settings/reveal-key/openai", None),
     ("GET", "/api/v1/settings/raw", None),
