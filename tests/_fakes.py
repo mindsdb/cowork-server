@@ -2,6 +2,10 @@
 
 import asyncio
 
+# What the managed_dir fixture's managed memory holds.
+MANAGED_RULE = "Name Python packages by their package names only"
+MANAGED_LESSON = "The orders table is keyed by order_id"
+
 
 class FakeRequest:
     """Minimal Request stub for calling route handlers directly. `headers` is

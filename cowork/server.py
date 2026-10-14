@@ -24,6 +24,7 @@ from cowork.db.personal_resources import check_personal_resource_dependencies
 from cowork.db.scoped import MissingTenantScopeError
 from cowork.db.units import DatabaseBusy, busy_retry_seconds
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
+from cowork.managed import cortex_takes_managed_layer, managed_folder
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.streaming import TurnInProgress
@@ -386,6 +387,39 @@ def create_app() -> FastAPI:
                 "bearer token check, any caller could name any person in the identity headers."
             )
         check_personal_resource_dependencies(settings.personal_resources)
+
+    # The operator's managed folder reaches every turn read-only. A missing
+    # folder stops the start: its skill and connection names would otherwise
+    # stop being reserved, and its rules would silently reach no turn.
+    managed = managed_folder()
+    if managed is not None:
+        if settings.tenancy_mode == "org":
+            raise RuntimeError(
+                "COWORK_MANAGED_DIR is not supported in org tenancy mode: turns run on "
+                "remote workers, which receive none of the managed folder."
+            )
+        missing = managed.missing_dirs()
+        if missing:
+            raise RuntimeError(
+                "COWORK_MANAGED_DIR names missing folders: "
+                + ", ".join(str(path) for path in missing)
+                + ". Create or mount each one; the managed folder needs memory/, "
+                "skills/ and data-vault/."
+            )
+        if not cortex_takes_managed_layer():
+            raise RuntimeError(
+                "COWORK_MANAGED_DIR needs an anton whose Cortex takes managed_hc, the "
+                "read-only memory layer. The installed anton has none, so the "
+                "managed rules would reach no turn."
+            )
+        from anton.core.datasources.data_vault import LocalDataVault
+
+        logger.info(
+            "managed folder: %s (%d skills, %d connections)",
+            managed.root,
+            len(managed.skill_slugs()),
+            len(LocalDataVault(managed.vault_dir).list_connections()),
+        )
 
     # Org mode, or local tenancy that trusts identity headers: build a
     # per-request Principal from the identity headers. Added first so it sits

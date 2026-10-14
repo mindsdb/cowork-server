@@ -842,6 +842,29 @@ class AppSettings(Settings):
             return frozenset(name.strip() for name in value.split(",") if name.strip())
         return value
 
+    managed_dir: Path | None = Field(
+        default=None,
+        validation_alias=AliasChoices("COWORK_MANAGED_DIR"),
+        description=(
+            "The operator's managed folder (cowork.managed.ManagedFolder): "
+            "memory/ with rules and lessons every turn reads, skills/ every "
+            "person sees as built-in, and data-vault/ with connections every "
+            "turn can use. Cowork never writes it. Blank or unset: none. "
+            "create_app refuses it in org tenancy, when the folder or any of "
+            "memory/, skills/ and data-vault/ is missing, and when the "
+            "installed anton's Cortex takes no managed_hc."
+        ),
+    )
+
+    @field_validator("managed_dir", mode="before")
+    @classmethod
+    def _blank_managed_dir_is_none(cls, value: object) -> object:
+        # A blank value read as a Path is ".", the working directory, which
+        # exists: the missing-folder refusal would then pass on a typo.
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     organization_switch_enabled: bool = Field(
         default=False,
         validation_alias=AliasChoices("COWORK_ORGANIZATION_SWITCH_ENABLED"),
