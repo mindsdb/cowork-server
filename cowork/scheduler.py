@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import TYPE_CHECKING, TypeVar
 from uuid import UUID, uuid4
@@ -777,6 +777,16 @@ async def _scheduler_loop() -> None:
             # claims by it even if the task has not run yet.
             _inflight.add(occurrence_id)
             asyncio.create_task(run_occurrence(occurrence_id, is_manual=False))
+
+
+def boot_reap_cutoff(org_mode: bool, now: datetime | None = None) -> datetime | None:
+    """Which running runs a starting server may reap: all of them on the
+    desktop, where it is the only process, or only those older than a lease
+    in org mode, where another replica may still be running the rest. Leases
+    release those once they lapse."""
+    if not org_mode:
+        return None
+    return (now or datetime.now(timezone.utc)) - timedelta(seconds=_LEASE_SECONDS)
 
 
 def start_scheduler() -> None:
