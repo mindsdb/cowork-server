@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import TYPE_CHECKING, TypeVar
 from uuid import UUID, uuid4
@@ -21,9 +21,9 @@ from cowork.db.scoped import (
     unsafe_unscoped_session,
 )
 from cowork.db.units import run_db
-from cowork.models.schedule import Schedule
-from cowork.schedule_timing import count_missed_occurrences, next_future_occurrence
-from cowork.schemas.schedules import Cadence, OccurrenceStatus, RunStatus, resolve_schedule_model
+from cowork.models.schedule import Schedule, ScheduleOccurrence
+from cowork.schedule_timing import advance_occurrence, overdue_slots
+from cowork.schemas.schedules import Cadence, MissedRunPolicy, OccurrenceStatus, RunStatus, resolve_schedule_model
 from cowork.services.schedules import ScheduleOccurrenceService, ScheduleRunService, ScheduleService
 from cowork.streaming.registry import registry
 
@@ -67,25 +67,26 @@ _inflight: set[UUID] = set()
 
 _RECURRING_CADENCES = {Cadence.hourly, Cadence.daily, Cadence.weekly, Cadence.weekdays}
 
-# A one-off whose slot has just passed is still due this poll and must be run,
-# not disabled — the poll runs `_handle_missed_runs` before `_due_schedules`,
-# so disabling on any overdue amount kills the task before it can fire (the
-# task then shows as "Paused" and never runs; ENG-1675). Only a one-off overdue
-# by more than this catch-up window — the app was offline when its slot passed —
-# is disabled without running, so a long-stale task doesn't fire unexpectedly on
-# the next launch. Mirrors the recurring branch, which lets a single overdue slot
-# (missed == 1) run rather than fast-forwarding past it.
-#
-# Independent of `_FRESHNESS_WINDOW_SECONDS[Cadence.once]` below despite the shared
-# 1h value: this bounds how late a one-off may still run; the freshness window
-# suppresses a slot after a recent successful run. Tune them separately.
-_ONCE_CATCHUP_WINDOW_SECONDS = 60 * 60
+# How late a slot may be and still count as on time rather than missed. The
+# `skip` policy still runs a slot this late, and a one-off under it is
+# disabled only once it is later than this. The poll runs every 30s, so an
+# on-time slot is never close to it.
+_LATE_GRACE_SECONDS = 60 * 60
+# Missed slots older than this are never run, whatever the policy; they are
+# counted in missed_runs only.
+_MISSED_RUN_LOOKBACK = timedelta(days=7)
+# The most missed slots `bounded_catch_up` will run after an outage.
+_MAX_CATCH_UP = 10
+# Cron occurrences in a row that may settle failed before the schedule pauses
+# itself. Retries within one occurrence count once.
+_MAX_FAILED_OCCURRENCES = 3
 
-# Freshness guard (ENG-688): if a successful run — typically a manual
-# "run now" — finished this recently before a due cron slot, the slot is
-# skipped instead of executed, so both runs don't publish the same output
-# twice. Hourly gets a tighter window so consecutive slots never suppress
-# each other even when a run finishes mid-hour.
+# Freshness guard (ENG-688): if a successful manual "run now" finished this
+# recently before a due cron slot, the slot is skipped instead of executed,
+# so both runs don't publish the same output twice. Only manual runs count: a
+# cron run is its own slot, and counting it would skip the slots a catch-up
+# runs back to back. Hourly gets a tighter window so a run finishing mid-hour
+# never suppresses the next slot.
 _FRESHNESS_WINDOW_SECONDS = {
     Cadence.once: 60 * 60,
     Cadence.hourly: 30 * 60,
@@ -104,7 +105,9 @@ def _advance_next_run_at(schedule: Schedule, session) -> None:
     if schedule.cadence not in _RECURRING_CADENCES:
         return
 
-    schedule.next_run_at = next_future_occurrence(
+    # One slot on, not straight past now: a catch-up runs the missed slots in
+    # turn, and the missed-run policy repositions anything else left behind.
+    schedule.next_run_at = advance_occurrence(
         schedule.cadence,
         schedule.next_run_at,
         schedule.timezone,
@@ -133,48 +136,109 @@ def _apply_success_write_back(
     session.add(schedule)
 
 
-def _handle_missed_runs(session) -> None:
+def _select_missed(policy: str, slots: list[datetime], now: datetime) -> list[datetime]:
+    """Which of a schedule's overdue slots (oldest first, all inside the
+    lookback) its missed-run policy runs."""
+    if not slots:
+        return []
+    if policy == MissedRunPolicy.skip:
+        latest = slots[-1]
+        return [latest] if (now - latest).total_seconds() <= _LATE_GRACE_SECONDS else []
+    if policy == MissedRunPolicy.bounded_catch_up:
+        return slots[-_MAX_CATCH_UP:]
+    return slots[-1:]
+
+
+def _record_skipped(session, schedule_id, slots: list[datetime]) -> None:
+    """Stage one settled `skipped` occurrence per slot passed over, so the
+    history shows what did not run. A slot already recorded is left as is."""
+    if not slots:
+        return
+    keys = {_slot_key(slot): slot for slot in slots}
+    taken = set(
+        session.exec(
+            session.select(ScheduleOccurrence.occurrence_key)
+            .where(ScheduleOccurrence.schedule_id == schedule_id)
+            .where(ScheduleOccurrence.occurrence_key.in_(list(keys)))  # type: ignore[attr-defined]
+        ).all()
+    )
     now = datetime.now(timezone.utc)
-    schedules = ScheduleService(session).list_schedules()
-    for schedule in schedules:
+    for key, slot in keys.items():
+        if key in taken:
+            continue
+        session.add(
+            ScheduleOccurrence(
+                schedule_id=schedule_id,
+                occurrence_key=key,
+                trigger_source="cron",
+                scheduled_for=slot,
+                status=OccurrenceStatus.skipped,
+                settled_at=now,
+            )
+        )
+
+
+def _handle_missed_once(session, schedule: Schedule, next_run: datetime, now: datetime) -> None:
+    """A one-off whose time passed runs at the next opportunity, unless it is
+    too late for its policy; then it is disabled and recorded as skipped."""
+    late = now - next_run
+    limit = (
+        timedelta(seconds=_LATE_GRACE_SECONDS)
+        if schedule.missed_run_policy == MissedRunPolicy.skip
+        else _MISSED_RUN_LOOKBACK
+    )
+    if late <= limit:
+        return
+    schedule.missed_runs += 1
+    schedule.enabled = False
+    session.add(schedule)
+    _record_skipped(session, schedule.id, [next_run])
+
+
+def _handle_missed_recurring(session, schedule: Schedule, next_run: datetime, now: datetime) -> None:
+    """Move a recurring schedule's slot to the first missed slot its policy
+    runs, or past now when it runs none, and record the rest as skipped.
+
+    The due-check then claims the selected slots one at a time, as each
+    occurrence settles. Applying the policy again to a schedule it already
+    moved changes nothing, so a poll that repeats it is harmless.
+    """
+    older, recent, future = overdue_slots(
+        schedule.cadence,
+        next_run,
+        schedule.timezone,
+        now=now,
+        since=now - _MISSED_RUN_LOOKBACK,
+    )
+    selected = _select_missed(schedule.missed_run_policy, recent, now)
+    passed_over = [slot for slot in recent if slot not in selected]
+    if not older and not passed_over:
+        return
+    schedule.missed_runs += older + len(passed_over)
+    schedule.next_run_at = selected[0] if selected else future
+    session.add(schedule)
+    _record_skipped(session, schedule.id, passed_over)
+
+
+def _handle_missed_runs(session) -> None:
+    """Apply each schedule's missed-run policy to the slots it missed.
+
+    A schedule with an occurrence in flight is left alone: its slot is not
+    due again until that occurrence settles, and the policy then sees every
+    slot that passed meanwhile.
+    """
+    now = datetime.now(timezone.utc)
+    occurrences = ScheduleOccurrenceService(session)
+    for schedule in ScheduleService(session).list_schedules():
         if not schedule.enabled:
             continue
-
         next_run = ensure_utc(schedule.next_run_at)
-
-        if next_run >= now:
+        if next_run >= now or occurrences.has_active(schedule.id):
             continue
-
         if schedule.cadence == Cadence.once:
-            # A due one-off is left enabled so `_due_schedules` executes it on
-            # this same tick. Only disable it without running when it is overdue
-            # beyond the catch-up window — the app was offline when its slot
-            # passed — so a long-stale one-off doesn't fire on the next launch.
-            # Bump missed_runs like the recurring branch so an auto-disabled
-            # one-off carries a signal it was skipped rather than run.
-            if (now - next_run).total_seconds() > _ONCE_CATCHUP_WINDOW_SECONDS:
-                schedule.missed_runs += 1
-                schedule.enabled = False
-                session.add(schedule)
-            continue
-
-        if schedule.cadence not in _RECURRING_CADENCES:
-            continue
-
-        missed, future = count_missed_occurrences(
-            schedule.cadence,
-            next_run,
-            schedule.timezone,
-            now=now,
-        )
-        # Only fast-forward when more than one occurrence was skipped (app
-        # offline for multiple cadence periods). A single overdue slot
-        # (missed == 1) is still due this poll — advancing here would skip
-        # the run entirely. 
-        if missed > 1:
-            schedule.missed_runs += missed
-            schedule.next_run_at = future
-            session.add(schedule)
+            _handle_missed_once(session, schedule, next_run, now)
+        elif schedule.cadence in _RECURRING_CADENCES:
+            _handle_missed_recurring(session, schedule, next_run, now)
 
     session.commit()
 
@@ -350,6 +414,36 @@ def _settle_occurrence(
         )
     else:
         occurrences.settle(occurrence_id, OccurrenceStatus.success)
+    _count_settlement(session, occurrence_id)
+
+
+def _count_settlement(session: ScopedSession, occurrence_id: UUID) -> None:
+    """Stage the schedule's failure streak for an occurrence that just settled,
+    and pause the schedule when the streak reaches its limit.
+
+    Only cron occurrences that settle failed extend the streak; a success of
+    either kind ends it. A cancelled or skipped occurrence leaves it as is,
+    and so does a manual failure, which the user saw happen.
+    """
+    occurrence = ScheduleOccurrenceService(session).get(occurrence_id)
+    if occurrence is None or occurrence.status == OccurrenceStatus.active:
+        return
+    schedule = session.get(Schedule, occurrence.schedule_id)
+    if schedule is None:
+        return
+    if occurrence.status == OccurrenceStatus.success:
+        schedule.consecutive_failures = 0
+    elif occurrence.status == OccurrenceStatus.failed and occurrence.trigger_source != "manual":
+        schedule.consecutive_failures += 1
+        if schedule.consecutive_failures >= _MAX_FAILED_OCCURRENCES and schedule.enabled:
+            schedule.enabled = False
+            schedule.auto_paused_at = datetime.now(timezone.utc)
+            logger.warning(
+                f"Schedule {schedule.id} paused after {schedule.consecutive_failures} failed runs in a row"
+            )
+    else:
+        return
+    session.add(schedule)
 
 
 def _record_turn_outcome(
@@ -660,7 +754,7 @@ def _ran_recently(schedule: Schedule, run_service: ScheduleRunService, now: date
     window = _FRESHNESS_WINDOW_SECONDS.get(schedule.cadence)
     if not window:
         return False
-    last = run_service.last_successful_finish(schedule.id)
+    last = run_service.last_successful_finish(schedule.id, manual_only=True)
     return last is not None and (now - last).total_seconds() < window
 
 
@@ -731,6 +825,7 @@ def _reap_expired_leases(session: ScopedSession, now: datetime) -> None:
             error=_LEASE_EXPIRED_ERROR,
             retry_delay=_retry_delay(occurrence.attempts) if occurrence.attempts else 0,
         )
+        _count_settlement(session, occurrence.id)
     if expired:
         session.commit()
 

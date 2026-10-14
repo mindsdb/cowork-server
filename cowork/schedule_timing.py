@@ -98,3 +98,61 @@ def count_missed_occurrences(
         missed += 1
         cursor = advance_occurrence(cadence, cursor, timezone_name)
     return missed, cursor
+
+
+def overdue_slots(
+    cadence: str,
+    next_run_at: datetime,
+    timezone_name: str,
+    *,
+    now: datetime,
+    since: datetime,
+) -> tuple[int, list[datetime], datetime]:
+    """Split the slots from ``next_run_at`` up to ``now``.
+
+    Returns how many came due before ``since`` (counted, not kept), the ones
+    at or after it in order, and the first slot after ``now``.
+    """
+    reference = ensure_utc(now)
+    floor = ensure_utc(since)
+    cursor = ensure_utc(next_run_at)
+    if reference is None or floor is None or cursor is None:
+        raise ValueError("next_run_at, now and since must be datetimes")
+
+    older = 0
+    recent: list[datetime] = []
+    while cursor <= reference:
+        if cursor < floor:
+            older += 1
+        else:
+            recent.append(cursor)
+        cursor = advance_occurrence(cadence, cursor, timezone_name)
+    return older, recent, cursor
+
+
+def normalize_next_run(
+    cadence: str,
+    next_run_at: datetime,
+    timezone_name: str,
+    *,
+    now: datetime | None = None,
+) -> datetime:
+    """The first real slot at or after ``next_run_at`` for a recurring cadence.
+
+    A weekday schedule never starts on a weekend, and a start that is already
+    in the past moves forward to the first slot after ``now`` instead of
+    reading as a missed run. A one-off keeps the time it was given.
+    """
+    start = ensure_utc(next_run_at)
+    if start is None:
+        raise ValueError("next_run_at must be a datetime")
+    if cadence == Cadence.once:
+        return start
+    if cadence == Cadence.weekdays:
+        tz = resolve_timezone(timezone_name)
+        if start.astimezone(tz).weekday() >= 5:
+            start = advance_occurrence(cadence, start, timezone_name)
+    reference = ensure_utc(now or datetime.now(timezone.utc))
+    if start <= reference:
+        start = next_future_occurrence(cadence, start, timezone_name, now=reference)
+    return start

@@ -51,6 +51,7 @@ def create_schedule(body: ScheduleCreateRequest, scoped: ScopedSessionDep):
             timezone=body.timezone,
             project_id=body.project_id,
             enabled=body.enabled,
+            missed_run_policy=body.missed_run_policy,
         )
     except ValueError as e:
         # e.g. a project_id that isn't visible in this scope

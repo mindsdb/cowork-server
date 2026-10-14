@@ -10,6 +10,7 @@ from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule, ScheduleOccurrence, ScheduleRun
+from cowork.schedule_timing import normalize_next_run
 from cowork.schemas.schedules import OccurrenceStatus, RunStatus
 
 
@@ -61,6 +62,7 @@ class ScheduleService:
         timezone: str = "UTC",
         project_id: UUID | None = None,
         enabled: bool = True,
+        missed_run_policy: str = "run_latest_once",
     ) -> Schedule:
         # Anchor the parent (same as conversations): the target project must be
         # visible in scope, or a foreign org's project id could be attached.
@@ -71,11 +73,12 @@ class ScheduleService:
             title=title,
             prompt=prompt,
             cadence=cadence,
-            next_run_at=next_run_at,
+            next_run_at=normalize_next_run(cadence, next_run_at, timezone),
             model=model,
             timezone=timezone,
             project_id=target_project_id,
             enabled=enabled,
+            missed_run_policy=missed_run_policy,
         )
         self.session.add(schedule)
         self.session.commit()
@@ -90,6 +93,10 @@ class ScheduleService:
         for field, value in kwargs.items():
             if value is not None and hasattr(schedule, field):
                 setattr(schedule, field, value)
+        if {"cadence", "timezone", "next_run_at"} & {k for k, v in kwargs.items() if v is not None}:
+            # The slot follows the edit at once, rather than firing on the old
+            # cadence or reading a start already in the past as a missed run.
+            schedule.next_run_at = normalize_next_run(schedule.cadence, schedule.next_run_at, schedule.timezone)
         self.session.add(schedule)
         self.session.commit()
         self.session.refresh(schedule)
@@ -154,8 +161,15 @@ class ScheduleService:
         return schedule
 
     def resume_schedule(self, schedule_id: UUID) -> Schedule:
+        """Turn the schedule back on, clearing an auto-pause and its failure
+        streak. The run history stays. A recurring slot that passed while the
+        schedule was paused moves to the next one rather than running as a
+        missed slot the moment it resumes."""
         schedule = self.get_schedule(schedule_id)
         schedule.enabled = True
+        schedule.auto_paused_at = None
+        schedule.consecutive_failures = 0
+        schedule.next_run_at = normalize_next_run(schedule.cadence, schedule.next_run_at, schedule.timezone)
         self.session.add(schedule)
         self.session.commit()
         self.session.refresh(schedule)
@@ -211,15 +225,20 @@ class ScheduleRunService:
         ).first()
         return run is not None
 
-    def last_successful_finish(self, schedule_id: UUID) -> datetime | None:
-        """When the schedule's most recent successful run (manual or cron)
-        finished, or None if it never succeeded. Used by the scheduler's
-        freshness guard to skip a due slot right after e.g. a manual run.
+    def last_successful_finish(self, schedule_id: UUID, *, manual_only: bool = False) -> datetime | None:
+        """When the schedule's most recent successful run finished, or None if
+        it never succeeded. Used by the scheduler's freshness guard to skip a
+        due slot right after a manual run.
         """
-        run = self.session.exec(
+        query = (
             self.session.select(ScheduleRun)
             .where(ScheduleRun.schedule_id == schedule_id)
             .where(ScheduleRun.status == RunStatus.success)
+        )
+        if manual_only:
+            query = query.where(ScheduleRun.is_manual == True)  # noqa: E712
+        run = self.session.exec(
+            query
             .order_by(ScheduleRun.finished_at.desc())  # type: ignore[union-attr]
             .limit(1)
         ).first()

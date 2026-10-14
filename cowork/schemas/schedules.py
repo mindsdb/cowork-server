@@ -58,6 +58,21 @@ class OccurrenceStatus(str, Enum):
     success = "success"
     failed = "failed"
     cancelled = "cancelled"
+    # A slot that came due while the app was closed and the missed-run policy
+    # chose not to run. Recorded so the history shows it was passed over.
+    skipped = "skipped"
+
+
+class MissedRunPolicy(str, Enum):
+    """What a recurring schedule does with slots that passed while it could
+    not run (the app was closed, or the machine asleep)."""
+
+    # Run nothing that was missed; only a slot that is barely late still runs.
+    skip = "skip"
+    # Run the most recent missed slot once and skip the rest.
+    run_latest_once = "run_latest_once"
+    # Run up to a bounded number of the most recent missed slots, in order.
+    bounded_catch_up = "bounded_catch_up"
 
 
 class ScheduleCreateRequest(CamelRequest):
@@ -69,6 +84,7 @@ class ScheduleCreateRequest(CamelRequest):
     timezone: str = "UTC"
     project_id: UUID | None = None
     enabled: bool = True
+    missed_run_policy: MissedRunPolicy = MissedRunPolicy.run_latest_once
 
 
 class ScheduleUpdateRequest(CamelRequest):
@@ -80,6 +96,7 @@ class ScheduleUpdateRequest(CamelRequest):
     timezone: str | None = None
     project_id: UUID | None = None
     enabled: bool | None = None
+    missed_run_policy: MissedRunPolicy | None = None
 
 
 class ScheduleResponse(CamelResponse):
@@ -96,6 +113,9 @@ class ScheduleResponse(CamelResponse):
     last_result_conversation_id: UUID | None
     last_error: str | None
     missed_runs: int
+    missed_run_policy: str = MissedRunPolicy.run_latest_once
+    consecutive_failures: int = 0
+    auto_paused_at: datetime | None = None
     # Not a Schedule column — endpoints fill it from ScheduleRunService so the
     # UI can show an in-flight run (manual or cron).
     running: bool = False

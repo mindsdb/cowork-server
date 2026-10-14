@@ -5,7 +5,7 @@ from uuid import UUID
 
 import pytest
 from sqlalchemy import create_engine
-from sqlmodel import Session, SQLModel
+from sqlmodel import Session, SQLModel, select
 
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule
@@ -950,50 +950,45 @@ def test_missed_runs_leaves_just_due_once_enabled_to_run():
     assert [s.id for s in _due_schedules(scoped, now)] == [schedule.id]
 
 
-def test_missed_runs_disables_stale_once_overdue_beyond_window():
+@pytest.mark.parametrize(
+    ("policy", "late", "runs"),
+    [
+        # The default runs a one-off the app was closed for, inside the lookback.
+        ("run_latest_once", timedelta(hours=2), True),
+        ("run_latest_once", timedelta(days=6), True),
+        ("run_latest_once", timedelta(days=8), False),
+        # `skip` only runs one that is barely late.
+        ("skip", timedelta(minutes=30), True),
+        ("skip", timedelta(hours=2), False),
+    ],
+)
+def test_a_missed_once_runs_or_is_skipped_by_its_policy(policy, late, runs):
+    from cowork.models.schedule import ScheduleOccurrence
     from cowork.scheduler import _due_schedules, _handle_missed_runs
 
     session = _session()
     now = datetime.now(timezone.utc)
-    # Slot passed hours ago (app was offline) — do not fire it late.
-    schedule = _schedule(session, cadence="once", next_run_at=now - timedelta(hours=2))
+    schedule = _schedule(session, cadence="once", next_run_at=now - late)
+    schedule.missed_run_policy = policy
+    session.add(schedule)
+    session.commit()
     scoped = ScopedSession(session, SYSTEM_SCOPE)
 
     _handle_missed_runs(scoped)
 
     session.refresh(schedule)
-    assert schedule.enabled is False
-    # Auto-disabled without running carries a missed-run signal.
-    assert schedule.missed_runs == 1
-    assert _due_schedules(scoped, now) == []
-
-
-def test_missed_runs_once_near_catchup_boundary():
-    from cowork.scheduler import (
-        _ONCE_CATCHUP_WINDOW_SECONDS,
-        _due_schedules,
-        _handle_missed_runs,
-    )
-
-    session = _session()
-    now = datetime.now(timezone.utc)
-    window = _ONCE_CATCHUP_WINDOW_SECONDS
-    # Straddle the catch-up boundary: just inside stays enabled and runs, just
-    # outside is disabled. `_handle_missed_runs` reads its own wall clock, so a
-    # small margin keeps each case on its intended side without flaking.
-    inside = _schedule(session, cadence="once", next_run_at=now - timedelta(seconds=window - 30))
-    outside = _schedule(session, cadence="once", next_run_at=now - timedelta(seconds=window + 30))
-    scoped = ScopedSession(session, SYSTEM_SCOPE)
-
-    _handle_missed_runs(scoped)
-
-    session.refresh(inside)
-    session.refresh(outside)
-    assert inside.enabled is True
-    assert outside.enabled is False
+    assert schedule.enabled is runs
     due_ids = [s.id for s in _due_schedules(scoped, now)]
-    assert inside.id in due_ids
-    assert outside.id not in due_ids
+    assert (schedule.id in due_ids) is runs
+    skipped = session.exec(
+        select(ScheduleOccurrence).where(ScheduleOccurrence.schedule_id == schedule.id)
+    ).all()
+    if runs:
+        assert skipped == []
+    else:
+        # Disabled without running carries a missed-run signal and a record.
+        assert schedule.missed_runs == 1
+        assert [o.status for o in skipped] == ["skipped"]
 
 
 # --- A poll runs in a worker thread beside the run's units, so a run can end

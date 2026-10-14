@@ -476,3 +476,261 @@ async def test_run_now_says_so_when_the_schedule_is_waiting_to_retry():
 
     assert answered.status_code == 409
     assert "waiting to try again" in answered.json()["detail"]
+
+
+# --- Missed runs (ENG-943) ---------------------------------------------------
+
+
+def _set(engine, schedule_id: UUID, **fields) -> None:
+    with Session(engine) as session:
+        row = session.get(Schedule, schedule_id)
+        for name, value in fields.items():
+            setattr(row, name, value)
+        session.add(row)
+        session.commit()
+
+
+def _skipped_slots(engine, schedule_id: UUID) -> list[datetime]:
+    return sorted(
+        o.scheduled_for.replace(tzinfo=timezone.utc)
+        for o in _occurrences(engine, schedule_id)
+        if o.status == OccurrenceStatus.skipped
+    )
+
+
+def _settle_claimed(engine, occurrence_id: UUID, outcome_status: RunStatus = RunStatus.success) -> None:
+    """Run an attempt at the occurrence to the given end, as the executor would."""
+    from cowork.scheduler import _RunOutcome, _settle_occurrence
+
+    with Session(engine) as session:
+        scoped = _scoped(session)
+        run = ScheduleOccurrenceService(scoped).start_attempt(occurrence_id, is_manual=False, lease_seconds=60)
+        _settle_occurrence(
+            scoped, occurrence_id=occurrence_id, attempt=run.attempt,
+            outcome=_RunOutcome(status=outcome_status, error="boom" if outcome_status == RunStatus.failed else None),
+            retryable=False,
+        )
+        session.commit()
+        ScheduleRunService(scoped).finish_run(run.id, status=outcome_status)
+
+
+def test_after_an_outage_the_default_runs_only_the_latest_missed_slot(tmp_path):
+    """A weekly task three weeks behind runs once, for its latest slot. The
+    three earlier slots are all older than the 7-day lookback, so they are
+    counted in missed_runs without a skipped record each."""
+    from cowork.scheduler import _poll
+
+    engine = _engine(tmp_path)
+    now = datetime.now(timezone.utc)
+    latest = now - timedelta(hours=1)
+    schedule_id = _schedule(engine, cadence="weekly", next_run_at=latest - timedelta(weeks=3))
+
+    with Session(engine) as session:
+        ready = _poll(_scoped(session))
+
+    [claimed] = ready
+    with Session(engine) as session:
+        occurrence = session.get(ScheduleOccurrence, claimed)
+        schedule = session.get(Schedule, schedule_id)
+        assert occurrence.scheduled_for.replace(tzinfo=timezone.utc) == latest
+        assert schedule.next_run_at.replace(tzinfo=timezone.utc) == latest + timedelta(weeks=1)
+        assert schedule.missed_runs == 3
+    assert _skipped_slots(engine, schedule_id) == []
+
+
+def test_applying_the_policy_twice_changes_nothing(tmp_path):
+    from cowork.scheduler import _handle_missed_runs
+
+    engine = _engine(tmp_path)
+    now = datetime.now(timezone.utc)
+    schedule_id = _schedule(engine, cadence="daily", next_run_at=now - timedelta(days=3, hours=1))
+
+    with Session(engine) as session:
+        _handle_missed_runs(_scoped(session))
+    with Session(engine) as session:
+        first = session.get(Schedule, schedule_id)
+        snapshot = (first.next_run_at, first.missed_runs)
+    with Session(engine) as session:
+        _handle_missed_runs(_scoped(session))
+    with Session(engine) as session:
+        again = session.get(Schedule, schedule_id)
+        assert (again.next_run_at, again.missed_runs) == snapshot
+    assert len(_skipped_slots(engine, schedule_id)) == 3
+
+
+def test_bounded_catch_up_runs_at_most_ten_missed_slots_in_turn(tmp_path):
+    from cowork.scheduler import _MAX_CATCH_UP, _poll
+
+    engine = _engine(tmp_path)
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    first_missed = now - timedelta(hours=14)
+    schedule_id = _schedule(engine, cadence="hourly", next_run_at=first_missed)
+    _set(engine, schedule_id, missed_run_policy="bounded_catch_up")
+
+    ran: list[datetime] = []
+    for _ in range(20):
+        with Session(engine) as session:
+            ready = _poll(_scoped(session))
+        if not ready:
+            break
+        [occurrence_id] = ready  # single-flight: one slot at a time
+        with Session(engine) as session:
+            ran.append(session.get(ScheduleOccurrence, occurrence_id).scheduled_for.replace(tzinfo=timezone.utc))
+        _settle_claimed(engine, occurrence_id)
+
+    expected = [now - timedelta(hours=h) for h in range(_MAX_CATCH_UP - 1, -1, -1)]
+    assert ran == expected
+    assert _skipped_slots(engine, schedule_id) == [first_missed + timedelta(hours=h) for h in range(5)]
+
+
+def test_skip_runs_nothing_the_app_was_closed_for(tmp_path):
+    from cowork.scheduler import _poll
+
+    engine = _engine(tmp_path)
+    now = datetime.now(timezone.utc)
+    schedule_id = _schedule(engine, cadence="daily", next_run_at=now - timedelta(days=2, hours=3))
+    _set(engine, schedule_id, missed_run_policy="skip")
+
+    with Session(engine) as session:
+        assert _poll(_scoped(session)) == []
+    with Session(engine) as session:
+        assert session.get(Schedule, schedule_id).next_run_at.replace(tzinfo=timezone.utc) > now
+    assert len(_skipped_slots(engine, schedule_id)) == 3
+
+
+def test_a_cron_success_does_not_suppress_the_next_slot(tmp_path):
+    """The freshness guard is for a manual run just before a slot. A cron run
+    that just finished is its own slot and must not skip the next one."""
+    from cowork.scheduler import _due_schedules
+
+    engine = _engine(tmp_path)
+    now = datetime.now(timezone.utc)
+    schedule_id = _schedule(engine, cadence="hourly", next_run_at=now - timedelta(seconds=30))
+    with Session(engine) as session:
+        run_service = ScheduleRunService(_scoped(session))
+        run = run_service.create_run(schedule_id, is_manual=False)
+        run_service.finish_run(run.id)
+
+    with Session(engine) as session:
+        assert [s.id for s in _due_schedules(_scoped(session), now)] == [schedule_id]
+
+
+# --- Edits --------------------------------------------------------------------
+
+
+def test_editing_cadence_or_timezone_moves_the_next_slot_at_once(tmp_path):
+    from cowork.services.schedules import ScheduleService
+
+    engine = _engine(tmp_path)
+    now = datetime.now(timezone.utc)
+    schedule_id = _schedule(engine, cadence="daily", next_run_at=now + timedelta(hours=1))
+    saturday = datetime(2030, 1, 5, 9, 0, tzinfo=timezone.utc)
+    assert saturday.weekday() == 5
+
+    with Session(engine) as session:
+        service = ScheduleService(_scoped(session))
+        edited = service.update_schedule(schedule_id, cadence="weekdays", next_run_at=saturday)
+        assert edited.next_run_at.replace(tzinfo=timezone.utc) == saturday + timedelta(days=2)
+
+        # A start already in the past moves to the next slot instead of
+        # firing as a missed run on the next poll.
+        stale = service.update_schedule(schedule_id, cadence="daily", next_run_at=now - timedelta(days=3))
+        assert stale.next_run_at.replace(tzinfo=timezone.utc) > now
+
+
+# --- Auto-pause -------------------------------------------------------------
+
+
+def _fail_occurrences(engine, schedule_id: UUID, count: int, *, start: int = 0, manual: bool = False) -> None:
+    for n in range(start, start + count):
+        with Session(engine) as session:
+            occurrence = ScheduleOccurrenceService(_scoped(session)).claim(
+                schedule_id,
+                occurrence_key=f"{'manual' if manual else 'slot'}:{n}",
+                trigger_source="manual" if manual else "cron",
+                scheduled_for=DUE,
+                max_attempts=1,
+                lease_seconds=60,
+            )
+        _settle_claimed(engine, occurrence.id, RunStatus.failed)
+
+
+def test_three_failed_occurrences_in_a_row_pause_the_schedule(tmp_path):
+    from cowork.scheduler import _MAX_FAILED_OCCURRENCES
+
+    engine = _engine(tmp_path)
+    schedule_id = _schedule(engine)
+
+    _fail_occurrences(engine, schedule_id, _MAX_FAILED_OCCURRENCES - 1)
+    with Session(engine) as session:
+        assert session.get(Schedule, schedule_id).enabled is True
+
+    _fail_occurrences(engine, schedule_id, 1, start=_MAX_FAILED_OCCURRENCES)
+    with Session(engine) as session:
+        schedule = session.get(Schedule, schedule_id)
+        assert schedule.enabled is False
+        assert schedule.auto_paused_at is not None
+        assert schedule.consecutive_failures == _MAX_FAILED_OCCURRENCES
+
+
+def test_retries_inside_one_occurrence_count_once(tmp_path):
+    """Three failed attempts at one occurrence are one failure, not three."""
+    from cowork.scheduler import _RunOutcome, _settle_occurrence
+
+    engine = _engine(tmp_path)
+    schedule_id = _schedule(engine)
+    occurrence_id = _claim(engine, schedule_id, "slot:a")
+    for attempt in (1, 2, 3):
+        with Session(engine) as session:
+            scoped = _scoped(session)
+            occurrence = session.get(ScheduleOccurrence, occurrence_id)
+            occurrence.next_attempt_at = datetime.now(timezone.utc)
+            session.add(occurrence)
+            session.commit()
+            ScheduleOccurrenceService(scoped).start_attempt(occurrence_id, is_manual=False, lease_seconds=60)
+            _settle_occurrence(
+                scoped, occurrence_id=occurrence_id, attempt=attempt,
+                outcome=_RunOutcome(status=RunStatus.failed, error="boom"), retryable=True,
+            )
+            session.commit()
+
+    with Session(engine) as session:
+        schedule = session.get(Schedule, schedule_id)
+        assert schedule.consecutive_failures == 1
+        assert schedule.enabled is True
+
+
+def test_a_success_resets_the_streak_and_manual_failures_do_not_count(tmp_path):
+    engine = _engine(tmp_path)
+    schedule_id = _schedule(engine)
+
+    _fail_occurrences(engine, schedule_id, 2)
+    _fail_occurrences(engine, schedule_id, 5, start=10, manual=True)
+    with Session(engine) as session:
+        assert session.get(Schedule, schedule_id).consecutive_failures == 2
+
+    ok = _claim(engine, schedule_id, "slot:ok")
+    _settle_claimed(engine, ok)
+    with Session(engine) as session:
+        schedule = session.get(Schedule, schedule_id)
+        assert schedule.consecutive_failures == 0
+        assert schedule.enabled is True
+
+
+def test_resume_clears_the_auto_pause_and_keeps_the_history(tmp_path):
+    from cowork.scheduler import _MAX_FAILED_OCCURRENCES
+    from cowork.services.schedules import ScheduleService
+
+    engine = _engine(tmp_path)
+    schedule_id = _schedule(engine)
+    _fail_occurrences(engine, schedule_id, _MAX_FAILED_OCCURRENCES)
+
+    with Session(engine) as session:
+        resumed = ScheduleService(_scoped(session)).resume_schedule(schedule_id)
+        assert resumed.enabled is True
+        assert resumed.auto_paused_at is None
+        assert resumed.consecutive_failures == 0
+        assert resumed.next_run_at.replace(tzinfo=timezone.utc) > datetime.now(timezone.utc)
+
+    assert len(_runs(engine, schedule_id)) == _MAX_FAILED_OCCURRENCES
+    assert len(_occurrences(engine, schedule_id)) == _MAX_FAILED_OCCURRENCES
