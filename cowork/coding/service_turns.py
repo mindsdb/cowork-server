@@ -4,6 +4,7 @@ import dataclasses
 import logging
 import threading
 import uuid
+from pathlib import Path
 
 from cowork.coding.commands import CommandIntent
 from cowork.coding.connector_capabilities import ConnectorCapability
@@ -17,6 +18,7 @@ from cowork.coding.contracts import (
     SessionCreateRequest,
     SessionStatus,
     TaskCapability,
+    WorkspaceMode,
 )
 from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_models import TERMINAL_RUN_STATUSES, RunStatus, RuntimeCommand, RuntimeEvent, TaskRun
@@ -24,10 +26,16 @@ from cowork.coding.engines.base import EngineCredentials, EngineInputReference, 
 from cowork.coding.reasoning import ModelLevels
 from cowork.coding.session_factory import PendingLocalSession
 from cowork.coding.turns import RunningTurn, fail_turn, mark_running
+from cowork.coding.workspace import WorkspaceError
 from cowork.services.skills import CodeSkillService
 
 
 logger = logging.getLogger(__name__)
+
+
+IN_PLACE_BUSY = (
+    "Another task is working in this folder. Wait for it to finish, or choose Worktree to run them side by side"
+)
 
 
 def _await_first_turn(current: CodingSession) -> None:
@@ -64,6 +72,11 @@ class CodingTurnOperations:
         try:
             self._validated_command_intent(self.get_session(begun.session_id), request.prompt, request.attachments)
             require_attachments_exist(request.attachments)
+            in_place_root = (
+                self.workspaces.in_place_root(request.path or "")
+                if begun.workspace_mode == WorkspaceMode.in_place and begun.project is None
+                else None
+            )
             thread = threading.Thread(
                 target=self._prepare_and_start,
                 args=(begun, credentials),
@@ -71,6 +84,8 @@ class CodingTurnOperations:
                 daemon=True,
             )
             with self._lock:
+                if in_place_root is not None and self._in_place_conflict(begun.session_id, in_place_root):
+                    raise RuntimeError(IN_PLACE_BUSY)
                 self._running[begun.session_id] = RunningTurn(engine=None, turn_id="", thread=thread, preparing=True)
             thread.start()
         except Exception:
@@ -227,6 +242,37 @@ class CodingTurnOperations:
     ) -> RuntimeCommand:
         return self.remote.acknowledge_command(run_id, command_id, computer_id, lease_id, epoch, result, error)
 
+    def _in_place_conflict(self, session_id: str, root: Path) -> bool:
+        """Whether another active in-place task works in ``root``.
+
+        Two agents editing one checkout would overwrite each other, so only
+        one in-place task per repository runs at a time. Call with
+        ``self._lock`` held so two starts cannot both pass.
+        """
+        target = root.resolve()
+        for other_id in self._running:
+            if other_id == session_id:
+                continue
+            try:
+                other = self.store.load_session(other_id)
+            except (FileNotFoundError, KeyError, ValueError):
+                continue
+            if other.workspace_mode != WorkspaceMode.in_place:
+                continue
+            # A task still preparing has no workspace yet; its folder resolves
+            # to the same repository its workspace will be.
+            try:
+                other_root = (
+                    Path(other.workspace_path)
+                    if other.workspace_path
+                    else self.workspaces.in_place_root(other.source_path)
+                )
+            except WorkspaceError:
+                continue
+            if other_root.resolve() == target:
+                return True
+        return False
+
     def _is_remote(self, session: CodingSession) -> bool:
         return self.remote.is_remote(session)
 
@@ -269,6 +315,10 @@ class CodingTurnOperations:
                 raise RuntimeError("This coding task already has a running turn")
             if not session.workspace_path:
                 raise RuntimeError("This task did not start because its workspace could not be prepared. Start a new task.")
+            if session.workspace_mode == WorkspaceMode.in_place and self._in_place_conflict(
+                session_id, Path(session.workspace_path),
+            ):
+                raise RuntimeError(IN_PLACE_BUSY)
             engine_attachments = validate_references(session, attachments)
             # Mode changes must finish preflight before allocating a new run.
             if continue_completed:

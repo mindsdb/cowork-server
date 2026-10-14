@@ -267,6 +267,40 @@ class WorkspaceManager:
         if not allow_folder_copy and self._git_root(path) is None:
             raise WorkspaceError("Local folder isolation was not enabled for this request")
 
+    def in_place_root(self, raw_path: str) -> Path:
+        """Return the repository an in-place task on ``raw_path`` works in.
+
+        Review compares an in-place task against the commit it started from,
+        so the folder must be in a Git repository that has one.
+        """
+        path = self._resolve_existing(raw_path)
+        if path is None or not path.is_dir():
+            raise WorkspaceError("Choose an existing local folder")
+        root = self._git_root(path)
+        if root is None:
+            raise WorkspaceError("Working in the original folder needs a Git repository; choose Worktree")
+        if self._head_revision(root) is None:
+            raise WorkspaceError("Working in the original folder needs a repository with a commit; choose Worktree")
+        return root
+
+    def prepare_in_place(self, raw_path: str) -> PreparedWorkspace:
+        """Point a task at the user's repository itself; nothing is created."""
+        root = self.in_place_root(raw_path)
+        inspection = self.inspect(str(root))
+        return PreparedWorkspace(
+            source_path=root,
+            workspace_path=root,
+            kind=WorkspaceKind.direct_folder,
+            repository_root=root,
+            base_revision=inspection.revision,
+            source_dirty=inspection.dirty,
+            warning=(
+                "The folder already had uncommitted changes. They appear in this task's review alongside the agent's."
+                if inspection.dirty
+                else None
+            ),
+        )
+
     def prepare(
         self,
         session_id: str,
@@ -353,7 +387,10 @@ class WorkspaceManager:
         with self._mutation_lock:
             source = Path(source_path)
             current = Path(workspace_path)
-            if kind == WorkspaceKind.direct_folder:
+            # A legacy direct-folder task has no starting commit, so its fork
+            # shares the folder. An in-place task's fork gets a worktree that
+            # carries its changes; two tasks never edit the same checkout.
+            if kind == WorkspaceKind.direct_folder and not base_revision:
                 return PreparedWorkspace(
                     source_path=source,
                     workspace_path=current,
@@ -398,7 +435,7 @@ class WorkspaceManager:
             return PreparedWorkspace(
                 source_path=source,
                 workspace_path=target,
-                kind=kind,
+                kind=WorkspaceKind.git_worktree,
                 repository_root=source,
                 base_revision=base_revision,
                 source_dirty=False,
