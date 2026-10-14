@@ -6,6 +6,8 @@ folder and they then disappear from the artifact list and do not serve.
 """
 from __future__ import annotations
 
+import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -127,6 +129,67 @@ def test_an_in_root_project_is_still_found_by_the_scan(engine):
     session = _scoped(engine)
     bases = {Path(s.base).resolve() for s in artifacts_sources_for_scope(session)}
     assert base.resolve() in bases
+
+
+# -- path resolution ---------------------------------------------------------
+
+
+def test_a_path_inside_an_adopted_folder_resolves_with_a_session(engine, tmp_path):
+    """The path-addressed surface, which cannot use `artifacts_sources_for_project`
+    because it is given a filesystem path and no project id."""
+    from cowork.services.artifacts import resolve_artifact_path
+
+    folder = tmp_path / "Documents" / "notes"
+    folder.mkdir(parents=True)
+    artifact = _artifacts_dir(folder) / "dash"
+    artifact.mkdir()
+    primary = artifact / "index.html"
+    primary.write_text("<html></html>")
+    ProjectService(_scoped(engine)).create_project("notes", path=folder)
+
+    resolved = resolve_artifact_path(str(primary), session=_scoped(engine))
+    assert resolved == primary.resolve()
+
+
+def test_the_same_path_is_refused_without_a_session(engine, tmp_path):
+    """Callers that hold no session keep the old behavior, so nothing that
+    resolves by scan today starts resolving by row behind their back."""
+    from cowork.services.artifacts import resolve_artifact_path
+
+    folder = tmp_path / "Documents" / "notes"
+    folder.mkdir(parents=True)
+    artifact = _artifacts_dir(folder) / "dash"
+    artifact.mkdir()
+    primary = artifact / "index.html"
+    primary.write_text("<html></html>")
+    ProjectService(_scoped(engine)).create_project("notes", path=folder)
+
+    with pytest.raises(FileNotFoundError):
+        resolve_artifact_path(str(primary))
+
+
+def test_the_artifact_root_climb_stops_at_an_adopted_container(engine, tmp_path):
+    """The container set bounds the climb. It is empty for an adopted folder
+    without the widening, and a `metadata.json` the user happens to keep in
+    their own folder then becomes the artifact root — handing every sibling
+    file in that folder to whatever reads the root."""
+    from cowork.services.artifacts import _artifact_root_for
+
+    folder = tmp_path / "Documents" / "notes"
+    folder.mkdir(parents=True)
+    # A file of the user's own, above the artifacts dir. An unbounded climb
+    # walks up to it; a bounded one never leaves `.anton/artifacts/`.
+    (folder / "metadata.json").write_text("{}")
+    base = _artifacts_dir(folder)
+    loose = base / "stray"
+    loose.mkdir()
+    primary = loose / "index.html"
+    primary.write_text("<html></html>")
+    ProjectService(_scoped(engine)).create_project("notes", path=folder)
+
+    root = _artifact_root_for(primary, session=_scoped(engine))
+    assert root == loose.resolve()
+    assert root != folder.resolve()
 
 
 # -- serving -----------------------------------------------------------------
@@ -275,3 +338,111 @@ def test_the_artifacts_route_lists_an_adopted_folder(projects_root, tmp_path):
     # Every HTML preview now carries the storage shim (see preview_html.py);
     # this route is not what's under test here, only that it resolves at all.
     assert "anton-preview" in served.text
+
+
+def test_published_state_still_returns_the_blank_default_when_the_database_errors(
+    engine, tmp_path, monkeypatch, caplog
+):
+    """Its contract is to answer for any path, never to raise. Resolving through
+    the project row put a database read in the way, and the agent's own
+    `publish_or_preview` calls this with no guard of its own.
+
+    The path has to resolve, or the run never reaches the read under test.
+    """
+    from cowork.services import publish as publish_service
+    from cowork.services.publish import published_owner_state, published_state
+
+    folder = tmp_path / "Documents" / "notes"
+    folder.mkdir(parents=True)
+    artifact = _artifacts_dir(folder) / "dash"
+    artifact.mkdir()
+    primary = artifact / "index.html"
+    primary.write_text("<html></html>")
+    (artifact / "metadata.json").write_text("{}")
+    ProjectService(_scoped(engine)).create_project("notes", path=folder)
+
+    def _locked(_session=None):
+        raise RuntimeError("database is locked")
+
+    # Patched in `publish`, which binds the name at import; patching it in
+    # `artifacts` would leave this binding pointing at the real one, and the
+    # resolution above still has to succeed.
+    monkeypatch.setattr(publish_service, "_artifact_dirs_for_scope", _locked)
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.publish"):
+        assert published_state(str(primary), _scoped(engine)) == {
+            "report_id": "",
+            "url": "",
+            "published": False,
+        }
+        assert published_owner_state(str(primary), _scoped(engine)) == {}
+
+    # Blank is what the contract promises, but an outage must not be silent:
+    # without this it is indistinguishable from an artifact that is simply
+    # not published.
+    assert [r.msg for r in caplog.records].count(
+        "Could not resolve artifact roots for %s"
+    ) == 2
+    assert all("database is locked" in r.exc_text for r in caplog.records)
+
+
+def test_published_state_reads_the_artifact_roots_once(engine, tmp_path, monkeypatch):
+    """Path resolution reuses the roots already read. A second read is a second
+    database round trip, and one failing there was swallowed with no log as an
+    artifact that is simply not published."""
+    from cowork.services import artifacts as artifacts_service
+    from cowork.services.publish import published_owner_state, published_state
+
+    folder = tmp_path / "Documents" / "notes"
+    folder.mkdir(parents=True)
+    artifact = _artifacts_dir(folder) / "dash"
+    artifact.mkdir()
+    primary = artifact / "index.html"
+    primary.write_text("<html></html>")
+    (artifact / "metadata.json").write_text("{}")
+    entry = {"report_id": "uuid-once", "url": "https://4nton.ai/a/uuid-once", "published": True}
+    (artifact / ".published.json").write_text(json.dumps({"index.html": entry}))
+    ProjectService(_scoped(engine)).create_project("notes", path=folder)
+
+    def _second_read(_session=None):
+        raise RuntimeError("database is locked")
+
+    # Only the binding `resolve_artifact_path` would use; `publish` keeps its own.
+    monkeypatch.setattr(artifacts_service, "_artifact_dirs_for_scope", _second_read)
+
+    assert published_state(str(primary), _scoped(engine)) == {
+        "report_id": "uuid-once",
+        "url": "https://4nton.ai/a/uuid-once",
+        "published": True,
+    }
+    assert published_owner_state(str(primary), _scoped(engine)) == entry
+
+
+def test_a_relative_path_in_two_roots_is_reported_as_ambiguous(engine, tmp_path):
+    """The one behavior change an allocated project can see. Widening the root
+    set widens this ambiguity: a relative path that matched one root before can
+    match two once any folder is adopted, and the caller is told to send an
+    absolute path rather than being handed an arbitrary one of them."""
+    from cowork.services.artifacts import resolve_artifact_path
+
+    # The service holds the session; letting it go detaches the row.
+    svc = ProjectService(_scoped(engine))
+    allocated = svc.create_project("reports")
+    allocated_dash = _artifacts_dir(Path(allocated.path)) / "dash"
+    allocated_dash.mkdir()
+    (allocated_dash / "index.html").write_text("<html></html>")
+
+    adopted = tmp_path / "Documents" / "old-work"
+    adopted.mkdir(parents=True)
+    adopted_dash = _artifacts_dir(adopted) / "dash"
+    adopted_dash.mkdir()
+    (adopted_dash / "index.html").write_text("<html></html>")
+    ProjectService(_scoped(engine)).create_project("old-work", path=adopted)
+
+    with pytest.raises(ValueError, match="multiple project artifact roots"):
+        resolve_artifact_path("dash/index.html", session=_scoped(engine))
+
+    # Without the adopted root in play the same relative path still resolves.
+    assert resolve_artifact_path("dash/index.html") == (
+        allocated_dash / "index.html"
+    ).resolve()

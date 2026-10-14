@@ -5,7 +5,9 @@ from fastapi import APIRouter, Depends, Query
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSessionDep
-from cowork.services.artifact_roots import artifacts_sources_for_scan as _sources_for_scan
+from cowork.services.artifact_roots import (
+    artifacts_sources_for_desktop_paths as _desktop_sources,
+)
 from cowork.services.artifacts import list_artifacts as _list_artifacts
 from cowork.services.conversations import ConversationService
 from cowork.services.pins import PinService
@@ -80,7 +82,7 @@ async def search_cowork(
             })
 
     # Artifacts
-    for artifact in _list_artifacts(_sources_for_scan()):
+    for artifact in _list_artifacts(_desktop_sources(scoped)):
         text = " ".join([
             artifact.get("title") or "",
             artifact.get("description") or "",

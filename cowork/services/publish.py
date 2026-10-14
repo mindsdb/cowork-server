@@ -43,6 +43,7 @@ from cowork.services.artifacts import (
     _load_published_map,
     _scan_artifact_dirs,
     html_artifacts,
+    _artifact_dirs_for_scope,
     resolve_artifact_path,
 )
 
@@ -50,7 +51,7 @@ from cowork.services.artifacts import (
 # session factory and the FastAPI dependency graph, and this module is imported
 # from the harness turn path where that is dead weight.
 if TYPE_CHECKING:
-    from cowork.db.scoped import TenantScope
+    from cowork.db.scoped import ScopedSession, TenantScope
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +193,9 @@ def _write_published_map(published_json: Path, published_map: dict[str, Any]) ->
             pass
 
 
-def desktop_artifact_and_base(raw_path: str) -> tuple[Path, Path]:
+def desktop_artifact_and_base(
+    raw_path: str, session: "ScopedSession | None" = None
+) -> tuple[Path, Path]:
     """(artifact, artifacts_base) for a desktop request path.
 
     Split from credential resolution so callers can validate cheap, local things
@@ -202,10 +205,10 @@ def desktop_artifact_and_base(raw_path: str) -> tuple[Path, Path]:
     The loop only IDENTIFIES which root the artifact sits under;
     `resolve_artifact_path` has already rejected anything outside them.
     """
-    artifact = resolve_artifact_path(raw_path, allow_dir=True)
+    artifact = resolve_artifact_path(raw_path, allow_dir=True, session=session)
     if artifact is None:
         raise FileNotFoundError("Artifact not found")
-    for root in _scan_artifact_dirs():
+    for root in _artifact_dirs_for_scope(session):
         try:
             artifact.resolve().relative_to(root.resolve())
         except (ValueError, OSError):
@@ -222,7 +225,9 @@ def desktop_publish_credential() -> tuple[str, str]:
     return api_key, publish_url
 
 
-def desktop_publish_context(raw_path: str) -> tuple[Path, Path, str, str]:
+def desktop_publish_context(
+    raw_path: str, session: "ScopedSession | None" = None
+) -> tuple[Path, Path, str, str]:
     """(artifact, artifacts_base, api_key, publish_url) for the desktop path.
 
     Keeps the pre-existing behavior - path resolution against the registered
@@ -230,7 +235,7 @@ def desktop_publish_context(raw_path: str) -> tuple[Path, Path, str, str]:
     place, so the publish functions themselves stay free of both. The org path
     supplies these four values from the DB and a minted turn key instead.
     """
-    artifact, root = desktop_artifact_and_base(raw_path)
+    artifact, root = desktop_artifact_and_base(raw_path, session)
     api_key, publish_url = desktop_publish_credential()
     return artifact, root, api_key, publish_url
 
@@ -287,12 +292,12 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
     return publish_url, api_key
 
 
-def list_publishable() -> dict:
+def list_publishable(session: "ScopedSession | None" = None) -> dict:
     settings = get_user_settings()
     state = _load_state()
     publish_url, api_key = _resolve_publish_endpoint(settings)
     return {
-        "artifacts": html_artifacts(),
+        "artifacts": html_artifacts(session),
         "publishReady": bool(api_key),
         "publishUrl": publish_url,
         "history": state.get("publish_history", [])[:40],
@@ -761,7 +766,7 @@ def published_artifact_access(artifact: Path, *, artifacts_base: Path) -> dict:
     return access_from_owner_side(entry)
 
 
-def update_artifact(raw_path: str) -> dict:
+def update_artifact(raw_path: str, session: "ScopedSession | None" = None) -> dict:
     """Re-publish an already-published artifact, preserving its URL and access.
 
     `publish_artifact` reuses the stored report_id (→ the lambda mints a new
@@ -772,7 +777,7 @@ def update_artifact(raw_path: str) -> dict:
     """
     # Path first, credential later: an artifact with nothing published must
     # report that, not "configure your API key".
-    artifact, artifacts_base = desktop_artifact_and_base(raw_path)
+    artifact, artifacts_base = desktop_artifact_and_base(raw_path, session)
     _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
         artifact, container_dirs=[artifacts_base]
     )
@@ -800,13 +805,17 @@ def update_artifact(raw_path: str) -> dict:
     return result
 
 
-def _resolve_report_id(raw_path: str) -> tuple[Path, str, str]:
+def _resolve_report_id(
+    raw_path: str, session: "ScopedSession | None" = None
+) -> tuple[Path, str, str]:
     """Resolve (published_json_path, published_key, report_id) for an artifact.
 
     Raises FileNotFoundError when the artifact has no live publish record.
     """
-    artifact = resolve_artifact_path(raw_path, allow_dir=True)
-    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(artifact)
+    artifact = resolve_artifact_path(raw_path, allow_dir=True, session=session)
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
+        artifact, _artifact_dirs_for_scope(session)
+    )
     published_json = published_dir / ".published.json"
     if not published_json.is_file():
         raise FileNotFoundError("Artifact has no publish record")
@@ -831,7 +840,7 @@ def _publisher_http_detail(exc: Exception) -> str:
         return body or str(exc)
 
 
-def list_versions(raw_path: str) -> dict:
+def list_versions(raw_path: str, session: "ScopedSession | None" = None) -> dict:
     """List the publish history (versions) of a live artifact.
 
     Returns {reportId, currentMd5, artifactType, versions: [...]} with versions
@@ -842,7 +851,7 @@ def list_versions(raw_path: str) -> dict:
     if not api_key:
         raise ValueError("Configure your provider API key in Settings to view versions")
 
-    _published_json, _key, report_id = _resolve_report_id(raw_path)
+    _published_json, _key, report_id = _resolve_report_id(raw_path, session)
 
     try:
         from anton.publisher import list_versions as _list_versions
@@ -881,7 +890,9 @@ def list_versions(raw_path: str) -> dict:
     }
 
 
-def activate_version(raw_path: str, md5: str) -> dict:
+def activate_version(
+    raw_path: str, md5: str, session: "ScopedSession | None" = None
+) -> dict:
     """Roll the live URL back to an existing version (flips current_md5).
 
     On success, rewrites `.published.json` so the `modified` badge reflects the
@@ -898,7 +909,7 @@ def activate_version(raw_path: str, md5: str) -> dict:
     if not api_key:
         raise ValueError("Configure your provider API key in Settings before rolling back")
 
-    published_json, published_key, report_id = _resolve_report_id(raw_path)
+    published_json, published_key, report_id = _resolve_report_id(raw_path, session)
 
     try:
         from anton.publisher import activate_version as _activate_version
@@ -940,7 +951,7 @@ def activate_version(raw_path: str, md5: str) -> dict:
     }
 
 
-def published_state(raw_path: str) -> dict:
+def published_state(raw_path: str, session: "ScopedSession | None" = None) -> dict:
     """Owner-side publish state for an artifact path, resolved exactly the way
     `publish_artifact` resolves it (so the chat tool and the GUI never disagree
     on where `.published.json` lives).
@@ -953,13 +964,23 @@ def published_state(raw_path: str) -> dict:
     # resolve_artifact_path raises (not returns None) for paths outside a known
     # artifacts dir, so guard the whole resolution — the documented contract is
     # to return the blank default for any unresolvable path, never to raise.
+    # The roots are read once, here, so a database that did not answer is
+    # logged: it returns the same blank as an unresolvable path, and without
+    # the log an outage would read as "not published".
     try:
-        artifact = resolve_artifact_path(raw_path, allow_dir=True)
+        containers = _artifact_dirs_for_scope(session)
+    except Exception:
+        logger.warning("Could not resolve artifact roots for %s", raw_path, exc_info=True)
+        return dict(blank)
+    try:
+        artifact = resolve_artifact_path(raw_path, allow_dir=True, artifact_dirs=containers)
     except Exception:
         return dict(blank)
     if artifact is None:
         return dict(blank)
-    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(artifact)
+    _publish_target, published_dir, published_key, _is_fullstack = _resolve_publish_target(
+        artifact, containers
+    )
     entry = _load_published_map(published_dir).get(published_key)
     if not isinstance(entry, dict):
         return dict(blank)
@@ -971,17 +992,29 @@ def published_state(raw_path: str) -> dict:
     }
 
 
-def published_owner_state(raw_path: str) -> dict:
+def published_owner_state(
+    raw_path: str, session: "ScopedSession | None" = None
+) -> dict:
     """Raw owner-side `.published.json` entry, resolved exactly like
     `publish_artifact`. Returns {} for any unresolvable/absent record. Unlike
     `published_state`, exposes the access fields (mode/access_password/emails/
     org_allowed) needed to preserve access on re-publish."""
+    # See `published_state`: the roots are read once so a database failure is
+    # logged, since an empty record here tells the comments route the artifact
+    # has no cloud thread.
     try:
-        artifact = resolve_artifact_path(raw_path, allow_dir=True)
+        containers = _artifact_dirs_for_scope(session)
+    except Exception:
+        logger.warning("Could not resolve artifact roots for %s", raw_path, exc_info=True)
+        return {}
+    try:
+        artifact = resolve_artifact_path(raw_path, allow_dir=True, artifact_dirs=containers)
     except Exception:
         return {}
     if artifact is None:
         return {}
-    _t, published_dir, published_key, _fs = _resolve_publish_target(artifact)
+    _t, published_dir, published_key, _fs = _resolve_publish_target(
+        artifact, containers
+    )
     entry = _load_published_map(published_dir).get(published_key)
     return entry if isinstance(entry, dict) else {}
