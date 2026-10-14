@@ -375,6 +375,73 @@ async def test_two_peoples_same_slug_backends_keep_running(stack, monkeypatch):
     assert len(artifacts._BACKEND_LAUNCH_LOCKS) == 2
 
 
+class _FakePad:
+    """anton's LocalScratchpadRuntime as the launcher reads it, recording its folder."""
+
+    def __init__(self, name: str, *, workspace_path: Path, **_coding) -> None:
+        self.workspace = workspace_path
+        self._venv_python = str(workspace_path / ".anton" / "scratchpad-venvs" / name / "bin" / "python")
+
+    def _ensure_venv(self) -> None:
+        pass
+
+
+@pytest.fixture
+def fake_pads(monkeypatch):
+    from cowork.services import scratchpad_runtime
+
+    monkeypatch.setattr(scratchpad_runtime, "_pads", {})
+    monkeypatch.setattr(
+        scratchpad_runtime,
+        "_resolve_coding",
+        lambda **coding: tuple(coding.values()),
+    )
+    monkeypatch.setattr("anton.core.backends.local.LocalScratchpadRuntime", _FakePad)
+    return scratchpad_runtime
+
+
+async def test_two_peoples_same_slug_backends_get_their_own_venvs(stack, monkeypatch, fake_pads):
+    """anton's launcher asks the pool for the slug's venv, then installs the
+    artifact's requirements into that slug's pad. A pool keyed by slug alone
+    would hand B's backend A's pad, inside A's project."""
+    from cowork.services import artifacts
+
+    a_app = _artifact(_general(ALICE), "app", title="A app")
+    b_app = _artifact(_general(BOB), "app", title="B app")
+    seen: dict[Path, tuple[str, Path]] = {}
+
+    async def fake_launch(*, slug, artifact_folder, scratchpad_pool, tracked_backends, ds_env, health_timeout):
+        # What anton's launcher asks of the pool: the venv, then the pad.
+        venv_python = await scratchpad_pool.venv_python(slug)
+        pad = await scratchpad_pool.get_or_create(slug)
+        seen[artifact_folder] = (venv_python, pad.workspace)
+        return {"port": 40000 + len(seen), "pid": len(seen)}
+
+    monkeypatch.setattr("anton.core.artifacts.backend_launcher.launch_artifact_backend", fake_launch)
+    monkeypatch.setattr(artifacts, "_probe_port", lambda _port, **_kw: False)
+    monkeypatch.setattr(artifacts, "_LAUNCHED_BACKENDS", {})
+    monkeypatch.setattr(artifacts, "_BACKEND_LAUNCH_LOCKS", {})
+
+    await artifacts._ensure_backend_running(a_app, 1, scope=ALICE)
+    await artifacts._ensure_backend_running(b_app, 1, scope=BOB)
+
+    a_root, b_root = a_app.parents[2].resolve(), b_app.parents[2].resolve()
+    assert seen[a_app][1] == a_root
+    assert seen[b_app][1] == b_root
+    assert seen[b_app][0].startswith(str(b_root))
+    assert set(fake_pads._pads) == {a_root, b_root}
+
+
+def test_the_scratchpad_cap_counts_each_project_on_its_own(tmp_path, monkeypatch, fake_pads):
+    monkeypatch.setattr(fake_pads, "MAX_PADS", 1)
+    a_project, b_project = tmp_path / "a", tmp_path / "b"
+
+    assert fake_pads.get_or_create("app", workspace_path=str(a_project)).workspace == a_project.resolve()
+    assert fake_pads.get_or_create("other", workspace_path=str(b_project)).workspace == b_project.resolve()
+    with pytest.raises(RuntimeError, match="Maximum concurrent scratchpads"):
+        fake_pads.get_or_create("other", workspace_path=str(a_project))
+
+
 async def test_a_backend_launches_only_inside_the_callers_projects(stack, monkeypatch):
     from cowork.services import artifacts
 
