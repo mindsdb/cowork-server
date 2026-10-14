@@ -201,6 +201,7 @@ def _persist_direct_connection(
             # upgrade to "write" back to "read".
             default_fields={"_access_mode": "read"} if body.method == "mcp" else None,
             vault=vault,
+            scope=scope,
         )
     except ManagedConnectionError:
         # A derived name that lands on a managed connection: create_app's

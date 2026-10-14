@@ -28,9 +28,9 @@ if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
 
 
-def own_vault_for_scope(scope: "TenantScope | None" = None):
-    """The vault ``scope`` saves into, without the operator's managed entries."""
-    from anton.core.datasources.data_vault import LocalDataVault
+def own_vault_root(scope: "TenantScope | None" = None) -> Path:
+    """The folder of the vault ``scope`` saves into (own_vault_for_scope), and
+    the root its record locks are keyed by (vault_lock)."""
     from cowork.db.scoped import scoped_storage_root
 
     # Org mode keys the persisted vault per org, the same as SkillService and
@@ -38,7 +38,14 @@ def own_vault_for_scope(scope: "TenantScope | None" = None):
     # org deployment a missing scope RAISES rather than falling back, because
     # the fallback path is the shared namespace root and saved credentials
     # must never land there.
-    return LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), scope, store="data-vault"))
+    return scoped_storage_root(Path(ConnectorSettings().vault_dir), scope, store="data-vault")
+
+
+def own_vault_for_scope(scope: "TenantScope | None" = None):
+    """The vault ``scope`` saves into, without the operator's managed entries."""
+    from anton.core.datasources.data_vault import LocalDataVault
+
+    return LocalDataVault(own_vault_root(scope))
 
 
 def with_managed_connections(own):
@@ -126,6 +133,10 @@ def persist_connection(
     MCP connector defaulting ``_access_mode`` to ``"read"`` — a token
     refresh/re-auth reaching this same save path must not clobber a value the
     user already upgraded to ``"write"``).
+
+    ``scope`` names the vault saved into and the record lock the save takes
+    (own_vault_root); a caller passing ``vault`` passes the scope it built
+    that vault for.
     """
     if vault is None:
         vault = vault_for_scope(scope)
@@ -149,7 +160,7 @@ def persist_connection(
     # new connection can't race anything since nothing else references it
     # yet), and an unlocked interleaving with one of those would silently
     # revert whichever side saves first.
-    with lock_for(connector_id, base_slug):
+    with lock_for(vault_root=own_vault_root(scope), engine=connector_id, name=base_slug):
         # Resolve modify-flow "keep" sentinels against the record being
         # updated, so an unchanged secret keeps its stored value instead of
         # persisting the literal sentinel.
@@ -229,14 +240,15 @@ def set_connection_label(engine: str, name: str, label: str, *, vault=None,
     or None if the connection doesn't exist or `label` is blank. Used by the
     agent's learn-and-persist flow (e.g. after the user confirms which address
     is "Support") — updates only the non-secret ``_user_label`` and leaves the
-    identity/slug and secrets untouched.
+    identity/slug and secrets untouched. ``scope`` names the vault and the
+    record lock, as in persist_connection.
     """
     clean_label = str(label or "").strip()
     if not clean_label:
         return None
     if vault is None:
         vault = vault_for_scope(scope)
-    with lock_for(engine, name):
+    with lock_for(vault_root=own_vault_root(scope), engine=engine, name=name):
         record = vault.read_record(engine, name)
         if record is None:
             return None

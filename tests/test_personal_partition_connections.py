@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
 from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -110,6 +111,44 @@ def test_desktop_reads_the_configured_vault(monkeypatch, tmp_path):
         assert _names(turn_vault_for_scope(None)) == {("postgres", "sales")}
     finally:
         get_app_settings.cache_clear()
+
+
+# ── one record lock per vault ───────────────────────────────────────────────
+
+
+def _start(target, *args) -> threading.Thread:
+    thread = threading.Thread(target=target, args=args, daemon=True)
+    thread.start()
+    return thread
+
+
+def test_a_persons_delete_never_drops_another_persons_record_lock(stack):
+    """A and B each own `postgres/sales`, two records in two vaults. B's
+    delete of B's own must not drop the lock A's in-flight write holds, or
+    A's next write would run beside it and whichever saved last would revert
+    the other. Nor does B's write wait on A's."""
+    from cowork.services.connectors.connections import ConnectionsService
+    from cowork.services.connectors.persist import own_vault_root
+    from cowork.services.connectors.vault_lock import lock_for
+
+    _save_sales(ALICE, secret="alice-secret")
+    _save_sales(BOB, secret="bob-secret")
+    alices = ConnectionsService(ALICE)
+    bobs = ConnectionsService(BOB)
+
+    with lock_for(vault_root=own_vault_root(ALICE), engine="postgres", name="sales"):
+        # A's first write is in flight.
+        b_write = _start(bobs.patch_token, "postgres", "sales", {"status": "b"})
+        b_write.join(timeout=5)
+        assert not b_write.is_alive(), "B's write waited on A's record lock"
+        assert bobs.delete("postgres", "sales")
+        a_second = _start(alices.patch_token, "postgres", "sales", {"status": "a"})
+        a_second.join(timeout=0.3)
+        assert a_second.is_alive(), "A's second write ran beside the first"
+    a_second.join(timeout=5)
+
+    assert not a_second.is_alive()
+    assert vault_for_scope(ALICE).read_record("postgres", "sales")["fields"]["status"] == "a"
 
 
 # ── an in-process turn ──────────────────────────────────────────────────────

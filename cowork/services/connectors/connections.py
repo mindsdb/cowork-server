@@ -4,15 +4,14 @@ import json
 
 from anton.core.datasources.data_vault import is_secret_key
 
-from cowork.common.settings.app_settings import ConnectorSettings
-from cowork.db.scoped import TenantScope, scoped_storage_root
+from cowork.db.scoped import TenantScope
 from cowork.schemas.connectors import ConnectionDetailResponse, ConnectionSummaryResponse
 from cowork.services.connectors.identity import (
     VAULT_KEEP_SENTINEL as _SENTINEL,
     connection_display_name,
 )
 from cowork.services.connectors.layered_vault import LayeredDataVault
-from cowork.services.connectors.persist import with_managed_connections
+from cowork.services.connectors.persist import own_vault_root, with_managed_connections
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.vault_lock import discard_lock, lock_for
 
@@ -35,11 +34,13 @@ class ConnectionsService:
         self.scope = scope
 
     def _vault(self):
-        from pathlib import Path
         from anton.core.datasources.data_vault import LocalDataVault
-        return with_managed_connections(
-            LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), self.scope, store="data-vault"))
-        )
+        return with_managed_connections(LocalDataVault(own_vault_root(self.scope)))
+
+    def _lock(self, engine: str, name: str):
+        """The record lock every read-modify-write here takes, keyed by this
+        scope's own vault (vault_lock)."""
+        return lock_for(vault_root=own_vault_root(self.scope), engine=engine, name=name)
 
     @staticmethod
     def _is_managed_in(vault, engine: str, name: str) -> bool:
@@ -170,7 +171,7 @@ class ConnectionsService:
         Returns ``False`` if the entry does not exist.
         """
         vault = self._vault()
-        with lock_for(engine, name):
+        with self._lock(engine, name):
             record = self._read_record(vault, engine, name)
             if record is None:
                 return False
@@ -207,7 +208,7 @@ class ConnectionsService:
         Returns the merged list, or None if the connection doesn't exist.
         """
         vault = self._vault()
-        with lock_for(engine, name):
+        with self._lock(engine, name):
             record = self._read_record(vault, engine, name)
             if record is None:
                 return None
@@ -249,7 +250,7 @@ class ConnectionsService:
         Returns the resulting list, or None if the connection doesn't exist.
         """
         vault = self._vault()
-        with lock_for(engine, name):
+        with self._lock(engine, name):
             record = self._read_record(vault, engine, name)
             if record is None:
                 return None
@@ -303,7 +304,7 @@ class ConnectionsService:
 
     def delete(self, engine: str, name: str) -> bool:
         deleted = self._vault().delete(engine, name)
-        discard_lock(engine, name)
+        discard_lock(vault_root=own_vault_root(self.scope), engine=engine, name=name)
         return deleted
 
 

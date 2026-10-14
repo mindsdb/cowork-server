@@ -37,11 +37,12 @@ def _vault(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "cowork.api.v1.endpoints.connectors.connections.ConnectorSettings", fake_settings,
     )
-    # ConnectionsService (used by patch_access_mode's local-mode branch) reads
-    # its own module-level ConnectorSettings import, separate from the one
-    # above — both must point at the same test vault.
+    # ConnectionsService (used by patch_access_mode's local-mode branch) finds
+    # its vault through persist.own_vault_root, which reads persist's own
+    # ConnectorSettings import, separate from the one above — both must point
+    # at the same test vault.
     monkeypatch.setattr(
-        "cowork.services.connectors.connections.ConnectorSettings", fake_settings,
+        "cowork.services.connectors.persist.ConnectorSettings", fake_settings,
     )
 
 
