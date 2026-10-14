@@ -244,8 +244,22 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             return message
         return SideEffectResult.failed(message, reason=reason)
 
+    from cowork.services.publish import OWNED_BY_OTHER_USER_MESSAGE, PublishOwnedByOtherUser
+
     try:
         result = _publish_artifact(abs_path, access=access)
+    except PublishOwnedByOtherUser:
+        # The model can edit files, so spell out that it must not work around
+        # the refusal (e.g. by dropping the stored report_id). Not a ban for the
+        # rest of the conversation: the user may fix the account and ask again.
+        logger.info("Cowork publish refused: %s", OWNED_BY_OTHER_USER_MESSAGE)
+        return _fail(
+            f"PUBLISH FAILED: {OWNED_BY_OTHER_USER_MESSAGE} The existing link belongs "
+            "to another account. Do not retry, and do not publish this artifact under "
+            "a new report on your own. Tell the user, and publish again only if they "
+            "ask after resolving it.",
+            reason="owned_by_other_user",
+        )
     except ValueError as exc:
         # The service raises ValueError for several distinct reasons. Only the
         # missing-API-key case warrants the STOP/"go configure a key" directive;
@@ -935,9 +949,9 @@ _RECALL_HISTORY_LIMIT_MAX = 10
 async def _cowork_recall_history(load_archive, tc_input: dict) -> str:
     """Tool handler for `recall_history` — search the archived earlier turns.
 
-    `load_archive` returns the archive as plain message dicts, so the handler
-    stays a presentation layer: it never touches the DB, and the hosted path
-    can supply the same archive off the shared mount instead.
+    `load_archive` is awaited for the archive as plain message dicts, so the
+    handler stays a presentation layer: it never touches the DB, and the
+    hosted path can supply the same archive off the shared mount instead.
     """
     from cowork.services.history_recall import format_turns, search_turns
 
@@ -951,7 +965,7 @@ async def _cowork_recall_history(load_archive, tc_input: dict) -> str:
     limit = max(1, min(limit, _RECALL_HISTORY_LIMIT_MAX))
 
     try:
-        messages = load_archive()
+        messages = await load_archive()
     except Exception as exc:
         logger.exception("Cowork recall_history failed")
         return f"recall_history: could not read the archive ({type(exc).__name__})."
@@ -974,7 +988,8 @@ async def _cowork_recall_history(load_archive, tc_input: dict) -> str:
 
 
 def build_cowork_recall_history_tool(load_archive):
-    """`load_archive` is called per tool call and returns the archived messages."""
+    """`load_archive` is an async callable, awaited per tool call for the
+    archived messages."""
     from anton.core.tools.tool_defs import ToolDef
 
     async def handler(_session, tc_input: dict) -> str:

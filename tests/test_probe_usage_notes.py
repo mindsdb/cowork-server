@@ -2,7 +2,9 @@
 redirect that strips Authorization) can live there instead of in the
 user-facing method description."""
 import asyncio
+from types import SimpleNamespace
 
+from cowork.db.scoped import LOCAL_SCOPE
 from cowork.handlers import probe as probe_handler
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
 from cowork.services.connectors.submissions import SubmissionStore
@@ -42,6 +44,11 @@ def test_handler_hands_the_resolved_notes_to_the_probe(monkeypatch):
     monkeypatch.setattr(probe_handler, "CredentialProbe", RecordingProbe)
     monkeypatch.setattr(probe_handler.ProbeHandler, "_build_llm_client", staticmethod(lambda settings=None: object()))
     monkeypatch.setattr(
+        probe_handler, "_read_probe_settings",
+        lambda _session: SimpleNamespace(resolved_planning_provider=None),
+    )
+    monkeypatch.setattr("cowork.services.providers.web_tool_kwargs_for", lambda _provider: {})
+    monkeypatch.setattr(
         probe_handler.registry, "usage_notes_for",
         lambda engines: {e: f"NOTE-{e}" for e in engines},
     )
@@ -54,7 +61,7 @@ def test_handler_hands_the_resolved_notes_to_the_probe(monkeypatch):
 
     async def drain():
         return [
-            chunk async for chunk in probe_handler.ProbeHandler(session=None).run(
+            chunk async for chunk in probe_handler.ProbeHandler(scope=LOCAL_SCOPE).run(
                 submission_id, "langfuse", None, "", None
             )
         ]
