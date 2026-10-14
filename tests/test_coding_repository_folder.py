@@ -65,7 +65,7 @@ def worktrees(repository: Path) -> list[str]:
 def test_inner_repositories_become_worktrees_inside_the_folder_copy(tmp_path: Path, folder: Path) -> None:
     manager = WorkspaceManager(tmp_path / "coding")
 
-    prepared = manager.prepare("task", str(folder), allow_direct_folder=True)
+    prepared = manager.prepare("task", str(folder), allow_folder_copy=True)
     workspace = prepared.workspace_path
 
     assert prepared.kind == WorkspaceKind.local_copy
@@ -92,7 +92,7 @@ def test_inner_repositories_become_worktrees_inside_the_folder_copy(tmp_path: Pa
 
 def test_changes_in_repositories_and_loose_files_review_and_apply_back(tmp_path: Path, folder: Path) -> None:
     manager = WorkspaceManager(tmp_path / "coding")
-    workspace = manager.prepare("task", str(folder), allow_direct_folder=True).workspace_path
+    workspace = manager.prepare("task", str(folder), allow_folder_copy=True).workspace_path
     (workspace / "services" / "api" / "server.py").write_text("serve(port=8080)\n", encoding="utf-8")
     (workspace / "plan.md").write_text("plan v2\n", encoding="utf-8")
 
@@ -113,8 +113,8 @@ def test_cleanup_forgets_only_its_own_worktrees(tmp_path: Path, folder: Path) ->
     stale = tmp_path / "someone-elses-worktree"
     git(folder / "app", "worktree", "add", "--detach", str(stale))
     subprocess.run(["rm", "-rf", str(stale)], check=True)
-    first = manager.prepare("first", str(folder), allow_direct_folder=True).workspace_path
-    second = manager.prepare("second", str(folder), allow_direct_folder=True).workspace_path
+    first = manager.prepare("first", str(folder), allow_folder_copy=True).workspace_path
+    second = manager.prepare("second", str(folder), allow_folder_copy=True).workspace_path
     assert len(worktrees(folder / "app")) == 4
 
     manager.cleanup("first", str(folder), str(first), WorkspaceKind.local_copy, None)
@@ -126,7 +126,7 @@ def test_cleanup_forgets_only_its_own_worktrees(tmp_path: Path, folder: Path) ->
 
 def test_a_fork_gets_its_own_worktrees_and_inherits_the_parent_changes(tmp_path: Path, folder: Path) -> None:
     manager = WorkspaceManager(tmp_path / "coding")
-    parent = manager.prepare("parent", str(folder), allow_direct_folder=True).workspace_path
+    parent = manager.prepare("parent", str(folder), allow_folder_copy=True).workspace_path
     (parent / "services" / "api" / "server.py").write_text("forked()\n", encoding="utf-8")
 
     child = manager.fork("child", str(folder), str(parent), WorkspaceKind.local_copy, None).workspace_path
@@ -148,7 +148,7 @@ def test_a_repository_whose_changes_cannot_be_carried_is_copied_instead(
     monkeypatch.setattr(source_changes, "copy_source_changes", refuse)
     manager = WorkspaceManager(tmp_path / "coding")
 
-    workspace = manager.prepare("task", str(folder), allow_direct_folder=True).workspace_path
+    workspace = manager.prepare("task", str(folder), allow_folder_copy=True).workspace_path
 
     assert (workspace / "app" / ".git").is_dir()
     assert (workspace / "app" / "src" / "main.py").read_text(encoding="utf-8") == "print('dirty')\n"
@@ -166,7 +166,7 @@ def test_without_git_a_repository_folder_is_copied_as_before(
 
     monkeypatch.setattr(manager.git, "run", no_git)
 
-    workspace = manager.prepare("task", str(folder), allow_direct_folder=True).workspace_path
+    workspace = manager.prepare("task", str(folder), allow_folder_copy=True).workspace_path
 
     assert (workspace / "app" / ".git").is_dir()
     assert (workspace / "node_modules").is_dir()
@@ -179,7 +179,7 @@ def test_a_folder_task_shows_which_dependency_folders_it_left_out(tmp_path: Path
 
     service = service_with(tmp_path, FakeEngine())
     created = service.create_session(
-        SessionCreateRequest(path=str(folder), prompt="Go", allow_direct_folder=True), CREDS, "fake", "fake-model",
+        SessionCreateRequest(path=str(folder), prompt="Go", allow_folder_copy=True), CREDS, "fake", "fake-model",
     )
     session = wait_for_status(service, created.id, SessionStatus.completed)
 
@@ -204,7 +204,7 @@ def test_what_an_interrupted_preparation_left_is_removed_and_only_its_worktrees_
 
     monkeypatch.setattr(manager, "_baseline_from", stop)
     with pytest.raises(_AppStopped):
-        manager.prepare("task", str(folder), allow_direct_folder=True)
+        manager.prepare("task", str(folder), allow_folder_copy=True)
     left = manager.worktrees_root / "task"
     assert (left / "app" / ".git").is_file()
     assert len(worktrees(folder / "app")) == 3
@@ -238,7 +238,7 @@ def test_a_task_whose_preparation_the_app_abandoned_is_cleaned_up_on_restart(
 
     monkeypatch.setattr(first.workspaces, "_baseline_from", stuck)
     created = first.create_session(
-        SessionCreateRequest(path=str(folder), prompt="Go", allow_direct_folder=True), CREDS, "fake", "fake-model",
+        SessionCreateRequest(path=str(folder), prompt="Go", allow_folder_copy=True), CREDS, "fake", "fake-model",
     )
     assert built.wait(timeout=10)
     assert len(worktrees(folder / "app")) == 2
@@ -260,7 +260,7 @@ def test_a_task_whose_preparation_the_app_abandoned_is_cleaned_up_on_restart(
 def test_an_unrecorded_worktree_task_is_removed_and_forgotten(tmp_path: Path, folder: Path) -> None:
     manager = WorkspaceManager(tmp_path / "coding")
     repo = folder / "app"
-    prepared = manager.prepare("task", str(repo), allow_direct_folder=False)
+    prepared = manager.prepare("task", str(repo), allow_folder_copy=False)
     assert prepared.kind == WorkspaceKind.git_worktree
     assert len(worktrees(repo)) == 2
 
