@@ -327,6 +327,7 @@ class ScheduleRunService:
     def reap_orphaned_runs(
         self,
         error: str = "Run orphaned by a server restart before it completed.",
+        started_before: datetime | None = None,
     ) -> int:
         """Mark every run still in ``running`` as ``failed``.
 
@@ -335,10 +336,15 @@ class ScheduleRunService:
         with a running run, a single stale row wedges that schedule
         permanently. Called once on boot to release those runs. Returns the
         number of runs reaped.
+
+        ``started_before`` limits it to runs that began before then. Where
+        other processes share the database, a run newer than that may still
+        be live on one of them.
         """
-        runs = self.session.exec(
-            self.session.select(ScheduleRun).where(ScheduleRun.status == RunStatus.running)
-        ).all()
+        query = self.session.select(ScheduleRun).where(ScheduleRun.status == RunStatus.running)
+        if started_before is not None:
+            query = query.where(ScheduleRun.started_at < started_before)
+        runs = self.session.exec(query).all()
         now = datetime.now(timezone.utc)
         for run in runs:
             started_at = (

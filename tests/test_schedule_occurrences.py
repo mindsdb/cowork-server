@@ -780,3 +780,34 @@ def test_running_a_recurring_schedule_now_keeps_its_slot(tmp_path):
         schedule = session.get(Schedule, schedule_id)
         assert schedule.enabled is True
         assert schedule.next_run_at.replace(tzinfo=timezone.utc) == slot
+# --- Boot reaping by tenancy mode ---------------------------------------------
+
+
+def test_boot_reaps_everything_on_the_desktop_but_only_stale_runs_in_org_mode(tmp_path):
+    """On the desktop the starting server is the only process. In org mode
+    another replica may still be running a recent run, so only runs older
+    than a lease are reaped; the lease covers the rest."""
+    from cowork.scheduler import _LEASE_SECONDS, boot_reap_cutoff
+
+    now = datetime.now(timezone.utc)
+    assert boot_reap_cutoff(False, now) is None
+    assert boot_reap_cutoff(True, now) == now - timedelta(seconds=_LEASE_SECONDS)
+
+    engine = _engine(tmp_path)
+    schedule_id = _schedule(engine)
+    with Session(engine) as session:
+        runs = ScheduleRunService(_scoped(session))
+        stale = runs.create_run(schedule_id)
+        stale.started_at = now - timedelta(seconds=_LEASE_SECONDS + 60)
+        session.add(stale)
+        session.commit()
+        live_id = runs.create_run(schedule_id).id
+        stale_id = stale.id
+
+    with Session(engine) as session:
+        assert ScheduleRunService(_scoped(session)).reap_orphaned_runs(
+            started_before=boot_reap_cutoff(True, now)
+        ) == 1
+    with Session(engine) as session:
+        assert session.get(ScheduleRun, stale_id).status == RunStatus.failed
+        assert session.get(ScheduleRun, live_id).status == RunStatus.running

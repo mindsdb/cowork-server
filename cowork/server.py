@@ -193,11 +193,14 @@ async def lifespan(app: FastAPI):
     try:
         from cowork.db.scoped import ScopedSession, SYSTEM_SCOPE
         from cowork.db.session import get_open_session
+        from cowork.scheduler import boot_reap_cutoff
         from cowork.services.schedules import ScheduleRunService
 
         recovery_session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
         try:
-            reaped = ScheduleRunService(recovery_session).reap_orphaned_runs()
+            reaped = ScheduleRunService(recovery_session).reap_orphaned_runs(
+                started_before=boot_reap_cutoff(get_app_settings().tenancy_mode == "org"),
+            )
             if reaped:
                 logger.warning(f"Reaped {reaped} orphaned scheduled run(s) on boot")
         finally:
