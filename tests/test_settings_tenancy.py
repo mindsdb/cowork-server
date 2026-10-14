@@ -306,3 +306,127 @@ def test_check_constraint_rejects_bad_row_shapes(engine):
             s.add(bad)
             with pytest.raises(IntegrityError):
                 s.commit()
+
+
+# personal partitions (local tenancy with trusted identity headers)
+
+PARTITION_A = "44e92829-e701-599b-88f9-69f5bf1165eb"
+PARTITION_B = "55e92829-e701-599b-88f9-69f5bf1165eb"
+
+
+def _person(partition: str | None, user: str | None, *, resources=None) -> TenantScope:
+    from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
+
+    return TenantScope(
+        personal=True,
+        org_id=partition,
+        user_id=user,
+        personal_resources=ALL_PERSONAL_RESOURCES if resources is None else resources,
+    )
+
+
+def select_settings():
+    from sqlmodel import select
+
+    return select(Setting)
+
+
+def test_operator_pinned_keys_are_the_model_endpoint_memory_and_cost():
+    from cowork.common.settings.user_settings import setting_is_operator_pinned
+
+    for key in (
+        "memory_enabled", "memory_mode", "episodic_memory",
+        "planning_provider", "planning_model", "coding_model", "router_model",
+        "coding_reasoning_effort", "model_mode", "model_overrides", "providers_json",
+        "minds_url", "openai_base_url", "publish_url",
+        "max_tool_rounds", "max_continuations", "max_turn_tokens",
+    ):
+        assert setting_is_operator_pinned(key) is True, key
+    for key in UserSettings.model_fields:
+        if UserSettings.field_is_sensitive(key):
+            assert setting_is_operator_pinned(key) is True, key
+    for key in ("tone", "greeting", "favicon", "harness", "artifact_autopublish_enabled", "hub_workspace_id"):
+        assert setting_is_operator_pinned(key) is False, key
+
+
+def test_personal_keys_are_per_person(engine):
+    alice = _person(PARTITION_A, "alice")
+    bob = _person(PARTITION_B, "bob")
+    _svc(engine, alice).upsert_setting("tone", "spicy")
+    _svc(engine, alice).upsert_setting("harness", "anton")
+
+    assert _svc(engine, alice).get_setting("tone").value == "spicy"
+    assert _svc(engine, bob).get_setting("tone").value == "balanced"
+    assert _svc(engine, LOCAL_SCOPE).get_setting("tone").value == "balanced"
+    with Session(engine) as s:
+        rows = {(r.key, r.scope, r.org_id, r.user_id) for r in s.exec(select_settings()).all()}
+    assert ("tone", "user", PARTITION_A, "alice") in rows
+    # An org key the proxy allows goes per person too: the partition is the org.
+    assert ("harness", "org", PARTITION_A, None) in rows
+
+
+def test_pinned_key_ignores_a_persons_own_row(engine, monkeypatch):
+    # A stray row in a person's partition (the agent's code can write the
+    # database) must not turn memory off for that person.
+    monkeypatch.setenv("MEMORY_MODE", "autopilot")
+    alice = _person(PARTITION_A, "alice")
+    with Session(engine) as s:
+        s.add(Setting(key="memory_mode", value="off", scope="user", org_id=PARTITION_A, user_id="alice"))
+        s.add(Setting(key="max_tool_rounds", value="7", scope="org", org_id=PARTITION_A))
+        s.commit()
+
+    # No global row: the environment decides.
+    assert _svc(engine, alice).get_setting("memory_mode").is_set is False
+    assert _svc(engine, alice).load().memory_mode == "autopilot"
+    assert _svc(engine, alice).load().max_tool_rounds != 7
+
+    # A global row beats the environment, for every person.
+    _svc(engine, LOCAL_SCOPE).upsert_setting("memory_mode", "copilot")
+    assert _svc(engine, alice).load().memory_mode == "copilot"
+    assert _svc(engine, alice).get_setting("memory_mode").value == "copilot"
+    listed = {item.key: item.value for item in _svc(engine, alice).list_settings()}
+    assert listed["memory_mode"] == "copilot"
+
+
+def test_pinned_key_write_in_a_partition_lands_on_the_global_row(engine):
+    alice = _person(PARTITION_A, "alice")
+    bob = _person(PARTITION_B, "bob")
+    _svc(engine, alice).upsert_setting("max_turn_tokens", "2000000")
+
+    with Session(engine) as s:
+        rows = [r for r in s.exec(select_settings()).all() if r.key == "max_turn_tokens"]
+    assert [(r.scope, r.org_id, r.user_id) for r in rows] == [(None, None, None)]
+    assert _svc(engine, bob).get_setting("max_turn_tokens").value == "2000000"
+    assert _svc(engine, LOCAL_SCOPE).get_setting("max_turn_tokens").value == "2000000"
+    # Deleting it from a partition removes the deployment row, the only one.
+    assert _svc(engine, bob).delete_setting("max_turn_tokens") is True
+    assert _svc(engine, LOCAL_SCOPE).get_setting("max_turn_tokens").is_set is False
+
+
+def test_personal_scope_with_shared_settings_keeps_todays_global_rows(engine):
+    alice = _person(PARTITION_A, "alice", resources=frozenset())
+    bob = _person(PARTITION_B, "bob", resources=frozenset())
+    _svc(engine, alice).upsert_setting("tone", "spicy")
+    assert _svc(engine, bob).get_setting("tone").value == "spicy"
+    with Session(engine) as s:
+        rows = [(r.scope, r.org_id, r.user_id) for r in s.exec(select_settings()).all()]
+    assert rows == [(None, None, None)]
+
+
+def test_personal_partition_without_an_id_fails_closed_on_write(engine):
+    from cowork.db.scoped import MissingTenantScopeError
+
+    with pytest.raises(MissingTenantScopeError):
+        _svc(engine, _person(None, "alice")).upsert_setting("tone", "spicy")
+
+
+def test_org_mode_still_keys_pinned_keys_by_org_and_user(engine):
+    # Hosted regression: the pinned marker changes nothing in org mode.
+    _svc(engine, _org(ORG_A, "alice")).upsert_setting("max_tool_rounds", "40")
+    _svc(engine, _org(ORG_A, "alice")).upsert_setting("memory_mode", "copilot")
+    with Session(engine) as s:
+        rows = {(r.key, r.scope, r.org_id, r.user_id) for r in s.exec(select_settings()).all()}
+    assert ("max_tool_rounds", "org", ORG_A, None) in rows
+    assert ("memory_mode", "user", ORG_A, "alice") in rows
+    assert _svc(engine, _org(ORG_A, "alice")).get_setting("memory_mode").value == "copilot"
+    assert _svc(engine, _org(ORG_A, "bob")).get_setting("memory_mode").value == "autopilot"
