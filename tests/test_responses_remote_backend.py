@@ -759,6 +759,20 @@ def test_memory_on_still_writes(monkeypatch, memory_write_fakes, mode):
     assert memory_write_fakes.written == [entries]
 
 
+def test_a_failed_settings_read_writes_nothing(monkeypatch, memory_write_fakes):
+    """Fail closed: with the settings unknown, a user who turned memory off must
+    not get a write, and the turn itself must not fail over it."""
+    def raising(scope=None):
+        raise RuntimeError("settings store down")
+
+    monkeypatch.setattr(responses_mod, "get_user_settings", raising)
+    entries = [{"text": "remember", "kind": "always", "scope": "project"}]
+
+    ResponsesHandler._persist_turn_memory(memory_write_fakes.session, uuid4(), entries, object())
+
+    assert memory_write_fakes.written == []
+
+
 def _units_on_the_test_database(monkeypatch, *, scope=None):
     """The real units, each in a worker thread on the test database, for a
     test that needs a unit to block or a cancel to wait for one. They run in
