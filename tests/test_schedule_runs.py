@@ -564,7 +564,7 @@ def test_execute_schedule_disables_corrupt_org_row_instead_of_looping(monkeypatc
 # only truthful signal — without it a cancelled or failed run is recorded as
 # success.
 
-def test_turn_terminal_reason_reads_the_terminal_record(tmp_path, monkeypatch):
+def test_turn_evidence_reads_the_terminal_record(tmp_path, monkeypatch):
     import asyncio
     from types import SimpleNamespace
 
@@ -582,10 +582,13 @@ def test_turn_terminal_reason_reads_the_terminal_record(tmp_path, monkeypatch):
         scheduler_mod, "registry",
         SimpleNamespace(get=lambda cid: SimpleNamespace(buffer=buf)),
     )
-    assert asyncio.run(scheduler_mod._turn_terminal_reason("c1")) == "cancelled"
+    evidence = asyncio.run(scheduler_mod._turn_evidence("c1"))
+    assert evidence.reason == "cancelled"
+    # Nothing but the turn's start was written before it ended.
+    assert evidence.acted is False
 
 
-def test_turn_terminal_reason_with_real_registry_cancel(tmp_path):
+def test_turn_evidence_with_real_registry_cancel(tmp_path):
     """End-to-end through the real registry: cancel a producer that swallows
     its CancelledError the way handlers/responses._produce does. The task
     ends NOT-cancelled — which is exactly why task state can't be the
@@ -624,19 +627,21 @@ def test_turn_terminal_reason_with_real_registry_cancel(tmp_path):
         await registry.cancel(conversation_id)
         assert handle.task.done()
         assert handle.task.cancelled() is False  # the swallowed cancel
-        return await scheduler_mod._turn_terminal_reason(conversation_id)
+        return (await scheduler_mod._turn_evidence(conversation_id)).reason
 
     assert asyncio.run(main()) == "cancelled"
 
 
-def test_turn_terminal_reason_none_without_handle(monkeypatch):
+def test_turn_evidence_unknown_without_handle(monkeypatch):
     import asyncio
     from types import SimpleNamespace
 
     import cowork.scheduler as scheduler_mod
 
     monkeypatch.setattr(scheduler_mod, "registry", SimpleNamespace(get=lambda cid: None))
-    assert asyncio.run(scheduler_mod._turn_terminal_reason("c1")) is None
+    evidence = asyncio.run(scheduler_mod._turn_evidence("c1"))
+    # Nothing is known, so nothing is assumed: it may have acted.
+    assert (evidence.reason, evidence.acted) == (None, True)
 
 
 def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
@@ -664,10 +669,10 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
 
     monkeypatch.setattr(responses_mod, "ResponsesHandler", FakeHandler)
 
-    async def _terminal(_conversation_id):
-        return reason
+    async def _evidence(_conversation_id):
+        return scheduler_mod._TurnEvidence(reason=reason, acted=True)
 
-    monkeypatch.setattr(scheduler_mod, "_turn_terminal_reason", _terminal)
+    monkeypatch.setattr(scheduler_mod, "_turn_evidence", _evidence)
 
     session = get_open_session()
     schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
@@ -759,7 +764,7 @@ def test_a_database_error_in_a_runs_last_writes_logs_its_schedule_and_conversati
     def connection_lost(session, **kwargs):
         raise OperationalError("UPDATE schedule_runs SET private_statement_marker", {}, Exception(driver_text))
 
-    monkeypatch.setattr(scheduler_mod, "_record_turn_outcome", connection_lost)
+    monkeypatch.setattr(scheduler_mod, "_record_attempt_end", connection_lost)
     monkeypatch.setattr(scheduler_mod, "_finish_run", connection_lost)
     logged = owned_logger(scheduler_mod.logger.name)
 
@@ -777,7 +782,7 @@ def test_a_database_error_in_a_runs_last_writes_logs_its_schedule_and_conversati
         assert (record.schedule_id, record.conversation_id) == (str(schedule_id), str(conversation_id))
         assert record.exc_info is None
         assert driver_text not in repr(record.__dict__)
-    # The run's failure is logged first, then the finish write's.
+    # The run's end is logged first, then the fallback finish write's.
     assert errors[0].lineno < errors[1].lineno
     lines = [line for line in logged.output().splitlines() if "Database operation failed" in line]
     assert len(lines) == 2
@@ -1016,7 +1021,8 @@ def test_a_poll_skips_a_slot_its_run_used_up_after_the_poll_read_it(tmp_path, mo
     this poll has read the schedule and before it asks whether a run is
     active. The poll then sees the slot as used: a Stopped daily run does not
     start again, and neither does a one-off whose claim disabled it."""
-    from cowork.scheduler import _claim_slot, _finish_run, _poll, _record_turn_outcome, _start_attempt
+    from cowork.scheduler import _AttemptEnd, _claim_slot, _poll, _record_attempt_end, _start_attempt
+    from cowork.schemas.schedules import AttemptOutcome
 
     engine = _file_engine(tmp_path)
     with Session(engine) as session:
@@ -1034,12 +1040,13 @@ def test_a_poll_skips_a_slot_its_run_used_up_after_the_poll_read_it(tmp_path, mo
                 scoped = ScopedSession(run_session, SYSTEM_SCOPE)
                 occurrence_id = _claim_slot(scoped, scoped.get(Schedule, schedule_id))
                 attempt = _start_attempt(scoped, occurrence_id=occurrence_id, is_manual=False)
-                outcome = _record_turn_outcome(
-                    scoped, schedule_id=schedule_id, reason=reason, conversation_id=None,
-                    occurrence_id=occurrence_id, attempt=attempt.number,
+                outcome = (
+                    AttemptOutcome.cancelled if reason == "cancelled" else AttemptOutcome.failed_during_execution
                 )
-                _finish_run(
-                    scoped, run_id=attempt.run_id, conversation_id=None, error=outcome.error, status=outcome.status,
+                _record_attempt_end(
+                    scoped, attempt=attempt, occurrence_id=occurrence_id,
+                    end=_AttemptEnd(outcome=outcome, error=None if reason == "cancelled" else "boom"),
+                    retry_delay=None, conversation_id=None,
                 )
         return has_active_run(self, asked_id)
 

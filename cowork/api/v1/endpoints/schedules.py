@@ -109,13 +109,25 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
-    from cowork.scheduler import claim_manual_run, run_occurrence
+    from cowork.scheduler import admission, claim_manual_run, run_occurrence
     from cowork.services.conversations import ConversationService
 
-    # Claim before creating anything: a schedule already running (or waiting
-    # to retry) refuses a second run rather than overlapping it.
-    occurrence_id = claim_manual_run(scoped, schedule.id)
+    # Counted with the cron runs: a run-now past the cap would start one more
+    # turn than this process runs at once.
+    if not admission.reserve():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Too many scheduled tasks are running right now. Run this one when one of them finishes.",
+        )
+    try:
+        # Claim before creating anything: a schedule already running (or
+        # waiting to retry) refuses a second run rather than overlapping it.
+        occurrence_id = claim_manual_run(scoped, schedule.id)
+    except BaseException:
+        admission.unreserve()
+        raise
     if occurrence_id is None:
+        admission.unreserve()
         retrying = ScheduleOccurrenceService(scoped).pending_retry_at(schedule.id) is not None
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -125,11 +137,16 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
                 else "This task is already running. Wait for it to finish, then run it again."
             ),
         )
-
-    conversation = ConversationService(scoped).create_conversation(
-        topic=schedule.title,
-        project_id=schedule.project_id,
-    )
+    admission.fill(occurrence_id)
+    try:
+        conversation = ConversationService(scoped).create_conversation(
+            topic=schedule.title,
+            project_id=schedule.project_id,
+        )
+    except BaseException:
+        # Nothing will run the claim; its lease lapses and the reaper settles it.
+        admission.release(occurrence_id)
+        raise
     # FastAPI closes this session only after the background run ends, which
     # can take minutes. Give the request's connection back before it starts.
     scoped.close()

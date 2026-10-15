@@ -106,6 +106,15 @@ class ScheduleOccurrence(BaseSQLModel, table=True):
         sa_type=sa.DateTime(timezone=True),  # type: ignore
         description="When a running attempt is presumed dead and may be reaped",
     )
+    lease_token: str | None = Field(
+        default=None,
+        max_length=36,
+        description=(
+            "Who holds the occurrence now. Every change of hands and every write by "
+            "a holder is conditional on it, so a holder that lost the occurrence "
+            "(reaped, or settled elsewhere) cannot overwrite the new holder's state"
+        ),
+    )
     settled_at: datetime | None = Field(
         default=None,
         sa_type=sa.DateTime(timezone=True),  # type: ignore
@@ -157,3 +166,20 @@ class ScheduleRun(BaseSQLModel, table=True):
         description="The occurrence this run is an attempt at; NULL on runs from before occurrences",
     )
     attempt: int | None = Field(default=None, description="1-based attempt number within the occurrence")
+    execution_started_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description=(
+            "When the attempt handed its turn to the agent. Written before the hand-off, "
+            "so a run without it is known not to have acted"
+        ),
+    )
+    stop_requested_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="When the scheduler asked the turn to stop (its duration bound)",
+    )
+    outcome: str | None = Field(
+        default=None,
+        description="How the attempt ended, by what is known of its execution (AttemptOutcome)",
+    )

@@ -34,12 +34,8 @@ from cowork.streaming.backend import get_backend
 from cowork.streaming.buffer import RedisStreamBuffer
 from cowork.streaming.turn_index import get_turn, list_turns
 from cowork.turnqueue.answers import RemoteAnswerResult, submit_remote_answer
-from cowork.turnqueue.redis_client import (
-    STALLED_CANCEL_REASON,
-    cancel_cause_key,
-    cancel_flag_key,
-    get_redis,
-)
+from cowork.streaming.stop import request_remote_cancel, stop_turn
+from cowork.turnqueue.redis_client import STALLED_CANCEL_REASON
 
 
 logger = setup_logging()
@@ -152,36 +148,6 @@ def _just_started(turn: dict) -> bool:
 # create a pod (up to two minutes), and get the first event out of it.
 TURN_START_GRACE_SECONDS = 180
 
-
-async def _request_cancel(correlation_id: str, *, stalled: bool = False) -> None:
-    """Ask whoever is running this turn to stop.
-
-    The controller checks this key while it streams. Writing it rather than
-    messaging a replica is what makes cancel work regardless of which replica
-    the request landed on.
-
-    The cause goes in the same transaction as the flag: a stall sets it, any
-    other cancel clears it. scratchpad-controller's ``_clear_cancel`` deletes
-    the flag right after it publishes the cancelled reply, so the replica that
-    owns the turn reads the cause, not the flag, when that reply arrives. One
-    transaction means the latest cancel decides: a failed write leaves no
-    stray cause behind, and a Stop after a stall saves as a Stop.
-    """
-    async with get_redis().pipeline(transaction=True) as pipe:
-        if stalled:
-            pipe.set(
-                cancel_cause_key(correlation_id), STALLED_CANCEL_REASON,
-                ex=CANCEL_FLAG_TTL_SECONDS,
-            )
-        else:
-            pipe.delete(cancel_cause_key(correlation_id))
-        pipe.set(cancel_flag_key(correlation_id), "1", ex=CANCEL_FLAG_TTL_SECONDS)
-        await pipe.execute()
-
-
-# Long enough for a controller mid-turn to notice, short enough that a stale
-# flag cannot cancel a later turn that reuses the id.
-CANCEL_FLAG_TTL_SECONDS = 300
 
 # no-store (not just no-cache): a chat stream can carry secrets the model
 # echoed (e.g. a raw API key embedded in generated scratchpad code), so it
@@ -341,21 +307,13 @@ async def cancel_response(req: CancelRequest, scope: TenantScopeDep):
     stalled = req.reason == STALLED_CANCEL_REASON
     handle = _authorized_handle(registry.get(req.conversation_id), scope)
     if handle is not None:
-        turn = await get_turn(req.conversation_id) if get_backend() == "redis" else None
-        if turn is not None:
-            await _request_cancel(turn["correlation_id"], stalled=stalled)
-        # Before the cancel, so the producer's CancelledError handler cannot
-        # miss it (see TurnLifecycle). Assigned, not only set: the latest
-        # cancel decides, so a Stop after a stall cancel that the turn
-        # swallowed (a running cell) saves as a Stop.
-        handle.lifecycle.stalled = stalled
-        cancelled = await handle.cancel()
+        cancelled = await stop_turn(handle, stalled=stalled)
         return {"cancelled": cancelled, "conversation_id": req.conversation_id}
 
     found = await _shared_turn(req.conversation_id, scope)
     if found is None or not found.in_flight:
         return JSONResponse(status_code=404, content={"status": "not_found"})
-    await _request_cancel(found.index["correlation_id"], stalled=stalled)
+    await request_remote_cancel(found.index["correlation_id"], stalled=stalled)
     return {"cancelled": True, "conversation_id": req.conversation_id}
 
 

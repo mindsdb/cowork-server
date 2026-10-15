@@ -17,9 +17,9 @@ from sqlmodel import Session, SQLModel, select
 from cowork.db.scoped import SYSTEM_SCOPE, ScopedSession
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule, ScheduleOccurrence, ScheduleRun
-from cowork.schemas.schedules import OccurrenceStatus, RunStatus
+from cowork.schemas.schedules import AttemptOutcome, OccurrenceStatus, RunStatus
 from cowork.services.projects import GENERAL_PROJECT_ID
-from cowork.services.schedules import ScheduleOccurrenceService, ScheduleRunService
+from cowork.services.schedules import ScheduleOccurrenceService, ScheduleRunService, Settlement
 
 DUE = datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc)
 
@@ -148,7 +148,7 @@ def test_one_attempt_starts_even_when_two_pollers_try(tmp_path):
         first = ScheduleOccurrenceService(_scoped(a)).start_attempt(occurrence_id, is_manual=False, lease_seconds=60)
         second = ScheduleOccurrenceService(_scoped(b)).start_attempt(occurrence_id, is_manual=False, lease_seconds=60)
 
-    assert first is not None and first.attempt == 1
+    assert first is not None and first.number == 1
     assert second is None
     assert [r.attempt for r in _runs(engine, schedule_id)] == [1]
 
@@ -157,12 +157,13 @@ def test_one_attempt_starts_even_when_two_pollers_try(tmp_path):
 
 
 def test_a_failed_attempt_waits_then_retries_until_its_attempts_are_spent(tmp_path):
-    from cowork.scheduler import _RETRY_DELAYS_SECONDS, _RunOutcome, _settle_occurrence
+    """Only a failure before execution is retried, and only as often as the
+    occurrence allows."""
+    from cowork.scheduler import _RETRY_DELAYS_SECONDS, _retry_delay
 
     engine = _engine(tmp_path)
     schedule_id = _schedule(engine)
     occurrence_id = _claim(engine, schedule_id, "slot:a")
-    failed = _RunOutcome(status=RunStatus.failed, error="boom")
 
     delays = []
     for attempt in (1, 2, 3):
@@ -174,12 +175,17 @@ def test_a_failed_attempt_waits_then_retries_until_its_attempts_are_spent(tmp_pa
             occurrence.next_attempt_at = datetime.now(timezone.utc)
             session.add(occurrence)
             session.commit()
-            run = occurrences.start_attempt(occurrence_id, is_manual=False, lease_seconds=60)
-            assert run is not None and run.attempt == attempt
+            started = occurrences.start_attempt(occurrence_id, is_manual=False, lease_seconds=60)
+            assert started is not None and started.number == attempt
             before = datetime.now(timezone.utc)
-            _settle_occurrence(scoped, occurrence_id=occurrence_id, attempt=attempt, outcome=failed, retryable=True)
+            settlement = occurrences.end_attempt(
+                occurrence_id, started.token, outcome=AttemptOutcome.failed_before_execution,
+                error="boom", retry_delay=_retry_delay(attempt),
+            )
             session.commit()
-            occurrence = occurrences.get(occurrence_id)
+            assert settlement == (Settlement.retry_scheduled if attempt < 3 else Settlement.settled)
+        with Session(engine) as session:
+            occurrence = session.get(ScheduleOccurrence, occurrence_id)
             if occurrence.next_attempt_at is not None:
                 delays.append((occurrence.next_attempt_at.replace(tzinfo=timezone.utc) - before).total_seconds())
 
@@ -191,31 +197,28 @@ def test_a_failed_attempt_waits_then_retries_until_its_attempts_are_spent(tmp_pa
 
 
 @pytest.mark.parametrize(
-    ("outcome_status", "retryable", "expected"),
+    ("outcome", "retry_delay", "expected"),
     [
-        (RunStatus.cancelled, True, OccurrenceStatus.cancelled),
-        (RunStatus.failed, False, OccurrenceStatus.failed),
-        (RunStatus.success, True, OccurrenceStatus.success),
+        (AttemptOutcome.cancelled, 60, OccurrenceStatus.cancelled),
+        (AttemptOutcome.failed_before_execution, None, OccurrenceStatus.failed),
+        (AttemptOutcome.failed_during_execution, 60, OccurrenceStatus.failed),
+        (AttemptOutcome.interrupted, 60, OccurrenceStatus.failed),
+        (AttemptOutcome.uncertain, 60, OccurrenceStatus.failed),
+        (AttemptOutcome.completed, 60, OccurrenceStatus.success),
     ],
 )
-def test_attempts_that_should_not_retry_settle_at_once(tmp_path, outcome_status, retryable, expected):
-    """A run the user stopped, or one that will fail the same way every time,
-    settles on its first attempt."""
-    from cowork.scheduler import _RunOutcome, _settle_occurrence
-
+def test_attempts_that_should_not_retry_settle_at_once(tmp_path, outcome, retry_delay, expected):
+    """A run the user stopped, one that may have acted, or one that will fail
+    the same way every time, settles on its first attempt."""
     engine = _engine(tmp_path)
     schedule_id = _schedule(engine)
     occurrence_id = _claim(engine, schedule_id, "slot:a")
     with Session(engine) as session:
-        scoped = _scoped(session)
-        ScheduleOccurrenceService(scoped).start_attempt(occurrence_id, is_manual=False, lease_seconds=60)
-        _settle_occurrence(
-            scoped,
-            occurrence_id=occurrence_id,
-            attempt=1,
-            outcome=_RunOutcome(status=outcome_status, error="x" if outcome_status == RunStatus.failed else None),
-            retryable=retryable,
-        )
+        occurrences = ScheduleOccurrenceService(_scoped(session))
+        started = occurrences.start_attempt(occurrence_id, is_manual=False, lease_seconds=60)
+        assert occurrences.end_attempt(
+            occurrence_id, started.token, outcome=outcome, error="x", retry_delay=retry_delay,
+        ) == Settlement.settled
         session.commit()
 
     [occurrence] = _occurrences(engine, schedule_id)
@@ -264,8 +267,11 @@ def test_the_poll_returns_a_retry_once_it_comes_due(tmp_path):
     occurrence_id = _claim(engine, schedule_id, "slot:a")
     with Session(engine) as session:
         occurrences = ScheduleOccurrenceService(_scoped(session))
-        occurrences.start_attempt(occurrence_id, is_manual=False, lease_seconds=60)
-        occurrences.fail_attempt(occurrence_id, error="boom", retry_delay=60)
+        started = occurrences.start_attempt(occurrence_id, is_manual=False, lease_seconds=60)
+        occurrences.end_attempt(
+            occurrence_id, started.token, outcome=AttemptOutcome.failed_before_execution,
+            error="boom", retry_delay=60,
+        )
         session.commit()
 
     with Session(engine) as session:
@@ -280,31 +286,42 @@ def test_the_poll_returns_a_retry_once_it_comes_due(tmp_path):
         assert _poll(_scoped(session)) == [occurrence_id]
 
 
-def test_the_poll_reaps_an_attempt_whose_lease_ran_out(tmp_path):
-    """The process running an attempt died: its run is recorded failed and
-    the occurrence waits for its next attempt instead of blocking the
-    schedule until a restart."""
+@pytest.mark.parametrize("executed", [False, True])
+def test_the_poll_reaps_an_attempt_whose_lease_ran_out(tmp_path, executed):
+    """The process running an attempt died. Its run is recorded failed
+    rather than blocking the schedule until a restart. An attempt that never
+    reached the agent is tried again; one that did may have acted, so its
+    occurrence settles without a replay."""
     from cowork.scheduler import _LEASE_EXPIRED_ERROR, _poll
 
     engine = _engine(tmp_path)
     schedule_id = _schedule(engine, next_run_at=datetime.now(timezone.utc) + timedelta(hours=1))
     occurrence_id = _claim(engine, schedule_id, "slot:a")
     with Session(engine) as session:
-        run = ScheduleOccurrenceService(_scoped(session)).start_attempt(
-            occurrence_id, is_manual=False, lease_seconds=-1
-        )
-        assert run is not None
+        occurrences = ScheduleOccurrenceService(_scoped(session))
+        started = occurrences.start_attempt(occurrence_id, is_manual=False, lease_seconds=60)
+        if executed:
+            assert occurrences.begin_execution(started, occurrence_id, lease_seconds=-1)
+        else:
+            occurrences.renew(occurrence_id, started.token, lease_seconds=-1)
 
     with Session(engine) as session:
         _poll(_scoped(session))
 
     [occurrence] = _occurrences(engine, schedule_id)
-    assert occurrence.status == OccurrenceStatus.active
-    assert occurrence.next_attempt_at is not None
     assert occurrence.lease_expires_at is None
+    if executed:
+        assert occurrence.status == OccurrenceStatus.failed
+        assert occurrence.next_attempt_at is None
+    else:
+        assert occurrence.status == OccurrenceStatus.active
+        assert occurrence.next_attempt_at is not None
     [reaped] = _runs(engine, schedule_id)
     assert reaped.status == RunStatus.failed
     assert reaped.error == _LEASE_EXPIRED_ERROR
+    assert reaped.outcome == (
+        AttemptOutcome.interrupted if executed else AttemptOutcome.failed_before_execution
+    )
 
 
 def test_the_poll_leaves_an_attempt_this_process_is_running(tmp_path, monkeypatch):
@@ -315,7 +332,8 @@ def test_the_poll_leaves_an_attempt_this_process_is_running(tmp_path, monkeypatc
     occurrence_id = _claim(engine, schedule_id, "slot:a")
     with Session(engine) as session:
         ScheduleOccurrenceService(_scoped(session)).start_attempt(occurrence_id, is_manual=False, lease_seconds=-1)
-    monkeypatch.setattr(scheduler, "_inflight", {occurrence_id})
+    monkeypatch.setattr(scheduler, "admission", scheduler._Admission(3))
+    scheduler.admission.admit(occurrence_id)
 
     with Session(engine) as session:
         scheduler._poll(_scoped(session))
@@ -362,13 +380,14 @@ def test_a_failing_cron_run_schedules_a_retry_and_a_later_attempt_succeeds(monke
 
             return _gen()
 
+    # The first turn fails without having acted, so it may be tried again.
     reasons = iter(["error", "completed"])
 
-    async def _terminal(_conversation_id):
-        return next(reasons)
+    async def _evidence(_conversation_id):
+        return scheduler_mod._TurnEvidence(reason=next(reasons), acted=False)
 
     monkeypatch.setattr(responses_mod, "ResponsesHandler", FakeHandler)
-    monkeypatch.setattr(scheduler_mod, "_turn_terminal_reason", _terminal)
+    monkeypatch.setattr(scheduler_mod, "_turn_evidence", _evidence)
 
     session = get_open_session()
     schedule_id = ScheduleService(_scoped(session)).create_schedule(
@@ -438,11 +457,14 @@ def test_a_schedule_waiting_to_retry_reports_when(tmp_path):
         scoped = _scoped(session)
         assert _serialize(session.get(Schedule, schedule_id), scoped)["retryAt"] is None
         occurrences = ScheduleOccurrenceService(scoped)
-        run = occurrences.start_attempt(occurrence_id, is_manual=False, lease_seconds=60)
+        started = occurrences.start_attempt(occurrence_id, is_manual=False, lease_seconds=60)
         assert _serialize(session.get(Schedule, schedule_id), scoped)["retryAt"] is None
-        occurrences.fail_attempt(occurrence_id, error="boom", retry_delay=60)
+        occurrences.end_attempt(
+            occurrence_id, started.token, outcome=AttemptOutcome.failed_before_execution,
+            error="boom", retry_delay=60,
+        )
         session.commit()
-        ScheduleRunService(scoped).finish_run(run.id, error="boom")
+        ScheduleRunService(scoped).finish_run(started.run_id, error="boom")
 
         data = _serialize(session.get(Schedule, schedule_id), scoped)
 
@@ -461,8 +483,11 @@ async def test_run_now_says_so_when_the_schedule_is_waiting_to_retry():
         scoped = _scoped(session)
         occurrence_id = _claim_slot(scoped, session.get(Schedule, schedule_id))
         occurrences = ScheduleOccurrenceService(scoped)
-        occurrences.start_attempt(occurrence_id, is_manual=False, lease_seconds=60)
-        occurrences.fail_attempt(occurrence_id, error="boom", retry_delay=60)
+        started = occurrences.start_attempt(occurrence_id, is_manual=False, lease_seconds=60)
+        occurrences.end_attempt(
+            occurrence_id, started.token, outcome=AttemptOutcome.failed_before_execution,
+            error="boom", retry_delay=60,
+        )
         session.commit()
         # The attempt's run would be finished by the executor; settle it here.
         for run in session.exec(select(ScheduleRun).where(ScheduleRun.occurrence_id == occurrence_id)).all():
@@ -481,10 +506,11 @@ async def test_run_now_says_so_when_the_schedule_is_waiting_to_retry():
 # --- Boot reaping by tenancy mode ---------------------------------------------
 
 
-def test_boot_reaps_everything_on_the_desktop_but_only_stale_runs_in_org_mode(tmp_path):
+def test_boot_reaps_everything_on_the_desktop_but_only_stale_legacy_runs_in_org_mode(tmp_path):
     """On the desktop the starting server is the only process. In org mode
-    another replica may still be running a recent run, so only runs older
-    than a lease are reaped; the lease covers the rest."""
+    another replica may still be running a run: only a run from before
+    occurrences that is older than a lease is reaped. An occurrence's run is
+    live for as long as its lease is renewed, so the lease reaper owns it."""
     from cowork.scheduler import _LEASE_SECONDS, boot_reap_cutoff
 
     now = datetime.now(timezone.utc)
@@ -493,6 +519,7 @@ def test_boot_reaps_everything_on_the_desktop_but_only_stale_runs_in_org_mode(tm
 
     engine = _engine(tmp_path)
     schedule_id = _schedule(engine)
+    occurrence_id = _claim(engine, schedule_id, "slot:a")
     with Session(engine) as session:
         runs = ScheduleRunService(_scoped(session))
         stale = runs.create_run(schedule_id)
@@ -501,6 +528,13 @@ def test_boot_reaps_everything_on_the_desktop_but_only_stale_runs_in_org_mode(tm
         session.commit()
         live_id = runs.create_run(schedule_id).id
         stale_id = stale.id
+        held = ScheduleOccurrenceService(_scoped(session)).start_attempt(
+            occurrence_id, is_manual=False, lease_seconds=60
+        )
+        old_attempt = session.get(ScheduleRun, held.run_id)
+        old_attempt.started_at = now - timedelta(days=1)
+        session.add(old_attempt)
+        session.commit()
 
     with Session(engine) as session:
         assert ScheduleRunService(_scoped(session)).reap_orphaned_runs(
@@ -509,3 +543,5 @@ def test_boot_reaps_everything_on_the_desktop_but_only_stale_runs_in_org_mode(tm
     with Session(engine) as session:
         assert session.get(ScheduleRun, stale_id).status == RunStatus.failed
         assert session.get(ScheduleRun, live_id).status == RunStatus.running
+        assert session.get(ScheduleRun, held.run_id).status == RunStatus.running
+        assert session.get(ScheduleOccurrence, occurrence_id).status == OccurrenceStatus.active
