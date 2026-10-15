@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -470,6 +471,31 @@ def _count_settlement(session: ScopedSession, occurrence_id: UUID) -> None:
     session.add(schedule)
 
 
+_GENERIC_RUN_FAILURE = "Run did not complete — open the run's task for details."
+
+# Failure codes a later attempt would hit again unchanged: the model or the
+# account has to change first. Any other code, or none, is worth a retry.
+_PERMANENT_FAILURE_CODES = frozenset({
+    "model_not_found",
+    "model_access_denied",
+    "model_disabled",
+    "model_restricted",
+    "provider_auth",
+    "included_allowance_exhausted",
+    "image_format",
+    "content_too_large",
+    "token_limit",
+})
+
+
+@dataclass(frozen=True)
+class _TurnFailure:
+    """What the turn's own failure frame said: user-facing text and its code."""
+
+    message: str | None = None
+    code: str | None = None
+
+
 def _record_turn_outcome(
     session: ScopedSession,
     *,
@@ -478,6 +504,7 @@ def _record_turn_outcome(
     conversation_id: UUID | None,
     occurrence_id: UUID | None = None,
     attempt: int = 1,
+    failure: _TurnFailure | None = None,
 ) -> _RunOutcome:
     schedule_service = ScheduleService(session)
     run_service = ScheduleRunService(session)
@@ -490,13 +517,14 @@ def _record_turn_outcome(
     elif reason is not None and reason != "completed":
         outcome = _RunOutcome(
             status=RunStatus.failed,
-            error="Run did not complete — open the run's task for details.",
+            error=(failure.message if failure and failure.message else _GENERIC_RUN_FAILURE),
         )
         schedule.last_error = outcome.error
         session.add(schedule)
     else:
         _apply_success_write_back(schedule, run_service, conversation_id, session)
-    _settle_occurrence(session, occurrence_id=occurrence_id, attempt=attempt, outcome=outcome, retryable=True)
+    retryable = not (failure and failure.code in _PERMANENT_FAILURE_CODES)
+    _settle_occurrence(session, occurrence_id=occurrence_id, attempt=attempt, outcome=outcome, retryable=retryable)
 
     try:
         session.commit()
@@ -509,7 +537,7 @@ def _record_turn_outcome(
         session.rollback()
         schedule = schedule_service.get_schedule(schedule_id)
         _apply_success_write_back(schedule, run_service, None, session)
-        _settle_occurrence(session, occurrence_id=occurrence_id, attempt=attempt, outcome=outcome, retryable=True)
+        _settle_occurrence(session, occurrence_id=occurrence_id, attempt=attempt, outcome=outcome, retryable=retryable)
         session.commit()
     return outcome
 
@@ -704,10 +732,12 @@ async def _run_attempt(
         # buffer's terminal record is the only truthful signal of how the
         # turn ended — without it every run is recorded as success.
         reason = await _turn_terminal_reason(str(conversation_id))
+        failure = await _turn_failure(str(conversation_id)) if reason not in (None, "completed", "cancelled") else None
         outcome = await _until_it_lands(
             partial(
                 _record_turn_outcome, schedule_id=schedule_id, reason=reason,
                 conversation_id=conversation_id, occurrence_id=occurrence_id, attempt=attempt.number,
+                failure=failure,
             ),
             schedule_id=schedule_id,
         )
@@ -751,6 +781,54 @@ async def _run_attempt(
                 "Failed to finish the run record",
                 extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
             )
+
+
+# How far back from the end of a failed turn's stream to look for its
+# response.failed frame; it is written just before the terminal record.
+_FAILURE_LOOKBACK_RECORDS = 20
+
+
+def _failure_from_record(data: dict) -> _TurnFailure | None:
+    """The response.failed payload in one SSE record, if it carries one."""
+    frame = data.get("sse") if isinstance(data, dict) else None
+    if not isinstance(frame, str) or "response.failed" not in frame:
+        return None
+    for line in frame.splitlines():
+        if not line.startswith("data:"):
+            continue
+        try:
+            payload = json.loads(line[len("data:"):].strip())
+        except ValueError:
+            continue
+        if isinstance(payload, dict) and payload.get("type") == "response.failed":
+            message = payload.get("error")
+            code = payload.get("code")
+            return _TurnFailure(
+                message=message if isinstance(message, str) and message.strip() else None,
+                code=code if isinstance(code, str) else None,
+            )
+    return None
+
+
+async def _turn_failure(conversation_id: str) -> _TurnFailure | None:
+    """What a failed turn told the user, read from the last response.failed
+    frame in its closed stream, or None when there is none to read. The text
+    is the same user-safe message the chat shows."""
+    handle = registry.get(conversation_id)
+    if handle is None or not handle.buffer.is_closed:
+        return None
+    found: _TurnFailure | None = None
+    try:
+        buffer = handle.buffer
+        async for rec in buffer.tail(max(buffer.latest_seq - _FAILURE_LOOKBACK_RECORDS, 0)):
+            failure = _failure_from_record(rec.data)
+            if failure is not None:
+                found = failure
+            if rec.is_terminal:
+                break
+    except Exception:
+        logger.exception(f"Could not read the failure for conversation {conversation_id}")
+    return found
 
 
 async def _turn_terminal_reason(conversation_id: str) -> str | None:
