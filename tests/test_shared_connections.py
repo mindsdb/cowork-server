@@ -26,6 +26,7 @@ import os
 from pathlib import Path
 
 from types import SimpleNamespace
+from typing import NamedTuple
 
 import pytest
 from anton.core.datasources.data_vault import LocalDataVault
@@ -372,12 +373,16 @@ async def test_alice_changes_her_shared_connection_and_bob_sees_each_change(shar
     assert [c.name for c in await connections_ep.list_connections(BOB, None)] == []
 
 
-async def _connect_in_chat(
-    turn, monkeypatch, *, known_variables: dict[str, str]
-) -> tuple[str, object]:
+class ConnectedInChat(NamedTuple):
+    # What the tool told the agent.
+    answer: str
+    # The vault the session holds once the tool returns.
+    session_vault: object
+
+
+async def _connect_in_chat(turn, monkeypatch, *, known_variables: dict[str, str]) -> ConnectedInChat:
     """Run the turn's own connect_new_datasource tool as the agent calls it
-    with credentials pasted in chat, its connection test passing. Returns
-    the tool's answer and the vault the session holds afterwards."""
+    with credentials pasted in chat, its connection test passing."""
 
     async def connection_test_passes(*_args, **_kwargs) -> bool:
         return True
@@ -394,7 +399,7 @@ async def _connect_in_chat(
         _active_datasource=None,
     )
     answer = await tool.handler(session, {"engine": "postgres", "known_variables": known_variables})
-    return answer, session._data_vault
+    return ConnectedInChat(answer=answer, session_vault=session._data_vault)
 
 
 BOBS_DB = {"host": "bob-db.example", "database": "postgres", "user": "bob", "password": "bobSecret123"}
@@ -410,8 +415,9 @@ async def test_bobs_pasted_connection_with_a_shared_ones_database_is_his_own(sha
     assert alices["fields"]["_user_label"] == "postgres"
 
     async with built_turn(monkeypatch=monkeypatch, tmp_path=stores, scope=BOB) as turn:
-        answer, held = await _connect_in_chat(turn, monkeypatch, known_variables=dict(BOBS_DB))
-        assert held is turn.config.data_vault
+        connected = await _connect_in_chat(turn, monkeypatch, known_variables=dict(BOBS_DB))
+        assert connected.session_vault is turn.config.data_vault
+    answer = connected.answer
 
     assert answer.startswith("Saved connection"), answer
     [bobs] = own_vault_for_scope(BOB).list_connections()
@@ -431,14 +437,15 @@ async def test_where_all_are_shared_a_pasted_connection_never_lands_on_someone_e
     alices = own_vault_for_scope(LOCAL_SCOPE).read_record("postgres", "erp")
 
     async with built_turn(monkeypatch=monkeypatch, tmp_path=stores, scope=BOB_SHARED) as turn:
-        answer, _held = await _connect_in_chat(turn, monkeypatch, known_variables=dict(BOBS_DB))
+        answer = (await _connect_in_chat(turn, monkeypatch, known_variables=dict(BOBS_DB))).answer
         assert answer.startswith("Saved connection"), answer
         [bobs] = [c["name"] for c in own_vault_for_scope(LOCAL_SCOPE).list_connections() if c["name"] != "erp"]
         assert _stored(LOCAL_SCOPE, bobs)[CREATED_BY_FIELD] == SUB_B
 
-        answer, _held = await _connect_in_chat(
+        connected = await _connect_in_chat(
             turn, monkeypatch, known_variables={**BOBS_DB, "password": "rotatedSecret1"}
         )
+    answer = connected.answer
 
     assert answer.startswith(f"Updated connection `postgres-{bobs}`"), answer
     assert _stored(LOCAL_SCOPE, bobs)["password"] == "rotatedSecret1"
