@@ -229,7 +229,7 @@ def test_policy_keeps_recent_tasks_and_releases_the_idle_rest(tmp_path: Path) ->
     age(service, old, 48)
     age(service, recent, 30)
 
-    released = service.retention.run_policy(RetentionPolicy(keep_count=1, min_idle=timedelta(hours=24)))
+    released = service.retention.run_policy(RetentionPolicy(enabled=True, keep_count=1, min_idle=timedelta(hours=24)))
 
     assert released == [old]
     assert service.get_session(old).workspace_released_at is not None
@@ -250,7 +250,7 @@ def test_policy_never_releases_pinned_recently_active_or_automated_tasks(tmp_pat
         touch_updated_at=False,
     )
 
-    assert service.retention.run_policy(RetentionPolicy(keep_count=0, min_idle=timedelta(hours=24))) == []
+    assert service.retention.run_policy(RetentionPolicy(enabled=True, keep_count=0, min_idle=timedelta(hours=24))) == []
 
 
 def test_archiving_releases_and_using_the_task_restores_its_changes(tmp_path: Path) -> None:
