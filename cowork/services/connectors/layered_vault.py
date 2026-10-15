@@ -26,6 +26,11 @@ SHARED_CONNECTION_REFUSAL = "This connection is shared with you and can't be cha
 # API's fields.
 CREATED_BY_FIELD = "_created_by"
 
+# The bookkeeping fields that name a connection, which anton de-duplicates a
+# new connection's label against (anton.utils.datasources
+# .ensure_unique_user_label).
+LABEL_FIELDS = frozenset({"_user_label", "_label"})
+
 
 class SharedConnectionError(PermissionError):
     """A save or a delete reached a connection the saver can't change.
@@ -211,3 +216,38 @@ class LayeredDataVault:
 
     def clear_ds_env(self) -> None:
         self._own.clear_ds_env()
+
+    def for_connecting(self) -> ConnectingDataVault:
+        """This vault as anton's connect_new_datasource matches a new
+        connection against it (ConnectingDataVault)."""
+        return ConnectingDataVault(
+            own=self._own,
+            managed=self._managed,
+            shared=self._shared,
+            shared_by_own=self._shared_by_own,
+            changer=self._changer,
+        )
+
+
+class ConnectingDataVault(LayeredDataVault):
+    """A LayeredDataVault whose entries the reader can't change load as their
+    labels alone.
+
+    anton's connect_new_datasource (anton.tools.handle_connect_datasource)
+    updates the saved connection whose identity fields match the new one's,
+    the engine's ``name_from``: the database alone for postgres, mysql, mssql
+    and mariadb. Matched to a connection someone shares with the reader, or
+    to someone else's where connections are shared, the save over it is
+    refused, and the reader's own connection is never saved. Loaded as its
+    labels alone, such an entry matches nothing, so the new connection is
+    saved as the reader's own, and its label is still de-duplicated against
+    every label the reader sees. Every other read is the LayeredDataVault's,
+    so the turn's DS_* scrubbing, which reads read_record and env_for, still
+    covers every entry.
+    """
+
+    def load(self, engine: str, name: str) -> dict[str, str] | None:
+        fields = super().load(engine, name)
+        if fields is None or self.can_change(engine, name):
+            return fields
+        return {key: value for key, value in fields.items() if key in LABEL_FIELDS}

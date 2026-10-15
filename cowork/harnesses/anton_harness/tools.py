@@ -13,9 +13,9 @@ makes sense for a server process: no console.print, no Live spinner,
 no webbrowser.open. Status flows back to the desktop UI through the
 normal SSE event stream and the response string the LLM renders.
 
-Right now we only override PUBLISH_TOOL — the only one users have hit.
-Add more here as needed (CONNECT_DATASOURCE_TOOL is the next likely
-candidate; same pattern).
+PUBLISH_TOOL is overridden here, and CONNECT_DATASOURCE_TOOL keeps anton's
+handler with a vault that matches only the asker's own connections. Add more
+here as needed; same pattern.
 """
 
 from __future__ import annotations
@@ -882,6 +882,48 @@ def build_cowork_label_connection_tool():
         # `connect-datasource` SKILL.md (see lookup_connector above).
         unlock_skill="connect-datasource",
     )
+
+
+#########################
+# Connect Datasource Tool
+#########################
+
+
+async def _cowork_connect_datasource(session: Any, tc_input: dict) -> str:
+    """Tool handler for `connect_new_datasource`: anton's own
+    (anton.tools.handle_connect_datasource), matched only against the
+    connections the asker can change.
+
+    anton's handler updates the saved connection whose identity fields match
+    the new one's. The turn's vault also lists connections the asker can't
+    change, so it runs against that vault's ConnectingDataVault, where those
+    match nothing and a new connection is saved as the asker's own.
+    """
+    from anton.tools import handle_connect_datasource
+
+    from cowork.services.connectors.layered_vault import LayeredDataVault
+
+    vault = session._data_vault
+    if not isinstance(vault, LayeredDataVault):
+        return await handle_connect_datasource(session, tc_input)
+    # anton's handler reads the vault off the session, and a session runs its
+    # tool calls one at a time, so the swap holds for this call alone.
+    session._data_vault = vault.for_connecting()
+    try:
+        return await handle_connect_datasource(session, tc_input)
+    finally:
+        session._data_vault = vault
+
+
+def build_cowork_connect_datasource_tool():
+    """anton's console-less connect_new_datasource, the one its ChatSession
+    swaps in where there is no console, as cowork's turns have none, with
+    _cowork_connect_datasource as its handler."""
+    import dataclasses
+
+    from anton.tools import CONNECT_DATASOURCE_TOOL_NO_CONSOLE
+
+    return dataclasses.replace(CONNECT_DATASOURCE_TOOL_NO_CONSOLE, handler=_cowork_connect_datasource)
 
 
 ##################

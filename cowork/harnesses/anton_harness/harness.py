@@ -1049,19 +1049,20 @@ class AntonHarness:
         # from anton.core.memory.episodes import EpisodicMemory
         from anton.core.session import ChatSessionConfig, SystemPromptContext
         # from anton.memory.history_store import HistoryStore
-        from anton.tools import CONNECT_DATASOURCE_TOOL
         from anton.workspace import Workspace
         # Cowork override — anton's stock PUBLISH_TOOL prints to a Rich
         # Console and pops a webbrowser, both of which die in the FastAPI
         # process. The wrapper exposes the same schema to the LLM but
         # routes through a server-aware handler.
         from .tools import (
+            build_cowork_connect_datasource_tool,
             build_cowork_publish_tool,
             build_cowork_lookup_connector_tool,
             build_cowork_label_connection_tool,
             build_cowork_request_credentials_tool,
             build_cowork_create_skill_draft_tool,
         )
+        CONNECT_DATASOURCE_TOOL = build_cowork_connect_datasource_tool()
         PUBLISH_TOOL = build_cowork_publish_tool()
         LOOKUP_CONNECTOR_TOOL = build_cowork_lookup_connector_tool()
         REQUEST_CREDENTIALS_TOOL = build_cowork_request_credentials_tool()

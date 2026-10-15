@@ -25,6 +25,8 @@ import logging
 import os
 from pathlib import Path
 
+from types import SimpleNamespace
+
 import pytest
 from anton.core.datasources.data_vault import LocalDataVault
 from anton.utils.datasources import build_datasource_context
@@ -367,6 +369,79 @@ async def test_alice_changes_her_shared_connection_and_bob_sees_each_change(shar
     assert ("postgres", "erp") not in _names(vault_for_scope(BOB))
     assert vault_for_scope(BOB).read_record("postgres", "erp") is None
     assert [c.name for c in await connections_ep.list_connections(BOB, None)] == []
+
+
+async def _connect_in_chat(
+    turn, monkeypatch, *, known_variables: dict[str, str]
+) -> tuple[str, object]:
+    """Run the turn's own connect_new_datasource tool as the agent calls it
+    with credentials pasted in chat, its connection test passing. Returns
+    the tool's answer and the vault the session holds afterwards."""
+
+    async def connection_test_passes(*_args, **_kwargs) -> bool:
+        return True
+
+    monkeypatch.setattr(
+        "anton.commands.datasource.verify.run_connection_test", connection_test_passes
+    )
+    [tool] = [tool for tool in turn.config.tools if tool.name == "connect_new_datasource"]
+    session = SimpleNamespace(
+        _data_vault=turn.config.data_vault,
+        _console=None,
+        _settings=SimpleNamespace(analytics_enabled=False),
+        _scratchpads=None,
+        _active_datasource=None,
+    )
+    answer = await tool.handler(session, {"engine": "postgres", "known_variables": known_variables})
+    return answer, session._data_vault
+
+
+BOBS_DB = {"host": "bob-db.example", "database": "postgres", "user": "bob", "password": "bobSecret123"}
+
+
+async def test_bobs_pasted_connection_with_a_shared_ones_database_is_his_own(sharing, monkeypatch, stores):
+    """anton matches a pasted connection to a saved one by its identity
+    fields, the database alone for postgres. One with the database of the
+    connection Alice shares is a new connection of Bob's own, not a change to
+    hers, and its label is de-duplicated against hers."""
+    assert ConnectionsService(ALICE).patch_token("postgres", "erp", {"database": "postgres"})
+    alices = own_vault_for_scope(ALICE).read_record("postgres", "erp")
+    assert alices["fields"]["_user_label"] == "postgres"
+
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=stores, scope=BOB) as turn:
+        answer, held = await _connect_in_chat(turn, monkeypatch, known_variables=dict(BOBS_DB))
+        assert held is turn.config.data_vault
+
+    assert answer.startswith("Saved connection"), answer
+    [bobs] = own_vault_for_scope(BOB).list_connections()
+    stored = _stored(BOB, bobs["name"])
+    assert (stored["host"], stored[CREATED_BY_FIELD]) == ("bob-db.example", SUB_B)
+    assert stored["_user_label"] == "postgres 2"
+    assert own_vault_for_scope(ALICE).read_record("postgres", "erp") == alices
+
+
+async def test_where_all_are_shared_a_pasted_connection_never_lands_on_someone_elses(
+    all_shared, monkeypatch, stores
+):
+    """Everyone's connections sit in one vault: Bob's paste with the database
+    of Alice's connection is a new one of his own, which he then updates in
+    place."""
+    persist_connection("postgres", None, "erp", {**ERP, "database": "postgres"}, scope=ALICE_SHARED)
+    alices = own_vault_for_scope(LOCAL_SCOPE).read_record("postgres", "erp")
+
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=stores, scope=BOB_SHARED) as turn:
+        answer, _held = await _connect_in_chat(turn, monkeypatch, known_variables=dict(BOBS_DB))
+        assert answer.startswith("Saved connection"), answer
+        [bobs] = [c["name"] for c in own_vault_for_scope(LOCAL_SCOPE).list_connections() if c["name"] != "erp"]
+        assert _stored(LOCAL_SCOPE, bobs)[CREATED_BY_FIELD] == SUB_B
+
+        answer, _held = await _connect_in_chat(
+            turn, monkeypatch, known_variables={**BOBS_DB, "password": "rotatedSecret1"}
+        )
+
+    assert answer.startswith(f"Updated connection `postgres-{bobs}`"), answer
+    assert _stored(LOCAL_SCOPE, bobs)["password"] == "rotatedSecret1"
+    assert own_vault_for_scope(LOCAL_SCOPE).read_record("postgres", "erp") == alices
 
 
 def test_only_registry_entries_of_existing_connections_are_read(sharing):
