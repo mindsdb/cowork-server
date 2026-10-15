@@ -14,6 +14,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import (
     TurnLimits,
     UserSettings,
+    default_turn_limits,
     effective_turn_limits,
     setting_is_org_scoped,
 )
@@ -201,3 +202,22 @@ def test_a_replica_that_loses_the_race_skips_that_scope(engine):
     session.exec = stale_exec  # type: ignore[method-assign]
     assert enable_limits_for_saved_budgets(session) is True
     assert _switch_rows(engine) == {("org", ORG_A, None, "True"), ("org", ORG_B, None, "True")}
+
+
+def test_the_settings_response_carries_the_safety_limits(engine, monkeypatch):
+    """Settings shows these, greyed out, while the switch is off: the values in
+    force, not the user's saved ones, which stay untouched."""
+    monkeypatch.setenv("COWORK_DEFAULT_MAX_TOOL_ROUNDS", "300")
+    get_app_settings.cache_clear()
+    svc = SettingService(Session(engine), LOCAL_SCOPE)
+    svc.upsert_setting("max_tool_rounds", "12")
+
+    rows = {r.key: r for r in svc.list_settings()}
+    assert rows["max_tool_rounds"].value == "12"
+    assert rows["max_tool_rounds"].default == "300"
+    assert rows["max_turn_tokens"].default == str(default_turn_limits().max_turn_tokens)
+    assert rows["max_continuations"].default == str(default_turn_limits().max_continuations)
+    # Only the budgets carry one.
+    assert rows["limits_enabled"].default is None
+    assert rows["greeting"].default is None
+    assert svc.get_setting("max_tool_rounds").default == "300"

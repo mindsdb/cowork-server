@@ -10,6 +10,8 @@ from sqlmodel import Session, select
 from cowork.common.encryption import decrypt, encrypt
 from cowork.common.settings.runtime_credential import get_minds_credential
 from cowork.common.settings.user_settings import (
+    BUDGET_SETTING_KEYS,
+    default_turn_limits,
     reject_unknown_harness,
     UserSettings,
     invalidate_user_settings_cache,
@@ -242,6 +244,7 @@ class SettingService:
             is_set=is_set,
             value=value,
             options=UserSettings.field_options(key),
+            default=str(getattr(default_turn_limits(), key)) if key in BUDGET_SETTING_KEYS else None,
         )
 
     def load(self) -> UserSettings:

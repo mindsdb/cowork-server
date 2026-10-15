@@ -1413,17 +1413,23 @@ class TurnLimits(NamedTuple):
     max_continuations: int
 
 
+def default_turn_limits() -> TurnLimits:
+    """The deployment defaults (``COWORK_DEFAULT_MAX_*``): the safety limits a
+    turn runs to while ``limits_enabled`` is off."""
+    app = get_app_settings()
+    return TurnLimits(app.default_max_turn_tokens, app.default_max_tool_rounds, app.default_max_continuations)
+
+
 def effective_turn_limits(settings: UserSettings) -> TurnLimits:
     """The budgets a turn runs with.
 
-    With ``limits_enabled`` off these are the deployment defaults
-    (``COWORK_DEFAULT_MAX_*``), and stored budget values are ignored, not
-    deleted. With it on, they are the resolved settings.
+    With ``limits_enabled`` off these are ``default_turn_limits()``, and stored
+    budget values are ignored, not deleted. With it on, they are the resolved
+    settings.
     """
     if settings.limits_enabled:
         return TurnLimits(settings.max_turn_tokens, settings.max_tool_rounds, settings.max_continuations)
-    app = get_app_settings()
-    return TurnLimits(app.default_max_turn_tokens, app.default_max_tool_rounds, app.default_max_continuations)
+    return default_turn_limits()
 
 
 _current_scope: ContextVar["TenantScope | None"] = ContextVar("settings_scope", default=None)
