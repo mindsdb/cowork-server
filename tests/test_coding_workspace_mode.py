@@ -134,7 +134,7 @@ def test_the_composer_learns_which_modes_a_new_task_can_use(tmp_path: Path, monk
     folder = service.workspace_mode_options(None, None)
     assert folder.supported == [WorkspaceMode.worktree, WorkspaceMode.in_place]
     assert folder.default == WorkspaceMode.worktree
-    assert service.workspace_mode_options(project.id, None).supported == [WorkspaceMode.worktree]
+    assert service.workspace_mode_options(project.id, None).supported == [WorkspaceMode.worktree, WorkspaceMode.in_place]
     assert service.workspace_mode_options(None, "another-computer").supported == [WorkspaceMode.worktree]
 
     monkeypatch.setattr("cowork.coding.workspace_mode._IN_PLACE_PLATFORMS", frozenset())
