@@ -32,7 +32,7 @@ from anton.core.tools.skill_format import SKILL_FILE
 from pydantic import BaseModel, ConfigDict
 
 from cowork.db.personal_resources import PersonalResource
-from cowork.managed import SharedSkill, SharedSkills, managed_folder
+from cowork.managed import SharedSkill, SharedSkills, managed_folder, readonly_skill_dirs
 from cowork.ops import (
     OperatorCommandError,
     Person,
@@ -48,6 +48,7 @@ from cowork.ops import (
 from cowork.services.projects import GENERAL_PROJECT
 from cowork.services.skills import (
     SkillService,
+    agent_skill_names,
     is_builtin_skill,
     linked_turn_skills,
     shared_turn_skills,
@@ -98,18 +99,6 @@ def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _readonly_skill_dirs(root: Path) -> list[Path]:
-    """The skill folders anton reads from one read-only root: every
-    directory holding a SKILL.md file."""
-    if not root.is_dir():
-        return []
-    return [
-        entry
-        for entry in sorted(root.iterdir())
-        if entry.is_dir() and (entry / SKILL_FILE).is_file()
-    ]
-
-
 def snapshot_skills(*, person: Person, project: str) -> SkillSnapshot:
     """The skills a turn of the person's in ``project`` hands anton.
 
@@ -133,10 +122,10 @@ def snapshot_skills(*, person: Person, project: str) -> SkillSnapshot:
         )
     managed = managed_folder()
     readonly: list[tuple[SkillSource, list[Path]]] = [
-        ("host", _readonly_skill_dirs(HOST_SKILLS_DIR)),
-        ("managed", [] if managed is None else _readonly_skill_dirs(managed.skills_dir)),
+        ("host", list(readonly_skill_dirs(HOST_SKILLS_DIR).values())),
+        ("managed", [] if managed is None else list(managed.skill_dirs().values())),
         ("shared", [skill.path for skill in shared_turn_skills(service=service, project_name=project)]),
-        ("anton", _readonly_skill_dirs(SkillStore().builtin_root)),
+        ("anton", list(readonly_skill_dirs(SkillStore().builtin_root).values())),
     ]
     for source, skill_dirs in readonly:
         for skill_dir in skill_dirs:
@@ -172,6 +161,11 @@ def share_skill(*, person: Person, slug: str, managed_dir: Path) -> RegistryChan
     if is_builtin_skill(slug):
         raise OperatorCommandError(
             f"{slug} is a packaged built-in skill, which every person already has."
+        )
+    if slug in agent_skill_names():
+        raise OperatorCommandError(
+            f"Every person's agent already has a skill named {slug}, so the share would reach "
+            "nobody. Rename the skill before sharing it."
         )
     managed = managed_folder()
     if managed is not None and slug in managed.skill_slugs():

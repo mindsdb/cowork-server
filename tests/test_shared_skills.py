@@ -39,6 +39,7 @@ from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResourc
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_open_session
 from cowork.harnesses.anton_harness.harness import HOST_SKILLS_DIR
+from cowork.managed import readonly_skill_dirs
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.skill import META_CREATED_BY
@@ -51,6 +52,7 @@ from cowork.services.skills import (
     STILL_SHARED_SKILL_REFUSAL,
     SkillImmutableError,
     SkillService,
+    agent_skill_names,
     link_turn_skills,
 )
 from tests._turns import built_turn
@@ -432,6 +434,30 @@ def test_an_earlier_layer_hides_a_later_same_named_one(sharing, scoped):
     # A packaged built-in's name is never someone else's.
     assert listed[builtin]["shared"] is False
     assert bob.shared_with_owner() == {}
+
+
+@pytest.mark.parametrize("root", ["anton", "host"])
+def test_a_skill_the_agent_already_has_is_never_shared(sharing, scoped, stores, root):
+    """anton reads its packaged skills after the shared ones and the
+    harness's own before them, so a shared skill of either name would
+    replace anton's in everyone's turns or reach nobody. A registry entry for
+    one shares nothing, and Bob still makes his own of that name."""
+    from anton.core.memory.skills import SkillStore
+
+    slug = sorted(readonly_skill_dirs(SkillStore().builtin_root if root == "anton" else HOST_SKILLS_DIR))[0]
+    assert slug in agent_skill_names()
+    SkillService(ALICE).create_skill(slug, "Alice's version, for everyone.")
+    _write_registry(sharing, [_entry(sub=SUB_A, partition=PARTITION_A, skill=slug)])
+    shared_dir = stores / "bob-turn" / "shared-skills"
+
+    assert slug not in SkillService(BOB).shared_with_owner()
+    assert slug not in _listed(scoped, BOB)
+    link_turn_skills(
+        scope=BOB, project_name="general", skills_dir=stores / "bob-turn" / "skills", shared_skills_dir=shared_dir
+    )
+    assert slug not in _links(shared_dir)
+    created = skills_ep.create_skill(SkillCreateRequest(label=slug, instructions="Bob's."), scoped(BOB), None)
+    assert (created["id"], created["shared"]) == (slug, False)
 
 
 def test_only_registry_entries_of_existing_skills_are_read(sharing, scoped):

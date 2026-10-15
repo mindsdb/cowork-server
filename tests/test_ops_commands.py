@@ -26,6 +26,7 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession
 from cowork.db.session import get_open_session
 from cowork.harnesses.memory.registry import MemorySlot
+from cowork.managed import readonly_skill_dirs
 from cowork.models.project import Project
 from cowork.ops import Person, personal_scope
 from cowork.ops import connections as connections_ops
@@ -251,6 +252,29 @@ def test_share_skill_refuses_what_it_cannot_share(stack, capsys, slug, message):
     status, out, err = _skill_command(ALICE, slug, stack.root, capsys)
     assert status == 1 and out == ""
     assert message in err
+    assert not (stack.root / "shared" / "skills.json").exists()
+
+
+def _first_skill_in(root: Path) -> str:
+    return sorted(readonly_skill_dirs(root))[0]
+
+
+@pytest.mark.parametrize("root", ["anton", "host"])
+def test_share_skill_refuses_a_name_the_agent_already_has(stack, capsys, root):
+    """anton reads its packaged skills after the shared ones and the
+    harness's own before them, so a share of either name would replace
+    anton's for everyone or reach nobody."""
+    from anton.core.memory.skills import SkillStore
+
+    from cowork.harnesses.anton_harness.harness import HOST_SKILLS_DIR
+
+    slug = _first_skill_in(SkillStore().builtin_root if root == "anton" else HOST_SKILLS_DIR)
+    SkillService(personal_scope(ALICE)).create_skill(slug, "Alice's own version.")
+
+    status, out, err = _skill_command(ALICE, slug, stack.root, capsys)
+
+    assert status == 1 and out == ""
+    assert f"Every person's agent already has a skill named {slug}" in err
     assert not (stack.root / "shared" / "skills.json").exists()
 
 

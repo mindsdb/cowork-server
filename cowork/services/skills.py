@@ -35,7 +35,13 @@ from cowork.common.settings import get_app_settings
 from cowork.creators import changer_for
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import TenantScope, scope_for_identity, scoped_storage_root
-from cowork.managed import SharedSkill, SharedSkills, managed_folder, reads_shared_registry
+from cowork.managed import (
+    SharedSkill,
+    SharedSkills,
+    managed_folder,
+    reads_shared_registry,
+    readonly_skill_dirs,
+)
 from cowork.models.skill import (
     META_CREATED_AT,
     META_CREATED_BY,
@@ -288,6 +294,25 @@ def shared_turn_skills(
         if skill is not None and _used_in(skill, project_name=project_name):
             selected.append(TurnSkill(slug=slug, path=skill_dir))
     return selected
+
+
+def agent_skill_names() -> frozenset[str]:
+    """The skills every person's agent already has from a read-only root
+    beside the managed folder: the harness's own (HOST_SKILLS_DIR) and
+    anton's packaged ones (anton's SkillStore.builtin_root).
+
+    anton reads the harness's root ahead of the shared skills and its
+    packaged ones after them, so a shared skill by one of these names would
+    reach nobody or replace anton's for everyone. Neither is shared
+    (SkillService._sharing, cowork.ops.skills.share_skill).
+    """
+    from anton.core.memory.skills import SkillStore
+
+    from cowork.harnesses.anton_harness.harness import HOST_SKILLS_DIR
+
+    return frozenset(
+        {*readonly_skill_dirs(HOST_SKILLS_DIR), *readonly_skill_dirs(SkillStore().builtin_root)}
+    )
 
 
 def reads_shared_skills(scope: TenantScope | None) -> bool:
@@ -619,9 +644,10 @@ class SkillService:
 
         A skill someone else shares is skipped when its creator's store no
         longer holds it, and hidden by a same-named skill earlier in the
-        owner's order: a packaged built-in, a managed skill, then any entry of
-        the owner's own store. For a name two people share, the first entry
-        wins. A malformed registry shares nothing and logs an error
+        owner's order: a packaged built-in, one the agent already has
+        (agent_skill_names), a managed skill, then any entry of the owner's
+        own store. For a name two people share, the first entry wins. A
+        malformed registry shares nothing and logs an error
         (SharedRegistry.read_live).
         """
         managed = managed_folder()
@@ -629,7 +655,12 @@ class SkillService:
             return _NOTHING_SHARED
         registry = SharedSkills.read_live(managed.shared_skills_file, logger=logger).root
         partition = self._scope.org_id
-        taken = {*self.packaged_builtin_slugs, *managed.skill_slugs(), *self._own_entry_names()}
+        taken = {
+            *self.packaged_builtin_slugs,
+            *agent_skill_names(),
+            *managed.skill_slugs(),
+            *self._own_entry_names(),
+        }
         with_owner: dict[str, Path] = {}
         for entry in registry:
             if entry.partition_id == partition or entry.skill in taken or entry.skill in with_owner:

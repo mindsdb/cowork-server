@@ -165,6 +165,19 @@ def reads_shared_registry(scope: TenantScope | None, *, resource: PersonalResour
     return scope is not None and scope.personal and scope.partitioned_for(resource)
 
 
+def readonly_skill_dirs(root: Path) -> dict[str, Path]:
+    """Each skill folder anton's SkillStore reads from the read-only skill
+    root ``root``, by slug, sorted: every directory holding a ``SKILL.md``
+    file. Empty when ``root`` is not a directory."""
+    if not root.is_dir():
+        return {}
+    return {
+        entry.name: entry
+        for entry in sorted(root.iterdir())
+        if entry.is_dir() and (entry / SKILL_FILE).is_file()
+    }
+
+
 class ManagedFolder(BaseModel):
     """The managed folder and the folders in it."""
 
@@ -215,19 +228,10 @@ class ManagedFolder(BaseModel):
         return SharedSkills.read(self.shared_skills_file)
 
     def skill_dirs(self) -> dict[str, Path]:
-        """Each managed skill's folder, by slug, sorted.
-
-        The folders anton's SkillStore reads from a read-only root: every
-        directory holding a ``SKILL.md`` file. So the names reserved here are
-        exactly the skills a turn can load from this folder.
-        """
-        if not self.skills_dir.is_dir():
-            return {}
-        return {
-            entry.name: entry
-            for entry in sorted(self.skills_dir.iterdir())
-            if entry.is_dir() and (entry / SKILL_FILE).is_file()
-        }
+        """Each managed skill's folder, by slug, sorted (readonly_skill_dirs),
+        so the names reserved here are exactly the skills a turn can load
+        from this folder."""
+        return readonly_skill_dirs(self.skills_dir)
 
     def skill_slugs(self) -> frozenset[str]:
         return frozenset(self.skill_dirs())
