@@ -5,7 +5,7 @@ from uuid import UUID
 
 import pytest
 from sqlalchemy import create_engine
-from sqlmodel import Session, SQLModel
+from sqlmodel import Session, SQLModel, select
 
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule
@@ -686,6 +686,11 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
         enabled=True,
     )
     schedule_id = schedule.id
+    # Created schedules start at their next future slot; put this one back
+    # where a cron claim finds it, due.
+    schedule.next_run_at = datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc)
+    session.add(schedule)
+    session.commit()
     original_next = ensure_utc(schedule.next_run_at)
     session.close()
 
@@ -948,57 +953,11 @@ def test_missed_runs_leaves_just_due_once_enabled_to_run():
     schedule = _schedule(session, cadence="once", next_run_at=now - timedelta(seconds=30))
     scoped = ScopedSession(session, SYSTEM_SCOPE)
 
-    _handle_missed_runs(scoped)
+    _handle_missed_runs(scoped, now)
 
     session.refresh(schedule)
     assert schedule.enabled is True
     assert [s.id for s in _due_schedules(scoped, now)] == [schedule.id]
-
-
-def test_missed_runs_disables_stale_once_overdue_beyond_window():
-    from cowork.scheduler import _due_schedules, _handle_missed_runs
-
-    session = _session()
-    now = datetime.now(timezone.utc)
-    # Slot passed hours ago (app was offline) — do not fire it late.
-    schedule = _schedule(session, cadence="once", next_run_at=now - timedelta(hours=2))
-    scoped = ScopedSession(session, SYSTEM_SCOPE)
-
-    _handle_missed_runs(scoped)
-
-    session.refresh(schedule)
-    assert schedule.enabled is False
-    # Auto-disabled without running carries a missed-run signal.
-    assert schedule.missed_runs == 1
-    assert _due_schedules(scoped, now) == []
-
-
-def test_missed_runs_once_near_catchup_boundary():
-    from cowork.scheduler import (
-        _ONCE_CATCHUP_WINDOW_SECONDS,
-        _due_schedules,
-        _handle_missed_runs,
-    )
-
-    session = _session()
-    now = datetime.now(timezone.utc)
-    window = _ONCE_CATCHUP_WINDOW_SECONDS
-    # Straddle the catch-up boundary: just inside stays enabled and runs, just
-    # outside is disabled. `_handle_missed_runs` reads its own wall clock, so a
-    # small margin keeps each case on its intended side without flaking.
-    inside = _schedule(session, cadence="once", next_run_at=now - timedelta(seconds=window - 30))
-    outside = _schedule(session, cadence="once", next_run_at=now - timedelta(seconds=window + 30))
-    scoped = ScopedSession(session, SYSTEM_SCOPE)
-
-    _handle_missed_runs(scoped)
-
-    session.refresh(inside)
-    session.refresh(outside)
-    assert inside.enabled is True
-    assert outside.enabled is False
-    due_ids = [s.id for s in _due_schedules(scoped, now)]
-    assert inside.id in due_ids
-    assert outside.id not in due_ids
 
 
 # --- A poll runs in a worker thread beside the run's units, so a run can end

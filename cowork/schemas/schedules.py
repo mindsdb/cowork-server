@@ -83,6 +83,33 @@ class AttemptOutcome(str, Enum):
     uncertain = "uncertain"
 
 
+class ScheduleState(str, Enum):
+    """What a schedule will do next, for display."""
+
+    active = "active"
+    # The user paused it: nothing starts on its own until it is resumed.
+    paused = "paused"
+    # Repeated failures paused it.
+    auto_paused = "auto_paused"
+    # A one-off whose time passed while the app could not run it, by too much
+    # to run on its own. Run now still runs it.
+    missed = "missed"
+    # A one-off that has run, or is running.
+    done = "done"
+
+
+def schedule_state(schedule) -> ScheduleState:
+    if schedule.auto_paused_at is not None:
+        return ScheduleState.auto_paused
+    if schedule.paused_at is not None:
+        return ScheduleState.paused
+    if schedule.missed_at is not None:
+        return ScheduleState.missed
+    if not schedule.enabled:
+        return ScheduleState.done if schedule.cadence == Cadence.once else ScheduleState.paused
+    return ScheduleState.active
+
+
 class ScheduleCreateRequest(CamelRequest):
     title: str
     prompt: str
@@ -105,6 +132,14 @@ class ScheduleUpdateRequest(CamelRequest):
     enabled: bool | None = None
 
 
+class SkippedPeriodResponse(CamelResponse):
+    first_slot: datetime
+    last_slot: datetime
+    slot_count: int
+    reason: str
+    created_at: datetime | None
+
+
 class ScheduleResponse(CamelResponse):
     id: UUID
     title: str
@@ -119,6 +154,14 @@ class ScheduleResponse(CamelResponse):
     last_result_conversation_id: UUID | None
     last_error: str | None
     missed_runs: int
+    consecutive_failures: int = 0
+    auto_paused_at: datetime | None = None
+    paused_at: datetime | None = None
+    missed_at: datetime | None = None
+    # Filled by the endpoints: the derived ScheduleState, and the most recent
+    # stretch of slots it passed over without running.
+    state: ScheduleState = ScheduleState.active
+    last_skipped: SkippedPeriodResponse | None = None
     # Not a Schedule column — endpoints fill it from ScheduleRunService so the
     # UI can show an in-flight run (manual or cron).
     running: bool = False

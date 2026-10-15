@@ -40,6 +40,29 @@ class Schedule(BaseSQLModel, table=True):
     )
     last_error: str | None = Field(default=None, description="Error message from last failed run")
     missed_runs: int = Field(default=0, description="Count of runs missed while the scheduler was offline")
+    consecutive_failures: int = Field(
+        default=0,
+        sa_column_kwargs={"server_default": "0"},
+        description="Cron occurrences in a row that settled failed; a success resets it",
+    )
+    auto_paused_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="When repeated failures paused the schedule; cleared on resume",
+    )
+    paused_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description=(
+            "When the user paused the schedule; cleared on resume. A one-off is also "
+            "disabled once it is claimed, so `enabled` alone does not mean paused"
+        ),
+    )
+    missed_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="When a one-off was found too late to run on its own; cleared when it runs or is moved",
+    )
     org_id: str | None = Field(default=None, index=True, max_length=36, description="Owning organization; NULL on local/desktop rows")
     created_by: str | None = Field(default=None, max_length=36, description="User who created the row; NULL on local/desktop rows")
 
@@ -53,6 +76,36 @@ class Schedule(BaseSQLModel, table=True):
     occurrences: list["ScheduleOccurrence"] = Relationship(
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
+    skipped_periods: list["ScheduleSkippedPeriod"] = Relationship(
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
+
+
+class ScheduleSkippedPeriod(BaseSQLModel, table=True):
+    """Slots a schedule passed over without running, summarized: one row per
+    time the scheduler found it behind, however many slots that covered."""
+
+    __tablename__ = "schedule_skipped_periods"
+
+    schedule_id: UUID = Field(
+        sa_column=sa.Column(
+            sa.Uuid(),
+            sa.ForeignKey("schedules.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+        description="Parent schedule",
+    )
+    first_slot: datetime = Field(
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="UTC instant of the first slot passed over",
+    )
+    last_slot: datetime = Field(
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="UTC instant of the last slot passed over",
+    )
+    slot_count: int = Field(description="Slots passed over, first and last included")
+    reason: str = Field(description="offline (the app was not running) | one_off_missed")
 
 
 class ScheduleOccurrence(BaseSQLModel, table=True):
