@@ -34,9 +34,9 @@ def _automation_enabled(session: CodingSession) -> bool:
 @dataclass(frozen=True)
 class RetentionPolicy:
     # Releasing unarchived idle tasks; archived tasks are released either way.
-    enabled: bool = False
+    enabled: bool = True
     keep_count: int = 10
-    min_idle: timedelta = timedelta(hours=24)
+    min_idle: timedelta = timedelta(days=14)
 
 
 @dataclass(frozen=True)
