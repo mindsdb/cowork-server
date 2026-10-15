@@ -121,6 +121,13 @@ def overdue_slots(
 
     older = 0
     recent: list[datetime] = []
+    if cadence == Cadence.hourly and cursor < floor:
+        # Hourly slots are a fixed hour apart in UTC, so the ones before the
+        # floor are counted, not walked: a schedule a year behind would
+        # otherwise step through thousands of slots on every poll.
+        skipped = int((floor - cursor) // timedelta(hours=1))
+        older += skipped
+        cursor += timedelta(hours=skipped)
     while cursor <= reference:
         if cursor < floor:
             older += 1

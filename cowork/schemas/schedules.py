@@ -114,6 +114,7 @@ class ScheduleResponse(CamelResponse):
     last_error: str | None
     missed_runs: int
     missed_run_policy: str = MissedRunPolicy.run_latest_once
+    spec_version: int = 1
     consecutive_failures: int = 0
     auto_paused_at: datetime | None = None
     # Not a Schedule column — endpoints fill it from ScheduleRunService so the
@@ -137,4 +138,14 @@ class ScheduleRunResponse(CamelResponse):
     is_manual: bool
     occurrence_id: UUID | None = None
     attempt: int | None = None
+    spec_version: int | None = None
+    created_at: datetime | None
+
+
+class ScheduleEventResponse(CamelResponse):
+    id: UUID
+    schedule_id: UUID
+    kind: str
+    actor: str | None
+    detail: dict | None
     created_at: datetime | None

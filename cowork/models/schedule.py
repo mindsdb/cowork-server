@@ -9,6 +9,10 @@ from cowork.models.base import BaseSQLModel
 
 class Schedule(BaseSQLModel, table=True):
     __tablename__ = "schedules"
+    __table_args__ = (
+        # The poll's due-scan: enabled schedules whose slot has come.
+        sa.Index("ix_schedules_enabled_next_run_at", "enabled", "next_run_at"),
+    )
 
     title: str = Field(description="Display name for the schedule")
     prompt: str = Field(description="The prompt to run on each execution")
@@ -50,6 +54,11 @@ class Schedule(BaseSQLModel, table=True):
         sa_column_kwargs={"server_default": "0"},
         description="Cron occurrences in a row that settled failed; a success resets it",
     )
+    spec_version: int = Field(
+        default=1,
+        sa_column_kwargs={"server_default": "1"},
+        description="Bumped by every edit that changes what a run does",
+    )
     auto_paused_at: datetime | None = Field(
         default=None,
         sa_type=sa.DateTime(timezone=True),  # type: ignore
@@ -66,6 +75,9 @@ class Schedule(BaseSQLModel, table=True):
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
     occurrences: list["ScheduleOccurrence"] = Relationship(
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
+    events: list["ScheduleEvent"] = Relationship(
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
 
@@ -172,3 +184,24 @@ class ScheduleRun(BaseSQLModel, table=True):
         description="The occurrence this run is an attempt at; NULL on runs from before occurrences",
     )
     attempt: int | None = Field(default=None, description="1-based attempt number within the occurrence")
+    spec_version: int | None = Field(default=None, description="The schedule's spec_version when the attempt started")
+
+
+class ScheduleEvent(BaseSQLModel, table=True):
+    """A change in a schedule's life: created, edited, paused, resumed, or
+    auto-paused. Runs are recorded separately, as occurrences and attempts."""
+
+    __tablename__ = "schedule_events"
+
+    schedule_id: UUID = Field(
+        sa_column=sa.Column(
+            sa.Uuid(),
+            sa.ForeignKey("schedules.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+        description="Parent schedule",
+    )
+    kind: str = Field(description="created | edited | paused | resumed | auto_paused")
+    actor: str | None = Field(default=None, max_length=64, description="User who caused it; NULL for the scheduler")
+    detail: dict | None = Field(default=None, sa_column=sa.Column(sa.JSON(), nullable=True), description="What changed")

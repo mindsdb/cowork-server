@@ -24,7 +24,13 @@ from cowork.db.units import run_db
 from cowork.models.schedule import Schedule, ScheduleOccurrence
 from cowork.schedule_timing import advance_occurrence, overdue_slots
 from cowork.schemas.schedules import Cadence, MissedRunPolicy, OccurrenceStatus, RunStatus, resolve_schedule_model
-from cowork.services.schedules import ScheduleOccurrenceService, ScheduleRunService, ScheduleService
+from cowork.services.schedules import (
+    ScheduleOccurrenceService,
+    ScheduleRunService,
+    ScheduleService,
+    prune_schedule_history,
+    record_schedule_event,
+)
 from cowork.streaming.registry import registry
 
 if TYPE_CHECKING:
@@ -60,6 +66,11 @@ _MAX_CONCURRENT_RUNS = 3
 # process running it died: the turn's own bound, plus the time its last writes
 # may spend waiting for a connection, plus slack.
 _LEASE_SECONDS = _MAX_RUN_DURATION_SECONDS + _BOOKKEEPING_DEADLINE_SECONDS + 60
+# Run history (settled occurrences and their attempts) is kept this long, and
+# pruned at most this often.
+_HISTORY_RETENTION = timedelta(days=90)
+_PRUNE_INTERVAL = timedelta(hours=1)
+_last_prune_at: datetime | None = None
 _scheduler_task: asyncio.Task | None = None
 # Occurrences this process is running now; the poll sizes its claims by it and
 # never reaps one of its own.
@@ -229,9 +240,7 @@ def _handle_missed_runs(session) -> None:
     """
     now = datetime.now(timezone.utc)
     occurrences = ScheduleOccurrenceService(session)
-    for schedule in ScheduleService(session).list_schedules():
-        if not schedule.enabled:
-            continue
+    for schedule in ScheduleService(session).due(now):
         next_run = ensure_utc(schedule.next_run_at)
         if next_run >= now or occurrences.has_active(schedule.id):
             continue
@@ -449,6 +458,10 @@ def _count_settlement(session: ScopedSession, occurrence_id: UUID) -> None:
         if schedule.consecutive_failures >= _MAX_FAILED_OCCURRENCES and schedule.enabled:
             schedule.enabled = False
             schedule.auto_paused_at = datetime.now(timezone.utc)
+            record_schedule_event(
+                session, schedule.id, "auto_paused",
+                {"failed_runs": schedule.consecutive_failures, "error": occurrence.error},
+            )
             logger.warning(
                 f"Schedule {schedule.id} paused after {schedule.consecutive_failures} failed runs in a row"
             )
@@ -779,7 +792,7 @@ def _due_schedules(session, now: datetime) -> list[Schedule]:
     occurrences = ScheduleOccurrenceService(session)
     due: list[Schedule] = []
     skipped = False
-    for s in ScheduleService(session).list_schedules():
+    for s in ScheduleService(session).due(now):
         # Gate on ANY occurrence in flight, manual included, or waiting for a
         # retry: the slot is deferred, not consumed, and once the occurrence
         # settles the freshness guard decides whether it still fires. The
@@ -841,6 +854,17 @@ def _reap_expired_leases(session: ScopedSession, now: datetime) -> None:
         session.commit()
 
 
+def _maybe_prune(session: ScopedSession, now: datetime) -> None:
+    """Delete run history past its retention, at most once an hour."""
+    global _last_prune_at
+    if _last_prune_at is not None and now - _last_prune_at < _PRUNE_INTERVAL:
+        return
+    _last_prune_at = now
+    deleted = prune_schedule_history(session, now - _HISTORY_RETENTION)
+    if deleted:
+        logger.info(f"Pruned {deleted} scheduled run(s) older than {_HISTORY_RETENTION.days} days")
+
+
 def _poll(session: ScopedSession, capacity: int = _MAX_CONCURRENT_RUNS) -> list[UUID]:
     """One poll's unit: reap dead occurrences, settle missed runs, then claim.
 
@@ -849,6 +873,7 @@ def _poll(session: ScopedSession, capacity: int = _MAX_CONCURRENT_RUNS) -> list[
     """
     now = datetime.now(timezone.utc)
     _reap_expired_leases(session, now)
+    _maybe_prune(session, now)
     _handle_missed_runs(session)
     ready = [o for o in ScheduleOccurrenceService(session).ready_for_attempt(now) if o not in _inflight]
     ready = ready[: max(capacity, 0)]

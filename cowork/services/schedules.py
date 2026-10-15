@@ -9,9 +9,27 @@ from sqlalchemy.exc import IntegrityError
 from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
-from cowork.models.schedule import Schedule, ScheduleOccurrence, ScheduleRun
+from cowork.models.schedule import Schedule, ScheduleEvent, ScheduleOccurrence, ScheduleRun
 from cowork.schedule_timing import normalize_next_run
 from cowork.schemas.schedules import OccurrenceStatus, RunStatus
+
+
+# Fields whose change alters what a run does, so an edit to any of them bumps
+# spec_version. A rename (title) or the enabled toggle does not.
+SPEC_FIELDS = ("prompt", "model", "project_id", "cadence", "timezone", "missed_run_policy")
+
+
+def record_schedule_event(session, schedule_id: UUID, kind: str, detail: dict | None = None) -> None:
+    """Stage a lifecycle event. The actor is the request's user, or NULL when
+    the scheduler itself acts (or on the desktop, which has no user id)."""
+    session.add(
+        ScheduleEvent(
+            schedule_id=schedule_id,
+            kind=kind,
+            actor=getattr(session.scope, "user_id", None),
+            detail=detail,
+        )
+    )
 
 
 class ScheduleService:
@@ -45,6 +63,29 @@ class ScheduleService:
         if project_id is not None:
             query = query.where(Schedule.project_id == project_id)
         return list(self.session.exec(query).all())
+
+    def due(self, now: datetime) -> list[Schedule]:
+        """Enabled schedules whose slot has come, read through the
+        (enabled, next_run_at) index instead of every schedule."""
+        return list(
+            self.session.exec(
+                self._owned_select()
+                .where(Schedule.enabled == True)  # noqa: E712
+                .where(Schedule.next_run_at <= now)
+            ).all()
+        )
+
+    def events(self, schedule_id: UUID, limit: int = 100) -> list[ScheduleEvent]:
+        if self._owned(schedule_id) is None:
+            return []
+        return list(
+            self.session.exec(
+                self.session.select(ScheduleEvent)
+                .where(ScheduleEvent.schedule_id == schedule_id)
+                .order_by(ScheduleEvent.created_at.desc())  # type: ignore[union-attr]
+                .limit(limit)
+            ).all()
+        )
 
     def get_schedule(self, schedule_id: UUID) -> Schedule:
         schedule = self._owned(schedule_id)
@@ -81,6 +122,7 @@ class ScheduleService:
             missed_run_policy=missed_run_policy,
         )
         self.session.add(schedule)
+        record_schedule_event(self.session, schedule.id, "created")
         self.session.commit()
         self.session.refresh(schedule)
         return schedule
@@ -90,9 +132,20 @@ class ScheduleService:
         new_project_id = kwargs.get("project_id")
         if new_project_id is not None and self.session.get(Project, new_project_id) is None:
             raise ValueError("Project not found")
+        changed = sorted(
+            field for field, value in kwargs.items()
+            if value is not None and hasattr(schedule, field) and getattr(schedule, field) != value
+        )
         for field, value in kwargs.items():
             if value is not None and hasattr(schedule, field):
                 setattr(schedule, field, value)
+        if any(field in SPEC_FIELDS for field in changed):
+            schedule.spec_version += 1
+        if changed:
+            record_schedule_event(
+                self.session, schedule.id, "edited",
+                {"fields": changed, "spec_version": schedule.spec_version},
+            )
         if {"cadence", "timezone", "next_run_at"} & {k for k, v in kwargs.items() if v is not None}:
             # The slot follows the edit at once, rather than firing on the old
             # cadence or reading a start already in the past as a missed run.
@@ -156,6 +209,7 @@ class ScheduleService:
         schedule = self.get_schedule(schedule_id)
         schedule.enabled = False
         self.session.add(schedule)
+        record_schedule_event(self.session, schedule.id, "paused")
         self.session.commit()
         self.session.refresh(schedule)
         return schedule
@@ -166,11 +220,13 @@ class ScheduleService:
         schedule was paused moves to the next one rather than running as a
         missed slot the moment it resumes."""
         schedule = self.get_schedule(schedule_id)
+        was_auto_paused = schedule.auto_paused_at is not None
         schedule.enabled = True
         schedule.auto_paused_at = None
         schedule.consecutive_failures = 0
         schedule.next_run_at = normalize_next_run(schedule.cadence, schedule.next_run_at, schedule.timezone)
         self.session.add(schedule)
+        record_schedule_event(self.session, schedule.id, "resumed", {"from_auto_pause": was_auto_paused})
         self.session.commit()
         self.session.refresh(schedule)
         return schedule
@@ -481,6 +537,7 @@ class ScheduleOccurrenceService:
         ):
             return None
         occurrence.attempts += 1
+        schedule = self.session.get(Schedule, occurrence.schedule_id)
         occurrence.next_attempt_at = None
         occurrence.lease_expires_at = now + timedelta(seconds=lease_seconds)
         run = ScheduleRun(
@@ -490,6 +547,7 @@ class ScheduleOccurrenceService:
             is_manual=is_manual,
             occurrence_id=occurrence.id,
             attempt=occurrence.attempts,
+            spec_version=schedule.spec_version if schedule is not None else None,
         )
         self.session.add(occurrence)
         self.session.add(run)
@@ -566,3 +624,38 @@ class ScheduleOccurrenceService:
             .where(ScheduleRun.status == RunStatus.running)
             .limit(1)
         ).first()
+
+
+def prune_schedule_history(session: ScopedSession, before: datetime) -> int:
+    """Delete settled occurrences, and their attempts, that settled before
+    ``before``, plus runs from before occurrences that finished then. Returns
+    the number of runs deleted. Active occurrences and running runs are kept.
+
+    Runs are deleted explicitly rather than by foreign-key cascade: the
+    desktop's SQLite runs without foreign-key enforcement.
+    """
+    raw = unsafe_unscoped_session(session)
+    old = sa.select(ScheduleOccurrence.id).where(
+        ScheduleOccurrence.status != OccurrenceStatus.active,
+        ScheduleOccurrence.settled_at < before,
+    )
+    deleted = raw.execute(
+        sa.delete(ScheduleRun).where(
+            sa.or_(
+                ScheduleRun.occurrence_id.in_(old),  # type: ignore[union-attr]
+                sa.and_(
+                    ScheduleRun.occurrence_id.is_(None),  # type: ignore[union-attr]
+                    ScheduleRun.status != RunStatus.running,
+                    ScheduleRun.started_at < before,
+                ),
+            )
+        )
+    ).rowcount
+    raw.execute(
+        sa.delete(ScheduleOccurrence).where(
+            ScheduleOccurrence.status != OccurrenceStatus.active,
+            ScheduleOccurrence.settled_at < before,
+        )
+    )
+    session.commit()
+    return deleted or 0
