@@ -25,6 +25,7 @@ from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from typing import Any, Optional
 from weakref import WeakValueDictionary
+from uuid import uuid4
 
 from cowork.common.logger import log_context
 from cowork.streaming.buffer import StreamBuffer
@@ -90,9 +91,18 @@ class TurnInProgress(Exception):
         self.turn_id = turn_id
 
 
+@dataclass(frozen=True)
+class RunIdentity:
+    """A new instance even when a turn number is reused; never a client-supplied id."""
+
+    run_id: str = field(default_factory=lambda: str(uuid4()))
+    correlation_id: str = field(default_factory=lambda: str(uuid4()))
+    remote: bool = False
+
+
 @dataclass
 class TurnLifecycle:
-    """One bit of shared state between a producer coroutine and its handle.
+    """Shared identity and lifecycle state for a producer coroutine and its handle.
 
     Exists because of an ordering problem: ``registry.start()`` builds the
     producer coroutine before the ``RunHandle`` that will own it exists, so the
@@ -129,6 +139,8 @@ class TurnLifecycle:
     timed_out: bool = False
     saved_question: bool = False
     stalled: bool = False
+    cancel_requested: bool = False
+    identity: RunIdentity = field(default_factory=RunIdentity)
 
 
 @dataclass
@@ -154,6 +166,18 @@ class RunHandle:
     user_id: str | None = None
     # Shared with the producer coroutine, see TurnLifecycle.
     lifecycle: TurnLifecycle = field(default_factory=TurnLifecycle)
+
+    @property
+    def run_id(self) -> str:
+        return self.lifecycle.identity.run_id
+
+    def request_cancel(self) -> bool:
+        """Signal this captured task, without waiting for its persistence to finish."""
+        if not self.is_running:
+            return False
+        self.lifecycle.cancel_requested = True
+        self.task.cancel()
+        return True
 
     @property
     def is_running(self) -> bool:
@@ -186,9 +210,8 @@ class RunHandle:
         still running. The turn is stopped either way, so a failed teardown is
         logged and the answer stays True.
         """
-        if self.task.done():
+        if not self.request_cancel():
             return False
-        self.task.cancel()
 
         try:
             await self.task
@@ -285,6 +308,32 @@ class RunRegistry:
                 await asyncio.shield(asyncio.gather(existing.task, return_exceptions=True))
             buffer = await open_buffer()
             lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
+            from cowork.streaming.backend import get_backend
+            if get_backend() == "redis":
+                from cowork.db.units import run_to_completion
+                from cowork.streaming.turn_index import forget_run, record_turn
+                # Publish immutable identity before either the producer or its
+                # first reader can request cancellation. Dispatch never replaces it.
+                async def publish() -> None:
+                    async with asyncio.timeout(5):
+                        await record_turn(
+                            conversation_id, turn_id=turn_id,
+                            run_id=lifecycle.identity.run_id,
+                            correlation_id=lifecycle.identity.correlation_id,
+                            org_id=org_id, user_id=user_id,
+                        )
+
+                try:
+                    await run_to_completion(publish())
+                except BaseException:
+                    # Setup can be cancelled while Redis has committed but not
+                    # replied. Settle that write, then remove only this instance.
+                    try:
+                        async with asyncio.timeout(5):
+                            await forget_run(conversation_id, lifecycle.identity.run_id)
+                    except Exception:
+                        logger.exception("Could not remove unstarted run %s", lifecycle.identity.run_id)
+                    raise
             task = asyncio.create_task(
                 self._run_bounded(produce(buffer), buffer, conversation_id, turn_id, lifecycle),
                 name=f"turn[{conversation_id}/{turn_id}]",
@@ -354,6 +403,12 @@ class RunRegistry:
                 )
 
         watchdog = asyncio.ensure_future(_watchdog())
+        from cowork.streaming.backend import get_backend
+        from cowork.streaming.cancellation import watch_cancel
+        cancel_watch = (
+            asyncio.create_task(watch_cancel(task, buffer, lifecycle))
+            if get_backend() == "redis" and not lifecycle.identity.remote else None
+        )
         try:
             await task
         except asyncio.CancelledError:
@@ -367,7 +422,11 @@ class RunRegistry:
             # overwrite the turn's own result (including a cancellation
             # RunHandle.cancel is waiting to observe).
             watchdog.cancel()
-            await asyncio.gather(watchdog, return_exceptions=True)
+            watchers = [watchdog]
+            if cancel_watch is not None:
+                cancel_watch.cancel()
+                watchers.append(cancel_watch)
+            await asyncio.gather(*watchers, return_exceptions=True)
 
     def get(self, conversation_id: str) -> Optional[RunHandle]:
         """Current handle (incl. recently-finished, useful for replay)."""

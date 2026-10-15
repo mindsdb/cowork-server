@@ -4,7 +4,7 @@ import uuid
 from enum import Enum
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_serializer
+from pydantic import BaseModel, Field, StrictBool, model_serializer, model_validator
 
 from cowork.schemas.connectors import DisabledConnection
 
@@ -175,6 +175,17 @@ class ResponsesRequest(BaseModel):
         default=False,
         description="Whether the chat completion request is streaming or not",
     )
+    cancel_on_disconnect: StrictBool = Field(
+        default=False,
+        description="Cancel this streaming turn if its originating HTTP client disconnects. Reconnected tails do not own the turn.",
+    )
+
+    @model_validator(mode="after")
+    def disconnect_requires_streaming(self) -> "ResponsesRequest":
+        if self.cancel_on_disconnect and self.stream is not True:
+            raise ValueError("cancel_on_disconnect requires stream=true")
+        return self
+
     # TODO(migration): Per MIGRATION.md, attachment_ids should be removed.
     # The client should instead send input_file content blocks in the input
     # field (the handler already supports this path). This field is a compat
