@@ -109,7 +109,7 @@ def _saver_for(scope: "TenantScope") -> Saver:
 def vault_for_scope(scope: "TenantScope | None" = None):
     """``scope``'s saved connections, for reading and for saving.
 
-    On the desktop and in org tenancy without a managed folder, that is its
+    On the desktop without a managed folder, and in org tenancy, that is its
     own vault (own_vault_for_scope). With COWORK_MANAGED_DIR set or
     COWORK_TRUST_IDENTITY_HEADERS on, it is a LayeredDataVault: the managed
     folder's connections, the scope's own, then the ones others share with a

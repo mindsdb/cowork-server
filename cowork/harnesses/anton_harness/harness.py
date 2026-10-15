@@ -1266,11 +1266,12 @@ class AntonHarness:
             from cowork.services.connectors.persist import turn_vault_for_scope
 
             # The asker's own connections, with the operator's managed ones
-            # over them, from the turn's bound scope (use_settings_scope),
-            # never the operator view _units_scope falls back to: an unbound
-            # turn on a partitioned deployment is refused here rather than
-            # handed the base vault. A connection the agent saves through it
-            # lands in the asker's own vault.
+            # over them and the ones others share with the asker after them,
+            # from the turn's bound scope (use_settings_scope), never the
+            # operator view _units_scope falls back to: an unbound turn on a
+            # partitioned deployment is refused here rather than handed the
+            # base vault. A connection the agent saves through it lands in
+            # the asker's own vault, stamped with its creator.
             source_vault = turn_vault_for_scope(current_settings_scope())
             if disabled_connections:
                 turn_scratch_dir = _new_turn_scratch_dir()
