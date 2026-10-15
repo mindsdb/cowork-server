@@ -306,6 +306,7 @@ class ProbeHandler:
             if spec is None and _is_oauth_grant(form_spec, method, credentials):
                 try:
                     vault = vault_for_scope(self.scope)
+                    extends_name = form_spec.get("_extends_connection")
                     slug = persist_connection(
                         connector_id, method, extends_name or name, credentials,
                         label=connection_label, user_label=connection_user_label,
@@ -395,6 +396,7 @@ class ProbeHandler:
                 workspace=workspace,
                 form_spec=form_spec,
                 skipped=skipped,
+                usage_notes=registry.usage_notes_for([connector_id]).get(connector_id),
                 web_tool_kwargs=web_tools,
             )
             try:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from pathlib import Path
 from cowork.schemas.connectors import (
     ConnectorMetadataResponse,
@@ -42,6 +43,18 @@ class ConnectorSpecRegistry:
         if c is None:
             return None
         return self._to_connector_spec_response(c)
+
+    def usage_notes_for(self, engines: Iterable[str]) -> dict[str, str]:
+        """engine -> `usage_notes` for those of `engines` whose spec declares
+        non-blank notes. Reads the raw spec dicts: the notes are deliberately
+        left out of ConnectorSpecResponse built by get_connector()."""
+        specs = self.get_connectors()
+        notes: dict[str, str] = {}
+        for engine in engines:
+            text = (specs.get(engine) or {}).get("usage_notes")
+            if isinstance(text, str) and text.strip():
+                notes[engine] = text
+        return notes
 
     def list_connectors(self) -> list[ConnectorMetadataResponse]:
         items = [

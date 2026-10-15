@@ -581,3 +581,29 @@ async def test_not_owned_slugs_are_dropped_and_logged(
     assert out == {"mine"}
     assert [c["folder"].name for c in published] == ["mine"]
     assert "result=skipped not_owner=1" in caplog.text
+
+
+async def test_a_report_owned_by_another_account_is_skipped_not_failed(base, enabled, key, monkeypatch, caplog):
+    """A 409 `artifact_owned_by_other_user` is a skip, like `not_owner`."""
+    import logging
+
+    from cowork.services.publish import PublishOwnedByOtherUser
+
+    _make(base, "rep", files={"report.html": "<html></html>"},
+          meta={"slug": "rep", "type": "html-app"})
+    calls = []
+
+    def owned_elsewhere(artifact, **kwargs):
+        calls.append(artifact)
+        raise PublishOwnedByOtherUser()
+
+    monkeypatch.setattr(ap, "publish_artifact", owned_elsewhere)
+    with caplog.at_level(logging.WARNING, logger="cowork.services.artifact_autopublish"):
+        out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
+
+    assert out == set()
+    assert len(calls) == 1
+    assert "result=skipped slug=rep reason=owned_by_other_user" in caplog.text
+    assert "result=failed" not in caplog.text
+    assert not (base / "rep" / ".published.json").exists()
+    assert locks.acquire(base, "rep", ttl_s=600) is True

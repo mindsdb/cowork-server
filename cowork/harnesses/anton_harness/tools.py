@@ -79,13 +79,14 @@ def _access_from_state(entry: dict) -> dict:
 
 
 # Cowork-flavoured description/prompt for the publish_or_preview tool.
-# The CLI-flavoured copies inside anton-core's `tools.py` mention the
-# legacy `.anton/output/` artifacts dir and reference a `/publish`
-# slash command that doesn't exist in antontron — both confuse the
-# LLM in the desktop context, so we override them in `build_cowork_publish_tool`.
+# The CLI-flavoured copies inside anton-core's `tools.py` describe the
+# interactive CLI flow ('ask' prompts the user, 'preview' opens a
+# browser), which doesn't exist in the desktop process and confuses the
+# LLM there, so we override them in `build_cowork_publish_tool`.
 COWORK_PUBLISH_DESCRIPTION = (
-    "Preview, check, or publish an HTML dashboard / report. Files live "
-    "under the project's `artifacts/<artifact-id>/<name>.html`. Actions: "
+    "Preview, check, or publish an HTML dashboard / report. Pass as "
+    "`file_path` the artifact's slug or the absolute path that "
+    "`create_artifact` or `generate_artifact` returned. Actions: "
     "'ask' (default) and 'preview' check whether the file is already "
     "published and return the public URL if so — they DON'T publish; "
     "use them when generating a new file to confirm state. 'publish' "
@@ -133,6 +134,40 @@ COWORK_PUBLISH_PROMPT = (
 )
 
 
+def _resolve_publish_path(session: Any, raw_path: str) -> Path | None:
+    """The existing path `raw_path` names, or None when nothing matches.
+
+    A relative path is looked up in the session project's artifacts folder
+    first (`<slug>`, `<slug>/<file>`, `artifacts/<slug>/...`), then under the
+    project folder, where `.anton/artifacts/<slug>` resolves. `..` in a
+    relative path is refused: resolving collapses it even through a missing
+    folder, so `artifacts/../.anton/memory` would otherwise land in
+    `.anton/memory`.
+    """
+    from cowork.services.artifacts import _candidate_relative_artifacts
+
+    try:
+        path = Path(raw_path).expanduser()
+        workspace = getattr(session, "_workspace", None)
+        base = getattr(workspace, "base", None)
+        if not path.is_absolute() and base:
+            if ".." in path.parts:
+                return None
+            # `as_posix()` drops the `.` segments and doubled slashes that
+            # the helper would otherwise reject (`artifacts//<slug>`).
+            matches = _candidate_relative_artifacts(
+                path.as_posix(), [Path(workspace.artifacts_dir)]
+            )
+            if matches:
+                return matches[0]
+            path = Path(base) / path
+        path = path.resolve()
+        return path if path.exists() else None
+    except (OSError, RuntimeError, ValueError):
+        # NUL bytes, over-long names and unknown `~user` raise here.
+        return None
+
+
 async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     """Server-side equivalent of anton.tools.handle_publish_or_preview.
 
@@ -150,18 +185,16 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
     if not raw_path:
         return "publish_or_preview: missing file_path"
 
-    file_path = Path(raw_path).expanduser()
-    if not file_path.is_absolute():
-        # Anton's session carries the active workspace base.
-        workspace = getattr(session, "_workspace", None)
-        if workspace is not None:
-            base = getattr(workspace, "base", None)
-            if base:
-                file_path = Path(base) / raw_path
-    file_path = file_path.resolve()
-
-    if not file_path.exists():
-        return f"File not found: {file_path}"
+    file_path = _resolve_publish_path(session, raw_path)
+    if file_path is None:
+        # Echo only what the agent passed: the joined path could name a folder
+        # outside the artifacts (e.g. `.anton/memory`).
+        shown = raw_path if len(raw_path) <= 200 else raw_path[:200] + "…"
+        return (
+            f"Artifact not found: {shown!r}. Pass the artifact's slug "
+            "(list_artifacts shows it) or the absolute path that "
+            "create_artifact or generate_artifact returned."
+        )
 
     abs_path = str(file_path)
 
@@ -254,8 +287,22 @@ async def _cowork_publish_or_preview(session: Any, tc_input: dict):
             return message
         return SideEffectResult.failed(message, reason=reason)
 
+    from cowork.services.publish import OWNED_BY_OTHER_USER_MESSAGE, PublishOwnedByOtherUser
+
     try:
         result = _publish_artifact(abs_path, access=access)
+    except PublishOwnedByOtherUser:
+        # The model can edit files, so spell out that it must not work around
+        # the refusal (e.g. by dropping the stored report_id). Not a ban for the
+        # rest of the conversation: the user may fix the account and ask again.
+        logger.info("Cowork publish refused: %s", OWNED_BY_OTHER_USER_MESSAGE)
+        return _fail(
+            f"PUBLISH FAILED: {OWNED_BY_OTHER_USER_MESSAGE} The existing link belongs "
+            "to another account. Do not retry, and do not publish this artifact under "
+            "a new report on your own. Tell the user, and publish again only if they "
+            "ask after resolving it.",
+            reason="owned_by_other_user",
+        )
     except ValueError as exc:
         # The service raises ValueError for several distinct reasons. Only the
         # missing-API-key case warrants the STOP/"go configure a key" directive;
@@ -304,8 +351,7 @@ def build_cowork_publish_tool():
     can build the session config without paying the import cost twice.
 
     The description and prompt are replaced with cowork-flavoured copy
-    that names the right artifacts path (`artifacts/<id>/<file>.html`,
-    not the legacy `.anton/output/`) and tells the LLM publishing
+    that says what to pass as `file_path` and tells the LLM publishing
     works directly from chat — no slash command, no UI dance. Without
     these overrides the LLM defaults to CLI-era guidance and refuses
     to call `action: 'publish'` even when the user explicitly asked.
