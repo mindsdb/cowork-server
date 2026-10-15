@@ -13,7 +13,9 @@ or display math) gets one origin:
   read the data its value was computed from, traced through the names a
   scratchpad keeps across cells and turns, so such a cell may be an earlier
   turn's. A figure names at most ``MAX_FIGURE_SOURCES`` steps, the ones whose
-  output holds it first;
+  output holds it first. A step with no tool_use_id holds a figure but is
+  never named, nor are the cells it read data from: the client opens a step
+  by that id;
 - ``question``: no step of this turn holds it, but the question writes it in
   the same form (value, sign, currency, scale and percent);
 - ``none``: nothing in the turn holds it, so the renderer marks it as a figure
@@ -22,7 +24,12 @@ or display math) gets one origin:
 A step of an earlier turn never holds a figure. Its cells are read only for
 the names, functions and data their scratchpad passes on to this turn's cells,
 so a figure the answer repeats from an earlier turn, with no step of this turn
-holding it, has no source.
+holding it, has no source. Only the last ``MAX_EARLIER_CELLS`` earlier-turn
+cells are read, and the formatter reads the history only when the answer has
+figures (``has_figures``) and this turn ran a cell (``ran_cell``). These
+limits never change a figure's origin. They can only drop an earlier cell a
+figure names as the one that read its data, or a string or function a cell
+of this turn reuses.
 
 Only the scratchpad's cells and the tools in ``EVIDENCE_TOOLS`` are steps: the
 web tools and read_text_file. Every other tool hands back the agent's own text
@@ -38,8 +45,9 @@ printing it, has no source.
 Each step a figure names is described once: its kind, a short label, the file
 it read, the web page it reached, and the SQL and HTTP requests its code shows
 (``cell_queries``). Its label, web page, SQL and requests pass through
-``_redacted`` before they leave this module. Its file is named by its place in
-the project or by its files-store id, never by the text the code spelled.
+``_redacted``, a best-effort credential sweep, before they leave this module.
+Its file is named by its place in the project or by its files-store id, never
+by the text the code spelled.
 """
 
 from __future__ import annotations
@@ -85,6 +93,10 @@ MAX_REQUEST_CHARS = 500
 MAX_LABELED_DOCUMENTS = 3
 # The most steps one figure names.
 MAX_FIGURE_SOURCES = 3
+# The most earlier-turn cells read for the names, functions and data they
+# pass to this turn's cells, the latest ones, because each one's code is
+# parsed again on every answer.
+MAX_EARLIER_CELLS = 50
 # The tools besides the scratchpad whose results are evidence: a web page or
 # search result, and a file's text. recall_history and anton's recall hand
 # back earlier answers verbatim, the artifact and skill tools the agent's own
@@ -125,7 +137,8 @@ class TurnStep:
     # A step of an earlier turn of the conversation. It never holds a figure.
     # Its cells are read before this turn's, so the names, functions and data
     # they bound reach this turn's cells, and a cell of this turn computed
-    # from data such a cell read names it.
+    # from data such a cell read names it. Only the last MAX_EARLIER_CELLS
+    # such cells are read.
     earlier_turn: bool = False
 
 
@@ -269,8 +282,10 @@ _DOCUMENT = re.compile(
 _DS_VARIABLE = re.compile(r"\bDS_[A-Z0-9_]+")
 # A scratchpad action that clears the cell namespace the next cell reads.
 _NAMESPACE_RESETS = frozenset({"reset", "remove"})
-# How anton's result for a scratchpad call it refused to run begins: the call
-# was cut off, or went down with its round, and nothing ran.
+# How the result anton streams for a scratchpad call it refused to run begins
+# (anton core.session._discarded_tool_call_events): the call was cut off, or
+# went down with its round, and nothing ran. History rows mark such a result
+# is_error instead, and the formatter leaves those calls out.
 _DISCARDED_CALL = "[error] exec failed"
 # A scratchpad call's name argument, found in arguments too long to parse
 # whole: the cloud pod cuts them at its wire limit.
@@ -296,6 +311,10 @@ _REDACTED = "[redacted]"
 # quote or a space ends the match, so it never runs past a string literal in
 # SQL.
 _USERINFO = re.compile(r"(://)(?:[^\s/?#'\"@:]{0,256}:[^\s'\"]{0,1024}|[^\s/?#'\"@]{0,256})@")
+# A password longer than _USERINFO's window: the user and everything after
+# its : is masked, up to the next space or quote. A long path after a
+# host:port is masked too.
+_LONG_USERINFO = re.compile(r"(://)[^\s/?#'\"@:]{0,256}:[^\s'\"]{1025,}+")
 # The same, for a password that holds a doubled quote, as SQL writes a quote
 # inside a string literal: Pa''ss. The lookahead finds the doubled quote
 # before the slower match runs.
@@ -323,19 +342,20 @@ _QUERY_STRING = re.compile(r"(://[^\s'\"?#]{0,2048}+)[?#][^\s'\"]*+")
 # where a word starts: password, Pwd, s3_secret_access_key, X-Api-Key,
 # private_key, passphrase, AccountKey. "pass" counts only as the key's last
 # part (pass, db_pass), so pass_rate and passenger are not secret keys.
-_SECRET_KEY = (
+_SENSITIVE_NAME = (
     r"(?<![\w.-])[\w.-]{0,64}(?:password|passwd|passphrase|pwd|secret|token|api[_-]?key|access[_-]?key"
     r"|account[_-]?key|private[_-]?key|authorization|credential|cookie|(?<![a-z0-9])pass(?![\w.-]))[\w.-]{0,64}+"
 )
-# What joins a key to its value: =, :, or => as Ruby and PHP write it.
-_ASSIGN = r"[ \t]*(?:=>|[:=])[ \t]*"
+# What joins a key to its value: =, :, or => as Ruby and PHP write it. Once
+# => matched, the = is never read alone, which would take the > as a value.
+_ASSIGN = r"[ \t]*(?>=>|[:=])[ \t]*"
 # A secret key's value in quotes after its key, the key quoted or not:
 # password='a b c', "token": "x", 'Authorization': 'Bearer x'. A doubled
 # quote inside the value is a quote, as SQL writes it. The quotes stay, so the
 # SQL around the value still reads. An unclosed value runs to the end of its
 # line.
 _QUOTED_SECRET = re.compile(
-    rf"(?P<key>(?<![\w.-])[\"']?{_SECRET_KEY}[\"']?{_ASSIGN})"
+    rf"(?P<key>(?<![\w.-])[\"']?{_SENSITIVE_NAME}[\"']?{_ASSIGN})"
     r"(?:(?P<single>')(?:''|\\.|[^'\n\\])*+(?P<single_close>')?"
     r"|(?P<double>\")(?:\"\"|\\.|[^\"\n\\])*+(?P<double_close>\")?)",
     re.IGNORECASE,
@@ -345,7 +365,7 @@ _QUOTED_SECRET = re.compile(
 # scheme before the value (Basic, Bearer, Token, any word followed by a
 # token-shaped value) is redacted with it.
 _BARE_SECRET = re.compile(
-    rf"(?P<key>{_SECRET_KEY}{_ASSIGN})"
+    rf"(?P<key>{_SENSITIVE_NAME}{_ASSIGN})"
     r"(?:[A-Za-z][\w-]{0,31}[ \t]+(?=[A-Za-z0-9._~+/=-]{8}))?"
     r"[^\s,;&'\"](?:[^\s,;&'\"]|['\"](?=[^\s,;&)\]}'\"]))*+",
     re.IGNORECASE,
@@ -373,6 +393,17 @@ _SECRET_SHAPE = re.compile(
 _JSON = json.JSONDecoder()
 
 
+def has_figures(answer: str) -> bool:
+    """Whether ``answer`` holds a figure ``find_figure_sources`` would list."""
+    return bool(_numbers(answer, skips=_skipped_spans(answer), prose=True))
+
+
+def ran_cell(step: TurnStep) -> bool:
+    """Whether the step is a scratchpad cell anton ran: an exec call it did
+    not discard."""
+    return step.tool_name == "scratchpad" and step.action == "exec" and not step.content.startswith(_DISCARDED_CALL)
+
+
 def find_figure_sources(
     *, answer: str, question: str, steps: Sequence[TurnStep], files: AgentFiles | None = None,
 ) -> FigureSources:
@@ -391,15 +422,17 @@ def find_figure_sources(
     outputs = [_output_values(step.output_numbers) for step in described]
     index_of: dict[str, int] = {}
     for index, step in enumerate(described):
-        index_of.setdefault(step.tool_use_id, index)
+        if step.tool_use_id:
+            index_of.setdefault(step.tool_use_id, index)
     asked = _numbers(question, skips=_skipped_spans(question), prose=True)
     named: set[int] = set()
     figures: list[Figure] = []
     for number in numbers:
-        holders = _holders(described, outputs=outputs, figure=number)
+        held = _holders(described, outputs=outputs, figure=number)
+        holders = _named_holders(described, outputs=outputs, figure=number, holders=held)
         readers = _readers(described, holders=holders, index_of=index_of)
         named.update(holders, readers)
-        if holders:
+        if held:
             origin = FigureOrigin.step
         elif any(_same_form(value, figure=number) for value in asked):
             origin = FigureOrigin.question
@@ -485,12 +518,15 @@ class _ScratchpadCall:
 
 def _describe_steps(steps: Sequence[TurnStep]) -> list[_DescribedStep]:
     """Each step that can be a source, earlier turns' first and then this
-    turn's, each in step order. A scratchpad call is one only when it ran a
-    cell: anton runs no call it discarded, and another action's output
-    repeats earlier cells or is empty. A tool call is one only when the tool
-    is one of ``EVIDENCE_TOOLS``. Each scratchpad keeps what its cells bound
-    (``_Pad``) across cells and turns, until a reset or remove that ran."""
-    ordered = [step for step in steps if step.earlier_turn] + [step for step in steps if not step.earlier_turn]
+    turn's, each in step order. Of the earlier turns' steps, only those from
+    the ``MAX_EARLIER_CELLS``-th last cell that ran on are read. A scratchpad
+    call is one only when it ran a cell: anton runs no call it discarded, and
+    another action's output repeats earlier cells or is empty. A tool call is
+    one only when the tool is one of ``EVIDENCE_TOOLS``. Each scratchpad keeps
+    what its cells bound (``_Pad``) across cells and turns, until a reset or
+    remove that ran."""
+    earlier = [step for step in steps if step.earlier_turn]
+    ordered = [*_latest_cells(earlier, limit=MAX_EARLIER_CELLS), *(step for step in steps if not step.earlier_turn)]
     pads: dict[str, _Pad] = {}
     described: list[_DescribedStep] = []
     for step in ordered:
@@ -504,7 +540,7 @@ def _describe_steps(steps: Sequence[TurnStep]) -> list[_DescribedStep]:
         if step.action in _NAMESPACE_RESETS:
             pads.pop(call.pad, None)
             continue
-        if step.action != "exec":
+        if not ran_cell(step):
             continue
         cell = step.cell if step.cell is not None else _cell_result(step.content)
         code = call.code or (cell.code if cell is not None else "")
@@ -514,6 +550,13 @@ def _describe_steps(steps: Sequence[TurnStep]) -> list[_DescribedStep]:
         pad.record(reading, tool_use_id=step.tool_use_id)
         described.append(_describe_cell(step, code=code, reading=reading, cell=cell, drawn_from=drawn_from))
     return described
+
+
+def _latest_cells(steps: Sequence[TurnStep], *, limit: int) -> Sequence[TurnStep]:
+    """``steps`` from the ``limit``-th last cell that ran on, or all of them
+    when fewer cells ran."""
+    ran = [index for index, step in enumerate(steps) if ran_cell(step)]
+    return steps[ran[-limit]:] if len(ran) > limit else steps
 
 
 def _scratchpad_call(step: TurnStep) -> _ScratchpadCall:
@@ -718,18 +761,43 @@ def _readers(
 
 
 def _redacted(text: str) -> str:
-    """``text`` without credentials: known key shapes (``scrub_credentials``
-    and ``_SECRET_SHAPE``), a URL's user and password and an EZConnect
-    string's, the path of a URL that is itself a credential (a webhook's, a
-    bot's), a URL's query string and fragment, a bearer token, and the value
-    of any key=value, key: value or key => value pair whose key names a
-    secret, quoted or not, with the auth scheme before it. A quoted value
-    keeps its quotes."""
+    """``text`` with the credentials this sweep knows redacted. It is best
+    effort: it finds a secret by its key's name or its own shape, so a secret
+    under any other key name, one passed by position (ClickHouse's
+    ``s3(url, key_id, secret)``), or a token in the path of a URL on a host
+    ``_SECRET_URL_PATH`` does not list goes through as written.
+
+    It redacts:
+
+    - what ``scrub_credentials`` knows: the turn's registered connection
+      secrets, the provider keys the server holds, and mdb_, sk-, AIza and
+      AQ. keys;
+    - ``_SECRET_SHAPE``: AWS access key ids (AKIA, ASIA), GitHub tokens
+      (ghp_, gho_, ghu_, ghs_, ghr_, github_pat_), Slack tokens (xox?-,
+      xapp-), Stripe secret and restricted keys (sk_, rk_), Hugging Face
+      (hf_) and Google OAuth (ya29.) tokens, JWTs and PEM private keys;
+    - a URL's user and password (with a password longer than 1,024
+      characters, everything after the user up to the next space or quote),
+      an Oracle EZConnect string's password, a URL's query string and
+      fragment, and the path of a Slack, Discord, Teams, Zapier, IFTTT or
+      Telegram bot URL;
+    - a bearer token;
+    - the value of a key=value, key: value or key => value pair, quoted or
+      not, with any auth scheme before it, whose key's name holds password,
+      passwd, passphrase, pwd, secret, token, api key, access key, account
+      key, private key, authorization, credential or cookie, or whose last
+      part is pass, on its own or after _, - or . (pass, db_pass; not
+      dbpass) (``_SENSITIVE_NAME``). A quoted value keeps its quotes.
+
+    A connector whose credential has a key name or shape not listed here
+    adds it to ``_SENSITIVE_NAME`` or ``_SECRET_SHAPE``, with a case in
+    tests/test_figure_sources.py."""
     text = scrub_credentials(text)
     # Only text with a doubled quote can hold a password with one.
     if "''" in text or '""' in text:
         text = _QUOTED_USERINFO.sub(r"\1***@", text)
     text = _USERINFO.sub(r"\1***@", text)
+    text = _LONG_USERINFO.sub(r"\1***", text)
     text = _EZCONNECT.sub("***@", text)
     text = _SECRET_URL_PATH.sub(r"\g<service>***", text)
     text = _QUERY_STRING.sub(r"\1?...", text)
@@ -836,20 +904,27 @@ def _output_values(numbers: Sequence[_Number]) -> _OutputValues:
 
 
 def _holders(steps: Sequence[_DescribedStep], *, outputs: Sequence[_OutputValues], figure: _Number) -> list[int]:
-    """The steps whose output holds the figure, in step order. Past
-    MAX_FIGURE_SOURCES, the steps that print its exact value are kept before
-    those that print a value that only rounds to it."""
-    holders = [
+    """The steps whose output holds the figure, in step order."""
+    return [
         index for index, step in enumerate(steps)
         if _holds(step, values=outputs[index], figure=figure, tolerance=figure.tolerance)
     ]
-    if len(holders) <= MAX_FIGURE_SOURCES:
-        return holders
+
+
+def _named_holders(
+    steps: Sequence[_DescribedStep], *, outputs: Sequence[_OutputValues], figure: _Number, holders: Sequence[int],
+) -> list[int]:
+    """The holders the figure names: those with a tool_use_id, in step order.
+    Past MAX_FIGURE_SOURCES, the steps that print its exact value are kept
+    before those that print a value that only rounds to it."""
+    named = [index for index in holders if steps[index].tool_use_id]
+    if len(named) <= MAX_FIGURE_SOURCES:
+        return named
     exact = [
-        index for index in holders
+        index for index in named
         if _holds(steps[index], values=outputs[index], figure=figure, tolerance=Decimal(0))
     ]
-    rounded = [index for index in holders if index not in exact]
+    rounded = [index for index in named if index not in exact]
     return sorted((exact + rounded)[:MAX_FIGURE_SOURCES])
 
 

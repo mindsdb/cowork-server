@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import errno
+import json
 import logging
 import os
+from dataclasses import asdict
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from uuid import uuid4
 
 import pytest
+from anton.core.backends.base import Cell
 from sqlmodel import Session
 
 from cowork.common.settings.app_settings import get_app_settings
@@ -21,6 +24,7 @@ from cowork.harnesses.anton_harness.agent_files import (
     conversation_attachments,
     read_conversation_attachments,
 )
+from cowork.harnesses.anton_harness.figure_sources import SourceKind, TurnStep, find_figure_sources
 from cowork.services.files import FileService, attachment_purpose
 
 
@@ -41,6 +45,16 @@ def stored(tmp_path: Path) -> Attachment:
     path.parent.mkdir(parents=True)
     path.write_text("part,qty\nP100,999\n")
     return Attachment(file_id=file_id, stored_path=str(path))
+
+
+@pytest.fixture
+def artifacts(project: Path) -> Path:
+    """The project's artifacts folder, which a cloud pod sees at
+    /project-artifacts, holding report/data.csv."""
+    folder = project / ".anton" / "artifacts"
+    (folder / "report").mkdir(parents=True)
+    (folder / "report" / "data.csv").write_text("qty\n250\n")
+    return folder
 
 
 def _in_pod(project: Path, conversation_id, **kwargs) -> AgentFiles:
@@ -321,6 +335,109 @@ class TestATurnACloudPodRuns:
 
         assert _in_pod(project, mine).named_file(str(own)) is None
 
+    def test_a_file_the_pod_reads_in_the_projects_artifacts_is_named_by_its_project_path(
+        self, project: Path, artifacts: Path,
+    ):
+        conversation_id = uuid4()
+        (project / "conversations" / str(conversation_id)).mkdir(parents=True)
+
+        assert _in_pod(project, conversation_id).named_file("/project-artifacts/report/data.csv") == NamedFile(
+            path=".anton/artifacts/report/data.csv",
+        )
+
+    def test_it_names_the_path_a_turn_this_server_runs_names_for_the_same_artifact(
+        self, project: Path, artifacts: Path,
+    ):
+        conversation_id = uuid4()
+        (project / "conversations" / str(conversation_id)).mkdir(parents=True)
+
+        in_pod = _in_pod(project, conversation_id).named_file("/project-artifacts/report/data.csv")
+        here = AgentFiles.on_this_server(project).named_file(".anton/artifacts/report/data.csv")
+
+        assert in_pod == here
+
+    def test_without_the_projects_place_on_the_mount_the_artifacts_mount_names_nothing(
+        self, project: Path, artifacts: Path,
+    ):
+        # The turn's job then runs as the default project, so the pod's
+        # /project-artifacts holds that project's artifacts, not these.
+        conversation_id = uuid4()
+        (project / "conversations" / str(conversation_id)).mkdir(parents=True)
+        files = AgentFiles.in_cloud_pod(project, conversation_id=conversation_id, workspace_rel_path=None)
+
+        assert files.named_file("/project-artifacts/report/data.csv") is None
+
+    @pytest.mark.parametrize("literal", [
+        "/project-artifacts/../data/stock.csv",
+        "/project-artifacts/report/../../data/stock.csv",
+        "/project-artifacts/../../../data/stock.csv",
+    ])
+    def test_a_dotdot_above_the_artifacts_mount_names_nothing(self, project: Path, artifacts: Path, literal: str):
+        # The pod sees nothing of the project above its artifacts folder.
+        conversation_id = uuid4()
+        (project / "conversations" / str(conversation_id)).mkdir(parents=True)
+
+        assert _in_pod(project, conversation_id).named_file(literal) is None
+
+    def test_a_link_from_the_artifacts_into_a_conversations_folder_names_nothing(
+        self, project: Path, artifacts: Path,
+    ):
+        mine, theirs = uuid4(), uuid4()
+        (project / "conversations" / str(mine)).mkdir(parents=True)
+        (project / "conversations" / str(theirs)).mkdir(parents=True)
+        (project / "conversations" / str(theirs) / "notes.csv").write_text("a,b\n1,2\n")
+        (artifacts / "peek.csv").symlink_to(f"../../conversations/{theirs}/notes.csv")
+
+        assert _in_pod(project, mine).named_file("/project-artifacts/peek.csv") is None
+
+    def test_a_link_from_the_artifacts_to_the_pods_staged_attachment_names_nothing(
+        self, project: Path, artifacts: Path, stored: Attachment,
+    ):
+        # The pod's artifacts mount holds the link, not the folder it leads
+        # into, so the pod can't read through it.
+        conversation_id = uuid4()
+        staged = project / "conversations" / str(conversation_id) / "attachments" / stored.file_id / "stock.csv"
+        staged.parent.mkdir(parents=True)
+        staged.write_text(Path(stored.stored_path).read_text())
+        (artifacts / "att.csv").symlink_to(
+            f"../../conversations/{conversation_id}/attachments/{stored.file_id}/stock.csv",
+        )
+        files = _in_pod(project, conversation_id, attachments=[stored])
+
+        assert files.named_file("/project-artifacts/att.csv") is None
+        assert files.named_file(f"attachments/{stored.file_id}/stock.csv") == NamedFile(attachment_id=stored.file_id)
+
+    def test_an_artifact_at_an_attachments_staged_place_is_named_by_its_project_path(
+        self, project: Path, artifacts: Path, stored: Attachment,
+    ):
+        # The server stages attachments in the conversation's folder only, so
+        # a file the artifacts folder holds at the same place is an artifact.
+        conversation_id = uuid4()
+        (project / "conversations" / str(conversation_id)).mkdir(parents=True)
+        lookalike = artifacts / "attachments" / stored.file_id / "stock.csv"
+        lookalike.parent.mkdir(parents=True)
+        lookalike.write_text("part,qty\nP100,7\n")
+        files = _in_pod(project, conversation_id, attachments=[stored])
+
+        assert files.named_file(f"/project-artifacts/attachments/{stored.file_id}/stock.csv") == NamedFile(
+            path=f".anton/artifacts/attachments/{stored.file_id}/stock.csv",
+        )
+
+    @pytest.mark.parametrize("literal", [
+        "../../data/stock.csv",
+        "/mnt/cowork-shared/projects/general/data/stock.csv",
+        "/project-artifacts/../data/stock.csv",
+    ])
+    def test_a_project_files_upload_the_pod_cannot_see_names_nothing(
+        self, project: Path, artifacts: Path, literal: str,
+    ):
+        # A Project files upload sits in the project, outside the
+        # conversation's folder and the artifacts folder the pod mounts.
+        conversation_id = uuid4()
+        (project / "conversations" / str(conversation_id)).mkdir(parents=True)
+
+        assert _in_pod(project, conversation_id).named_file(literal) is None
+
     def test_the_turn_carries_its_projects_id(self, project: Path):
         project_id = uuid4()
 
@@ -378,6 +495,30 @@ class TestAFileAttachedToAConversationACloudPodRuns:
         assert _in_pod(project, staged, attachments=[stored]).named_file(
             f"attachments/{stored.file_id}/stock.csv",
         ) == NamedFile(path=f"conversations/{staged}/notes.csv")
+
+
+class TestAFigureACloudPodReadsFromTheProjectsArtifacts:
+    def test_its_step_names_the_artifact_by_its_project_path(self, project: Path):
+        conversation_id = uuid4()
+        (project / "conversations" / str(conversation_id)).mkdir(parents=True)
+        (project / ".anton" / "artifacts" / "stock").mkdir(parents=True)
+        (project / ".anton" / "artifacts" / "stock" / "data.csv").write_text("part,site,qty\nP100,S1,250\n")
+        code = "import pandas as pd\nprint(pd.read_csv('/project-artifacts/stock/data.csv'))"
+        cell = TurnStep(
+            tool_use_id="toolu_read",
+            tool_name="scratchpad",
+            action="exec",
+            tool_input=json.dumps({"action": "exec", "name": "main", "code": code}),
+            content=json.dumps(asdict(Cell(
+                code=code, stdout="part site qty\nP100 S1 250\n", stderr="", error=None, description="",
+            ))),
+        )
+
+        [step] = find_figure_sources(
+            answer="S1 holds 250 units.", question="", steps=[cell], files=_in_pod(project, conversation_id),
+        ).steps
+
+        assert (step.kind, step.path) == (SourceKind.file, ".anton/artifacts/stock/data.csv")
 
 
 class TestAProjectPathOnWindows:

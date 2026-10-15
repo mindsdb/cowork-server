@@ -43,7 +43,18 @@ its own, not where it binds it, so a base query that ``+``, ``+=`` or an
 f-string extends is not one. A candidate counts when, past its comments, it
 starts with SELECT or a WITH ... AS ( common table expression, reads FROM, and
 does not end like a sentence: that drops ``df.query('qty > 5')``, DDL, writes
-and a printed label such as ``"With rows from stock.csv:"``.
+and a printed label such as ``"With rows from stock.csv:"``. A candidate that
+counts is split at each ``;`` outside a string literal, a quoted name, a
+dollar-quoted string or a comment, and a statement is listed only when it
+counts by the same rule, so a statement after a query in the same string (DDL
+that sets a password, a write) is not. The split is read twice, with a
+backslash in quotes escaping the next character, as MySQL reads it, and as an
+ordinary character, as Postgres and SQLite read it; when the two split a
+candidate differently, nothing from it is listed. A following statement is
+listed with the query only where the database ends a statement at a ``;``
+that both readings put inside a literal, a quoted name or a comment, such as
+a ``;`` after a quote in a MySQL ``#`` comment, or after a ``--`` that MySQL
+reads as two minus signs (``1--1``).
 
 A function the cell defines keeps the queries, requests and environment reads
 its body shows, so a later cell that calls it makes them too. Each name the
@@ -62,6 +73,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import partial
+from itertools import pairwise
 from types import MappingProxyType
 
 MAX_QUERIES = 3
@@ -135,6 +147,21 @@ _SQL_CTE = re.compile(
     re.IGNORECASE,
 )
 _SQL_FROM = re.compile(r"\bfrom\b", re.IGNORECASE)
+# A name in backticks or brackets, a dollar-quoted string, which only the
+# $tag$ that opened it closes (a $ inside a name and a $1 parameter open
+# none), or a comment, inside which a ; ends no statement, or a ; that does.
+# A name, string or comment left open runs to the end of the text, so the
+# scan stays linear.
+_SQL_TOKEN_REST = (
+    r"`[^`]*+`?|\[[^\]]*+\]?|(?<![\w$])\$(?P<tag>(?:[A-Za-z_]\w*)?)\$.*?(?:\$(?P=tag)\$|\Z)"
+    r"|--[^\n]*+|/\*.*?(?:\*/|\Z)|;"
+)
+# Those, or a string in single or double quotes read with a backslash
+# escaping the next character, as MySQL reads one.
+_SQL_TOKEN_ESCAPED = re.compile(r"'(?:''|\\.|[^'\\])*+'?|\"(?:\"\"|\\.|[^\"\\])*+\"?|" + _SQL_TOKEN_REST, re.DOTALL)
+# Those, or a string in single or double quotes read with a backslash as an
+# ordinary character, as Postgres and SQLite read one.
+_SQL_TOKEN_PLAIN = re.compile(r"'(?:''|[^'])*+'?|\"(?:\"\"|[^\"])*+\"?|" + _SQL_TOKEN_REST, re.DOTALL)
 
 URL_START = re.compile(r"https?://", re.IGNORECASE)
 # A URL with a scheme and a host but no path, which can carry no token.
@@ -1115,9 +1142,37 @@ class _CellReader(ast.NodeVisitor):
 
 def _queries(texts: Iterable[str]) -> tuple[str, ...]:
     """Up to MAX_QUERIES distinct SQL statements among ``texts``, in order,
-    dedented and stripped."""
-    statements = (textwrap.dedent(text).strip() for text in dict.fromkeys(texts) if is_sql(text))
+    dedented and stripped. A text that reads as a query is split into its
+    statements (_statements), and only those that read as a query themselves
+    are listed, so a statement after a query in the same text (DDL that sets
+    a password, a write) is listed only where the database ends a statement
+    at a ``;`` that _statements reads as inside a literal, a quoted name or a
+    comment."""
+    statements = (
+        textwrap.dedent(statement).strip()
+        for text in dict.fromkeys(texts) if is_sql(text)
+        for statement in _statements(text) if is_sql(statement)
+    )
     return tuple(_first_unique(statements, limit=MAX_QUERIES))
+
+
+def _statements(text: str) -> list[str]:
+    """``text`` split after each ``;`` outside a string literal, a quoted
+    name, a dollar-quoted string or a comment; each statement keeps its
+    ``;``. Empty when a backslash in a string in single or double quotes moves
+    a split: MySQL reads it as escaping the next character, Postgres and
+    SQLite as an ordinary one, so where each statement ends depends on the
+    database that runs the text."""
+    ends = _statement_ends(text, token=_SQL_TOKEN_ESCAPED)
+    if ends != _statement_ends(text, token=_SQL_TOKEN_PLAIN):
+        return []
+    return [text[start:end] for start, end in pairwise([0, *ends, len(text)])]
+
+
+def _statement_ends(text: str, *, token: re.Pattern[str]) -> list[int]:
+    """Where each statement in ``text`` ends, just past each ``;`` that
+    ``token`` reads as one."""
+    return [match.end() for match in token.finditer(text) if match.group() == ";"]
 
 
 def _only_labels(strings: Sequence[str], *, labels: set[int]) -> tuple[str, ...]:

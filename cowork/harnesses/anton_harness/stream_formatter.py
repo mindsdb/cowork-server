@@ -27,7 +27,16 @@ from typing import Annotated, Any, AsyncIterator, Callable, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
-from cowork.harnesses.anton_harness.figure_sources import CellResult, FigureSources, TurnStep, find_figure_sources
+from cowork.harnesses.anton_harness.figure_sources import (
+    EVIDENCE_TOOLS,
+    CellResult,
+    FigureSources,
+    TurnStep,
+    find_figure_sources,
+    has_figures,
+    ran_cell,
+)
+from cowork.schemas.figure_sources import FigureOrigin
 from cowork.schemas.responses import (
     Response,
     ResponseOutput,
@@ -87,9 +96,11 @@ class TurnContext:
     conversation's earlier messages as the model is seeded with them. Its
     cells pass the names, functions and data they bound on to this turn's
     cells, so a figure that a cell of this turn computed from data an earlier
-    turn's cell read names that cell too. An earlier turn's step never holds
-    a figure itself: a figure the answer only repeats from an earlier turn
-    has no source."""
+    turn's cell read names that cell too. The formatter reads it only when
+    the answer has figures and this turn ran a cell, and then only its last
+    figure_sources.MAX_EARLIER_CELLS cells; no figure's origin depends on it.
+    An earlier turn's step never holds a figure itself: a figure the answer
+    only repeats from an earlier turn has no source."""
 
     question: str
     files: AgentFiles | None = None
@@ -112,6 +123,13 @@ class TurnEvidence:
     tool_rows: list = field(default_factory=list)
     history: list[dict] = field(default_factory=list)
     files: AgentFiles | None = None
+    # The tool_use_ids of this turn's EVIDENCE_TOOLS calls, as the stream
+    # announced them. Their results reach the formatter only in tool_rows.
+    evidence_calls: tuple[str, ...] = ()
+    # Whether anton compacted the turn's context mid-way (the stream carried
+    # a StreamContextCompacted), after which no producer sends the turn's
+    # tool rows.
+    compacted: bool = False
 
 
 @dataclass
@@ -194,7 +212,8 @@ def classify_cell_status(content: str) -> str:
     return "ok"
 
 
-# anton's reply when every attempt at the turn failed: its error, not an answer.
+# anton's reply when every attempt at the turn failed: its error, not an answer
+# (the fallback reply in anton core.session's turn loop).
 _ANTON_FAILURE_REPLY = "An unexpected error occurred: "
 
 # The header over each block the client appends, for the agent only, to the
@@ -204,7 +223,12 @@ _APPENDED_CONTEXT = re.compile(r"^\[[^\n]*Anton-only context[^\n]*\]$", re.MULTI
 
 # anton hands the model a cell's result in labeled parts (format_cell_result):
 # what the cell printed under [output], then [logs], [stderr] and [error].
-_CELL_RESULT_PART = re.compile(r"^\[(?:output|logs|stderr|error)\]\n", re.MULTILINE)
+# anton's session appends [artifact lint] after a cell that changed an
+# artifact.
+_CELL_RESULT_PART = re.compile(r"^\[(?:output|logs|stderr|error|artifact lint)\]\n", re.MULTILINE)
+# The note format_cell_result puts after printed output it cut short, with
+# the line breaks before the next part.
+_TRUNCATION_NOTE = re.compile(r"\n\n\.\.\. \(truncated, \d+ chars total\)\n*\Z")
 
 
 class _HistoryRow(BaseModel):
@@ -244,6 +268,10 @@ class _ToolResultBlock(BaseModel):
     type: Literal["tool_result"]
     tool_use_id: str
     content: str | list[_ResultPart] = ""
+    # anton marks a result is_error only when it answered the call itself
+    # without running it: arguments it refused, or a call an error cut off.
+    # None of such a result is the tool's output.
+    is_error: bool = False
 
     @property
     def text(self) -> str:
@@ -284,17 +312,38 @@ async def find_answer_sources(evidence: TurnEvidence) -> FigureSources:
 
 
 def _answer_sources(evidence: TurnEvidence) -> FigureSources:
-    """find_answer_sources's work, run in a worker thread."""
+    """find_answer_sources's work, run in a worker thread. An answer with no
+    figures reads none of the turn's rows or history."""
+    if not has_figures(evidence.answer):
+        return FigureSources()
     streamed_ids = {step.tool_use_id for step in evidence.steps}
     from_rows = [step for step in _row_steps(evidence.tool_rows) if step.tool_use_id not in streamed_ids]
-    # Oldest first, so the names, functions and data earlier turns' cells
-    # bound reach this turn's cells. An earlier turn's step never holds a
-    # figure.
-    earlier = [replace(step, earlier_turn=True) for step in _row_steps(evidence.history)]
-    question = "\n".join([_typed_text(evidence.question), *evidence.answers])
-    return find_figure_sources(
-        answer=evidence.answer, question=question, steps=[*earlier, *evidence.steps, *from_rows], files=evidence.files,
+    this_turn = [*evidence.steps, *from_rows]
+    # An earlier turn's cells only pass names, functions and data on to this
+    # turn's cells, so a turn that ran no cell reads none of them. Oldest
+    # first, so what they bound reaches this turn's cells. An earlier turn's
+    # step never holds a figure.
+    earlier = (
+        [replace(step, earlier_turn=True) for step in _row_steps(evidence.history)]
+        if any(ran_cell(step) for step in this_turn) else []
     )
+    question = "\n".join([_typed_text(evidence.question), *evidence.answers])
+    sources = find_figure_sources(
+        answer=evidence.answer, question=question, steps=[*earlier, *this_turn], files=evidence.files,
+    )
+    if evidence.compacted and evidence.evidence_calls:
+        held = streamed_ids | _row_result_ids(evidence.tool_rows)
+        if any(call not in held for call in evidence.evidence_calls):
+            # A turn that compacts mid-way sends no tool rows, so a web page
+            # or file it read may be missing from them, and a figure no step
+            # holds may be one it read: such a figure gets no mark rather
+            # than "no source". A turn that did not compact holds every call
+            # that ran; a call missing there never ran, as in a round anton
+            # threw away and retried.
+            return sources.model_copy(update={
+                "figures": [figure for figure in sources.figures if figure.origin != FigureOrigin.none],
+            })
+    return sources
 
 
 def _typed_text(text: str) -> str:
@@ -306,6 +355,7 @@ def _typed_text(text: str) -> str:
 def _row_steps(rows: Sequence[object]) -> list[TurnStep]:
     """Each tool call in history rows (an assistant row's tool_use blocks, a
     user row's tool_result blocks) that has its result there, in call order.
+    A call whose result anton marked is_error never ran, so it is left out.
     The matcher decides which tools' calls are steps
     (figure_sources.EVIDENCE_TOOLS)."""
     calls: dict[str, _ToolUseBlock] = {}
@@ -318,7 +368,7 @@ def _row_steps(rows: Sequence[object]) -> list[TurnStep]:
     steps = []
     for tool_use_id, call in calls.items():
         result = results.get(tool_use_id)
-        if result is None:
+        if result is None or result.is_error:
             continue
         cell = None
         action = ""
@@ -335,6 +385,12 @@ def _row_steps(rows: Sequence[object]) -> list[TurnStep]:
             cell=cell,
         ))
     return steps
+
+
+def _row_result_ids(rows: Sequence[object]) -> set[str]:
+    """The tool_use_ids of every tool result in history rows, is_error ones
+    included: a call anton answered itself has its result there too."""
+    return {block.tool_use_id for block in _row_blocks(rows) if isinstance(block, _ToolResultBlock)}
 
 
 def _row_blocks(rows: Sequence[object]) -> Iterator[_ToolUseBlock | _ToolResultBlock]:
@@ -365,12 +421,13 @@ def _cell_arguments(arguments: dict[str, Any]) -> _CellArguments:
 def _replayed_cell(result: str, *, arguments: _CellArguments) -> CellResult:
     """A cell's result as history rows hold it: its code and description
     from the call's arguments, and what it printed, the [output] part,
-    without the logs, stderr and error the model saw beside it."""
+    without the logs, stderr, error and artifact lint the model saw beside
+    it, or the note on how long output cut short was."""
     stdout = ""
     if result.startswith("[output]\n"):
         printed = result[len("[output]\n"):]
         next_part = _CELL_RESULT_PART.search(printed)
-        stdout = printed[:next_part.start()] if next_part else printed
+        stdout = _TRUNCATION_NOTE.sub("", printed[:next_part.start()] if next_part else printed)
     return CellResult(code=arguments.code, stdout=stdout, description=arguments.one_line_description)
 
 
@@ -475,7 +532,11 @@ async def format_responses_stream(
     turn_context = TurnContext(question="")
     user_answers: list[str] = []
     tool_rows: list = []
-    # Set when the answer is anton's failure reply, which carries no figures.
+    evidence_calls: list[str] = []
+    compacted = False
+    # Whether the turn's last text is anton's failure reply, which carries no
+    # figures. anton streams that reply as one delta and ends the turn on it,
+    # so each delta with visible text sets or clears this.
     failure_reply = False
 
     resp = Response(id=resp_id, model=model, status=ResponseStatus.created)
@@ -489,8 +550,8 @@ async def format_responses_stream(
 
     async for event in event_stream:
         if isinstance(event, StreamTextDelta):
-            if event.text.startswith(_ANTON_FAILURE_REPLY):
-                failure_reply = True
+            if event.text.strip():
+                failure_reply = event.text.startswith(_ANTON_FAILURE_REPLY)
             # `.strip()`, not truthiness: a lone newline is text enough to
             # satisfy the latch and not enough to be an answer, so spending it
             # there leaves a blank message where the user had read a real one.
@@ -534,6 +595,8 @@ async def format_responses_stream(
         elif isinstance(event, StreamToolUseStart):
             tool_names[event.id] = event.name
             tool_json_parts[event.id] = []
+            if event.name in EVIDENCE_TOOLS:
+                evidence_calls.append(event.id)
             if "scratchpad" in event.name:
                 role = Role.thought_scratchpad_start.value
             elif "memorize" in event.name:
@@ -804,6 +867,7 @@ async def format_responses_stream(
             })
 
         elif isinstance(event, StreamContextCompacted):
+            compacted = True
             seq += 1
             yield _event("response.in_progress", {
                 "type": "response.in_progress",
@@ -912,6 +976,8 @@ async def format_responses_stream(
         tool_rows=tool_rows,
         history=turn_context.history,
         files=turn_context.files,
+        evidence_calls=tuple(evidence_calls),
+        compacted=compacted,
     ))
     if sources.figures:
         seq += 1

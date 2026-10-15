@@ -5,15 +5,19 @@ import logging
 import time
 from dataclasses import asdict, replace
 from pathlib import Path
+from urllib.parse import quote
 from uuid import uuid4
 
 import pytest
 from anton.cloud_turn.__main__ import _clip_result_content
 from anton.core.backends.base import Cell
+from anton.core.llm.provider import StreamToolResult, ToolCall
+from anton.core.session import _discarded_tool_call_events
 
 from cowork.harnesses.anton_harness import figure_sources as figure_sources_mod
 from cowork.harnesses.anton_harness.agent_files import AgentFiles, Attachment, NamedFile
 from cowork.harnesses.anton_harness.figure_sources import (
+    MAX_EARLIER_CELLS,
     MAX_FIGURE_SOURCES,
     MAX_LABELED_DOCUMENTS,
     MAX_QUERY_CHARS,
@@ -27,6 +31,11 @@ from cowork.harnesses.anton_harness.figure_sources import (
     TurnStep,
     find_figure_sources,
 )
+
+# The current code reads each timed input in about a second or less on a
+# laptop under coverage, so a CI runner several times slower still passes; the
+# slow form each test guards against takes 15 s or more on the same laptop.
+TIME_BOUND_SECONDS = 5.0
 
 
 def _cell(tool_use_id: str, *, code: str, stdout: str, description: str = "", pad: str = "main") -> TurnStep:
@@ -59,8 +68,16 @@ def _earlier(step: TurnStep) -> TurnStep:
     return replace(step, earlier_turn=True)
 
 
-# anton's result for a call it refused to run because its round was cut off.
-DISCARDED = "[error] exec failed — Discarded: the round it belonged to was cut off"
+def _discarded(tool_use_id: str, *, action: str, code: str = "") -> TurnStep:
+    """A scratchpad call anton refused to run, with the result it streams for
+    it in the call's place."""
+    tool_input = {"action": action, "name": "main", **({"code": code} if code else {})}
+    events = _discarded_tool_call_events(ToolCall(id=tool_use_id, name="scratchpad", input=tool_input, repaired=True))
+    [result] = [event for event in events if isinstance(event, StreamToolResult)]
+    return TurnStep(
+        tool_use_id=tool_use_id, tool_name="scratchpad", action=action, tool_input=json.dumps(tool_input),
+        content=result.content,
+    )
 
 
 READ_STOCK = _cell(
@@ -351,6 +368,26 @@ class TestReadTextFile:
 
         assert _origins(sources) == [("4096", FigureOrigin.none), ("250", FigureOrigin.step)]
 
+    @pytest.mark.parametrize(("stop", "shortened"), [("done", 0), ("page", 0), ("chars", 0), ("page", 2)])
+    def test_antons_header_and_long_line_mark_are_not_the_files_text(self, stop: str, shortened: int):
+        """The header and mark as anton's read_text_file writes them. Skipped
+        with an anton that has no read_text_file."""
+        text_file = pytest.importorskip("anton.core.tools.text_file")
+        line = "P100," + "x" * 5_000 + ",250"
+        content = text_file.TextRange(
+            path="data/stock.csv", total_lines=900, first=1, last=2, body=f"part,qty\n{text_file._shorten(line)}\n",
+            stop=stop, shortened=shortened,
+        ).render()
+        step = _tool("toolu_t", "read_text_file", {"path": "data/stock.csv"}, content)
+
+        sources = find_figure_sources(
+            answer=f"900 lines, {len(line)} characters; S1 holds 250.", question="", steps=[step],
+        )
+
+        assert _origins(sources) == [
+            ("900", FigureOrigin.none), (str(len(line)), FigureOrigin.none), ("250", FigureOrigin.step),
+        ]
+
 
 class TestQueriesAcrossCells:
     def test_a_query_an_earlier_cell_spelled_is_the_later_cells(self):
@@ -376,7 +413,7 @@ class TestQueriesAcrossCells:
 
     def test_a_reset_anton_discarded_keeps_the_strings_its_cells_bound(self):
         spell = _cell("toolu_1", code="sql = 'SELECT qty FROM stock'", stdout="")
-        discarded = _scratchpad("toolu_reset", action="reset", content=DISCARDED)
+        discarded = _discarded("toolu_reset", action="reset")
         run = _cell("toolu_2", code="cur.execute(sql)\nprint(cur.fetchone()[0])", stdout="250\n")
 
         step = find_figure_sources(answer="S1 holds 250.", question="", steps=[spell, discarded, run]).steps[0]
@@ -385,7 +422,7 @@ class TestQueriesAcrossCells:
 
     def test_a_cell_anton_discarded_neither_binds_names_nor_is_a_step(self):
         spell = _cell("toolu_1", code="sql = 'SELECT qty FROM stock'", stdout="")
-        discarded = _scratchpad("toolu_x", action="exec", content=DISCARDED, code="sql = 'SELECT 250 FROM other'")
+        discarded = _discarded("toolu_x", action="exec", code="sql = 'SELECT 250 FROM other'")
         run = _cell("toolu_2", code="cur.execute(sql)\nprint(cur.fetchone()[0])", stdout="250\n")
 
         sources = find_figure_sources(answer="S1 holds 250.", question="", steps=[spell, discarded, run])
@@ -596,6 +633,65 @@ class TestEarlierTurns:
         sources = find_figure_sources(answer="340 units in all.", question="", steps=[load, total])
 
         assert [s.tool_use_id for s in _figure(sources, "340").sources] == ["toolu_new", "toolu_old"]
+
+    @pytest.mark.parametrize(("cells_after", "named"), [
+        (MAX_EARLIER_CELLS - 1, ["toolu_new", "toolu_old"]),
+        (MAX_EARLIER_CELLS, ["toolu_new"]),
+    ])
+    def test_only_the_latest_earlier_cells_are_read(self, cells_after: int, named: list[str]):
+        load = _earlier(_cell("toolu_old", code="df = pd.read_csv('stock.csv')", stdout=""))
+        after = [_earlier(_cell(f"toolu_{i}", code=f"x_{i} = {i}", stdout="")) for i in range(cells_after)]
+        total = _cell("toolu_new", code="print(df.qty.sum())", stdout="340\n")
+
+        sources = find_figure_sources(answer="340 units in all.", question="", steps=[load, *after, total])
+
+        assert _figure(sources, "340").origin is FigureOrigin.step
+        assert [s.tool_use_id for s in _figure(sources, "340").sources] == named
+
+
+class TestStepsWithNoId:
+    """The client opens a step by its tool_use_id, so a step without one is
+    never named."""
+
+    def test_a_figure_only_a_step_with_no_id_holds_is_sourced_but_names_no_step(self):
+        unnamed = replace(READ_STOCK, tool_use_id="")
+
+        sources = find_figure_sources(answer="S1 holds 250 units.", question="", steps=[unnamed])
+
+        assert _figure(sources, "250").origin is FigureOrigin.step
+        assert _figure(sources, "250").sources == []
+        assert sources.steps == []
+
+    def test_a_step_with_no_id_takes_none_of_the_places_a_figure_names(self):
+        steps = [
+            _cell("", code="print(v)", stdout="250\n"),
+            *(_cell(f"toolu_{i}", code="print(v)", stdout="250\n") for i in range(MAX_FIGURE_SOURCES)),
+        ]
+
+        sources = find_figure_sources(answer="S1 holds 250 units.", question="", steps=steps)
+
+        expected = [f"toolu_{i}" for i in range(MAX_FIGURE_SOURCES)]
+        assert [s.tool_use_id for s in _figure(sources, "250").sources] == expected
+        assert [step.tool_use_id for step in sources.steps] == expected
+
+    def test_an_earlier_turns_cell_with_no_id_is_not_named_as_the_one_that_read_the_data(self):
+        load = _earlier(_cell("", code="df = pd.read_csv('stock.csv')", stdout=""))
+        total = _cell("toolu_b", code="print(df.qty.sum())", stdout="340\n")
+
+        sources = find_figure_sources(answer="340 units in all.", question="", steps=[load, total])
+
+        assert _figure(sources, "340").sources == [FigureSource(tool_use_id="toolu_b")]
+        assert [step.tool_use_id for step in sources.steps] == ["toolu_b"]
+
+    def test_the_cells_a_step_with_no_id_read_from_are_not_named_either(self):
+        load = _cell("toolu_load", code="df = pd.read_csv('stock.csv')", stdout="")
+        total = _cell("", code="print(df.qty.sum())", stdout="340\n")
+
+        sources = find_figure_sources(answer="340 units in all.", question="", steps=[load, total])
+
+        assert _figure(sources, "340").origin is FigureOrigin.step
+        assert _figure(sources, "340").sources == []
+        assert sources.steps == []
 
 
 class TestFilePaths:
@@ -1019,6 +1115,11 @@ class TestSecretsInQueries:
             "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=XyZm9vYmFyU2VjcmV0==;EndpointSuffix=core.windows.net",
             "XyZm9vYmFyU2VjcmV0",
         ),
+        ("pat=github_pat_11ABCDEFG0123456789_abcdefghijXyZ", "abcdefghijXyZ"),
+        ("gh=gho_" + "XyZ1" * 9, "XyZ1XyZ1XyZ1"),
+        ("rk=rk_test_51HXyZabcdefghij", "XyZabcdefghij"),
+        ("slack=xoxp-1234567890-XyZslackuser", "XyZslackuser"),
+        ("Bearer XyZabcdefghijk", "XyZabcdefghijk"),
     ])
     def test_a_credential_shape_in_sql_is_never_sent(self, literal: str, secret: str):
         sql = f"SELECT qty FROM read_source('{literal}')"
@@ -1031,8 +1132,78 @@ class TestSecretsInQueries:
         assert step_out.queries[0].endswith("')")
         assert secret not in event
 
+    @pytest.mark.parametrize("form", ["{key}='XyZv9alue'", '"{key}": "XyZv9alue"', "{key}=XyZv9alue"])
+    @pytest.mark.parametrize("key", [
+        "password", "passwd", "passphrase", "pwd", "secret", "token", "api_key", "apikey", "X-Api-Key", "access_key",
+        "account_key", "private_key", "authorization", "credential", "cookie", "pass", "db_pass",
+    ])
+    def test_each_listed_key_word_is_redacted(self, key: str, form: str):
+        sql = f"SELECT qty FROM read_source({form.format(key=key)})"
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        assert "XyZv9alue" not in _event(step)
+
+    @pytest.mark.parametrize("length", [1_025, 5_000])
+    def test_a_url_password_longer_than_the_userinfo_window_is_masked(self, length: int):
+        sql = f"SELECT qty FROM postgres_scan('postgres://u:{'p' * length}@db.example/x', 'public', 'stock')"
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        event = _event(step)
+
+        assert "ppppp" not in event
+        assert "u:" not in event
+
+    def test_a_percent_encoded_token_as_a_url_password_is_masked(self):
+        """An RDS IAM auth token, percent-encoded as a database URL needs it."""
+        token = quote(
+            "db.example.rds.amazonaws.com:5432/?Action=connect&DBUser=u&X-Amz-Algorithm=AWS4-HMAC-SHA256"
+            "&X-Amz-Date=20261015T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host"
+            "&X-Amz-Security-Token=" + "IQoJb3JpZ2luX2VjE" * 60 + "&X-Amz-Signature=XyZsignature0123456789",
+            safe="",
+        )
+        sql = f"SELECT qty FROM postgres_scan('postgresql://u:{token}@db.example.rds.amazonaws.com:5432/db', 'public', 'stock')"
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        event = _event(step)
+
+        for secret in ("X-Amz-Security-Token", "IQoJb3JpZ2luX2VjE", "X-Amz-Signature", "XyZsignature"):
+            assert secret not in event
+
+    @pytest.mark.parametrize("call", [
+        "print(query_minds_data({sql!r}).qty.sum())", "cur.execute({sql!r})\nprint(cur.fetchone()[0])",
+    ], ids=["query_minds_data", "cursor"])
+    @pytest.mark.parametrize(("sql", "sent"), [
+        ("SELECT qty FROM stock; CREATE USER app IDENTIFIED BY 'XyZhunter2'", ["SELECT qty FROM stock;"]),
+        ("SELECT qty FROM stock; ALTER USER root WITH PASSWORD 'XyZhunter2'", ["SELECT qty FROM stock;"]),
+        ("SELECT qty FROM stock; SET PASSWORD FOR app = 'XyZhunter2'", ["SELECT qty FROM stock;"]),
+        # Postgres and SQLite read 'C:\' as a closed literal, MySQL as an
+        # open one, so where the query ends depends on the database.
+        ("SELECT qty FROM stock WHERE p = 'C:\\'; ALTER USER bob WITH PASSWORD 'XyZhunter2'", []),
+    ], ids=["create-user", "alter-user", "set-password", "after-a-backslash"])
+    def test_a_statement_after_a_query_is_not_sent(self, sql: str, sent: list[str], call: str):
+        step = _cell("toolu_k", code=call.format(sql=sql), stdout="42\n")
+
+        event = _event(step)
+
+        assert FigureSources.model_validate_json(event).steps[0].queries == sent
+        assert "XyZhunter2" not in event
+
+    @pytest.mark.parametrize(("literal", "redacted"), [
+        ("password => 'x9secret'", "password => '[redacted]'"),
+        ('password=>"x9secret"', 'password=>"[redacted]"'),
+    ])
+    def test_a_value_after_a_fat_arrow_is_redacted_once(self, literal: str, redacted: str):
+        sql = f"SELECT qty FROM t WHERE {literal}"
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        assert FigureSources.model_validate_json(_event(step)).steps[0].queries == [
+            f"SELECT qty FROM t WHERE {redacted}",
+        ]
+
     @pytest.mark.parametrize(
-        "filler", ["a" * 60_000, "password" * 7_500, "x://a:" * 10_000, "x://a:''" * 8_192, "eyJ-" * 16_384],
+        "filler",
+        ["a" * 100_000, "password" * 7_500, "x://a:" * 25_000, "x://a:''" * 10_240, "eyJ-" * 65_536],
+        ids=["word", "secret-key", "userinfo", "quoted-userinfo", "jwt"],
     )
     def test_a_long_query_is_redacted_quickly(self, filler: str):
         sql = f"SELECT qty FROM read_source('{filler}')"
@@ -1041,7 +1212,7 @@ class TestSecretsInQueries:
 
         _event(step)
 
-        assert time.perf_counter() - start < 1.0
+        assert time.perf_counter() - start < TIME_BOUND_SECONDS
 
     def test_a_quoted_passphrase_is_redacted_whole_and_keeps_its_quotes(self):
         sql = "SELECT qty FROM pg_scan(host='db', password='correct horse battery staple', table='stock')"
@@ -1144,14 +1315,16 @@ class TestWhatIsNotAFigure:
 
         assert find_figure_sources(answer=answer, question="", steps=[READ_STOCK]) == FigureSources()
 
-    @pytest.mark.parametrize("filler", ["](" * 32_768, "[^1]" * 16_384, "10/14/2026 " * 6_000])
+    @pytest.mark.parametrize(
+        "filler", ["](" * 49_152, "[^1]" * 24_576, "10/14/2026 " * 12_000], ids=["link", "citation", "date"],
+    )
     def test_a_long_answer_full_of_skipped_spans_is_read_quickly(self, filler: str):
         text = filler + " S1 holds 250 units."
         start = time.perf_counter()
 
         sources = find_figure_sources(answer=text, question=text, steps=[READ_STOCK])
 
-        assert time.perf_counter() - start < 1.0
+        assert time.perf_counter() - start < TIME_BOUND_SECONDS
         assert [f.text for f in sources.figures] == ["250"]
 
     def test_an_answer_with_no_numbers_has_no_figures(self):
@@ -1514,10 +1687,9 @@ class TestManyHolders:
         sources = find_figure_sources(answer=answer, question="", steps=steps)
 
         # A scan of every output value per figure and step compares 400 x 25 x
-        # 1,600 times; the sorted index compares none. The time bound leaves
-        # room for a coverage run on a slow CI runner.
+        # 1,600 times; the sorted index compares none.
         assert compared < 400 * 25
-        assert time.perf_counter() - start < 5.0
+        assert time.perf_counter() - start < TIME_BOUND_SECONDS
         assert len(sources.figures) == 400
         for figure in sources.figures:
             holders = [f"toolu_{i}" for i, values in enumerate(printed) if int(figure.text) in values]
@@ -1579,12 +1751,12 @@ class TestDisplayMath:
 
     @pytest.mark.parametrize("opener", ["\\[", "\\("])
     def test_math_left_open_runs_to_the_end_and_is_read_quickly(self, opener: str):
-        text = opener * 32_768 + " S1 holds 250 units."
+        text = opener * 49_152 + " S1 holds 250 units."
         start = time.perf_counter()
 
         sources = find_figure_sources(answer=text, question=text, steps=[READ_STOCK])
 
-        assert time.perf_counter() - start < 1.0
+        assert time.perf_counter() - start < TIME_BOUND_SECONDS
         assert sources == FigureSources()
 
 

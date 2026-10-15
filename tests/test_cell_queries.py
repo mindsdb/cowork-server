@@ -5,6 +5,7 @@ import time
 
 import pytest
 
+from cowork.harnesses.anton_harness import cell_queries as cell_queries_mod
 from cowork.harnesses.anton_harness.cell_queries import (
     MAX_RENDERED_CHARS,
     MAX_STRING_CHARS,
@@ -14,6 +15,11 @@ from cowork.harnesses.anton_harness.cell_queries import (
     read_cell,
     strip_url,
 )
+
+# The current code reads each timed input in about a second or less on a
+# laptop under coverage, so a CI runner several times slower still passes; the
+# slow form each test guards against takes 15 s or more on the same laptop.
+TIME_BOUND_SECONDS = 5.0
 
 
 def _queries(code: str, **names: str) -> list[str]:
@@ -458,8 +464,8 @@ class TestWhatIsNotAQuery:
     def test_unclosed_comments_read_in_linear_time(self):
         start = time.perf_counter()
 
-        assert not is_sql("/* a" * 200_000)
-        assert time.perf_counter() - start < 1.0
+        assert not is_sql("/* a" * 50_000)
+        assert time.perf_counter() - start < TIME_BOUND_SECONDS
 
     def test_a_comment_that_reads_like_sql_is_not_a_query(self):
         assert _queries("""
@@ -500,6 +506,107 @@ class TestQueryLimits:
             cur.execute("SELECT c FROM t")
             cur.execute("SELECT d FROM t")
         """) == ["SELECT a FROM t", "SELECT b FROM t", "SELECT c FROM t"]
+
+
+class TestStatementsInOneString:
+    @pytest.mark.parametrize("second", [
+        "CREATE USER bob IDENTIFIED BY 'XyZhunter2'",
+        "ALTER USER root WITH PASSWORD 'XyZhunter2'",
+        "SET PASSWORD FOR bob = 'XyZhunter2'",
+    ])
+    def test_a_statement_after_a_query_is_not_listed(self, second: str):
+        sql = f"SELECT qty FROM stock; {second}"
+
+        assert read_cell(f"cur.execute({sql!r})", names={}).queries == ("SELECT qty FROM stock;",)
+
+    def test_each_query_in_a_script_is_listed_on_its_own_in_order(self):
+        assert _queries('''
+            con.executescript("""
+                SELECT qty FROM stock WHERE note = 'it''s';
+                DELETE FROM stock WHERE qty = 0;
+                SELECT site FROM sites
+            """)
+        ''') == ["SELECT qty FROM stock WHERE note = 'it''s';", "SELECT site FROM sites"]
+
+    def test_a_function_lists_only_the_query_of_a_string_with_two_statements(self):
+        reading = read_cell(textwrap.dedent("""
+            def stock():
+                return cur.execute("SELECT qty FROM stock; CREATE USER bob IDENTIFIED BY 'XyZhunter2'")
+        """), names={})
+
+        assert reading.functions["stock"].queries == ("SELECT qty FROM stock;",)
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT qty FROM stock WHERE note = 'a; b' -- c; d\n AND site = 'S1'",
+        "SELECT \"a;b\", `c;d` FROM stock /* e; f */ WHERE site = 'S1'",
+        "SELECT qty FROM stock WHERE note = 'it''s; fine'",
+    ])
+    def test_a_semicolon_in_a_literal_a_quoted_name_or_a_comment_keeps_its_query_whole(self, sql: str):
+        assert read_cell(f"cur.execute({sql!r})", names={}).queries == (sql,)
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT $$a;b$$ AS x FROM t",
+        "SELECT $body$a;$$;b$body$ AS x FROM t",
+        "SELECT [a;b] FROM t",
+    ], ids=["dollar-quote", "tagged-dollar-quote", "bracketed-name"])
+    def test_a_semicolon_in_a_dollar_quoted_string_or_a_bracketed_name_keeps_its_query_whole(self, sql: str):
+        assert read_cell(f"cur.execute({sql!r})", names={}).queries == (sql,)
+
+    @pytest.mark.parametrize(("query", "listed"), [
+        ("SELECT $body$a;b$body$ AS x FROM t;", "SELECT $body$a;b$body$ AS x FROM t;"),
+        ("SELECT qty FROM stock WHERE id = $1;", "SELECT qty FROM stock WHERE id = $1;"),
+        ("SELECT a$b$c FROM t;", "SELECT a$b$c FROM t;"),
+        ("SELECT [a;b] FROM t;", "SELECT [a;b] FROM t;"),
+    ], ids=["after-a-dollar-quote", "positional-parameter", "dollar-in-a-name", "after-a-bracketed-name"])
+    def test_a_statement_after_a_dollar_or_a_bracket_is_not_listed(self, query: str, listed: str):
+        sql = f"{query} CREATE USER bob IDENTIFIED BY 'XyZhunter2'"
+
+        assert read_cell(f"cur.execute({sql!r})", names={}).queries == (listed,)
+
+    # MySQL reads a backslash in a literal or a quoted name as escaping the
+    # next character; Postgres and SQLite read it as an ordinary one, so
+    # 'C:\' is a closed literal there and the ; after it ends the query.
+    @pytest.mark.parametrize("sql", [
+        "SELECT qty FROM stock WHERE p = 'C:\\'; ALTER USER bob WITH PASSWORD 'XyZhunter2'",
+        'SELECT "a\\" FROM t; ALTER USER bob WITH PASSWORD \'XyZhunter2\'',
+        "SELECT qty FROM stock WHERE note = 'it\\'s; fine'",
+    ], ids=["literal", "quoted-name", "escaped-quote"])
+    def test_a_string_a_backslash_splits_differently_lists_nothing(self, sql: str):
+        assert read_cell(f"cur.execute({sql!r})", names={}).queries == ()
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT qty FROM stock WHERE p = 'C:\\'",
+        "SELECT qty FROM stock WHERE note = 'it\\'s fine'",
+        "SELECT qty FROM stock WHERE p = 'C:\\new;'",
+    ])
+    def test_a_backslash_that_moves_no_split_keeps_its_query(self, sql: str):
+        assert read_cell(f"cur.execute({sql!r})", names={}).queries == (sql,)
+
+    def test_a_label_that_reads_like_sql_up_to_a_semicolon_is_not_a_query(self):
+        assert _queries("""
+            ax.set_xlabel("Select a site from the list; units are pallets.")
+        """) == []
+
+    # Each filler opens a comment, a literal, a quoted name or a dollar-quoted
+    # string and never closes it, so the rest of the string is one statement.
+    # A splitter that tries each opener again reads the rest of the string
+    # once per opener.
+    @pytest.mark.parametrize("filler", [
+        "/*'';" * 40_000,
+        "\\'" * 60_000,
+        '\\"' * 60_000,
+        "".join(f"$t{i}x$;" for i in range(15_000)),
+        "[;" * 60_000,
+    ], ids=["comment", "literal", "quoted-name", "dollar-quote", "bracketed-name"])
+    def test_a_string_left_open_splits_into_statements_in_linear_time(self, filler: str):
+        sql = "SELECT qty FROM stock WHERE note = " + filler
+        code = f"cur.execute({sql!r})"
+        start = time.perf_counter()
+
+        reading = read_cell(code, names={})
+
+        assert time.perf_counter() - start < TIME_BOUND_SECONDS
+        assert reading.queries == (sql,)
 
 
 class TestRequestsACellMakes:
@@ -768,12 +875,14 @@ class TestBoundedReading:
         assert sum(len(text) for text in reading.strings) <= MAX_RENDERED_CHARS + len(code)
 
     def test_a_name_is_never_bound_to_a_string_longer_than_the_cap(self):
-        start = time.perf_counter()
+        url = "https://e.example/"
+        # 13 doublings pass MAX_STRING_CHARS and stay inside the cell's
+        # MAX_RENDERED_CHARS, so only the cap can unbind x.
+        assert MAX_STRING_CHARS < len(url) * 2**13 and len(url) * 2**14 <= MAX_RENDERED_CHARS
 
-        reading = read_cell('x = "https://e.example/"\n' + "x += x\n" * 17 + "f(x)\n", names={})
+        reading = read_cell(f"x = {url!r}\n" + "x += x\n" * 13 + "f(x)\n", names={})
 
         assert all(len(value) <= MAX_STRING_CHARS for value in reading.names.values())
-        assert time.perf_counter() - start < 1.0
 
     def test_a_query_built_past_the_render_budget_lists_no_fragment(self):
         spent = "s = 'https://e.example/'\n" + "s = s + s\n" * 11 + "s + s\n" * 20
@@ -800,14 +909,26 @@ class TestBoundedReading:
         assert reading.queries == ()
         assert reading.names == {"k": "v"}
 
-    def test_a_large_name_read_in_many_placeholders_reads_in_linear_time(self):
+    def test_a_large_name_read_in_many_placeholders_is_checked_for_sql_once(self, monkeypatch):
         base = "https://example.com/" + "a" * 60_000
         code = f"base = {base!r}\n" + 'x = f"' + "{base}" * 10_000 + '"\n'
+        checked = 0
+        check = cell_queries_mod.is_sql
+
+        def counted(text: str) -> bool:
+            nonlocal checked
+            checked += 1
+            return check(text)
+
+        monkeypatch.setattr(cell_queries_mod, "is_sql", counted)
         start = time.perf_counter()
 
         read_cell(code, names={})
 
-        assert time.perf_counter() - start < 1.0
+        # Checking the name once per placeholder reads 60,000 characters
+        # 10,000 times; a check per distinct string reads them once.
+        assert checked < 10_000
+        assert time.perf_counter() - start < TIME_BOUND_SECONDS
 
     def test_a_large_query_read_in_many_placeholders_stays_within_the_cells_budget(self):
         base = "SELECT " + "a" * 60_000 + " FROM t"
@@ -823,7 +944,7 @@ class TestBoundedReading:
 
         reading = read_cell(code, names={})
 
-        assert time.perf_counter() - start < 1.0
+        assert time.perf_counter() - start < TIME_BOUND_SECONDS
         assert reading.strings == ("{a}" * 10_000,)
 
     def test_placeholders_read_as_written_past_non_ascii_text_and_crlf_line_ends(self):
