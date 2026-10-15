@@ -51,10 +51,16 @@ class WorkspaceUsage:
         self._measured_at: datetime | None = None
         self._thread: threading.Thread | None = None
 
-    def snapshot(self) -> WorkspaceUsagePage:
-        """The last measurement, starting a new one in the background if it is stale."""
+    def snapshot(self, session_id: str | None = None) -> WorkspaceUsagePage:
+        """The last measurement, starting a new one in the background if it is stale.
+
+        A measurement that does not include ``session_id``, such as one taken
+        before that task was created, counts as stale.
+        """
         with self._lock:
             stale = self._measured_at is None or utc_now() - self._measured_at > self._max_age
+            if session_id is not None and all(item.session_id != session_id for item in self._items):
+                stale = True
             if stale and self._thread is None:
                 self._thread = threading.Thread(target=self._measure_in_background, name="coding-workspace-usage", daemon=True)
                 self._thread.start()
