@@ -231,9 +231,12 @@ def engines():
 
 
 @router.get("/workspace-usage", response_model=WorkspaceUsagePage)
-def workspace_usage():
-    """Approximate storage Cowork manages for each task; measured in the background."""
-    return _service().workspace_usage_page()
+def workspace_usage(session_id: str | None = Query(default=None, min_length=1, max_length=128)):
+    """Approximate storage Cowork manages for each task; measured in the background.
+
+    Passing the task being looked at measures again if the last measurement predates it.
+    """
+    return _service().workspace_usage_page(session_id)
 
 
 @router.get("/models")
