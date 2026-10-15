@@ -107,6 +107,20 @@ def test_a_fresh_measurement_is_reused(tmp_path: Path) -> None:
     assert len(calls) == 1
 
 
+def test_a_task_missing_from_the_last_measurement_is_measured_again(tmp_path: Path) -> None:
+    ids = ["task-1"]
+    usage = WorkspaceUsage(lambda: roots(tmp_path), lambda: list(ids), max_age=timedelta(hours=1))
+    usage.measure()
+    ids.append("task-2")
+
+    assert not usage.snapshot("task-1").measuring
+    assert usage.snapshot("task-2").measuring
+    thread = usage._thread
+    if thread is not None:
+        thread.join(timeout=3)
+    assert {item.session_id for item in usage.snapshot("task-2").items} == {"task-1", "task-2"}
+
+
 def test_the_service_reports_a_worktree_task_and_the_total(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     write(repo / "data.bin", 200_000)
@@ -172,3 +186,31 @@ def test_a_project_task_is_measured_across_its_folders(tmp_path: Path) -> None:
     page = service.workspace_usage.measure()
 
     assert {item.session_id: item.bytes for item in page.items}[session.id] >= 200_000
+
+
+def test_the_endpoint_answers_at_once_and_accepts_the_viewed_task(tmp_path: Path, monkeypatch) -> None:
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from cowork.api.v1.endpoints import coding
+    from cowork.api.v1.router import api_router
+    from cowork.common.settings.app_settings import get_app_settings
+
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "local")
+    get_app_settings.cache_clear()
+    engine = FakeEngine()
+    service = service_with(tmp_path / "coding", engine)
+    monkeypatch.setattr(coding, "_service", lambda: service)
+    app = FastAPI()
+    app.state.engine = engine
+    app.include_router(api_router)
+    try:
+        with TestClient(app, client=("127.0.0.1", 12345)) as client:
+            response = client.get("/api/v1/coding/workspace-usage", params={"session_id": "task-1"})
+            assert response.status_code == 200
+            body = response.json()
+            assert body["measured_at"] is None and body["measuring"] is True
+            assert body["removed_task_bytes"] == 0
+    finally:
+        get_app_settings.cache_clear()
