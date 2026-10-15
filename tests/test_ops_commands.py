@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -710,3 +712,14 @@ def test_registry_stdout_refusals_print_nothing_on_stdout(stack, capsys):
     assert (status, out) == (1, "")
     assert "has no skill named never-made" in err
     assert not (stack.root / "shared").exists()
+
+
+@pytest.mark.parametrize("module", ["cowork.ops.memory", "cowork.ops.skills", "cowork.ops.connections"])
+def test_each_command_loads_every_model_it_queries_through(module):
+    """The operator runs a command in a fresh interpreter, unlike these tests, which import every
+    model. A relationship named by string resolves at the first query, so a command that loads
+    only the models it queries stops there."""
+    probe = f"import {module}\nfrom sqlalchemy.orm import configure_mappers\nconfigure_mappers()\n"
+    result = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=120)
+
+    assert result.returncode == 0, result.stderr
