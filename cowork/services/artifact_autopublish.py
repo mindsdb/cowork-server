@@ -98,9 +98,9 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
     """
     from cowork.services.artifacts import _user_files, content_mtime, load_published_map
     from cowork.services.publish import (
-        PUBLISHABLE_STATIC_SUFFIXES,
         _resolve_publish_target,
         compute_publish_md5,
+        is_publishable_static,
     )
 
     if not _user_files(folder):
@@ -118,10 +118,11 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
         # /upload is strict here: literally backend.py plus static/index.html.
         if not (folder / "backend.py").is_file() or not (folder / "static" / "index.html").is_file():
             return PublishDecision(None, REASON_NOT_PUBLISHABLE, True)
-    elif publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
+    elif not is_publishable_static(publish_target, artifacts_base):
         # Suffix, not the on-disk name: _zip_html renames a single file to
         # index.html inside the archive, so an artifact whose primary is
-        # `report.html` publishes normally.
+        # `report.html` publishes normally. A non-content primary (README,
+        # generation input) is refused by `publish_artifact`, so skip it here.
         return PublishDecision(None, REASON_NOT_PUBLISHABLE)
 
     current_mtime = content_mtime(folder)
