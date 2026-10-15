@@ -185,3 +185,86 @@ def test_a_folder_task_shows_which_dependency_folders_it_left_out(tmp_path: Path
 
     assert session.workspace_warning is not None
     assert "app/node_modules" in session.workspace_warning
+
+
+class _AppStopped(BaseException):
+    """Stands in for the process dying: no cleanup handler catches it."""
+
+
+def test_what_an_interrupted_preparation_left_is_removed_and_only_its_worktrees_forgotten(
+    tmp_path: Path, folder: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = WorkspaceManager(tmp_path / "coding")
+    stale = tmp_path / "someone-elses-worktree"
+    git(folder / "app", "worktree", "add", "--detach", str(stale))
+    subprocess.run(["rm", "-rf", str(stale)], check=True)
+
+    def stop(*_args, **_kwargs):
+        raise _AppStopped
+
+    monkeypatch.setattr(manager, "_baseline_from", stop)
+    with pytest.raises(_AppStopped):
+        manager.prepare("task", str(folder), allow_direct_folder=True)
+    left = manager.worktrees_root / "task"
+    assert (left / "app" / ".git").is_file()
+    assert len(worktrees(folder / "app")) == 3
+
+    # The task never recorded a workspace, so deleting it passes no path.
+    manager.cleanup("task", str(folder), "", WorkspaceKind.local_copy, None)
+
+    assert not left.exists()
+    assert not (manager.local_copies.baselines_root / "task").exists()
+    assert worktrees(folder / "app") == [f"worktree {(folder / 'app').resolve()}", f"worktree {stale.resolve()}"]
+    assert len(worktrees(folder / "services" / "api")) == 1
+
+
+def test_a_task_whose_preparation_the_app_abandoned_is_cleaned_up_on_restart(
+    tmp_path: Path, folder: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    from coding_service_fakes import CREDS, FakeEngine, service_with
+
+    from cowork.coding.contracts import SessionCreateRequest, SessionStatus
+
+    first = service_with(tmp_path, FakeEngine())
+    built, release = threading.Event(), threading.Event()
+    baseline_from = first.workspaces._baseline_from
+
+    def stuck(*args, **kwargs):
+        built.set()
+        release.wait(timeout=10)
+        return baseline_from(*args, **kwargs)
+
+    monkeypatch.setattr(first.workspaces, "_baseline_from", stuck)
+    created = first.create_session(
+        SessionCreateRequest(path=str(folder), prompt="Go", allow_direct_folder=True), CREDS, "fake", "fake-model",
+    )
+    assert built.wait(timeout=10)
+    assert len(worktrees(folder / "app")) == 2
+
+    # A second service over the same root stands in for the next launch.
+    restarted = service_with(tmp_path, FakeEngine())
+    recovered = restarted.get_session(created.id)
+
+    assert recovered.status == SessionStatus.failed
+    assert not (restarted.workspaces.worktrees_root / created.id).exists()
+    assert len(worktrees(folder / "app")) == 1
+    restarted.delete_session(created.id)
+    assert restarted.list_sessions(True).items == []
+    release.set()
+    first._running[created.id].thread.join(timeout=10)
+    assert len(worktrees(folder / "app")) == 1
+
+
+def test_an_unrecorded_worktree_task_is_removed_and_forgotten(tmp_path: Path, folder: Path) -> None:
+    manager = WorkspaceManager(tmp_path / "coding")
+    repo = folder / "app"
+    prepared = manager.prepare("task", str(repo), allow_direct_folder=False)
+    assert prepared.kind == WorkspaceKind.git_worktree
+    assert len(worktrees(repo)) == 2
+
+    manager.cleanup("task", str(repo), "", WorkspaceKind.git_worktree, None)
+
+    assert not prepared.workspace_path.exists()
+    assert worktrees(repo) == [f"worktree {repo.resolve()}"]
