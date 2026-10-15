@@ -626,6 +626,25 @@ class RenameSessionRequest(BaseModel):
     title: str = Field(min_length=1, max_length=200)
 
 
+class WorkspaceUsageItem(BaseModel):
+    session_id: str
+    bytes: int
+
+
+class WorkspaceUsagePage(BaseModel):
+    """Approximate disk used by each task's managed folders.
+
+    Sizes count allocated blocks. On macOS a folder copy shares blocks with
+    its source, so its real cost is lower than shown. ``measured_at`` is
+    ``None`` until the first measurement finishes.
+    """
+
+    items: list[WorkspaceUsageItem]
+    total_bytes: int
+    measured_at: datetime | None = None
+    measuring: bool = False
+
+
 class SessionPage(BaseModel):
     items: list[CodingSession]
 
