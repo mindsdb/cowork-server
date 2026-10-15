@@ -483,8 +483,9 @@ def test_execute_schedule_disables_corrupt_org_row_instead_of_looping(monkeypatc
     from cowork.common.settings.app_settings import get_app_settings
     from cowork.db.scoped import ScopedSession, TenantScope
     from cowork.db.session import get_open_session
-    from cowork.models.schedule import ScheduleRun
+    from cowork.models.schedule import ScheduleOccurrence, ScheduleRun
     from cowork.scheduler import execute_schedule
+    from cowork.schemas.schedules import OccurrenceStatus
     from cowork.services.schedules import ScheduleService
 
     org_id = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
@@ -528,13 +529,19 @@ def test_execute_schedule_disables_corrupt_org_row_instead_of_looping(monkeypatc
         s = get_open_session()
         after = s.get(Schedule, schedule_id)
         assert after.enabled is False, "corrupt row must be disabled, not left due"
-        # Not advanced — disabling is what stops the re-fire, not a moved slot.
-        assert ensure_utc(after.next_run_at) == original_next_run
+        # The claim consumed the slot before the run found the row corrupt.
+        assert ensure_utc(after.next_run_at) > original_next_run
         runs = s.exec(
             select(ScheduleRun).where(ScheduleRun.schedule_id == schedule_id)
         ).all()
-        assert runs, "the attempt must still record a run"
-        assert all(r.status == RunStatus.failed for r in runs)
+        assert len(runs) == 1, "the attempt must still record a run"
+        assert runs[0].status == RunStatus.failed
+        # A row that can never resolve an identity is not worth retrying.
+        occurrence = s.exec(
+            select(ScheduleOccurrence).where(ScheduleOccurrence.schedule_id == schedule_id)
+        ).one()
+        assert occurrence.status == OccurrenceStatus.failed
+        assert occurrence.attempts == 1
         s.close()
     finally:
         s = get_open_session()
@@ -557,7 +564,7 @@ def test_execute_schedule_disables_corrupt_org_row_instead_of_looping(monkeypatc
 # only truthful signal — without it a cancelled or failed run is recorded as
 # success.
 
-def test_turn_terminal_reason_reads_the_terminal_record(tmp_path, monkeypatch):
+def test_turn_evidence_reads_the_terminal_record(tmp_path, monkeypatch):
     import asyncio
     from types import SimpleNamespace
 
@@ -575,10 +582,13 @@ def test_turn_terminal_reason_reads_the_terminal_record(tmp_path, monkeypatch):
         scheduler_mod, "registry",
         SimpleNamespace(get=lambda cid: SimpleNamespace(buffer=buf)),
     )
-    assert asyncio.run(scheduler_mod._turn_terminal_reason("c1")) == "cancelled"
+    evidence = asyncio.run(scheduler_mod._turn_evidence("c1"))
+    assert evidence.reason == "cancelled"
+    # Nothing but the turn's start was written before it ended.
+    assert evidence.acted is False
 
 
-def test_turn_terminal_reason_with_real_registry_cancel(tmp_path):
+def test_turn_evidence_with_real_registry_cancel(tmp_path):
     """End-to-end through the real registry: cancel a producer that swallows
     its CancelledError the way handlers/responses._produce does. The task
     ends NOT-cancelled — which is exactly why task state can't be the
@@ -617,19 +627,21 @@ def test_turn_terminal_reason_with_real_registry_cancel(tmp_path):
         await registry.cancel(conversation_id)
         assert handle.task.done()
         assert handle.task.cancelled() is False  # the swallowed cancel
-        return await scheduler_mod._turn_terminal_reason(conversation_id)
+        return (await scheduler_mod._turn_evidence(conversation_id)).reason
 
     assert asyncio.run(main()) == "cancelled"
 
 
-def test_turn_terminal_reason_none_without_handle(monkeypatch):
+def test_turn_evidence_unknown_without_handle(monkeypatch):
     import asyncio
     from types import SimpleNamespace
 
     import cowork.scheduler as scheduler_mod
 
     monkeypatch.setattr(scheduler_mod, "registry", SimpleNamespace(get=lambda cid: None))
-    assert asyncio.run(scheduler_mod._turn_terminal_reason("c1")) is None
+    evidence = asyncio.run(scheduler_mod._turn_evidence("c1"))
+    # Nothing is known, so nothing is assumed: it may have acted.
+    assert (evidence.reason, evidence.acted) == (None, True)
 
 
 def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
@@ -657,10 +669,10 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
 
     monkeypatch.setattr(responses_mod, "ResponsesHandler", FakeHandler)
 
-    async def _terminal(_conversation_id):
-        return reason
+    async def _evidence(_conversation_id):
+        return scheduler_mod._TurnEvidence(reason=reason, acted=True)
 
-    monkeypatch.setattr(scheduler_mod, "_turn_terminal_reason", _terminal)
+    monkeypatch.setattr(scheduler_mod, "_turn_evidence", _evidence)
 
     session = get_open_session()
     schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
@@ -752,7 +764,7 @@ def test_a_database_error_in_a_runs_last_writes_logs_its_schedule_and_conversati
     def connection_lost(session, **kwargs):
         raise OperationalError("UPDATE schedule_runs SET private_statement_marker", {}, Exception(driver_text))
 
-    monkeypatch.setattr(scheduler_mod, "_record_turn_outcome", connection_lost)
+    monkeypatch.setattr(scheduler_mod, "_record_attempt_end", connection_lost)
     monkeypatch.setattr(scheduler_mod, "_finish_run", connection_lost)
     logged = owned_logger(scheduler_mod.logger.name)
 
@@ -765,12 +777,12 @@ def test_a_database_error_in_a_runs_last_writes_logs_its_schedule_and_conversati
     for record in errors:
         assert record.getMessage() == (
             "Database operation failed: error_type=OperationalError sqlstate=unknown "
-            f"site=scheduler.execute_schedule:{record.lineno}"
+            f"site=scheduler._run_attempt:{record.lineno}"
         )
         assert (record.schedule_id, record.conversation_id) == (str(schedule_id), str(conversation_id))
         assert record.exc_info is None
         assert driver_text not in repr(record.__dict__)
-    # The run's failure is logged first, then the finish write's.
+    # The run's end is logged first, then the fallback finish write's.
     assert errors[0].lineno < errors[1].lineno
     lines = [line for line in logged.output().splitlines() if "Database operation failed" in line]
     assert len(lines) == 2
@@ -1005,19 +1017,17 @@ def _file_engine(tmp_path):
 
 @pytest.mark.parametrize(("cadence", "reason"), [("daily", "cancelled"), ("once", "error")])
 def test_a_poll_skips_a_slot_its_run_used_up_after_the_poll_read_it(tmp_path, monkeypatch, cadence, reason):
-    """The run records its outcome and its finish after the poll has read the
-    schedule and before the poll asks whether a run is active. The poll then
-    sees the slot as used: a Stopped daily run does not start again, and
-    neither does a one-off its failed run disabled."""
-    from cowork.scheduler import _finish_run, _poll, _record_turn_outcome
+    """Another poller claims the slot, runs it and records how it went after
+    this poll has read the schedule and before it asks whether a run is
+    active. The poll then sees the slot as used: a Stopped daily run does not
+    start again, and neither does a one-off whose claim disabled it."""
+    from cowork.scheduler import _AttemptEnd, _claim_slot, _poll, _record_attempt_end, _start_attempt
+    from cowork.schemas.schedules import AttemptOutcome
 
     engine = _file_engine(tmp_path)
     with Session(engine) as session:
         schedule_id = _schedule(
             session, cadence=cadence, next_run_at=datetime.now(timezone.utc) - timedelta(minutes=1)
-        ).id
-        run_id = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE)).create_run(
-            schedule_id, is_manual=False
         ).id
 
     has_active_run = ScheduleRunService.has_active_run
@@ -1028,10 +1038,16 @@ def test_a_poll_skips_a_slot_its_run_used_up_after_the_poll_read_it(tmp_path, mo
             ended.append(asked_id)
             with Session(engine) as run_session:
                 scoped = ScopedSession(run_session, SYSTEM_SCOPE)
-                outcome = _record_turn_outcome(
-                    scoped, schedule_id=schedule_id, reason=reason, is_manual=False, conversation_id=None,
+                occurrence_id = _claim_slot(scoped, scoped.get(Schedule, schedule_id))
+                attempt = _start_attempt(scoped, occurrence_id=occurrence_id, is_manual=False)
+                outcome = (
+                    AttemptOutcome.cancelled if reason == "cancelled" else AttemptOutcome.failed_during_execution
                 )
-                _finish_run(scoped, run_id=run_id, conversation_id=None, error=outcome.error, status=outcome.status)
+                _record_attempt_end(
+                    scoped, attempt=attempt, occurrence_id=occurrence_id,
+                    end=_AttemptEnd(outcome=outcome, error=None if reason == "cancelled" else "boom"),
+                    retry_delay=None, conversation_id=None,
+                )
         return has_active_run(self, asked_id)
 
     monkeypatch.setattr(ScheduleRunService, "has_active_run", the_run_ends_first)
@@ -1072,7 +1088,11 @@ def test_a_poll_skips_a_schedule_deleted_after_the_poll_read_it(tmp_path, monkey
         due = _poll(ScopedSession(poll_session, SYSTEM_SCOPE))
 
     assert len(deleted) == 1
-    assert due == list(schedule_ids - set(deleted))
+    from cowork.models.schedule import ScheduleOccurrence
+
+    with Session(engine) as check:
+        claimed_for = [check.get(ScheduleOccurrence, o).schedule_id for o in due]
+    assert claimed_for == list(schedule_ids - set(deleted))
 
 
 # --- ENG-769: reap orphaned `running` runs left by a crash/restart.
