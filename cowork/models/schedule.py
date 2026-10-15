@@ -8,6 +8,9 @@ from cowork.models.base import BaseSQLModel
 
 
 class Schedule(BaseSQLModel, table=True):
+    """A task and when it runs. Its fields are the editor's current state; what
+    each occurrence runs is the ScheduleVersion it was claimed against."""
+
     __tablename__ = "schedules"
     __table_args__ = (
         # The poll's due-scan: enabled schedules whose slot has come.
@@ -44,25 +47,28 @@ class Schedule(BaseSQLModel, table=True):
     )
     last_error: str | None = Field(default=None, description="Error message from last failed run")
     missed_runs: int = Field(default=0, description="Count of runs missed while the scheduler was offline")
-    missed_run_policy: str = Field(
-        default="run_latest_once",
-        sa_column_kwargs={"server_default": "run_latest_once"},
-        description="skip | run_latest_once | bounded_catch_up",
-    )
     consecutive_failures: int = Field(
         default=0,
         sa_column_kwargs={"server_default": "0"},
         description="Cron occurrences in a row that settled failed; a success resets it",
     )
-    spec_version: int = Field(
-        default=1,
-        sa_column_kwargs={"server_default": "1"},
-        description="Bumped by every edit that changes what a run does",
-    )
     auto_paused_at: datetime | None = Field(
         default=None,
         sa_type=sa.DateTime(timezone=True),  # type: ignore
         description="When repeated failures paused the schedule; cleared on resume",
+    )
+    paused_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description=(
+            "When the user paused the schedule; cleared on resume. A one-off is also "
+            "disabled once it is claimed, so `enabled` alone does not mean paused"
+        ),
+    )
+    missed_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="When a one-off was found too late to run on its own; cleared when it runs or is moved",
     )
     org_id: str | None = Field(default=None, index=True, max_length=36, description="Owning organization; NULL on local/desktop rows")
     created_by: str | None = Field(default=None, max_length=36, description="User who created the row; NULL on local/desktop rows")
@@ -77,9 +83,73 @@ class Schedule(BaseSQLModel, table=True):
     occurrences: list["ScheduleOccurrence"] = Relationship(
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
+    skipped_periods: list["ScheduleSkippedPeriod"] = Relationship(
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
+    versions: list["ScheduleVersion"] = Relationship(
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
     events: list["ScheduleEvent"] = Relationship(
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
+
+
+class ScheduleVersion(BaseSQLModel, table=True):
+    """What a schedule ran, as of one edit: written once, never changed.
+
+    An occurrence is claimed against the current version and every attempt at
+    it runs that version, so an edit takes effect from the next occurrence.
+    Holds the explicit settings only. Credentials, permissions, the project's
+    files and what "default" model resolves to are read when the run starts.
+    """
+
+    __tablename__ = "schedule_versions"
+    __table_args__ = (
+        sa.UniqueConstraint("schedule_id", "number", name="uq_schedule_versions_number"),
+    )
+
+    schedule_id: UUID = Field(
+        sa_column=sa.Column(
+            sa.Uuid(),
+            sa.ForeignKey("schedules.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+        description="Parent schedule",
+    )
+    number: int = Field(description="1 for the schedule as created, then one more per edit to these fields")
+    prompt: str = Field(description="The prompt this version runs")
+    model: str = Field(description='The configured model, or the "default" sentinel')
+    project_id: UUID = Field(sa_type=sa.Uuid(), description="The project this version runs in")
+    cadence: str = Field(description="The cadence this version ran on")
+    timezone: str = Field(description="The time zone its slots were computed in")
+
+
+class ScheduleSkippedPeriod(BaseSQLModel, table=True):
+    """Slots a schedule passed over without running, summarized: one row per
+    time the scheduler found it behind, however many slots that covered."""
+
+    __tablename__ = "schedule_skipped_periods"
+
+    schedule_id: UUID = Field(
+        sa_column=sa.Column(
+            sa.Uuid(),
+            sa.ForeignKey("schedules.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+        description="Parent schedule",
+    )
+    first_slot: datetime = Field(
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="UTC instant of the first slot passed over",
+    )
+    last_slot: datetime = Field(
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="UTC instant of the last slot passed over",
+    )
+    slot_count: int = Field(description="Slots passed over, first and last included")
+    reason: str = Field(description="offline (the app was not running) | one_off_missed")
 
 
 class ScheduleOccurrence(BaseSQLModel, table=True):
@@ -133,12 +203,31 @@ class ScheduleOccurrence(BaseSQLModel, table=True):
         sa_type=sa.DateTime(timezone=True),  # type: ignore
         description="When a running attempt is presumed dead and may be reaped",
     )
+    lease_token: str | None = Field(
+        default=None,
+        max_length=36,
+        description=(
+            "Who holds the occurrence now. Every change of hands and every write by "
+            "a holder is conditional on it, so a holder that lost the occurrence "
+            "(reaped, or settled elsewhere) cannot overwrite the new holder's state"
+        ),
+    )
     settled_at: datetime | None = Field(
         default=None,
         sa_type=sa.DateTime(timezone=True),  # type: ignore
         description="UTC datetime the occurrence reached its final status",
     )
     error: str | None = Field(default=None, description="Error from the last failed attempt")
+    version_id: UUID | None = Field(
+        default=None,
+        sa_column=sa.Column(
+            sa.Uuid(),
+            sa.ForeignKey("schedule_versions.id"),
+            nullable=True,
+            index=True,
+        ),
+        description="The settings every attempt at this occurrence runs; NULL only on occurrences from before versions",
+    )
 
 
 class ScheduleRun(BaseSQLModel, table=True):
@@ -184,7 +273,23 @@ class ScheduleRun(BaseSQLModel, table=True):
         description="The occurrence this run is an attempt at; NULL on runs from before occurrences",
     )
     attempt: int | None = Field(default=None, description="1-based attempt number within the occurrence")
-    spec_version: int | None = Field(default=None, description="The schedule's spec_version when the attempt started")
+    execution_started_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description=(
+            "When the attempt handed its turn to the agent. Written before the hand-off, "
+            "so a run without it is known not to have acted"
+        ),
+    )
+    stop_requested_at: datetime | None = Field(
+        default=None,
+        sa_type=sa.DateTime(timezone=True),  # type: ignore
+        description="When the scheduler asked the turn to stop (its duration bound)",
+    )
+    outcome: str | None = Field(
+        default=None,
+        description="How the attempt ended, by what is known of its execution (AttemptOutcome)",
+    )
 
 
 class ScheduleEvent(BaseSQLModel, table=True):
