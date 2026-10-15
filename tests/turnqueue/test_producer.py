@@ -999,6 +999,57 @@ async def test_replies_refresh_the_idle_deadline(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_the_controllers_liveness_replies_keep_a_quiet_turn_alive_and_show_nothing(monkeypatch):
+    """scratchpad-controller relays a busy pod's heartbeat as a `worker_alive`
+    progress reply, so a single step longer than the idle bound doesn't fail a
+    live turn. It must count as activity and never reach the caller as
+    content."""
+
+    class QuietStepRedis(SilentRedis):
+        """A long tool step: nothing but liveness replies, then the answer.
+        The blocking read times out empty between them, which is when the
+        loop checks the idle bound."""
+
+        def __init__(self):
+            super().__init__(delay=0.02)
+            self._alive_left = 12
+            self._quiet = False
+
+        async def xread(self, streams, count=None, block=None):
+            self.reads += 1
+            await asyncio.sleep(self._delay)
+            if self.reads == 1:
+                return [["scratchpad:reply:conv-1", [["1-0", _reply(
+                    "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+                )]]]]
+            self._quiet = not self._quiet
+            if self._quiet:
+                return None
+            if self._alive_left:
+                self._alive_left -= 1
+                return [["scratchpad:reply:conv-1", [[f"{self.reads}-0",
+                                                      _reply("progress", {"phase": "worker_alive"})]]]]
+            return [["scratchpad:reply:conv-1", [[f"{self.reads}-0", _reply("turn_completed", {})]]]]
+
+    fake = QuietStepRedis()
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    # The quiet step (~24 reads x 20ms, ~0.5s) runs well past the bound, and
+    # each gap between liveness replies (~0.04s) is well inside it.
+    monkeypatch.setenv("COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS", "0.15")
+
+    items = await asyncio.wait_for(_drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi",
+        model="m",
+    ), include_policy=True), timeout=5)
+
+    assert items == [
+        ("progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}),
+        ("turn_completed", {}),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_idle_bound_can_be_disabled(monkeypatch):
     """<= 0 keeps the old unbounded behavior for an operator who needs it."""
     fake = SilentRedis(delay=0.005)
