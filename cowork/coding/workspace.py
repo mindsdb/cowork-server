@@ -750,6 +750,10 @@ class WorkspaceManager:
         base_revision: str | None,
     ) -> None:
         with self._mutation_lock:
+            if not workspace_path:
+                # Preparation never recorded a workspace, but may have left one.
+                self.discard_unrecorded(session_id)
+                return
             if kind == WorkspaceKind.local_copy:
                 try:
                     self.local_copies.cleanup(
@@ -782,6 +786,67 @@ class WorkspaceManager:
                     shutil.rmtree(actual)
             if source.is_dir():
                 self.git.run(source, "worktree", "prune")
+
+    def discard_unrecorded(self, key: str) -> None:
+        """Remove what an interrupted preparation left behind for ``key``.
+
+        A task whose preparation stopped part-way, for example because the app
+        quit, has no recorded workspace. It may still have a partly built
+        folder under the managed roots, and worktrees registered for it in the
+        user's repositories. Only worktrees inside this task's own folders are
+        unregistered.
+        """
+        relative = managed_key(key)
+        with self._mutation_lock:
+            for root in (self.worktrees_root, self.legacy_worktrees_root, self.local_copies.legacy_copies_root):
+                target = root / relative
+                if target.is_symlink() or not target.is_dir():
+                    continue
+                self._unregister_worktrees_under(target)
+                _force_remove(target)
+            _force_remove(self.local_copies.baselines_root / relative)
+
+    def _unregister_worktrees_under(self, root: Path) -> None:
+        links = [root / ".git"] if (root / ".git").is_file() else []
+        pending = [(root, 0)]
+        while pending:
+            directory, depth = pending.pop()
+            try:
+                entries = list(os.scandir(directory))
+            except OSError:
+                continue
+            for entry in entries:
+                if entry.name in _DEPENDENCY_DIRS or entry.name == ".git" or not entry.is_dir(follow_symlinks=False):
+                    continue
+                link = Path(entry.path) / ".git"
+                if link.is_file():
+                    links.append(link)
+                elif depth + 1 < _REPOSITORY_SEARCH_DEPTH + 2:
+                    pending.append((Path(entry.path), depth + 1))
+        for link in links:
+            self._unregister_worktree(link)
+
+    def _unregister_worktree(self, link: Path) -> None:
+        """Forget one worktree checkout, even one Git left half-made."""
+        checkout = link.parent
+        try:
+            common = self.git.run(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+            removed = self.git.run(Path(common).parent, "worktree", "remove", "--force", str(checkout), check=False)
+            if removed.returncode == 0:
+                return
+        except WorkspaceError as exc:
+            logger.info("Could not unregister the worktree %s through Git: %s", checkout, exc)
+        # Git could not read the checkout. Its registration is a folder in the
+        # repository's worktrees directory that points back here; remove only
+        # that one, as `git worktree prune` would.
+        try:
+            admin = Path(link.read_text(encoding="utf-8").removeprefix("gitdir:").strip())
+            if admin.parent.name == "worktrees" and Path(
+                (admin / "gitdir").read_text(encoding="utf-8").strip()
+            ).parent.resolve() == checkout.resolve():
+                shutil.rmtree(admin, ignore_errors=True)
+        except OSError:
+            pass
 
     def prune_task_root(self, session_id: str) -> None:
         """Remove an empty project-task parent without discarding task files."""
