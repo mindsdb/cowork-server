@@ -364,6 +364,12 @@ async def cancel_response(req: CancelRequest, scope: TenantScopeDep):
             return {"cancelled": False, "conversation_id": req.conversation_id}
         await request_cancel(found.index["correlation_id"], reason=req.reason, client=get_redis())
         return {"cancelled": True, "conversation_id": req.conversation_id}
+    if handle is not None and get_backend() == "redis":
+        turn = await get_turn(req.conversation_id)
+        if turn is not None and turn["correlation_id"] != handle.lifecycle.identity.correlation_id:
+            # RunRegistry retains finished handles for replay. A successor may
+            # run on another replica; _shared_turn below authorizes its owner.
+            handle = None
     if handle is not None:
         if get_backend() == "redis" or handle.lifecycle.identity.remote:
             await _request_cancel(handle.lifecycle.identity.correlation_id, stalled=stalled)

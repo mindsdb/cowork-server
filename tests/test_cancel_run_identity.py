@@ -112,6 +112,69 @@ async def test_exact_cancel_uses_captured_handle_not_a_new_shared_index(redis, m
         await new_owner.shutdown()
 
 
+@pytest.mark.parametrize("reason", [None, "stalled"])
+@pytest.mark.parametrize("legacy_index", [False, True])
+async def test_ordinary_cancel_reaches_a_successor_when_this_replica_retains_the_predecessor(
+    redis, monkeypatch, reason, legacy_index,
+):
+    old_owner, new_owner = RunRegistry(), RunRegistry()
+    old = await start(old_owner, turn=0)
+    await old.cancel()
+    new = await start(new_owner, turn=1)
+    monkeypatch.setattr(responses, "registry", old_owner)
+    try:
+        if legacy_index:
+            # Older replicas and channel turns publish a correlation without a run ID.
+            await turn_index.record_turn(
+                "c", turn_id=new.turn_id, correlation_id=new.lifecycle.identity.correlation_id,
+                org_id=None, user_id=None,
+            )
+        reply = await responses.cancel_response(responses.CancelRequest(
+            conversation_id="c", reason=reason,
+        ), LOCAL)
+        assert reply["cancelled"] is True
+        assert await redis.exists(cancellation.cancel_flag_key(new.lifecycle.identity.correlation_id))
+        assert not await redis.exists(cancellation.cancel_flag_key(old.lifecycle.identity.correlation_id))
+        await settled(new)
+        assert new.task.cancelled()
+        assert new.lifecycle.stalled is (reason == "stalled")
+    finally:
+        await old_owner.shutdown()
+        await new_owner.shutdown()
+
+
+@pytest.mark.parametrize("org,user", [("org", "bob"), ("other", "alice")])
+async def test_retained_predecessor_does_not_authorize_ordinary_cancel_of_a_foreign_successor(
+    redis, monkeypatch, org, user,
+):
+    old_owner, new_owner = RunRegistry(), RunRegistry()
+    old = await start(old_owner, turn=0, org="org", user="alice")
+    await old.cancel()
+    new = await start(new_owner, turn=1, org=org, user=user)
+    monkeypatch.setattr(responses, "registry", old_owner)
+    try:
+        reply = await responses.cancel_response(
+            responses.CancelRequest(conversation_id="c"),
+            TenantScope(org_mode=True, org_id="org", user_id="alice"),
+        )
+        assert reply.status_code == 404
+        assert new.is_answering
+        assert not await redis.exists(cancellation.cancel_flag_key(new.lifecycle.identity.correlation_id))
+        assert not await redis.exists(cancellation.cancel_flag_key(old.lifecycle.identity.correlation_id))
+    finally:
+        await old_owner.shutdown()
+        await new_owner.shutdown()
+
+
+async def test_ordinary_cancel_keeps_the_finished_current_runs_false_result(redis, monkeypatch):
+    owner = RunRegistry()
+    handle = await start(owner)
+    await handle.cancel()
+    monkeypatch.setattr(responses, "registry", owner)
+    reply = await responses.cancel_response(responses.CancelRequest(conversation_id="c"), LOCAL)
+    assert reply == {"cancelled": False, "conversation_id": "c"}
+
+
 async def test_another_replica_cancels_the_owner_of_a_direct_or_local_run(redis, monkeypatch):
     owner, receiver = RunRegistry(), RunRegistry()
     handle = await start(owner)
