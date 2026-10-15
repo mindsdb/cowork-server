@@ -88,12 +88,16 @@ def published(monkeypatch):
 def owned_slugs(monkeypatch):
     """Keep testing reconciliation logic in isolation from the owner filter.
 
-    `_owned_slugs` opens its own DB session and resolves real ownership rows;
-    this module's fixtures use a non-UUID project id ("project-1") and write no
-    DB rows, so the default here is "everything is owned" and individual tests
+    `_owned_slugs` resolves real ownership rows in a database unit; this
+    module's fixtures use a non-UUID project id ("project-1") and write no DB
+    rows, so the default here is "everything is owned" and individual tests
     override it to exercise the filter itself.
     """
-    monkeypatch.setattr(ap, "_owned_slugs", lambda base, scope, project_id, slugs: (list(slugs), 0, 0))
+
+    async def all_owned(*, artifacts_base, scope, project_id, slugs):
+        return ap.OwnedSlugs(owned=list(slugs), not_owner=0, owner_unknown=0)
+
+    monkeypatch.setattr(ap, "_owned_slugs", all_owned)
 
 
 pytestmark = pytest.mark.usefixtures("publish_url")
@@ -564,8 +568,8 @@ async def test_not_owned_slugs_are_dropped_and_logged(
     _make(base, "theirs", files={"other.html": "<html></html>"},
           meta={"slug": "theirs", "type": "html-app"})
 
-    def fake_owned(base_, scope, project_id, slugs):
-        return ([s for s in slugs if s == "mine"], 1, 0)
+    async def fake_owned(*, artifacts_base, scope, project_id, slugs):
+        return ap.OwnedSlugs(owned=[s for s in slugs if s == "mine"], not_owner=1, owner_unknown=0)
 
     monkeypatch.setattr(ap, "_owned_slugs", fake_owned)
 
@@ -577,3 +581,29 @@ async def test_not_owned_slugs_are_dropped_and_logged(
     assert out == {"mine"}
     assert [c["folder"].name for c in published] == ["mine"]
     assert "result=skipped not_owner=1" in caplog.text
+
+
+async def test_a_report_owned_by_another_account_is_skipped_not_failed(base, enabled, key, monkeypatch, caplog):
+    """A 409 `artifact_owned_by_other_user` is a skip, like `not_owner`."""
+    import logging
+
+    from cowork.services.publish import PublishOwnedByOtherUser
+
+    _make(base, "rep", files={"report.html": "<html></html>"},
+          meta={"slug": "rep", "type": "html-app"})
+    calls = []
+
+    def owned_elsewhere(artifact, **kwargs):
+        calls.append(artifact)
+        raise PublishOwnedByOtherUser()
+
+    monkeypatch.setattr(ap, "publish_artifact", owned_elsewhere)
+    with caplog.at_level(logging.WARNING, logger="cowork.services.artifact_autopublish"):
+        out = await ap.autopublish_project_artifacts(base, ORG_SCOPE, project_id=PROJECT_ID, touched={"rep"})
+
+    assert out == set()
+    assert len(calls) == 1
+    assert "result=skipped slug=rep reason=owned_by_other_user" in caplog.text
+    assert "result=failed" not in caplog.text
+    assert not (base / "rep" / ".published.json").exists()
+    assert locks.acquire(base, "rep", ttl_s=600) is True

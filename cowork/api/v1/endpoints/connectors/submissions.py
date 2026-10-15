@@ -9,23 +9,22 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
-from sqlmodel import Session
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
-from cowork.db.scoped import ScopedSessionDep
-from cowork.db.session import get_session
+from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.handlers.probe import ProbeHandler
-from cowork.schemas.connectors import ConnectorField, SubmitFormRequest
+from cowork.schemas.connectors import ConnectorField, InvalidConnectorIdError, SubmitFormRequest
+from cowork.services.connectors.persist import vault_for_scope
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.submissions import store
 
-# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
-# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
-# whenever org mode has no org in scope. Declaring it too makes the
-# requirement visible to a route walker instead of something only
-# discoverable by reading scoped.py.
+# AuthenticatedInOrgMode: in org mode a request with no verified principal is
+# refused with 401 before the form is read. The stream holds no request
+# session: the probe handler's database units open their own tenant-scoped
+# sessions, so no connection stays checked out while the probe waits on the
+# model.
 router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
-SessionDep = Annotated[Session, Depends(get_session)]
+TenantScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
 def _resolve_fields(spec, method_id: str | None) -> list:
@@ -72,9 +71,11 @@ def _missing_required(fields: list, values: dict, skipped: list[str]) -> list[st
 
 
 @router.post("/")
-async def submit_form(req: SubmitFormRequest, session: SessionDep, scoped: ScopedSessionDep) -> StreamingResponse:
+async def submit_form(req: SubmitFormRequest, scope: TenantScopeDep) -> StreamingResponse:
     try:
         connector_id = req.resolve_connector_id()
+    except InvalidConnectorIdError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
@@ -109,6 +110,16 @@ async def submit_form(req: SubmitFormRequest, session: SessionDep, scoped: Scope
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connector not found.")
         form_id = req.form_spec.get("form_id") or req.form_id or f"{connector_id}-connector"
         fields = _fields_from_spec_dict(req.form_spec, method)
+        extends_name = req.form_spec.get("_extends_connection")
+        if extends_name is not None and (
+            not isinstance(extends_name, str)
+            or not extends_name.strip()
+            or vault_for_scope(scope).read_record(connector_id, extends_name) is None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"No {connector_id} connection named {extends_name!r} to add these fields to.",
+            )
 
     missing = _missing_required(fields, req.values, req.skipped)
     if missing:
@@ -126,7 +137,7 @@ async def submit_form(req: SubmitFormRequest, session: SessionDep, scoped: Scope
         form_spec=req.form_spec,
     )
 
-    handler = ProbeHandler(scoped)
+    handler = ProbeHandler(scope=scope)
     return StreamingResponse(
         handler.run(submission_id, connector_id, method, req.name, req.conversation_id),
         media_type="text/event-stream",
