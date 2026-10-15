@@ -39,7 +39,7 @@ from cowork.common.paths import (
     dir_unlink,
 )
 from cowork.common.settings.app_settings import get_app_settings
-from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
+from anton.core.artifacts.internal_files import NON_CONTENT_NAMES, REVISIONS_DIRNAME
 
 if TYPE_CHECKING:
     from cowork.db.scoped import ScopedSession
@@ -1687,6 +1687,17 @@ def get_preview_mount(token: str) -> Path | None:
     return _PREVIEW_MOUNTS.get(token)
 
 
+def _is_publishable_candidate(rel: Path) -> bool:
+    """`rel` is relative to the artifacts container: `parts[0]` is the
+    artifact folder, `parts[1]` the first component inside it. Anton's
+    non-content names match on that first component only (`static/prd.md`
+    is content); the revision journal is skipped at any depth."""
+    parts = rel.parts
+    if REVISIONS_DIRNAME in parts:
+        return False
+    return len(parts) < 2 or parts[1] not in NON_CONTENT_NAMES
+
+
 def html_artifacts() -> list[dict]:
     """List every publishable file (HTML + Markdown) under every project's
     artifacts tree.
@@ -1694,7 +1705,8 @@ def html_artifacts() -> list[dict]:
     `.md` files publish as rendered HTML pages (see `publish.py`), so they
     belong in this list alongside `.html`. Fullstack apps keep their pages
     inside `static/`; they're surfaced as a single entry per artifact root
-    (titled by the root's metadata), not one row per page.
+    (titled by the root's metadata), not one row per page. Non-content files
+    (README, generation inputs, revision copies) are not listed.
     """
     out = []
     seen: set[str] = set()
@@ -1703,7 +1715,12 @@ def html_artifacts() -> list[dict]:
     for art_root in _scan_artifact_dirs():
         if not art_root.exists():
             continue
-        candidates = [p for ext in ("*.html", "*.md") for p in art_root.rglob(ext)]
+        candidates = [
+            p
+            for ext in ("*.html", "*.md")
+            for p in art_root.rglob(ext)
+            if _is_publishable_candidate(p.relative_to(art_root))
+        ]
         for path in sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True):
             key = str(path.resolve())
             if key in seen:
