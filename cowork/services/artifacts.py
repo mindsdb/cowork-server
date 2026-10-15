@@ -40,7 +40,11 @@ from cowork.common.paths import (
     dir_unlink,
 )
 from cowork.common.settings.app_settings import get_app_settings
-from anton.core.artifacts.internal_files import NON_CONTENT_NAMES, REVISIONS_DIRNAME, is_bytecode_name
+from anton.core.artifacts.internal_files import (
+    NON_CONTENT_NAMES,
+    REVISIONS_DIRNAME,
+    is_bytecode_name,
+)
 from anton.core.artifacts.store import iter_content_files
 
 if TYPE_CHECKING:
@@ -293,45 +297,10 @@ def _user_files_with_mtimes(folder: Path) -> list[tuple[Path, int]]:
     """All non-housekeeping files inside an artifact folder, paired with their
     mtime in nanoseconds, sorted by mtime desc.
 
-    One `os.scandir` pass: `DirEntry.is_file(follow_symlinks=False)` and
-    `DirEntry.stat(follow_symlinks=False)` are served from the entry the
-    kernel already returned, so each file is stat'd once instead of the
-    two-to-four times separate `rglob`/`is_file`/`is_symlink`/`stat` calls cost.
+    anton's `iter_content_files` decides what is content, so the card and
+    anton's own view of the artifact cannot disagree.
     """
-    out: list[tuple[Path, int]] = []
-
-    def _walk(start: Path, start_top: str | None) -> None:
-        # Explicit stack, not recursion: a folder deep enough to exhaust the
-        # call stack raises RecursionError, which is not an OSError and would
-        # otherwise escape every handler in the card builder above this.
-        stack: list[tuple[Path, str | None]] = [(start, start_top)]
-        while stack:
-            dir_path, top = stack.pop()
-            try:
-                with os.scandir(dir_path) as it:
-                    entries = list(it)
-            except OSError:
-                continue
-            for entry in entries:
-                entry_top = top if top is not None else entry.name
-                # First path component only: `static/prd.md` is content.
-                if entry_top in NON_CONTENT_NAMES:
-                    continue
-                # Bytecode at any depth: imports leave it next to any module.
-                if is_bytecode_name(entry.name):
-                    continue
-                try:
-                    if entry.is_dir(follow_symlinks=False):
-                        stack.append((Path(entry.path), entry_top))
-                        continue
-                    if not entry.is_file(follow_symlinks=False):
-                        continue
-                    mtime_ns = entry.stat(follow_symlinks=False).st_mtime_ns
-                except OSError:
-                    continue
-                out.append((Path(entry.path), mtime_ns))
-
-    _walk(folder, None)
+    out = [(path, st.st_mtime_ns) for path, st in iter_content_files(folder)]
     out.sort(key=lambda item: item[1], reverse=True)
     return out
 
