@@ -376,13 +376,13 @@ class CodingSettings(Settings):
         ),
     )  # COWORK_CODING_DIR
     workspace_retention_enabled: bool = Field(
-        default=False,
+        default=True,
         validation_alias=AliasChoices("COWORK_CODING_WORKSPACE_RETENTION"),
         description=(
-            "Also release the workspaces of idle, unarchived coding tasks to "
-            "reclaim disk. Off by default: only archiving a task releases its "
-            "workspace. A released workspace is rebuilt with its changes when "
-            "the task is next used."
+            "Also release the workspaces of long-idle, unarchived coding tasks "
+            "to reclaim disk, beyond the most recent few. Archiving a task "
+            "releases its workspace either way. A released workspace is "
+            "rebuilt with its changes when the task is next used."
         ),
     )  # COWORK_CODING_WORKSPACE_RETENTION
     workspace_keep_count: int = Field(
@@ -392,7 +392,7 @@ class CodingSettings(Settings):
         description="Most recently active task workspaces that are never released automatically.",
     )  # COWORK_CODING_WORKSPACE_KEEP_COUNT
     workspace_min_idle_hours: float = Field(
-        default=24,
+        default=14 * 24,
         ge=0,
         validation_alias=AliasChoices("COWORK_CODING_WORKSPACE_MIN_IDLE_HOURS"),
         description="How long a task must be idle before its workspace can be released automatically.",
