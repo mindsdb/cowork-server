@@ -49,7 +49,7 @@ async def test_the_stream_stays_per_delta_and_the_stored_answer_holds_one_delta(
     conversation_id = str(uuid4())
 
     transport = httpx.ASGITransport(app=create_app())
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
         answered = await client.post(
             "/api/v1/responses/",
             json={"input": "hi", "stream": True, "conversation": conversation_id},

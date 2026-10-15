@@ -61,7 +61,7 @@ async def _ask_while_others_are_served() -> _Measured:
             ticks += 1
 
     transport = httpx.ASGITransport(app=create_app(), raise_app_exceptions=False)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+    async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
 
         async def probe_liveness():
             nonlocal live_answers
@@ -128,7 +128,7 @@ async def test_a_connection_that_frees_within_pool_timeout_is_used(one_connectio
     asyncio.get_running_loop().call_later(WAIT / 2, held_elsewhere.close)
     try:
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=create_app()), base_url="http://test",
+            transport=httpx.ASGITransport(app=create_app()), base_url="http://testserver",
         ) as client:
             response = await asyncio.wait_for(
                 client.post("/api/v1/responses/", json={"input": "hi", "stream": True}),
