@@ -552,7 +552,7 @@ class OAuthService:
             #
             # default_label=account_name gives a brand-new connection's tile a
             # meaningful title (the account/org/workspace name the provider
-            # returned) instead of the generic engine-id default — but only
+            # returned) instead of no label at all — but only
             # for a genuinely new connection; it can never clobber a label the
             # user already set on a reconnect (see persist_connection's
             # default_label docs).
@@ -562,13 +562,10 @@ class OAuthService:
             # the granted scopes (Drive/Calendar/Ads/Analytics/Gmail) include
             # profile/openid, so Google's userinfo response never carries a
             # name claim, and account_name is always empty. Without that
-            # fallback, persist_connection instead defaults to the bare
-            # engine id (e.g. "gmail"), de-duplicated with a trailing counter
-            # on a second account ("gmail 2") — a label that survives
-            # connectionIdentity()'s "title, again" filter and leaks into the
-            # tile subtitle next to the email. Defaulting to the email keeps
-            # the label identical to the subtitle's own identity value, so
-            # the frontend's dedup collapses them back to just the email.
+            # fallback a new Google connection would get no label, and its
+            # tile would read as the bare connector name. Defaulting to the
+            # email keeps the label identical to the subtitle's own identity
+            # value, so the frontend's dedup collapses them to just the email.
             connection_name = persist_connection(
                 cfg.engine, "browser_oauth_builtin", "", new_fields,
                 default_label=oauth_default_label(new_fields, cfg.engine),
