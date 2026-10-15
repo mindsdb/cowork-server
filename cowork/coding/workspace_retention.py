@@ -33,7 +33,8 @@ def _automation_enabled(session: CodingSession) -> bool:
 
 @dataclass(frozen=True)
 class RetentionPolicy:
-    enabled: bool = True
+    # Releasing unarchived idle tasks; archived tasks are released either way.
+    enabled: bool = False
     keep_count: int = 10
     min_idle: timedelta = timedelta(hours=24)
 
@@ -121,9 +122,11 @@ class WorkspaceRetention:
                 try:
                     for item in items:
                         if not self.workspaces.release(item.key, item.source_path, item.workspace_path, item.kind):
-                            raise WorkspaceError(f"{item.workspace_path} cannot be released safely")
+                            reason = self.workspaces.release_refusal(item.key) or "it cannot be released safely"
+                            raise WorkspaceError(f"Kept the workspace because {reason}")
                 except Exception as exc:
                     logger.info("Keeping the workspace for coding task %s: %s", session_id, exc)
+                    self._note(session_id, kept=str(exc) if isinstance(exc, WorkspaceError) else "Kept the workspace after an error")
                     try:
                         self._restore_released(items)
                     except Exception:
@@ -132,6 +135,7 @@ class WorkspaceRetention:
                     else:
                         self._mark_released(session_id, None)
                     return False
+            self._note(session_id, kept=None)
             return True
         finally:
             self._unreserve(session_id)
@@ -163,8 +167,14 @@ class WorkspaceRetention:
             session = self.store.load_session(session_id)
             if session.workspace_released_at is None:
                 return
-            self._restore_released(self._items(session))
+            try:
+                self._restore_released(self._items(session))
+            except Exception as exc:
+                # The saved state stays, so a later attempt can still succeed.
+                self._note(session_id, restore_error=str(exc) or "The workspace could not be rebuilt")
+                raise
             self._mark_released(session_id, None)
+            self._note(session_id, restore_error=None)
         finally:
             if not reserved:
                 self._unreserve(session_id)
@@ -210,6 +220,17 @@ class WorkspaceRetention:
         for item in items:
             if self.workspaces.is_released(item.key, item.kind):
                 self.workspaces.restore(item.key, item.source_path, item.workspace_path, item.kind)
+
+    _UNSET = object()
+
+    def _note(self, session_id: str, *, kept: object = _UNSET, restore_error: object = _UNSET) -> None:
+        def update(current: CodingSession) -> None:
+            if kept is not self._UNSET:
+                current.workspace_kept_reason = kept  # type: ignore[assignment]
+            if restore_error is not self._UNSET:
+                current.workspace_restore_error = restore_error  # type: ignore[assignment]
+
+        self.store.update_session(session_id, update, touch_updated_at=False)
 
     def _mark_released(self, session_id: str, released_at: datetime | None) -> None:
         self.store.update_session(

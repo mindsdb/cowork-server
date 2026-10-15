@@ -135,6 +135,8 @@ def test_a_released_repository_folder_restores_as_worktrees_with_its_changes(tmp
     manager.restore("task", str(folder), str(workspace), WorkspaceKind.local_copy)
 
     assert (workspace / "app" / ".git").is_file()
+    # Ignored files the task depends on come back too.
+    assert (workspace / "app" / ".env").read_text(encoding="utf-8") == "TOKEN=1\n"
     assert {(item.path, item.status) for item in manager.diff(str(workspace), None)} == before
     assert before == {("app/src/main.py", "M"), ("docs/new.md", "A")}
 

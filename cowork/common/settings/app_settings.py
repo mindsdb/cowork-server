@@ -376,12 +376,13 @@ class CodingSettings(Settings):
         ),
     )  # COWORK_CODING_DIR
     workspace_retention_enabled: bool = Field(
-        default=True,
+        default=False,
         validation_alias=AliasChoices("COWORK_CODING_WORKSPACE_RETENTION"),
         description=(
-            "Release the workspaces of idle, finished coding tasks to reclaim "
-            "disk. A released workspace is rebuilt with its changes when the "
-            "task is next opened. Archiving a task releases it regardless."
+            "Also release the workspaces of idle, unarchived coding tasks to "
+            "reclaim disk. Off by default: only archiving a task releases its "
+            "workspace. A released workspace is rebuilt with its changes when "
+            "the task is next used."
         ),
     )  # COWORK_CODING_WORKSPACE_RETENTION
     workspace_keep_count: int = Field(
