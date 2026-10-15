@@ -32,6 +32,7 @@ from cowork.coding.contracts import (
     TaskCapability,
     WorkspaceInspection,
     WorkspaceModeOptions,
+    WorkspaceUsagePage,
 )
 from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_models import CodeTask, RunStatus
@@ -72,6 +73,7 @@ from cowork.coding.terminal_service import TaskTerminalService
 from cowork.coding.turns import RunningTurn, TurnExecutor, fail_turn
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager, _org_mode
 from cowork.coding.workspace_mode import workspace_mode_options
+from cowork.coding.workspace_usage import WorkspaceUsage
 from cowork.coding.workspace_retention import RetentionPolicy, WorkspaceRetention
 from cowork.common.settings.app_settings import get_app_settings
 
@@ -103,6 +105,10 @@ class CodingService(
         self.registry = registry or engine_registry
         self.store = store or CodingStore(root)
         self.workspaces = workspaces or WorkspaceManager(root)
+        self.workspace_usage = WorkspaceUsage(
+            self.workspaces.task_roots,
+            lambda: [session.id for session in self.store.list_sessions()],
+        )
         shell_options = [item.id.value for item in shell_inventory().items]
         available_engines = [item.id for item in self.registry.capabilities() if item.available]
         self.control = ControlPlaneService(
@@ -289,6 +295,10 @@ class CodingService(
 
     def capabilities(self) -> list[EngineCapabilities]:
         return self.registry.capabilities()
+
+    def workspace_usage_page(self) -> WorkspaceUsagePage:
+        """Approximate disk used by each task's workspace, measured in the background."""
+        return self.workspace_usage.snapshot()
 
     def workspace_mode_options(
         self, project_id: str | None, computer_id: str | None, path: str | None = None,

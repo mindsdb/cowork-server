@@ -1059,19 +1059,22 @@ class WorkspaceManager:
                 pins.append((repository, ref, result.stdout.strip()))
         return pins
 
-    def prune_task_root(self, session_id: str) -> None:
-        """Remove an empty project-task parent without discarding task files."""
-        relative = managed_key(session_id)
-        if len(relative.parts) != 1:
-            raise WorkspaceError("Invalid project task workspace key")
-        managed_roots = (
+    def task_roots(self) -> tuple[Path, ...]:
+        """Managed folders that hold a ``<task>`` directory of each task's files."""
+        return (
             self.worktrees_root,
             self.legacy_worktrees_root,
             self.local_copies.legacy_copies_root,
             self.local_copies.baselines_root,
             self.folder_baselines.root,
         )
-        for workspace_root in managed_roots:
+
+    def prune_task_root(self, session_id: str) -> None:
+        """Remove an empty project-task parent without discarding task files."""
+        relative = managed_key(session_id)
+        if len(relative.parts) != 1:
+            raise WorkspaceError("Invalid project task workspace key")
+        for workspace_root in self.task_roots():
             task_root = workspace_root / relative
             if task_root.is_symlink() or not task_root.is_dir():
                 continue
