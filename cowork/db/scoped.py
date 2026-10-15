@@ -89,8 +89,10 @@ SYSTEM_SCOPE = LOCAL_SCOPE
 def tenant_scope_required() -> bool:
     """True when code with no scope must refuse rather than fall back to
     LOCAL_SCOPE or a base storage root: in org tenancy, and on a local
-    deployment that trusts identity headers, where LOCAL_SCOPE is the operator
-    view of every person's rows."""
+    deployment that trusts identity headers. There LOCAL_SCOPE is the operator
+    view, which lists every person's conversations, running answers,
+    projects, files, schedules and pins, and reads skills, connections,
+    artifacts and memory from the deployment's own stores."""
     settings = get_app_settings()
     return settings.tenancy_mode == "org" or settings.trust_identity_headers
 

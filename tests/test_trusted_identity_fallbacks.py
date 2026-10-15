@@ -1,8 +1,10 @@
 """Code with no scope on a deployment that trusts identity headers.
 
-There, LOCAL_SCOPE is the operator view of every person's rows, so a helper
-that finds no scope bound skips its work, as it does in org tenancy, instead of
-falling back to LOCAL_SCOPE. Desktop keeps the fallback. Boot paths name
+There, LOCAL_SCOPE is the operator view, which lists every person's
+conversations, running answers, projects, files, schedules and pins, and reads
+skills, connections, artifacts and memory from the deployment's own stores. So
+a helper that finds no scope bound skips its work, as it does in org tenancy,
+instead of falling back to LOCAL_SCOPE. Desktop keeps the fallback. Boot paths name
 LOCAL_SCOPE explicitly, so the stack still boots with the setting on.
 """
 from __future__ import annotations
