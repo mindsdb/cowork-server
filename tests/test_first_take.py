@@ -227,7 +227,7 @@ async def _route(handler, monkeypatch, *, first_take: bool, enabled: bool = True
 
     monkeypatch.setattr(responses, "decide_route", delegated)
     monkeypatch.setattr(
-        responses, "_settings_binding", lambda: RouterBinding(provider=provider, model="fast", label="x"),
+        responses, "_first_take_binding", lambda minted, turn_model: RouterBinding(provider=provider, model="m", label="x"),
     )
     monkeypatch.setattr(responses, "_first_take_enabled", lambda: enabled)
     await handler._route_request(
@@ -274,6 +274,97 @@ async def test_attachments_never_start_one(monkeypatch):
         has_disabled_connections=False,
         first_take=True,
     )
+    assert handler.first_take is None
+
+
+# ── which model it speaks with ─────────────────────────────────────────────
+
+
+def _settings(monkeypatch, *, router_model="router-pick", router_provider="anthropic"):
+    import cowork.handlers.responses as responses
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(responses, "get_user_settings", lambda *a, **k: SimpleNamespace(
+        resolved_router_model=router_model,
+        resolved_router_provider=SimpleNamespace(value=router_provider),
+    ))
+
+
+def test_hosted_uses_the_task_pick_on_the_minted_key(monkeypatch):
+    from cowork.handlers.responses import _first_take_binding
+
+    _settings(monkeypatch)
+    minted = RouterBinding(provider="minted-key", model="mindshub_air", label="minds_cloud")
+    picked = _first_take_binding(minted, "claude-opus-4-8")
+    assert (picked.provider, picked.model, picked.label) == ("minted-key", "claude-opus-4-8", "minds_cloud")
+
+
+def test_hosted_without_a_pick_uses_the_routing_model_not_the_gates(monkeypatch):
+    from cowork.handlers.responses import _first_take_binding
+
+    _settings(monkeypatch, router_model="kimi-k3")
+    minted = RouterBinding(provider="minted-key", model="mindshub_air", label="minds_cloud")
+    assert _first_take_binding(minted, None).model == "kimi-k3"
+
+
+def test_elsewhere_the_router_role_is_resolved_like_the_turns_own(monkeypatch):
+    """build_llm_client applies the pick to the router only on the router's own
+    provider (test_build_llm_client covers that rule); the take takes its answer."""
+    from types import SimpleNamespace
+    import cowork.services.providers as providers
+    from cowork.handlers.responses import _first_take_binding
+
+    _settings(monkeypatch)
+    seen = {}
+
+    def fake_build(**kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(router_provider="router-provider", router_model="resolved-router")
+
+    monkeypatch.setattr(providers, "build_llm_client", fake_build)
+    binding = _first_take_binding(None, "gpt-5.5")
+    assert seen == {"model_override": "gpt-5.5"}
+    assert (binding.provider, binding.model, binding.label) == ("router-provider", "resolved-router", "anthropic")
+    _first_take_binding(None, "")
+    assert seen == {"model_override": None}
+
+
+def test_no_model_means_no_take(monkeypatch):
+    import cowork.services.providers as providers
+    from cowork.handlers.responses import _first_take_binding
+
+    _settings(monkeypatch, router_model=None)
+    assert _first_take_binding(RouterBinding(provider="k", model="air", label="x"), None) is None
+
+    def broken(**_kwargs):
+        raise ValueError("Anthropic API key is not configured")
+
+    monkeypatch.setattr(providers, "build_llm_client", broken)
+    assert _first_take_binding(None, None) is None
+
+
+@pytest.mark.asyncio
+async def test_route_request_hands_the_task_pick_over(monkeypatch):
+    import cowork.handlers.responses as responses
+
+    seen = {}
+
+    async def delegated(**_kwargs):
+        return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
+
+    def binding_for(minted, turn_model):
+        seen["turn_model"] = turn_model
+        return None
+
+    monkeypatch.setattr(responses, "decide_route", delegated)
+    monkeypatch.setattr(responses, "_first_take_binding", binding_for)
+    monkeypatch.setattr(responses, "_first_take_enabled", lambda: True)
+    handler = _handler()
+    await handler._route_request(
+        conversation_id=None, gate_rows=[], harness_input=[{"type": "text", "text": "hi"}],
+        has_attachments=False, has_disabled_connections=False, first_take=True, turn_model="claude-opus-4-8",
+    )
+    assert seen == {"turn_model": "claude-opus-4-8"}
     assert handler.first_take is None
 
 

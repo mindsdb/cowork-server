@@ -39,7 +39,6 @@ from cowork.handlers.response_routing import (
     _text_history,
     RouteDecision,
     RouterBinding,
-    _settings_binding,
     decide_route,
     ineligible_reason,
 )
@@ -538,14 +537,34 @@ def _failed_frame_for(exc: Exception, *, request_id: str | None = None) -> str:
     return response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)
 
 
-def _quiet_settings_binding() -> RouterBinding | None:
-    """The stored-settings gate target, or None if it can't be built.
+def _first_take_binding(minted: RouterBinding | None, turn_model: str | None) -> RouterBinding | None:
+    """Where the first take runs: the model the user picked for this task or
+    message, else their "Routing & summarization" model. None if neither can
+    be built, and then there is no take; the turn is unaffected.
 
-    Only the first take uses this. When it fails, decide_route builds it again
-    and fails open on its own terms, so the gate's handling is unchanged.
+    Not the gate's model: the gate needs a fast hidden default to decide in
+    time, while the take is something the user reads, so it speaks with the
+    model they chose.
+
+    `minted` is the gate's per-turn MindsHub binding on hosted orgs, where
+    every model is served through the same key, so the pick applies as is.
+    Everywhere else the router role is resolved the way the turn's own client
+    resolves it (build_llm_client): the per-task pick only when it runs on the
+    router's provider, since a pick from another provider can't be called
+    with the router's key.
     """
     try:
-        return _settings_binding()
+        if minted is not None:
+            model = turn_model or get_user_settings().resolved_router_model
+            return RouterBinding(provider=minted.provider, model=model, label=minted.label) if model else None
+        from cowork.services.providers import build_llm_client
+
+        client = build_llm_client(model_override=turn_model or None)
+        return RouterBinding(
+            provider=client.router_provider,
+            model=client.router_model,
+            label=get_user_settings().resolved_router_provider.value,
+        )
     except Exception:
         return None
 
@@ -565,8 +584,8 @@ def _start_first_take(
     harness: str | None,
     metadata: dict[str, str],
 ) -> FirstTake | None:
-    """Start the turn's first take (ENG-3406) on the gate's model, or None
-    when it is switched off or there is no gate model to run it on.
+    """Start the turn's first take (ENG-3406) on `binding`, or None when it is
+    switched off or there is no model to run it on.
 
     Its trace is its own (tag ``cowork-first-take``), joined to the gate's by
     the correlation id, so its cost is countable apart from the gate's.
@@ -653,6 +672,7 @@ class ResponsesHandler:
                 has_disabled_connections=bool(disabled),
                 trace_metadata=trace_metadata,
                 first_take=bool(request.stream) and self.interactive,
+                turn_model=request.model,
             )
             first_take, self.first_take = getattr(self, "first_take", None), None
             trace_metadata = {
@@ -919,19 +939,23 @@ class ResponsesHandler:
         has_disabled_connections: bool,
         trace_metadata: dict[str, str] | None = None,
         first_take: bool = False,
+        turn_model: str | None = None,
     ) -> tuple[RouteDecision, dict | None]:
         """Run Cowork's narrow pre-Anton gate with only safe text context.
 
         With `first_take`, the instant first take (ENG-3406) starts beside the
-        gate on the same model and history, left on `self.first_take` for
-        handle() to keep or cancel once the route is known.
+        gate on the same history, on the user's model (`turn_model`, the
+        request's pick, else their router model; see _first_take_binding), left
+        on `self.first_take` for handle() to keep or cancel once the route is
+        known. `turn_model` is used for nothing else here.
 
         `gate_rows` is the history handle()'s first unit read for the gate
         (see _TurnStart).
 
-        The composer's per-conversation model pick (`request.model`) is
-        deliberately not passed down: it drives Anton's turn, not the gate
-        (see `UserSettings.resolved_gate_model`).
+        The composer's per-conversation model pick (`request.model`) never
+        reaches the gate: it drives Anton's turn, not the gate (see
+        `UserSettings.resolved_gate_model`). It arrives as `turn_model` for
+        the first take only.
 
         Returns the decision plus pre-minted turn credentials
         (`{"correlation_id", "llm"}`) for a delegated remote turn to reuse."""
@@ -986,9 +1010,8 @@ class ResponsesHandler:
                     binding, turn_llm = await self._router_binding()
                     correlation_id = (turn_llm or {}).get("correlation_id")
                     if first_take:
-                        binding = binding or _quiet_settings_binding()
                         self.first_take = _start_first_take(
-                            binding,
+                            _first_take_binding(binding, turn_model),
                             history=history,
                             conversation_id=conversation_id,
                             harness=self.harness_name,
