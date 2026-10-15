@@ -31,6 +31,7 @@ from cowork.common.paths import cowork_home
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.dev_setup import run_dev_setup
 from cowork.scheduler import start_scheduler
+from cowork.services.pending_credential_clear import consume_pending_credential_clear
 
 
 # Set up logging
@@ -146,6 +147,9 @@ def _warm_agent_runtime() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_dev_setup()
+    # After migrations and the .env seed, before anything reads a credential.
+    app_settings = get_app_settings()
+    consume_pending_credential_clear(app_settings.database.uri, app_settings.tenancy_mode)
     # Before the server reports ready, so the first turn does not pay for imports.
     await asyncio.to_thread(_warm_agent_runtime)
     # History recovery also retries buffers sealed by an earlier failed sweep.
