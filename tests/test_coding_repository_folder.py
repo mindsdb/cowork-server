@@ -26,7 +26,7 @@ def make_repository(path: Path, files: dict[str, str]) -> Path:
     for name, content in files.items():
         (path / name).parent.mkdir(parents=True, exist_ok=True)
         (path / name).write_text(content, encoding="utf-8")
-    (path / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+    (path / ".gitignore").write_text("node_modules/\n.env\nbuild/\n", encoding="utf-8")
     git(path, "add", ".")
     git(path, "commit", "-m", "base")
     return path
@@ -46,9 +46,15 @@ def folder(tmp_path: Path) -> Path:
     (root / "node_modules" / "left-pad" / "index.js").write_text("module.exports = 1\n", encoding="utf-8")
     (root / "app" / "node_modules").mkdir()
     (root / "app" / "node_modules" / "dep.js").write_text("ignored\n", encoding="utf-8")
+    (root / "app" / "__pycache__").mkdir()
+    (root / "app" / "__pycache__" / "main.pyc").write_bytes(b"cache")
     # Uncommitted work in a repository carries over into the task.
     (root / "app" / "src" / "main.py").write_text("print('dirty')\n", encoding="utf-8")
     (root / "app" / "untracked.txt").write_text("untracked\n", encoding="utf-8")
+    # Ignored files that are not dependencies are part of how the folder works.
+    (root / "app" / ".env").write_text("TOKEN=1\n", encoding="utf-8")
+    (root / "services" / "api" / "build").mkdir()
+    (root / "services" / "api" / "build" / "out.txt").write_text("built\n", encoding="utf-8")
     return root
 
 
@@ -70,9 +76,15 @@ def test_inner_repositories_become_worktrees_inside_the_folder_copy(tmp_path: Pa
     assert (workspace / "plan.md").is_file()
     assert (workspace / "services" / "README.md").is_file()
     assert (workspace / "docs" / "guide.md").is_file()
-    # Dependencies are neither copied at the folder level nor checked out from a repo.
+    assert (workspace / "app" / ".env").read_text(encoding="utf-8") == "TOKEN=1\n"
+    assert (workspace / "services" / "api" / "build" / "out.txt").is_file()
+    # Dependencies are neither copied at the folder level nor checked out from
+    # a repo, and the task is told which ones it has to rebuild.
     assert not (workspace / "node_modules").exists()
     assert not (workspace / "app" / "node_modules").exists()
+    assert prepared.warning is not None
+    assert "app/node_modules" in prepared.warning and "node_modules" in prepared.warning
+    assert "__pycache__" not in prepared.warning
     assert manager.diff(str(workspace), None) == []
     baseline = manager.local_copies._baseline_for(workspace)
     assert not (baseline / "app" / ".git").exists()
@@ -158,3 +170,18 @@ def test_without_git_a_repository_folder_is_copied_as_before(
 
     assert (workspace / "app" / ".git").is_dir()
     assert (workspace / "node_modules").is_dir()
+
+
+def test_a_folder_task_shows_which_dependency_folders_it_left_out(tmp_path: Path, folder: Path) -> None:
+    from coding_service_fakes import CREDS, FakeEngine, service_with, wait_for_status
+
+    from cowork.coding.contracts import SessionCreateRequest, SessionStatus
+
+    service = service_with(tmp_path, FakeEngine())
+    created = service.create_session(
+        SessionCreateRequest(path=str(folder), prompt="Go", allow_direct_folder=True), CREDS, "fake", "fake-model",
+    )
+    session = wait_for_status(service, created.id, SessionStatus.completed)
+
+    assert session.workspace_warning is not None
+    assert "app/node_modules" in session.workspace_warning
