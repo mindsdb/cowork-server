@@ -46,6 +46,145 @@ def _schedule(
     return schedule
 
 
+def _conversation(session: Session, *, topic: str = "run"):
+    from cowork.models.conversation import Conversation
+
+    conv = Conversation(topic=topic, project_id=GENERAL_PROJECT_ID)
+    session.add(conv)
+    session.commit()
+    session.refresh(conv)
+    return conv
+
+
+# --- Which conversations are a schedule's runs. The conversation list says
+# so per conversation (scheduled_id), so the desktop groups a schedule's runs
+# into one row, and the schedule poll does not carry every run's id.
+
+def _run_with_conversation(session, run_service, schedule):
+    conv = _conversation(session)
+    run = run_service.create_run(schedule.id, is_manual=False)
+    run_service.set_run_conversation(run.id, conv.id)
+    return conv
+
+
+def test_conversations_name_the_schedule_they_are_runs_of():
+    session = _session()
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
+    s1, s2 = _schedule(session, title="A"), _schedule(session, title="B")
+    c1 = _run_with_conversation(session, run_service, s1)
+    c2 = _run_with_conversation(session, run_service, s1)
+    c3 = _run_with_conversation(session, run_service, s2)
+    ordinary = _conversation(session, topic="chat")
+    unattached = run_service.create_run(s1.id, is_manual=False)  # no conversation yet
+
+    assert unattached is not None
+    assert run_service.schedules_for_conversations([c1.id, c2.id, c3.id, ordinary.id]) == {
+        c1.id: s1.id, c2.id: s1.id, c3.id: s2.id,
+    }
+    assert run_service.schedules_for_conversations([]) == {}
+
+
+def test_the_lookup_stays_inside_the_callers_schedules():
+    from cowork.db.scoped import TenantScope
+
+    session = _session()
+    mine = _schedule(session, title="mine")
+    theirs = _schedule(session, title="theirs")
+    for schedule, user in ((mine, "u1"), (theirs, "u2")):
+        schedule.org_id, schedule.created_by = "o1", user
+        session.add(schedule)
+    session.commit()
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
+    c_mine = _run_with_conversation(session, run_service, mine)
+    c_theirs = _run_with_conversation(session, run_service, theirs)
+
+    scoped = ScheduleRunService(ScopedSession(session, TenantScope(org_mode=True, org_id="o1", user_id="u1")))
+    assert scoped.schedules_for_conversations([c_mine.id, c_theirs.id]) == {c_mine.id: mine.id}
+
+
+def test_a_page_of_conversations_does_not_load_a_long_history(monkeypatch):
+    """A schedule with thousands of runs, and a page of three conversations:
+    the lookup asks about those three, and the schedule poll carries a count,
+    not the history."""
+    from sqlalchemy import event
+
+    from cowork.api.v1.endpoints.schedules import list_schedules
+    from cowork.models.conversation import Conversation
+    from cowork.models.schedule import ScheduleRun
+
+    session = _session()
+    schedule = _schedule(session)
+    conversations = [Conversation(topic=f"run {n}", project_id=GENERAL_PROJECT_ID) for n in range(3000)]
+    session.add_all(conversations)
+    session.flush()
+    started = datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc)
+    session.add_all([
+        ScheduleRun(schedule_id=schedule.id, started_at=started, status=RunStatus.success, conversation_id=c.id)
+        for c in conversations
+    ])
+    session.commit()
+    page = [c.id for c in conversations[-3:]]
+    statements: list[tuple[str, tuple]] = []
+    event.listen(
+        session.get_bind(), "before_cursor_execute",
+        lambda _conn, _cur, statement, params, _ctx, _many: statements.append((statement, params)),
+    )
+
+    found = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE)).schedules_for_conversations(page)
+    lookups = [s for s in statements if "schedule_runs" in s[0]]
+
+    assert found == {cid: schedule.id for cid in page}
+    assert len(lookups) == 1
+    # One parameter per conversation on the page, not one per run.
+    assert len(lookups[0][1]) == len(page)
+
+    body = list_schedules(ScopedSession(session, SYSTEM_SCOPE))
+    [listed] = body["schedules"]
+    assert listed["runCount"] == 3000
+    assert "runs_index" not in body
+
+
+def test_the_lookup_uses_the_conversation_index():
+    from sqlalchemy import text
+
+    session = _session()
+    plan = session.exec(text(
+        "EXPLAIN QUERY PLAN SELECT schedule_id FROM schedule_runs WHERE conversation_id IN ('a', 'b')"
+    )).fetchall()
+    assert any("ix_schedule_runs_conversation_id" in str(row) for row in plan), plan
+
+
+def test_the_conversation_list_reports_scheduled_id(monkeypatch):
+    import asyncio
+
+    import test_turn_pool_connections as turn_pool
+
+    from cowork.db.units import unit_session
+
+    async def main(schedule_id):
+        with unit_session(scope=SYSTEM_SCOPE) as session:
+            run_service = ScheduleRunService(session)
+            from cowork.services.conversations import ConversationService
+
+            conv = ConversationService(session).create_conversation(topic="run", project_id=GENERAL_PROJECT_ID)
+            chat = ConversationService(session).create_conversation(topic="chat", project_id=GENERAL_PROJECT_ID)
+            run = run_service.create_run(schedule_id, is_manual=False)
+            run_service.set_run_conversation(run.id, conv.id)
+            conv_id, chat_id = conv.id, chat.id
+        async with turn_pool._client() as client:
+            listed = (await client.get("/api/v1/conversations/", params={"project": "all", "limit": 200})).json()
+            one = (await client.get(f"/api/v1/conversations/{conv_id}")).json()
+        return conv_id, chat_id, listed, one
+
+    with turn_pool._a_daily_schedule(due=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc)) as schedule_id:
+        conv_id, chat_id, listed, one = asyncio.run(main(schedule_id))
+
+    by_id = {c["id"]: c for c in listed["conversations"]}
+    assert by_id[str(conv_id)]["scheduledId"] == str(schedule_id)
+    assert by_id[str(chat_id)]["scheduledId"] is None
+    assert one["scheduledId"] == str(schedule_id)
+
+
 def test_has_running_run_false_when_no_runs():
     session = _session()
     schedule = _schedule(session)

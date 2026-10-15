@@ -220,3 +220,22 @@ def test_audit_upgrade_gives_every_schedule_its_first_version_and_keeps_history(
 
     _migrate(engine, uri, PAUSE_AND_MISSED, down=True)
     assert {"schedule_versions", "schedule_events"}.isdisjoint(sa.inspect(engine).get_table_names())
+
+
+CONVERSATION_INDEX = "8ffc4296fcbe"
+
+
+def test_run_conversation_index_upgrade_and_downgrade(database):
+    engine, uri = database
+    _migrate(engine, uri, AUDIT_TRAIL)
+    _, run_id = _seed_schedule_and_run(engine)
+
+    _migrate(engine, uri, CONVERSATION_INDEX)
+
+    indexes = {ix["name"] for ix in sa.inspect(engine).get_indexes("schedule_runs")}
+    assert "ix_schedule_runs_conversation_id" in indexes
+    assert _run_row(engine, run_id)["status"] == "success"
+
+    _migrate(engine, uri, AUDIT_TRAIL, down=True)
+    indexes = {ix["name"] for ix in sa.inspect(engine).get_indexes("schedule_runs")}
+    assert "ix_schedule_runs_conversation_id" not in indexes

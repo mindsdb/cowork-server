@@ -677,6 +677,14 @@ class UserSettings(Settings):
         title="Show Counters",
         description="Show counters in the UI.",
     )
+    schedule_keep_awake: bool = Field(
+        default=True,
+        title="Keep Awake For Scheduled Tasks",
+        description=(
+            "Keep the desktop from idle-sleeping while a scheduled task is running, "
+            "about to run, or waiting to retry."
+        ),
+    )
     nav_title: str = Field(
         default="",
         title="Nav Title",

@@ -141,3 +141,9 @@ def test_autopublish_description_names_the_override_that_works(monkeypatch):
     # Naming the alias is fine — saying it is the override is not. The
     # description must mark it as NOT the bypass.
     assert "NOT that" in text or "not that" in text
+
+
+def test_keeping_the_desktop_awake_for_scheduled_tasks_defaults_on():
+    # On unless the user turns it off: a task that comes due while the
+    # laptop idle-sleeps does not run.
+    assert UserSettings.model_fields["schedule_keep_awake"].get_default() is True
