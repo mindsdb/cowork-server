@@ -23,7 +23,7 @@ from uuid import UUID
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
-from cowork.services.publish import publish_artifact
+from cowork.services.publish import PublishOwnedByOtherUser, publish_artifact
 
 if TYPE_CHECKING:
     from cowork.services.artifact_ownership import OwnerResolution
@@ -98,9 +98,9 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
     """
     from cowork.services.artifacts import _user_files, content_mtime, load_published_map
     from cowork.services.publish import (
-        PUBLISHABLE_STATIC_SUFFIXES,
         _resolve_publish_target,
         compute_publish_md5,
+        is_publishable_static,
     )
 
     if not _user_files(folder):
@@ -118,10 +118,11 @@ def needs_publish(folder: Path, artifacts_base: Path) -> PublishDecision:
         # /upload is strict here: literally backend.py plus static/index.html.
         if not (folder / "backend.py").is_file() or not (folder / "static" / "index.html").is_file():
             return PublishDecision(None, REASON_NOT_PUBLISHABLE, True)
-    elif publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
+    elif not is_publishable_static(publish_target, artifacts_base):
         # Suffix, not the on-disk name: _zip_html renames a single file to
         # index.html inside the archive, so an artifact whose primary is
-        # `report.html` publishes normally.
+        # `report.html` publishes normally. A non-content primary (README,
+        # generation input) is refused by `publish_artifact`, so skip it here.
         return PublishDecision(None, REASON_NOT_PUBLISHABLE)
 
     current_mtime = content_mtime(folder)
@@ -353,6 +354,13 @@ async def _publish_one(
         # retry is attempted — the next turn reads the record and sees the real
         # state. The TTL is what eventually frees the slug.
         _record("timeout", slug=slug, timeout_s=f"{timeout_s:.1f}")
+        return False
+    except PublishOwnedByOtherUser:
+        # The upload service holds this report_id for another account, so a
+        # retry cannot succeed and a fresh report_id would publish a copy. A
+        # skip like `not_owner`, not a failure; no thread is left running.
+        release(artifacts_base, slug)
+        _record("skipped", slug=slug, reason="owned_by_other_user")
         return False
     except Exception as exc:
         # A synchronous failure (a 502 a second in, ValueError from the target

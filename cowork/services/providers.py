@@ -102,10 +102,26 @@ def is_minds_host(url: str | None) -> bool:
     return host in ("mindshub.ai", "mdb.ai") or host.endswith((".mindshub.ai", ".mdb.ai"))
 
 
-# Working prod publish host. Prod's api host (api.mindshub.ai) does NOT serve the
-# publish API — it lives on the legacy 4nton.ai host — so prod, plus anything we
-# can't map to a non-prod MindsHub env, falls back here.
-PUBLISH_FAILSAFE_URL = "https://4nton.ai"
+# Prod publish host. The view host serves the publishing API (/upload, /list,
+# /delete/{id}, /versions, /activate); prod's api host (api.mindshub.ai) does
+# not. So prod, plus anything we can't map to a non-prod MindsHub env, falls
+# back here.
+PUBLISH_FAILSAFE_URL = "https://view.mindshub.ai"
+
+# The former prod publish host. It serves the same API but is being retired
+# for publishing, while saved settings may still name it.
+LEGACY_PUBLISH_HOST = "4nton.ai"
+
+
+def normalize_publish_url(publish_url: str | None) -> str | None:
+    """`publish_url` with the retired 4nton.ai host replaced by the prod
+    publish host; any other URL is returned unchanged."""
+    try:
+        host = (urlparse(publish_url or "").hostname or "").lower().rstrip(".")
+    except ValueError:
+        # `.hostname` raises on an unbalanced bracket; see `is_minds_host`.
+        return publish_url
+    return PUBLISH_FAILSAFE_URL if host == LEGACY_PUBLISH_HOST else publish_url
 
 
 def publish_url_for_endpoint(endpoint_url: str | None) -> str:
@@ -115,9 +131,9 @@ def publish_url_for_endpoint(endpoint_url: str | None) -> str:
     served on the *non-prod* MindsHub api hosts, so a provider pointed at
     ``api.<env>.mindshub.ai`` (dev/staging) publishes to that same host. Prod
     (``api.mindshub.ai``) has no publish routes, and anything unrecognised
-    (mdb.ai, a custom endpoint, empty) falls back to the legacy ``4nton.ai``
-    host. anton appends the route path; an explicit `publish_url` /
-    `ANTON_PUBLISH_URL` overrides this.
+    (mdb.ai, a custom endpoint, empty) falls back to the prod publish host,
+    ``view.mindshub.ai``. anton appends the route path; an explicit
+    `publish_url` / `ANTON_PUBLISH_URL` overrides this.
     """
     host = (urlparse(endpoint_url or "").hostname or "").lower()
     if host.startswith("api.") and host.endswith(".mindshub.ai") and host != "api.mindshub.ai":
@@ -131,17 +147,11 @@ def is_mindshub_publish_url(publish_url: str | None) -> bool:
     Only MindsHub's service can run a full-stack artifact. A service an operator
     points `ANTON_PUBLISH_URL` or the `publish_url` setting at, such as one a
     customer built from the publishing specification, stores static bundles
-    only. Matches the hosts `publish_url_for_endpoint` can return: the MindsHub
-    api hosts (via `is_minds_host`) and the legacy `4nton.ai` host.
+    only. Matches the hosts `publish_url_for_endpoint` can return (MindsHub
+    hosts, via `is_minds_host`); a retired `4nton.ai` URL counts as the prod
+    publish host it maps to.
     """
-    if is_minds_host(publish_url):
-        return True
-    try:
-        host = (urlparse(publish_url or "").hostname or "").lower()
-    except ValueError:
-        # `.hostname` raises on an unbalanced bracket; see `is_minds_host`.
-        return False
-    return host == urlparse(PUBLISH_FAILSAFE_URL).hostname
+    return is_minds_host(normalize_publish_url(publish_url))
 
 
 # Gemini speaks OpenAI-compatible at Google's endpoint — NOT api.openai.com.
