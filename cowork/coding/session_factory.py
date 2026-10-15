@@ -33,12 +33,19 @@ from cowork.coding.reasoning import ModelLevels, resolve_reasoning_effort
 from cowork.coding.skill_models import SkillResolution
 from cowork.coding.skill_runtime import SkillRuntimeResolver
 from cowork.coding.store import CodingStore
-from cowork.coding.workspace import WorkspaceManager, _org_mode
+from cowork.coding.workspace import WorkspaceError, WorkspaceManager, _org_mode
 from cowork.coding.workspace_mode import resolve_workspace_mode
 from cowork.services.skills import CodeSkillService
 
 EventEmitter = Callable[[str, CodingEvent], CodingEvent]
 TASK_TITLE_MAX_LENGTH = 72
+ISOLATED_PROJECT_INSTRUCTION = (
+    "Never modify the user's source folders directly; work only in the isolated task workspace paths below."
+)
+IN_PLACE_PROJECT_INSTRUCTION = (
+    "These are the user's own checkouts, on whatever branch each is on; your changes land there directly. "
+    "Do not switch branches unless asked."
+)
 
 
 @dataclass(frozen=True)
@@ -117,10 +124,11 @@ def _project_setup_instructions(
     project: CodeProject,
     workspaces: list[TaskWorkspace],
 ) -> list[str]:
+    in_place = any(item.workspace_kind == WorkspaceKind.direct_folder for item in workspaces)
     sections = [
         f"You are working in the MindsHub Code Project {project.name!r}.",
         "Treat every listed task workspace as part of one project. Inspect and change multiple folders when the outcome requires it.",
-        "Never modify the user's source folders directly; work only in the isolated task workspace paths below.",
+        IN_PLACE_PROJECT_INSTRUCTION if in_place else ISOLATED_PROJECT_INSTRUCTION,
     ]
     if workspaces:
         sections.append("Project folders:\n" + "\n".join(
@@ -250,8 +258,12 @@ class CodingSessionFactory:
                 project.default_workspace_mode if project else None,
                 runs_locally=runs_locally,
                 org_mode=_org_mode(),
-                project_task=project is not None,
             )
+            if workspace_mode == WorkspaceMode.in_place and request.repository_setup is not None:
+                if request.workspace_mode is not None:
+                    raise ValueError("Branch choices start an isolated worktree; choose Worktree")
+                # The project default is a preference; branch choices need a worktree.
+                workspace_mode = WorkspaceMode.worktree
         except ValueError:
             with suppress(KeyError, ValueError):
                 self.control.set_run_status(control_snapshot.run.id, RunStatus.failed)
@@ -272,9 +284,16 @@ class CodingSessionFactory:
         try:
             # Preparation runs in the background, so reject a folder it would
             # refuse now, while the composer can still show the error.
-            if project is None and workspace_mode == WorkspaceMode.in_place:
-                self.workspaces.in_place_root(request.path or "")
-            elif project is None:
+            if workspace_mode == WorkspaceMode.in_place:
+                try:
+                    self.in_place_roots(project, request.resource_ids, request.path)
+                except (WorkspaceError, ValueError):
+                    if request.workspace_mode is not None:
+                        raise
+                    # A project default of working in place is a preference:
+                    # folders that cannot be worked in directly are isolated.
+                    workspace_mode = WorkspaceMode.worktree
+            if workspace_mode != WorkspaceMode.in_place and project is None:
                 self.workspaces.check_source(request.path or "", request.allow_folder_copy)
             validate_directories(request.additional_dirs)
         except Exception:
@@ -323,6 +342,18 @@ class CodingSessionFactory:
             raise
         return pending
 
+    def in_place_roots(
+        self,
+        project: CodeProject | None,
+        resource_ids: list[str] | None,
+        path: str | None,
+    ) -> set[Path]:
+        """The repositories an in-place task would work in; refuses any it cannot."""
+        if project is None:
+            return {self.workspaces.in_place_root(path or "")}
+        selected = self._selected_project(project, resource_ids)
+        return {root for _, root in self.project_workspaces.in_place_roots(selected)}
+
     def complete(self, pending: PendingLocalSession, cancelled: Callable[[], bool]) -> CodingSession:
         """Prepare a pending task's workspace and run its setup commands.
 
@@ -359,7 +390,9 @@ class CodingSessionFactory:
             )
             self.control.set_run_status(pending.control_snapshot.run.id, RunStatus.ready)
             self._emit_workspace_ready(session)
-            if preparation.project and not cancelled():
+            # The user's own checkouts are already set up; setup commands are
+            # for the fresh folders an isolated task gets.
+            if preparation.project and session.workspace_mode != WorkspaceMode.in_place and not cancelled():
                 self._run_setup(session, preparation.project, cancelled)
             return self.store.load_session(session.id)
         except Exception:
@@ -405,6 +438,9 @@ class CodingSessionFactory:
             task_id=snapshot.task.id,
             run_id=snapshot.run.id,
             computer_id=snapshot.computer.id,
+            # Until preparation fills it in, the requested scope lets an
+            # in-place task's repositories be found while it prepares.
+            resource_ids=list(request.resource_ids or []),
             scope_all_project_resources=request.resource_ids is None,
             runtime_epoch=snapshot.run.epoch,
             project_id=project.id if project else None,
@@ -502,7 +538,11 @@ class CodingSessionFactory:
             if selected_project.playbook
             else ("", None)
         )
-        prepared = self.project_workspaces.prepare(session_id, selected_project, request.repository_setup)
+        prepared = (
+            self.project_workspaces.prepare_in_place(session_id, selected_project)
+            if workspace_mode == WorkspaceMode.in_place
+            else self.project_workspaces.prepare(session_id, selected_project, request.repository_setup)
+        )
         permission_mode = (
             request.permission_mode
             if "permission_mode" in request.model_fields_set
