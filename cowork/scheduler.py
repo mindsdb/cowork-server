@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -265,6 +266,16 @@ class _TurnEvidence:
     # Whether the stream holds anything beyond the turn's start, its progress
     # frames and its failure: an answer, a tool call, anything the agent did.
     acted: bool
+    # What the turn's last response.failed frame told the user, if any.
+    failure: _TurnFailure | None = None
+
+
+@dataclass(frozen=True)
+class _TurnFailure:
+    """What a turn's failure frame said: its user-safe text and its code."""
+
+    message: str | None = None
+    code: str | None = None
 
 
 @dataclass(frozen=True)
@@ -916,8 +927,25 @@ _UNCERTAIN_ERROR = (
 )
 
 
+# Failure codes a later attempt would hit again unchanged: the model or the
+# account has to change first. A code can rule a retry out; none rules one
+# in, since the code says nothing about what the turn did first.
+_PERMANENT_FAILURE_CODES = frozenset({
+    "model_not_found",
+    "model_access_denied",
+    "model_disabled",
+    "model_restricted",
+    "provider_auth",
+    "included_allowance_exhausted",
+    "image_format",
+    "content_too_large",
+    "token_limit",
+})
+
+
 def _classify(evidence: _TurnEvidence, *, timed_out: bool) -> _AttemptEnd:
-    """What the turn's ending says about whether it acted."""
+    """What the turn's ending says about whether it acted, and what to tell
+    the user: the turn's own failure text when it gave one."""
     if timed_out:
         return _AttemptEnd(outcome=AttemptOutcome.interrupted, error=_DURATION_ERROR)
     reason = evidence.reason
@@ -930,11 +958,38 @@ def _classify(evidence: _TurnEvidence, *, timed_out: bool) -> _AttemptEnd:
         return _AttemptEnd(outcome=AttemptOutcome.interrupted, error=_INTERRUPTED_ERROR)
     if reason is None:
         return _AttemptEnd(outcome=AttemptOutcome.uncertain, error=_UNCERTAIN_ERROR)
+    failure = evidence.failure or _TurnFailure()
     if not evidence.acted:
         return _AttemptEnd(
-            outcome=AttemptOutcome.failed_before_execution, error=_FAILED_BEFORE_ERROR, retryable=True,
+            outcome=AttemptOutcome.failed_before_execution,
+            error=failure.message or _FAILED_BEFORE_ERROR,
+            retryable=failure.code not in _PERMANENT_FAILURE_CODES,
         )
-    return _AttemptEnd(outcome=AttemptOutcome.failed_during_execution, error=_FAILED_DURING_ERROR)
+    return _AttemptEnd(
+        outcome=AttemptOutcome.failed_during_execution, error=failure.message or _FAILED_DURING_ERROR,
+    )
+
+
+def _failure_from_record(data: dict) -> _TurnFailure | None:
+    """The response.failed payload in one SSE record, if it carries one."""
+    frame = data.get("sse") if isinstance(data, dict) else None
+    if not isinstance(frame, str) or "response.failed" not in frame:
+        return None
+    for line in frame.splitlines():
+        if not line.startswith("data:"):
+            continue
+        try:
+            payload = json.loads(line[len("data:"):].strip())
+        except ValueError:
+            continue
+        if isinstance(payload, dict) and payload.get("type") == "response.failed":
+            message = payload.get("error")
+            code = payload.get("code")
+            return _TurnFailure(
+                message=message if isinstance(message, str) and message.strip() else None,
+                code=code if isinstance(code, str) else None,
+            )
+    return None
 
 
 def _sse_events(record) -> list[str]:
@@ -946,8 +1001,9 @@ def _sse_events(record) -> list[str]:
 
 async def _turn_evidence(conversation_id: str) -> _TurnEvidence:
     """How the turn that just ended on this conversation went, from its
-    buffer: the terminal reason, and whether anything beyond its start and
-    failure was written. Unknown (no reason, acted) when unavailable.
+    buffer: the terminal reason, whether anything beyond its start and
+    failure was written, and what its failure frame said. Unknown (no
+    reason, acted) when unavailable; nothing is assumed from a failed read.
 
     Only call after the turn's stream has ended: the buffer is closed then,
     so reading it returns at the terminal record."""
@@ -955,13 +1011,17 @@ async def _turn_evidence(conversation_id: str) -> _TurnEvidence:
     if handle is None or not handle.buffer.is_closed:
         return _TurnEvidence(reason=None, acted=True)
     acted = False
+    failure: _TurnFailure | None = None
     try:
         async for rec in handle.buffer.tail(0):
             if rec.is_terminal:
-                return _TurnEvidence(reason=str(rec.data.get("reason") or "") or None, acted=acted)
+                return _TurnEvidence(
+                    reason=str(rec.data.get("reason") or "") or None, acted=acted, failure=failure,
+                )
             events = _sse_events(rec)
             if not events or any(event not in _PRE_EXECUTION_EVENTS for event in events):
                 acted = True
+            failure = _failure_from_record(rec.data) or failure
     except Exception:
         logger.exception(f"Could not read terminal state for conversation {conversation_id}")
     return _TurnEvidence(reason=None, acted=True)

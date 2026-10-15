@@ -43,7 +43,18 @@ def _serialize(schedule, scoped) -> dict:
     skipped = ScheduleService(scoped).last_skipped(schedule.id)
     data["lastSkipped"] = SkippedPeriodResponse.serialize(skipped) if skipped else None
     data["version"] = ScheduleService(scoped).current_version_number(schedule.id)
+    data["lastRun"] = _last_run(schedule.id, scoped)
     return data
+
+
+def _last_run(schedule_id, scoped) -> dict | None:
+    """How the schedule's latest finished run ended, so a failure shows on the
+    schedule itself, including a one-off's, which has no next slot."""
+    runs = ScheduleRunService(scoped)
+    run = runs.last_finished(schedule_id)
+    if run is None:
+        return None
+    return {**ScheduleRunResponse.serialize(run), **_camel(runs.run_context([run]).get(run.occurrence_id, {}))}
 
 
 @router.get("/")

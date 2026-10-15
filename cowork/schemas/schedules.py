@@ -164,6 +164,9 @@ class ScheduleResponse(CamelResponse):
     last_skipped: SkippedPeriodResponse | None = None
     # The number of the version the next occurrence will run.
     version: int | None = None
+    # The latest finished run (ScheduleRunResponse shape), filled by the
+    # endpoints.
+    last_run: dict | None = None
     # Not a Schedule column — endpoints fill it from ScheduleRunService so the
     # UI can show an in-flight run (manual or cron).
     running: bool = False
