@@ -9,6 +9,35 @@ from pydantic import BaseModel
 from cowork.schemas.base import CamelRequest, CamelResponse
 
 
+# The `model` value a schedule stores when it should run on the account's
+# configured default models rather than a pinned id. The scheduler UI removed
+# the per-task model picker (see ScheduleTaskModal), so the frontend always
+# sends `model: null` and every schedule carries this sentinel.
+#
+# It is NOT a servable model id. Passing it into a turn makes the harness
+# override every model role with the literal string "default"
+# (`_apply_model_override` treats any truthy value as a real pick), and the
+# gateway 404s it as `model_not_found` — surfaced to the user as "That model
+# isn't available" (ENG-2353). `resolve_schedule_model` turns it back into None
+# before the turn is built, so the account-wide defaults govern the run.
+DEFAULT_MODEL_SENTINEL = "default"
+
+
+def resolve_schedule_model(stored: str | None) -> str | None:
+    """The model to run a schedule with, or None to follow the account defaults.
+
+    A schedule stores ``DEFAULT_MODEL_SENTINEL`` when it should track the
+    account's configured default model — the only mode the UI offers. That
+    sentinel is not a real model id, so it must become None (a no-op override)
+    before the turn is built, or the gateway rejects it (ENG-2353). A schedule
+    that pinned a concrete id (legacy rows, or a future picker) is passed
+    through unchanged.
+    """
+    if not stored or stored == DEFAULT_MODEL_SENTINEL:
+        return None
+    return stored
+
+
 class Cadence(str, Enum):
     once = "once"
     hourly = "hourly"
@@ -24,6 +53,28 @@ class RunStatus(str, Enum):
     cancelled = "cancelled"
 
 
+class OccurrenceStatus(str, Enum):
+    active = "active"
+    success = "success"
+    failed = "failed"
+    cancelled = "cancelled"
+    # A slot that came due while the app was closed and the missed-run policy
+    # chose not to run. Recorded so the history shows it was passed over.
+    skipped = "skipped"
+
+
+class MissedRunPolicy(str, Enum):
+    """What a recurring schedule does with slots that passed while it could
+    not run (the app was closed, or the machine asleep)."""
+
+    # Run nothing that was missed; only a slot that is barely late still runs.
+    skip = "skip"
+    # Run the most recent missed slot once and skip the rest.
+    run_latest_once = "run_latest_once"
+    # Run up to a bounded number of the most recent missed slots, in order.
+    bounded_catch_up = "bounded_catch_up"
+
+
 class ScheduleCreateRequest(CamelRequest):
     title: str
     prompt: str
@@ -33,6 +84,7 @@ class ScheduleCreateRequest(CamelRequest):
     timezone: str = "UTC"
     project_id: UUID | None = None
     enabled: bool = True
+    missed_run_policy: MissedRunPolicy = MissedRunPolicy.run_latest_once
 
 
 class ScheduleUpdateRequest(CamelRequest):
@@ -44,6 +96,7 @@ class ScheduleUpdateRequest(CamelRequest):
     timezone: str | None = None
     project_id: UUID | None = None
     enabled: bool | None = None
+    missed_run_policy: MissedRunPolicy | None = None
 
 
 class ScheduleResponse(CamelResponse):
@@ -60,9 +113,15 @@ class ScheduleResponse(CamelResponse):
     last_result_conversation_id: UUID | None
     last_error: str | None
     missed_runs: int
+    missed_run_policy: str = MissedRunPolicy.run_latest_once
+    spec_version: int = 1
+    consecutive_failures: int = 0
+    auto_paused_at: datetime | None = None
     # Not a Schedule column — endpoints fill it from ScheduleRunService so the
     # UI can show an in-flight run (manual or cron).
     running: bool = False
+    # Also filled by the endpoints: when a failed run will be tried again.
+    retry_at: datetime | None = None
     created_at: datetime | None
     modified_at: datetime | None
 
@@ -77,4 +136,16 @@ class ScheduleRunResponse(CamelResponse):
     error: str | None
     conversation_id: UUID | None
     is_manual: bool
+    occurrence_id: UUID | None = None
+    attempt: int | None = None
+    spec_version: int | None = None
+    created_at: datetime | None
+
+
+class ScheduleEventResponse(CamelResponse):
+    id: UUID
+    schedule_id: UUID
+    kind: str
+    actor: str | None
+    detail: dict | None
     created_at: datetime | None

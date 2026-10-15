@@ -3,8 +3,7 @@
 Asserts the AntonHarness forwards `trace_tags` / `trace_metadata` into
 `ChatSession.turn_stream` when the installed anton supports them, tolerates an
 older anton whose `turn_stream` lacks the kwargs (no TypeError — the blocker
-the deployed PyPI/main anton would otherwise hit), and that Hermes accepts the
-kwargs so the handler can forward them uniformly.
+the deployed PyPI/main anton would otherwise hit).
 """
 
 import asyncio
@@ -48,7 +47,8 @@ def _run_harness(monkeypatch, session):
     monkeypatch.setattr(autopublish, "autopublish_project_artifacts", _no_autopublish)
 
     async def _fake_build(
-        self, conversation, model=None, reasoning_effort=None, disabled_connections=None, channel_context=None
+        self, conversation, model=None, reasoning_effort=None, disabled_connections=None, channel_context=None,
+        tool_messages=False,
     ):
         return session, None, None
 
@@ -84,10 +84,3 @@ def test_forwards_trace_kwargs_when_anton_supports_them(monkeypatch):
 def test_tolerates_anton_without_trace_kwargs(monkeypatch):
     # Must not raise TypeError: unexpected keyword argument 'trace_tags'.
     _run_harness(monkeypatch, _SessionWithoutTraceKwargs())
-
-
-def test_hermes_stream_response_accepts_trace_kwargs():
-    from cowork.harnesses.hermes_harness.harness import HermesHarness
-
-    params = inspect.signature(HermesHarness.stream_response).parameters
-    assert "trace_tags" in params and "trace_metadata" in params

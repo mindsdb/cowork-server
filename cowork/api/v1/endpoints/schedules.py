@@ -2,25 +2,35 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import ScopedSessionDep
 from cowork.schemas.schedules import (
+    DEFAULT_MODEL_SENTINEL,
     ScheduleCreateRequest,
+    ScheduleEventResponse,
     ScheduleResponse,
     ScheduleRunResponse,
     ScheduleUpdateRequest,
 )
-from cowork.services.schedules import ScheduleRunService, ScheduleService
+from cowork.services.schedules import ScheduleOccurrenceService, ScheduleRunService, ScheduleService
 
-router = APIRouter()
+# AuthenticatedInOrgMode, declared explicitly: ScopedSessionDep already fails
+# closed on its own (MissingTenantScopeError -> 401, cowork/db/scoped.py)
+# whenever org mode has no org in scope. Declaring it too makes the
+# requirement visible to a route walker instead of something only
+# discoverable by reading scoped.py.
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 
 
 def _serialize(schedule, scoped) -> dict:
-    """ScheduleResponse plus the live `running` flag (any in-flight run)."""
+    """ScheduleResponse plus the live state: `running` (any in-flight run) and
+    `retryAt` (a failed run waiting to be tried again)."""
     data = ScheduleResponse.serialize(schedule)
     data["running"] = ScheduleRunService(scoped).has_active_run(schedule.id)
+    data["retryAt"] = ScheduleOccurrenceService(scoped).pending_retry_at(schedule.id)
     return data
 
 
@@ -45,10 +55,11 @@ def create_schedule(body: ScheduleCreateRequest, scoped: ScopedSessionDep):
             prompt=body.prompt,
             cadence=body.cadence,
             next_run_at=body.next_run_at,
-            model=body.model or "default",
+            model=body.model or DEFAULT_MODEL_SENTINEL,
             timezone=body.timezone,
             project_id=body.project_id,
             enabled=body.enabled,
+            missed_run_policy=body.missed_run_policy,
         )
     except ValueError as e:
         # e.g. a project_id that isn't visible in this scope
@@ -107,16 +118,33 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
-    from cowork.scheduler import execute_schedule
+    from cowork.scheduler import claim_manual_run, run_occurrence
     from cowork.services.conversations import ConversationService
+
+    # Claim before creating anything: a schedule already running (or waiting
+    # to retry) refuses a second run rather than overlapping it.
+    occurrence_id = claim_manual_run(scoped, schedule.id)
+    if occurrence_id is None:
+        retrying = ScheduleOccurrenceService(scoped).pending_retry_at(schedule.id) is not None
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This task's last run failed and is waiting to try again. Run it after that retry finishes."
+                if retrying
+                else "This task is already running. Wait for it to finish, then run it again."
+            ),
+        )
 
     conversation = ConversationService(scoped).create_conversation(
         topic=schedule.title,
         project_id=schedule.project_id,
     )
+    # FastAPI closes this session only after the background run ends, which
+    # can take minutes. Give the request's connection back before it starts.
+    scoped.close()
 
     background_tasks.add_task(
-        execute_schedule, schedule_id, is_manual=True,
+        run_occurrence, occurrence_id, is_manual=True,
         conversation_id=conversation.id,
     )
     return {"detail": "Run triggered", "conversation_id": str(conversation.id)}
@@ -130,3 +158,14 @@ def list_schedule_runs(schedule_id: UUID, scoped: ScopedSessionDep, limit: int =
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     runs = ScheduleRunService(scoped).list_runs(schedule_id, limit=limit)
     return {"runs": [ScheduleRunResponse.serialize(r) for r in runs]}
+
+
+@router.get("/{schedule_id}/events")
+def list_schedule_events(schedule_id: UUID, scoped: ScopedSessionDep, limit: int = 100):
+    """The schedule's lifecycle: created, edited, paused, resumed, auto-paused."""
+    service = ScheduleService(scoped)
+    try:
+        service.get_schedule(schedule_id)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    return {"events": [ScheduleEventResponse.serialize(e) for e in service.events(schedule_id, limit=limit)]}

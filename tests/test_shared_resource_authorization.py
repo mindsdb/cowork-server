@@ -154,6 +154,7 @@ def test_pending_claims_hide_attribution_and_fail_capabilities_closed(org_engine
         "canRename": False,
         "canDelete": False,
         "canEditInstructions": False,
+        "directoryIsExternal": False,
     }
 
     instruction_claim, instruction_token = access.reserve_claim(
@@ -360,6 +361,7 @@ def test_project_creator_admin_and_general_policy(org_engine):
         "canRename",
         "canDelete",
         "canEditInstructions",
+        "directoryIsExternal",
     }
     linked = skills.get_skill(
         foreign_skill["id"],
@@ -2299,6 +2301,7 @@ def test_postgres_resource_lock_engine_is_unpooled_and_autocommit(monkeypatch):
     assert captured["url"] == bind.url
     assert captured["poolclass"] is NullPool
     assert captured["isolation_level"] == "AUTOCOMMIT"
+    assert captured["hide_parameters"] is True
     assert captured["connect_args"]["connect_timeout"] <= 10
 
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from uuid import UUID
 
+import pytest
 from sqlalchemy import create_engine
-from sqlmodel import Session, SQLModel
+from sqlmodel import Session, SQLModel, select
 
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule
@@ -292,7 +294,7 @@ def test_execute_schedule_stamps_trace_identity(monkeypatch):
     captured: list = []
 
     class FakeHandler:
-        def __init__(self, session, principal=None):
+        def __init__(self, *, principal=None, interactive=True):
             pass
 
         async def handle(self, request):
@@ -337,12 +339,134 @@ def test_execute_schedule_stamps_trace_identity(monkeypatch):
         s.close()
 
 
+# ENG-2353: a schedule stores the "default" sentinel (the UI removed the model
+# picker), which is NOT a servable model id. If it reached the turn verbatim the
+# harness would override every model role with the literal string "default" and
+# the gateway would 404 it as model_not_found ("That model isn't available") —
+# but only for prompts that delegate to Anton, since the pre-Anton routing gate
+# answers trivial prompts on its own gate model and never touches it. The run
+# must instead pass None so the account-wide default models govern the turn.
+
+def test_resolve_schedule_model_sentinel_and_pins():
+    from cowork.schemas.schedules import (
+        DEFAULT_MODEL_SENTINEL,
+        resolve_schedule_model,
+    )
+
+    # The sentinel and anything falsy resolve to None (account defaults).
+    assert resolve_schedule_model(DEFAULT_MODEL_SENTINEL) is None
+    assert resolve_schedule_model("default") is None
+    assert resolve_schedule_model("") is None
+    assert resolve_schedule_model(None) is None
+    # A real id passes through untouched.
+    assert resolve_schedule_model("sonnet") == "sonnet"
+
+
+def test_execute_schedule_resolves_default_sentinel_to_none(monkeypatch):
+    import asyncio
+
+    import cowork.handlers.responses as responses_mod
+    from cowork.db.session import get_open_session
+    from cowork.scheduler import execute_schedule
+
+    captured: list = []
+
+    class FakeHandler:
+        def __init__(self, *, principal=None, interactive=True):
+            pass
+
+        async def handle(self, request):
+            captured.append(request)
+
+            async def _gen():
+                if False:
+                    yield
+
+            return _gen()
+
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", FakeHandler)
+
+    session = get_open_session()
+    schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
+        title="default model test",
+        prompt="generate random hausa names",
+        cadence="daily",
+        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+        model="default",
+        timezone="UTC",
+        project_id=GENERAL_PROJECT_ID,
+        enabled=True,
+    )
+    schedule_id = schedule.id
+    session.close()
+
+    try:
+        asyncio.run(execute_schedule(schedule_id, is_manual=False))
+        assert captured, "handler was never invoked"
+        # None → _apply_model_override is a no-op → account defaults apply.
+        assert captured[0].model is None
+    finally:
+        s = get_open_session()
+        ScheduleService(ScopedSession(s, SYSTEM_SCOPE)).delete_schedule(schedule_id)
+        s.close()
+
+
+def test_execute_schedule_passes_pinned_model_through(monkeypatch):
+    """A schedule that pinned a concrete id (legacy rows, or a future picker)
+    still runs on that id — the sentinel resolution must not flatten real picks."""
+    import asyncio
+
+    import cowork.handlers.responses as responses_mod
+    from cowork.db.session import get_open_session
+    from cowork.scheduler import execute_schedule
+
+    captured: list = []
+
+    class FakeHandler:
+        def __init__(self, *, principal=None, interactive=True):
+            pass
+
+        async def handle(self, request):
+            captured.append(request)
+
+            async def _gen():
+                if False:
+                    yield
+
+            return _gen()
+
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", FakeHandler)
+
+    session = get_open_session()
+    schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
+        title="pinned model test",
+        prompt="do the thing",
+        cadence="daily",
+        next_run_at=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc),
+        model="sonnet",
+        timezone="UTC",
+        project_id=GENERAL_PROJECT_ID,
+        enabled=True,
+    )
+    schedule_id = schedule.id
+    session.close()
+
+    try:
+        asyncio.run(execute_schedule(schedule_id, is_manual=False))
+        assert captured, "handler was never invoked"
+        assert captured[0].model == "sonnet"
+    finally:
+        s = get_open_session()
+        ScheduleService(ScopedSession(s, SYSTEM_SCOPE)).delete_schedule(schedule_id)
+        s.close()
+
+
 # A scheduled run in org mode has no request, so it derives a service principal
 # from the schedule row: the conversation is created under the owning org and
 # the turn receives that principal so the remote backend can mint the org's key
 # headlessly.
 
-def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch):
+def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch, granted_product_permissions):
     import asyncio
 
     import cowork.handlers.responses as responses_mod
@@ -362,8 +486,9 @@ def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch):
     captured: dict = {}
 
     class FakeHandler:
-        def __init__(self, session, principal=None):
+        def __init__(self, *, principal=None, interactive=True):
             captured["principal"] = principal
+            captured["interactive"] = interactive
 
         async def handle(self, request):
             async def _gen():
@@ -402,6 +527,9 @@ def test_execute_schedule_uses_service_principal_in_org_mode(monkeypatch):
         assert principal is not None, "the turn must receive a service principal"
         assert principal.org_id == org_id
         assert principal.user_id == user_id
+        # Nobody is watching a scheduled run to answer an ask_user card, so the
+        # handler must be built non-interactive regardless of ask_user_enabled.
+        assert captured["interactive"] is False
 
         # The conversation was created under the owning org, not as an invisible
         # NULL-org row.
@@ -429,8 +557,9 @@ def test_execute_schedule_disables_corrupt_org_row_instead_of_looping(monkeypatc
     from cowork.common.settings.app_settings import get_app_settings
     from cowork.db.scoped import ScopedSession, TenantScope
     from cowork.db.session import get_open_session
-    from cowork.models.schedule import ScheduleRun
+    from cowork.models.schedule import ScheduleOccurrence, ScheduleRun
     from cowork.scheduler import execute_schedule
+    from cowork.schemas.schedules import OccurrenceStatus
     from cowork.services.schedules import ScheduleService
 
     org_id = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
@@ -474,13 +603,19 @@ def test_execute_schedule_disables_corrupt_org_row_instead_of_looping(monkeypatc
         s = get_open_session()
         after = s.get(Schedule, schedule_id)
         assert after.enabled is False, "corrupt row must be disabled, not left due"
-        # Not advanced — disabling is what stops the re-fire, not a moved slot.
-        assert ensure_utc(after.next_run_at) == original_next_run
+        # The claim consumed the slot before the run found the row corrupt.
+        assert ensure_utc(after.next_run_at) > original_next_run
         runs = s.exec(
             select(ScheduleRun).where(ScheduleRun.schedule_id == schedule_id)
         ).all()
-        assert runs, "the attempt must still record a run"
-        assert all(r.status == RunStatus.failed for r in runs)
+        assert len(runs) == 1, "the attempt must still record a run"
+        assert runs[0].status == RunStatus.failed
+        # A row that can never resolve an identity is not worth retrying.
+        occurrence = s.exec(
+            select(ScheduleOccurrence).where(ScheduleOccurrence.schedule_id == schedule_id)
+        ).one()
+        assert occurrence.status == OccurrenceStatus.failed
+        assert occurrence.attempts == 1
         s.close()
     finally:
         s = get_open_session()
@@ -535,6 +670,8 @@ def test_turn_terminal_reason_with_real_registry_cancel(tmp_path):
     from cowork.streaming.buffer import FileStreamBuffer
     from cowork.streaming.registry import registry
 
+    from _fakes import opens
+
     buf = FileStreamBuffer(tmp_path / "turn.jsonl")
     conversation_id = "eng688-real-cancel-test"
 
@@ -554,8 +691,8 @@ def test_turn_terminal_reason_with_real_registry_cancel(tmp_path):
         handle = await registry.start(
             conversation_id=conversation_id,
             turn_id=0,
-            buffer=buf,
-            producer_coro=producer(),
+            open_buffer=opens(buf),
+            produce=lambda _buffer: producer(),
         )
         await started.wait()
         await registry.cancel(conversation_id)
@@ -589,7 +726,7 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
     from cowork.services.schedules import ScheduleService
 
     class FakeHandler:
-        def __init__(self, session, principal=None):
+        def __init__(self, *, principal=None, interactive=True):
             pass
 
         async def handle(self, request):
@@ -627,6 +764,7 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
         fresh = ScheduleService(ScopedSession(check, SYSTEM_SCOPE)).get_schedule(schedule_id)
         run = ScheduleRunService(ScopedSession(check, SYSTEM_SCOPE)).list_runs(schedule_id)[0]
         state = {
+            "schedule_id": schedule_id,
             "run_status": run.status,
             "run_error": run.error,
             "run_conversation_id": run.conversation_id,
@@ -677,6 +815,52 @@ def test_execute_schedule_completed_is_success(monkeypatch):
     assert state["next_advanced"] is True
 
 
+def test_a_database_error_in_a_runs_last_writes_logs_its_schedule_and_conversation(
+    monkeypatch, caplog, owned_logger,
+):
+    """The outcome write and the finish write both fail on the database. The
+    database filter replaces each line with its type and call site, and the
+    schedule and conversation it concerned travel as record attributes, so
+    the line still says which schedule wedged."""
+    import logging
+
+    from sqlalchemy.exc import OperationalError
+
+    import cowork.scheduler as scheduler_mod
+
+    driver_text = "server closed the connection unexpectedly"
+
+    def connection_lost(session, **kwargs):
+        raise OperationalError("UPDATE schedule_runs SET private_statement_marker", {}, Exception(driver_text))
+
+    monkeypatch.setattr(scheduler_mod, "_record_turn_outcome", connection_lost)
+    monkeypatch.setattr(scheduler_mod, "_finish_run", connection_lost)
+    logged = owned_logger(scheduler_mod.logger.name)
+
+    state = _execute_with_terminal(monkeypatch, "completed")
+
+    schedule_id, conversation_id = state["schedule_id"], state["run_conversation_id"]
+    assert conversation_id is not None
+    errors = [r for r in caplog.records if r.name == scheduler_mod.logger.name and r.levelno == logging.ERROR]
+    assert len(errors) == 2, [r.getMessage() for r in errors]
+    for record in errors:
+        assert record.getMessage() == (
+            "Database operation failed: error_type=OperationalError sqlstate=unknown "
+            f"site=scheduler._run_attempt:{record.lineno}"
+        )
+        assert (record.schedule_id, record.conversation_id) == (str(schedule_id), str(conversation_id))
+        assert record.exc_info is None
+        assert driver_text not in repr(record.__dict__)
+    # The run's failure is logged first, then the finish write's.
+    assert errors[0].lineno < errors[1].lineno
+    lines = [line for line in logged.output().splitlines() if "Database operation failed" in line]
+    assert len(lines) == 2
+    for line in lines:
+        assert f"[Schedule:{schedule_id}][Conversation:{conversation_id}]" in line
+    assert driver_text not in logged.output()
+    assert "private_statement_marker" not in logged.output()
+
+
 def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
     """The run's conversation is recorded as soon as it exists — not at
     finish — so the runs list can open a run that is still executing."""
@@ -704,7 +888,7 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
     seen: dict = {}
 
     class FakeHandler:
-        def __init__(self, session, principal=None):
+        def __init__(self, *, principal=None, interactive=True):
             pass
 
         async def handle(self, request):
@@ -733,7 +917,7 @@ def test_execute_schedule_links_conversation_before_turn_starts(monkeypatch):
         s.close()
 
 
-def test_execute_schedule_derives_service_principal_in_org_mode(monkeypatch):
+def test_execute_schedule_derives_service_principal_in_org_mode(monkeypatch, granted_product_permissions):
     """A schedule's own org_id/created_by — stamped when a real user created it
     through the request-scoped path — is what fires the turn in org mode. No
     live request principal exists at cron time, so the schedule row is the only
@@ -783,7 +967,7 @@ def test_execute_schedule_derives_service_principal_in_org_mode(monkeypatch):
     seen: dict = {}
 
     class FakeHandler:
-        def __init__(self, session, principal=None):
+        def __init__(self, *, principal=None, interactive=True):
             seen["principal"] = principal
 
         async def handle(self, request):
@@ -840,50 +1024,137 @@ def test_missed_runs_leaves_just_due_once_enabled_to_run():
     assert [s.id for s in _due_schedules(scoped, now)] == [schedule.id]
 
 
-def test_missed_runs_disables_stale_once_overdue_beyond_window():
+@pytest.mark.parametrize(
+    ("policy", "late", "runs"),
+    [
+        # The default runs a one-off the app was closed for, inside the lookback.
+        ("run_latest_once", timedelta(hours=2), True),
+        ("run_latest_once", timedelta(days=6), True),
+        ("run_latest_once", timedelta(days=8), False),
+        # `skip` only runs one that is barely late.
+        ("skip", timedelta(minutes=30), True),
+        ("skip", timedelta(hours=2), False),
+    ],
+)
+def test_a_missed_once_runs_or_is_skipped_by_its_policy(policy, late, runs):
+    from cowork.models.schedule import ScheduleOccurrence
     from cowork.scheduler import _due_schedules, _handle_missed_runs
 
     session = _session()
     now = datetime.now(timezone.utc)
-    # Slot passed hours ago (app was offline) — do not fire it late.
-    schedule = _schedule(session, cadence="once", next_run_at=now - timedelta(hours=2))
+    schedule = _schedule(session, cadence="once", next_run_at=now - late)
+    schedule.missed_run_policy = policy
+    session.add(schedule)
+    session.commit()
     scoped = ScopedSession(session, SYSTEM_SCOPE)
 
     _handle_missed_runs(scoped)
 
     session.refresh(schedule)
-    assert schedule.enabled is False
-    # Auto-disabled without running carries a missed-run signal.
-    assert schedule.missed_runs == 1
-    assert _due_schedules(scoped, now) == []
-
-
-def test_missed_runs_once_near_catchup_boundary():
-    from cowork.scheduler import (
-        _ONCE_CATCHUP_WINDOW_SECONDS,
-        _due_schedules,
-        _handle_missed_runs,
-    )
-
-    session = _session()
-    now = datetime.now(timezone.utc)
-    window = _ONCE_CATCHUP_WINDOW_SECONDS
-    # Straddle the catch-up boundary: just inside stays enabled and runs, just
-    # outside is disabled. `_handle_missed_runs` reads its own wall clock, so a
-    # small margin keeps each case on its intended side without flaking.
-    inside = _schedule(session, cadence="once", next_run_at=now - timedelta(seconds=window - 30))
-    outside = _schedule(session, cadence="once", next_run_at=now - timedelta(seconds=window + 30))
-    scoped = ScopedSession(session, SYSTEM_SCOPE)
-
-    _handle_missed_runs(scoped)
-
-    session.refresh(inside)
-    session.refresh(outside)
-    assert inside.enabled is True
-    assert outside.enabled is False
+    assert schedule.enabled is runs
     due_ids = [s.id for s in _due_schedules(scoped, now)]
-    assert inside.id in due_ids
-    assert outside.id not in due_ids
+    assert (schedule.id in due_ids) is runs
+    skipped = session.exec(
+        select(ScheduleOccurrence).where(ScheduleOccurrence.schedule_id == schedule.id)
+    ).all()
+    if runs:
+        assert skipped == []
+    else:
+        # Disabled without running carries a missed-run signal and a record.
+        assert schedule.missed_runs == 1
+        assert [o.status for o in skipped] == ["skipped"]
+
+
+# --- A poll runs in a worker thread beside the run's units, so a run can end
+# between the poll's read of a schedule and its active-run check.
+
+def _file_engine(tmp_path):
+    """A SQLite file database, so the poll and the run each hold a connection
+    of their own and see each other's commits, as on Postgres."""
+    engine = create_engine(f"sqlite:///{tmp_path / 'poll.db'}")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(Project(id=GENERAL_PROJECT_ID, name="general", path="/general"))
+        session.commit()
+    return engine
+
+
+@pytest.mark.parametrize(("cadence", "reason"), [("daily", "cancelled"), ("once", "error")])
+def test_a_poll_skips_a_slot_its_run_used_up_after_the_poll_read_it(tmp_path, monkeypatch, cadence, reason):
+    """Another poller claims the slot, runs it and records how it went after
+    this poll has read the schedule and before it asks whether a run is
+    active. The poll then sees the slot as used: a Stopped daily run does not
+    start again, and neither does a one-off whose claim disabled it."""
+    from cowork.scheduler import _claim_slot, _finish_run, _poll, _record_turn_outcome, _start_attempt
+
+    engine = _file_engine(tmp_path)
+    with Session(engine) as session:
+        schedule_id = _schedule(
+            session, cadence=cadence, next_run_at=datetime.now(timezone.utc) - timedelta(minutes=1)
+        ).id
+
+    has_active_run = ScheduleRunService.has_active_run
+    ended: list[UUID] = []
+
+    def the_run_ends_first(self, asked_id):
+        if not ended:
+            ended.append(asked_id)
+            with Session(engine) as run_session:
+                scoped = ScopedSession(run_session, SYSTEM_SCOPE)
+                occurrence_id = _claim_slot(scoped, scoped.get(Schedule, schedule_id))
+                attempt = _start_attempt(scoped, occurrence_id=occurrence_id, is_manual=False)
+                outcome = _record_turn_outcome(
+                    scoped, schedule_id=schedule_id, reason=reason, conversation_id=None,
+                    occurrence_id=occurrence_id, attempt=attempt.number,
+                )
+                _finish_run(
+                    scoped, run_id=attempt.run_id, conversation_id=None, error=outcome.error, status=outcome.status,
+                )
+        return has_active_run(self, asked_id)
+
+    monkeypatch.setattr(ScheduleRunService, "has_active_run", the_run_ends_first)
+
+    with Session(engine) as poll_session:
+        due = _poll(ScopedSession(poll_session, SYSTEM_SCOPE))
+
+    assert ended == [schedule_id]
+    assert due == []
+
+
+def test_a_poll_skips_a_schedule_deleted_after_the_poll_read_it(tmp_path, monkeypatch):
+    """A schedule deleted between the poll's read and its active-run check is
+    left out, and the poll still returns the other due schedules."""
+    from cowork.scheduler import _poll
+
+    engine = _file_engine(tmp_path)
+    due_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    with Session(engine) as session:
+        schedule_ids = {
+            _schedule(session, title="first", next_run_at=due_at).id,
+            _schedule(session, title="second", next_run_at=due_at).id,
+        }
+
+    has_active_run = ScheduleRunService.has_active_run
+    deleted: list[UUID] = []
+
+    def deleted_first(self, asked_id):
+        if not deleted:
+            deleted.append(asked_id)
+            with Session(engine) as other:
+                ScheduleService(ScopedSession(other, SYSTEM_SCOPE)).delete_schedule(asked_id)
+        return has_active_run(self, asked_id)
+
+    monkeypatch.setattr(ScheduleRunService, "has_active_run", deleted_first)
+
+    with Session(engine) as poll_session:
+        due = _poll(ScopedSession(poll_session, SYSTEM_SCOPE))
+
+    assert len(deleted) == 1
+    from cowork.models.schedule import ScheduleOccurrence
+
+    with Session(engine) as check:
+        claimed_for = [check.get(ScheduleOccurrence, o).schedule_id for o in due]
+    assert claimed_for == list(schedule_ids - set(deleted))
 
 
 # --- ENG-769: reap orphaned `running` runs left by a crash/restart.
@@ -968,3 +1239,50 @@ def test_same_org_users_cannot_see_each_others_schedules(tmp_path, monkeypatch):
     assert svc("bob").delete_schedule(a.id) is False
     assert svc("alice").get_schedule(a.id).id == a.id
     get_app_settings.cache_clear()
+
+
+def _fk_enforced_session() -> Session:
+    """A SQLite session with `PRAGMA foreign_keys=ON`, so the delete-ordering
+    that Postgres rejects in the cloud fails here too instead of passing under
+    SQLite's default unenforced foreign keys."""
+    from sqlalchemy import event
+    from sqlalchemy.pool import StaticPool
+
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+
+    @event.listens_for(engine, "connect")
+    def _fk_on(dbapi_conn, _record):
+        cursor = dbapi_conn.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    SQLModel.metadata.create_all(engine)
+    session = Session(engine)
+    session.add(Project(id=GENERAL_PROJECT_ID, name="general", path="/general"))
+    session.commit()
+    return session
+
+
+def test_delete_schedule_with_runs_under_enforced_foreign_keys():
+    """ENG-2356: deleting a schedule that has run rows returned HTTP 500 on
+    Postgres because the parent DELETE was emitted before its schedule_runs.
+    Deleting must remove the schedule and its runs with foreign keys enforced."""
+    from sqlmodel import select
+
+    from cowork.models.schedule import ScheduleRun
+
+    session = _fk_enforced_session()
+    scoped = ScopedSession(session, SYSTEM_SCOPE)
+    schedule = _schedule(session)
+    run_service = ScheduleRunService(scoped)
+    for _ in range(3):
+        run_service.create_run(schedule.id, is_manual=False)
+
+    assert ScheduleService(scoped).delete_schedule(schedule.id) is True
+
+    assert session.get(Schedule, schedule.id) is None
+    assert not session.exec(
+        select(ScheduleRun).where(ScheduleRun.schedule_id == schedule.id)
+    ).all()

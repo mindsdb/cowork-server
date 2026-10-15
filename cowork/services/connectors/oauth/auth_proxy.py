@@ -131,6 +131,20 @@ async def proxy_delete(engine: str, name: str, request: Request, settings: OAuth
     await _relay("DELETE", f"/v1/oauth/{engine}/{name}", request=request, settings=settings)
 
 
+async def proxy_access_mode(engine: str, name: str, access_mode: str, request: Request, settings: OAuthSettings) -> dict:
+    """Change a connection's read/write/none tool-access mode via auth's
+    Data Vault (org mode has no local vault of its own to write this to).
+    Introduced for HubSpot's MCP connector's "edit access" affordance (no
+    other connector has an editable-after-connect setting yet) — auth's
+    `PATCH /v1/oauth/{engine}/{name}/access-mode` view is Stage 3 work and
+    may not exist yet; until it ships this cleanly 404s via `_relay`, same
+    as any other not-yet-implemented auth route."""
+    return await _relay(
+        "PATCH", f"/v1/oauth/{engine}/{name}/access-mode",
+        request=request, settings=settings, json_body={"access_mode": access_mode},
+    )
+
+
 async def proxy_token(engine: str, request: Request, settings: OAuthSettings, *, name: str = "") -> dict:
     """Mint a live access token for `engine` via auth's turn-key endpoint,
     reused here (not just by anton) since its authorization is deliberately

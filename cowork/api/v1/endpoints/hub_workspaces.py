@@ -1,18 +1,23 @@
 """The MindsHub workspace selector's two routes.
 
-- GET  /            the gate, the caller's workspaces, and which one is active
+- GET  /            the caller's workspaces and which one is active
 - PUT  /active      switch the caller into another workspace
 
 A MindsHub Workspace is an org-internal container that owns hub resources and
 lives in the auth service. It is unrelated to the filesystem directories this
 repo calls workspaces; the stored key is ``hub_workspace_id`` for that reason.
 
-**This selector changes what the client shows, not what a turn is billed to.**
-Which workspace a usage row carries is decided by the credential the turn
-presents, and neither credential carries one today: a desktop turn runs against
-a long-lived key bound to a user and an organization, and a cloud turn runs
-against a short-TTL key whose mint body has no workspace field. So nothing here
-touches the turn path, and a test asserts it.
+The listing is answered whatever its length. Whether a client draws a control
+is the client's decision, and Cowork's is to draw nothing below two rows.
+
+**Which workspace a usage row carries is decided by the credential the turn
+presents, not by this selector directly.** A desktop turn still runs against a
+long-lived key bound to a user and an organization only. A cloud turn now
+carries this stored pick: the remote producer reads `hub_workspace_id` and
+forwards it to the turn-key and artifact-publish-key mints (`cowork/turnqueue/
+producer.py`, `cowork/services/artifact_autopublish.py`), which bind the key's
+`workspace_id` to it. So the desktop path is still workspace-blind; the cloud
+path picks this up as soon as a caller uses the selector below.
 
 **The stored key has a second writer, and it grants nothing.**
 ``hub_workspace_id`` is a declared ``UserSettings`` field, so
@@ -39,6 +44,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sqlmodel import Session
 
+from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
 from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.db.session import get_session
 from cowork.principal import hub_credential
@@ -48,7 +54,6 @@ from cowork.schemas.hub_workspaces import (
     HubWorkspaceView,
 )
 from cowork.services.hub_workspaces import (
-    authorization_ui_enabled,
     fetch_hub_workspaces,
     resolve_active,
     selectable,
@@ -57,35 +62,21 @@ from cowork.services.settings import SettingService
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 SessionDep = Annotated[Session, Depends(get_session)]
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 SETTING_KEY = "hub_workspace_id"
 
-# Switched off, so there is nothing to say about workspaces. Deliberately the
-# same body a caller gets when the gate is off for them specifically: the client
-# renders nothing either way, and a response that distinguished the two would
-# tell an unflagged caller that a surface exists.
-_DISABLED = HubWorkspaceView()
-
 
 async def _build_view(
     request: Request, session: Session, scope: TenantScope
 ) -> HubWorkspaceView:
-    """The selector's whole state, gate first.
-
-    The gate is read before the listing, not alongside it, so a switched-off app
-    makes no workspace request at all. That is worth one sequential round trip:
-    the alternative asks auth for a listing nobody is going to render.
-    """
+    """The selector's whole state: the caller's workspaces and which is active."""
     bearer = hub_credential(request)
     org_id = scope.org_id or ""
     user_id = scope.user_id or ""
-    if not await authorization_ui_enabled(bearer_token=bearer, org_id=org_id, user_id=user_id):
-        return _DISABLED
-
     listing = await fetch_hub_workspaces(bearer_token=bearer, org_id=org_id, user_id=user_id)
     stored = SettingService(session, scope).load().hub_workspace_id
     active = resolve_active(listing.workspaces, stored)
@@ -134,12 +125,6 @@ async def set_active_hub_workspace(
     bearer = hub_credential(request)
     org_id = scope.org_id or ""
     user_id = scope.user_id or ""
-    if not await authorization_ui_enabled(bearer_token=bearer, org_id=org_id, user_id=user_id):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="workspace selection is not enabled",
-        )
-
     listing = await fetch_hub_workspaces(bearer_token=bearer, org_id=org_id, user_id=user_id)
     if not listing.reachable:
         raise HTTPException(

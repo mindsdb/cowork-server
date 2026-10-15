@@ -16,6 +16,7 @@ from cowork.coding.project_models import (
     DeliveryRecord,
     IntegrationStatus,
     ProjectConnection,
+    RepositoryResource,
     PublishRequest,
     PullRequestActionRequest,
     PullRequestStatus,
@@ -26,8 +27,9 @@ from cowork.coding.project_models import (
     WorkItemSearchRequest,
 )
 from cowork.coding.work_discovery import DeveloperWorkDiscovery
+from cowork.coding.repository_discovery import GitHubRepositoryPage, github_repositories
 from cowork.coding.workspace import WorkspaceError
-from cowork.db.scoped import TenantScope
+from cowork.db.scoped import TenantScope, scope_for_background_context
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.developer_validation import (
     DeveloperCredentialError,
@@ -48,6 +50,17 @@ class SlackTarget:
 class GitPushCredentials:
     remote_url: str
     environment: dict[str, str]
+
+
+def local_repository_credentials(project: CodeProject, resource: RepositoryResource) -> GitPushCredentials:
+    """Resolve credentials at use time, only on the local desktop execution plane."""
+    if not any(connection.provider == "github" and connection.name == resource.connector_name for connection in project.connections):
+        raise WorkspaceError("Add this repository's GitHub connection to the Code Project before starting a task")
+    integration = DeveloperIntegrationService(scope_for_background_context())
+    try:
+        return integration.git_push_credentials(project, resource.source_url or "", resource.connector_name)
+    finally:
+        integration.close()
 
 
 class DeveloperIntegrationService:
@@ -90,15 +103,19 @@ class DeveloperIntegrationService:
             )
         return result
 
-    def read(self, project: CodeProject, request: SourceContextRequest) -> SourceContext:
-        connection, fields = self._connection(project, request.provider, request.connection_name)
+    def read(self, project: CodeProject | None, request: SourceContextRequest) -> SourceContext:
+        connection, fields = (
+            self._connection(project, request.provider, request.connection_name)
+            if project is not None
+            else self._account_connection(request.provider, request.connection_name)
+        )
         if request.provider == "github":
             return self._read_github(request, connection, fields)
         if request.provider == "linear":
             return self._read_linear(request, connection, fields)
         return self._read_slack(request, connection, fields)
 
-    def search(self, project: CodeProject, request: WorkItemSearchRequest) -> WorkItemPage:
+    def search(self, project: CodeProject | None, request: WorkItemSearchRequest) -> WorkItemPage:
         # Discovery is account-scoped: opening the picker must not silently
         # mutate a project. The chosen account is added to the project only
         # when the user actually links one of its work items.
@@ -120,6 +137,13 @@ class DeveloperIntegrationService:
             connection_name=connection.name,
         )
 
+    def repositories(self, connection_name: str, page: int = 1) -> GitHubRepositoryPage:
+        connection, fields = self._account_connection("github", connection_name)
+        api, token, host = self._github_credentials(fields)
+        return github_repositories(
+            self._request, api=api, token=token, host=host, connection_name=connection.name, page=page,
+        )
+
     def _account_connection(
         self,
         provider: str,
@@ -127,7 +151,8 @@ class DeveloperIntegrationService:
     ) -> tuple[ProjectConnection, dict[str, Any]]:
         candidates = [item for item in self.connections.list() if item.engine == provider]
         summary = next((item for item in candidates if item.name == requested_name), None) if requested_name else None
-        summary = summary or (candidates[0] if len(candidates) == 1 else None)
+        if not requested_name and len(candidates) == 1:
+            summary = candidates[0]
         provider_label = "GitHub" if provider == "github" else provider.title()
         if summary is None:
             if candidates:

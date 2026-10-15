@@ -14,9 +14,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
+from contextlib import contextmanager
 from types import ModuleType
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from anton.core.llm.provider import ProviderAuthError
@@ -134,6 +136,203 @@ def test_remote_content_validation_error_maps_to_curated_copy():
     assert message == te.CONTENT_RECOVERY_USER_MESSAGE
 
 
+# ── ENG-2689: too-large is its own card, and still repairs the conversation ──
+
+
+# anton's REAL parent type, deliberately. cowork-server pins anton from a git
+# branch, so `ContentTooLargeError` is not installed here yet — but production's
+# object is a real subclass of a real `ContentValidationError`, and that is the
+# whole point: BOTH detectors match it, so only their ORDER decides the card.
+# A hand-rolled stand-in would satisfy neither detector's isinstance check and
+# these tests would pass without the ordering ever being exercised.
+from anton.core.llm.provider import ContentValidationError as _AntonContentValidationError
+
+
+class ContentTooLargeError(_AntonContentValidationError):
+    """Named to match anton's class exactly — the name is the discriminator on
+    both transports (the remote wire carries only "<Type>: <message>")."""
+
+    def __init__(self, message, code="content_too_large"):
+        super().__init__(message, code=code)
+
+
+_RESIZE_COPY = (
+    "An image in this conversation is too large for the model to accept. The "
+    "provider said: The image you provided requires 32400 patches after "
+    "processing, exceeding the limit of 30000. Please resize the image and "
+    "try again. That image will be removed automatically so the conversation "
+    "can continue."
+)
+
+
+def test_the_too_large_fixture_is_also_matched_by_the_broader_detector():
+    """Guards the two tests below from passing for the wrong reason. If this
+    ever fails, the fixture stopped being a ContentValidationError and the
+    ordering assertions became vacuous."""
+    exc = ContentTooLargeError(_RESIZE_COPY)
+    assert te.is_content_validation_error(exc)
+    assert te.is_content_too_large_error(exc)
+
+
+def test_too_large_wins_over_the_content_recovery_detector():
+    """The ranking that matters. anton's too-large type SUBCLASSES the
+    content-validation one, so the broader detector matches it too — checked
+    in the wrong order, a user whose image is too big is told the problem was
+    already fixed and they can keep going, which is false."""
+    result = te.friendly_turn_error(ContentTooLargeError(_RESIZE_COPY))
+    assert result is not None
+    code, message = result
+    assert code == te.CONTENT_TOO_LARGE_CODE
+    assert message != te.CONTENT_RECOVERY_USER_MESSAGE
+
+
+def test_too_large_keeps_the_providers_resize_instruction():
+    """The sentence the user needed. This module normally replaces anton's
+    message with curated copy; here anton's is the more specific of the two
+    because it carries the provider's own remedy."""
+    _, message = te.friendly_turn_error(ContentTooLargeError(_RESIZE_COPY))
+    assert "resize the image" in message.lower()
+    assert "temporarily unavailable" not in message.lower()
+
+
+def test_a_plain_content_validation_error_keeps_its_own_card():
+    """The ENG-1992 behaviour must not move: that failure IS already fixed
+    server-side, and telling the user to attach a smaller image would be
+    nonsense advice for a serialization mismatch."""
+    result = te.friendly_turn_error(
+        _AntonContentValidationError("bad image block")
+    )
+    assert result is not None
+    code, message = result
+    assert code == te.CONTENT_RECOVERY_CODE
+    assert message == te.CONTENT_RECOVERY_USER_MESSAGE
+
+
+def test_remote_too_large_maps_to_its_own_code_and_passes_the_message():
+    """The hosted/pod path. Only the scrubbed "<Type>: <message>" string
+    crosses that wire, so the class name is the entire discriminator — which
+    is why anton raises a distinct subclass rather than varying a `code` the
+    wire does not carry."""
+    code, message = te.remote_turn_error(f"ContentTooLargeError: {_RESIZE_COPY}")
+    assert code == te.CONTENT_TOO_LARGE_CODE
+    assert "resize the image" in message.lower()
+
+
+@pytest.mark.parametrize("param,value,allowed", [
+    ("reasoning_effort", "ultra", "'low', 'medium', 'high'"),
+    ("tool_choice", "always", "'none', 'auto', 'required'"),
+    ("service_tier", "turbo", "'auto', 'default', 'flex'"),
+])
+def test_an_unrelated_enum_error_is_not_a_content_rejection(param, value, allowed):
+    """The destructive false positive (review of ENG-2689). These phrases are
+    generic enum-validation prose, and answering them with a content rejection
+    makes the caller strip EVERY image from the conversation and tell the user
+    it fixed things — while the real configuration error goes unmentioned.
+
+    Verified as a live defect before the guard: a `reasoning_effort` typo
+    returned `content_recovery` from this very function.
+    """
+    exc = Exception(
+        "Error code: 400 - {'error': {'message': \"Invalid value: '%s'. "
+        "Supported values are: %s.\", 'param': '%s'}}" % (value, allowed, param)
+    )
+    assert not te.is_content_validation_error(exc)
+    assert not te.is_content_too_large_error(exc)
+    assert te.friendly_turn_error(exc) is None
+
+
+def test_a_param_that_legitimately_takes_image_is_not_a_content_rejection():
+    """Found by adversarially reviewing the first version of this guard, not by
+    the reviewer. `modalities` legitimately accepts the value 'image', so
+    "Supported values are: 'image', 'audio'" names a content-block token while
+    having nothing to do with content — and the corroboration rule as first
+    written still sent it down the path that deletes every image in the
+    conversation. A param the provider named is decisive when recoverable."""
+    exc = Exception(
+        "Error code: 400 - {'error': {'message': \"Invalid value: 'text'. "
+        "Supported values are: 'image', 'audio'.\", 'param': 'modalities'}}"
+    )
+    assert not te.is_content_validation_error(exc)
+    assert te.friendly_turn_error(exc) is None
+
+
+def test_the_real_shape_dialects_still_qualify():
+    """The guard must not be so tight it kills ENG-1992. Both live dialects
+    name a content-block type, which is exactly the corroboration required."""
+    openai_dialect = Exception(
+        "Invalid value: 'image'. Supported values are: 'input_text', "
+        "'input_image', 'input_file'."
+    )
+    anthropic_dialect = Exception(
+        "Input tag 'image_url' found using 'type' does not match any of the "
+        "expected tags: 'image'"
+    )
+    for exc in (openai_dialect, anthropic_dialect):
+        assert te.is_content_validation_error(exc)
+        assert te.friendly_turn_error(exc)[0] == te.CONTENT_RECOVERY_CODE
+
+
+def test_every_repair_guard_consults_the_shared_set():
+    """The two tests above cover the local streaming and non-streaming sites
+    behaviourally. The remote site (`_produce_remote`) needs staged files, a
+    saved question, seeded history, an artifact snapshot and a memory read
+    before it reaches its guard. Mocking all of that would produce a test that
+    passes for reasons unrelated to the guard, which is the failure mode this
+    whole exercise is about. So that third site is pinned structurally
+    instead, in the same style as `test_no_return_emits_a_literal_code` below.
+
+    This is the exact mutation that went undetected: replacing the three guards
+    with `code == "content_recovery"` while leaving `CONTENT_REPAIR_CODES`
+    defined kept 191 checked-in tests green with ENG-2689's next-turn repair
+    gone. Asserting set membership proved a property of a constant; nothing
+    proved a handler consulted it.
+    """
+    import ast
+    import inspect
+
+    from cowork.handlers import responses as responses_mod
+
+    tree = ast.parse(inspect.getsource(responses_mod))
+    parent = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent[child] = node
+
+    calls = [
+        n for n in ast.walk(tree)
+        if isinstance(n, ast.Call)
+        and isinstance(n.func, ast.Attribute)
+        and n.func.attr == "repair_image_content"
+    ]
+    assert len(calls) == 3, f"expected 3 repair sites, found {len(calls)}"
+
+    banned = {te.CONTENT_RECOVERY_CODE, te.CONTENT_TOO_LARGE_CODE}
+    for call in calls:
+        # Nearest enclosing `if`, walking up — `ast.walk` alone double-counts,
+        # since the guard's own body contains further `if`s.
+        node, guard = call, None
+        while node in parent:
+            node = parent[node]
+            if isinstance(node, ast.If):
+                guard = node
+                break
+        assert guard is not None, "a repair call is not behind any guard at all"
+
+        names = {n.id for n in ast.walk(guard.test) if isinstance(n, ast.Name)}
+        assert "CONTENT_REPAIR_CODES" in names, (
+            "a repair site does not consult CONTENT_REPAIR_CODES, so it handles "
+            "only one of the two permanent-content families"
+        )
+        literals = {
+            n.value for n in ast.walk(guard.test)
+            if isinstance(n, ast.Constant) and isinstance(n.value, str)
+        }
+        assert not (literals & banned), (
+            "a repair site compares `code` to a bare code literal; that is how "
+            "one family silently stops being repaired"
+        )
+
+
 def test_response_failed_sse_shape():
     frame = te.response_failed_sse("oops", "image_format")
     assert frame.startswith("event: response.failed\ndata: ")
@@ -156,7 +355,7 @@ def _handler_with_raising_formatter(exc: Exception) -> ResponsesHandler:
 
     async def _stream_response(
         *, conversation, input, model=None, reasoning_effort=None, disabled_connections=None,
-        trace_tags=None, trace_metadata=None,
+        trace_tags=None, trace_metadata=None, tool_messages=False, model_wait=None,
     ):
         if False:
             yield
@@ -184,10 +383,8 @@ async def _collect_produce_sse(handler: ResponsesHandler) -> list[str]:
             pass
 
     conv_id = uuid4()
-    mock_session = MagicMock()
 
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=mock_session),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -221,7 +418,7 @@ async def test_stream_emits_friendly_failed_event_for_image_error():
 async def test_produce_pending_persist_failure_does_not_clear_all_pending():
     # ENG-1231 hardening (in-process _produce, mirror of the _produce_remote test):
     # if the pending user persist raises before its id is captured, this turn owns
-    # no pending row — persist() must NOT fall back to finalize_pending(conv, None),
+    # no pending row — persist() must NOT fall back to clear_pending(conv, message_id=None),
     # which would clear a pending row stranded by an earlier crashed turn.
     from unittest.mock import MagicMock, patch
 
@@ -235,7 +432,6 @@ async def test_produce_pending_persist_failure_does_not_clear_all_pending():
             pass
 
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -251,9 +447,39 @@ async def test_produce_pending_persist_failure_does_not_clear_all_pending():
             harness_id="anton",
             buffer=_Buffer(),
         )
-        # No row was persisted for this turn → finalize must not have run at all,
+        # No row was persisted for this turn → clearing must not have run at all,
         # in particular never the clear-all (message_id=None) form.
-        conv_svc.return_value.finalize_pending.assert_not_called()
+        conv_svc.return_value.clear_pending.assert_not_called()
+
+
+def test_a_full_pool_maps_to_server_busy():
+    """A pool that freed no connection in time is not a provider failure: it
+    gets its own code and a sentence that names the wait."""
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+    from cowork.db.units import DatabaseBusy
+
+    busy = (te.SERVER_BUSY_CODE, "Cowork is busy. Try again in about 5 seconds.")
+    assert te.friendly_turn_error(PoolTimeoutError("QueuePool limit of size 20 overflow 20 reached")) == busy
+    assert te.friendly_turn_error(DatabaseBusy("no database unit slot freed within POOL_TIMEOUT")) == busy
+
+
+async def test_stream_fails_a_turn_that_finds_the_pool_full_with_a_timed_retry():
+    """Inside a stream a full pool is one response.failed frame, carrying the
+    wait the way rate_limited does, so a card can gate its Retry on it."""
+    from cowork.db.units import DatabaseBusy
+
+    frames = await _collect_produce_sse(
+        _handler_with_raising_formatter(DatabaseBusy("no database connection freed within POOL_TIMEOUT"))
+    )
+
+    failed = [f for f in frames if "response.failed" in f]
+    assert len(failed) == 1
+    payload = json.loads(failed[0].split("data: ", 1)[1].strip())
+    assert payload["code"] == te.SERVER_BUSY_CODE
+    assert payload["error"] == "Cowork is busy. Try again in about 5 seconds."
+    assert payload["retry_after"] == 5
+    assert payload["retry_at"].endswith("Z")
 
 
 async def test_stream_redacts_generic_error():
@@ -283,6 +509,59 @@ def test_collect_raises_400_with_curated_message_for_image_error():
     assert "PNG or JPEG" in err.value.detail["error"]
 
 
+@contextmanager
+def _records_from(name: str, level: int = logging.WARNING):
+    """Capture one logger's records, with that logger forced back on.
+
+    Not caplog: the alembic env used by the migration tests calls fileConfig,
+    which defaults to disable_existing_loggers=True and leaves every logger
+    built before it with disabled=True for the rest of the session. A log
+    assertion running after one of those silently captures nothing, so this
+    clears the flag for the duration and puts it back.
+    """
+    captured: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            captured.append(record)
+
+    target = logging.getLogger(name)
+    handler = _Capture(level)
+    restore = (target.level, target.propagate, target.disabled)
+    target.setLevel(level)
+    target.propagate = False
+    target.disabled = False
+    target.addHandler(handler)
+    try:
+        yield captured
+    finally:
+        target.removeHandler(handler)
+        target.level, target.propagate, target.disabled = restore
+
+
+def test_collect_puts_the_same_id_on_the_body_and_the_log_line():
+    # The non-streaming arm is reached from handle() and from the scheduler, and
+    # it failed with no id at all: the user got the generic message and the log
+    # line named neither the turn nor a reference to quote.
+    handler = _handler_with_raising_formatter(Exception("kaboom"))
+    conversation_id = uuid4()
+    with _records_from("cowork.handlers.responses") as records:
+        with pytest.raises(HTTPException) as err:
+            asyncio.run(handler._collect(
+                stream=None, conversation_id=conversation_id, model="anton", original_content="hi",
+            ))
+
+    request_id = err.value.detail["request_id"]
+    UUID(request_id)
+    deployed = [r for r in records if r.levelno >= logging.WARNING]
+    assert deployed
+    assert all(getattr(r, "request_id", None) == request_id for r in deployed)
+    # The conversation travels beside the id, so a database error's sanitized
+    # line still names it.
+    [failed] = [r for r in deployed if r.getMessage() == "[responses] turn failed"]
+    assert failed.conversation_id == str(conversation_id)
+
+
 def test_collect_raises_500_generic_for_unmapped_error():
     handler = _handler_with_raising_formatter(Exception("kaboom: secret-token-xyz"))
     with pytest.raises(HTTPException) as err:
@@ -297,10 +576,27 @@ def test_collect_raises_500_generic_for_unmapped_error():
 
 # ── Conversation repair on content validation error (ENG-1992) ────
 
-def test_stream_repairs_conversation_on_content_validation_error():
+# Both permanent-content families, because they enter through different
+# detectors and only the repair GUARD is shared. Before ENG-2689 these tests
+# only ever drove the shape family, so reverting all three handler guards to
+# `code == "content_recovery"` left 191 checked-in tests green with the
+# oversized-image repair gone entirely (review of ENG-2689).
+_REPAIR_FAMILIES = [
+    pytest.param(
+        lambda: Exception(
+            "Invalid value: 'image'. Supported values are: 'input_text', 'input_image'"
+        ),
+        id="shape",
+    ),
+    pytest.param(lambda: ContentTooLargeError(_RESIZE_COPY), id="too_large"),
+]
+
+
+@pytest.mark.parametrize("make_exc", _REPAIR_FAMILIES)
+def test_stream_repairs_conversation_on_content_validation_error(make_exc):
     from unittest.mock import MagicMock, patch
 
-    exc = Exception("Invalid value: 'image'. Supported values are: 'input_text', 'input_image'")
+    exc = make_exc()
     handler = _handler_with_raising_formatter(exc)
 
     class _Buffer:
@@ -312,7 +608,6 @@ def test_stream_repairs_conversation_on_content_validation_error():
 
     conv_id = uuid4()
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -345,7 +640,6 @@ def test_stream_does_not_repair_conversation_for_unrelated_errors():
 
     conv_id = uuid4()
     with (
-        patch("cowork.handlers.responses.get_open_session", return_value=MagicMock()),
         patch("cowork.handlers.responses.ConversationService") as conv_svc,
         patch("cowork.handlers.responses.get_harness", return_value=handler.harness),
     ):
@@ -363,12 +657,15 @@ def test_stream_does_not_repair_conversation_for_unrelated_errors():
         conv_svc.return_value.repair_image_content.assert_not_called()
 
 
-def test_collect_repairs_conversation_on_content_validation_error():
-    from unittest.mock import MagicMock, patch
+@pytest.mark.parametrize("make_exc", _REPAIR_FAMILIES)
+def test_collect_repairs_conversation_on_content_validation_error(make_exc):
+    from unittest.mock import patch
 
-    exc = Exception("Invalid value: 'image'. Supported values are: 'input_text', 'input_image'")
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    exc = make_exc()
     handler = _handler_with_raising_formatter(exc)
-    handler.scoped = MagicMock()  # __init__ bypassed; _collect's repair path needs this
+    handler.scope = LOCAL_SCOPE  # __init__ bypassed; _collect's repair unit needs this
     conv_id = uuid4()
 
     with patch("cowork.handlers.responses.ConversationService") as conv_svc:
@@ -376,7 +673,7 @@ def test_collect_repairs_conversation_on_content_validation_error():
         with pytest.raises(HTTPException) as err:
             asyncio.run(handler._collect(stream=None, conversation_id=conv_id, model="anton", original_content="hi"))
         assert err.value.status_code == 400
-        assert err.value.detail["code"] == te.CONTENT_RECOVERY_CODE
+        assert err.value.detail["code"] in te.CONTENT_REPAIR_CODES
         conv_svc.return_value.repair_image_content.assert_called_once_with(conv_id)
 
 
@@ -531,8 +828,10 @@ async def test_auth_reconnectable_keys_on_the_failing_role_not_planning():
 
     exc = ProviderAuthError("provider rejected the credential")
     exc.role = "coding"
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
@@ -557,8 +856,10 @@ async def test_auth_reconnectable_uses_planning_role_in_a_mixed_config():
     with patch(
         "cowork.handlers.responses.get_user_settings",
         return_value=_MixedSettings(),
-    ):
+    ) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     failed = next(f for f in frames if "response.failed" in f)
     payload = json.loads(failed.split("data: ", 1)[1].strip())
@@ -586,8 +887,10 @@ async def test_auth_without_a_role_does_not_name_a_provider_in_a_mixed_config():
     # LLMClient's confirmation wrappers set it.
     exc = ProviderAuthError("provider rejected the credential")
     assert exc.role is None
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_MixedSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_MixedSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
@@ -608,8 +911,10 @@ async def test_auth_without_a_role_still_names_an_unambiguous_provider():
         resolved_router_provider = Provider.OPENAI
 
     exc = ProviderAuthError("provider rejected the credential")
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_MindsSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_MindsSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
 
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
@@ -791,6 +1096,7 @@ def _byok_failure(status_code, message="Server returned an upstream error"):
     [
         (402, "wallet_empty", te.TOKEN_LIMIT_CODE),
         (429, "included_allowance_exhausted", te.ALLOWANCE_EXHAUSTED_CODE),
+        (429, "free_air_daily_spend_fuse_exceeded", te.FREE_SERVING_PAUSED_CODE),
         (429, "rate_limited", te.RATE_LIMITED_CODE),
         (503, "policy_unavailable", te.POLICY_UNAVAILABLE_CODE),
         (404, "unknown_model", te.MODEL_NOT_FOUND_CODE),
@@ -837,7 +1143,7 @@ def test_spent_free_allowance_is_its_own_card_not_out_of_credits():
     # ENG-1537. These used to share the credits card, but they are different
     # situations: `access.py` only issues this reason for a free-bucket model on
     # an org that has NEVER topped up, so the user has not spent money — they
-    # used the monthly grant, which resets. Telling them "you're out of credits"
+    # used the free grant, which resets. Telling them "you're out of credits"
     # both misdescribes it and hides the free way forward.
     code, message = te.friendly_turn_error(
         _gateway_failure(429, reason="included_allowance_exhausted")
@@ -858,15 +1164,15 @@ def test_empty_wallet_keeps_the_out_of_credits_card():
     assert message == te.TOKEN_LIMIT_USER_MESSAGE
 
 
-def test_allowance_reset_at_is_read_off_the_chain():
+def test_gate_reset_at_is_read_off_the_chain():
     # The gate sends this on the allowance denial and NOT on a velocity one, so
     # the card can name when the grant refreshes instead of only asking for money.
     exc = _gateway_failure(429, reason="included_allowance_exhausted")
     exc.__cause__.response.headers["X-MindsHub-Reset-At"] = "2026-09-01T00:00:00Z"
-    assert te.allowance_reset_at(exc) == "2026-09-01T00:00:00Z"
-    # Absent → the renderer falls back to "resets next month"; never invented here.
-    assert te.allowance_reset_at(_gateway_failure(429, reason="included_allowance_exhausted")) is None
-    assert te.allowance_reset_at(Exception("bare")) is None
+    assert te.gate_reset_at(exc) == "2026-09-01T00:00:00Z"
+    # Absent → the renderer falls back to its no-time copy; never invented here.
+    assert te.gate_reset_at(_gateway_failure(429, reason="included_allowance_exhausted")) is None
+    assert te.gate_reset_at(Exception("bare")) is None
 
 
 def test_reset_at_rides_the_failed_payload_only_when_present():
@@ -875,6 +1181,311 @@ def test_reset_at_rides_the_failed_payload_only_when_present():
     )
     assert with_reset["reset_at"] == "2026-09-01T00:00:00Z"
     assert "reset_at" not in te.response_failed_payload("msg", te.TOKEN_LIMIT_CODE)
+
+
+# ── The free-Air spend fuse is its own stop ─────────────────────────────────
+#
+# The gate trips `free_air_daily_spend_fuse_exceeded` (429) when the day's free
+# MindsHub Air budget is spent fleet-wide, and denies every org whose wallet
+# cannot pay until the end of the UTC day. Unmapped, it fell to the bare-status
+# 429 rule and told the user they were out of credits, which misnames a stop
+# they did nothing to cause.
+
+_FUSE_REASON = "free_air_daily_spend_fuse_exceeded"
+_FUSE_RESET_AT = "2026-09-25T00:00:00Z"
+
+
+def _fuse_via_body_code():
+    """A gateway fuse denial whose X-MindsHub-Reason header was lost on the way.
+
+    The body `code` still names the fuse, and the reset instant still rides its
+    own X-MindsHub-Reset-At header.
+    """
+    exc = ConnectionError("Server returned 429")
+    exc.__cause__ = inner = _FakeAPIStatusError(
+        429, {"X-MindsHub-Reset-At": _FUSE_RESET_AT}, url=_minds_gateway_url()
+    )
+    inner.body = {"error": {"code": _FUSE_REASON, "message": "Free serving is paused"}}
+    return exc
+
+
+def _fuse_via_header():
+    exc = _gateway_failure(429, reason=_FUSE_REASON)
+    exc.__cause__.response.headers["X-MindsHub-Reset-At"] = _FUSE_RESET_AT
+    return exc
+
+
+# anton's REAL parent type, as for ContentTooLargeError above. The pinned anton
+# predates MindsHubBillingStop, but production's stop IS a TokenLimitExceeded,
+# and that is what sends it to the out-of-credits rung when the body code goes
+# unread. A stand-in without the parent would pass for the wrong reason.
+from anton.core.llm.provider import TokenLimitExceeded as _AntonTokenLimitExceeded
+
+
+class MindsHubBillingStop(_AntonTokenLimitExceeded):
+    """Named to match anton's base of WalletEmptyError, AllowanceExhaustedError
+    and FreeServingPausedError. Like them it carries the gate's status and no
+    ``.response``: the response stays on the SDK error it is raised from."""
+
+    def __init__(self, message, *, reason, status_code=429):
+        super().__init__(message)
+        self.reason = reason
+        self.status_code = status_code
+
+
+def _typed_stop_via_body_code(reason, *, url=None):
+    """The billing stop anton raises today, on a lane that lost X-MindsHub-Reason.
+
+    The SDK error it is raised from still holds the response, the body `code`
+    and the reset header. ``url`` defaults to the configured gateway.
+    """
+    inner = _FakeAPIStatusError(
+        429, {"X-MindsHub-Reset-At": _FUSE_RESET_AT}, url=url or _minds_gateway_url()
+    )
+    inner.body = {"error": {"code": reason, "message": "Denied"}}
+    stop = MindsHubBillingStop(f"Server returned 429: {reason}", reason=reason)
+    stop.__cause__ = inner
+    return stop
+
+
+def test_fuse_header_maps_to_free_serving_paused_not_out_of_credits():
+    code, message = te.friendly_turn_error(_fuse_via_header())
+    assert code == te.FREE_SERVING_PAUSED_CODE
+    assert message == te.FREE_SERVING_PAUSED_USER_MESSAGE
+    assert code not in (te.TOKEN_LIMIT_CODE, te.ALLOWANCE_EXHAUSTED_CODE)
+
+
+def test_fuse_body_code_maps_when_the_header_is_lost():
+    # Without the body carrier this lane falls to the bare-status 429 rule and
+    # renders as out-of-credits.
+    code, message = te.friendly_turn_error(_fuse_via_body_code())
+    assert code == te.FREE_SERVING_PAUSED_CODE
+    assert message == te.FREE_SERVING_PAUSED_USER_MESSAGE
+
+
+def test_the_typed_stop_fixture_is_the_shape_that_cards_as_out_of_credits():
+    """Guards the typed-stop tests below from passing for the wrong reason. If
+    this fails, the fixture stopped being a TokenLimitExceeded with a status
+    and no response, and those tests no longer exercise the lost host."""
+    exc = _typed_stop_via_body_code(_FUSE_REASON)
+    assert te.is_token_limit_error(exc)
+    assert exc.status_code == 429
+    assert not hasattr(exc, "response")
+
+
+@pytest.mark.parametrize(
+    ("reason", "expected_code", "expected_message"),
+    [
+        (_FUSE_REASON, te.FREE_SERVING_PAUSED_CODE, te.FREE_SERVING_PAUSED_USER_MESSAGE),
+        (
+            "included_allowance_exhausted",
+            te.ALLOWANCE_EXHAUSTED_CODE, te.ALLOWANCE_EXHAUSTED_USER_MESSAGE,
+        ),
+    ],
+)
+def test_antons_typed_stop_maps_from_the_body_code_when_the_header_is_lost(
+    reason, expected_code, expected_message
+):
+    # The stop carries the gate's status but no response, so the gateway host
+    # sits one link down the chain. Read off the stop, the host was None, the
+    # body code never counted, and both stops carded as "You're out of
+    # credits", naming the wrong limit.
+    exc = _typed_stop_via_body_code(reason)
+    assert te.friendly_turn_error(exc) == (expected_code, expected_message)
+
+
+@pytest.mark.parametrize("reason", [_FUSE_REASON, "included_allowance_exhausted"])
+def test_the_probe_classifier_reads_a_typed_stops_body_code(reason):
+    # gateway_denial reads the body code by the same rule, so it names the
+    # limit for the typed stop too.
+    assert te.gateway_denial(exc=_typed_stop_via_body_code(reason)) == te.GatewayDenial(
+        reason=reason, reset_at=_FUSE_RESET_AT,
+    )
+
+
+@pytest.mark.parametrize("reason", [_FUSE_REASON, "included_allowance_exhausted"])
+def test_a_third_party_body_under_a_typed_stop_still_selects_nothing(reason):
+    # The body counts only when the response that carried it came from the
+    # configured gateway, however deep in the chain that response sits.
+    exc = _typed_stop_via_body_code(reason, url="https://openrouter.ai/api/v1/x")
+    code, _ = te.friendly_turn_error(exc)
+    assert code not in (te.FREE_SERVING_PAUSED_CODE, te.ALLOWANCE_EXHAUSTED_CODE)
+    assert te.gateway_denial(exc=exc) is None
+
+
+def test_a_relayed_upstream_503_under_antons_retry_wrappers_stays_provider_overloaded():
+    """The bare-status rule keeps the host of the entry that gave the status.
+
+    The gateway relays an upstream provider's 503 with no X-MindsHub-Reason.
+    anton classifies it as a TransientProviderError carrying the status and no
+    response, and raises ProviderOverloadedError from that once its retry
+    budget runs out. A fix that paired the wrapper's status with the host of
+    any later response would read this as the gateway's own 503 and card a
+    provider incident as "Billing is temporarily unavailable".
+    """
+    from anton.core.llm.provider import TransientProviderError
+
+    transient = TransientProviderError("The model provider returned 503.", code="http_503")
+    transient.status_code = 503
+    transient.__cause__ = _FakeAPIStatusError(503, {}, url=_minds_gateway_url())
+    exc = _FakeOverloadedErr(_OVERLOAD_MSG, model="sonnet")
+    exc.__cause__ = transient
+    assert te.friendly_turn_error(exc) == (te.PROVIDER_OVERLOADED_CODE, _OVERLOAD_MSG)
+
+
+def test_the_cause_chain_walk_survives_a_cycle():
+    # Every chain reader iterates _cause_chain, so its cycle guard is the only
+    # thing standing between a self-referencing chain and a hung error handler.
+    first = ConnectionError("first")
+    second = _FakeAPIStatusError(429, {}, url=_minds_gateway_url())
+    first.__cause__ = second
+    second.__cause__ = first
+    assert list(te._cause_chain(exc=first)) == [first, second]
+    assert te._http_error_context(first) == (429, None, te._configured_minds_host())
+    assert te.gate_reset_at(first) is None
+    assert te.retry_after_seconds(first) is None
+
+
+def test_the_fuse_is_no_longer_a_header_present_but_unmapped_reason():
+    # A reason the header carries but this module does not map skips the
+    # header rung and falls to the rest of the ladder. The fuse used to be one.
+    assert te._map_gateway_reason(_FUSE_REASON) == (
+        te.FREE_SERVING_PAUSED_CODE, te.FREE_SERVING_PAUSED_USER_MESSAGE,
+    )
+    # The mapping is exact: a reason the gateway does not emit is still
+    # unmapped, and no 429 reason becomes the fuse by resemblance.
+    assert te._map_gateway_reason("free_air_daily_spend_fuse") is None
+    result = te.friendly_turn_error(_gateway_failure(429, reason="some_future_reason"))
+    assert result is None or result[0] != te.FREE_SERVING_PAUSED_CODE
+
+
+def test_fuse_copy_names_the_shared_pause_and_the_way_out():
+    lowered = te.FREE_SERVING_PAUSED_USER_MESSAGE.lower()
+    assert "everyone" in lowered
+    assert "add credits" in lowered
+    # User-facing copy uses no em-dash.
+    assert "—" not in te.FREE_SERVING_PAUSED_USER_MESSAGE
+
+
+def test_the_free_allowance_is_never_called_monthly():
+    # The free MindsHub Air allowance is not monthly. Copy that calls it
+    # monthly tells a user who hit it to wait weeks for something that comes
+    # back much sooner. Both strings reach users: the allowance message is the
+    # channel reply on Slack and Discord, and the description is the settings
+    # help text. The allowance message makes no refill claim at all, because an
+    # org with no free grant hits the same stop and nothing refills for it.
+    from cowork.common.settings.user_settings import UserSettings
+
+    allowance = te.ALLOWANCE_EXHAUSTED_USER_MESSAGE
+    assert "month" not in allowance.lower()
+    assert "refill" not in allowance.lower()
+    assert "add credits" in allowance.lower()
+    assert "—" not in allowance
+
+    description = UserSettings.model_fields["max_turn_tokens"].description
+    assert "month" not in description.lower()
+
+
+# Words that would claim the free allowance comes back, or say when. An org
+# with no free grant hits the same `included_allowance_exhausted` stop and
+# nothing ever refills for it, and the window length is plan config, so the
+# fallback copy may claim neither.
+_ALLOWANCE_WINDOW_CLAIMS = (
+    "refill", "reset", "renew", "comes back", "wait",
+    "minute", "hour", "day", "week", "month",
+)
+
+
+@pytest.mark.parametrize(
+    "make_message",
+    [
+        pytest.param(
+            lambda: te._map_gateway_reason("included_allowance_exhausted")[1],
+            id="gateway-reason",
+        ),
+        pytest.param(
+            # The in-process path with no X-MindsHub-Reset-At, which is what the
+            # gate sends for an org whose allowance is zero.
+            lambda: te.friendly_turn_error(
+                _gateway_failure(429, reason="included_allowance_exhausted")
+            )[1],
+            id="in-process-no-reset-at",
+        ),
+        pytest.param(
+            # The hosted path: channels/runtime.py posts this verbatim to Slack
+            # and Discord, and reads no reset instant beside it.
+            lambda: te.remote_turn_error(
+                "AllowanceExhaustedError: Your included allowance for 'x' is exhausted."
+            )[1],
+            id="remote-channel-reply",
+        ),
+    ],
+)
+def test_the_allowance_stop_copy_claims_no_refill_or_window(make_message):
+    message = make_message().lower()
+    for claim in _ALLOWANCE_WINDOW_CLAIMS:
+        assert claim not in message, claim
+    # Credits stay the way forward in every case, grant or no grant.
+    assert "add credits" in message
+
+
+@pytest.mark.parametrize(
+    ("make_exc", "expected_code", "expected_error"),
+    [
+        pytest.param(
+            _fuse_via_header, te.FREE_SERVING_PAUSED_CODE,
+            te.FREE_SERVING_PAUSED_USER_MESSAGE, id="fuse-header",
+        ),
+        pytest.param(
+            _fuse_via_body_code, te.FREE_SERVING_PAUSED_CODE,
+            te.FREE_SERVING_PAUSED_USER_MESSAGE, id="fuse-body-code",
+        ),
+        pytest.param(
+            lambda: _with_reset_at(_gateway_failure(429, reason="included_allowance_exhausted")),
+            te.ALLOWANCE_EXHAUSTED_CODE, te.ALLOWANCE_EXHAUSTED_USER_MESSAGE,
+            id="allowance-header",
+        ),
+        pytest.param(
+            lambda: _typed_stop_via_body_code(_FUSE_REASON), te.FREE_SERVING_PAUSED_CODE,
+            te.FREE_SERVING_PAUSED_USER_MESSAGE, id="typed-fuse-body-code",
+        ),
+        pytest.param(
+            lambda: _typed_stop_via_body_code("included_allowance_exhausted"),
+            te.ALLOWANCE_EXHAUSTED_CODE, te.ALLOWANCE_EXHAUSTED_USER_MESSAGE,
+            id="typed-allowance-body-code",
+        ),
+    ],
+)
+async def test_stream_carries_reset_at_for_each_free_way_forward_stop(
+    make_exc, expected_code, expected_error
+):
+    # The in-process (desktop) path. The card needs `reset_at` to say when the
+    # free way forward comes back, and the handler attaches it only for the
+    # codes in RESET_AT_CODES.
+    frames = await _collect_produce_sse(_handler_with_raising_formatter(make_exc()))
+    failed = [f for f in frames if "response.failed" in f]
+    assert len(failed) == 1
+    payload = json.loads(failed[0].split("data: ", 1)[1].strip())
+    assert payload["code"] == expected_code
+    assert payload["error"] == expected_error
+    assert payload["reset_at"] == _FUSE_RESET_AT
+
+
+async def test_stream_leaves_reset_at_off_an_empty_wallet_stop():
+    # The out-of-credits card has no free way forward to time, so a reset
+    # header on that denial must not ride the frame.
+    exc = _with_reset_at(_gateway_failure(402, reason="wallet_empty"))
+    frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    payload = json.loads(
+        [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
+    )
+    assert payload["code"] == te.TOKEN_LIMIT_CODE
+    assert "reset_at" not in payload
+
+
+def _with_reset_at(exc):
+    exc.__cause__.response.headers["X-MindsHub-Reset-At"] = _FUSE_RESET_AT
+    return exc
 
 
 # ── The two 429 flavours must never share a card (ENG-1537) ────────
@@ -905,7 +1516,10 @@ def test_velocity_rate_limit_maps_from_the_body_code_when_the_header_is_lost():
     assert code == te.RATE_LIMITED_CODE
 
 
-@pytest.mark.parametrize("code", ["wallet_empty", "rate_limited", "included_allowance_exhausted"])
+@pytest.mark.parametrize("code", [
+    "wallet_empty", "rate_limited", "included_allowance_exhausted",
+    "free_air_daily_spend_fuse_exceeded",
+])
 def test_a_third_party_body_cannot_select_a_billing_verdict(code):
     # ENG-1537 review. The body-`code` carrier must be host-gated exactly like
     # the bare-status rule. A response body is third-party-controlled on a BYOK
@@ -922,6 +1536,7 @@ def test_a_third_party_body_cannot_select_a_billing_verdict(code):
     result = te.friendly_turn_error(exc)
     assert result is None or result[0] not in (
         te.TOKEN_LIMIT_CODE, te.RATE_LIMITED_CODE, te.ALLOWANCE_EXHAUSTED_CODE,
+        te.FREE_SERVING_PAUSED_CODE,
     ), f"a third-party body selected {result!r}"
 
 
@@ -971,7 +1586,7 @@ def test_a_real_provider_incident_still_maps_to_provider_overloaded():
 def test_billing_denials_still_card_immediately(status, reason, expected):
     # ENG-1169 regression guard, in the other direction. These share the 429
     # status (and 402) with the velocity limit but are permanent for the
-    # identical request — the allowance resets monthly — so they must keep
+    # identical request (no retry refills the allowance), so they must keep
     # going straight to the credits card and must never be routed to a wait.
     code, message = te.friendly_turn_error(_gateway_failure(status, reason=reason))
     assert code == expected
@@ -1288,8 +1903,10 @@ async def test_overloaded_reconnectable_keys_on_the_failing_model_not_planning()
         resolved_coding_provider = Provider.ANTHROPIC
 
     exc = _FakeOverloadedErr(_OVERLOAD_MSG, model="latest:haiku")  # the coding model
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
     )
@@ -1312,8 +1929,10 @@ async def test_overloaded_reconnectable_true_when_failing_model_is_managed():
         resolved_coding_provider = Provider.MINDS_CLOUD
 
     exc = _FakeOverloadedErr(_OVERLOAD_MSG, model="latest:sonnet")  # the planning model
-    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()):
+    with patch("cowork.handlers.responses.get_user_settings", return_value=_FakeSettings()) as settings:
         frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    # The handler read the patched settings, so the provider fields below come from them.
+    settings.assert_called_once_with()
     payload = json.loads(
         [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
     )
@@ -1327,6 +1946,61 @@ def test_remote_error_token_limit():
     code, msg = remote_turn_error("TokenLimitExceeded: Server returned 429 ...")
     assert code == TOKEN_LIMIT_CODE
     assert "credits" in msg
+
+
+@pytest.mark.parametrize(
+    ("wire_error", "expected_code", "expected_message"),
+    [
+        pytest.param(
+            "WalletEmptyError: Your wallet has no balance to cover the model 'sk-live-x'.",
+            te.TOKEN_LIMIT_CODE, te.TOKEN_LIMIT_USER_MESSAGE, id="wallet-empty",
+        ),
+        pytest.param(
+            "AllowanceExhaustedError: Your included allowance for 'sk-live-x' is exhausted.",
+            te.ALLOWANCE_EXHAUSTED_CODE, te.ALLOWANCE_EXHAUSTED_USER_MESSAGE,
+            id="allowance-exhausted",
+        ),
+        pytest.param(
+            "FreeServingPausedError: Free serving for 'sk-live-x' is paused until "
+            "the daily budget resets.",
+            te.FREE_SERVING_PAUSED_CODE, te.FREE_SERVING_PAUSED_USER_MESSAGE,
+            id="free-serving-paused",
+        ),
+        # Older worker images raise the parent type for every billing stop.
+        pytest.param(
+            "TokenLimitExceeded: Server returned 429 for 'sk-live-x'",
+            te.TOKEN_LIMIT_CODE, te.TOKEN_LIMIT_USER_MESSAGE, id="legacy-token-limit",
+        ),
+    ],
+)
+def test_remote_billing_stops_name_the_limit_that_fired(
+    wire_error, expected_code, expected_message
+):
+    # Hosted turns arrive as "TypeName: message", so the type name is all that
+    # tells the three billing stops apart. Before the name table, every hosted
+    # stop read as out of credits or as the generic error.
+    code, message = te.remote_turn_error(wire_error)
+    assert code == expected_code
+    assert message == expected_message
+    # The pod's own text is discarded for these; only curated copy reaches users.
+    assert "sk-live" not in message
+
+
+@pytest.mark.parametrize(
+    ("type_name", "expected_code", "fallback"),
+    [
+        ("ProviderOverloadedError", te.PROVIDER_OVERLOADED_CODE, te.PROVIDER_OVERLOADED_FALLBACK_MESSAGE),
+        ("ModelUnavailableError", te.MODEL_NOT_FOUND_CODE, te.MODEL_UNAVAILABLE_FALLBACK_MESSAGE),
+        (te.CONTENT_TOO_LARGE_TYPE_NAME, te.CONTENT_TOO_LARGE_CODE, te.CONTENT_TOO_LARGE_USER_MESSAGE),
+    ],
+)
+def test_remote_pass_through_types_fall_back_on_an_empty_message(
+    type_name, expected_code, fallback
+):
+    # These three pass anton's curated message through. An empty one must get
+    # the curated fallback, never an empty card.
+    assert te.remote_turn_error(f"{type_name}: ") == (expected_code, fallback)
+    assert te.remote_turn_error(f"{type_name}: curated copy") == (expected_code, "curated copy")
 
 
 def test_remote_error_overloaded_passes_curated_copy():
@@ -1544,6 +2218,118 @@ def test_remote_error_none_is_redacted():
     assert remote_turn_error(None)[0] == GENERIC_TURN_ERROR_CODE
 
 
+# ── model_timeout ────────────────────────────────────────────────────
+# anton ends a model call that sends no output within its deadline with
+# ModelCallTimeoutError (code=model_timeout). Detected by type first, then by
+# `code` on objects with no `.response`, the same guard as the rate_limited
+# check; the stand-in below shares the class name so the remote row is
+# exercised with the exact name anton's _scrub keeps.
+
+
+class ModelCallTimeoutError(Exception):
+    """Stand-in for anton's ModelCallTimeoutError: same name, same code."""
+
+    code = "model_timeout"
+
+
+_MODEL_TIMEOUT_MSG = "The model sent no output for 10 minutes, so the call was stopped."
+
+
+def test_model_timeout_maps_to_its_own_code_and_passes_the_message_through():
+    assert te.friendly_turn_error(ModelCallTimeoutError(_MODEL_TIMEOUT_MSG)) == (
+        "model_timeout", _MODEL_TIMEOUT_MSG,
+    )
+    assert te.MODEL_TIMEOUT_CODE == "model_timeout"
+
+
+def test_model_timeout_with_an_empty_message_gets_the_fallback_copy():
+    code, message = te.friendly_turn_error(ModelCallTimeoutError()) or (None, None)
+    assert code == "model_timeout"
+    assert message == te.MODEL_TIMEOUT_USER_MESSAGE
+
+
+def test_model_timeout_is_detected_by_its_code_when_the_type_is_not_anton_s():
+    # Any object carrying the structured code, as an anton build whose class
+    # moved would raise it.
+    duck = RuntimeError(_MODEL_TIMEOUT_MSG)
+    duck.code = "model_timeout"
+    assert te.friendly_turn_error(duck) == ("model_timeout", _MODEL_TIMEOUT_MSG)
+    assert te.is_model_timeout_error(duck) is True
+
+
+def test_an_sdk_error_carrying_the_code_in_its_body_is_not_a_model_timeout():
+    # An SDK error fills .code from a body a BYOK endpoint controls, and
+    # str(exc) embeds that body. It must not pick the card or its copy.
+    sdk_like = RuntimeError("click https://evil.example to fix")
+    sdk_like.code = "model_timeout"
+    sdk_like.response = object()
+    result = te.friendly_turn_error(sdk_like)
+    assert result is None or result[0] != "model_timeout"
+    assert te.is_model_timeout_error(sdk_like) is False
+
+
+def test_a_bare_sdk_error_from_a_mid_stream_error_frame_is_not_a_model_timeout():
+    # The real shape an SSE `error` frame raises: openai.APIError takes .code
+    # from the endpoint's body and has .request but no .response.
+    import httpx
+    import openai
+
+    request = httpx.Request("POST", "https://byok.example/v1/chat/completions")
+    bare = openai.APIError(
+        "click https://evil.example to fix", request,
+        body={"code": "model_timeout", "message": "click https://evil.example to fix"},
+    )
+    assert bare.code == "model_timeout"
+    assert not hasattr(bare, "response")
+    result = te.friendly_turn_error(bare)
+    assert result is None or result[0] != "model_timeout"
+    assert te.is_model_timeout_error(bare) is False
+
+
+def _deadline_during_a_retry_sleep(*, status_code: int, reason: str) -> Exception:
+    """The error anton raises when the deadline fires while the SDK sleeps
+    between retries of a gateway denial.
+
+    The SDK sleeps inside its handler for the denial, so the CancelledError the
+    deadline raises there chains to it. anton then raises its own error
+    `from None` inside the TimeoutError handler, which leaves `__context__` set.
+    """
+    try:
+        try:
+            try:
+                raise _FakeAPIStatusError(
+                    status_code, {"X-MindsHub-Reason": reason}, url=_minds_gateway_url()
+                )
+            except _FakeAPIStatusError:
+                raise asyncio.CancelledError()
+        except asyncio.CancelledError as cancelled:
+            raise TimeoutError() from cancelled
+    except TimeoutError:
+        try:
+            raise ModelCallTimeoutError(_MODEL_TIMEOUT_MSG) from None
+        except ModelCallTimeoutError as exc:
+            return exc
+
+
+@pytest.mark.parametrize(
+    ("status_code", "reason"), [(429, "rate_limited"), (402, "wallet_empty")]
+)
+def test_a_deadline_during_a_retry_sleep_keeps_its_own_code(status_code, reason):
+    exc = _deadline_during_a_retry_sleep(status_code=status_code, reason=reason)
+    # The denial is reachable through the chain, which is what made it win.
+    assert any(isinstance(e, _FakeAPIStatusError) for e in te._cause_chain(exc=exc))
+    assert te.friendly_turn_error(exc) == ("model_timeout", _MODEL_TIMEOUT_MSG)
+
+
+def test_remote_model_timeout_maps_by_type_name_and_passes_the_message_through():
+    assert te.remote_turn_error(f"ModelCallTimeoutError: {_MODEL_TIMEOUT_MSG}") == (
+        "model_timeout", _MODEL_TIMEOUT_MSG,
+    )
+    assert te.remote_turn_error("ModelCallTimeoutError: ") == (
+        te.MODEL_TIMEOUT_CODE, te.MODEL_TIMEOUT_USER_MESSAGE,
+    )
+
+
 # ── Wire-code inventory (ENG-1282) ────────────────────────────────
 
 def test_wire_code_inventory_matches_the_renderer_contract():
@@ -1581,10 +2367,38 @@ def test_wire_code_inventory_matches_the_renderer_contract():
         # ENG-1992 — a content-shaped rejection the server already repaired;
         # distinct copy from image_format (no re-upload needed).
         "content_recovery",
+        # ENG-2689 — an image the provider refused as too LARGE. Split off
+        # content_recovery because the copy is the opposite: that one says
+        # "fixed, keep going", this one needs the user to attach something
+        # smaller. The renderer branch lands in mindsdb/cowork's ChatView.jsx.
+        "content_too_large",
         # ENG-2126 — the worker never answered, so the turn never ran. Split off
         # anton_error because the two need opposite next steps: this one is ours
         # to fix, and reads as an agent bug while it shares that code.
         "worker_unresponsive",
+        # The fleet-wide free-Air spend fuse. Split off the credits and
+        # allowance cards because the user did nothing to cause it and it
+        # resets at the end of the UTC day. The renderer branch lands in
+        # mindsdb/cowork's ChatView.jsx + its turnFailureCards list.
+        "free_serving_paused",
+        # An admin in the organization restricted the model. Split off the
+        # model and credits cards because credits cannot lift it and only
+        # another model is a way forward. The renderer branch lands in
+        # mindsdb/cowork's ChatView.jsx + its turnFailureCards list.
+        "model_restricted",
+        # No database connection freed within the pool timeout. A renderer
+        # without a branch for it shows the frame's `error` in its generic
+        # alert, and that sentence already names the wait, so the next step
+        # survives until the card lands in mindsdb/cowork's ChatView.jsx.
+        "server_busy",
+        # A model call sent no output within anton's deadline. Split off
+        # anton_error because the model went silent, not the agent, and the
+        # card says so and offers Try again.
+        "model_timeout",
+        # The UI heard nothing for its idle window and cancelled the turn.
+        # Saved as a failure so a reload shows the stall card instead of a
+        # partial answer that reads like a Stop.
+        "stalled",
         "anton_error",
     }
 
@@ -1630,6 +2444,7 @@ def test_no_return_emits_a_literal_code():
         # The rung the ticket's headline case takes.
         (402, "wallet_empty", te.TOKEN_LIMIT_CODE),
         (429, "included_allowance_exhausted", te.ALLOWANCE_EXHAUSTED_CODE),
+        (429, "free_air_daily_spend_fuse_exceeded", te.FREE_SERVING_PAUSED_CODE),
         (429, "rate_limited", te.RATE_LIMITED_CODE),
         (503, "policy_unavailable", te.POLICY_UNAVAILABLE_CODE),
         (404, "unknown_model", te.MODEL_NOT_FOUND_CODE),
@@ -1670,17 +2485,23 @@ def test_collect_400_carries_the_code_for_each_gateway_reason(status, reason, ex
             Exception("'image_url' does not match the expected tags: 'image'"),
             te.IMAGE_FORMAT_CODE, id="image_format",
         ),
+        pytest.param(
+            ModelCallTimeoutError(_MODEL_TIMEOUT_MSG), "model_timeout", id="model_timeout",
+        ),
     ],
 )
 def test_collect_400_carries_the_code_for_each_typed_cause(exc, expected_code):
     """The rungs below the gateway header, asserted on the 400 it raises.
 
-    Three of the inventory's codes are absent from both sweeps, each pinned
-    elsewhere or unreachable. ``content_recovery`` runs the conversation-repair
-    branch and is pinned by its own test above. ``anton_error`` is the
-    unmapped fallback, pinned by the 500 test above and by the wire test's
-    ``unmapped-500`` row. ``worker_unresponsive`` comes from
+    The inventory's codes absent from both sweeps are each pinned elsewhere
+    or unreachable here. ``content_recovery`` and ``content_too_large`` run
+    the conversation-repair branch, pinned by its own tests above.
+    ``anton_error`` is the unmapped fallback, pinned by the 500 test above and
+    by the wire test's ``unmapped-500`` row. ``worker_unresponsive`` comes from
     ``remote_turn_error``, a different mapper that this path never calls.
+    ``model_restricted`` is pinned by its own mapping tests. ``stalled`` is
+    saved by the streaming producer when the UI cancels a turn, never by
+    ``friendly_turn_error``.
     """
     handler = _handler_with_raising_formatter(exc)
     with pytest.raises(HTTPException) as err:
@@ -1727,7 +2548,11 @@ def test_the_non_streaming_failure_body_on_the_wire(exc, expected_status, expect
         res = client.post("/api/v1/responses/", json={"input": "hi", "stream": False})
 
     assert res.status_code == expected_status, res.text
-    assert res.json()["detail"] == {
+    body = res.json()["detail"]
+    # The id is minted per failure, so pin its shape and the rest of the body
+    # exactly. The point of the assertion is that no OTHER field appears.
+    UUID(body.pop("request_id"))
+    assert body == {
         "type": "response.failed",
         "code": expected_code,
         "error": expected_error,
@@ -1939,6 +2764,7 @@ def test_responses_emits_model_for_every_model_unavailable_code():
 @pytest.mark.parametrize("reason,forbidden_code", [
     ("wallet_empty", "token_limit"),
     ("included_allowance_exhausted", "included_allowance_exhausted"),
+    ("free_air_daily_spend_fuse_exceeded", "free_serving_paused"),
     ("rate_limited", "rate_limited"),
     ("policy_unavailable", "policy_unavailable"),
     # The fifth. Not a billing verdict, but a third party should not get to
@@ -2045,3 +2871,224 @@ def test_remote_error_unmapped_type_still_falls_through_to_generic():
     assert code == te.GENERIC_TURN_ERROR_CODE
     assert msg == te.GENERIC_TURN_ERROR_MESSAGE
     assert "httpx" not in msg
+
+
+# ── An admin model rule is its own stop ────────────────────────────────────
+#
+# An admin in the organization can restrict a model. The gateway refuses it
+# with a 403 whose reason stays `permission_denied`, so an older client keeps
+# reading a plain 403, and names the rule on X-MindsHub-Deny-Detail and in the
+# body's `error.deny_detail`. Unmapped, the turn read as a generic error (or,
+# with the pinned anton, as "try again in a moment"), which tells the member
+# nothing about why the model is refused or what would work instead.
+
+_RESTRICTED_COPY = (
+    "An admin in your organization restricted the model 'sonnet'. "
+    "Choose another model in Settings."
+)
+
+
+def _restricted_failure(*, url, carrier="header", dialect="openai", status=403):
+    """The exception anton surfaces for the gateway's model-rule 403.
+
+    The reason header stays `permission_denied` either way. ``carrier`` picks
+    where the deny detail rides: its own header, or the body only (a lane that
+    lost the header). ``dialect`` picks the body shape: the OpenAI SDK peels the
+    error envelope, the Anthropic SDK keeps it.
+    """
+    headers = {"X-MindsHub-Reason": "permission_denied"}
+    if carrier == "header":
+        headers["X-MindsHub-Deny-Detail"] = "model_restricted"
+    wrapped = ConnectionError("Server returned 403")
+    wrapped.__cause__ = inner = _FakeAPIStatusError(status, headers, url=url)
+    error = {
+        "type": "permission_error",
+        "code": "permission_denied",
+        "message": "An administrator in your organization has restricted the model 'sonnet'.",
+    }
+    if carrier == "body":
+        error["deny_detail"] = "model_restricted"
+    inner.body = error if dialect == "openai" else {"type": "error", "error": error}
+    return wrapped
+
+
+def test_the_deny_detail_header_maps_to_model_restricted():
+    code, message = te.friendly_turn_error(_restricted_failure(url=_minds_gateway_url()))
+    assert code == te.MODEL_RESTRICTED_CODE
+    assert message == te.MODEL_RESTRICTED_USER_MESSAGE
+
+
+@pytest.mark.parametrize("dialect", ["openai", "anthropic"])
+def test_the_body_deny_detail_maps_when_the_header_is_lost(dialect):
+    # The body is the second carrier, read in both SDKs' shapes. Without it this
+    # lane falls to the rest of the ladder and stays generic.
+    exc = _restricted_failure(url=_minds_gateway_url(), carrier="body", dialect=dialect)
+    code, message = te.friendly_turn_error(exc)
+    assert code == te.MODEL_RESTRICTED_CODE
+    assert message == te.MODEL_RESTRICTED_USER_MESSAGE
+
+
+def test_the_body_deny_detail_needs_the_gateway_host_not_just_an_unknown_one():
+    # Same strictness as the body `code`: an unknown origin is not the gateway.
+    exc = _restricted_failure(url=None, carrier="body")
+    result = te.friendly_turn_error(exc)
+    assert result is None or result[0] != te.MODEL_RESTRICTED_CODE
+
+
+@pytest.mark.parametrize("carrier", ["header", "body"])
+def test_a_third_party_cannot_claim_an_admin_restricted_the_model(carrier):
+    # On a BYOK OPENAI_COMPATIBLE endpoint the whole response is third-party
+    # controlled. Neither carrier may put the admin copy in front of a user
+    # whose organization restricted nothing.
+    exc = _restricted_failure(url="https://openrouter.ai/api/v1/chat/completions", carrier=carrier)
+    result = te.friendly_turn_error(exc)
+    assert result is None or result[0] != te.MODEL_RESTRICTED_CODE
+
+
+def test_a_plain_permission_denied_is_not_an_admin_rule():
+    # A member without product.execute gets the same 403 permission_denied,
+    # with no deny detail. That is not a model rule, and choosing another model
+    # would not help, so it must not take this card.
+    exc = _gateway_failure(403, reason="permission_denied")
+    result = te.friendly_turn_error(exc)
+    assert result is None or result[0] != te.MODEL_RESTRICTED_CODE
+
+
+def test_the_deny_detail_counts_only_on_a_403():
+    exc = _restricted_failure(url=_minds_gateway_url(), status=402)
+    result = te.friendly_turn_error(exc)
+    assert result is None or result[0] != te.MODEL_RESTRICTED_CODE
+
+
+def test_an_unknown_deny_detail_is_not_model_restricted():
+    exc = _restricted_failure(url=_minds_gateway_url())
+    exc.__cause__.response.headers["X-MindsHub-Deny-Detail"] = "some_future_detail"
+    result = te.friendly_turn_error(exc)
+    assert result is None or result[0] != te.MODEL_RESTRICTED_CODE
+
+
+def test_antons_typed_error_names_the_model_over_the_fallback_copy():
+    # anton raises ModelRestrictedError (a ModelUnavailableError, code
+    # model_restricted) from the gateway's 403. Its copy names the model; the
+    # fallback cannot.
+    exc = _FakeModelErr(_RESTRICTED_COPY, "model_restricted", "sonnet")
+    exc.__cause__ = _restricted_failure(url=_minds_gateway_url()).__cause__
+    code, message = te.friendly_turn_error(exc)
+    assert code == te.MODEL_RESTRICTED_CODE
+    assert message == _RESTRICTED_COPY
+
+
+def test_the_typed_error_alone_still_maps_through_the_model_codes():
+    # Without the header chain (a skewed anton, or a test double), the code
+    # attribute is what maps it, which needs model_restricted in the shared set.
+    exc = _FakeModelErr(_RESTRICTED_COPY, "model_restricted", "sonnet")
+    assert te.model_unavailable_info(exc) == ("model_restricted", "sonnet")
+    assert te.friendly_turn_error(exc) == (te.MODEL_RESTRICTED_CODE, _RESTRICTED_COPY)
+
+
+def test_model_restricted_is_a_model_unavailable_code():
+    # responses.py attaches `model` to the failure frame for exactly this set,
+    # and the card names the restricted model from it.
+    assert te.MODEL_RESTRICTED_CODE in te.MODEL_UNAVAILABLE_CODES
+
+
+async def test_stream_names_the_restricted_model_on_the_failure_frame():
+    exc = _FakeModelErr(_RESTRICTED_COPY, "model_restricted", "sonnet")
+    exc.__cause__ = _restricted_failure(url=_minds_gateway_url()).__cause__
+    frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    failed = [f for f in frames if "response.failed" in f]
+    assert len(failed) == 1
+    payload = json.loads(failed[0].split("data: ", 1)[1].strip())
+    assert payload["code"] == te.MODEL_RESTRICTED_CODE
+    assert payload["model"] == "sonnet"
+
+
+async def test_stream_maps_the_restricted_403_from_an_untyped_anton():
+    # The pinned anton raises a bare ConnectionError for this 403. The header
+    # still decides the code; with no typed error there is no model to name,
+    # so the card falls back to its unnamed copy.
+    exc = _restricted_failure(url=_minds_gateway_url())
+    frames = await _collect_produce_sse(_handler_with_raising_formatter(exc))
+    payload = json.loads(
+        [f for f in frames if "response.failed" in f][0].split("data: ", 1)[1].strip()
+    )
+    assert payload["code"] == te.MODEL_RESTRICTED_CODE
+    assert payload["error"] == te.MODEL_RESTRICTED_USER_MESSAGE
+    assert payload["model"] == ""
+
+
+def test_remote_model_restricted_error_keeps_its_own_code():
+    # Hosted turns arrive as "TypeName: message". Without its own row this
+    # subclass name would fall to the generic code, since the table matches the
+    # name exactly and never walks to the parent's row.
+    code, message = te.remote_turn_error(f"ModelRestrictedError: {_RESTRICTED_COPY}")
+    assert code == te.MODEL_RESTRICTED_CODE
+    assert message == _RESTRICTED_COPY
+    assert te.remote_turn_error("ModelRestrictedError: ") == (
+        te.MODEL_RESTRICTED_CODE, te.MODEL_RESTRICTED_USER_MESSAGE,
+    )
+
+
+def test_model_restricted_copy_offers_another_model_not_credits():
+    lowered = te.MODEL_RESTRICTED_USER_MESSAGE.lower()
+    assert "admin" in lowered
+    assert "another model" in lowered
+    assert "credit" not in lowered
+    assert "—" not in te.MODEL_RESTRICTED_USER_MESSAGE
+
+
+# ── gateway_denial: the Settings probe's classifier ────────────────────────
+#
+# The Settings health probe used to throw the gateway's reason away and hand
+# the renderer "HTTP 429: <message>", which it read as "No credits available"
+# for every 429. gateway_denial names the reason with the same trust rules as
+# friendly_turn_error.
+
+_PROBE_RESET_AT = "2026-09-25T00:00:00Z"
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "reset_at"),
+    [
+        (429, "rate_limited", None),
+        (429, "free_air_daily_spend_fuse_exceeded", _PROBE_RESET_AT),
+        (429, "included_allowance_exhausted", _PROBE_RESET_AT),
+        (402, "wallet_empty", None),
+        (503, "policy_unavailable", None),
+    ],
+)
+def test_gateway_denial_names_each_probe_reason(status, reason, reset_at):
+    exc = _gateway_failure(status, reason=reason)
+    if reset_at is not None:
+        exc.__cause__.response.headers["X-MindsHub-Reset-At"] = reset_at
+    assert te.gateway_denial(exc=exc) == te.GatewayDenial(reason=reason, reset_at=reset_at)
+
+
+def test_gateway_denial_ignores_a_reason_from_a_known_third_party():
+    exc = _failure(429, reason="rate_limited", url="https://openrouter.ai/api/v1/chat/completions")
+    assert te.gateway_denial(exc=exc) is None
+
+
+@pytest.mark.parametrize("reason", ["invalid_credentials", "permission_denied", "unknown_model"])
+def test_gateway_denial_leaves_the_credential_and_model_reasons_out(reason):
+    # The probe reads 401/403 as a rejected key by status and always sends a
+    # model the gateway serves, so these are not billing notices.
+    assert te.gateway_denial(exc=_gateway_failure(403, reason=reason)) is None
+
+
+def test_gateway_denial_reads_the_body_code_only_from_the_gateway_host():
+    def _body_only(url):
+        exc = ConnectionError("Server returned 429")
+        exc.__cause__ = inner = _FakeAPIStatusError(429, {}, url=url)
+        inner.body = {"error": {"code": "free_air_daily_spend_fuse_exceeded"}}
+        return exc
+
+    assert te.gateway_denial(exc=_body_only(_minds_gateway_url())) == te.GatewayDenial(
+        reason="free_air_daily_spend_fuse_exceeded", reset_at=None,
+    )
+    assert te.gateway_denial(exc=_body_only(None)) is None
+    assert te.gateway_denial(exc=_body_only("https://openrouter.ai/api/v1/x")) is None
+
+
+def test_gateway_denial_is_none_for_a_plain_exception():
+    assert te.gateway_denial(exc=Exception("boom")) is None

@@ -114,3 +114,34 @@ def test_serve_injects_only_with_flag():
             r3 = client.get(f"/api/v1/artifacts/serve/proj/styles.css?{ACTIVATION_PARAM}=1")
             assert r3.status_code == 200
             assert "anton-comments" not in r3.text
+
+
+def test_serve_html_gets_sandbox_csp():
+    """Artifact HTML is project-generated and can carry attacker-influenced
+    content, rendered without sanitization by design (arbitrary preview is
+    the feature). The in-app iframe already sandboxes it, but that only
+    applies when the content is framed — ArtifactViewer's "open in browser"
+    loads this same URL as a direct top-level navigation, which no
+    client-side sandbox attribute can constrain. A CSP `sandbox` response
+    header must cover that path too, on every HTML response regardless of
+    whether the comment layer is active, and must not appear on non-HTML
+    assets."""
+    with tempfile.TemporaryDirectory() as tmp:
+        project_dir = _make_project(tmp).resolve()
+        with patch(
+            "cowork.services.artifacts._registered_project_dirs",
+            return_value=[project_dir],
+        ), patch(
+            "cowork.services.artifacts._projects_root",
+            return_value=project_dir.parent,
+        ):
+            csp = "sandbox allow-scripts allow-popups allow-forms allow-modals"
+
+            r = client.get(f"/api/v1/artifacts/serve/proj/index.html?{ACTIVATION_PARAM}=1")
+            assert r.headers.get("content-security-policy") == csp
+
+            r2 = client.get("/api/v1/artifacts/serve/proj/index.html")
+            assert r2.headers.get("content-security-policy") == csp
+
+            r3 = client.get("/api/v1/artifacts/serve/proj/styles.css")
+            assert "content-security-policy" not in r3.headers

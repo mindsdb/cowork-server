@@ -4,10 +4,12 @@ import hashlib
 import json
 import logging
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from uuid import UUID
 
 
+from cowork.common.logger import log_context
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, scope_of_session
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
@@ -47,6 +49,10 @@ class TaskObjectService:
 
     def __init__(self, session: ScopedSession) -> None:
         self.session = session
+
+    @property
+    def _org_mode(self) -> bool:
+        return bool(getattr(self.session.scope, "org_mode", False))
 
     # ── indexing ──────────────────────────────────────────────────────
 
@@ -92,7 +98,10 @@ class TaskObjectService:
         harness, or before this index existed. Returns the conversation's
         artifact rows."""
         base = _artifacts_base(project)
-        if base.is_dir():
+        # Org mode (ENG-2961, D8): provenance is agent-writable on the shared
+        # project root, so it must not create index rows that a relocation would
+        # then act on. Rows there come only from the end of the creating turn.
+        if not self._org_mode and base.is_dir():
             for folder in base.iterdir():
                 if not folder.is_dir():
                     continue
@@ -148,12 +157,37 @@ class TaskObjectService:
         return self._relocate_artifacts(conversation, source, dest)
 
     def _relocate_artifacts(self, conversation: Conversation, source: Project, dest: Project) -> int:
+        """Move the task's artifact folders and retarget its index rows.
+
+        Org mode (ENG-2961, D8): only folders owned by the task's creator move,
+        and their owner rows follow them. A row whose folder is already gone is
+        retargeted without an ownership check or a "not moved" log line — there
+        is nothing on disk to move or to protect.
+        """
         rows = self.reconcile_conversation(conversation, source)
         if not rows:
             return 0
         src_base = _artifacts_base(source)
         dest_base = _artifacts_base(dest)
         dest_base.mkdir(parents=True, exist_ok=True)
+        org_mode = self._org_mode
+        creator = str(conversation.created_by) if conversation.created_by else None
+        src_root = None
+        resolutions: dict = {}
+        if org_mode:
+            # Lazy: artifact_ownership imports this module back (lazily too).
+            from cowork.services.artifact_ownership import (
+                project_root_source,
+                rekey_artifact_owner,
+                resolve_artifact_owners,
+            )
+
+            src_root = project_root_source(source)
+            # One query for every row, before the loop.
+            resolutions = resolve_artifact_owners(
+                self.session, src_root, [row.ref for row in rows]
+            )
+        rekeys: list[tuple[str, str]] = []
         moved = 0
         for row in rows:
             src_folder = src_base / row.ref
@@ -162,17 +196,57 @@ class TaskObjectService:
                 row.project_id = dest.id
                 self.session.add(row)
                 continue
+            if org_mode:
+                # D8: a task carries only what its creator owns. Anything else
+                # indexed to it (someone else's, or ownerless) stays put, and its
+                # row keeps pointing at the source project.
+                resolution = resolutions[row.ref]
+                if not creator or resolution.owner_user_id != creator:
+                    logger.warning(
+                        "artifact not moved with task: project=%s slug=%s owner_state=%s",
+                        source.id, row.ref, resolution.state,
+                    )
+                    continue
             dest_slug = self._unique_slug(dest_base, row.ref, conversation.id)
             try:
                 shutil.move(str(src_folder), str(dest_base / dest_slug))
             except OSError:
                 logger.warning("Could not move artifact %r to project %r", row.ref, dest.name, exc_info=True)
                 continue
+            if org_mode:
+                rekeys.append((row.ref, dest_slug))
             row.project_id = dest.id
             row.ref = dest_slug
             self.session.add(row)
             moved += 1
         self.session.commit()
+        # After the index commit: each rekey commits on its own, and must not
+        # commit a half-applied batch of index rows along with it.
+        if rekeys:
+            actor = str(self.session.scope.user_id or creator)
+            # Plain values: a failed rekey commit expires every loaded row,
+            # and reading one back needs the session the failure broke.
+            dest_id, dest_name, conversation_id = dest.id, dest.name, conversation.id
+            for old_slug, new_slug in rekeys:
+                try:
+                    rekey_artifact_owner(
+                        self.session, src_root, old_slug, dest_id, new_slug, actor_id=actor
+                    )
+                except Exception:
+                    # The record names the folder at its new address: a name
+                    # collision gives it a new slug in the destination.
+                    logger.warning(
+                        "Could not move the owner of artifact %r to project %r",
+                        old_slug,
+                        dest_name,
+                        exc_info=True,
+                        extra=log_context(
+                            project_id=dest_id, conversation_id=conversation_id, artifact_slug=new_slug,
+                        ),
+                    )
+                    # The next rekey and the caller's own writes need a
+                    # usable session.
+                    self.session.rollback()
         return moved
 
     @staticmethod
@@ -191,12 +265,13 @@ class TaskObjectService:
 
 
 # ── run-boundary attribution ──────────────────────────────────────────────
-# Anton runs with its own episodic session id and never tags artifacts with
-# the cowork conversation_id, so provenance can't tell us which task created
-# which artifact. Instead cowork-server (which DOES know the conversation it's
-# running) snapshots the project's artifact folders before a turn and records
-# any that appear afterward as owned by that conversation. Harness-agnostic
-# and needs no agent change.
+# cowork-server snapshots the project's artifact folders before a turn and
+# attributes the ones that appear afterward to the turn. Since anton #399 the
+# artifact tools also write the cowork conversation id first in each folder's
+# `provenance`; the remote producers use it to drop folders a concurrent
+# sibling turn created (`artifact_ownership.turn_created_slugs`). Provenance is
+# agent-writable, so it only ever narrows a claim; ownership itself is a
+# server-written attribution row (ENG-2961).
 
 def snapshot_artifact_slugs(artifacts_base) -> set[str]:
     """The set of artifact folder names under a project's artifacts dir."""
@@ -261,11 +336,69 @@ def _recover_turn_scope(conversation) -> TenantScope | None:
         return None
 
 
-def _index_new_slugs(conversation_id, project_id, slugs: list[str], scope: TenantScope | None) -> None:
-    """Attribute freshly appeared artifacts to this conversation. Best-effort."""
+def record_new_artifacts(
+    session: ScopedSession,
+    *,
+    conversation_id,
+    project_id,
+    slugs: list[str],
+    creator: str | None,
+) -> None:
+    """Attribute freshly appeared artifacts to this conversation, in the
+    caller's session. Best-effort.
+
+    Two records: the `task_objects` row, and in org mode (ENG-2961) the owner
+    row naming ``creator``, the conversation's creator, since a project-level
+    root is shared by every member and the owner has to be written down when
+    the turn ends rather than read from the path later. A missed owner write
+    leaves the artifact `unknown`, never fails the turn.
+
+    Each slug's write is tried on its own and rolled back when it fails, so
+    one failure does not drop the slugs after it. A failure is logged at
+    ERROR with the conversation, the project and the slug as record
+    attributes, since the caller never sees it and a database error's
+    sanitized line keeps only those.
+    """
+    org_mode = bool(getattr(session.scope, "org_mode", False))
+    if org_mode and not creator:
+        logger.warning(
+            "artifact owner not recorded: conversation %s has no creator", conversation_id
+        )
+    svc = TaskObjectService(session)
+    # Independent of the owner writes below: a failed index row must not
+    # leave the artifact ownerless as well.
+    for slug in slugs:
+        try:
+            svc.index_artifact(conversation_id, project_id, slug)
+        except Exception:
+            session.rollback()
+            logger.error(
+                "Could not index an artifact",
+                exc_info=True,
+                extra=log_context(project_id=project_id, conversation_id=conversation_id, artifact_slug=slug),
+            )
+    if org_mode and creator and project_id:
+        from cowork.services.artifact_ownership import record_artifact_owner
+
+        for slug in slugs:
+            try:
+                record_artifact_owner(session, project_id, slug, creator, action="create")
+            except Exception:
+                session.rollback()
+                logger.error(
+                    "Could not record the owner of an artifact",
+                    exc_info=True,
+                    extra=log_context(project_id=project_id, conversation_id=conversation_id, artifact_slug=slug),
+                )
+
+
+def _index_new_slugs(
+    conversation, conversation_id, project_id, slugs: list[str], scope: TenantScope | None
+) -> None:
+    """record_new_artifacts on a short session of its own. Best-effort."""
     try:
         from cowork.common.settings.app_settings import get_app_settings
-        from cowork.db.session import get_engine, get_session_factory
+        from cowork.db.session import get_open_session
 
         if scope is None:
             # Never invent a scope: local mode passes through; org mode without
@@ -277,34 +410,51 @@ def _index_new_slugs(conversation_id, project_id, slugs: list[str], scope: Tenan
                 )
                 return
             scope = LOCAL_SCOPE
-        factory = get_session_factory(get_engine(get_app_settings().database.uri))
-        with factory() as session:
-            svc = TaskObjectService(ScopedSession(session, scope))
-            for slug in slugs:
-                svc.index_artifact(conversation_id, project_id, slug)
+        with get_open_session(get_app_settings().database.uri) as session:
+            record_new_artifacts(
+                ScopedSession(session, scope),
+                conversation_id=conversation_id,
+                project_id=project_id,
+                slugs=slugs,
+                creator=getattr(conversation, "created_by", None),
+            )
     except Exception:
-        logger.warning("Could not index artifacts created this turn", exc_info=True)
+        logger.warning(
+            "Could not index artifacts created this turn",
+            exc_info=True,
+            extra=log_context(conversation_id=conversation_id, project_id=project_id, artifact_slugs=slugs or None),
+        )
 
 
-def index_turn_artifacts(
-    conversation,
+@dataclass(frozen=True)
+class ArtifactChanges:
+    """What one turn did to its project's artifacts directory."""
+
+    # Folders the turn created, sorted. Each is indexed as this
+    # conversation's, so it relocates with the task and shows in the
+    # artifacts panel.
+    created: list[str]
+    # The created folders plus pre-existing ones the turn wrote to. The
+    # autopublish reconciler publishes these first.
+    touched: set[str]
+
+
+def turn_artifact_changes(
+    *,
     conversation_id,
-    project_id,
     artifacts_base,
     before: set[str],
     before_mtimes: dict[str, int],
     tracked_new: set[str] | None = None,
     tracked_edits: set[str] | None = None,
-) -> tuple[list[str], set[str], TenantScope | None]:
-    """End-of-turn artifact bookkeeping.
-
-    Returns (new_slugs, touched_slugs, scope):
-      • new_slugs — artifacts this turn CREATED; each is indexed as owned by
-        this conversation so it relocates with the task and shows in the
-        artifacts panel;
-      • touched_slugs — new_slugs plus pre-existing artifacts this turn WROTE
-        TO. The autopublish reconciler publishes these first;
-      • scope — the tenant scope for post-turn work (see _recover_turn_scope).
+    attribute_by_provenance: bool = False,
+    completed_cleanly: bool = True,
+) -> ArtifactChanges:
+    """What the turn created and touched, from the directory as it stands now
+    against ``before``, with an agent revision captured for every touched
+    folder. The filesystem half of the end-of-turn bookkeeping: it reads and
+    writes no database row, so a caller can record the result in a unit of
+    its own (record_new_artifacts).
 
     The two `tracked_*` bounds are what the turn's own artifact tools reported
     touching, and they are what makes attribution correct: every conversation
@@ -323,54 +473,107 @@ def index_turn_artifacts(
         not zero.
 
     Both default to None — a pure directory diff, the pre-existing behaviour.
-    That is only safe where no concurrent turn can write the directory: the
-    org deployment, where each conversation's pod mounts its own workspace.
+    That is only safe where no concurrent turn can write the directory. The org
+    deployment used to qualify (each conversation's pod had its own artifacts
+    dir), but since ENG-2056 its pods share the project-level base, so the
+    remote producer's pure diff carries the same concurrent-sibling caveat as
+    the desktop; the pod reports no tracked sets yet.
+
+    `attribute_by_provenance` is the remote producers' substitute for
+    `tracked_new` (ENG-2961): the pod reports no tracked sets, so a folder that
+    appeared is claimed only if its `metadata.json` provenance names this
+    conversation (`artifact_ownership.turn_created_slugs`), and, when the turn
+    did not complete cleanly, also if it has no provenance yet. Ignored when
+    `tracked_new` is given.
+    """
+    from cowork.services.artifacts import content_mtime_ns
+    from cowork.services.artifact_revisions import (
+        capture_agent_revision,
+        has_queued_agent_repair,
+    )
+
+    base = Path(artifacts_base)
+    after = snapshot_artifact_slugs(base)
+    if tracked_new is None and attribute_by_provenance:
+        from cowork.services.artifact_ownership import turn_created_slugs
+
+        tracked_new = turn_created_slugs(
+            base, before, conversation_id,
+            after=after, accept_unattributed=not completed_cleanly,
+        )
+    appeared = after - set(before or ())
+    # Intersected with `after` throughout, so a slug the agent opened and
+    # then deleted can't produce a card for a folder that is gone.
+    new = sorted(appeared if tracked_new is None else appeared & set(tracked_new))
+    touched = set(new)
+    editable = after if tracked_edits is None else (after & set(tracked_edits))
+    for slug in editable:
+        previous = (before_mtimes or {}).get(slug)
+        if previous is None:
+            continue  # appeared this turn — `new` above already ruled on it
+        try:
+            if content_mtime_ns(base / slug) > previous:
+                touched.add(slug)
+        except OSError:
+            continue
+    for slug in touched:
+        capture_agent_revision(base / slug, conversation_id=str(conversation_id))
+    # A repair turn that makes no source change must still leave the
+    # polling state. Check only artifacts with a handoff explicitly bound
+    # to this conversation; unrelated queued work is never consumed.
+    conversation_key = str(conversation_id)
+    for slug in after - touched:
+        if has_queued_agent_repair(base / slug, conversation_key):
+            capture_agent_revision(base / slug, conversation_id=conversation_key)
+    return ArtifactChanges(created=new, touched=touched)
+
+
+def index_turn_artifacts(
+    conversation,
+    conversation_id,
+    project_id,
+    artifacts_base,
+    before: set[str],
+    before_mtimes: dict[str, int],
+    tracked_new: set[str] | None = None,
+    tracked_edits: set[str] | None = None,
+    attribute_by_provenance: bool = False,
+    completed_cleanly: bool = True,
+) -> tuple[list[str], set[str], TenantScope | None]:
+    """End-of-turn artifact bookkeeping, on a short session of its own.
+
+    Returns (new_slugs, touched_slugs, scope):
+      • new_slugs: artifacts this turn CREATED (ArtifactChanges.created),
+        each indexed as owned by this conversation;
+      • touched_slugs: ArtifactChanges.touched;
+      • scope: the tenant scope for post-turn work (see _recover_turn_scope).
+
+    The bounds and `attribute_by_provenance` are turn_artifact_changes'.
 
     conversation_id/project_id are captured by the caller while the row is
-    unambiguously attached (not read here, to avoid depending on the session
-    still being live/unexpired in this end-of-turn path).
+    unambiguously attached, so the ids never depend on the session still being
+    live/unexpired in this end-of-turn path. `conversation` itself is read only
+    for the tenant scope and, when owners are recorded, `created_by`.
 
     Never raises. This runs in a turn's `finally`, so an exception here would
     replace the turn's real outcome; on any internal failure it degrades to
     ([], set(), None) and the next turn picks the work up.
     """
     try:
-        from cowork.services.artifacts import content_mtime_ns
-        from cowork.services.artifact_revisions import (
-            capture_agent_revision,
-            has_queued_agent_repair,
+        changes = turn_artifact_changes(
+            conversation_id=conversation_id,
+            artifacts_base=artifacts_base,
+            before=before,
+            before_mtimes=before_mtimes,
+            tracked_new=tracked_new,
+            tracked_edits=tracked_edits,
+            attribute_by_provenance=attribute_by_provenance,
+            completed_cleanly=completed_cleanly,
         )
-
-        base = Path(artifacts_base)
-        after = snapshot_artifact_slugs(base)
-        appeared = after - set(before or ())
-        # Intersected with `after` throughout, so a slug the agent opened and
-        # then deleted can't produce a card for a folder that is gone.
-        new = sorted(appeared if tracked_new is None else appeared & set(tracked_new))
-        touched = set(new)
-        editable = after if tracked_edits is None else (after & set(tracked_edits))
-        for slug in editable:
-            previous = (before_mtimes or {}).get(slug)
-            if previous is None:
-                continue  # appeared this turn — `new` above already ruled on it
-            try:
-                if content_mtime_ns(base / slug) > previous:
-                    touched.add(slug)
-            except OSError:
-                continue
-        for slug in touched:
-            capture_agent_revision(base / slug, conversation_id=str(conversation_id))
-        # A repair turn that makes no source change must still leave the
-        # polling state. Check only artifacts with a handoff explicitly bound
-        # to this conversation; unrelated queued work is never consumed.
-        conversation_key = str(conversation_id)
-        for slug in after - touched:
-            if has_queued_agent_repair(base / slug, conversation_key):
-                capture_agent_revision(base / slug, conversation_id=conversation_key)
         scope = _recover_turn_scope(conversation)
-        if new:
-            _index_new_slugs(conversation_id, project_id, new, scope)
-        return new, touched, scope
+        if changes.created:
+            _index_new_slugs(conversation, conversation_id, project_id, changes.created, scope)
+        return changes.created, changes.touched, scope
     except Exception:
         logger.warning("index_turn_artifacts failed", exc_info=True)
         return [], set(), None
@@ -382,6 +585,7 @@ def cards_for_slugs(
     *,
     project_id: str | None = None,
     project_name: str = "",
+    project_label: str = "",
 ) -> list[dict]:
     """Inline-chat card payloads for the given slugs, order preserved.
 
@@ -393,6 +597,12 @@ def cards_for_slugs(
     how the client addresses an artifact in org mode (project + slug); a card
     without them would fall back to the path-based endpoints, which org mode
     fails closed. Best-effort per slug: an unreadable artifact is skipped.
+
+    `project_name` must be the project's `name`: the card's serve URL is built
+    from it, and the serve route resolves that segment by name
+    (`services.artifacts._project_artifacts_base`). `project_label` is what the
+    card shows instead, when the caller has one
+    (`services.projects.display_label`).
     """
     from cowork.services.artifacts import card_for_folder
 
@@ -403,6 +613,14 @@ def cards_for_slugs(
             card = card_for_folder(
                 base / slug, len(cards),
                 project_id=project_id, project_name=project_name,
+                project_label=project_label,
+                # Without this the inline card's serveUrl is rediscovered by
+                # scanning the projects root, which cannot find a project
+                # pointed at a folder the user chose: the artifacts panel
+                # would offer "open in browser" and the turn card would not.
+                # Identical for an allocated project, whose directory name and
+                # project name are the same string.
+                artifacts_base=base,
             )
         except Exception:
             logger.warning("Could not build inline card for artifact %r", slug, exc_info=True)
@@ -410,27 +628,6 @@ def cards_for_slugs(
         if card is not None:
             cards.append(card)
     return cards
-
-
-def finalize_turn_artifacts(
-    conversation, conversation_id, project_id, artifacts_base, before: set[str],
-    tracked_new: set[str] | None = None,
-) -> list[dict]:
-    """Index this turn's new artifacts and return their cards.
-
-    Kept as the pre-split entry point for harnesses that do not participate in
-    autopublish (hermes_harness sets `supports_org_mode = False`). Callers that
-    need `touched` or the tenant scope use `index_turn_artifacts` directly.
-
-    `before_mtimes` is empty here on purpose: without a pre-turn mtime snapshot
-    `touched` degenerates to "the new slugs", which is all this entry point's
-    callers need — they do not publish.
-    """
-    new, _touched, _scope = index_turn_artifacts(
-        conversation, conversation_id, project_id, artifacts_base, before, {},
-        tracked_new=tracked_new,
-    )
-    return cards_for_slugs(artifacts_base, new)
 
 
 async def publish_and_card_turn_artifacts(
@@ -441,14 +638,15 @@ async def publish_and_card_turn_artifacts(
     scope,
     project_id: str | None = None,
     project_name: str = "",
+    project_label: str = "",
 ) -> list[dict]:
     """Reconcile publishes for this turn, then build the cards to emit.
 
-    The second half of the end-of-turn artifact flow; `index_turn_artifacts` is
-    the first half and produces the three arguments. They are separate because
-    only this half may await: indexing has to run in a turn's `finally` (so an
-    artifact is recorded even on error or Stop), and an `await` there is skipped
-    on cancellation.
+    The second half of the end-of-turn artifact flow. The first half records
+    what the turn created and produces the arguments. The in-process harness
+    protects its cleanup with run_to_completion and records the
+    turn_artifact_changes result in a database unit, including on error or
+    Stop. The remote producer uses the same two artifact helpers.
 
     Shared by both producers. The in-process harness reaches it through
     `AntonHarness.stream_response`; on an org deployment that harness refuses to
@@ -472,7 +670,7 @@ async def publish_and_card_turn_artifacts(
     from cowork.services.artifact_autopublish import autopublish_project_artifacts
 
     republished = await autopublish_project_artifacts(
-        artifacts_base, scope, touched=set(touched_slugs),
+        artifacts_base, scope, touched=set(touched_slugs), project_id=project_id,
     )
     if getattr(scope, "org_mode", False):
         carded = set(new_slugs) | (republished & set(touched_slugs))
@@ -480,7 +678,7 @@ async def publish_and_card_turn_artifacts(
         carded = set(touched_slugs)
     return cards_for_slugs(
         artifacts_base, sorted(carded),
-        project_id=project_id, project_name=project_name,
+        project_id=project_id, project_name=project_name, project_label=project_label,
     )
 
 
@@ -736,9 +934,8 @@ def _seed_draft_from_store(folder: Path, slug: str) -> None:
         logger.warning("Could not seed skill draft %r from store", slug, exc_info=True)
 
 
-# LLM-facing contract for the `create_skill_draft` tool, shared verbatim by both
-# harnesses (hermes registers it in run_agent's registry, anton as a ToolDef) so
-# the tool reads identically regardless of agent.
+# LLM-facing contract for the `create_skill_draft` tool. Registered by anton as
+# a ToolDef; kept harness-neutral so any agent reads the same contract.
 CREATE_SKILL_DRAFT_DESCRIPTION = (
     "Claim a staging folder for a skill you are building or improving for the "
     "user (e.g. while running the skill-creator skill). Call this BEFORE writing "

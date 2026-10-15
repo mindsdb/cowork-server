@@ -20,6 +20,8 @@ from cowork.handlers.responses import (
     cancelled_ask_user_retirements,
 )
 
+from _fakes import inline_run_db
+
 
 def _ask(question_id: str) -> dict:
     return {"type": "response.ask_user", "question_id": question_id, "prompt": "?"}
@@ -75,6 +77,10 @@ class _FakeBuffer:
     async def close(self, reason, extra=None):
         self.closed = reason
 
+    @property
+    def is_closed(self) -> bool:
+        return self.closed is not None
+
 
 def _cancellable_handler(monkeypatch, saved, published: asyncio.Event):
     """A handler whose turn publishes one ask_user and then blocks forever."""
@@ -86,15 +92,16 @@ def _cancellable_handler(monkeypatch, saved, published: asyncio.Event):
             pass
 
         def get_conversation(self, conv_id):
-            return object()
+            return SimpleNamespace(project=None)
 
         def save_user_message(self, conv_id, content, *, created_at=None, pending=False):
             msg = SimpleNamespace(id=uuid4())
             saved["user_id"] = msg.id
             return msg
 
-        def finalize_pending(self, conv_id, message_id=None):
+        def clear_pending(self, conv_id, *, message_id=None):
             saved["finalized"] = True
+            return True
 
         def save_assistant_turn(self, conv_id, text, events, harness=None, tool_rows=None):
             saved["events"] = events
@@ -115,8 +122,7 @@ def _cancellable_handler(monkeypatch, saved, published: asyncio.Event):
     )
 
     monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
-    monkeypatch.setattr(responses_mod, "ScopedSession", lambda s, scope: FakeSession())
-    monkeypatch.setattr(responses_mod, "get_open_session", lambda: None)
+    monkeypatch.setattr(responses_mod, "run_db", inline_run_db(FakeSession()))
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: None)
     monkeypatch.setattr(responses_mod, "get_harness", lambda name: fake_harness)
     return handler
@@ -147,3 +153,37 @@ async def test_stopping_a_turn_persists_a_retirement_for_the_open_question(monke
         "values": [],
         "text": "",
     }
+
+
+async def test_a_stall_retires_the_open_question_before_its_failure(monkeypatch):
+    """The UI gave up on a turn whose question was still open. The saved log
+    retires the question, then ends on the stall, so a reload shows no open
+    card that nothing can answer above the stall card."""
+    from cowork.streaming.registry import TurnLifecycle
+
+    saved: dict = {}
+    published = asyncio.Event()
+    handler = _cancellable_handler(monkeypatch, saved, published)
+    buffer = _FakeBuffer()
+
+    task = asyncio.create_task(handler._run_turn(
+        conv_id=uuid4(), harness_input=[], original_content="hi", model="anton",
+        disabled=None, harness_name="anton", harness_id="anton", buffer=buffer,
+        lifecycle=TurnLifecycle(stalled=True),
+    ))
+    await asyncio.wait_for(published.wait(), timeout=5)
+    task.cancel()
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=5)
+
+    assert buffer.closed == "interrupted"
+    events = saved["events"]
+    assert events[0]["type"] == "response.ask_user"
+    assert events[-2] == {
+        "type": "response.ask_user_answered",
+        "question_id": "ask:1",
+        "status": "cancelled",
+        "values": [],
+        "text": "",
+    }
+    assert events[-1]["type"] == "response.failed"
+    assert events[-1]["code"] == "stalled"

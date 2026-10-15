@@ -37,6 +37,10 @@ class RunningTurn:
     thread: threading.Thread
     cancel_requested: bool = False
     interruption_requested: bool = False
+    # Reserves a new task while its workspace prepares, before any engine exists.
+    preparing: bool = False
+    # The task was deleted while preparing; its thread releases what it made.
+    delete_requested: bool = False
     pending_steers: list[tuple[str, tuple[EngineInputReference, ...]]] = field(default_factory=list)
 
     def route_steer(
@@ -74,12 +78,14 @@ def finish_turn(session: CodingSession, status: SessionStatus) -> None:
     session.status = status
     session.active_turn_id = None
     session.pending_approval = None
+    session.pending_question = None
 
 
 def fail_turn(session: CodingSession, cancelled: bool, message: str) -> None:
     session.status = SessionStatus.cancelled if cancelled else SessionStatus.failed
     session.active_turn_id = None
     session.pending_approval = None
+    session.pending_question = None
     session.last_error = None if cancelled else message
 
 
@@ -87,6 +93,7 @@ def interrupt_turn(session: CodingSession) -> None:
     session.status = SessionStatus.interrupted
     session.active_turn_id = None
     session.pending_approval = None
+    session.pending_question = None
     session.last_error = None
 
 
@@ -105,7 +112,14 @@ class EventBuffer:
             EventType.reasoning,
             EventType.command,
             EventType.file_change,
-        }
+        } or (
+            # Plan snapshots and completion events must remain distinct;
+            # only the streamed text uses the bounded coalescing path.
+            event.type == EventType.plan
+            and event.phase == "progress"
+            and bool(event.text)
+            and not event.data
+        )
         if (
             mergeable
             and pending is not None

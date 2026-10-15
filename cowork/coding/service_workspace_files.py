@@ -17,6 +17,9 @@ class CodingWorkspaceFilesOperations:
     def get_session(self, session_id: str) -> CodingSession:  # pragma: no cover - mixin contract
         raise NotImplementedError
 
+    def _prepared_session(self, session_id: str) -> CodingSession:  # pragma: no cover - mixin contract
+        raise NotImplementedError
+
     def workspace_files(self, session_id: str, query: str = "", limit: int = 40) -> list[dict[str, str]]:
         return workspace_files(self._local_file_session(session_id), query, limit)
 
@@ -56,7 +59,7 @@ class CodingWorkspaceFilesOperations:
         return WorkspaceFileBrowser(self._local_file_session(session_id)).search(query, resource_id, limit)
 
     def _local_file_session(self, session_id: str) -> CodingSession:
-        session = self.get_session(session_id)
+        session = self._prepared_session(session_id)
         if not session.computer_is_local or not session.task_capabilities.files:
             raise RuntimeError(
                 "Task files stay on the computer running this task. Open Code Mode on that computer to browse them."

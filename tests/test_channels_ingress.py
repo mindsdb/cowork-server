@@ -5,6 +5,8 @@ Async cases run via ``asyncio.run`` inside sync tests, matching the rest of the
 channel suite (no pytest-asyncio dependency).
 """
 import asyncio
+import re
+from importlib.metadata import requires
 
 import cowork.channels.plugins.discord as discord
 import cowork.channels.plugins.slack as slack
@@ -610,3 +612,13 @@ def test_reconcile_once_with_multiple_orgs(monkeypatch):
             cleanup.commit()
         finally:
             cleanup.close()
+
+
+def test_aiohttp_is_a_core_dependency_not_only_an_extra():
+    """The Discord Gateway and Slack Socket Mode loops need aiohttp, and the
+    server image installs no extras, so it has to be an unconditional requirement."""
+    core = [
+        req for req in requires("cowork-server") or []
+        if re.match(r"aiohttp\s*(?:[<>=!~\[]|$)", req) and ";" not in req
+    ]
+    assert core, "aiohttp is only reachable through an extra"

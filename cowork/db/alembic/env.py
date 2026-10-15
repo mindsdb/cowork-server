@@ -7,6 +7,7 @@ from sqlalchemy.engine import make_url
 from sqlmodel import SQLModel
 
 import cowork.models.code_control  # noqa: F401
+import cowork.models.artifact_identity  # noqa: F401
 
 # Import models so SQLModel.metadata is fully populated for autogenerate.
 import cowork.models.conversation  # noqa: F401
@@ -69,7 +70,7 @@ def run_migrations_online() -> None:
 
     url = _database_url()
     _ensure_sqlite_dir(url)
-    connectable = create_engine(url, poolclass=pool.NullPool)
+    connectable = create_engine(url, poolclass=pool.NullPool, hide_parameters=True)
 
     with connectable.connect() as connection:
         context.configure(connection=connection, target_metadata=target_metadata, render_as_batch=True)

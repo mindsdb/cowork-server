@@ -1135,8 +1135,11 @@ def test_turn_completes_even_when_a_command_handler_hangs(tmp_path: Path, monkey
     release_steer.set()
     worker.join(timeout=5)
     assert not worker.is_alive()
-    assert engine.steers == [("turn-1", "Change direction")]
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and steer.id not in client.acknowledged:
+        time.sleep(0.01)
     assert steer.id in client.acknowledged
+    assert engine.steers == [("turn-1", "Change direction")]
 
 
 def test_router_emits_no_turn_checkpoint_after_the_turn_completed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1176,10 +1179,13 @@ def test_router_emits_no_turn_checkpoint_after_the_turn_completed(tmp_path: Path
     release_steer.set()
     worker.join(timeout=5)
     assert not worker.is_alive()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and steer.id not in client.acknowledged:
+        time.sleep(0.01)
+    assert steer.id in client.acknowledged
 
     completed_at = client.events.index(("turn_completed", {"status": "completed"}))
     assert ("checkpoint", {"activeTurn": "turn-1"}) not in client.events[completed_at:]
-    assert steer.id in client.acknowledged
 
 
 def test_approval_ids_are_unique_per_request(tmp_path: Path) -> None:

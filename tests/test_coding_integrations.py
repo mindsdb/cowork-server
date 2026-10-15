@@ -158,6 +158,55 @@ def test_github_enterprise_requests_fall_back_to_the_next_validated_address(tmp_
     assert attempts[:2] == ["2606:4700::6810:1", "140.82.112.3"]
 
 
+def test_github_enterprise_requests_spend_one_short_attempt_on_a_family_that_drops_packets(tmp_path: Path) -> None:
+    def many_record_resolver(_host, _port, **_kwargs):
+        v6 = [(30, 1, 6, "", (f"2606:4700::6810:{index}", 443, 0, 0)) for index in range(1, 9)]
+        v4 = [(2, 1, 6, "", (f"140.82.112.{index}", 443)) for index in range(1, 9)]
+        return v6 + v4
+
+    attempts: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request)
+        if ":" in request.url.host:
+            raise httpx.ConnectTimeout("timed out", request=request)
+        return httpx.Response(200, json=[] if request.url.path.endswith("/comments") else {"title": "Pinned"})
+
+    integration = service(handler, GHE_FIELDS, resolver=many_record_resolver)
+
+    assert integration.read(project(tmp_path), GHE_ISSUE).title == "Pinned"
+    first_request = attempts[:2]
+    assert [request.url.host for request in first_request] == ["2606:4700::6810:1", "140.82.112.1"]
+    assert first_request[0].extensions["timeout"]["connect"] < first_request[0].extensions["timeout"]["read"]
+    assert first_request[0].extensions["sni_hostname"] == "ghe.example.com"
+
+
+def test_github_enterprise_attempts_split_the_client_connect_timeout(tmp_path: Path) -> None:
+    """The last attempt gets what the short ones left of the client's own
+    connect timeout, which is 20 s for this service."""
+    def many_record_resolver(_host, _port, **_kwargs):
+        v6 = [(30, 1, 6, "", (f"2606:4700::6810:{index}", 443, 0, 0)) for index in range(1, 9)]
+        v4 = [(2, 1, 6, "", (f"140.82.112.{index}", 443)) for index in range(1, 9)]
+        return v6 + v4
+
+    attempts: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request)
+        if request.url.host != "140.82.112.2":
+            raise httpx.ConnectTimeout("timed out", request=request)
+        return httpx.Response(200, json=[] if request.url.path.endswith("/comments") else {"title": "Pinned"})
+
+    integration = service(handler, GHE_FIELDS, resolver=many_record_resolver)
+
+    assert integration.read(project(tmp_path), GHE_ISSUE).title == "Pinned"
+    first_request = attempts[:4]
+    assert [request.url.host for request in first_request] == [
+        "2606:4700::6810:1", "140.82.112.1", "2606:4700::6810:2", "140.82.112.2",
+    ]
+    assert [request.extensions["timeout"]["connect"] for request in first_request] == [3.0, 3.0, 3.0, 11.0]
+
+
 def test_github_enterprise_requests_stay_pinned_through_an_environment_proxy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -281,7 +330,8 @@ def test_github_requests_still_follow_same_origin_redirects(tmp_path: Path) -> N
     assert context.title == "Renamed"
 
 
-def test_connected_github_issue_becomes_normalized_source_context(tmp_path: Path) -> None:
+@pytest.mark.parametrize("standalone", [False, True])
+def test_connected_github_issue_becomes_normalized_source_context(tmp_path: Path, standalone: bool) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["Authorization"] == "Bearer secret"
         if request.url.path.endswith("/comments"):
@@ -303,7 +353,7 @@ def test_connected_github_issue_becomes_normalized_source_context(tmp_path: Path
 
     integration = service(handler, {("github", "github-work"): {"access_token": "secret"}})
     context = integration.read(
-        project(tmp_path),
+        None if standalone else project(tmp_path),
         SourceContextRequest(
             provider="github",
             kind="issue",
@@ -320,10 +370,11 @@ def test_connected_github_issue_becomes_normalized_source_context(tmp_path: Path
     assert context.attachments[0].url.endswith("mockup.png")
 
 
-def test_github_work_search_returns_normalized_issue_and_pull_request_results(tmp_path: Path) -> None:
+@pytest.mark.parametrize("standalone", [False, True])
+def test_github_work_search_returns_normalized_issue_and_pull_request_results(tmp_path: Path, standalone: bool) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/search/issues"
-        assert request.url.params["q"] == "delivery is:open"
+        assert request.url.params["q"] in {"is:issue delivery is:open", "is:pull-request delivery is:open"}
         assert request.url.params["sort"] == "updated"
         return httpx.Response(200, json={
             "incomplete_results": False,
@@ -353,21 +404,22 @@ def test_github_work_search_returns_normalized_issue_and_pull_request_results(tm
     integration = service(handler, {("github", "github-work"): {"access_token": "secret"}})
     current = project(tmp_path)
     current.connections = []
-    page = integration.search(current, WorkItemSearchRequest(
+    page = integration.search(None if standalone else current, WorkItemSearchRequest(
         provider="github",
         query="delivery",
         connection_name="github-work",
     ))
 
     assert [(item.external_id, item.kind) for item in page.items] == [
-        ("mindsdb/cowork#42", "issue"),
         ("mindsdb/cowork#99", "pull_request"),
+        ("mindsdb/cowork#42", "issue"),
     ]
-    assert page.items[0].assignee == "ian"
+    assert page.items[1].assignee == "ian"
     assert current.connections == []
 
 
-def test_linear_work_search_uses_assigned_issues_for_an_empty_query(tmp_path: Path) -> None:
+@pytest.mark.parametrize("standalone", [False, True])
+def test_linear_work_search_uses_assigned_issues_for_an_empty_query(tmp_path: Path, standalone: bool) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content)
         assert "viewer { assignedIssues" in body["query"]
@@ -387,7 +439,7 @@ def test_linear_work_search_uses_assigned_issues_for_an_empty_query(tmp_path: Pa
         }]}}}})
 
     integration = service(handler, {("linear", "linear-work"): {"api_key": "linear-secret"}})
-    page = integration.search(project(tmp_path), WorkItemSearchRequest(provider="linear"))
+    page = integration.search(None if standalone else project(tmp_path), WorkItemSearchRequest(provider="linear"))
 
     assert len(page.items) == 1
     assert page.items[0].external_id == "ENG-19"
@@ -415,7 +467,8 @@ def test_linear_work_search_uses_the_full_text_search_resolver(tmp_path: Path) -
     assert [item.external_id for item in page.items] == ["ENG-19"]
 
 
-def test_linear_and_slack_reads_use_their_connected_credentials(tmp_path: Path) -> None:
+@pytest.mark.parametrize("standalone", [False, True])
+def test_linear_and_slack_reads_use_their_connected_credentials(tmp_path: Path, standalone: bool) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -437,7 +490,7 @@ def test_linear_and_slack_reads_use_their_connected_credentials(tmp_path: Path) 
         ("linear", "linear-work"): {"api_key": "linear-secret"},
         ("slack", "slack-work"): {"bot_token": "slack-secret"},
     })
-    current = project(tmp_path)
+    current = None if standalone else project(tmp_path)
     linear = integration.read(current, SourceContextRequest(
         provider="linear",
         kind="issue",

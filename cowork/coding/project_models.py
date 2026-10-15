@@ -78,6 +78,17 @@ class ProjectActionPage(BaseModel):
     preview_pending: bool = False
 
 
+class ProjectCommandRefresh(BaseModel):
+    """What a task can run after adopting the project's current commands.
+
+    Counts cover only the folders in the task's scope, since those are the
+    only commands the task will ever be offered.
+    """
+
+    validate_count: int = Field(ge=0)
+    run_count: int = Field(ge=0)
+
+
 class ReviewFileActionRequest(BaseModel):
     folder_id: str | None = Field(default=None, min_length=1, max_length=120)
     path: str = Field(min_length=1, max_length=32_768)
@@ -100,6 +111,9 @@ class RepositoryResource(BaseModel):
     provider: Literal["github", "gitlab", "bitbucket", "git"] = "git"
     repository: str | None = Field(default=None, max_length=512)
     connector_name: str | None = Field(default=None, max_length=512)
+    # Older projects inferred connector_name for delivery. Only an explicit
+    # picker choice opts into using it for clone/fetch; preserve legacy Git auth.
+    use_connector_for_clone: bool = False
     local_path: str | None = Field(default=None, max_length=32_768)
     computer_id: str | None = Field(default=None, max_length=128)
     default_branch: str | None = Field(default=None, max_length=255)
@@ -108,6 +122,8 @@ class RepositoryResource(BaseModel):
 
     @model_validator(mode="after")
     def require_source(self) -> RepositoryResource:
+        if self.use_connector_for_clone and not self.connector_name:
+            raise ValueError("connector-based cloning requires a connection name")
         if not self.source_url and not self.local_path:
             raise ValueError("repository resources require a remote URL or local checkout")
         if not self.source_url and not self.computer_id:
@@ -301,15 +317,6 @@ class CodeProject(BaseModel):
             raise ValueError("project resource ids must be unique")
         if len(locations) != len(set(locations)):
             raise ValueError("the same folder cannot be added twice")
-        github_connections = [item.name for item in self.connections if item.provider == "github"]
-        if len(github_connections) == 1:
-            for resource in self.resources:
-                if (
-                    isinstance(resource, RepositoryResource)
-                    and resource.provider == "github"
-                    and not resource.connector_name
-                ):
-                    resource.connector_name = github_connections[0]
         self.folders = [resource_folder(resource) for resource in self.resources]
         connections = [(item.provider, item.name) for item in self.connections]
         if len(connections) != len(set(connections)):

@@ -10,6 +10,7 @@ from sqlmodel import Session, select
 from cowork.common.encryption import decrypt, encrypt
 from cowork.common.settings.runtime_credential import get_minds_credential
 from cowork.common.settings.user_settings import (
+    reject_unknown_harness,
     UserSettings,
     invalidate_user_settings_cache,
     setting_is_org_scoped,
@@ -160,7 +161,7 @@ class SettingService:
             raise ValueError(f"Unknown setting: '{key}'")
 
     @staticmethod
-    def _raw_data(rows: list[Setting]) -> dict[str, str]:
+    def _raw_data(rows: list[Setting], *, include_runtime: bool = True) -> dict[str, str]:
         """Decrypted field → value map for ``rows``, before model validation.
 
         Split out of ``_load`` so ``load_pending`` can overlay in-flight values
@@ -194,14 +195,23 @@ class SettingService:
         # an install upgrading from a build that persisted its key still has
         # that row until the migration clears it, and a stale key must never
         # shadow the live credential. Returns None outside local mode.
-        runtime_minds_key = get_minds_credential()
+        runtime_minds_key = get_minds_credential() if include_runtime else None
         if runtime_minds_key:
             data["minds_api_key"] = runtime_minds_key
         return data
 
     @staticmethod
     def _load(rows: list[Setting]) -> UserSettings:
-        return UserSettings(**SettingService._raw_data(rows))
+        data = SettingService._raw_data(rows, include_runtime=False)
+        stored_minds_key = data.get("minds_api_key")
+        runtime_minds_key = get_minds_credential()
+        if runtime_minds_key:
+            data["minds_api_key"] = runtime_minds_key
+        settings = UserSettings(**data)
+        if runtime_minds_key:
+            settings._stored_minds_api_key = SecretStr(stored_minds_key) if stored_minds_key else None
+            settings._runtime_minds_credential = True
+        return settings
 
     @staticmethod
     def _is_set(key: str, settings: UserSettings, set_keys: set[str]) -> bool:
@@ -288,7 +298,8 @@ class SettingService:
         """
         self._validate_key(key)
         try:
-            validated = UserSettings.model_validate({key: value})
+            with reject_unknown_harness():
+                validated = UserSettings.model_validate({key: value})
         except ValidationError as e:
             raise ValueError(str(e))
         field_val = getattr(validated, key)

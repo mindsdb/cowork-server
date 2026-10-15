@@ -40,7 +40,7 @@ PAID_ENABLED = {"mindshub_air": True, "sonnet": True, "haiku": True, "kimi": Tru
 def _listing(enabled):
     from cowork.services.providers import MindsModelListing
 
-    return MindsModelListing(list(enabled), {}, enabled, {}, {}, {}, {})
+    return MindsModelListing(list(enabled), {}, enabled, {}, {}, {}, {}, {})
 
 
 def _empty():
@@ -312,14 +312,10 @@ def test_write_raw_settings_warms_after_sync(monkeypatch, tmp_path):
     monkeypatch.setattr(settings_endpoint, "_ENV_PATH", tmp_path / ".env")
     us.get_app_settings.cache_clear()  # local tenancy
 
-    class _Req:
-        client = type("C", (), {"host": "127.0.0.1"})()
-        headers: dict = {}
-
     body = settings_endpoint._RawSettingsBody(content="ANTON_MINDS_API_KEY=mdb_test\n")
     session = get_open_session()
     try:
-        result = asyncio.run(settings_endpoint.write_raw_settings(body, session, _Req()))
+        result = asyncio.run(settings_endpoint.write_raw_settings(body, session))
         assert result == {"ok": True}
         assert warmed == [True]  # the sync path warmed the map exactly once
     finally:

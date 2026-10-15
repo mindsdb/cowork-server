@@ -23,6 +23,8 @@ from coding_service_fakes import (
     repository,
     service_with,
     wait_for_status,
+    wait_for_turn_thread,
+    wait_for_workspace,
     wait_for_steers,
 )
 
@@ -1265,10 +1267,9 @@ def test_non_git_session_reports_its_isolated_local_copy(tmp_path: Path) -> None
         "fake",
         "fake-model",
     )
-    wait_for_status(service, created.id, SessionStatus.completed)
+    created = wait_for_status(service, created.id, SessionStatus.completed)
 
-    ready = service.events(created.id).items[0]
-    assert ready.title == "Task workspace ready"
+    ready = next(event for event in service.events(created.id).items if event.title == "Task workspace ready")
     assert ready.text == "Created an isolated task workspace."
     assert ready.data["workspaceKind"] == "local_copy"
     assert created.workspace_path != str(folder.resolve())
@@ -1288,7 +1289,7 @@ def test_repository_without_commits_can_start_a_coding_session(tmp_path: Path) -
         "fake",
         "fake-model",
     )
-    wait_for_status(service, created.id, SessionStatus.completed)
+    created = wait_for_status(service, created.id, SessionStatus.completed)
 
     assert created.workspace_kind == WorkspaceKind.local_copy
     assert created.workspace_path != str(repo.resolve())
@@ -1631,6 +1632,7 @@ def test_a_queued_read_only_command_does_not_continue_a_completed_task(tmp_path:
     service = service_with(tmp_path, FakeEngine())
     created = service.create_session(SessionCreateRequest(path=str(repo), prompt="Start work"), CREDS, "fake", "gpt")
     wait_for_status(service, created.id, SessionStatus.completed)
+    wait_for_turn_thread(created.id)
     before = service.get_session(created.id)
     queued = QueuedInstruction(id="queued-status", prompt="/status")
     service.store.update_session(created.id, lambda session: session.queued_instructions.append(queued))
@@ -1653,6 +1655,7 @@ def test_queue_continues_after_an_immediate_command_without_reusing_its_id(tmp_p
         SessionCreateRequest(path=str(repo), prompt="First turn"), CREDS, "fake", "fake-model"
     )
     wait_for_status(service, created.id, SessionStatus.completed)
+    wait_for_turn_thread(created.id)
     first = QueuedInstruction(id="queued-status", prompt="/status")
     second = QueuedInstruction(id="queued-turn", prompt="Second turn")
     service.store.update_session(
@@ -2032,7 +2035,7 @@ def test_turn_accepts_native_file_references_and_workspace_mentions(tmp_path: Pa
         "fake",
         "fake-model",
     )
-    wait_for_status(service, created.id, SessionStatus.completed)
+    created = wait_for_status(service, created.id, SessionStatus.completed)
 
     assert len(engine.attachments[0]) == 1
     assert engine.attachments[0][0].name == "src/feature.py"
@@ -2120,7 +2123,7 @@ def test_fork_copies_conversation_and_working_changes_to_an_independent_worktree
     parent = service.create_session(
         SessionCreateRequest(path=str(repo), prompt="Build the feature"), CREDS, "fake", "fake-model"
     )
-    wait_for_status(service, parent.id, SessionStatus.completed)
+    parent = wait_for_status(service, parent.id, SessionStatus.completed)
     changed = Path(parent.workspace_path, "README.md")
     changed.write_text("forked work\n", encoding="utf-8")
     service.set_pinned(parent.id, True)
@@ -2325,7 +2328,7 @@ def test_project_fork_keeps_every_folder_change_isolated_and_reviewable(tmp_path
         "fake",
         "fake-model",
     )
-    wait_for_status(service, parent.id, SessionStatus.completed)
+    parent = wait_for_status(service, parent.id, SessionStatus.completed)
     (Path(parent.workspaces[0].workspace_path) / "README.md").write_text("parent app\n", encoding="utf-8")
     (Path(parent.workspaces[1].workspace_path) / "plan.txt").write_text("parent notes\n", encoding="utf-8")
 
@@ -2349,6 +2352,132 @@ def test_project_fork_keeps_every_folder_change_isolated_and_reviewable(tmp_path
     assert child.workspaces[1].workspace_path in child.developer_instructions
     assert engine.forked_workspaces[-1] == child.workspaces[0].workspace_path
     assert engine.forked_additional_dirs[-1] == tuple(child.additional_dirs)
+
+
+def test_existing_task_can_adopt_commands_added_to_the_project_later(tmp_path: Path) -> None:
+    app = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    project = service.projects.create(
+        ProjectCreateRequest(
+            name="Late checks",
+            folders=[ProjectFolder(id="app", name="App", path=str(app))],
+            default_engine_id="fake",
+            default_model="fake-model",
+        )
+    )
+    early = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Started before any checks existed"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    early = wait_for_status(service, early.id, SessionStatus.completed)
+    assert service.validate_project(early.id) == []
+
+    live = service.projects.get(project.id)
+    service.projects.update(project.id, ProjectUpdateRequest(resources=[
+        resource.model_copy(update={
+            "commands": [
+                ProjectCommand(
+                    id="late-check",
+                    label="Late check",
+                    argv=[sys.executable, "-c", "print('late')"],
+                    phase="validate",
+                ),
+                ProjectCommand(id="serve", label="Serve", argv=[sys.executable, "-m", "http.server"], phase="run"),
+            ],
+        })
+        for resource in live.resources
+    ]))
+
+    # The snapshot still rules until the user asks for the new commands.
+    assert service.validate_project(early.id) == []
+    assert service.project_action_page(early.id).items == []
+
+    summary = service.refresh_project_commands(early.id)
+
+    assert (summary.validate_count, summary.run_count) == (1, 1)
+    results = service.validate_project(early.id)
+    assert [(result["label"], result["return_code"]) for result in results] == [("Late check", 0)]
+    assert [item.id for item in service.project_action_page(early.id).items] == ["serve"]
+    assert service.get_session(early.id).resource_ids == early.resource_ids
+    assert any(event.title == "Project commands updated" for event in service.events(early.id).items)
+
+    # New tasks keep receiving the saved commands without any extra step.
+    late = service.create_session(
+        SessionCreateRequest(project_id=project.id, prompt="Started after"),
+        CREDS,
+        "fake",
+        "fake-model",
+    )
+    wait_for_status(service, late.id, SessionStatus.completed)
+    assert [result["label"] for result in service.validate_project(late.id)] == ["Late check"]
+
+
+def test_refreshing_commands_reaches_a_leased_remote_worker_before_reporting_success(tmp_path: Path) -> None:
+    service = service_with(tmp_path, FakeEngine())
+    created, remote = remote_task(tmp_path, service)
+    run, lease_id = service.control.acquire_lease(remote.id)
+    runtime_event(service, run, lease_id, 1, "status", {"status": "ready"})
+    live = service.projects.get(created.project_id)
+    check = ProjectCommand(id="late-check", label="Late check", argv=["npm", "test"], phase="validate")
+    service.projects.update(live.id, ProjectUpdateRequest(resources=[
+        resource.model_copy(update={"commands": [check]}) for resource in live.resources
+    ]))
+
+    outcome: dict[str, object] = {}
+
+    def refresh() -> None:
+        try:
+            outcome["summary"] = service.refresh_project_commands(created.id)
+        except Exception as exc:  # noqa: BLE001 - surfaced through the assertion below
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=refresh)
+    worker.start()
+    deadline = time.monotonic() + 5
+    pushed = None
+    while pushed is None and time.monotonic() < deadline:
+        pushed = next((
+            item for item in service.control.claim_commands(run.id, remote.id, lease_id, run.epoch)
+            if item.kind == "operation" and item.payload.get("operation") == "refresh_project"
+        ), None)
+        if pushed is None:
+            time.sleep(0.02)
+    assert pushed is not None, "the refresh never reached the leased worker"
+    # The worker receives exactly the commands that were saved, keyed by resource.
+    assert pushed.payload["commands"] == {"repo": [check.model_dump(mode="json")]}
+    # Success is not reported until the worker has taken the commands.
+    assert worker.is_alive()
+
+    service.acknowledge_runtime_command(run.id, pushed.id, run.computer_id, lease_id, run.epoch, {"resources": 1}, None)
+    worker.join(timeout=5)
+
+    assert "error" not in outcome, outcome.get("error")
+    summary = outcome["summary"]
+    assert (summary.validate_count, summary.run_count) == (1, 0)
+    task = service.control.store.get_task(created.task_id)
+    assert [command.id for command in task.execution_project.resources[0].commands] == ["late-check"]
+
+
+def test_refreshing_commands_for_an_unleased_remote_run_only_updates_the_snapshot(tmp_path: Path) -> None:
+    service = service_with(tmp_path, FakeEngine())
+    created, remote = remote_task(tmp_path, service)
+    live = service.projects.get(created.project_id)
+    check = ProjectCommand(id="late-check", label="Late check", argv=["npm", "test"], phase="validate")
+    service.projects.update(live.id, ProjectUpdateRequest(resources=[
+        resource.model_copy(update={"commands": [check]}) for resource in live.resources
+    ]))
+
+    summary = service.refresh_project_commands(created.id)
+
+    assert (summary.validate_count, summary.run_count) == (1, 0)
+    run, lease_id = service.control.acquire_lease(remote.id)
+    kinds = [item.kind for item in service.control.claim_commands(run.id, remote.id, lease_id, run.epoch)]
+    assert "operation" not in kinds
+    # The lease itself carries the refreshed snapshot, so nothing needed pushing.
+    lease = service.control.store.get_task(created.task_id)
+    assert [command.id for command in lease.execution_project.resources[0].commands] == ["late-check"]
 
 
 def test_scoped_task_validation_and_fork_use_immutable_project_snapshot(tmp_path: Path) -> None:
@@ -2398,7 +2527,7 @@ def test_scoped_task_validation_and_fork_use_immutable_project_snapshot(tmp_path
         "fake",
         "fake-model",
     )
-    wait_for_status(service, parent.id, SessionStatus.completed)
+    parent = wait_for_status(service, parent.id, SessionStatus.completed)
 
     live = service.projects.get(project.id)
     changed_resources = [
@@ -2453,7 +2582,7 @@ def test_project_runtime_opens_in_primary_workspace_and_keeps_other_folders_avai
         "fake",
         "fake-model",
     )
-    wait_for_status(service, task.id, SessionStatus.completed)
+    task = wait_for_status(service, task.id, SessionStatus.completed)
 
     primary = task.workspaces[0].workspace_path
     secondary = task.workspaces[1].workspace_path
@@ -2482,7 +2611,7 @@ def test_project_delivery_is_planned_then_explicitly_publishes_a_draft_pr(tmp_pa
         "fake",
         "fake-model",
     )
-    wait_for_status(service, task.id, SessionStatus.completed)
+    task = wait_for_status(service, task.id, SessionStatus.completed)
     (Path(task.workspace_path) / "README.md").write_text("delivery\n", encoding="utf-8")
 
     assert service.delivery_plan(task.id).items[0].status == "needs_commit"
@@ -2663,7 +2792,7 @@ def test_project_delivery_can_publish_a_selected_repository_with_its_own_copy(tm
         "fake",
         "fake-model",
     )
-    wait_for_status(service, task.id, SessionStatus.completed)
+    task = wait_for_status(service, task.id, SessionStatus.completed)
     for workspace in task.workspaces:
         (Path(workspace.workspace_path) / "README.md").write_text(f"{workspace.folder_name}\n", encoding="utf-8")
     service.commit(task.id, "Prepare delivery")
@@ -2790,7 +2919,7 @@ def test_project_task_resumes_same_workspaces_and_ports_after_service_restart(tm
         "fake",
         "fake-model",
     )
-    wait_for_status(first, task.id, SessionStatus.completed)
+    task = wait_for_status(first, task.id, SessionStatus.completed)
     original_paths = [item.workspace_path for item in first.get_session(task.id).workspaces]
     original_ports = first.get_session(task.id).allocated_ports
     original_engine_session_id = first.get_session(task.id).engine_session_id
@@ -2807,6 +2936,7 @@ def test_project_task_resumes_same_workspaces_and_ports_after_service_restart(tm
         "fake",
         "fake-model",
     )
+    next_task = wait_for_workspace(restarted, next_task.id)
 
     assert [item.workspace_path for item in loaded.workspaces] == original_paths
     assert loaded.allocated_ports == original_ports

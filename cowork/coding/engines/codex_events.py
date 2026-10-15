@@ -17,6 +17,8 @@ def map_codex_notification(method: str, payload: object) -> CodingEvent | None:
         return CodingEvent(type=EventType.reasoning, title="Reasoning", text=string(raw.get("delta")), phase="progress", item_id=item_id, turn_id=turn_id)
     if method == "turn/plan/updated":
         return CodingEvent(type=EventType.plan, title="Plan updated", phase="progress", turn_id=turn_id, data=sanitize(raw))
+    if method == "item/plan/delta":
+        return CodingEvent(type=EventType.plan, title="Proposed plan", text=string(raw.get("delta")), phase="progress", item_id=item_id, turn_id=turn_id)
     if method == "item/commandExecution/outputDelta":
         return CodingEvent(type=EventType.command, title="Command output", text=string(raw.get("delta")), phase="progress", item_id=item_id, turn_id=turn_id)
     if method == "item/fileChange/outputDelta":
@@ -70,6 +72,8 @@ def payload_dict(payload: object) -> dict[str, Any]:
 
 def event_type_for_item(item_type: str) -> EventType:
     lowered = item_type.lower()
+    if lowered == "plan":
+        return EventType.plan
     if "collab" in lowered or "subagent" in lowered or "sub_agent" in lowered:
         return EventType.child_work
     if "command" in lowered:
