@@ -395,6 +395,130 @@ async def test_stream_remote_replies_forwards_started_at_only_when_known(monkeyp
     assert "started_at" not in without
 
 
+_LIMIT_ENV = (
+    "MAX_TOOL_ROUNDS", "MAX_CONTINUATIONS", "MAX_TURN_TOKENS",
+    "COWORK_DEFAULT_MAX_TOOL_ROUNDS", "COWORK_DEFAULT_MAX_CONTINUATIONS", "COWORK_DEFAULT_MAX_TURN_TOKENS",
+)
+
+
+async def _enqueued_params(monkeypatch, org_id, **kwargs):
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    monkeypatch.setattr(prod, "_mint_oauth_block", AsyncMock(return_value=None))
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=org_id, user_id="u1", input_text="hi", model="m", **kwargs,
+    ))
+    return json.loads(fake.added[0][1]["payload"])["params"]
+
+
+_STORED_LIMITS = {"max_tool_rounds": 120, "max_continuations": 7, "max_turn_tokens": 3_000_000}
+
+
+def _deployment_defaults():
+    from cowork.common.settings.app_settings import get_app_settings
+
+    app = get_app_settings()
+    return {
+        "max_turn_tokens": app.default_max_turn_tokens,
+        "max_tool_rounds": app.default_max_tool_rounds,
+        "max_continuations": app.default_max_continuations,
+    }
+
+
+@pytest.fixture
+def org_settings(monkeypatch):
+    """Writes settings rows for an org in the real store; removes them after."""
+    from cowork.common.settings import user_settings as us
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.scoped import TenantScope
+    from cowork.db.session import get_open_session
+    from cowork.services.settings import SettingService
+
+    for key in _LIMIT_ENV:
+        monkeypatch.delenv(key, raising=False)
+    get_app_settings.cache_clear()
+    written = []
+
+    def write(org_id, rows):
+        scope = TenantScope(org_mode=True, org_id=org_id, user_id="u1")
+        s = get_open_session()
+        try:
+            for key, value in rows:
+                SettingService(s, scope).upsert_setting(key, value)
+        finally:
+            s.close()
+        written.append(scope)
+        return scope
+
+    yield write
+    s = get_open_session()
+    try:
+        for scope in written:
+            svc = SettingService(s, scope)
+            for key in (*_STORED_LIMITS, "limits_enabled"):
+                try:
+                    svc.delete_setting(key)
+                except Exception:
+                    pass
+    finally:
+        s.close()
+    us.invalidate_user_settings_cache()
+
+
+@pytest.mark.asyncio
+async def test_an_org_that_opted_in_sends_its_own_limits(monkeypatch, org_settings):
+    # Saving a budget turns the switch on at that scope.
+    org_settings("limits-chose", _STORED_LIMITS.items())
+    params = await _enqueued_params(monkeypatch, "limits-chose")
+    assert params["limits"] == _STORED_LIMITS
+
+
+@pytest.mark.asyncio
+async def test_an_org_with_the_switch_off_sends_the_defaults_over_its_stored_values(
+    monkeypatch, org_settings,
+):
+    """Stored values stay for when the switch goes back on, but don't apply."""
+    org_settings("limits-off", [("limits_enabled", "false"), *_STORED_LIMITS.items()])
+    params = await _enqueued_params(monkeypatch, "limits-off")
+    assert params["limits"] == _deployment_defaults()
+
+
+@pytest.mark.asyncio
+async def test_an_org_that_stored_nothing_sends_the_defaults(monkeypatch, org_settings):
+    params = await _enqueued_params(monkeypatch, "limits-none")
+    assert params["limits"] == _deployment_defaults()
+
+
+@pytest.mark.asyncio
+async def test_a_web_turn_sends_the_limits_of_its_settings_snapshot(monkeypatch, org_settings):
+    """The web path loads settings once per turn and binds them with
+    use_turn_settings; the producer reads the snapshot, not the database."""
+    from cowork.common.settings.user_settings import UserSettings, use_turn_settings
+    from cowork.db.scoped import TenantScope
+
+    scope = TenantScope(org_mode=True, org_id="limits-snapshot", user_id="u1")
+    snapshot = UserSettings(limits_enabled=True, **_STORED_LIMITS)
+    with use_turn_settings(scope, snapshot):
+        params = await _enqueued_params(monkeypatch, "limits-snapshot")
+    assert params["limits"] == _STORED_LIMITS
+
+
+@pytest.mark.asyncio
+async def test_a_turn_whose_limits_cant_be_read_still_runs_without_them(monkeypatch):
+    from cowork.common.settings import user_settings as us
+
+    def unreadable(scope):
+        raise RuntimeError("settings store down")
+
+    monkeypatch.setattr(us, "get_user_settings", unreadable)
+    params = await _enqueued_params(
+        monkeypatch, "o1", llm={"provider": "minds-cloud", "api_key": "k", "base_url": "https://x/v1"},
+    )
+    assert "limits" not in params
+    assert params["input"] == "hi"
+
+
 @pytest.mark.asyncio
 async def test_stream_remote_replies_attaches_oauth_block_with_the_llm_turn_key(monkeypatch):
     fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
