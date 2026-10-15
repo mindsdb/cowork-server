@@ -82,6 +82,34 @@ def _trace_block(*, user_id: str | None = None, org_id: str | None = None) -> di
         return {}
 
 
+#: The per-task limits a web turn runs under, by their UserSettings names. The
+#: pod applies them in place of anton's own defaults, as the desktop harness
+#: overlays them onto anton's settings for an in-process turn.
+_TURN_LIMIT_SETTINGS = ("max_tool_rounds", "max_continuations", "max_turn_tokens")
+
+
+def _limits_block(scope: TenantScope) -> dict[str, int] | None:
+    """The tenant's resolved per-task limits, for the job's params.
+
+    None when they can't be read: the pod then keeps anton's own defaults, which
+    is what every web turn ran under before this block existed. Not a reason to
+    fail the turn.
+    """
+    from cowork.common.settings.user_settings import get_user_settings
+
+    try:
+        user = get_user_settings(scope)
+    except Exception:
+        logger.warning("could not read the turn's limits; the pod keeps its defaults", exc_info=True)
+        return None
+    block = {}
+    for name in _TURN_LIMIT_SETTINGS:
+        value = getattr(user, name, None)
+        if isinstance(value, int) and not isinstance(value, bool):
+            block[name] = value
+    return block or None
+
+
 def _request_wire_size(params: dict) -> int:
     """Bytes the controller's request line will occupy for these params."""
     return len(json.dumps(params, separators=(",", ":")).encode("utf-8"))
@@ -591,6 +619,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     oauth_block = {**oauth_connections, "turn_key": llm_block.get("api_key", "")} if oauth_connections else None
     connectors_block = _connectors_block(oauth_connections)
 
+    limits_block = _limits_block(scope)
+
     # Org-relative, never absolute. cowork-server sees the shared tree at
     # <root>/<org_id> while the pod mounts its own org's access point AT
     # <root>, so the two sit at different depths and an absolute path from
@@ -627,6 +657,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # turn and would otherwise stamp today's date into the system
               # prompt, changing the cached prefix at midnight.
               **({"started_at": started_at} if started_at else {}),
+              # The tenant's per-task limits (steps, auto-continues, tokens).
+              # Without them the pod ran on anton's built-in 25 / 3 / 1.25M,
+              # whatever the tenant set. Absent when they can't be read.
+              **({"limits": limits_block} if limits_block else {}),
               # Trace attribution for the pod (ENG-1459). The remote turn runs in
               # a scratchpad pod that has no cowork-server installed, so nothing
               # there can derive the surface, this server's version, or its
