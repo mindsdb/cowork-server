@@ -377,6 +377,33 @@ def test_a_shared_connections_sign_in_saves_into_the_shared_vault(pending_gmail_
     assert {engine for engine, _name in _names(vault_for_scope(LOCAL_SCOPE))} == {"gmail"}
 
 
+def test_a_shared_connections_sign_in_is_the_persons_own(pending_gmail_sign_in, monkeypatch):
+    """Connections shared: the sign-in records the person who finished it as
+    the connection's creator, so their delete goes through and someone
+    else's answers 403."""
+    from cowork.api.v1.endpoints.connectors import connections as connections_ep
+    from cowork.services.connectors.layered_vault import CREATED_BY_FIELD, SHARED_CONNECTION_REFUSAL
+
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", "memory")
+    get_app_settings.cache_clear()
+    revoked = []
+    monkeypatch.setattr(connections_ep.oauth_service, "revoke", lambda engine, name, *_a, **_k: revoked.append(name))
+
+    _finish_gmail_sign_in(A)
+
+    [(engine, name)] = _names(vault_for_scope(LOCAL_SCOPE))
+    assert vault_for_scope(LOCAL_SCOPE).read_record(engine, name)["fields"][CREATED_BY_FIELD] == SUB_A
+    client = TestClient(cowork_server.create_app())
+    path = f"/api/v1/connectors/connections/{engine}/{name}"
+    bob = {**BEARER, "X-User-Id": SUB_B, "X-Organization-Id": DEPLOYMENT}
+    refused = client.delete(path, headers=bob)
+    assert (refused.status_code, refused.json()) == (403, {"detail": SHARED_CONNECTION_REFUSAL})
+    assert revoked == []
+    assert client.delete(path, headers=A).status_code == 204
+    assert revoked == [name]
+    assert _names(vault_for_scope(LOCAL_SCOPE)) == set()
+
+
 def test_the_operator_views_sign_in_saves_into_the_base_vault(pending_gmail_sign_in):
     """Every resource personal: the operator view (no person) still finishes
     its own sign-in, into the base vault, which no person's turn reads."""

@@ -70,7 +70,7 @@ async def start_oauth(service: str, request: Request, scope: ScopeDep,
         # sign-ins would clobber each other's. Where a person keeps their own
         # connections it is refused up front. Where connections are shared it
         # runs as on the desktop, and oauth_callback saves into the shared
-        # vault.
+        # vault, stamped with the caller's sub.
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=(
@@ -248,13 +248,13 @@ async def oauth_status(request: Request, scope: ScopeDep, state: str = Query(...
 def oauth_callback(service: str, scope: ScopeDep, code: str = "", state: str = "", error: str = ""):
     if service not in OAUTH_SERVICES:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown OAuth service: {service!r}")
-    # The vault for_resource names: the shared one for every caller
-    # start_oauth lets start, on the desktop and wherever connections are
-    # shared. An org scope with no org fails closed when it saves.
-    html = oauth_service.callback(
-        service, code, state, error, OAuthSettings(),
-        scope=scope.for_resource(PersonalResource.CONNECTIONS),
-    )
+    # The caller's own scope. For a person whose connections are shared,
+    # start_oauth lets the sign-in start, and vault_for_scope resolves their
+    # scope to the shared vault and stamps the connection with their sub, so
+    # it stays theirs to change. A request with no person is the operator
+    # view and stamps nobody. An org scope with no org fails closed when it
+    # saves.
+    html = oauth_service.callback(service, code, state, error, OAuthSettings(), scope=scope)
     return HTMLResponse(content=html)
 
 
