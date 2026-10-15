@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -100,41 +101,64 @@ def count_missed_occurrences(
     return missed, cursor
 
 
-def overdue_slots(
+@dataclass(frozen=True)
+class MissedSlots:
+    """A recurring schedule's slots from ``next_run_at`` up to now."""
+
+    # The latest slot inside the lookback, which runs once; None when every
+    # overdue slot is older than that.
+    run: datetime | None
+    # The slots passed over without running: how many, the first and the last.
+    skipped: int
+    first_skipped: datetime | None
+    last_skipped: datetime | None
+    # The first slot after now.
+    future: datetime
+
+
+def missed_slots(
     cadence: str,
     next_run_at: datetime,
     timezone_name: str,
     *,
     now: datetime,
-    since: datetime,
-) -> tuple[int, list[datetime], datetime]:
-    """Split the slots from ``next_run_at`` up to ``now``.
-
-    Returns how many came due before ``since`` (counted, not kept), the ones
-    at or after it in order, and the first slot after ``now``.
-    """
+    lookback: timedelta,
+) -> MissedSlots:
+    """Which of the overdue slots runs: the latest one no older than
+    ``lookback``, once. Every other overdue slot is passed over."""
     reference = ensure_utc(now)
-    floor = ensure_utc(since)
     cursor = ensure_utc(next_run_at)
-    if reference is None or floor is None or cursor is None:
-        raise ValueError("next_run_at, now and since must be datetimes")
-
-    older = 0
-    recent: list[datetime] = []
-    if cadence == Cadence.hourly and cursor < floor:
-        # Hourly slots are a fixed hour apart in UTC, so the ones before the
-        # floor are counted, not walked: a schedule a year behind would
-        # otherwise step through thousands of slots on every poll.
-        skipped = int((floor - cursor) // timedelta(hours=1))
-        older += skipped
-        cursor += timedelta(hours=skipped)
+    if reference is None or cursor is None:
+        raise ValueError("next_run_at and now must be datetimes")
+    floor = reference - lookback
+    overdue: list[datetime] = []
+    count = 0
+    first: datetime | None = None
+    if cadence == Cadence.hourly and cursor < floor - timedelta(hours=1):
+        # Hourly slots are a fixed hour apart in UTC, so the ones well before
+        # the floor are counted, not walked: a schedule a year behind would
+        # otherwise step through thousands of slots.
+        first = cursor
+        jumped = int((floor - cursor) // timedelta(hours=1)) - 1
+        count += jumped
+        cursor += timedelta(hours=jumped)
     while cursor <= reference:
-        if cursor < floor:
-            older += 1
-        else:
-            recent.append(cursor)
+        count += 1
+        if first is None:
+            first = cursor
+        # Only the last two are kept: the one that may run and the one before it.
+        overdue = [*overdue[-1:], cursor]
         cursor = advance_occurrence(cadence, cursor, timezone_name)
-    return older, recent, cursor
+    if not overdue:
+        return MissedSlots(run=None, skipped=0, first_skipped=None, last_skipped=None, future=cursor)
+    latest = overdue[-1]
+    if latest >= floor:
+        before = overdue[0] if len(overdue) == 2 else None
+        return MissedSlots(
+            run=latest, skipped=count - 1, first_skipped=first if count > 1 else None,
+            last_skipped=before, future=cursor,
+        )
+    return MissedSlots(run=None, skipped=count, first_skipped=first, last_skipped=latest, future=cursor)
 
 
 def normalize_next_run(

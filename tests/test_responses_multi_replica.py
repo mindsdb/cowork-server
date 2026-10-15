@@ -26,7 +26,7 @@ def fake_redis(monkeypatch):
     for mod in (turn_index, buffer_mod):
         monkeypatch.setattr(mod, "get_redis", lambda: client)
     monkeypatch.setattr(
-        "cowork.api.v1.endpoints.responses.get_redis", lambda: client)
+        "cowork.streaming.stop.get_redis", lambda: client)
     monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")
     registry.reset()
     yield client
