@@ -2,8 +2,9 @@
 
 create_app refuses a managed folder in org tenancy, one that is missing or
 lacks memory/, skills/ or data-vault/, naming each missing folder, one whose
-shared-connection or shared-skill registry is malformed, naming the file, and one an anton
-without the read-only memory layer would silently drop. A folder with no
+shared-connection or shared-skill registry is malformed, naming the file, one whose
+memory/ the server can't read and search, one beside remote turns, and one an
+anton without the read-only memory layer would silently drop. A folder with no
 shared/ starts: an operator who shares nothing needs none. A complete folder
 starts and says what it holds. With the setting unset or blank, the desktop
 and hosted servers start as before.
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 
 import pytest
@@ -87,6 +89,26 @@ def test_a_missing_inner_folder_is_refused_by_name(managed_dir, folder):
     assert str(managed_dir.root / folder) in message
     others = {"memory", "skills", "data-vault"} - {folder}
     assert not any(str(managed_dir.root / other) in message for other in others)
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="POSIX modes, enforced for non-root")
+def test_a_memory_folder_the_server_cannot_search_is_refused(managed_dir):
+    """anton reads memory/ on every turn, so a folder without the search bit
+    would fail each turn; the start stops instead, naming the folder."""
+    managed_dir.memory_dir.chmod(0o644)
+    try:
+        with pytest.raises(RuntimeError, match="memory folder .* can't be read") as refused:
+            cowork_server.create_app()
+    finally:
+        managed_dir.memory_dir.chmod(0o755)
+    assert str(managed_dir.memory_dir) in str(refused.value)
+
+
+def test_refused_with_remote_turns(managed_dir, monkeypatch):
+    """A remote turn runs on a worker that receives none of the managed folder."""
+    monkeypatch.setenv("COWORK_TURN_BACKEND", "remote")
+    with pytest.raises(RuntimeError, match="COWORK_TURN_BACKEND=remote is not supported"):
+        cowork_server.create_app()
 
 
 def test_refused_in_org_tenancy(managed_dir, org_deployment):

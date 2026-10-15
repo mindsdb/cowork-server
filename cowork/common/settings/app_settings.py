@@ -796,11 +796,14 @@ class AppSettings(Settings):
         default="enforce",
         validation_alias=AliasChoices("COWORK_IDENTITY_ENFORCE"),
         description=(
-            "Org-mode identity enforcement. 'enforce' (default): a request "
+            "Identity enforcement in org mode, and in local tenancy with "
+            "COWORK_TRUST_IDENTITY_HEADERS on. 'enforce' (default): a request "
             "without identity headers is rejected with 401. 'audit': it is "
             "logged and allowed through, which is the rollout mode the org "
-            "cutover needed and now has to be asked for. Dropping the env var "
-            "must not reopen the no-principal path, so the default is the "
+            "cutover needed and now has to be asked for; with trusted "
+            "identity headers it is served as the operator view, and a pair "
+            "that is present but broken is still rejected. Dropping the env "
+            "var must not reopen the no-principal path, so the default is the "
             "closed one."
         ),
     )
@@ -813,10 +816,13 @@ class AppSettings(Settings):
             "user) pair its own partition, keyed by "
             "cowork.principal.personal_partition_id. Only for a deployment "
             "behind a proxy that verifies each person and strips client copies "
-            "of those headers. create_app refuses it in org tenancy and when "
-            "COWORK_REQUIRE_AUTH is off. COWORK_IDENTITY_ENFORCE applies: "
-            "'enforce' answers 401 without a valid pair, and 'audit' serves "
-            "the request with no person, as the operator view."
+            "of those headers. create_app refuses it in org tenancy, when "
+            "COWORK_REQUIRE_AUTH is off, when COWORK_PERSONAL_RESOURCES leaves "
+            "memory off, and with COWORK_TURN_BACKEND=remote. "
+            "COWORK_IDENTITY_ENFORCE applies: 'enforce' answers 401 without a "
+            "valid pair, and 'audit' serves a request carrying no pair as the "
+            "operator view, with no person; a pair that is present but broken "
+            "answers 401 under either."
         ),
     )
     personal_resources: Annotated[frozenset[PersonalResource], NoDecode] = Field(
@@ -829,7 +835,9 @@ class AppSettings(Settings):
             "pins, memory, settings. Default: all of them. Blank: none. A "
             "resource left off stays shared across the deployment, as with the "
             "setting off. An unknown name fails settings load. create_app "
-            "refuses a list that breaks a dependency: projects requires "
+            "refuses a list without memory, a blank one included, since "
+            "memory left off is one store every person's turns learn into and "
+            "read back; and a list that breaks a dependency: projects requires "
             "conversations, and conversations requires files, pins and "
             "schedules. Ignored while COWORK_TRUST_IDENTITY_HEADERS is off."
         ),
@@ -852,10 +860,12 @@ class AppSettings(Settings):
             "with the operator's own connections every turn can use, and an "
             "optional shared/connections.json and shared/skills.json listing "
             "the connections and skills people share. Cowork never writes it. "
-            "Blank or unset: none. create_app refuses it in org tenancy, when "
-            "the folder or any of memory/, skills/ and data-vault/ is missing, "
-            "when either shared registry is malformed, and when the installed "
-            "anton's Cortex takes no managed_hc."
+            "Blank or unset: none. create_app refuses it in org tenancy, with "
+            "COWORK_TURN_BACKEND=remote, when the folder or any of memory/, "
+            "skills/ and data-vault/ is missing, when the server's user can't "
+            "read and search memory/, when either shared registry is "
+            "malformed, and when the installed anton's Cortex takes no "
+            "managed_hc."
         ),
     )
 

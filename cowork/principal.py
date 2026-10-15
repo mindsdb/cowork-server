@@ -26,7 +26,10 @@ first, on a request that already passed the shared bearer token. There the
 middleware runs with ``personal_partitions=True``: the principal's ``org_id``
 is the person's partition id (``personal_partition_id``), not the header's
 organization, so each (organization, user) pair is its own partition, and
-``user_id`` is the header's user. No pair under audit means the operator view.
+``user_id`` is the header's user. No pair under audit means the operator view;
+a pair that is present but broken (one header, or a non-UUID id) answers 401
+whatever the mode. Paths outside ``/api/`` (the web UI's page shell) name no
+person there and are not logged.
 
 In local mode without that setting (the desktop sidecar, the default) the
 middleware is not registered and ``request.state.principal`` is absent;
@@ -133,12 +136,22 @@ class TrustedHeaderMiddleware(BaseHTTPMiddleware):
         if request.url.path in _EXEMPT_PATHS or request.url.path in self._exempt_paths:
             return await call_next(request)
 
+        # Every data route sits under /api/. The rest is the web UI's page
+        # shell, which a browser loads with no pair, so it names no person
+        # and logs nothing.
+        if self._personal_partitions and not request.url.path.startswith("/api/"):
+            return await call_next(request)
+
         # Both ids are Keycloak UUIDs — validate format, normalize case.
         try:
             user_id = str(UUID(request.headers.get(HEADER_USER_ID, "").strip()))
             org_id = str(UUID(request.headers.get(HEADER_ORG_ID, "").strip()))
         except ValueError:
-            if self._enforce:
+            # Audit's pass-through is for a request that names nobody, the
+            # operator's. A pair the proxy sent but broke must never become
+            # the operator view.
+            named = HEADER_USER_ID in request.headers or HEADER_ORG_ID in request.headers
+            if self._enforce or (self._personal_partitions and named):
                 return JSONResponse({"detail": "Unauthorized"}, status_code=401)
             logger.warning(
                 "identity: no principal on %s %s (audit mode)",

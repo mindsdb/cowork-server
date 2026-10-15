@@ -11,12 +11,17 @@ stays while it is shared.
 
 ``unshare --skill <slug> --managed-dir <folder>`` removes the person's entry
 for that skill from the registry. The person's skill stays in their store.
+Both take ``--registry-stdout``, which prints the new registry instead of
+writing it (cowork.ops).
 
 ``snapshot [--project <name>]`` lists the skills the person's agent sees in a
 project (``general`` unless named), shared ones included, in anton's order of
 precedence, and prints one sha256 over them: the sha256 of the lines
-``<sha256 of SKILL.md>  <slug>/SKILL.md``, one per skill, sorted by slug, as
-``sha256sum`` prints them.
+``<sha256 of the file>  <slug>/<path in the skill>``, one per file of each
+skill, sorted by slug and path, as ``sha256sum`` prints them. Every file the
+agent can read counts, helper scripts and reference files included; a skill's
+``stats.json``, its hidden files and links don't, as for the files a turn
+hands the agent (cowork.services.skills._skill_wire_files).
 """
 
 from __future__ import annotations
@@ -28,22 +33,23 @@ import sys
 from pathlib import Path
 from typing import Literal
 
-from anton.core.tools.skill_format import SKILL_FILE
 from pydantic import BaseModel, ConfigDict
 
 from cowork.db.personal_resources import PersonalResource
 from cowork.managed import SharedSkill, SharedSkills, managed_folder, readonly_skill_dirs
 from cowork.ops import (
+    REGISTRY_ON_STDOUT,
     OperatorCommandError,
     Person,
     RegistryChange,
     add_person_arguments,
+    add_registry_stdout_argument,
+    finish_registry_change,
     managed_folder_at,
     person_from_arguments,
     personal_scope,
     read_registry,
     run_operator_command,
-    write_registry,
 )
 from cowork.services.projects import GENERAL_PROJECT
 from cowork.services.skills import (
@@ -57,12 +63,21 @@ from cowork.services.skills import (
 SkillSource = Literal["own", "host", "managed", "shared", "anton"]
 
 
+class SnapshotFile(BaseModel):
+    """One file of a skill: its path inside the skill's folder, and its sha256."""
+
+    model_config = ConfigDict(frozen=True)
+
+    path: str
+    sha256: str
+
+
 class SnapshotSkill(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     slug: str
     source: SkillSource
-    sha256: str
+    files: tuple[SnapshotFile, ...]
 
 
 class SkillSnapshot(BaseModel):
@@ -77,8 +92,9 @@ class SkillSnapshot(BaseModel):
     @property
     def sha256(self) -> str:
         manifest = "".join(
-            f"{skill.sha256}  {skill.slug}/{SKILL_FILE}\n"
+            f"{file.sha256}  {skill.slug}/{file.path}\n"
             for skill in sorted(self.skills, key=lambda skill: skill.slug)
+            for file in sorted(skill.files, key=lambda file: file.path)
         )
         return hashlib.sha256(manifest.encode("utf-8")).hexdigest()
 
@@ -97,6 +113,25 @@ class SkillSnapshot(BaseModel):
 
 def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _skill_files(skill_dir: Path) -> tuple[SnapshotFile, ...]:
+    """Every file of one skill the agent can read, by path inside the skill.
+
+    Leaves out what cowork.services.skills._skill_wire_files leaves out of a
+    turn: ``stats.json``, the store's private usage sidecar, which changes as
+    the skill is used; hidden files; and links. Unlike a turn's files, binary
+    and large files count, since the agent reads those too.
+    """
+    files: list[SnapshotFile] = []
+    for child in sorted(skill_dir.rglob("*")):
+        if not child.is_file() or child.is_symlink():
+            continue
+        relative = child.relative_to(skill_dir).as_posix()
+        if relative == "stats.json" or any(part.startswith(".") for part in relative.split("/")):
+            continue
+        files.append(SnapshotFile(path=relative, sha256=_file_sha256(child)))
+    return tuple(files)
 
 
 def snapshot_skills(*, person: Person, project: str) -> SkillSnapshot:
@@ -118,7 +153,7 @@ def snapshot_skills(*, person: Person, project: str) -> SkillSnapshot:
     found: dict[str, SnapshotSkill] = {}
     for skill in linked_turn_skills(service=service, project_name=project):
         found[skill.slug] = SnapshotSkill(
-            slug=skill.slug, source="own", sha256=_file_sha256(skill.path / SKILL_FILE)
+            slug=skill.slug, source="own", files=_skill_files(skill.path)
         )
     managed = managed_folder()
     readonly: list[tuple[SkillSource, list[Path]]] = [
@@ -131,9 +166,7 @@ def snapshot_skills(*, person: Person, project: str) -> SkillSnapshot:
         for skill_dir in skill_dirs:
             if skill_dir.name not in found:
                 found[skill_dir.name] = SnapshotSkill(
-                    slug=skill_dir.name,
-                    source=source,
-                    sha256=_file_sha256(skill_dir / SKILL_FILE),
+                    slug=skill_dir.name, source=source, files=_skill_files(skill_dir)
                 )
     return SkillSnapshot(person=person, project=project, skills=list(found.values()))
 
@@ -189,8 +222,9 @@ def share_skill(*, person: Person, slug: str, managed_dir: Path) -> RegistryChan
         # would reach nobody.
         raise OperatorCommandError(f"User {entry.user_id} already shares a skill named {slug}.")
     added = SharedSkill(user_id=person.user_id, partition_id=person.partition_id, skill=slug)
-    write_registry(path=path, registry=SharedSkills((*registry.root, added)))
-    return RegistryChange(entries=(added,), registry=path)
+    return RegistryChange(
+        entries=(added,), registry=path, updated=SharedSkills((*registry.root, added))
+    )
 
 
 def unshare_skill(*, person: Person, slug: str, managed_dir: Path) -> RegistryChange[SharedSkill]:
@@ -204,8 +238,7 @@ def unshare_skill(*, person: Person, slug: str, managed_dir: Path) -> RegistryCh
     if not removed:
         raise OperatorCommandError(f"User {person.user_id} shares no skill named {slug}.")
     kept = tuple(entry for entry in entries if entry not in removed)
-    write_registry(path=path, registry=SharedSkills(kept))
-    return RegistryChange(entries=removed, registry=path)
+    return RegistryChange(entries=removed, registry=path, updated=SharedSkills(kept))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -230,6 +263,7 @@ def main(argv: list[str] | None = None) -> int:
             type=Path,
             help="the managed folder, writable: the registry is its shared/skills.json",
         )
+        add_registry_stdout_argument(action)
     snapshot = actions.add_parser(
         "snapshot", help="print the skills the person's agent sees, with one sha256"
     )
@@ -247,16 +281,24 @@ def main(argv: list[str] | None = None) -> int:
             change = share_skill(
                 person=person, slug=arguments.skill, managed_dir=arguments.managed_dir
             )
-            return "\n".join(
+            target = REGISTRY_ON_STDOUT if arguments.registry_stdout else change.registry
+            message = "\n".join(
                 f"Shared skill {entry.skill} of user {person.user_id} with everyone, "
-                f"read-only: added it to {change.registry}."
+                f"read-only: added it to {target}."
                 for entry in change.entries
             )
-        change = unshare_skill(person=person, slug=arguments.skill, managed_dir=arguments.managed_dir)
-        return "\n".join(
-            f"Stopped sharing skill {entry.skill} of user {person.user_id}: removed it from "
-            f"{change.registry}. Their own skill stays in their store."
-            for entry in change.entries
+        else:
+            change = unshare_skill(
+                person=person, slug=arguments.skill, managed_dir=arguments.managed_dir
+            )
+            target = REGISTRY_ON_STDOUT if arguments.registry_stdout else change.registry
+            message = "\n".join(
+                f"Stopped sharing skill {entry.skill} of user {person.user_id}: removed it from "
+                f"{target}. Their own skill stays in their store."
+                for entry in change.entries
+            )
+        return finish_registry_change(
+            change, message=message, registry_stdout=arguments.registry_stdout
         )
 
     return run_operator_command(command)

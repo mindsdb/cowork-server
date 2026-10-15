@@ -9,32 +9,29 @@ and the desktop reads its vault as it always has.
 from __future__ import annotations
 
 import json
-import shutil
 import threading
-from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 from unittest.mock import MagicMock
 from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import SecretStr
 from sqlalchemy import delete
 
 # Imported at module scope on purpose: cowork.server builds an app at import
 # time (see tests/test_trusted_identity_local.py).
 import cowork.server as cowork_server
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.common.settings.user_settings import Provider, UserSettings, use_settings_scope
+from cowork.common.settings.user_settings import use_settings_scope
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError, TenantScope
 from cowork.db.session import get_open_session
-from cowork.harnesses.anton_harness import harness
 from cowork.harnesses.anton_harness.tools import _cowork_label_connection
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.principal import personal_partition_id
 from cowork.services.connectors.persist import turn_vault_for_scope, vault_for_scope
+from tests._turns import built_turn
 
 TOKEN = "partition-connections-test-token"
 DEPLOYMENT = "5f0c7d2e-8b1a-4c3e-9d4f-2a6b8c0e1f3a"
@@ -161,55 +158,13 @@ def test_a_persons_delete_never_drops_another_persons_record_lock(stack):
 # ── an in-process turn ──────────────────────────────────────────────────────
 
 
-@asynccontextmanager
-async def _turn_config(*, monkeypatch, tmp_path, scope: TenantScope | None, conversation_org: str | None):
-    """Build one in-process turn's session config, bound to ``scope``."""
-    saved = UserSettings(
-        _env_file=None,
-        planning_provider=Provider.OPENAI,
-        coding_provider=Provider.OPENAI,
-        router_provider=Provider.OPENAI,
-        planning_model="p", coding_model="c", router_model="r",
-        openai_api_key=SecretStr("test-only-key"),
-        episodic_memory=False,
-    )
-    monkeypatch.setattr("cowork.common.settings.user_settings.get_user_settings", lambda: saved)
-    monkeypatch.setattr(harness, "build_chat_session", lambda config: config)
-    monkeypatch.setenv("ANTON_SCRATCHPAD_PERSIST_SESSION", "false")
-
-    project_path = tmp_path / "projects" / f"p-{uuid4().hex[:6]}"
-    project_path.mkdir(parents=True)
-    with get_open_session() as db:
-        project = Project(name=project_path.name, path=str(project_path), org_id=conversation_org)
-        db.add(project)
-        db.commit()
-        conversation = Conversation(topic="connections", project_id=project.id, org_id=conversation_org)
-        db.add(conversation)
-        db.commit()
-        db.refresh(conversation)
-        with use_settings_scope(scope) if scope is not None else nullcontext():
-            config, scratch, _ = await harness.AntonHarness()._build_chat_session(conversation)
-        try:
-            yield config
-        finally:
-            if scratch:
-                shutil.rmtree(scratch, ignore_errors=True)
-            client = config.llm_client
-            for provider in (client.planning_provider, client.coding_provider, client.router_provider):
-                await provider._client.close()
-
-
 async def test_a_turn_sees_only_the_askers_connections(monkeypatch, stack):
     _save_sales(ALICE, secret="alice-secret")
 
-    async with _turn_config(
-        monkeypatch=monkeypatch, tmp_path=stack, scope=ALICE, conversation_org=PARTITION_A
-    ) as config:
-        assert _names(config.data_vault) == {("postgres", "sales")}
-    async with _turn_config(
-        monkeypatch=monkeypatch, tmp_path=stack, scope=BOB, conversation_org=PARTITION_B
-    ) as config:
-        assert _names(config.data_vault) == set()
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=stack, scope=ALICE) as turn:
+        assert _names(turn.config.data_vault) == {("postgres", "sales")}
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=stack, scope=BOB) as turn:
+        assert _names(turn.config.data_vault) == set()
 
 
 async def test_a_turn_bound_to_no_scope_is_refused(monkeypatch, stack):
@@ -221,7 +176,7 @@ async def test_a_turn_bound_to_no_scope_is_refused(monkeypatch, stack):
     _save_sales(LOCAL_SCOPE, secret="operator-secret")
 
     with pytest.raises(MissingTenantScopeError):
-        async with _turn_config(monkeypatch=monkeypatch, tmp_path=stack, scope=None, conversation_org=None):
+        async with built_turn(monkeypatch=monkeypatch, tmp_path=stack, scope=None):
             pass
 
 

@@ -53,9 +53,17 @@ class BearerTokenMiddleware(BaseHTTPMiddleware):
         self._exempt_paths = exempt_paths
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint):
-        # Always let CORS preflight through — the browser sends OPTIONS before
-        # the real request and never includes an Authorization header.
-        if request.method == "OPTIONS":
+        # Let a CORS preflight through: the browser sends OPTIONS before the
+        # real request and never includes an Authorization header. Only a
+        # genuine one, carrying Origin and Access-Control-Request-Method
+        # together, as TrustedHeaderMiddleware requires: an OPTIONS without
+        # them is an ordinary request, and passing it here would let it name
+        # a person in the identity headers with no token.
+        if (
+            request.method == "OPTIONS"
+            and request.headers.get("origin")
+            and request.headers.get("access-control-request-method")
+        ):
             return await call_next(request)
 
         if request.url.path in _EXEMPT_PATHS or request.url.path in self._exempt_paths:

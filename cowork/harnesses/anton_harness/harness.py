@@ -80,14 +80,13 @@ HOST_SKILLS_DIR = Path(__file__).parent / "skills"
 
 def _vault_scratch_dir() -> Path:
     """Where a turn's temporary folder is staged when it needs one: the
-    filtered data vault of a turn that disables one or more connections, the
     empty memory tiers of a turn with no person, and the links to the skills
     others share with the asker (see ``_new_turn_scratch_dir``).
 
     Local mode: cowork_home()/tmp, unchanged. Org mode: relocated off shared
     EFS storage by pod_local_only (see its docstring), because this directory
     carries no org_id segment: left on cowork_home() it would put every
-    organization's temporary vault contents under the same shared, readable
+    organization's temporary turn files under the same shared, readable
     location.
     """
     return pod_local_only(cowork_home() / "tmp", "tmp")
@@ -299,23 +298,6 @@ def _split_turn_into_rows(history_slice: list) -> list[dict]:
     from anton.cloud_turn.history_rows import split_turn_into_rows
 
     return split_turn_into_rows(history_slice)
-
-
-def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_dir: Path, LocalDataVault):
-    disabled_keys = {(d["engine"], d["name"]) for d in disabled_connections}
-    filtered = LocalDataVault(temp_dir)
-    for conn in source_vault.list_connections():
-        if (conn["engine"], conn["name"]) not in disabled_keys:
-            # The whole record, so each copy keeps its own secret classification
-            # (secure_keys) rather than falling back to the name heuristic.
-            record = source_vault.read_record(conn["engine"], conn["name"]) or {}
-            filtered.save(
-                conn["engine"],
-                conn["name"],
-                record.get("fields") or {},
-                secure_keys=record.get("secure_keys"),
-            )
-    return filtered
 
 
 def _picked_files_guidance(picked_by_connection: dict[str, list[dict]]) -> str:
@@ -1165,8 +1147,9 @@ class AntonHarness:
         skill_drafts_dir = anton_dir / "skill_drafts"
         context_dir = _settings_path(getattr(anton_settings, "context_dir", None), anton_dir / "context")
         episodes_dir = anton_dir / "episodes"
-        # The project's .anton/memory is created below only when it is this
-        # turn's project tier (person_turn_memory).
+        # In a personal partition the project's .anton/memory is never this
+        # turn's project tier (person_turn_memory); anton's Workspace above
+        # still creates it, empty.
         for directory in (artifacts_dir, skill_drafts_dir, context_dir, episodes_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
@@ -1223,9 +1206,8 @@ class AntonHarness:
             + attachment_context
         )
         output_context = (
-            # Artifacts now live in their own visible folder at the
-            # project root (`<base>/artifacts/<slug>/...`), one folder
-            # per output. The agent never picks the folder name itself
+            # Artifacts live under `<base>/.anton/artifacts/<slug>/`, one
+            # folder per output. The agent never picks the folder name itself
             # — it calls `create_artifact` to claim one, then writes
             # files into the absolute path the tool returns. Provenance
             # (which conversation, which turns) is tracked server-side
@@ -1259,12 +1241,13 @@ class AntonHarness:
             "The staged skill surfaces as a card the user explicitly saves or downloads; it is not saved until they do."
         )
 
-        # When connections are disabled, a temporary data vault is created because within Anton,
-        # the vault is used to inject a prompt related to the connected data sources.
-        # It lives in the turn's scratch folder, which the turn removes when it ends.
+        # When connections are disabled, the turn reads its vault through a
+        # FilteredDataVault that hides them, because anton lists the vault's
+        # connections in the prompt and in the agent's environment.
         data_vault = None
         turn_scratch_dir: Path | None = None
         if LocalDataVault is not None:
+            from cowork.services.connectors.layered_vault import FilteredDataVault
             from cowork.services.connectors.persist import turn_vault_for_scope
 
             # The asker's own connections, with the operator's managed ones
@@ -1276,9 +1259,9 @@ class AntonHarness:
             # the asker's own vault, stamped with its creator.
             source_vault = turn_vault_for_scope(current_settings_scope())
             if disabled_connections:
-                turn_scratch_dir = _new_turn_scratch_dir()
-                data_vault = _build_filtered_vault(
-                    source_vault, disabled_connections, turn_scratch_dir / "vault", LocalDataVault
+                data_vault = FilteredDataVault(
+                    source=source_vault,
+                    hidden=frozenset((d["engine"], d["name"]) for d in disabled_connections),
                 )
             else:
                 data_vault = source_vault
@@ -1420,8 +1403,10 @@ class AntonHarness:
                 self_awareness=self_awareness,
                 cortex=cortex,
                 # A turn that may not learn runs no end-of-turn memory pass
-                # either. Dropped by an anton that predates the field.
-                **supported_kwargs(ChatSessionConfig, background_memory=memory_layout.learns),
+                # either. Passed directly, as _turn_cortex passes managed_hc:
+                # every anton the floor admits has the field, and a dropped
+                # one would silently bring the memory passes back.
+                background_memory=memory_layout.learns,
                 # episodic=episodic,
                 system_prompt_context=SystemPromptContext(
                     runtime_context=build_runtime_context(anton_settings),

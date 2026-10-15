@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Mapping
 
+from pydantic import BaseModel, ConfigDict
 from redis.asyncio import Redis
 from redis.exceptions import WatchError
 
@@ -34,6 +36,25 @@ _TURNS_SET = "cowork:turns"
 
 def _turn_key(conversation_id: str) -> str:
     return f"cowork:turn:{conversation_id}"
+
+
+class TurnOwner(BaseModel):
+    """Who started a recorded turn: its org (a person's partition on a
+    trusted-identity deployment) and its user, None where the turn had none.
+
+    Built from a turn's hash in one place (``from_index``), so the owner check
+    never reads the hash's keys itself.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    org_id: str | None
+    user_id: str | None
+
+    @classmethod
+    def from_index(cls, turn: Mapping[str, str]) -> TurnOwner:
+        # record_turn writes "" for a missing id.
+        return cls(org_id=turn.get("org_id") or None, user_id=turn.get("user_id") or None)
 
 
 async def record_turn(

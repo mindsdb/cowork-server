@@ -23,7 +23,7 @@ from sqlmodel import Session
 # time (see tests/test_trusted_identity_local.py).
 import cowork.server as cowork_server
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
+from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.db.session import get_engine
 from cowork.models.project import Project
@@ -76,6 +76,18 @@ def _general(scope: TenantScope) -> Path:
         project = ProjectService(ScopedSession(raw, scope)).ensure_general_for_scope()
         assert project is not None
         return Path(project.path)
+
+
+def _general_id(scope: TenantScope) -> str:
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        return str(ProjectService(ScopedSession(raw, scope)).ensure_general_for_scope().id)
+
+
+def _with_port(folder: Path, port: int) -> Path:
+    """The artifact as a fullstack app whose backend listens on ``port``."""
+    meta = json.loads((folder / "metadata.json").read_text())
+    (folder / "metadata.json").write_text(json.dumps({**meta, "port": port}))
+    return folder
 
 
 def _artifact(project_dir: Path, slug: str, *, title: str, published_url: str = "") -> Path:
@@ -177,6 +189,24 @@ def test_export_by_path_reaches_only_the_owner(two_people):
     assert (dash / "report.html").is_file()
 
 
+def test_pdf_and_word_export_are_refused_in_a_personal_scope(two_people):
+    """Both converters embed the files the source HTML names, and a person's
+    HTML can name a file in another person's partition. Refused for the owner
+    as for anyone else, as /open and /reveal are; HTML export still works."""
+    dash, _notes = two_people
+    client = _client()
+
+    for fmt in ("pdf", "docx"):
+        body = {"path": str(dash / "index.html"), "format": fmt}
+        for headers in (A, B):
+            assert client.post("/api/v1/artifacts/export", json=body, headers=headers).status_code == 403
+    assert not (dash / "index.pdf").exists() and not (dash / "index.docx").exists()
+    html = client.post(
+        "/api/v1/artifacts/export", json={"path": str(dash / "report.md"), "format": "html"}, headers=A
+    )
+    assert html.status_code == 200
+
+
 def test_preview_mount_and_its_assets_reach_only_the_owner(two_people):
     dash, _notes = two_people
     body = {"path": str(dash / "index.html")}
@@ -223,9 +253,13 @@ def test_a_backend_preview_token_forwards_only_for_the_owner(two_people, monkeyp
         async def send(self, upstream_req, stream):
             return _Upstream()
 
-    async def running(_root, port, *, scope):
-        return True, "already_running", port
+    async def running(root, port, *, scope):
+        # A's backend, launched for A's project and slug.
+        project_root = str(root.parents[2].resolve())
+        artifacts._LAUNCHED_BACKENDS.setdefault(project_root, {})[root.name] = {"proc": _LiveProc(), "port": port}
+        return artifacts.BackendStatus(running=True, detail="already_running", port=port)
 
+    monkeypatch.setattr(artifacts, "_LAUNCHED_BACKENDS", {})
     monkeypatch.setattr(artifacts, "_ensure_backend_running", running)
     monkeypatch.setattr(preview_proxy, "get_proxy_client", _Client)
     client = _client()
@@ -238,6 +272,70 @@ def test_a_backend_preview_token_forwards_only_for_the_owner(two_people, monkeyp
     assert forwarded == []
     assert client.get(url, headers=A).status_code == 200
     assert forwarded == ["http://127.0.0.1:4242/data"]
+
+
+def test_the_proxy_forwards_only_to_the_callers_live_backend(stack, monkeypatch):
+    """B's iframe keeps its token after B's backend exits, and A's next launch
+    can take the freed port, which B's metadata.json still names. The proxy
+    then forwards B's requests to no backend but one launched for B: 503, so
+    the client mounts the preview again."""
+    from cowork.services import artifacts, preview_proxy
+
+    a_app = _with_port(_artifact(_general(ALICE), "app", title="A app"), 1)
+    b_app = _with_port(_artifact(_general(BOB), "app", title="B app"), 1)
+    procs: list[_LiveProc] = []
+    forwarded: list[str] = []
+
+    async def fake_launch(*, slug, artifact_folder, scratchpad_pool, tracked_backends, ds_env, health_timeout):
+        # bind(0) hands every launch the same freed port.
+        procs.append(_LiveProc())
+        tracked_backends[slug] = {"proc": procs[-1], "port": 5000, "pid": 5000, "log_path": ""}
+        return {"port": 5000, "pid": 5000}
+
+    class _Client:
+        def build_request(self, method, url, headers, content):
+            forwarded.append(url)
+            return (method, url)
+
+        async def send(self, upstream_req, stream):
+            return _Upstream()
+
+    monkeypatch.setattr("anton.core.artifacts.backend_launcher.launch_artifact_backend", fake_launch)
+    monkeypatch.setattr(artifacts, "_probe_port", lambda _port, **_kw: False)
+    monkeypatch.setattr(artifacts, "_LAUNCHED_BACKENDS", {})
+    monkeypatch.setattr(artifacts, "_BACKEND_LAUNCH_LOCKS", {})
+    monkeypatch.setattr(preview_proxy, "get_proxy_client", _Client)
+    client = _client()
+
+    b_mount = client.post("/api/v1/artifacts/preview-mount", json={"path": str(b_app / "index.html")}, headers=B)
+    [b_backend] = procs
+    b_backend.returncode = 0
+    a_mount = client.post("/api/v1/artifacts/preview-mount", json={"path": str(a_app / "index.html")}, headers=A)
+    for mounted in (b_mount, a_mount):
+        assert (mounted.status_code, mounted.json()["port"], mounted.json()["backendRunning"]) == (200, 5000, True)
+
+    assert client.get(f"/api/v1/artifacts/proxy/{b_mount.json()['token']}/data", headers=B).status_code == 503
+    assert forwarded == []
+    assert client.get(f"/api/v1/artifacts/proxy/{a_mount.json()['token']}/data", headers=A).status_code == 200
+    assert forwarded == ["http://127.0.0.1:5000/data"]
+
+
+def test_a_linked_artifacts_folder_reaches_no_one_elses_artifacts(two_people):
+    """B's agent can replace B's `.anton/artifacts` with a link to A's. The
+    path routes still reach none of A's artifacts through it."""
+    import shutil
+
+    dash, _notes = two_people
+    b_artifacts = _general(BOB) / ".anton" / "artifacts"
+    if b_artifacts.exists():
+        shutil.rmtree(b_artifacts)
+    b_artifacts.parent.mkdir(parents=True, exist_ok=True)
+    b_artifacts.symlink_to(dash.parent, target_is_directory=True)
+    primary = str(dash / "index.html")
+    client = _client()
+
+    assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=B).status_code == 404
+    assert client.get("/api/v1/artifacts/preview", params={"path": primary}, headers=A).status_code == 200
 
 
 def test_serve_by_project_name_reads_the_callers_own_project(two_people):
@@ -380,6 +478,22 @@ def test_the_operator_view_lists_no_persons_artifacts(two_people):
     folders = {Path(card["folder"]).resolve() for card in listed.json()}
     assert dash.resolve() not in folders and notes.resolve() not in folders
     assert not any(PARTITION_A in str(folder) for folder in folders)
+
+
+def test_the_operator_view_lists_no_persons_project_by_id(two_people):
+    """A card's serveUrl names its project by name alone, which the serve
+    route looks up in the unkeyed root, so the operator view can't serve a
+    person's cards. It is refused a person's project by id; the owner still
+    lists it."""
+    project_id = _general_id(ALICE)
+    client = _client()
+
+    refused = client.get("/api/v1/artifacts/", params={"project_id": project_id}, headers=BEARER)
+    mine = client.get("/api/v1/artifacts/", params={"project_id": project_id}, headers=A)
+
+    assert refused.status_code == 404
+    assert mine.status_code == 200
+    assert {card["slug"] for card in mine.json()} == {"dash", "notes"}
 
 
 # ── live backends ───────────────────────────────────────────────────────────
@@ -575,8 +689,9 @@ async def test_a_backend_launches_only_inside_the_callers_projects(stack, monkey
 
 def test_shared_projects_keep_todays_shared_artifacts(stack):
     """Projects left off COWORK_PERSONAL_RESOURCES stay in the unkeyed root,
-    where every person reads every artifact, as on today's stack."""
-    stack.setenv("COWORK_PERSONAL_RESOURCES", "")
+    where every person reads every artifact, as on today's stack. Memory stays
+    personal, as identity headers require."""
+    stack.setenv("COWORK_PERSONAL_RESOURCES", "memory")
     get_app_settings.cache_clear()
     root = Path(get_app_settings().project.root_dir)
     dash = _artifact(root / "shared-proj", "dash", title="Shared forecast")
@@ -589,6 +704,56 @@ def test_shared_projects_keep_todays_shared_artifacts(stack):
         assert preview.status_code == 200
         served = client.get("/api/v1/artifacts/serve/shared-proj/dash/index.html", headers=headers)
         assert served.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("personal", "status_code"),
+    [
+        (ALL_PERSONAL_RESOURCES - {PersonalResource.PROJECTS}, 409),
+        # Connections shared too: everyone's backend reads the one base vault,
+        # as on today's stack. Memory stays personal, as identity requires.
+        (frozenset({PersonalResource.MEMORY}), 200),
+    ],
+    ids=["connections-personal", "connections-shared"],
+)
+def test_shared_projects_with_personal_connections_refuse_a_live_backend(stack, monkeypatch, personal, status_code):
+    """With projects shared, A and B open the one artifact folder: one preview
+    token, and one metadata.json port the proxy follows, while a backend runs
+    with the connections of whoever launched it. Where connections are
+    personal, a live backend preview is refused for both, before any token
+    or launch; an HTML preview still mounts."""
+    from cowork.services import artifacts
+
+    stack.setenv("COWORK_PERSONAL_RESOURCES", ",".join(sorted(personal)))
+    get_app_settings.cache_clear()
+    root = Path(get_app_settings().project.root_dir)
+    app = _with_port(_artifact(root / "shared-proj", "app", title="Shared app"), 5000)
+    dash = _artifact(root / "shared-proj", "dash", title="Shared dash")
+    monkeypatch.setattr(
+        "anton.core.artifacts.backend_launcher.launch_artifact_backend",
+        lambda **_kw: pytest.fail("no backend launches here"),
+    )
+    monkeypatch.setattr(artifacts, "_probe_port", lambda _port, **_kw: True)
+    monkeypatch.setattr(artifacts, "_LAUNCHED_BACKENDS", {})
+    monkeypatch.setattr(artifacts, "_PREVIEW_MOUNTS", {})
+    client = _client()
+
+    for headers in (A, B):
+        mounted = client.post("/api/v1/artifacts/preview-mount", json={"path": str(app / "index.html")}, headers=headers)
+        assert mounted.status_code == status_code
+        static = client.post("/api/v1/artifacts/preview-mount", json={"path": str(dash / "index.html")}, headers=headers)
+        assert (static.status_code, static.json()["kind"]) == (200, "static")
+    if status_code == 409:
+        assert mounted.json()["detail"] == artifacts._SHARED_PROJECT_BACKEND_DETAIL
+        assert app.resolve() not in {path.resolve() for path in artifacts._PREVIEW_MOUNTS.values()}
+        # The agent can write a port into the static artifact's shared
+        # metadata.json; its token still forwards to no backend.
+        (dash / "metadata.json").write_text(json.dumps({"title": "Shared dash", "port": 5000}))
+        forwarded = client.get(f"/api/v1/artifacts/proxy/{static.json()['token']}/", headers=B)
+        assert forwarded.status_code == 409
+        assert forwarded.text == artifacts._SHARED_PROJECT_BACKEND_DETAIL
+    else:
+        assert mounted.json()["kind"] == "proxy"
 
 
 def test_desktop_previews_the_unkeyed_projects_root(monkeypatch, tmp_path):

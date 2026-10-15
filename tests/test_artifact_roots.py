@@ -367,13 +367,14 @@ def _personal(*, partition: str, user: str, resources=None) -> TenantScope:
 
 
 def test_sources_for_scope_lists_only_the_persons_own_projects(session, tmp_path, monkeypatch):
-    """A person's projects live under their partition, which the scan of the
-    unkeyed root never sees, so the list reads their rows instead. Another
-    person's project is not among them."""
+    """A person's list reads their project rows, as org mode does, so each
+    card carries its project id; the scan of their partition's projects root
+    would leave cards path-addressed. Another person's project is not among
+    them."""
     monkeypatch.setattr("cowork.services.artifact_roots._org_mode", lambda: False)
     monkeypatch.setattr(
         "cowork.services.artifact_roots.artifacts_sources_for_scan",
-        lambda: pytest.fail("a personal partition must not fall back to the unkeyed scan"),
+        lambda *, scope: pytest.fail("a personal partition must not fall back to the scan"),
     )
     mine = _project(session, tmp_path, name="alice-notes", org_id=PARTITION_A)
     _project(session, tmp_path, name="bob-notes", org_id=PARTITION_B)

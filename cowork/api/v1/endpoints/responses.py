@@ -33,7 +33,7 @@ from cowork.streaming import RunHandle, TurnInProgress, registry
 from cowork.streaming.answers import SubmitResult, broker
 from cowork.streaming.backend import get_backend
 from cowork.streaming.buffer import RedisStreamBuffer
-from cowork.streaming.turn_index import get_turn, list_turns
+from cowork.streaming.turn_index import TurnOwner, get_turn, list_turns
 from cowork.turnqueue.answers import RemoteAnswerResult, submit_remote_answer
 from cowork.turnqueue.redis_client import (
     STALLED_CANCEL_REASON,
@@ -85,11 +85,12 @@ def _authorized_handle(
     """
     if handle is None:
         return None
-    return handle if _owner_matches(handle.org_id, handle.user_id, scope) else None
+    owner = TurnOwner(org_id=handle.org_id, user_id=handle.user_id)
+    return handle if _owner_matches(owner, scope) else None
 
 
-def _owner_matches(org_id: str | None, user_id: str | None, scope: TenantScope) -> bool:
-    """Whether the caller may touch a turn owned by (org_id, user_id).
+def _owner_matches(owner: TurnOwner, scope: TenantScope) -> bool:
+    """Whether the caller may touch a turn ``owner`` started.
 
     Turns are personal — a conversation belongs to its creator — so wherever
     conversations are partitioned BOTH the org (or person's partition) and the
@@ -102,7 +103,7 @@ def _owner_matches(org_id: str | None, user_id: str | None, scope: TenantScope) 
     """
     if not scope.partitioned_for(PersonalResource.CONVERSATIONS):
         return True   # today's single-user behavior
-    return org_id == scope.org_id and user_id == scope.user_id
+    return owner.org_id == scope.org_id and owner.user_id == scope.user_id
 
 
 class SharedTurn(NamedTuple):
@@ -132,7 +133,7 @@ async def _shared_turn(
     if not conversation_id or get_backend() != "redis":
         return None
     turn = await get_turn(conversation_id)
-    if turn is None or not _owner_matches(turn.get("org_id") or None, turn.get("user_id") or None, scope):
+    if turn is None or not _owner_matches(TurnOwner.from_index(turn), scope):
         return None
     buf = RedisStreamBuffer(conversation_id=conversation_id, turn_id=int(turn["turn_id"]))
     await buf.refresh()
@@ -271,7 +272,7 @@ async def in_flight_list(scope: TenantScopeDep):
         seen = {row["conversation_id"] for row in out}
         for turn in await list_turns():
             cid = turn["conversation_id"]
-            if cid in seen or not _owner_matches(turn.get("org_id") or None, turn.get("user_id") or None, scope):
+            if cid in seen or not _owner_matches(TurnOwner.from_index(turn), scope):
                 continue
             buf = RedisStreamBuffer(conversation_id=cid, turn_id=int(turn["turn_id"]))
             await buf.refresh()

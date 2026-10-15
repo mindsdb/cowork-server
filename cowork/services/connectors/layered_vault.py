@@ -268,3 +268,69 @@ class ConnectingDataVault(LayeredDataVault):
         if fields is None or self.can_change(engine, name):
             return fields
         return {key: value for key, value in fields.items() if key in LABEL_FIELDS}
+
+
+class FilteredDataVault:
+    """A turn's vault without the connections its conversation turned off.
+
+    Every read skips a ``hidden`` (engine, name) as if nobody had saved it,
+    so the agent's environment, its connection listing and anton's match
+    of a pasted connection never see it. A save or delete goes to
+    ``source`` unchanged, so what the agent saves in the turn lands where it
+    would with nothing turned off and outlives the turn, and a
+    LayeredDataVault source still refuses a change to a connection the
+    asker can't change.
+    """
+
+    def __init__(self, *, source: DataVault, hidden: frozenset[tuple[str, str]]) -> None:
+        self._source = source
+        self._hidden = hidden
+
+    def _hides(self, engine: str, name: str) -> bool:
+        return (engine, name) in self._hidden
+
+    def save(
+        self,
+        engine: str,
+        name: str,
+        credentials: dict[str, str],
+        *,
+        secure_keys: list[str] | None = None,
+    ) -> object:
+        return self._source.save(engine, name, credentials, secure_keys=secure_keys)
+
+    def load(self, engine: str, name: str) -> dict[str, str] | None:
+        return None if self._hides(engine, name) else self._source.load(engine, name)
+
+    def read_record(self, engine: str, name: str) -> dict[str, Any] | None:
+        return None if self._hides(engine, name) else self._source.read_record(engine, name)
+
+    def delete(self, engine: str, name: str) -> bool:
+        return self._source.delete(engine, name)
+
+    def list_connections(self) -> list[dict[str, str]]:
+        return [
+            entry
+            for entry in self._source.list_connections()
+            if not self._hides(entry["engine"], entry["name"])
+        ]
+
+    def env_for(self, engine: str, name: str, *, flat: bool = False) -> dict[str, str] | None:
+        return None if self._hides(engine, name) else self._source.env_for(engine, name, flat=flat)
+
+    def inject_env(self, engine: str, name: str, *, flat: bool = False) -> list[str] | None:
+        return None if self._hides(engine, name) else self._source.inject_env(engine, name, flat=flat)
+
+    def clear_ds_env(self) -> None:
+        self._source.clear_ds_env()
+
+    def for_connecting(self) -> FilteredDataVault:
+        """This vault as anton's connect_new_datasource matches a new
+        connection against it: over the source's ConnectingDataVault where
+        the source is a LayeredDataVault, with the same connections hidden."""
+        source = (
+            self._source.for_connecting()
+            if isinstance(self._source, LayeredDataVault)
+            else self._source
+        )
+        return FilteredDataVault(source=source, hidden=self._hidden)

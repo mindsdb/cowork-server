@@ -233,9 +233,9 @@ def artifacts_sources_for_scope(session: ScopedSession) -> list[ProjectArtifacts
     """Every artifacts root the caller can read, across their organization's
     projects. In org mode that is each project's shared base (ENG-2056) plus the
     caller's own legacy conversation workspaces. In a person's partition it is
-    each of that person's projects, read from the database like org mode: the
-    filesystem scan sees only the unkeyed projects root, which holds no
-    partition's projects.
+    each of that person's projects, read from the database like org mode, so
+    every card carries its project id; the scan of the partition's projects
+    root would leave cards path-addressed.
 
     Used by the unparameterized artifacts list, which the frontend calls with no
     project filter. In local mode, and for a scope that keeps projects shared,
@@ -339,9 +339,9 @@ def artifacts_sources_for_scan(*, scope: TenantScope | None) -> list[ProjectArti
     """
     sources: list[ProjectArtifacts] = []
     for base in _scan_artifact_dirs(scope=scope):
-        # ``_scan_artifact_dirs`` historically follows directory links in its
-        # ``is_dir`` probe.  Do not let such a root become an authorization
-        # source; ordinary desktop directories retain the exact same shape.
+        # ``_scan_artifact_dirs`` skips a linked root too; this list repeats
+        # the check because it is an authorization source, so a linked root
+        # never becomes one. Ordinary desktop directories keep the same shape.
         if not _storage_components_are_safe(base.parent.parent, may_be_absent=False):
             continue
         project_path = base.parent.parent

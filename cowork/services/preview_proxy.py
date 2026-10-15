@@ -29,7 +29,14 @@ from starlette.responses import PlainTextResponse, Response, StreamingResponse
 
 from cowork.common.http_client import get_proxy_client
 from cowork.db.scoped import TenantScope
-from cowork.services.artifacts import _NO_EXEC_DETAIL, _org_mode, preview_mount_for
+from cowork.services.artifacts import (
+    _NO_EXEC_DETAIL,
+    _SHARED_PROJECT_BACKEND_DETAIL,
+    _backends_cross_people,
+    _org_mode,
+    backend_port_is_the_callers,
+    preview_mount_for,
+)
 from cowork.services.comments_layer import ACTIVATION_PARAM
 from cowork.services.preview_html import prepare_preview_html
 
@@ -121,7 +128,10 @@ async def proxy_artifact_request(
     (`preview_mount_for`), as on `/preview-asset`: a token is a stable
     hash of the artifact's path, so presenting another person's must not
     forward a request to their live backend, which runs with their
-    connection secrets.
+    connection secrets. For the same reason, where projects are
+    partitioned the port must still be the caller's own live backend's
+    (`backend_port_is_the_callers`); otherwise the answer is 503 and the
+    client mounts the preview again.
     """
     cors = _cors_headers(request)
 
@@ -153,8 +163,15 @@ async def proxy_artifact_request(
             status_code=404,
             headers=cors,
         )
+    # A static preview's token still reaches here, and the agent can write a
+    # `port` into the shared metadata.json. Where one backend would serve
+    # several people's connections, forward to none (as mount_preview does).
+    if _backends_cross_people():
+        return PlainTextResponse(_SHARED_PROJECT_BACKEND_DETAIL, status_code=409, headers=cors)
     backend_port = _read_backend_port(artifact_dir)
-    if backend_port is None:
+    if backend_port is None or not backend_port_is_the_callers(
+        artifact_dir, port=backend_port, scope=scope
+    ):
         return PlainTextResponse(
             "Artifact backend is not running yet",
             status_code=503,

@@ -5,6 +5,8 @@ person a partition (cowork.principal.personal_partition_id).
 COWORK_PERSONAL_RESOURCES names the resources that live in it. A resource left
 off stays shared across the deployment exactly as it is with the setting off:
 its rows keep a NULL org_id and its files stay under the base storage roots.
+create_app refuses a list without ``memory``, whose shared store every
+person's turns would learn into and read back.
 Hosted org tenancy partitions every resource and never reads the list.
 
 ``MODEL_RESOURCE`` and ``STORE_RESOURCE`` are how cowork.db.scoped finds the

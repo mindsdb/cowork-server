@@ -78,6 +78,7 @@ def _skill_response(
     visible: VisibleSkill, *, access: SharedResourceAccess, service: SkillService
 ) -> dict:
     skill = visible.skill
+    shared = visible.shared
     if visible.origin is SkillOrigin.MANAGED:
         # The operator's managed skill: built-in and read-only for every
         # caller, and authored by nobody here.
@@ -102,12 +103,17 @@ def _skill_response(
         pending = access.claim_is_pending(SKILL, skill.name)
         creator_id = access.creator_id(SKILL, skill.name)
         builtin = is_builtin_skill(skill.name)
+        theirs = not service.may_change(skill)
         can_change = (
             not pending
             and not (builtin and _builtins_immutable(access.session.scope))
             and access.can_change(creator_id)
-            and service.may_change(skill)
+            and not theirs
         )
+        # Where skills are left shared, the base store holds everyone's
+        # skills, and one the caller didn't create is shared with them,
+        # read-only, as a skill someone shares is where skills are personal.
+        shared = shared or theirs
     return SkillResponse(
         id=skill.id,
         label=skill.label,
@@ -125,7 +131,7 @@ def _skill_response(
             fallback_modified_at=skill.updated_at,
         ),
         is_builtin=builtin,
-        shared=visible.shared,
+        shared=shared,
         capabilities=SkillCapabilities(
             can_edit=can_change,
             can_delete=can_change,

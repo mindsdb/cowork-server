@@ -25,7 +25,13 @@ from cowork.common.paths import (
 )
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
-from cowork.db.scoped import ScopedSession, TenantScope, scoped_storage_root, unsafe_unscoped_session
+from cowork.db.scoped import (
+    ScopedSession,
+    TenantScope,
+    scoped_storage_root,
+    tenant_scope_required,
+    unsafe_unscoped_session,
+)
 from cowork.models.project import Project
 from cowork.services.shared_resources import RESOURCE_LOCK_TIMEOUT_SECONDS
 
@@ -99,7 +105,17 @@ def _rename_rewrites_skill_store(scope: TenantScope) -> bool:
     no wider than the project's own partition. With projects shared and
     skills personal that is the renamer's own store, and other people's
     skills keep the old project name.
+
+    A deployment that trusts identity headers decides from its own list, not
+    from the scope: the operator view (LOCAL_SCOPE) partitions nothing, yet
+    its rename of a base project would still rewrite the one shared store.
     """
+    settings = get_app_settings()
+    if settings.trust_identity_headers:
+        personal = settings.personal_resources
+        return not (
+            PersonalResource.PROJECTS in personal and PersonalResource.SKILLS not in personal
+        )
     return not (
         scope.partitioned_for(PersonalResource.PROJECTS)
         and not scope.partitioned_for(PersonalResource.SKILLS)
@@ -120,6 +136,14 @@ class ProjectNameLockBusyError(Exception):
 
 class ProjectPathNotAllowedError(ValueError):
     """A caller chose a project folder on a deployment that does not allow one."""
+
+
+class ProjectInUseError(Exception):
+    """Another person still has conversations or schedules in a shared project.
+
+    Not a `ValueError`, which the endpoints map to 400: the request is fine,
+    and the endpoint answers 409 until those rows are gone.
+    """
 
 
 @dataclass
@@ -680,14 +704,13 @@ class ProjectService:
 
         The tenancy refusal comes before any filesystem access on purpose: an
         org deployment does not run on the caller's machine, so statting a
-        path it chose would answer whether that server path exists. A person's
-        partition refuses for the same reason, and because an adopted server
-        folder would sit outside that person's projects root.
+        path it chose would answer whether that server path exists. A
+        deployment that trusts identity headers refuses for the same reason,
+        whoever asks and whatever it keeps per person: a person's adopted
+        server folder would sit outside their projects root, and skill links
+        reach no adopted folder there (skill_links._external_project_dirs).
         """
-        if (
-            get_app_settings().tenancy_mode == "org"
-            or self.session.scope.partitioned_for(PersonalResource.PROJECTS)
-        ):
+        if tenant_scope_required():
             raise ProjectPathNotAllowedError(
                 "Choosing a project folder is not available on this deployment"
             )
@@ -1093,6 +1116,7 @@ class ProjectService:
             return False
         if project.name == GENERAL_PROJECT:
             raise ValueError("Cannot delete the General project")
+        self._refuse_while_others_use(project_id)
         # Cascade to the project's conversations FIRST (ENG-701). Deleting a
         # project used to only rmtree its dir + drop the row, orphaning every
         # conversation in it — and their messages, events, task objects, and
@@ -1198,6 +1222,18 @@ class ProjectService:
                 conversation_stage,
                 cleanup_project_files=staged_path is None,
             )
+        try:
+            from cowork.services.memory import remove_project_memory_tiers
+
+            remove_project_memory_tiers(scope=self.session.scope, project_id=project_id)
+        except Exception:
+            # Committed already, like the tombstone below: a tier left behind
+            # is listed nowhere and goes with `cowork.ops.memory clear`, never
+            # with a retry.
+            logger.exception(
+                "Could not remove the deleted project's memory tiers",
+                extra=log_context(project_id=project_id),
+            )
         if staged_path is not None and staged_path.exists():
             try:
                 self._rmtree_in_root(staged_path)
@@ -1210,6 +1246,43 @@ class ProjectService:
                     staged_path,
                 )
         return True
+
+    def _refuse_while_others_use(self, project_id: UUID) -> None:
+        """Raise ProjectInUseError while a shared project holds another
+        partition's conversations or schedules.
+
+        A person's delete reaches only rows their scope can delete. The
+        scoped select misses another person's conversations, which the
+        ``conversations.project_id`` foreign key then refuses on Postgres, or
+        which are left pointing at nothing on SQLite; and the schedules
+        cascade loads another person's schedule, which the flush hook refuses.
+        Only where projects are shared and the rows are not; the read goes
+        through the unscoped session, since the scoped one can't see them.
+        """
+        scope = self.session.scope
+        if not scope.personal or scope.partitioned_for(PersonalResource.PROJECTS):
+            return
+        from cowork.models.conversation import Conversation
+        from cowork.models.schedule import Schedule
+
+        raw = unsafe_unscoped_session(self.session)
+        for model, resource in (
+            (Conversation, PersonalResource.CONVERSATIONS),
+            (Schedule, PersonalResource.SCHEDULES),
+        ):
+            if not scope.partitioned_for(resource):
+                continue
+            others = raw.execute(
+                sa.select(model.id)
+                .where(model.project_id == project_id)
+                .where(model.org_id.is_distinct_from(scope.org_id))
+                .limit(1)
+            ).first()
+            if others is not None:
+                raise ProjectInUseError(
+                    "Other people still have conversations or schedules in this "
+                    "project. It can be deleted once theirs are gone."
+                )
 
     def get_active_project(self) -> Project:
         project = self.session.exec(

@@ -39,7 +39,7 @@ from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResourc
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_open_session
 from cowork.harnesses.anton_harness.harness import HOST_SKILLS_DIR
-from cowork.managed import readonly_skill_dirs
+from cowork.managed import SharedSkills, readonly_skill_dirs
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.skill import META_CREATED_BY
@@ -477,6 +477,25 @@ def test_only_registry_entries_of_existing_skills_are_read(sharing, scoped):
     assert created["id"] == "never-made"
 
 
+def test_one_rename_reads_the_registry_once(sharing, scoped, monkeypatch):
+    """One request reads ``shared/skills.json`` once, however many of its
+    checks ask what is shared, as the registry's read_live is documented."""
+    SkillService(ALICE).create_skill("notes", "Alice's notes.")
+    reads: list[Path] = []
+    read_live = SharedSkills.read_live.__func__
+
+    def counted(cls, path, *, logger):
+        reads.append(path)
+        return read_live(cls, path, logger=logger)
+
+    monkeypatch.setattr(SharedSkills, "read_live", classmethod(counted))
+
+    renamed = skills_ep.update_skill("notes", SkillUpdateRequest(label="notes-v2"), scoped(ALICE), None)
+
+    assert renamed["id"] == "notes-v2"
+    assert reads == [sharing.shared_skills_file]
+
+
 def test_a_malformed_registry_shares_nothing_and_says_so(sharing, scoped, caplog, owned_logger):
     sharing.shared_skills_file.write_text('{"not": "a list"}')
     owned_logger("cowork.services.skills", level=logging.ERROR)
@@ -527,14 +546,17 @@ def test_where_all_are_shared_only_the_creator_changes_a_skill(all_shared, scope
     _every_change_but_create_is_refused(scoped, BOB_SHARED, "team-notes")
     _every_change_but_create_is_refused(scoped, ALICE_SHARED, "bob-upload")
 
-    # Everyone lists it, and the capabilities say who can change it.
-    for scope, capabilities in (
-        (BOB_SHARED, NO_CAPABILITY),
-        (LOCAL_SCOPE, EVERY_CAPABILITY),
-        (ALICE_SHARED, EVERY_CAPABILITY),
+    # Everyone lists it, and the capabilities say who can change it. Bob
+    # reads Alice's as shared with him, read-only.
+    for scope, capabilities, shared in (
+        (BOB_SHARED, NO_CAPABILITY, True),
+        (LOCAL_SCOPE, EVERY_CAPABILITY, False),
+        (ALICE_SHARED, EVERY_CAPABILITY, False),
     ):
         listed = _listed(scoped, scope)["team-notes"]
-        assert (listed["capabilities"], listed["shared"]) == (capabilities, False)
+        assert (listed["capabilities"], listed["shared"]) == (capabilities, shared)
+        read = skills_ep.get_skill("team-notes", scoped(scope), None)
+        assert (read["capabilities"], read["shared"]) == (capabilities, shared)
 
     alice = scoped(ALICE_SHARED)
     skills_ep.update_skill("team-notes", SkillUpdateRequest(instructions="Changed."), alice, None)

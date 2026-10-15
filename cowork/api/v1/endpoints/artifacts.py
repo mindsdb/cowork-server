@@ -52,6 +52,7 @@ from cowork.services.artifact_roots import (
     artifacts_sources_for_scan,
 )
 from cowork.services.artifacts import (
+    BackendPreviewRefused,
     ExecutionRefused,
     _org_mode,
     _project_artifacts_base,
@@ -228,8 +229,27 @@ def _scoped_project_cards(session, project_ref: str) -> list[dict]:
     the scoped server catalog, so root discovery still receives server-owned
     identity rather than the request string.
     """
-    _server_project_id, sources = _scoped_project_sources(session, project_ref)
+    server_project_id, sources = _scoped_project_sources(session, project_ref)
+    _refuse_a_persons_project_in_the_operator_view(session, server_project_id)
     return _artifact_cards(session, sources)
+
+
+def _refuse_a_persons_project_in_the_operator_view(session, project_id: UUID) -> None:
+    """The operator view (no person, so LOCAL_SCOPE) lists every project row,
+    but a card's serveUrl names its project by name alone, which the serve
+    route looks up in the unkeyed projects root. A person's project, a row
+    with an org_id, would list cards that serve 404 or the deployment's own
+    same-named artifact, so the operator view is refused it."""
+    if session.scope.partitioned:
+        return
+    if ProjectService(session).get_project(project_id).org_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                "This project is a person's own; the operator view lists only "
+                "the deployment's artifacts."
+            ),
+        )
 
 
 def _all_artifact_cards(session) -> list[dict]:
@@ -917,13 +937,15 @@ async def export_artifact_endpoint(req: _ExportBody, scope: ScopeDep):
     from cowork.services.artifacts import _org_mode
 
     fmt = (req.format or "").lower().lstrip(".")
-    if fmt in ("pdf", "docx") and _org_mode():
+    if fmt in ("pdf", "docx") and (_org_mode() or scope.personal):
         # Both converters resolve URIs referenced in the source HTML to embed
         # them in the output: xhtml2pdf fetches <img>/<link>/@import for PDF;
         # htmldocx's image handling calls urllib.request.urlopen for docx. The
         # source HTML is artifact content from the shared filesystem, written
         # by any org's agent, so this is an SSRF and local-file-read primitive
         # (including other orgs' trees) into a file the requester downloads.
+        # A person's partition is refused the same way, as /open and /reveal
+        # are: their HTML can name a file in another person's partition.
         # Plain HTML export does no such resolution, so it stays available.
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -954,6 +976,8 @@ async def preview_mount_endpoint(req: _PathBody, request: Request, scope: ScopeD
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
         payload = await mount_preview(artifact, scope=scope)
+    except BackendPreviewRefused as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=415, detail=str(e))
 

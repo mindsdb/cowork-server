@@ -37,16 +37,18 @@ from sqlalchemy import delete
 
 import cowork.server as cowork_server
 from cowork.api.v1.endpoints.connectors import connections as connections_ep
+from cowork.api.v1.endpoints.connectors import submissions as submissions_ep
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import use_settings_scope
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope, scope_from_principal, service_principal_for
 from cowork.db.session import get_open_session
-from cowork.harnesses.anton_harness.tools import _cowork_label_connection
+from cowork.handlers.probe import ProbeHandler
+from cowork.harnesses.anton_harness.tools import _cowork_label_connection, _cowork_request_credentials
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.principal import personal_partition_id
-from cowork.schemas.connectors import DirectSaveRequest, PatchPickedFilesBody
+from cowork.schemas.connectors import DirectSaveRequest, PatchPickedFilesBody, SubmitFormRequest
 from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.layered_vault import (
     CREATED_BY_FIELD,
@@ -57,6 +59,7 @@ from cowork.services.connectors.layered_vault import (
 )
 from cowork.services.connectors.persist import (
     own_vault_for_scope,
+    own_vault_root,
     persist_connection,
     set_connection_label,
     turn_vault_for_scope,
@@ -345,6 +348,115 @@ def test_bobs_save_whose_derived_name_lands_on_the_shared_one_answers_403(sharin
     assert own_vault_for_scope(BOB).list_connections() == []
 
 
+# A handcrafted connect in two steps: app credentials first, then the
+# tokens of the OAuth grant, added to the same connection (`extends`).
+ACME_APP = {"client_id": "acme-client", "client_secret": "acmeAppSecret1"}
+ACME_GRANT = {"access_token": "acme-access-1", "refresh_token": "acme-refresh-1"}
+
+
+def _share_alices_acme(managed_dir) -> None:
+    persist_connection("acme_crm", "app", "acme", dict(ACME_APP), scope=ALICE)
+    _write_registry(
+        managed_dir,
+        [_entry(sub=SUB_A, partition=PARTITION_A, name="acme", engine="acme_crm")],
+    )
+
+
+def _grant_step(name: str) -> SubmitFormRequest:
+    """The connect's second form, adding the grant's tokens to ``name``."""
+    return SubmitFormRequest(
+        name=name,
+        values=dict(ACME_GRANT),
+        form_spec={
+            "form_id": "fm_acmegrant1",
+            "engine": "acme_crm",
+            "fields": [],
+            "_extends_connection": name,
+            "_existing_name": name,
+        },
+    )
+
+
+async def _streamed(response) -> str:
+    return "".join([chunk async for chunk in response.body_iterator])
+
+
+def _vault_files(scope: TenantScope) -> dict[str, bytes]:
+    root = own_vault_root(scope)
+    return {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+
+async def test_bobs_later_step_naming_alices_shared_connection_is_refused(sharing, monkeypatch):
+    """Bob's vault reads Alice's shared connection, so its record would
+    merge into his step. The submission answers 403 before anything is
+    staged; the save itself is refused too, so the probe saves nothing.
+    Alice's record and secrets stay byte for byte, and Bob's vault stays
+    empty."""
+    _share_alices_acme(sharing)
+    before = _vault_files(ALICE)
+
+    submission_id = submissions_ep.store.stage(
+        form_id="fm_acmegrant1",
+        connector_id="acme_crm",
+        conversation_id=None,
+        values=dict(ACME_GRANT),
+        form_spec=_grant_step("acme").form_spec,
+    )
+    probed = "".join(
+        [event async for event in ProbeHandler(scope=BOB).run(submission_id, "acme_crm", None, "acme", None)]
+    )
+    assert f"Could not save: `{SHARED_CONNECTION_REFUSAL}`" in probed
+    staged: list = []
+    monkeypatch.setattr(submissions_ep.store, "stage", lambda **kwargs: staged.append(kwargs))
+
+    await _refused_async(lambda: submissions_ep.submit_form(_grant_step("acme"), BOB))
+
+    assert staged == []
+    assert _vault_files(ALICE) == before
+    assert own_vault_for_scope(BOB).list_connections() == []
+
+
+async def test_alice_adds_a_later_step_to_her_own_shared_connection(sharing):
+    _share_alices_acme(sharing)
+
+    response = await submissions_ep.submit_form(_grant_step("acme"), ALICE)
+
+    assert "Saved as `acme`" in await _streamed(response)
+    stored = _stored(ALICE, "acme", "acme_crm")
+    assert {key: stored[key] for key in {**ACME_APP, **ACME_GRANT}} == {**ACME_APP, **ACME_GRANT}
+    assert stored[CREATED_BY_FIELD] == SUB_A
+    assert vault_for_scope(BOB).load("acme_crm", "acme")["access_token"] == ACME_GRANT["access_token"]
+
+
+async def test_a_later_step_adds_to_a_persons_own_connection(trusted):
+    persist_connection("acme_crm", "app", "acme", dict(ACME_APP), scope=BOB)
+
+    response = await submissions_ep.submit_form(_grant_step("acme"), BOB)
+
+    assert "Saved as `acme`" in await _streamed(response)
+    assert [c["name"] for c in own_vault_for_scope(BOB).list_connections()] == ["acme"]
+    stored = _stored(BOB, "acme", "acme_crm")
+    assert {key: stored[key] for key in {**ACME_APP, **ACME_GRANT}} == {**ACME_APP, **ACME_GRANT}
+    assert stored[CREATED_BY_FIELD] == SUB_B
+
+
+async def test_bob_is_offered_no_later_step_for_alices_shared_connection(sharing):
+    """The agent's form for a later step reads Bob's vault, which holds
+    Alice's shared connection. Its submission would answer 403, so no form
+    renders for it; Alice still gets hers."""
+    _share_alices_acme(sharing)
+    step = {"engine": "acme_crm", "title": "Finish", "extends_connection": "acme"}
+
+    with use_settings_scope(BOB):
+        bobs = await _cowork_request_credentials(None, dict(step))
+    with use_settings_scope(ALICE):
+        alices = await _cowork_request_credentials(None, dict(step))
+
+    assert "data-vault-form" not in bobs
+    assert "shared with the user" in bobs
+    assert '"_extends_connection": "acme"' in alices
+
+
 async def test_alice_changes_her_shared_connection_and_bob_sees_each_change(sharing, monkeypatch):
     revoked = []
     monkeypatch.setattr(
@@ -411,6 +523,7 @@ async def test_bobs_pasted_connection_with_a_shared_ones_database_is_his_own(sha
     connection Alice shares is a new connection of Bob's own, not a change to
     hers, and its label is de-duplicated against hers."""
     assert ConnectionsService(ALICE).patch_token("postgres", "erp", {"database": "postgres"})
+    assert set_connection_label("postgres", "erp", "postgres", scope=ALICE) == "postgres"
     alices = own_vault_for_scope(ALICE).read_record("postgres", "erp")
     assert alices["fields"]["_user_label"] == "postgres"
 
@@ -425,6 +538,34 @@ async def test_bobs_pasted_connection_with_a_shared_ones_database_is_his_own(sha
     assert (stored["host"], stored[CREATED_BY_FIELD]) == ("bob-db.example", SUB_B)
     assert stored["_user_label"] == "postgres 2"
     assert own_vault_for_scope(ALICE).read_record("postgres", "erp") == alices
+
+
+async def test_with_a_connection_turned_off_bobs_paste_is_still_his_own(sharing, monkeypatch, stores):
+    """A conversation with any connection turned off reads the turn's vault
+    without it. A paste with the database of Alice's shared connection is
+    still a new connection of Bob's own, saved to his vault, never a change
+    to hers; and the one he turned off stays hidden for the turn."""
+    assert ConnectionsService(ALICE).patch_token("postgres", "erp", {"database": "postgres"})
+    persist_connection("mysql", None, "old", {"host": "old.example"}, scope=BOB)
+    alices = _vault_files(ALICE)
+
+    async with built_turn(
+        monkeypatch=monkeypatch,
+        tmp_path=stores,
+        scope=BOB,
+        disabled_connections=[{"engine": "mysql", "name": "old"}],
+    ) as turn:
+        listed = _names(turn.config.data_vault)
+        assert ("postgres", "erp") in listed and ("mysql", "old") not in listed
+        connected = await _connect_in_chat(turn, monkeypatch, known_variables=dict(BOBS_DB))
+        assert connected.session_vault is turn.config.data_vault
+
+    assert connected.answer.startswith("Saved connection"), connected.answer
+    [bobs] = [c["name"] for c in own_vault_for_scope(BOB).list_connections() if c["engine"] == "postgres"]
+    stored = _stored(BOB, bobs)
+    assert (stored["host"], stored[CREATED_BY_FIELD]) == ("bob-db.example", SUB_B)
+    assert _stored(BOB, "old", "mysql")["host"] == "old.example"
+    assert _vault_files(ALICE) == alices
 
 
 async def test_where_all_are_shared_a_pasted_connection_never_lands_on_someone_elses(
@@ -657,7 +798,7 @@ async def test_a_turn_with_no_person_changes_no_saved_connection(all_shared, mon
 
     for name in ("erp", "alices"):
         assert _stored(LOCAL_SCOPE, name)["password"] == ERP["password"]
-        assert _stored(LOCAL_SCOPE, name)["_user_label"] != "Run's"
+        assert _stored(LOCAL_SCOPE, name).get("_user_label") != "Run's"
     assert CREATED_BY_FIELD not in _stored(LOCAL_SCOPE, "from-the-run", "mysql")
     # The operator view's own request still changes them.
     assert set_connection_label("postgres", "erp", "Ops", scope=LOCAL_SCOPE) == "Ops"

@@ -675,10 +675,19 @@ def _conversation_workspace_ok(
     rel_posix: str, scoped: ScopedSession, cache: dict | None = None
 ) -> bool:
     """`conversations/<id>/…` is a per-conversation PRIVATE workspace even
-    though the project directory is org-shared, so only that conversation's
-    owner may list/read/write/delete inside it. Anything else is a shared
-    project file. Local mode has one user, so nothing is gated."""
-    if not scoped.scope.org_mode:
+    though the project directory is shared, so only that conversation's owner
+    may list/read/write/delete inside it: in org mode, and in a project a
+    trusted-identity deployment shares while it keeps conversations per person.
+    Anything else is a shared project file. Elsewhere nothing is gated: the
+    desktop has one user, the operator view reads everyone's, and a personal
+    partition's own projects hold only that person's conversations."""
+    scope = scoped.scope
+    shared_project_private_conversations = (
+        scope.personal
+        and scope.partitioned_for(PersonalResource.CONVERSATIONS)
+        and not scope.partitioned_for(PersonalResource.PROJECTS)
+    )
+    if not (scope.org_mode or shared_project_private_conversations):
         return True
     parts = rel_posix.split("/", 2)
     if len(parts) < 2 or parts[0] != CONVERSATIONS_DIRNAME:

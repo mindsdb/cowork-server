@@ -11,6 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
+from functools import cached_property
 from pathlib import Path
 from typing import NamedTuple
 from uuid import uuid4
@@ -513,7 +514,10 @@ class SkillService:
     read-only; the creator still changes theirs, except its name while it is
     shared. Where skills are shared, a person changes only a skill they
     created, and the operator view any (may_change). All of it is the
-    general store's alone: the Code store's skills are never shared.
+    general store's alone: the Code store records no creator and is never in
+    the registry. With skills left shared it is one store with no creator
+    rule, which only a caller on the server's own host reaches: its routes
+    are LoopbackDesktopOnly.
     """
 
     store_name = "skills"
@@ -637,10 +641,13 @@ class SkillService:
     def is_managed_skill(self, slug: str) -> bool:
         return slug in self.managed_skill_dirs()
 
+    @cached_property
     def _sharing(self) -> _Sharing:
         """What this store's owner shares and is shared, read live from the
         managed folder's ``shared/skills.json``; nothing for a scope that
         reads no shared skills (reads_shared_skills) or another store.
+        Read once per instance, which is one request or turn, as the
+        registry's read_live is.
 
         A skill someone else shares is skipped when its creator's store no
         longer holds it, and hidden by a same-named skill earlier in the
@@ -679,11 +686,11 @@ class SkillService:
     def shared_with_owner(self) -> dict[str, Path]:
         """Each skill someone else shares with this store's owner that they
         see, by slug: its folder in its creator's own store (_sharing)."""
-        return self._sharing().with_owner
+        return self._sharing.with_owner
 
     def shared_by_owner(self) -> frozenset[str]:
         """The slugs of this store's own skills that its owner shares."""
-        return self._sharing().by_owner
+        return self._sharing.by_owner
 
     def refuse_unchangeable(self, *slugs: str) -> None:
         """Refuse a change that would write, rename into or remove any of
@@ -897,7 +904,7 @@ class SkillService:
         skill.
         """
         managed = self._managed_skills()
-        sharing = self._sharing()
+        sharing = self._sharing
         visible = [
             VisibleSkill(skill=skill, origin=SkillOrigin.MANAGED) for skill in managed.values()
         ]

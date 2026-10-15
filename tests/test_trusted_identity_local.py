@@ -7,11 +7,15 @@ another person's conversation. Pins and schedules, which no per-service gate
 covers beyond the scoped session's own filter, get their two-person cases
 here too: B lists, reads, changes and deletes none of A's, the operator view
 lists both, and a deployment that leaves them off the list shares them. The
-other per-service gates have their own tests.
+other per-service gates have their own tests; one matrix here sends B's
+read, change and delete at each of A's other items through the real routes.
+A shared project another person still works in is never deleted under them.
 """
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from uuid import UUID, uuid4
 
 import pytest
@@ -24,14 +28,20 @@ from sqlmodel import Session
 # time, so importing it inside a test would raise before pytest.raises saw it.
 import cowork.server as cowork_server
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResourceDependencyError
+from cowork.db.personal_resources import (
+    ALL_PERSONAL_RESOURCES,
+    PersonalResource,
+    PersonalResourceDependencyError,
+)
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope, get_tenant_scope
 from cowork.db.session import get_engine
 from cowork.models.conversation import Conversation
+from cowork.models.file import File
 from cowork.models.pin import Pin
 from cowork.models.project import Project
 from cowork.models.schedule import Schedule
-from cowork.principal import personal_partition_id
+from cowork.models.setting import Setting
+from cowork.principal import TrustedHeaderMiddleware, personal_partition_id
 
 TOKEN = "trusted-identity-test-token"
 DEPLOYMENT = "5f0c7d2e-8b1a-4c3e-9d4f-2a6b8c0e1f3a"
@@ -59,6 +69,8 @@ def trusted(personal_deployment, monkeypatch, tmp_path):
         raw.exec(delete(Schedule).where(Schedule.created_by.in_([SUB_A, SUB_B])))
         raw.exec(delete(Conversation).where(Conversation.org_id.in_(partitions)))
         raw.exec(delete(Project).where(Project.org_id.in_(partitions)))
+        raw.exec(delete(File).where(File.org_id.in_(partitions)))
+        raw.exec(delete(Setting).where(Setting.org_id.in_(partitions)))
         raw.commit()
 
 
@@ -78,6 +90,14 @@ def _client(*, scope_route: bool = False) -> TestClient:
 
     # No `with`: skipping the lifespan skips boot migrations and background workers.
     return TestClient(app)
+
+
+def _loopback_client() -> TestClient:
+    """A client on the loopback address, as the stack's proxy is not: some
+    routes (a connection's delete among them) answer only there."""
+    return TestClient(
+        cowork_server.create_app(), base_url="http://127.0.0.1:26866", client=("127.0.0.1", 54321)
+    )
 
 
 # ── startup refusals ─────────────────────────────────────────────────────────
@@ -111,6 +131,40 @@ def test_a_broken_dependency_is_ignored_with_trust_off(trusted):
     cowork_server.create_app()
 
 
+@pytest.mark.parametrize("resources", ["", "pins,schedules", "projects,conversations,files,pins,schedules"])
+def test_refuses_memory_left_off_the_list(trusted, resources):
+    """Memory left off is one store every person's turns learn into, so a
+    deployment that names people refuses it, the empty list included."""
+    trusted.setenv("COWORK_PERSONAL_RESOURCES", resources)
+    get_app_settings.cache_clear()
+    with pytest.raises(RuntimeError, match="needs memory in COWORK_PERSONAL_RESOURCES") as refused:
+        cowork_server.create_app()
+    assert "read the others' lessons" in str(refused.value)
+
+
+@pytest.mark.parametrize("resources", ["memory", "projects,conversations,files,pins,schedules,memory"])
+def test_boots_with_memory_and_any_resource_shared(trusted, resources):
+    trusted.setenv("COWORK_PERSONAL_RESOURCES", resources)
+    get_app_settings.cache_clear()
+    cowork_server.create_app()
+
+
+def test_memory_left_off_is_ignored_with_trust_off(trusted):
+    trusted.setenv("COWORK_TRUST_IDENTITY_HEADERS", "false")
+    trusted.setenv("COWORK_PERSONAL_RESOURCES", "")
+    get_app_settings.cache_clear()
+    cowork_server.create_app()
+
+
+def test_refuses_remote_turns(trusted):
+    """A remote turn keeps memory in the project's own folder, not each
+    person's, so remote turns are refused where identity is trusted."""
+    trusted.setenv("COWORK_TURN_BACKEND", "remote")
+    get_app_settings.cache_clear()
+    with pytest.raises(RuntimeError, match="COWORK_TURN_BACKEND=remote is not supported"):
+        cowork_server.create_app()
+
+
 def test_boots_and_says_so(trusted, caplog, owned_logger):
     trusted.setenv("COWORK_PERSONAL_RESOURCES", "memory,skills")
     get_app_settings.cache_clear()
@@ -131,10 +185,44 @@ def test_boots_with_every_resource_by_default(trusted):
 
 # ── the middleware sits inside the bearer check ──────────────────────────────
 
-def test_identity_headers_without_the_bearer_are_401(trusted):
-    res = _client(scope_route=True).get(
-        "/api/v1/_scope", headers={"X-User-Id": SUB_A, "X-Organization-Id": DEPLOYMENT}
-    )
+def test_identity_headers_are_read_only_after_the_bearer(trusted, monkeypatch):
+    """The identity layer never runs for a request without the token, and
+    runs once for a request with it. A 401 alone can't show the order: the
+    bearer layer answers 401 to a pair without the token either way."""
+    calls: list[str] = []
+    dispatch = TrustedHeaderMiddleware.dispatch
+
+    async def spy(self, request, call_next):
+        calls.append(request.url.path)
+        return await dispatch(self, request, call_next)
+
+    monkeypatch.setattr(TrustedHeaderMiddleware, "dispatch", spy)
+    client = _client(scope_route=True)
+
+    res = client.get("/api/v1/_scope", headers={"X-User-Id": SUB_A, "X-Organization-Id": DEPLOYMENT})
+    assert res.status_code == 401
+    assert calls == []
+    assert client.get("/api/v1/_scope", headers=A).status_code == 200
+    assert calls == ["/api/v1/_scope"]
+
+
+def test_options_naming_a_person_without_the_bearer_is_401(trusted):
+    """Only a genuine preflight, which CORS answers, passes without the
+    token; an OPTIONS that names a person is refused on a route that accepts
+    OPTIONS."""
+    client = _client()
+    forged = {"X-User-Id": SUB_A, "X-Organization-Id": DEPLOYMENT}
+    for headers in (forged, {**forged, "Access-Control-Request-Method": "POST"}):
+        assert client.options("/api/v1/responses/", headers=headers).status_code == 401
+    assert client.options("/api/v1/responses/", headers=A).status_code == 200
+
+
+@pytest.mark.parametrize(
+    "pair",
+    [{"X-User-Id": SUB_A}, {"X-User-Id": "f:ldap:alice", "X-Organization-Id": DEPLOYMENT}],
+)
+def test_a_broken_pair_under_audit_is_401(trusted, pair):
+    res = _client(scope_route=True).get("/api/v1/_scope", headers={**BEARER, **pair})
     assert res.status_code == 401
 
 
@@ -217,6 +305,167 @@ def test_two_people_and_the_operator(trusted):
     assert {a_cid, b_cid} <= {c["id"] for c in operator.json()["conversations"]}
 
 
+@dataclass(frozen=True)
+class CrossRequest:
+    """One request B sends at A's item, and the status B must get."""
+
+    method: str
+    path: str
+    json: dict | None = None
+    status: int = 404
+
+
+@dataclass(frozen=True)
+class CrossCell:
+    """B's requests at one of A's items, and the check that A's item is
+    intact afterwards and nothing of it reached B."""
+
+    requests: tuple[CrossRequest, ...]
+    intact: Callable[[], None]
+
+
+def _conversation_cell(client: TestClient) -> CrossCell:
+    cid = _conversation(client, A, project_id=_project(client, A), topic="a-topic")
+    b_pid = _project(client, B)
+
+    def intact() -> None:
+        mine = client.get(f"/api/v1/conversations/{cid}", headers=A)
+        assert mine.status_code == 200 and mine.json()["title"] == "a-topic"
+        with Session(get_engine(get_app_settings().database.uri)) as raw:
+            assert str(raw.get(Conversation, UUID(cid)).project_id) != b_pid
+
+    return CrossCell(
+        requests=(
+            CrossRequest("PATCH", f"/api/v1/conversations/{cid}", {"topic": "b-took-it"}),
+            CrossRequest("POST", f"/api/v1/conversations/{cid}/move", {"projectId": b_pid}),
+            CrossRequest("DELETE", f"/api/v1/conversations/{cid}"),
+        ),
+        intact=intact,
+    )
+
+
+def _project_cell(client: TestClient) -> CrossCell:
+    name = f"a-{uuid4().hex[:6]}"
+    res = client.post("/api/v1/projects/", json={"name": name}, headers=A)
+    assert res.status_code == 201, res.text
+    pid = res.json()["id"]
+
+    def intact() -> None:
+        mine = {p["id"]: p["name"] for p in client.get("/api/v1/projects/", headers=A).json()}
+        assert mine.get(pid) == name
+
+    return CrossCell(
+        requests=(
+            CrossRequest("PATCH", f"/api/v1/projects/{pid}", {"name": "b-took-it"}),
+            CrossRequest("DELETE", f"/api/v1/projects/{pid}"),
+            CrossRequest("GET", f"/api/v1/projects/{name}/instructions"),
+            CrossRequest("GET", f"/api/v1/projects/{name}/files"),
+        ),
+        intact=intact,
+    )
+
+
+def _file_cell(client: TestClient) -> CrossCell:
+    res = client.post(
+        "/api/v1/files/", files={"file": ("a.txt", b"alice's", "text/plain")},
+        data={"purpose": "assistants"}, headers=A,
+    )
+    assert res.status_code == 201, res.text
+    fid = res.json()["id"]
+
+    def intact() -> None:
+        assert fid not in {f["id"] for f in client.get("/api/v1/files/", headers=B).json()["data"]}
+        assert client.get(f"/api/v1/files/{fid}/content", headers=A).content == b"alice's"
+
+    return CrossCell(
+        requests=(
+            CrossRequest("GET", f"/api/v1/files/{fid}"),
+            CrossRequest("GET", f"/api/v1/files/{fid}/content"),
+            CrossRequest("DELETE", f"/api/v1/files/{fid}"),
+        ),
+        intact=intact,
+    )
+
+
+def _skill_cell(client: TestClient) -> CrossCell:
+    res = client.post("/api/v1/skills/", json={"label": "a-private-skill", "instructions": "Alice's."}, headers=A)
+    assert res.status_code in (200, 201), res.text
+
+    def intact() -> None:
+        assert client.get("/api/v1/skills/a-private-skill", headers=A).status_code == 200
+        assert "a-private-skill" not in {s["id"] for s in client.get("/api/v1/skills/", headers=B).json()["skills"]}
+
+    return CrossCell(requests=(CrossRequest("GET", "/api/v1/skills/a-private-skill"),), intact=intact)
+
+
+def _connection_cell(client: TestClient) -> CrossCell:
+    from cowork.db.scoped import scope_from_principal
+    from cowork.principal import Principal
+    from cowork.services.connectors.persist import persist_connection
+
+    alice = scope_from_principal(Principal(user_id=SUB_A, org_id=personal_partition_id(DEPLOYMENT, SUB_A)))
+    persist_connection("postgres", None, "sales", {"host": "h", "password": "alicePw123"}, scope=alice)
+
+    def intact() -> None:
+        assert [c["name"] for c in client.get("/api/v1/connectors/connections/", headers=A).json()] == ["sales"]
+        assert client.get("/api/v1/connectors/connections/", headers=B).json() == []
+
+    return CrossCell(
+        requests=(
+            CrossRequest("GET", "/api/v1/connectors/connections/postgres/sales"),
+            CrossRequest("DELETE", "/api/v1/connectors/connections/postgres/sales"),
+        ),
+        intact=intact,
+    )
+
+
+def _setting_cell(client: TestClient) -> CrossCell:
+    assert client.put("/api/v1/settings/tone", json={"value": "spicy"}, headers=A).status_code == 200
+
+    def tone(headers: dict) -> str:
+        return {s["key"]: s["value"] for s in client.get("/api/v1/settings/", headers=headers).json()}["tone"]
+
+    def intact() -> None:
+        assert tone(A) == "spicy" and tone(B) != "spicy"
+
+    return CrossCell(requests=(CrossRequest("DELETE", "/api/v1/settings/tone"),), intact=intact)
+
+
+def _memory_cell(client: TestClient) -> CrossCell:
+    pid = _project(client, A)
+    lesson = {"scope": "project", "category": "lessons", "content": "- Pallets of 40", "project_id": pid}
+    assert client.put("/api/v1/memory/", json=lesson, headers=A).status_code == 200
+
+    def contents(headers: dict, project_id: str) -> list[str]:
+        res = client.get("/api/v1/memory/", params={"project_id": project_id}, headers=headers)
+        assert res.status_code == 200, res.text
+        return [entry["content"] for entry in res.json()]
+
+    def intact() -> None:
+        assert any("Pallets of 40" in content for content in contents(A, pid))
+        # B reads only B's own tiers at A's id: the answer for an unknown id.
+        assert contents(B, pid) == contents(B, str(uuid4()))
+        assert not any("Pallets of 40" in content for content in contents(B, pid))
+
+    return CrossCell(requests=(CrossRequest("GET", f"/api/v1/memory/?project_id={pid}", status=200),), intact=intact)
+
+
+@pytest.mark.parametrize(
+    "cell",
+    [_conversation_cell, _project_cell, _file_cell, _skill_cell, _connection_cell, _setting_cell, _memory_cell],
+    ids=lambda cell: cell.__name__.strip("_").removesuffix("_cell"),
+)
+def test_b_reads_changes_and_deletes_none_of_as_items(trusted, cell):
+    """Beside the listings above: every read, change and delete B sends at
+    one of A's items is refused as if it did not exist, and A's item stays."""
+    client = _loopback_client()
+    made = cell(client)
+    for request in made.requests:
+        res = client.request(request.method, request.path, json=request.json, headers=B)
+        assert res.status_code == request.status, (request, res.text)
+    made.intact()
+
+
 def test_turn_into_another_persons_conversation_is_404(trusted):
     client = _client()
     a_cid = _conversation(client, A, project_id=_project(client, A), topic="a-turn-target")
@@ -248,10 +497,11 @@ def test_turn_under_another_persons_project_is_404(trusted):
 
 # ── pins and schedules, two people over HTTP ─────────────────────────────────
 
-# Every resource personal (the default), and only pins and schedules personal:
-# the second case fails if either table is ever mapped to conversations or
+# Every resource personal (the default), and only pins and schedules personal
+# beside memory, which a trusted deployment always keeps per person: the
+# second case fails if either table is ever mapped to conversations or
 # projects instead of its own resource.
-PINS_AND_SCHEDULES_PERSONAL = [None, "pins,schedules"]
+PINS_AND_SCHEDULES_PERSONAL = [None, "pins,schedules,memory"]
 
 
 @pytest.fixture
@@ -373,3 +623,99 @@ def test_pins_and_schedules_left_off_the_list_are_shared(trusted, made_projects)
     assert (cid, "team-title") in _pins(client, B)
     assert sid in _schedule_ids(client, B)
     assert client.get(f"/api/v1/schedules/{sid}", headers=B).status_code == 200
+
+
+# ── a shared project another person works in ────────────────────────────────
+
+# Projects shared, and schedules (then conversations too) per person.
+SHARED_PROJECTS = [
+    "pins,schedules,memory",
+    ",".join(sorted(ALL_PERSONAL_RESOURCES - {PersonalResource.PROJECTS})),
+]
+
+
+def _rows_left(*, project_id: str, schedule_ids=(), conversation_ids=()) -> bool:
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        return (
+            raw.get(Project, UUID(project_id)) is not None
+            and all(raw.get(Schedule, UUID(sid)) is not None for sid in schedule_ids)
+            and all(raw.get(Conversation, UUID(cid)) is not None for cid in conversation_ids)
+        )
+
+
+@pytest.mark.parametrize("resources", SHARED_PROJECTS)
+def test_a_shared_project_holding_anothers_schedule_is_409(trusted, made_projects, resources):
+    """A's delete can't reach B's schedule, so it is refused until B's goes;
+    the creator's own delete included."""
+    _personal_resources(trusted, resources)
+    client = _client()
+    pid = _made_project(client, A, made_projects)
+    a_sid = _schedule(client, A, project_id=pid, title="a-schedule")
+    b_sid = _schedule(client, B, project_id=pid, title="b-schedule")
+
+    for headers in (A, B):
+        res = client.delete(f"/api/v1/projects/{pid}", headers=headers)
+        assert res.status_code == 409, res.text
+        assert "Other people still have conversations or schedules" in res.json()["detail"]
+    assert _rows_left(project_id=pid, schedule_ids=(a_sid, b_sid))
+
+    assert client.delete(f"/api/v1/schedules/{b_sid}", headers=B).status_code == 204
+    assert client.delete(f"/api/v1/projects/{pid}", headers=A).status_code == 204
+
+
+def test_a_shared_project_holding_anothers_conversation_is_409(trusted, made_projects):
+    """With conversations per person, A's scoped cascade can't see B's
+    conversation, which Postgres's foreign key would refuse and SQLite would
+    leave pointing at nothing."""
+    _personal_resources(trusted, SHARED_PROJECTS[1])
+    client = _client()
+    pid = _made_project(client, A, made_projects)
+    a_cid = _conversation(client, A, project_id=pid, topic="a-in-shared")
+    b_cid = _conversation(client, B, project_id=pid, topic="b-in-shared")
+
+    res = client.delete(f"/api/v1/projects/{pid}", headers=A)
+
+    assert res.status_code == 409, res.text
+    assert _rows_left(project_id=pid, conversation_ids=(a_cid, b_cid))
+    assert client.get(f"/api/v1/conversations/{b_cid}", headers=B).status_code == 200
+
+
+def test_a_shared_projects_conversation_workspace_stays_its_owners(trusted, made_projects):
+    """With projects shared and conversations per person, `conversations/<id>/`
+    inside the shared project is its owner's workspace: B reads, lists and
+    deletes none of A's there, while a plain project file stays shared and the
+    operator view still reads everything."""
+    _personal_resources(trusted, SHARED_PROJECTS[1])
+    client = _client()
+    name = f"p-{uuid4().hex[:6]}"
+    made = client.post("/api/v1/projects/", json={"name": name}, headers=A)
+    assert made.status_code == 201, made.text
+    made_projects.append(made.json()["id"])
+    a_cid = _conversation(client, A, project_id=made.json()["id"], topic="a-workspace")
+    secret = f"/api/v1/projects/{name}/files/conversations/{a_cid}/secret.txt"
+    shared = f"/api/v1/projects/{name}/files/notes.txt"
+    assert client.put(secret, json={"content": "a-only"}, headers=A).status_code == 200
+    assert client.put(shared, json={"content": "everyone"}, headers=A).status_code == 200
+
+    assert client.get(secret, headers=B).status_code == 404
+    assert client.delete(secret, headers=B).status_code == 404
+    assert client.put(secret, json={"content": "b-was-here"}, headers=B).status_code == 404
+    listing = client.get(f"/api/v1/projects/{name}/files", headers=B)
+    assert a_cid not in listing.text
+    assert client.get(shared, headers=B).status_code == 200
+
+    assert client.get(secret, headers=A).json()["content"] == "a-only"
+    assert client.get(secret, headers=BEARER).status_code == 200
+
+
+@pytest.mark.parametrize("resources", SHARED_PROJECTS)
+def test_a_shared_project_holding_only_the_deleters_rows_is_deleted(trusted, made_projects, resources):
+    _personal_resources(trusted, resources)
+    client = _client()
+    pid = _made_project(client, A, made_projects)
+    _schedule(client, A, project_id=pid, title="a-schedule")
+    _conversation(client, A, project_id=pid, topic="a-only")
+
+    assert client.delete(f"/api/v1/projects/{pid}", headers=A).status_code == 204
+    with Session(get_engine(get_app_settings().database.uri)) as raw:
+        assert raw.get(Project, UUID(pid)) is None

@@ -7,6 +7,7 @@ and all necessary configurations for the Cowork service.
 
 import asyncio
 import contextlib
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -20,7 +21,7 @@ from starlette.responses import JSONResponse
 
 from cowork.auth_middleware import BearerTokenMiddleware, ensure_auth_token, sync_auth_token
 from cowork.coding.inference_proxy import INFERENCE_PATHS
-from cowork.db.personal_resources import check_personal_resource_dependencies
+from cowork.db.personal_resources import PersonalResource, check_personal_resource_dependencies
 from cowork.db.scoped import MissingTenantScopeError
 from cowork.db.units import DatabaseBusy, busy_retry_seconds
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
@@ -31,9 +32,10 @@ from cowork.services.connectors.layered_vault import SharedConnectionError
 from cowork.streaming import TurnInProgress
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import cowork_home
-from cowork.common.settings.app_settings import get_app_settings
+from cowork.common.settings.app_settings import TurnQueueSettings, get_app_settings
 from cowork.dev_setup import run_dev_setup
 from cowork.scheduler import start_scheduler
+from cowork.services.pending_credential_clear import consume_pending_credential_clear
 
 
 # Set up logging
@@ -149,6 +151,9 @@ def _warm_agent_runtime() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     run_dev_setup()
+    # After migrations and the .env seed, before anything reads a credential.
+    app_settings = get_app_settings()
+    consume_pending_credential_clear(app_settings.database.uri, app_settings.tenancy_mode)
     # Before the server reports ready, so the first turn does not pay for imports.
     await asyncio.to_thread(_warm_agent_runtime)
     # History recovery also retries buffers sealed by an earlier failed sweep.
@@ -382,7 +387,7 @@ def create_app() -> FastAPI:
 
     # Trusted identity headers name a person in local tenancy. Only a request
     # that already passed the bearer token may name one, and each person's
-    # partition needs every resource its rows point at.
+    # partition needs every resource its rows point at, and memory of its own.
     if settings.trust_identity_headers:
         if settings.tenancy_mode == "org":
             raise RuntimeError(
@@ -396,6 +401,13 @@ def create_app() -> FastAPI:
                 "bearer token check, any caller could name any person in the identity headers."
             )
         check_personal_resource_dependencies(settings.personal_resources)
+        if PersonalResource.MEMORY not in settings.personal_resources:
+            raise RuntimeError(
+                "COWORK_TRUST_IDENTITY_HEADERS needs memory in COWORK_PERSONAL_RESOURCES. "
+                "Memory left off is one store that every person's turns learn into and "
+                "read back, so each person would read the others' lessons and profile "
+                "lines. Add memory to the list."
+            )
 
     # The operator's managed folder reaches every turn read-only. A missing
     # folder stops the start: its skill and connection names would otherwise
@@ -414,6 +426,14 @@ def create_app() -> FastAPI:
                 + ", ".join(str(path) for path in missing)
                 + ". Create or mount each one; the managed folder needs memory/, "
                 "skills/ and data-vault/."
+            )
+        # anton reads memory/ on every turn, and a folder it can't search
+        # fails each turn on its first rule.
+        if not os.access(managed.memory_dir, os.R_OK | os.X_OK):
+            raise RuntimeError(
+                f"COWORK_MANAGED_DIR's memory folder {managed.memory_dir} can't be read: "
+                "the server's user needs read and search permission on it (for example "
+                "chmod 755), or every turn fails reading its rules."
             )
         if not cortex_takes_managed_layer():
             raise RuntimeError(
@@ -441,6 +461,17 @@ def create_app() -> FastAPI:
             len(LocalDataVault(managed.vault_dir).list_connections()),
             len(shared_connections.root),
             len(shared_skills.root),
+        )
+
+    # A remote turn runs on a worker that reads and learns memory in the
+    # project's own folder, not in a person's tier, and receives none of the
+    # managed folder.
+    if TurnQueueSettings().is_remote and (settings.trust_identity_headers or managed is not None):
+        raise RuntimeError(
+            "COWORK_TURN_BACKEND=remote is not supported with COWORK_TRUST_IDENTITY_HEADERS "
+            "or COWORK_MANAGED_DIR: remote turns keep memory in each project's own folder, "
+            "not in each person's, and receive none of the managed folder. Leave "
+            "COWORK_TURN_BACKEND unset to run turns in this process."
         )
 
     # Org mode, or local tenancy that trusts identity headers: build a

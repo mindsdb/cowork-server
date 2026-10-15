@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import heapq
 import json
 import logging
 import mimetypes
@@ -25,7 +26,7 @@ import uuid
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from urllib.parse import quote
 
@@ -40,7 +41,8 @@ from cowork.common.paths import (
 )
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
-from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
+from anton.core.artifacts.internal_files import NON_CONTENT_NAMES, REVISIONS_DIRNAME
+from anton.core.artifacts.store import iter_content_files
 
 if TYPE_CHECKING:
     from cowork.db.scoped import ScopedSession, TenantScope
@@ -96,6 +98,20 @@ _NO_EXEC_DETAIL = (
 )
 
 
+_SHARED_PROJECT_BACKEND_DETAIL = (
+    "Live previews of apps with a backend are off on this deployment: projects "
+    "are shared while each person's connections are their own, and one shared "
+    "preview can't keep two people's connections apart."
+)
+
+
+class BackendPreviewRefused(RuntimeError):
+    """Raised by `mount_preview` instead of previewing an artifact's live
+    backend where one backend would serve several people's connections
+    (`_backends_cross_people`). The /artifacts/preview-mount route answers
+    it with 409 and its message."""
+
+
 class ExecutionRefused(RuntimeError):
     """Raised instead of running something, because `_org_mode()` is true.
 
@@ -118,14 +134,45 @@ _PREVIEW_MOUNTS: dict[str, Path] = {}
 # artifact slug inside it: anton's launcher keys the dict it is handed by slug
 # and reaps the previous entry under the same slug, so one dict per project
 # root keeps two partitions' same-slug artifacts from replacing each other.
-# Entry shape matches anton's launcher: {"proc", "port", "pid", "log_path"}.
-# Used to avoid double-launching and to reap on shutdown.
+# Entry shape matches anton's launcher: {"proc", "port", "pid", "log_path"},
+# read here as a LaunchedBackend. Used to avoid double-launching, to check
+# the proxy's port and to reap on shutdown.
 _LAUNCHED_BACKENDS: dict[str, dict[str, dict]] = {}
 
 # Per-(project root, slug) mutex so two parallel `preview-mount` requests
 # (React StrictMode double-effects, a double-click) can't both decide the port
 # is dead and spawn two backends side by side.
 _BACKEND_LAUNCH_LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
+
+
+@dataclass(frozen=True)
+class LaunchedBackend:
+    """One `_LAUNCHED_BACKENDS` entry, as this module reads it. anton's
+    launcher writes the entry, a dict, so the registry keeps dicts."""
+
+    proc: asyncio.subprocess.Process | None
+    port: int | None
+
+    @classmethod
+    def from_entry(cls, entry: dict) -> LaunchedBackend:
+        return cls(proc=entry.get("proc"), port=entry.get("port"))
+
+    @property
+    def live(self) -> bool:
+        return self.proc is not None and self.proc.returncode is None
+
+
+class BackendStatus(NamedTuple):
+    """What `_ensure_backend_running` reports for an artifact's backend."""
+
+    # Whether the backend answers.
+    running: bool
+    # "already_running" or "launched" when it runs; otherwise why it doesn't.
+    detail: str
+    # The port it answers on, which a fresh launch can change; 0 when it
+    # doesn't run.
+    port: int
+
 
 # ─── Type / kind mapping ──────────────────────────────────────────
 
@@ -232,11 +279,19 @@ def _registered_project_dirs(*, scope: TenantScope | None) -> list[Path]:
 
 
 def _scan_artifact_dirs(*, scope: TenantScope | None) -> list[Path]:
-    """Every `.anton/artifacts/` dir that exists under ``scope``'s projects."""
+    """Every `.anton/artifacts/` dir that exists under ``scope``'s projects.
+
+    A project whose `.anton` or `.anton/artifacts` is a link is skipped, as
+    artifacts_sources_for_scan skips it: every path route checks containment
+    against these dirs, so a link to another person's folder would make it
+    the caller's.
+    """
+    from cowork.services.artifact_roots import _storage_components_are_safe
+
     dirs: dict[str, Path] = {}
     for project_dir in _registered_project_dirs(scope=scope):
-        candidate = project_dir / ".anton" / "artifacts"
-        if candidate.is_dir():
+        if _storage_components_are_safe(project_dir, may_be_absent=False):
+            candidate = project_dir / ".anton" / "artifacts"
             dirs[str(candidate.resolve())] = candidate
     return list(dirs.values())
 
@@ -739,7 +794,7 @@ def serve_url_for(
     return ""
 
 
-def _candidate_relative_artifacts(raw_path: str, *, scope: TenantScope | None) -> list[Path]:
+def _candidate_relative_artifacts(raw_path: str, artifact_dirs: list[Path]) -> list[Path]:
     text = (raw_path or "").strip().replace("\\", "/")
     while text.startswith("./"):
         text = text[2:]
@@ -749,7 +804,7 @@ def _candidate_relative_artifacts(raw_path: str, *, scope: TenantScope | None) -
     if text.startswith("artifacts/"):
         text = text[len("artifacts/"):]
     matches: dict[str, Path] = {}
-    for art_root in _scan_artifact_dirs(scope=scope):
+    for art_root in artifact_dirs:
         try:
             target = (art_root / text).resolve()
             target.relative_to(art_root.resolve())
@@ -800,7 +855,7 @@ def resolve_artifact_path(
                 return resolved
         raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
-    matches = _candidate_relative_artifacts(raw_path, scope=scope)
+    matches = _candidate_relative_artifacts(raw_path, _scan_artifact_dirs(scope=scope))
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
@@ -1443,7 +1498,7 @@ def artifact_status_for_resolved(artifact: Path, *, scope: TenantScope | None) -
     # Fullstack artifacts keep their primary file in a `static/` subdir, so a
     # naive `artifact.parent` would land there instead of the artifact root
     # (where metadata.json + .published.json actually live) — climb via
-    # `_artifact_root_for` like `mount_preview`/`html_artifacts` do.
+    # `_artifact_root_for` like `mount_preview` does.
     folder = artifact if artifact.is_dir() else _artifact_root_for(artifact, scope=scope)
     card = card_for_folder(folder, scope=scope)
     if card is None:
@@ -1645,6 +1700,8 @@ async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
         # pod and use the mount as an SSRF pivot, backend running or not.
         if _org_mode():
             raise ValueError(_NO_EXEC_DETAIL)
+        if _backends_cross_people():
+            raise BackendPreviewRefused(_SHARED_PROJECT_BACKEND_DETAIL)
         # Register the artifact root (where metadata.json and the live port
         # live) so the proxy endpoint reads a current port by token, then
         # auto-launch the backend if dead. Returns without `proxyUrl`; the
@@ -1653,16 +1710,14 @@ async def mount_preview(path: Path, *, scope: TenantScope | None) -> dict:
         # reach us.
         root_token = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
         _PREVIEW_MOUNTS[root_token] = root
-        running, launch_detail, current_port = await _ensure_backend_running(
-            root, backend_port, scope=scope
-        )
+        backend = await _ensure_backend_running(root, backend_port, scope=scope)
         return {
             "kind": "proxy",
             "token": root_token,
             "artifactDir": str(root),
-            "port": current_port if running else backend_port,
-            "backendRunning": running,
-            "launchError": "" if running else launch_detail,
+            "port": backend.port if backend.running else backend_port,
+            "backendRunning": backend.running,
+            "launchError": "" if backend.running else backend.detail,
             # Fullstack apps publish from the artifact root, `.published.json`
             # keyed by the primary file name — surface the published state so
             # the viewer shows the "Published" pill for backend artifacts too.
@@ -1716,57 +1771,120 @@ def preview_mount_for(token: str, *, scope: TenantScope | None) -> Path | None:
     return None
 
 
+# Static artifact extensions a user can publish to a MindsHub web page.
+# `.html` is served as-is; `.md` is rendered to a styled HTML page first
+# (see `publish._render_markdown_to_html`). Fullstack artifacts bypass this —
+# they publish their directory regardless of the primary file's suffix.
+PUBLISHABLE_STATIC_SUFFIXES = (".html", ".md")
+_PUBLISHABLE_LIST_LIMIT = 40
+
+
+def is_non_content_path(path: Path, container: Path) -> bool:
+    """True when `path` is not artifact content: its first component inside the
+    artifact folder is in anton's `NON_CONTENT_NAMES` (`static/prd.md` is
+    content), or it lies in a revision journal at any depth.
+
+    `container` is an artifacts dir whose direct children are artifact folders.
+    A path outside it is not judged here and returns False.
+    """
+    try:
+        parts = path.resolve().relative_to(container.resolve()).parts
+    except (OSError, ValueError, RuntimeError):
+        return False
+    return REVISIONS_DIRNAME in parts or (len(parts) > 1 and parts[1] in NON_CONTENT_NAMES)
+
+
+class _PublishableCandidate(NamedTuple):
+    mtime_ns: int
+    path: Path
+    size: int
+    published_dir: Path
+    title: str
+
+
+def _humanize(name: str) -> str:
+    return name.replace("_", " ").replace("-", " ").title()
+
+
+def _publishable_in_folder(
+    folder: Path, container: Path, fullstack_types: frozenset[str]
+) -> list[_PublishableCandidate]:
+    """Publishable candidates of one artifact folder: one per static page, or a
+    single entry for a fullstack app."""
+    # `iter_content_files` already drops top-level non-content names; only a
+    # nested revision journal is left to skip.
+    pages = [
+        (path, st)
+        for path, st in iter_content_files(folder)
+        if path.suffix.lower() in PUBLISHABLE_STATIC_SUFFIXES
+        and REVISIONS_DIRNAME not in path.relative_to(folder).parts
+    ]
+    meta = _load_metadata(folder) if (folder / "metadata.json").is_file() else None
+    if (meta or {}).get("type") not in fullstack_types:
+        return [
+            _PublishableCandidate(st.st_mtime_ns, path, st.st_size, path.parent, _humanize(path.stem))
+            for path, st in pages
+        ]
+
+    # Fullstack apps are found by their metadata, not by having a page, so an
+    # app whose primary is not HTML/Markdown is still listed.
+    newest = max(pages, key=lambda page: page[1].st_mtime_ns, default=None)
+    primary = meta.get("primary")
+    entry_path = folder / primary if primary else None
+    if entry_path is None or not entry_path.is_file() or is_non_content_path(entry_path, container):
+        entry_path = newest[0] if newest else None
+    if entry_path is None:
+        return []
+    try:
+        st = entry_path.stat()
+    except OSError:
+        return []
+    mtime_ns = newest[1].st_mtime_ns if newest else st.st_mtime_ns
+    title = meta.get("name") or _humanize(folder.name)
+    return [_PublishableCandidate(mtime_ns, entry_path, st.st_size, folder, title)]
+
+
 def html_artifacts(*, scope: TenantScope | None) -> list[dict]:
-    """List every publishable file (HTML + Markdown) under the artifacts tree
-    of every project of ``scope``.
+    """List the most recently changed publishable files (HTML + Markdown)
+    across the artifacts tree of every project of ``scope``.
 
     `.md` files publish as rendered HTML pages (see `publish.py`), so they
     belong in this list alongside `.html`. Fullstack apps keep their pages
     inside `static/`; they're surfaced as a single entry per artifact root
-    (titled by the root's metadata), not one row per page.
+    (titled by the root's metadata), not one row per page. Non-content files
+    (README, generation inputs, revision copies) and symlinks are not listed.
     """
-    out = []
-    seen: set[str] = set()
-    seen_roots: set[str] = set()
     fullstack_types = _fullstack_types()
-    for art_root in _scan_artifact_dirs(scope=scope):
-        if not art_root.exists():
+    candidates: list[_PublishableCandidate] = []
+    for container in _scan_artifact_dirs(scope=scope):
+        try:
+            with os.scandir(container) as it:
+                entries = list(it)
+        except OSError:
             continue
-        candidates = [p for ext in ("*.html", "*.md") for p in art_root.rglob(ext)]
-        for path in sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True):
-            key = str(path.resolve())
-            if key in seen:
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    candidates.extend(_publishable_in_folder(path, container, fullstack_types))
+                elif entry.is_file(follow_symlinks=False) and path.suffix.lower() in PUBLISHABLE_STATIC_SUFFIXES:
+                    # Legacy loose file directly in the container.
+                    st = entry.stat(follow_symlinks=False)
+                    candidates.append(
+                        _PublishableCandidate(st.st_mtime_ns, path, st.st_size, container, _humanize(path.stem))
+                    )
+            except OSError:
                 continue
-
-            # Group fullstack apps by their artifact root — one entry per app.
-            artifact_root = _artifact_root_for(path, scope=scope)
-            meta = _load_metadata(artifact_root) if (artifact_root / "metadata.json").is_file() else None
-            if (meta or {}).get("type") in fullstack_types:
-                root_key = str(artifact_root.resolve())
-                if root_key in seen_roots:
-                    continue
-                seen_roots.add(root_key)
-                primary_hint = meta.get("primary") or ""
-                entry_path = (artifact_root / primary_hint) if primary_hint else path
-                if not entry_path.is_file():
-                    entry_path = path
-                seen.add(str(entry_path.resolve()))
-                out.append({
-                    "title": meta.get("name") or artifact_root.name.replace("_", " ").replace("-", " ").title(),
-                    "path": str(entry_path),
-                    "bytes": entry_path.stat().st_size if entry_path.is_file() else 0,
-                    "publishedUrl": _published_url_for(artifact_root, entry_path),
-                })
-                continue
-
-            seen.add(key)
-            out.append({
-                "title": path.stem.replace("_", " ").replace("-", " ").title(),
-                "path": str(path),
-                "bytes": path.stat().st_size,
-                "publishedUrl": _published_url_for(path.parent, path),
-            })
-    return out[:40]
+    newest = heapq.nlargest(_PUBLISHABLE_LIST_LIMIT, candidates, key=lambda c: c.mtime_ns)
+    return [
+        {
+            "title": c.title,
+            "path": str(c.path),
+            "bytes": c.size,
+            "publishedUrl": _published_url_for(c.published_dir, c.path),
+        }
+        for c in newest
+    ]
 
 
 # ─── Backend-artifact auto-launch ─────────────────────────────────
@@ -1800,6 +1918,16 @@ def _probe_port(port: int, *, timeout: float = 0.3) -> bool:
         return False
 
 
+def _launched_live_on(*, project_root: Path, slug: str, port: int) -> bool:
+    """Whether a backend this server launched for ``project_root`` and
+    ``slug`` is still running, on ``port``."""
+    entry = _LAUNCHED_BACKENDS.get(str(project_root), {}).get(slug)
+    if entry is None:
+        return False
+    backend = LaunchedBackend.from_entry(entry)
+    return backend.port == port and backend.live
+
+
 def _backend_answers(
     *, project_root: Path, slug: str, port: int, scope: TenantScope | None
 ) -> bool:
@@ -1818,11 +1946,44 @@ def _backend_answers(
         return False
     if scope is None or not scope.partitioned_for(PersonalResource.PROJECTS):
         return True
-    entry = _LAUNCHED_BACKENDS.get(str(project_root), {}).get(slug)
-    if entry is None or entry.get("port") != port:
-        return False
-    proc = entry.get("proc")
-    return proc is not None and proc.returncode is None
+    return _launched_live_on(project_root=project_root, slug=slug, port=port)
+
+
+def backend_port_is_the_callers(
+    artifact_dir: Path, *, port: int, scope: TenantScope | None
+) -> bool:
+    """Whether the preview proxy may forward ``scope``'s request for the
+    artifact at ``artifact_dir`` to ``port``, the one its metadata.json names.
+
+    Where projects are partitioned, only to a live backend this server
+    launched for that artifact's project root and slug, on that port, as
+    `_backend_answers` counts at mount: once the caller's backend exits,
+    another person's next launch can take its port while the caller's token
+    still resolves. Anywhere else, any port, as `_backend_answers` counts any
+    listener there.
+    """
+    if scope is None or not scope.partitioned_for(PersonalResource.PROJECTS):
+        return True
+    project_root = _resolve_project_root(artifact_dir, scope=scope)
+    return project_root is not None and _launched_live_on(
+        project_root=project_root, slug=artifact_dir.name, port=port
+    )
+
+
+def _backends_cross_people() -> bool:
+    """Whether one live backend would serve several people's connections: on
+    a deployment that trusts identity headers, with projects shared and
+    connections personal. Everyone reads the one artifact folder, so they
+    share its preview token and the port its metadata.json names, which the
+    proxy follows on every request, while the backend runs with the secrets
+    of whoever launched it. A backend per person doesn't help: each launch
+    rewrites that one port."""
+    settings = get_app_settings()
+    return (
+        settings.trust_identity_headers
+        and PersonalResource.CONNECTIONS in settings.personal_resources
+        and PersonalResource.PROJECTS not in settings.personal_resources
+    )
 
 
 def _resolve_project_root(artifact_dir: Path, *, scope: TenantScope | None) -> Path | None:
@@ -1847,37 +2008,34 @@ def _resolve_project_root(artifact_dir: Path, *, scope: TenantScope | None) -> P
 
 async def _ensure_backend_running(
     artifact_dir: Path, port: int, *, scope: TenantScope | None
-) -> tuple[bool, str, int]:
+) -> BackendStatus:
     """Bring up the artifact's backend if it isn't already listening.
 
-    Returns `(running, detail, port)`:
-      - `running=True`  → port is alive; `detail` is a short label
-        ("already_running" or "launched"); `port` may differ from the
-        input when the helper had to allocate a fresh free port.
-      - `running=False` → backend is down and we couldn't start it;
-        `detail` carries the reason; `port` echoes the input port.
+    Running, `detail` is "already_running" or "launched", and the port may
+    differ from ``port`` when the helper had to allocate a fresh free one.
+    Down and not startable, `detail` carries the reason.
 
     In org mode this always refuses; see `_org_mode`. The no-exec check is
     deployment-wide, so a personal partition launches like the desktop does.
     """
     if _org_mode():
-        return False, _NO_EXEC_DETAIL, 0
+        return BackendStatus(running=False, detail=_NO_EXEC_DETAIL, port=0)
 
     slug = artifact_dir.name
     # The project root first, so nothing about the port is reported for an
     # artifact outside the caller's own projects.
     project_root = _resolve_project_root(artifact_dir, scope=scope)
     if project_root is None:
-        return False, "Artifact is not in a registered project.", 0
+        return BackendStatus(running=False, detail="Artifact is not in a registered project.", port=0)
     if _backend_answers(project_root=project_root, slug=slug, port=port, scope=scope):
-        return True, "already_running", port
+        return BackendStatus(running=True, detail="already_running", port=port)
 
     # Serialize launches per project root and slug: two partitions can each
     # hold an artifact with the same slug. Whichever request wins the lock
     # does the actual work; the rest just re-probe after it releases.
     async with _launch_lock(project_root=project_root, slug=slug):
         if _backend_answers(project_root=project_root, slug=slug, port=port, scope=scope):
-            return True, "already_running", port
+            return BackendStatus(running=True, detail="already_running", port=port)
         return await _launch_backend_locked(
             artifact_dir, project_root=project_root, scope=scope
         )
@@ -1885,7 +2043,7 @@ async def _ensure_backend_running(
 
 async def _launch_backend_locked(
     artifact_dir: Path, *, project_root: Path, scope: TenantScope | None
-) -> tuple[bool, str, int]:
+) -> BackendStatus:
     """Spawn the artifact's backend via anton's shared launcher.
 
     The slug-keyed scratchpad venv (provisioned by Anton when the agent
@@ -1960,7 +2118,7 @@ async def _launch_backend_locked(
         # Helper returned an error string. Strip the redundant "Error: "
         # prefix so the message reads naturally in the preview pane.
         detail = result[len("Error: "):] if result.startswith("Error: ") else result
-        return False, detail, 0
+        return BackendStatus(running=False, detail=detail, port=0)
 
     new_port = int(result["port"])
     # Persist the new port directly to metadata.json. The proxy reads
@@ -1986,7 +2144,7 @@ async def _launch_backend_locked(
         "Auto-launched artifact backend via anton helper: slug=%s port=%d pid=%s",
         slug, new_port, result.get("pid"),
     )
-    return True, "launched", new_port
+    return BackendStatus(running=True, detail="launched", port=new_port)
 
 
 def shutdown_launched_backends() -> None:
@@ -2000,10 +2158,10 @@ def shutdown_launched_backends() -> None:
     """
     for project_root, backends in list(_LAUNCHED_BACKENDS.items()):
         for entry in list(backends.values()):
-            proc = entry.get("proc")
-            if proc is not None and proc.returncode is None:
+            backend = LaunchedBackend.from_entry(entry)
+            if backend.live:
                 try:
-                    proc.terminate()
+                    backend.proc.terminate()
                 except (OSError, ProcessLookupError):
                     pass
         _LAUNCHED_BACKENDS.pop(project_root, None)

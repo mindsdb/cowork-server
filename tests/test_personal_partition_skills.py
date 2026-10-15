@@ -8,19 +8,15 @@ keep today's links, and the desktop is unchanged.
 """
 from __future__ import annotations
 
-import shutil
-from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from fastapi import HTTPException
-from pydantic import SecretStr
 from sqlalchemy import delete
 
 from cowork.api.v1.endpoints import skills as skills_ep
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.common.settings.user_settings import Provider, UserSettings, use_settings_scope
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_open_session
@@ -32,6 +28,7 @@ from cowork.schemas.skills import SkillUpdateRequest
 from cowork.services.projects import ProjectService
 from cowork.services.skill_links import sync_turn_skill_links
 from cowork.services.skills import BUILTIN_SKILL_SLUGS, SkillService, link_turn_skills
+from tests._turns import built_turn
 
 DEPLOYMENT = "5f0c7d2e-8b1a-4c3e-9d4f-2a6b8c0e1f3a"
 SUB_A = "11111111-1111-4111-8111-111111111111"
@@ -244,63 +241,16 @@ def test_boot_still_fans_out_where_skills_are_shared(stack, monkeypatch):
 # ── the in-process turn ─────────────────────────────────────────────────────
 
 
-@asynccontextmanager
-async def _turn_config(*, monkeypatch, project_path: Path, scope: TenantScope | None, project_org: str | None):
-    """Build one in-process turn's session config, bound to ``scope``."""
-    saved = UserSettings(
-        _env_file=None,
-        planning_provider=Provider.OPENAI,
-        coding_provider=Provider.OPENAI,
-        router_provider=Provider.OPENAI,
-        planning_model="p", coding_model="c", router_model="r",
-        openai_api_key=SecretStr("test-only-key"),
-        episodic_memory=False,
-    )
-    monkeypatch.setattr("cowork.common.settings.user_settings.get_user_settings", lambda: saved)
-    monkeypatch.setattr(harness, "build_chat_session", lambda config: config)
-    monkeypatch.setenv("ANTON_SCRATCHPAD_PERSIST_SESSION", "false")
-
-    project_path.mkdir(parents=True, exist_ok=True)
-    with get_open_session() as db:
-        project = Project(name=project_path.name, path=str(project_path), org_id=project_org)
-        db.add(project)
-        db.commit()
-        conversation = Conversation(
-            topic="skills",
-            project_id=project.id,
-            org_id=scope.org_id if scope is not None and scope.partitioned_for(
-                PersonalResource.CONVERSATIONS
-            ) else None,
-        )
-        db.add(conversation)
-        db.commit()
-        db.refresh(conversation)
-        with use_settings_scope(scope) if scope is not None else nullcontext():
-            config, scratch, _ = await harness.AntonHarness()._build_chat_session(conversation)
-        try:
-            yield config, scratch
-        finally:
-            if scratch:
-                shutil.rmtree(scratch, ignore_errors=True)
-            client = config.llm_client
-            for provider in (client.planning_provider, client.coding_provider, client.router_provider):
-                await provider._client.close()
-
-
 async def test_a_persons_turn_reads_their_own_skills_from_their_project(monkeypatch, stack):
     SkillService(ALICE).create_skill("probe-a-skill", "Alice's private procedure.")
-    a_project = stack / "shared" / PARTITION_A / "projects" / f"a-{uuid4().hex[:6]}"
-    b_project = stack / "shared" / PARTITION_B / "projects" / f"b-{uuid4().hex[:6]}"
 
-    async with _turn_config(
-        monkeypatch=monkeypatch, project_path=a_project, scope=ALICE, project_org=PARTITION_A
-    ) as (config, _scratch):
-        assert config.settings.skills_root == a_project / "skills"
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=stack, scope=ALICE) as turn:
+        a_project = Path(turn.project.path)
+        assert turn.config.settings.skills_root == a_project / "skills"
         assert "probe-a-skill" in _links(a_project / "skills")
-    async with _turn_config(
-        monkeypatch=monkeypatch, project_path=b_project, scope=BOB, project_org=PARTITION_B
-    ) as (config, _scratch):
-        assert config.settings.skills_root == b_project / "skills"
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=stack, scope=BOB) as turn:
+        b_project = Path(turn.project.path)
+        assert turn.config.settings.skills_root == b_project / "skills"
         assert "probe-a-skill" not in _links(b_project / "skills")
         assert set(BUILTIN_SKILL_SLUGS) <= set(_links(b_project / "skills"))
 
@@ -317,15 +267,12 @@ async def test_a_shared_projects_folder_is_never_rewritten_by_a_persons_turn(mon
     get_app_settings.cache_clear()
     alice = _person(partition=PARTITION_A, sub=SUB_A, resources=shared_projects)
     SkillService(alice).create_skill("probe-a-skill", "Alice's private procedure.")
-    project = stack / "home" / "projects" / f"team-{uuid4().hex[:6]}"
 
-    async with _turn_config(
-        monkeypatch=monkeypatch, project_path=project, scope=alice, project_org=None
-    ) as (config, scratch):
-        assert scratch is not None
-        assert config.settings.skills_root == scratch / "skills"
-        assert "probe-a-skill" in _links(scratch / "skills")
-        assert _links(project / "skills") == {}
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=stack, scope=alice, project_org=None) as turn:
+        assert turn.scratch is not None
+        assert turn.config.settings.skills_root == turn.scratch / "skills"
+        assert "probe-a-skill" in _links(turn.scratch / "skills")
+        assert _links(Path(turn.project.path) / "skills") == {}
 
 
 async def test_desktop_turns_keep_the_fanned_out_project_folder(monkeypatch, tmp_path):
@@ -336,17 +283,11 @@ async def test_desktop_turns_keep_the_fanned_out_project_folder(monkeypatch, tmp
     calls = []
     monkeypatch.setattr(harness, "link_turn_skills", lambda **kwargs: calls.append(kwargs))
     try:
-        project = tmp_path / "projects" / f"desk-{uuid4().hex[:6]}"
-        async with _turn_config(
-            monkeypatch=monkeypatch, project_path=project, scope=None, project_org=None
-        ) as (config, _scratch):
-            assert config.settings.skills_root == project / "skills"
+        async with built_turn(monkeypatch=monkeypatch, tmp_path=tmp_path, scope=None) as turn:
+            assert turn.config.settings.skills_root == Path(turn.project.path) / "skills"
         assert calls == []
     finally:
         get_app_settings.cache_clear()
-        with get_open_session() as db:
-            db.exec(delete(Project).where(Project.path == str(project)))
-            db.commit()
 
 
 # ── a project rename and the skills that name it ────────────────────────────

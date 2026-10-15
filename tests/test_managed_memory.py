@@ -3,10 +3,11 @@
 Every turn hands anton's Cortex the managed ``memory/`` as its read-only layer
 (``managed_hc``): a person's turn, a turn with no person and a desktop turn.
 The turn's learned tiers are never that folder, so nothing the turn learns
-lands there. How anton renders the layer into the prompt is anton's, and its
-own tests cover it; here the Cortex is the managed_dir fixture's stand-in,
-which records the layer it was given. With no managed folder, no layer is
-passed.
+lands there. The managed_dir fixture writes a real Hippocampus folder, and
+each turn here builds the installed anton's Cortex, so these tests check the
+layer that Cortex is handed and the rule and lesson it reads from it. How
+anton renders the layer into the prompt is anton's, and its own tests cover
+it. With no managed folder, no layer is passed.
 """
 from __future__ import annotations
 

@@ -41,7 +41,8 @@ class SkillResponse(CamelResponse):
     attribution: ResourceAttribution
     is_builtin: bool
     # In the shared-skill registry: one someone else shares with the caller,
-    # read-only for them, or one of the caller's own they share.
+    # read-only for them, or one of the caller's own they share. With skills
+    # left shared, also one someone else created, read-only for the caller.
     shared: bool = False
     capabilities: SkillCapabilities
 

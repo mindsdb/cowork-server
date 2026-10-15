@@ -56,6 +56,15 @@ def _app(org_mode: bool = True, enforce: bool = True, personal_partitions: bool 
     async def slack_webhook():
         return {"ack": True}
 
+    # The web UI's page shell, which a browser loads with no identity.
+    @app.get("/")
+    def page_shell(principal: Principal | None = Depends(get_principal)):
+        return {"principal": None if principal is None else principal.user_id}
+
+    @app.get("/assets/{name}")
+    def page_asset(name: str):
+        return {"asset": name}
+
     # A route with its own explicit OPTIONS handler (like responses.py's
     # OpenByDesign preflight body) — CORSMiddleware only intercepts a
     # genuine preflight (Origin + Access-Control-Request-Method) before this
@@ -617,6 +626,56 @@ def test_personal_partitions_audit_serves_no_person():
     res = _personal_client(enforce=False).get("/api/v1/whoami")
     assert res.status_code == 200
     assert res.json() == {"principal": None}
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {"X-User-Id": USER_ID},
+        {"X-Organization-Id": ORG_ID},
+        {"X-User-Id": "f:ldap:alice", "X-Organization-Id": ORG_ID},
+        {"X-User-Id": USER_ID, "X-Organization-Id": "not-a-uuid"},
+        {"X-User-Id": "  ", "X-Organization-Id": ORG_ID},
+    ],
+)
+def test_personal_partitions_audit_refuses_a_broken_pair(headers, caplog):
+    """Audit serves a request that names nobody as the operator view. A pair
+    the proxy sent but broke is no such request: it answers 401."""
+    with caplog.at_level("WARNING", logger="cowork.principal"):
+        res = _personal_client(enforce=False).get("/api/v1/whoami", headers=headers)
+    assert res.status_code == 401
+    assert "no principal" not in caplog.text
+
+
+def test_hosted_audit_still_lets_a_broken_pair_through():
+    res = _client(enforce=False).get("/api/v1/whoami", headers={"X-User-Id": USER_ID})
+    assert res.status_code == 200
+    assert res.json() == {"principal": None}
+
+
+@pytest.mark.parametrize("enforce", [True, False])
+def test_personal_partitions_leave_the_page_shell_alone(enforce, caplog):
+    """The page shell names no person and logs no missing one, under either
+    mode; the API beside it behaves as before."""
+    client = _personal_client(enforce=enforce)
+    with caplog.at_level("WARNING", logger="cowork.principal"):
+        for path in ("/", "/assets/app.js"):
+            assert client.get(path).status_code == 200, path
+        shell = client.get("/", headers={"X-User-Id": USER_ID, "X-Organization-Id": ORG_ID})
+    assert shell.json() == {"principal": None}
+    assert "no principal" not in caplog.text
+
+    with caplog.at_level("WARNING", logger="cowork.principal"):
+        api = client.get("/api/v1/whoami")
+    if enforce:
+        assert api.status_code == 401
+    else:
+        assert api.json() == {"principal": None}
+        assert "no principal on GET /api/v1/whoami" in caplog.text
+
+
+def test_hosted_still_reads_identity_on_every_path():
+    assert _client().get("/").status_code == 401
 
 
 def test_underscore_spelled_identity_headers_name_no_person():

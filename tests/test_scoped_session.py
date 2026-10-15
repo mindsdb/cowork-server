@@ -151,7 +151,7 @@ def test_local_scope_does_not_filter(session):
     assert len(rows) == 4
 
 
-def test_combined_filters_keeppartition(session, partition):
+def test_combined_filters_keep_the_partition(session, partition):
     scoped = ScopedSession(session, partition())
     stmt = scoped.select(ScopedNote).where(ScopedNote.title == "a1")
     assert [n.title for n in scoped.exec(stmt).all()] == ["a1"]

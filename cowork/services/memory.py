@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import stat
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -17,11 +18,13 @@ from pydantic import (
     field_validator,
 )
 
-from cowork.common.paths import dir_lstat, dir_rmtree, dir_unlink, pinned_dir
+from cowork.common.paths import dir_lstat, dir_rmtree, dir_unlink, opened_subdir_nofollow, pinned_dir
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import ScopedSession, TenantScope
 from cowork.harnesses.memory.registry import MemorySlot
 from cowork.harnesses.memory.store import (
+    PERSONAL_PROJECTS_DIRNAME,
     GlobalMemoryStore,
     PROJECT_SLOTS,
     ProjectMemoryStore,
@@ -501,6 +504,67 @@ def reset_person_memory(scope: TenantScope) -> PersonMemoryReset:
         return PersonMemoryReset(root=root, removed=False)
     logger.info("memory: removed a person's memory at %s", root)
     return PersonMemoryReset(root=root, removed=True)
+
+
+def _real_child_dirs(path: Path) -> list[str]:
+    """The names of the directories in ``path``, links left out; none when
+    ``path`` is missing."""
+    try:
+        with os.scandir(path) as entries:
+            return sorted(entry.name for entry in entries if entry.is_dir(follow_symlinks=False))
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+
+
+def remove_project_memory_tiers(*, scope: TenantScope, project_id: UUID) -> int:
+    """Remove each person's memory tier for a deleted project; return how many.
+
+    On a deployment that trusts identity headers a person's project tier lives
+    under their own global tier (PersonalProjectMemoryStore), outside the
+    project's folder, so deleting the project leaves it, listed nowhere. Where
+    projects are personal only the deleter can have one. Where they are
+    shared, or the operator view deletes, every person's tier for that
+    project id goes. Everywhere else project memory sits in the project's own
+    folder and goes with it.
+
+    The walk from the shared root down to each tier's ``projects`` folder
+    opens every level without following a link (opened_subdir_nofollow), as
+    the agent's code runs as the server's user and could plant one.
+    """
+    settings = get_app_settings()
+    if not (
+        settings.trust_identity_headers
+        and PersonalResource.MEMORY in settings.personal_resources
+    ):
+        return 0
+    shared = Path(settings.storage.shared_root)
+    # <shared>/<partition>/memory/users/<sub>, as scoped_user_storage_root
+    # lays out a person's global tier.
+    if scope.partitioned_for(PersonalResource.PROJECTS):
+        people = [(scope.org_id, scope.user_id)] if scope.org_id and scope.user_id else []
+    else:
+        people = [
+            (partition, sub)
+            for partition in _real_child_dirs(shared)
+            for sub in _real_child_dirs(shared / partition / "memory" / "users")
+        ]
+    name = str(UUID(str(project_id)))
+    removed = 0
+    for partition, sub in people:
+        try:
+            with opened_subdir_nofollow(
+                shared, partition, "memory", "users", sub, PERSONAL_PROJECTS_DIRNAME
+            ) as projects:
+                if stat.S_ISDIR(dir_lstat(projects, name).st_mode):
+                    dir_rmtree(projects, name)
+                else:
+                    dir_unlink(projects, name)
+        except FileNotFoundError:
+            continue
+        removed += 1
+    if removed:
+        logger.info("memory: removed %d memory tier(s) of deleted project %s", removed, name)
+    return removed
 
 
 class MemoryService:

@@ -354,6 +354,25 @@ def _snapshot_lines(out: str) -> tuple[dict[str, str], str]:
     return skills, lines[-1]
 
 
+def _manifest_digest(skills: dict[str, str], roots: dict[str, Path]) -> str:
+    """sha256 over sha256sum's line for every file of every skill, by slug and
+    path, leaving out stats.json, hidden files and links."""
+    lines = []
+    for slug, source in sorted(skills.items()):
+        skill_dir = roots[source] / slug
+        for path in sorted(skill_dir.rglob("*")):
+            relative = path.relative_to(skill_dir).as_posix()
+            if (
+                not path.is_file()
+                or path.is_symlink()
+                or relative == "stats.json"
+                or any(part.startswith(".") for part in relative.split("/"))
+            ):
+                continue
+            lines.append(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {slug}/{relative}\n")
+    return f"sha256 {hashlib.sha256(''.join(lines).encode()).hexdigest()}"
+
+
 def test_skills_snapshot_lists_what_the_agent_sees_with_a_stable_hash(stack, capsys):
     from cowork.harnesses.anton_harness.harness import HOST_SKILLS_DIR
 
@@ -372,16 +391,12 @@ def test_skills_snapshot_lists_what_the_agent_sees_with_a_stable_hash(stack, cap
     assert skills["connect-datasource"] == "(host)"
     assert all(skills[slug] == "(own)" for slug in BUILTIN_SKILL_SLUGS)
 
-    # The hash is sha256 over sha256sum's lines for each SKILL.md, by slug.
+    # The hash is sha256 over sha256sum's lines for every file of each skill.
     own_root = SkillService(personal_scope(ALICE)).root
     from anton.core.memory.skills import SkillStore
 
     roots = {"(own)": own_root, "(host)": HOST_SKILLS_DIR, "(managed)": stack.skills_dir, "(anton)": SkillStore().builtin_root}
-    manifest = "".join(
-        f"{hashlib.sha256((roots[source] / slug / 'SKILL.md').read_bytes()).hexdigest()}  {slug}/SKILL.md\n"
-        for slug, source in sorted(skills.items())
-    )
-    assert digest_line == f"sha256 {hashlib.sha256(manifest.encode()).hexdigest()}"
+    assert digest_line == _manifest_digest(skills, roots)
 
     _, again, _ = _run(skills_ops.main, ["snapshot", *_arguments(ALICE)], capsys)
     assert again == out
@@ -389,6 +404,35 @@ def test_skills_snapshot_lists_what_the_agent_sees_with_a_stable_hash(stack, cap
     SkillService(personal_scope(ALICE)).update_skill("my-notes", instructions="Changed.")
     _, changed, _ = _run(skills_ops.main, ["snapshot", *_arguments(ALICE)], capsys)
     assert _snapshot_lines(changed)[1] != digest_line
+
+
+def test_a_snapshot_follows_every_file_of_a_skill_but_its_usage(stack, capsys):
+    """A helper script or reference file is part of what the agent reads, so
+    changing one changes the hash; the store's usage sidecar and hidden files
+    are not."""
+    own = SkillService(personal_scope(ALICE)).root / "my-notes"
+    SkillService(personal_scope(ALICE)).create_skill("my-notes", "Mine.")
+    (own / "helper.py").write_text("print('v1')\n")
+    managed = stack.skills_dir / "team-skill"
+    managed.mkdir()
+    (managed / "SKILL.md").write_text("---\nname: team-skill\ndescription: Team.\n---\nTeam way.\n")
+    (managed / "refs").mkdir()
+    (managed / "refs" / "ref.md").write_text("Reference v1.\n")
+
+    def digest() -> str:
+        _, out, _ = _run(skills_ops.main, ["snapshot", *_arguments(ALICE)], capsys)
+        return _snapshot_lines(out)[1]
+
+    first = digest()
+    (own / "stats.json").write_text('{"uses": 3}')
+    (own / ".cache").write_text("anything")
+    assert digest() == first
+
+    (own / "helper.py").write_text("print('v2')\n")
+    after_helper = digest()
+    assert after_helper != first
+    (managed / "refs" / "ref.md").write_text("Reference v2.\n")
+    assert digest() != after_helper
 
 
 def test_a_snapshot_takes_a_managed_skill_over_a_same_named_own_one(stack, capsys):
@@ -415,7 +459,7 @@ def test_a_snapshot_includes_the_skills_others_share_and_follows_their_edits(sta
     assert skills["team-skill"] == "(shared)"
     assert "private-skill" not in skills
 
-    # The shared skill's line hashes the SKILL.md in Alice's own store.
+    # The shared skill's lines hash the files in Alice's own store.
     from anton.core.memory.skills import SkillStore
 
     from cowork.harnesses.anton_harness.harness import HOST_SKILLS_DIR
@@ -427,11 +471,7 @@ def test_a_snapshot_includes_the_skills_others_share_and_follows_their_edits(sta
         "(shared)": alice.root,
         "(anton)": SkillStore().builtin_root,
     }
-    manifest = "".join(
-        f"{hashlib.sha256((roots[source] / slug / 'SKILL.md').read_bytes()).hexdigest()}  {slug}/SKILL.md\n"
-        for slug, source in sorted(skills.items())
-    )
-    assert digest_line == f"sha256 {hashlib.sha256(manifest.encode()).hexdigest()}"
+    assert digest_line == _manifest_digest(skills, roots)
 
     alice.update_skill("team-skill", instructions="The team's new way.")
     _, changed, _ = _run(skills_ops.main, ["snapshot", *_arguments(BOB)], capsys)
@@ -509,6 +549,48 @@ def test_share_connection_refuses_an_unknown_or_ambiguous_name(stack, capsys):
     assert not (stack.root / "shared" / "connections.json").exists()
 
 
+def test_an_ambiguous_name_is_refused_naming_the_engine_option(stack, capsys):
+    """One Google account connected to Gmail and to Calendar saves two
+    connections under one name."""
+    own = own_vault_for_scope(personal_scope(ALICE))
+    own.save("gmail", "ada-example-com", {"account_email": "ada@example.com"})
+    own.save("google_calendar", "ada-example-com", {"account_email": "ada@example.com"})
+
+    status, out, err = _share(ALICE, "ada-example-com", stack.root, capsys)
+
+    assert (status, out) == (1, "")
+    assert "for gmail, google_calendar. Name one with --engine (ENGINE= for make)." in err
+    assert not (stack.root / "shared" / "connections.json").exists()
+
+
+def test_the_engine_option_shares_and_unshares_one_of_two(stack, capsys):
+    own = own_vault_for_scope(personal_scope(ALICE))
+    own.save("gmail", "ada-example-com", {"account_email": "ada@example.com"})
+    own.save("google_calendar", "ada-example-com", {"account_email": "ada@example.com"})
+
+    def run(action: str, *engine: str) -> tuple[int, str, str]:
+        return _run(
+            connections_ops.main,
+            [action, *_arguments(ALICE), "--name", "ada-example-com", *engine, "--managed-dir", str(stack.root)],
+            capsys,
+        )
+
+    assert run("share", "--engine", "gmail")[0] == 0
+    assert run("share", "--engine", "google_calendar")[0] == 0
+    assert [entry["engine"] for entry in _registry(stack.root)] == ["gmail", "google_calendar"]
+    status, _, err = run("share", "--engine", "slack")
+    assert status == 1 and "has no saved slack connection named ada-example-com" in err
+
+    status, out, err = run("unshare")
+    assert (status, out) == (1, "")
+    assert "shares 2 connections named ada-example-com, for gmail, google_calendar" in err
+    assert "--engine (ENGINE= for make)" in err
+
+    status, out, _ = run("unshare", "--engine", "gmail")
+    assert status == 0 and "connection gmail/ada-example-com" in out
+    assert [entry["engine"] for entry in _registry(stack.root)] == ["google_calendar"]
+
+
 def test_share_connection_refuses_one_already_shared_or_hidden(stack, capsys):
     own_vault_for_scope(personal_scope(ALICE)).save("postgres", "erp", {"host": "alice.example"})
     own_vault_for_scope(personal_scope(BOB)).save("postgres", "erp", {"host": "bob.example"})
@@ -561,3 +643,70 @@ def test_share_connection_refuses_where_connections_are_shared(stack, monkeypatc
     assert (status, out) == (1, "")
     assert "COWORK_PERSONAL_RESOURCES leaves connections shared" in err
     assert not (stack.root / "shared" / "connections.json").exists()
+
+
+# ── --registry-stdout ───────────────────────────────────────────────────────
+
+
+def _tree(folder: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(folder)): path.read_bytes() if path.is_file() else b""
+        for path in sorted(folder.rglob("*"))
+    }
+
+
+@pytest.mark.parametrize("module", ["skills", "connections"])
+def test_registry_stdout_prints_the_bytes_and_writes_nothing(stack, capsys, module):
+    """The stack's operator scripts check the registry and write it on the
+    host, so with the flag the command writes nothing, stdout holds exactly
+    what it would have written, and its message goes to stderr."""
+    if module == "skills":
+        main, name_option, registry_file = skills_ops.main, "--skill", stack.shared_skills_file
+        SkillService(personal_scope(ALICE)).create_skill("alice-item", "Alice's.")
+        SkillService(personal_scope(BOB)).create_skill("bob-item", "Bob's.")
+        message = "Shared skill alice-item"
+    else:
+        main, name_option, registry_file = connections_ops.main, "--name", stack.shared_connections_file
+        own_vault_for_scope(personal_scope(ALICE)).save("postgres", "alice-item", {"host": "a"})
+        own_vault_for_scope(personal_scope(BOB)).save("mysql", "bob-item", {"host": "b"})
+        message = "Shared connection postgres/alice-item"
+
+    def run(person: Person, action: str, *flag: str) -> tuple[int, str, str]:
+        name = "alice-item" if person == ALICE else "bob-item"
+        return _run(
+            main,
+            [action, *_arguments(person), name_option, name, "--managed-dir", str(stack.root), *flag],
+            capsys,
+        )
+
+    # Bob's entry, written the ordinary way, is what Alice's command reads.
+    assert run(BOB, "share")[0] == 0
+    written = registry_file.read_bytes()
+    before = _tree(stack.root)
+
+    status, out, err = run(ALICE, "share", "--registry-stdout")
+
+    assert status == 0
+    assert _tree(stack.root) == before
+    assert message in err and "the registry on stdout" in err
+    printed = json.loads(out)
+    assert [entry["user_id"] for entry in printed] == [SUB_B, SUB_A]
+    # Exactly the bytes the command writes without the flag.
+    assert run(ALICE, "share")[0] == 0
+    assert out.encode() == registry_file.read_bytes() != written
+
+    status, out, err = run(ALICE, "unshare", "--registry-stdout")
+    assert status == 0
+    assert out.encode() == written
+    assert "Stopped sharing" in err
+
+
+def test_registry_stdout_refusals_print_nothing_on_stdout(stack, capsys):
+    status, out, err = _run(
+        skills_ops.main,
+        ["share", *_arguments(ALICE), "--skill", "never-made", "--managed-dir", str(stack.root), "--registry-stdout"],
+        capsys,
+    )
+    assert (status, out) == (1, "")
+    assert "has no skill named never-made" in err
+    assert not (stack.root / "shared").exists()
