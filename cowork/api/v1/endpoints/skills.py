@@ -15,7 +15,6 @@ from cowork.db.scoped import (
     get_tenant_scope,
 )
 from cowork.db.session import get_open_session
-from cowork.managed import MANAGED_SKILL_REFUSAL
 from cowork.models.skill import Skill
 from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.principal import Principal, get_principal
@@ -33,7 +32,9 @@ from cowork.services.shared_resources import (
     SharedResourceAccess,
 )
 from cowork.services.skills import (
+    SkillOrigin,
     SkillService,
+    VisibleSkill,
     builtin_skill_refusal,
     is_builtin_skill,
 )
@@ -73,26 +74,24 @@ def _builtins_immutable(scope: TenantScope) -> bool:
     return scope.partitioned_for(PersonalResource.SKILLS)
 
 
-def _refuse_managed(service: SkillService, *slugs: str) -> None:
-    """Refuse every change to a skill the operator's managed folder provides,
-    before any read of the caller's own store: a slug the managed folder holds
-    may be missing there, or hidden behind the managed skill."""
-    if any(service.is_managed_skill(slug) for slug in slugs):
-        raise PermissionError(MANAGED_SKILL_REFUSAL)
-
-
 def _skill_response(
-    skill: Skill, access: SharedResourceAccess, *, managed: bool = False
+    visible: VisibleSkill, *, access: SharedResourceAccess, service: SkillService
 ) -> dict:
-    if managed:
+    skill = visible.skill
+    if visible.origin is SkillOrigin.MANAGED:
         # The operator's managed skill: built-in and read-only for every
         # caller, and authored by nobody here.
         creator_id = None
         builtin = True
         can_change = False
+    elif visible.origin is SkillOrigin.SHARED:
+        # Someone else's skill, shared with the caller: read-only here, and
+        # its creator is named to nobody (ResourceAttribution outside org mode).
+        creator_id = None
+        builtin = False
+        can_change = False
     else:
         if access.org_mode and access.has_trusted_actor:
-            service = SkillService(access.session.scope)
             with access.coordination_lock(SKILL_PROJECT_REFERENCES, "all"):
                 with access.coordination_lock(SKILL, skill.name):
                     access.recover_stale_claim(
@@ -107,6 +106,7 @@ def _skill_response(
             not pending
             and not (builtin and _builtins_immutable(access.session.scope))
             and access.can_change(creator_id)
+            and service.may_change(skill)
         )
     return SkillResponse(
         id=skill.id,
@@ -125,6 +125,7 @@ def _skill_response(
             fallback_modified_at=skill.updated_at,
         ),
         is_builtin=builtin,
+        shared=visible.shared,
         capabilities=SkillCapabilities(
             can_edit=can_change,
             can_delete=can_change,
@@ -232,13 +233,11 @@ def list_skills(
     # `build_turn_skills`.
     skill_service = SkillService(scoped.scope)
     skill_service.ensure_builtin_skills()
-    skills = skill_service.list_visible_skills()
-    managed = skill_service.managed_skill_dirs()
     access = SharedResourceAccess(scoped, principal)
     return {
         "skills": [
-            _skill_response(skill, access, managed=skill.name in managed)
-            for skill in skills
+            _skill_response(visible, access=access, service=skill_service)
+            for visible in skill_service.list_visible_skills()
         ]
     }
 
@@ -294,7 +293,7 @@ def create_skill(
                 claim=claim,
                 claim_token=claim_token,
             )
-    return _skill_response(skill, access)
+    return _skill_response(service.as_own(skill), access=access, service=service)
 
 
 def _upload_skill_bytes(
@@ -348,7 +347,7 @@ def _upload_skill_bytes(
                 claim=claim,
                 claim_token=claim_token,
             )
-    return _skill_response(skill, access)
+    return _skill_response(service.as_own(skill), access=access, service=service)
 
 
 @router.post(
@@ -393,13 +392,11 @@ def get_skill(
 ):
     service = SkillService(scoped.scope)
     try:
-        skill = service.get_visible_skill(skill_id)
+        visible = service.get_visible_skill(skill_id)
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     return _skill_response(
-        skill,
-        SharedResourceAccess(scoped, principal),
-        managed=service.is_managed_skill(skill.name),
+        visible, access=SharedResourceAccess(scoped, principal), service=service
     )
 
 
@@ -415,7 +412,9 @@ def update_skill(
     with _project_reference_lock(access):
         resource_coordination = ExitStack()
         try:
-            _refuse_managed(service, skill_id)
+            # Before any read of the caller's own store, which may not hold a
+            # managed or shared slug, or holds one hidden behind it.
+            service.refuse_unchangeable(skill_id)
             if scoped.scope.org_mode and body.projects is not None:
                 _require_known_projects(scoped, body.projects)
             current = service.get_skill(skill_id)
@@ -426,7 +425,7 @@ def update_skill(
                 if body.label is not None
                 else current.name
             )
-            _refuse_managed(service, current.name, target_slug)
+            service.refuse_unchangeable(current.name, target_slug)
             if scoped.scope.org_mode:
                 for slug in sorted({current.name, target_slug}):
                     resource_coordination.enter_context(
@@ -542,7 +541,7 @@ def update_skill(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
         finally:
             resource_coordination.close()
-    return _skill_response(skill, access)
+    return _skill_response(service.as_own(skill), access=access, service=service)
 
 
 @router.delete("/{skill_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -557,7 +556,7 @@ def delete_skill(
     reference_coordination.__enter__()
     resource_coordination = None
     try:
-        _refuse_managed(service, skill_id)
+        service.refuse_unchangeable(skill_id)
         skill = service.get_skill(skill_id)
         if scoped.scope.org_mode:
             resource_coordination = access.coordination_lock(SKILL, skill.name)

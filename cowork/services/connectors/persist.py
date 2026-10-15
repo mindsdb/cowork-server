@@ -15,12 +15,13 @@ from typing import TYPE_CHECKING
 from anton.utils.datasources import default_user_label, ensure_unique_user_label
 
 from cowork.common.settings.app_settings import ConnectorSettings, get_app_settings
+from cowork.creators import changer_for
 from cowork.managed import (
     ManagedFolder,
     SharedConnection,
     SharedConnections,
-    SharedConnectionsError,
     managed_folder,
+    reads_shared_registry,
 )
 from cowork.services.connectors.identity import (
     derive_connection_name,
@@ -28,7 +29,7 @@ from cowork.services.connectors.identity import (
     resolve_unique_slug,
     secure_keys_for,
 )
-from cowork.services.connectors.layered_vault import LayeredDataVault, Saver, SharedFrom
+from cowork.services.connectors.layered_vault import LayeredDataVault, SharedFrom
 from cowork.services.connectors.vault_lock import lock_for
 
 if TYPE_CHECKING:
@@ -57,35 +58,15 @@ def own_vault_for_scope(scope: "TenantScope | None" = None):
     return LocalDataVault(own_vault_root(scope))
 
 
-def read_shared_connections(managed: ManagedFolder) -> SharedConnections:
-    """The managed folder's shared-connection registry, read live.
-
-    A malformed registry shares nothing and logs an error naming the file:
-    every turn and request goes on with the reader's own connections, and
-    nobody reads anyone else's. create_app refuses to start on one, so this
-    is a registry broken after the server started.
-    """
-    try:
-        return managed.shared_connections()
-    except SharedConnectionsError as error:
-        logger.error("no connection is shared until the registry is fixed: %s", error)
-        return SharedConnections(())
-
-
 def _registry_for(scope: "TenantScope | None", managed: ManagedFolder | None) -> SharedConnections:
-    """The shared-connection registry ``scope`` reads. Only a person's scope
-    that keeps connections personal reads one: where connections are shared,
-    the base vault already holds everyone's."""
+    """The shared-connection registry ``scope`` reads (reads_shared_registry),
+    read live: a malformed one shares nothing and logs an error naming the
+    file (SharedRegistry.read_live)."""
     from cowork.db.personal_resources import PersonalResource
 
-    if (
-        managed is None
-        or scope is None
-        or not scope.personal
-        or not scope.partitioned_for(PersonalResource.CONNECTIONS)
-    ):
+    if managed is None or not reads_shared_registry(scope, resource=PersonalResource.CONNECTIONS):
         return SharedConnections(())
-    return read_shared_connections(managed)
+    return SharedConnections.read_live(managed.shared_connections_file, logger=logger)
 
 
 def _shared_from(entry: SharedConnection) -> SharedFrom:
@@ -94,16 +75,6 @@ def _shared_from(entry: SharedConnection) -> SharedFrom:
 
     creator = scope_for_identity(org_id=entry.partition_id, user_id=entry.user_id)
     return SharedFrom(entry=entry, vault=own_vault_for_scope(creator))
-
-
-def _saver_for(scope: "TenantScope") -> Saver:
-    from cowork.db.personal_resources import PersonalResource
-
-    return Saver(
-        user_id=scope.user_id if scope.personal else None,
-        operator_view=not scope.personal,
-        deployment_wide=not scope.partitioned_for(PersonalResource.CONNECTIONS),
-    )
 
 
 def vault_for_scope(scope: "TenantScope | None" = None):
@@ -117,10 +88,11 @@ def vault_for_scope(scope: "TenantScope | None" = None):
     Every save there records its creator, and a save or delete of a
     connection the scope can't change raises SharedConnectionError.
     """
+    from cowork.db.personal_resources import PersonalResource
+
     own = own_vault_for_scope(scope)
     managed = managed_folder()
-    trusted = get_app_settings().trust_identity_headers
-    if managed is None and not trusted:
+    if managed is None and not get_app_settings().trust_identity_headers:
         return own
     from anton.core.datasources.data_vault import LocalDataVault
 
@@ -135,7 +107,7 @@ def vault_for_scope(scope: "TenantScope | None" = None):
         shared_by_own=frozenset(
             (entry.engine, entry.name) for entry in registry if entry.partition_id == own_partition
         ),
-        saver=_saver_for(scope) if trusted and scope is not None else None,
+        changer=changer_for(scope, resource=PersonalResource.CONNECTIONS),
     )
 
 

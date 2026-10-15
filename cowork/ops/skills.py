@@ -1,17 +1,22 @@
-"""One person's skills: ``python -m cowork.ops.skills share|snapshot``.
+"""One person's skills: ``python -m cowork.ops.skills share|unshare|snapshot``.
 
-``share --skill <slug> --managed-dir <folder>`` moves one of the person's
-skills into the operator's managed skills: it copies the skill's folder into
-``<folder>/<slug>``, then deletes the person's own copy. ``<folder>`` is a
-copy of the managed ``skills/`` folder the caller can write, which the caller
-then places in the managed folder itself, read-only for everyone, the
-author included.
+``share --skill <slug> --managed-dir <folder>`` shares one of the person's
+skills with everyone, read-only: it adds the skill to the shared-skill
+registry, ``<folder>/shared/skills.json`` (cowork.managed.SharedSkills).
+``<folder>`` is the managed folder, writable by the caller; cowork-server
+reads the same registry read-only. Nothing is copied: everyone else reads the
+skill live from the person's own store and can't change it, and the person
+still edits, disables and deletes it as their own (SkillService). Its name
+stays while it is shared.
+
+``unshare --skill <slug> --managed-dir <folder>`` removes the person's entry
+for that skill from the registry. The person's skill stays in their store.
 
 ``snapshot [--project <name>]`` lists the skills the person's agent sees in a
-project (``general`` unless named), in anton's order of precedence, and
-prints one sha256 over them: the sha256 of the lines ``<sha256 of SKILL.md>
-<slug>/SKILL.md``, one per skill, sorted by slug, as ``sha256sum`` prints
-them.
+project (``general`` unless named), shared ones included, in anton's order of
+precedence, and prints one sha256 over them: the sha256 of the lines
+``<sha256 of SKILL.md>  <slug>/SKILL.md``, one per skill, sorted by slug, as
+``sha256sum`` prints them.
 """
 
 from __future__ import annotations
@@ -19,28 +24,36 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
-import shutil
 import sys
 from pathlib import Path
 from typing import Literal
-from uuid import uuid4
 
 from anton.core.tools.skill_format import SKILL_FILE
 from pydantic import BaseModel, ConfigDict
 
-from cowork.managed import managed_folder
+from cowork.db.personal_resources import PersonalResource
+from cowork.managed import SharedSkill, SharedSkills, managed_folder
 from cowork.ops import (
     OperatorCommandError,
     Person,
+    RegistryChange,
     add_person_arguments,
+    managed_folder_at,
     person_from_arguments,
     personal_scope,
+    read_registry,
     run_operator_command,
+    write_registry,
 )
 from cowork.services.projects import GENERAL_PROJECT
-from cowork.services.skills import SkillService, is_builtin_skill, linked_turn_skills
+from cowork.services.skills import (
+    SkillService,
+    is_builtin_skill,
+    linked_turn_skills,
+    shared_turn_skills,
+)
 
-SkillSource = Literal["own", "host", "managed", "anton"]
+SkillSource = Literal["own", "host", "managed", "shared", "anton"]
 
 
 class SnapshotSkill(BaseModel):
@@ -81,13 +94,6 @@ class SkillSnapshot(BaseModel):
         return "\n".join(lines)
 
 
-class SharedSkill(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    slug: str
-    destination: Path
-
-
 def _file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -110,8 +116,9 @@ def snapshot_skills(*, person: Person, project: str) -> SkillSnapshot:
     The turn's own skills folder first (link_turn_skills, which seeds the
     packaged builtins into the person's store, as their first turn does),
     then anton's read-only roots in its order: the harness's own skills, the
-    managed skills, then anton's packaged ones. A slug is taken from the
-    first place that has it, as anton's SkillStore takes it.
+    managed skills, the skills others share with the person (each read live
+    from its creator's store), then anton's packaged ones. A slug is taken
+    from the first place that has it, as anton's SkillStore takes it.
     """
     from anton.core.memory.skills import SkillStore
 
@@ -125,13 +132,14 @@ def snapshot_skills(*, person: Person, project: str) -> SkillSnapshot:
             slug=skill.slug, source="own", sha256=_file_sha256(skill.path / SKILL_FILE)
         )
     managed = managed_folder()
-    readonly_roots: list[tuple[SkillSource, Path]] = [
-        ("host", HOST_SKILLS_DIR),
-        *([] if managed is None else [("managed", managed.skills_dir)]),
-        ("anton", SkillStore().builtin_root),
+    readonly: list[tuple[SkillSource, list[Path]]] = [
+        ("host", _readonly_skill_dirs(HOST_SKILLS_DIR)),
+        ("managed", [] if managed is None else _readonly_skill_dirs(managed.skills_dir)),
+        ("shared", [skill.path for skill in shared_turn_skills(service=service, project_name=project)]),
+        ("anton", _readonly_skill_dirs(SkillStore().builtin_root)),
     ]
-    for source, root in readonly_roots:
-        for skill_dir in _readonly_skill_dirs(root):
+    for source, skill_dirs in readonly:
+        for skill_dir in skill_dirs:
             if skill_dir.name not in found:
                 found[skill_dir.name] = SnapshotSkill(
                     slug=skill_dir.name,
@@ -143,7 +151,7 @@ def snapshot_skills(*, person: Person, project: str) -> SkillSnapshot:
 
 def _refuse_links(skill_dir: Path) -> None:
     """A link in a shared skill would hand every person whatever it points
-    at, so the person's copy must hold none."""
+    at, so the person's skill must hold none when it is shared."""
     for directory, subdirectories, files in os.walk(skill_dir):
         for name in [*subdirectories, *files]:
             entry = Path(directory) / name
@@ -153,57 +161,81 @@ def _refuse_links(skill_dir: Path) -> None:
                 )
 
 
-def share_skill(*, person: Person, slug: str, managed_dir: Path) -> SharedSkill:
-    if not managed_dir.is_dir():
-        raise OperatorCommandError(f"{managed_dir} is not a folder.")
+def share_skill(*, person: Person, slug: str, managed_dir: Path) -> RegistryChange[SharedSkill]:
+    scope = personal_scope(person)
+    if not scope.partitioned_for(PersonalResource.SKILLS):
+        raise OperatorCommandError(
+            "COWORK_PERSONAL_RESOURCES leaves skills shared, so everyone already uses every skill."
+        )
+    path = managed_folder_at(managed_dir).shared_skills_file
+    registry = read_registry(registry_type=SharedSkills, path=path)
     if is_builtin_skill(slug):
         raise OperatorCommandError(
             f"{slug} is a packaged built-in skill, which every person already has."
         )
     managed = managed_folder()
     if managed is not None and slug in managed.skill_slugs():
+        # Everyone reads the operator's own skill first, so the share would
+        # reach nobody.
         raise OperatorCommandError(f"The managed folder already provides a skill named {slug}.")
-    service = SkillService(personal_scope(person))
+    service = SkillService(scope)
     try:
         complete = service.has_complete_skill(slug)
     except ValueError as error:
         raise OperatorCommandError(str(error)) from None
     if not complete:
         raise OperatorCommandError(f"User {person.user_id} has no skill named {slug}.")
-    source = service._skill_dir(slug)
-    _refuse_links(source)
-    destination = managed_dir / slug
-    if destination.exists() or destination.is_symlink():
-        raise OperatorCommandError(f"{destination} already exists.")
+    _refuse_links(service._skill_dir(slug))
+    for entry in registry.root:
+        if entry.skill != slug:
+            continue
+        if entry.partition_id == person.partition_id:
+            raise OperatorCommandError(f"Skill {slug} of user {person.user_id} is already shared.")
+        # Everyone else reads the first entry for a name, so a second one
+        # would reach nobody.
+        raise OperatorCommandError(f"User {entry.user_id} already shares a skill named {slug}.")
+    added = SharedSkill(user_id=person.user_id, partition_id=person.partition_id, skill=slug)
+    write_registry(path=path, registry=SharedSkills((*registry.root, added)))
+    return RegistryChange(entries=(added,), registry=path)
 
-    # Copied under a name no skill can have, so the person's copy is deleted
-    # before the shared one is in place under the skill's name.
-    staged = managed_dir / f".{slug}.sharing-{uuid4().hex}"
-    shutil.copytree(source, staged, symlinks=True)
-    try:
-        service.delete_skill(slug)
-    except BaseException:
-        shutil.rmtree(staged, ignore_errors=True)
-        raise
-    staged.rename(destination)
-    return SharedSkill(slug=slug, destination=destination)
+
+def unshare_skill(*, person: Person, slug: str, managed_dir: Path) -> RegistryChange[SharedSkill]:
+    path = managed_folder_at(managed_dir).shared_skills_file
+    entries = read_registry(registry_type=SharedSkills, path=path).root
+    removed = tuple(
+        entry
+        for entry in entries
+        if entry.partition_id == person.partition_id and entry.skill == slug
+    )
+    if not removed:
+        raise OperatorCommandError(f"User {person.user_id} shares no skill named {slug}.")
+    kept = tuple(entry for entry in entries if entry not in removed)
+    write_registry(path=path, registry=SharedSkills(kept))
+    return RegistryChange(entries=removed, registry=path)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m cowork.ops.skills",
-        description="Share one person's skill with everyone, or print the skills their agent sees.",
+        description=(
+            "Share one person's skill with everyone, stop sharing it, or print the "
+            "skills their agent sees."
+        ),
     )
     actions = parser.add_subparsers(dest="action", required=True)
-    share = actions.add_parser("share", help="move the person's skill into the managed skills")
-    add_person_arguments(share)
-    share.add_argument("--skill", required=True, help="the skill's name, its slug")
-    share.add_argument(
-        "--managed-dir",
-        required=True,
-        type=Path,
-        help="the writable copy of the managed skills folder the skill is copied into",
+    share = actions.add_parser("share", help="share the person's skill with everyone, read-only")
+    unshare = actions.add_parser(
+        "unshare", help="stop sharing it; the person's skill stays theirs"
     )
+    for action in (share, unshare):
+        add_person_arguments(action)
+        action.add_argument("--skill", required=True, help="the skill's name, its slug")
+        action.add_argument(
+            "--managed-dir",
+            required=True,
+            type=Path,
+            help="the managed folder, writable: the registry is its shared/skills.json",
+        )
     snapshot = actions.add_parser(
         "snapshot", help="print the skills the person's agent sees, with one sha256"
     )
@@ -217,10 +249,20 @@ def main(argv: list[str] | None = None) -> int:
     def command() -> str:
         if arguments.action == "snapshot":
             return snapshot_skills(person=person, project=arguments.project).render()
-        shared = share_skill(person=person, slug=arguments.skill, managed_dir=arguments.managed_dir)
-        return (
-            f"Moved skill {shared.slug} of user {person.user_id} into {shared.destination}. "
-            "The person's own copy is deleted."
+        if arguments.action == "share":
+            change = share_skill(
+                person=person, slug=arguments.skill, managed_dir=arguments.managed_dir
+            )
+            return "\n".join(
+                f"Shared skill {entry.skill} of user {person.user_id} with everyone, "
+                f"read-only: added it to {change.registry}."
+                for entry in change.entries
+            )
+        change = unshare_skill(person=person, slug=arguments.skill, managed_dir=arguments.managed_dir)
+        return "\n".join(
+            f"Stopped sharing skill {entry.skill} of user {person.user_id}: removed it from "
+            f"{change.registry}. Their own skill stays in their store."
+            for entry in change.entries
         )
 
     return run_operator_command(command)

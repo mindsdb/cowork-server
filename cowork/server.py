@@ -24,7 +24,7 @@ from cowork.db.personal_resources import check_personal_resource_dependencies
 from cowork.db.scoped import MissingTenantScopeError
 from cowork.db.units import DatabaseBusy, busy_retry_seconds
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
-from cowork.managed import SharedConnectionsError, cortex_takes_managed_layer, managed_folder
+from cowork.managed import SharedRegistryError, cortex_takes_managed_layer, managed_folder
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL, SharedConnectionError
@@ -421,22 +421,25 @@ def create_app() -> FastAPI:
                 "managed rules would reach no turn."
             )
         # A malformed registry stops the start, where the operator sees it. One
-        # broken later shares nothing until fixed (read_shared_connections).
+        # broken later shares nothing until fixed (SharedRegistry.read_live).
         try:
-            shared = managed.shared_connections()
-        except SharedConnectionsError as error:
+            shared_connections = managed.shared_connections()
+            shared_skills = managed.shared_skills()
+        except SharedRegistryError as error:
             raise RuntimeError(
-                f"COWORK_MANAGED_DIR's shared-connection registry is malformed: {error}. "
+                f"COWORK_MANAGED_DIR's shared registry is malformed: {error}. "
                 "Fix or remove the file; a missing one shares nothing."
             ) from error
         from anton.core.datasources.data_vault import LocalDataVault
 
         logger.info(
-            "managed folder: %s (%d skills, %d connections, %d shared connections)",
+            "managed folder: %s (%d skills, %d connections, %d shared connections, "
+            "%d shared skills)",
             managed.root,
             len(managed.skill_slugs()),
             len(LocalDataVault(managed.vault_dir).list_connections()),
-            len(shared.root),
+            len(shared_connections.root),
+            len(shared_skills.root),
         )
 
     # Org mode, or local tenancy that trusts identity headers: build a

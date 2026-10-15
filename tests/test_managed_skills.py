@@ -3,10 +3,11 @@
 Every person lists them as built-in, with no capability, and a managed skill
 wins over a same-named skill in the person's own store. Their names are
 reserved: create, upload, rename into, edit, disable and delete of a managed
-slug each answer 403 with the operator sentence, whether or not the person's
+slug each answer 403 with the shared sentence, whether or not the person's
 store holds that name too, and in every scope. A turn reads them from anton's
 read-only roots after the harness's own skills, and never links a person's
-same-named skill over them. With no managed folder, the listing and the
+same-named skill over them; a person's turn reads the skills others share
+with them after the managed ones. With no managed folder, the listing and the
 turn's roots are unchanged.
 """
 from __future__ import annotations
@@ -24,12 +25,17 @@ from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_open_session
 from cowork.harnesses.anton_harness.harness import HOST_SKILLS_DIR
-from cowork.managed import MANAGED_SKILL_REFUSAL
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.principal import personal_partition_id
 from cowork.schemas.skills import SkillCreateRequest, SkillUpdateRequest
-from cowork.services.skills import CodeSkillService, SkillImmutableError, SkillService, link_turn_skills
+from cowork.services.skills import (
+    SHARED_SKILL_REFUSAL,
+    CodeSkillService,
+    SkillImmutableError,
+    SkillService,
+    link_turn_skills,
+)
 from tests._turns import built_turn
 
 DEPLOYMENT = "5f0c7d2e-8b1a-4c3e-9d4f-2a6b8c0e1f3a"
@@ -89,7 +95,7 @@ def _refusal(call) -> HTTPException:
     with pytest.raises(HTTPException) as refused:
         call()
     assert refused.value.status_code == 403
-    assert refused.value.detail == MANAGED_SKILL_REFUSAL
+    assert refused.value.detail == SHARED_SKILL_REFUSAL
     return refused.value
 
 
@@ -164,12 +170,12 @@ def test_the_service_refuses_too_in_every_scope(managed_dir, stores):
     get_app_settings.cache_clear()
     _write_skill(managed_dir.skills_dir, MANAGED, MANAGED_BODY)
     desktop = SkillService(LOCAL_SCOPE)
-    with pytest.raises(SkillImmutableError, match="provided by your operator"):
+    with pytest.raises(SkillImmutableError, match="shared with you"):
         desktop.create_skill(MANAGED, "x")
     _write_skill(desktop.root, MANAGED, "Mine.")
-    with pytest.raises(SkillImmutableError, match="provided by your operator"):
+    with pytest.raises(SkillImmutableError, match="shared with you"):
         desktop.delete_skill(MANAGED)
-    with pytest.raises(SkillImmutableError, match="provided by your operator"):
+    with pytest.raises(SkillImmutableError, match="shared with you"):
         desktop.update_skill(MANAGED, instructions="x")
     # The Code store never reserves the general catalogue's managed names.
     assert CodeSkillService(LOCAL_SCOPE).is_managed_skill(MANAGED) is False
@@ -201,7 +207,11 @@ def test_a_turn_never_links_a_same_named_own_skill(managed_skill, stores):
 
 async def test_a_turn_reads_managed_skills_after_the_host_skills(monkeypatch, managed_skill, stores):
     async with built_turn(monkeypatch=monkeypatch, tmp_path=stores, scope=ALICE) as turn:
-        assert turn.config.settings.skills_extra_roots == [HOST_SKILLS_DIR, managed_skill.skills_dir]
+        assert turn.config.settings.skills_extra_roots == [
+            HOST_SKILLS_DIR,
+            managed_skill.skills_dir,
+            turn.scratch / "shared-skills",
+        ]
 
 
 async def test_without_a_managed_folder_a_turn_reads_the_host_skills_only(monkeypatch, stores):

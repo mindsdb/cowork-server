@@ -847,15 +847,15 @@ class AppSettings(Settings):
         validation_alias=AliasChoices("COWORK_MANAGED_DIR"),
         description=(
             "The operator's managed folder (cowork.managed.ManagedFolder): "
-            "memory/ with rules and lessons every turn reads, skills/ every "
-            "person sees as built-in, data-vault/ with the operator's own "
-            "connections every turn can use, and an optional "
-            "shared/connections.json listing the connections people share. "
-            "Cowork never writes it. Blank or unset: none. create_app refuses "
-            "it in org tenancy, when the folder or any of memory/, skills/ and "
-            "data-vault/ is missing, when shared/connections.json is "
-            "malformed, and when the installed anton's Cortex takes no "
-            "managed_hc."
+            "memory/ with rules and lessons every turn reads, skills/ with the "
+            "operator's own skills every person sees as built-in, data-vault/ "
+            "with the operator's own connections every turn can use, and an "
+            "optional shared/connections.json and shared/skills.json listing "
+            "the connections and skills people share. Cowork never writes it. "
+            "Blank or unset: none. create_app refuses it in org tenancy, when "
+            "the folder or any of memory/, skills/ and data-vault/ is missing, "
+            "when either shared registry is malformed, and when the installed "
+            "anton's Cortex takes no managed_hc."
         ),
     )
 

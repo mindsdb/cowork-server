@@ -368,7 +368,8 @@ def test_a_persons_builtin_copy_is_immutable(skills_root, personal_deployment):
 
 def test_a_person_with_shared_skills_keeps_the_desktop_store(skills_root, personal_deployment):
     """Skills left off the personal list stay in the unkeyed store, seeded at
-    boot, and its builtin copies stay editable, as on today's shared stack."""
+    boot. Its builtin copies are mutable there, but nobody created them, so
+    only the operator view changes them."""
     shared = _person(resources=frozenset())
     assert ensure_builtin_skills(shared) is False
     assert SkillService(shared).root == skills_root
@@ -377,7 +378,9 @@ def test_a_person_with_shared_skills_keeps_the_desktop_store(skills_root, person
     target = skills_root / victim
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(BUILTIN_SKILLS_DIR / victim, target)
-    assert SkillService(shared).delete_skill(victim) is True
+    with pytest.raises(SkillImmutableError, match="shared with you"):
+        SkillService(shared).delete_skill(victim)
+    assert SkillService(LOCAL_SCOPE).delete_skill(victim) is True
 
 
 def test_skill_links_run_only_where_skills_and_projects_are_shared(

@@ -37,7 +37,7 @@ from cowork.services.connectors.connections import service
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.projects import display_label
 from cowork.services.skill_links import links_apply_to
-from cowork.services.skills import link_turn_skills
+from cowork.services.skills import link_turn_skills, reads_shared_skills
 from cowork.streaming.liveness import ModelWaitTicker
 
 if TYPE_CHECKING:
@@ -80,9 +80,9 @@ HOST_SKILLS_DIR = Path(__file__).parent / "skills"
 
 def _vault_scratch_dir() -> Path:
     """Where a turn's temporary folder is staged when it needs one: the
-    filtered data vault of a turn that disables one or more connections, and
-    the empty memory tiers of a turn with no person (see
-    ``_new_turn_scratch_dir``).
+    filtered data vault of a turn that disables one or more connections, the
+    empty memory tiers of a turn with no person, and the links to the skills
+    others share with the asker (see ``_new_turn_scratch_dir``).
 
     Local mode: cowork_home()/tmp, unchanged. Org mode: relocated off shared
     EFS storage by pod_local_only (see its docstring), because this directory
@@ -1098,7 +1098,8 @@ class AntonHarness:
         # interactive connection tools). The operator's managed skills follow
         # them, so a host skill keeps its name; anton ranks every read-only
         # root below the turn's own skills folder, which never links a slug a
-        # managed skill holds (link_turn_skills).
+        # managed skill holds (link_turn_skills). A person's turn adds the
+        # skills others share with them after these, below.
         managed = managed_folder()
         anton_settings.skills_extra_roots = [
             HOST_SKILLS_DIR,
@@ -1382,7 +1383,9 @@ class AntonHarness:
             # asker's store, builtins seeded first. A project that is the
             # asker's alone takes them in its skills folder; a shared project's
             # folder is every person's at once, so the turn's scratch folder
-            # takes them instead.
+            # takes them instead. The skills others share with the asker are
+            # linked into the scratch folder too, which anton reads as its last
+            # host root: read-only, after the managed skills.
             turn_scope = current_settings_scope()
             if not links_apply_to(turn_scope):
                 if turn_scope is not None and turn_scope.partitioned_for(
@@ -1393,10 +1396,20 @@ class AntonHarness:
                     if turn_scratch_dir is None:
                         turn_scratch_dir = _new_turn_scratch_dir()
                     turn_skills_dir = turn_scratch_dir / "skills"
+                shared_skills_dir = None
+                if reads_shared_skills(turn_scope):
+                    if turn_scratch_dir is None:
+                        turn_scratch_dir = _new_turn_scratch_dir()
+                    shared_skills_dir = turn_scratch_dir / "shared-skills"
+                    anton_settings.skills_extra_roots = [
+                        *anton_settings.skills_extra_roots,
+                        shared_skills_dir,
+                    ]
                 link_turn_skills(
                     scope=turn_scope,
                     project_name=conversation.project.name,
                     skills_dir=turn_skills_dir,
+                    shared_skills_dir=shared_skills_dir,
                 )
                 anton_settings.skills_root = turn_skills_dir
 

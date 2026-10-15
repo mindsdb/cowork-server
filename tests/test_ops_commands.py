@@ -3,11 +3,13 @@
 Each command acts in one person's space, worked out from the pair the proxy
 sends: memory print shows what that person's agent learned and nothing of
 the other's, and after memory clear it shows nothing learned. skills share
-moves a person's skill into the managed folder, where the author loses edit
-like everyone else. skills snapshot lists what the person's agent sees, with
-a sha256 that stays the same while the skills do. connections share adds a
-person's connection to the shared-connection registry, where everyone else
-reads it from the person's own vault, and unshare takes it out again.
+adds a person's skill to the shared-skill registry, where everyone else reads
+it from the person's own store while the person still edits it, and unshare
+takes it out again. skills snapshot lists what the person's agent sees,
+shared skills included, with a sha256 that stays the same while the skills
+do. connections share adds a person's connection to the shared-connection
+registry, where everyone else reads it from the person's own vault, and
+unshare takes it out again.
 """
 from __future__ import annotations
 
@@ -17,7 +19,6 @@ from pathlib import Path
 
 import pytest
 from anton.core.datasources.data_vault import LocalDataVault
-from fastapi import HTTPException
 from sqlalchemy import delete
 
 from cowork.api.v1.endpoints import skills as skills_ep
@@ -25,14 +26,12 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import ScopedSession
 from cowork.db.session import get_open_session
 from cowork.harnesses.memory.registry import MemorySlot
-from cowork.managed import MANAGED_SKILL_REFUSAL
 from cowork.models.project import Project
 from cowork.ops import Person, personal_scope
 from cowork.ops import connections as connections_ops
 from cowork.ops import memory as memory_ops
 from cowork.ops import skills as skills_ops
 from cowork.schemas.memory import MemoryScope
-from cowork.schemas.skills import SkillUpdateRequest
 from cowork.services.connectors.persist import own_vault_for_scope, vault_for_scope
 from cowork.services.memory import MemoryService
 from cowork.services.skills import BUILTIN_SKILL_SLUGS, SkillService
@@ -169,37 +168,75 @@ def test_a_person_id_that_is_not_a_uuid_is_refused(stack, capsys):
 # ── skills ──────────────────────────────────────────────────────────────────
 
 
-def test_share_skill_moves_it_and_its_author_loses_edit(stack, capsys):
-    alice = SkillService(personal_scope(ALICE))
-    alice.create_skill("team-skill", "Do it the team's way.")
-
-    status, out, _ = _run(
+def _skill_command(
+    person: Person, slug: str, folder: Path, capsys, *, action: str = "share"
+) -> tuple[int, str, str]:
+    return _run(
         skills_ops.main,
-        ["share", *_arguments(ALICE), "--skill", "team-skill", "--managed-dir", str(stack.skills_dir)],
+        [action, *_arguments(person), "--skill", slug, "--managed-dir", str(folder)],
         capsys,
     )
 
+
+def _skill_registry(folder: Path) -> list[dict]:
+    return json.loads((folder / "shared" / "skills.json").read_text())
+
+
+def _listed_skills(person: Person) -> dict[str, dict]:
+    raw = get_open_session()
+    try:
+        scoped = ScopedSession(raw, personal_scope(person))
+        return {s["id"]: s for s in skills_ep.list_skills(scoped, None)["skills"]}
+    finally:
+        raw.close()
+
+
+def test_share_skill_adds_it_to_the_registry_and_its_creator_keeps_edit(stack, capsys):
+    alice = SkillService(personal_scope(ALICE))
+    alice.create_skill("team-skill", "Do it the team's way.")
+
+    status, out, _ = _skill_command(ALICE, "team-skill", stack.root, capsys)
+
+    assert status == 0
+    registry_file = stack.root / "shared" / "skills.json"
+    assert out == (
+        f"Shared skill team-skill of user {SUB_A} with everyone, read-only: "
+        f"added it to {registry_file}.\n"
+    )
+    assert _skill_registry(stack.root) == [
+        {"user_id": SUB_A, "partition_id": ALICE.partition_id, "skill": "team-skill"}
+    ]
+    assert registry_file.stat().st_mode & 0o777 == 0o644
+    # Nothing is copied: the skill stays in Alice's store, and the managed
+    # skills folder stays empty.
+    assert (alice.root / "team-skill" / "SKILL.md").is_file()
+    assert list(stack.skills_dir.iterdir()) == []
+
+    bobs = _listed_skills(BOB)["team-skill"]
+    assert (bobs["isBuiltin"], bobs["shared"]) == (False, True)
+    assert bobs["capabilities"] == {"canEdit": False, "canDelete": False, "canDisable": False}
+    alices = _listed_skills(ALICE)["team-skill"]
+    assert (alices["shared"], alices["capabilities"]["canEdit"]) == (True, True)
+    alice.update_skill("team-skill", instructions="The team's new way.")
+    assert _listed_skills(BOB)["team-skill"]["declarative"] == "The team's new way."
+
+
+def test_unshare_skill_removes_it_and_keeps_the_persons_own(stack, capsys):
+    SkillService(personal_scope(ALICE)).create_skill("team-skill", "Alice's.")
+    SkillService(personal_scope(BOB)).create_skill("bob-skill", "Bob's.")
+    _skill_command(ALICE, "team-skill", stack.root, capsys)
+    _skill_command(BOB, "bob-skill", stack.root, capsys)
+
+    status, out, _ = _skill_command(ALICE, "team-skill", stack.root, capsys, action="unshare")
+
     assert status == 0
     assert out == (
-        f"Moved skill team-skill of user {SUB_A} into {stack.skills_dir / 'team-skill'}. "
-        "The person's own copy is deleted.\n"
+        f"Stopped sharing skill team-skill of user {SUB_A}: removed it from "
+        f"{stack.root / 'shared' / 'skills.json'}. Their own skill stays in their store.\n"
     )
-    assert "Do it the team's way." in (stack.skills_dir / "team-skill" / "SKILL.md").read_text()
-    assert not (alice.root / "team-skill").exists()
-    assert [entry.name for entry in stack.skills_dir.iterdir()] == ["team-skill"]
-
-    for person in (ALICE, BOB):
-        raw = get_open_session()
-        try:
-            scoped = ScopedSession(raw, personal_scope(person))
-            listed = {s["id"]: s for s in skills_ep.list_skills(scoped, None)["skills"]}
-            assert listed["team-skill"]["isBuiltin"] is True
-            assert listed["team-skill"]["capabilities"]["canEdit"] is False
-            with pytest.raises(HTTPException) as refused:
-                skills_ep.update_skill("team-skill", SkillUpdateRequest(instructions="mine now"), scoped, None)
-            assert refused.value.status_code == 403 and refused.value.detail == MANAGED_SKILL_REFUSAL
-        finally:
-            raw.close()
+    assert [entry["skill"] for entry in _skill_registry(stack.root)] == ["bob-skill"]
+    assert "team-skill" not in _listed_skills(BOB)
+    assert _listed_skills(ALICE)["team-skill"]["shared"] is False
 
 
 @pytest.mark.parametrize(
@@ -209,16 +246,12 @@ def test_share_skill_moves_it_and_its_author_loses_edit(stack, capsys):
         ("never-made", "has no skill named never-made"),
     ],
 )
-def test_share_skill_refuses_what_it_cannot_move(stack, capsys, slug, message):
+def test_share_skill_refuses_what_it_cannot_share(stack, capsys, slug, message):
     SkillService(personal_scope(ALICE)).ensure_builtin_skills()
-    status, out, err = _run(
-        skills_ops.main,
-        ["share", *_arguments(ALICE), "--skill", slug, "--managed-dir", str(stack.skills_dir)],
-        capsys,
-    )
+    status, out, err = _skill_command(ALICE, slug, stack.root, capsys)
     assert status == 1 and out == ""
     assert message in err
-    assert list(stack.skills_dir.iterdir()) == []
+    assert not (stack.root / "shared" / "skills.json").exists()
 
 
 def test_share_skill_refuses_a_skill_holding_a_link(stack, capsys, tmp_path):
@@ -228,15 +261,67 @@ def test_share_skill_refuses_a_skill_holding_a_link(stack, capsys, tmp_path):
     secret.write_text("not for everyone")
     (alice.root / "team-skill" / "notes.txt").symlink_to(secret)
 
-    status, _, err = _run(
-        skills_ops.main,
-        ["share", *_arguments(ALICE), "--skill", "team-skill", "--managed-dir", str(stack.skills_dir)],
-        capsys,
-    )
+    status, _, err = _skill_command(ALICE, "team-skill", stack.root, capsys)
 
     assert status == 1 and "holds a link" in err
     assert (alice.root / "team-skill" / "SKILL.md").exists()
-    assert list(stack.skills_dir.iterdir()) == []
+    assert not (stack.root / "shared" / "skills.json").exists()
+
+
+def test_share_skill_refuses_one_already_shared_or_hidden(stack, capsys):
+    SkillService(personal_scope(ALICE)).create_skill("team-skill", "Alice's.")
+    SkillService(personal_scope(BOB)).create_skill("team-skill", "Bob's.")
+    SkillService(personal_scope(BOB)).create_skill("report", "Bob's.")
+    (stack.skills_dir / "report").mkdir()
+    (stack.skills_dir / "report" / "SKILL.md").write_text(
+        "---\nname: report\ndescription: The operator's.\n---\nOperator way.\n"
+    )
+    _skill_command(ALICE, "team-skill", stack.root, capsys)
+
+    for person, slug, message in (
+        (ALICE, "team-skill", f"Skill team-skill of user {SUB_A} is already shared."),
+        (BOB, "team-skill", f"User {SUB_A} already shares a skill named team-skill."),
+        (BOB, "report", "The managed folder already provides a skill named report."),
+    ):
+        status, out, err = _skill_command(person, slug, stack.root, capsys)
+        assert (status, out) == (1, "")
+        assert message in err
+    assert len(_skill_registry(stack.root)) == 1
+
+
+def test_unshare_skill_refuses_a_name_the_person_shares_none_of(stack, capsys):
+    SkillService(personal_scope(ALICE)).create_skill("team-skill", "Alice's.")
+    _skill_command(ALICE, "team-skill", stack.root, capsys)
+
+    status, out, err = _skill_command(BOB, "team-skill", stack.root, capsys, action="unshare")
+
+    assert (status, out) == (1, "")
+    assert f"User {SUB_B} shares no skill named team-skill." in err
+    assert len(_skill_registry(stack.root)) == 1
+
+
+def test_a_malformed_skill_registry_is_never_rewritten(stack, capsys):
+    SkillService(personal_scope(ALICE)).create_skill("team-skill", "Alice's.")
+    registry_file = stack.root / "shared" / "skills.json"
+    registry_file.parent.mkdir()
+    registry_file.write_text('{"not": "a list"}')
+
+    for action in ("share", "unshare"):
+        status, out, err = _skill_command(ALICE, "team-skill", stack.root, capsys, action=action)
+        assert (status, out) == (1, "")
+        assert "is not a list of shared skills" in err
+    assert registry_file.read_text() == '{"not": "a list"}'
+
+
+def test_share_skill_refuses_where_skills_are_shared(stack, monkeypatch, capsys):
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", "connections,memory,settings")
+    get_app_settings.cache_clear()
+
+    status, out, err = _skill_command(ALICE, "team-skill", stack.root, capsys)
+
+    assert (status, out) == (1, "")
+    assert "COWORK_PERSONAL_RESOURCES leaves skills shared" in err
+    assert not (stack.root / "shared" / "skills.json").exists()
 
 
 def _snapshot_lines(out: str) -> tuple[dict[str, str], str]:
@@ -293,6 +378,40 @@ def test_a_snapshot_takes_a_managed_skill_over_a_same_named_own_one(stack, capsy
     _, out, _ = _run(skills_ops.main, ["snapshot", *_arguments(ALICE)], capsys)
 
     assert _snapshot_lines(out)[0]["team-skill"] == "(managed)"
+
+
+def test_a_snapshot_includes_the_skills_others_share_and_follows_their_edits(stack, capsys):
+    alice = SkillService(personal_scope(ALICE))
+    alice.create_skill("team-skill", "Do it the team's way.")
+    alice.create_skill("private-skill", "Alice's alone.")
+    _skill_command(ALICE, "team-skill", stack.root, capsys)
+
+    _, out, _ = _run(skills_ops.main, ["snapshot", *_arguments(BOB)], capsys)
+    skills, digest_line = _snapshot_lines(out)
+    assert skills["team-skill"] == "(shared)"
+    assert "private-skill" not in skills
+
+    # The shared skill's line hashes the SKILL.md in Alice's own store.
+    from anton.core.memory.skills import SkillStore
+
+    from cowork.harnesses.anton_harness.harness import HOST_SKILLS_DIR
+
+    roots = {
+        "(own)": SkillService(personal_scope(BOB)).root,
+        "(host)": HOST_SKILLS_DIR,
+        "(managed)": stack.skills_dir,
+        "(shared)": alice.root,
+        "(anton)": SkillStore().builtin_root,
+    }
+    manifest = "".join(
+        f"{hashlib.sha256((roots[source] / slug / 'SKILL.md').read_bytes()).hexdigest()}  {slug}/SKILL.md\n"
+        for slug, source in sorted(skills.items())
+    )
+    assert digest_line == f"sha256 {hashlib.sha256(manifest.encode()).hexdigest()}"
+
+    alice.update_skill("team-skill", instructions="The team's new way.")
+    _, changed, _ = _run(skills_ops.main, ["snapshot", *_arguments(BOB)], capsys)
+    assert _snapshot_lines(changed)[1] != digest_line
 
 
 # ── connections ─────────────────────────────────────────────────────────────

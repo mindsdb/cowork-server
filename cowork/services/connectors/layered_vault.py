@@ -13,8 +13,8 @@ from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 from anton.core.datasources.data_vault import DataVault
-from pydantic import BaseModel, ConfigDict
 
+from cowork.creators import Changer
 from cowork.managed import SharedConnection
 
 SHARED_CONNECTION_REFUSAL = "This connection is shared with you and can't be changed here."
@@ -40,21 +40,6 @@ class SharedConnectionError(PermissionError):
         self.name = name
 
 
-class Saver(BaseModel):
-    """Who saves through a vault on a deployment that trusts identity headers."""
-
-    model_config = ConfigDict(frozen=True)
-
-    # The person's sub; None for the operator view (a request with no person)
-    # and for a person's partition acting with no user.
-    user_id: str | None
-    operator_view: bool
-    # The vault is the deployment's base vault, which every person reads
-    # (connections shared): only an entry's creator changes it there, and an
-    # entry with no creator only the operator view.
-    deployment_wide: bool
-
-
 @dataclass(frozen=True)
 class SharedFrom:
     """A registry entry of someone else's, with that person's own vault."""
@@ -77,12 +62,12 @@ class LayeredDataVault:
 
     Only the scope's own entries can change: a save or delete of a managed or
     shared one raises SharedConnectionError, and so does one of an own entry
-    the saver didn't create where the own vault is deployment-wide. Every
-    other save and delete goes to the own vault, a turn's included, so what
-    the agent saves in a turn outlives the turn. With a ``saver``, every save
-    records the connection's creator in CREATED_BY_FIELD: a create stamps the
-    saver's sub (none for the operator view), and an update keeps the stored
-    value, whatever the saved fields say.
+    the changer didn't create where the own vault is deployment-wide
+    (Changer.may_change). Every other save and delete goes to the own vault,
+    a turn's included, so what the agent saves in a turn outlives the turn.
+    With a ``changer``, every save records the connection's creator in
+    CREATED_BY_FIELD: a create stamps the changer's (Changer.creator), and an
+    update keeps the stored value, whatever the saved fields say.
     """
 
     def __init__(
@@ -92,13 +77,13 @@ class LayeredDataVault:
         managed: DataVault | None = None,
         shared: tuple[SharedFrom, ...] = (),
         shared_by_own: frozenset[tuple[str, str]] = frozenset(),
-        saver: Saver | None = None,
+        changer: Changer | None = None,
     ) -> None:
         self._own = own
         self._managed = managed
         self._shared = shared
         self._shared_by_own = shared_by_own
-        self._saver = saver
+        self._changer = changer
 
     def _find(self, engine: str, name: str) -> _Found:
         """The vault that answers for (engine, name), with its record; the
@@ -121,23 +106,18 @@ class LayeredDataVault:
     def _creator(record: dict[str, Any]) -> str | None:
         return str((record.get("fields") or {}).get(CREATED_BY_FIELD) or "") or None
 
-    def _saver_may_change(self, record: dict[str, Any]) -> bool:
-        """Whether the saver may change this record of the own vault."""
-        if self._saver is None or not self._saver.deployment_wide:
-            return True
-        creator = self._creator(record)
-        if self._saver.operator_view:
-            return creator is None
-        return creator is not None and creator == self._saver.user_id
-
     def _may_change(self, found: _Found) -> bool:
         if found.vault is not self._own:
             return False
-        return found.record is None or self._saver_may_change(found.record)
+        return (
+            found.record is None
+            or self._changer is None
+            or self._changer.may_change(self._creator(found.record))
+        )
 
     def can_change(self, engine: str, name: str) -> bool:
         """Whether a save or delete of (engine, name) goes through: false for a
-        managed or shared entry, and for an own entry the saver didn't create
+        managed or shared entry, and for an own entry the changer didn't create
         where the own vault is deployment-wide. True for one nobody holds."""
         return self._may_change(self._find(engine, name))
 
@@ -153,15 +133,15 @@ class LayeredDataVault:
 
     def _stamped(self, found: _Found, credentials: dict[str, str]) -> dict[str, str]:
         """``credentials`` with CREATED_BY_FIELD as the record keeps it: the
-        stored creator on an update, the saver's sub on a create, and none
+        stored creator on an update, the changer's on a create, and none
         where neither names one. Never the value the caller passed."""
         fields = dict(credentials)
-        if self._saver is None:
+        if self._changer is None:
             return fields
         if found.record is not None:
             creator = self._creator(found.record)
         else:
-            creator = None if self._saver.operator_view else self._saver.user_id
+            creator = self._changer.creator
         fields.pop(CREATED_BY_FIELD, None)
         if creator is not None:
             fields[CREATED_BY_FIELD] = creator

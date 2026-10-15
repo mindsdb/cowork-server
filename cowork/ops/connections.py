@@ -15,85 +15,39 @@ by that name from the registry. The person's connection stays in their vault.
 from __future__ import annotations
 
 import argparse
-import os
 import sys
-import tempfile
 from pathlib import Path
-from typing import NamedTuple
 
 from anton.core.datasources.data_vault import LocalDataVault
-from pydantic import BaseModel, ConfigDict
 
 from cowork.db.personal_resources import PersonalResource
-from cowork.managed import (
-    ManagedFolder,
-    SharedConnection,
-    SharedConnections,
-    SharedConnectionsError,
-    managed_folder,
-)
+from cowork.managed import SharedConnection, SharedConnections, managed_folder
 from cowork.ops import (
     OperatorCommandError,
     Person,
+    RegistryChange,
     add_person_arguments,
+    managed_folder_at,
     person_from_arguments,
     personal_scope,
+    read_registry,
     run_operator_command,
+    write_registry,
 )
 from cowork.services.connectors.persist import own_vault_for_scope
 
 
-class RegistryChange(BaseModel):
-    """What share or unshare did to the registry file."""
-
-    model_config = ConfigDict(frozen=True)
-
-    entries: tuple[SharedConnection, ...]
-    registry: Path
-
-
-class _Registry(NamedTuple):
-    path: Path
-    connections: SharedConnections
-
-
-def _registry_at(managed_dir: Path) -> _Registry:
-    if not managed_dir.is_dir():
-        raise OperatorCommandError(f"{managed_dir} is not a folder.")
-    path = ManagedFolder.at(managed_dir).shared_connections_file
-    try:
-        return _Registry(path=path, connections=SharedConnections.read(path))
-    except SharedConnectionsError as error:
-        # Never rewrite a registry this command can't read: it would drop
-        # every entry in it.
-        raise OperatorCommandError(f"{error}. Fix or remove it first.") from error
-
-
-def _write_registry(path: Path, registry: SharedConnections) -> None:
-    """Replace the registry file at once, so the server never reads half of it."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=path.parent, prefix=".connections-", suffix=".json", delete=False
-    ) as handle:
-        handle.write(registry.model_dump_json(indent=2) + "\n")
-    temporary = Path(handle.name)
-    try:
-        # Readable by the server's user, whatever the caller's umask.
-        temporary.chmod(0o644)
-        os.replace(temporary, path)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-
-
-def share_connection(*, person: Person, name: str, managed_dir: Path) -> RegistryChange:
+def share_connection(
+    *, person: Person, name: str, managed_dir: Path
+) -> RegistryChange[SharedConnection]:
     scope = personal_scope(person)
     if not scope.partitioned_for(PersonalResource.CONNECTIONS):
         raise OperatorCommandError(
             "COWORK_PERSONAL_RESOURCES leaves connections shared, so everyone already "
             "uses every connection."
         )
-    registry = _registry_at(managed_dir)
+    path = managed_folder_at(managed_dir).shared_connections_file
+    registry = read_registry(registry_type=SharedConnections, path=path)
     own = own_vault_for_scope(scope)
     engines = sorted(
         entry["engine"] for entry in own.list_connections() if entry["name"] == name
@@ -113,7 +67,7 @@ def share_connection(*, person: Person, name: str, managed_dir: Path) -> Registr
         raise OperatorCommandError(
             f"The managed folder already provides a {engine} connection named {name}."
         )
-    for entry in registry.connections.root:
+    for entry in registry.root:
         if (entry.engine, entry.name) != (engine, name):
             continue
         if entry.partition_id == person.partition_id:
@@ -128,13 +82,15 @@ def share_connection(*, person: Person, name: str, managed_dir: Path) -> Registr
     added = SharedConnection(
         user_id=person.user_id, partition_id=person.partition_id, engine=engine, name=name
     )
-    _write_registry(registry.path, SharedConnections((*registry.connections.root, added)))
-    return RegistryChange(entries=(added,), registry=registry.path)
+    write_registry(path=path, registry=SharedConnections((*registry.root, added)))
+    return RegistryChange(entries=(added,), registry=path)
 
 
-def unshare_connection(*, person: Person, name: str, managed_dir: Path) -> RegistryChange:
-    registry = _registry_at(managed_dir)
-    entries = registry.connections.root
+def unshare_connection(
+    *, person: Person, name: str, managed_dir: Path
+) -> RegistryChange[SharedConnection]:
+    path = managed_folder_at(managed_dir).shared_connections_file
+    entries = read_registry(registry_type=SharedConnections, path=path).root
     removed = tuple(
         entry
         for entry in entries
@@ -143,8 +99,8 @@ def unshare_connection(*, person: Person, name: str, managed_dir: Path) -> Regis
     if not removed:
         raise OperatorCommandError(f"User {person.user_id} shares no connection named {name}.")
     kept = tuple(entry for entry in entries if entry not in removed)
-    _write_registry(registry.path, SharedConnections(kept))
-    return RegistryChange(entries=removed, registry=registry.path)
+    write_registry(path=path, registry=SharedConnections(kept))
+    return RegistryChange(entries=removed, registry=path)
 
 
 def main(argv: list[str] | None = None) -> int:

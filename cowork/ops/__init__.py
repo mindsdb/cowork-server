@@ -12,21 +12,27 @@ Results go to stdout as plain text, and errors and log lines to stderr. A
 command that can't do what it was asked prints why and exits with status 1.
 
 The helpers below are shared by every module: the two person arguments, the
-Person they make, and the scope that person's own requests get.
+Person they make, the scope that person's own requests get, and the reading
+and writing of the managed folder's shared registries.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
+import tempfile
 from collections.abc import Callable
+from pathlib import Path
+from typing import Generic, TypeVar
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.scoped import TenantScope, scope_from_principal
+from cowork.managed import ManagedFolder, SharedEntry, SharedRegistry, SharedRegistryError
 from cowork.principal import Principal, personal_partition_id
 
 
@@ -122,3 +128,53 @@ def run_operator_command(command: Callable[[], str]) -> int:
         return 1
     sys.stdout.write(output if output.endswith("\n") else output + "\n")
     return 0
+
+
+# ── the shared registries ────────────────────────────────────────────────────
+
+EntryT = TypeVar("EntryT", bound=SharedEntry)
+RegistryT = TypeVar("RegistryT", bound=SharedRegistry)
+
+
+class RegistryChange(BaseModel, Generic[EntryT]):
+    """What share or unshare did to a registry file."""
+
+    model_config = ConfigDict(frozen=True)
+
+    entries: tuple[EntryT, ...]
+    registry: Path
+
+
+def managed_folder_at(managed_dir: Path) -> ManagedFolder:
+    """The managed folder at ``managed_dir``, the writable path the caller
+    passes; its registries sit in its ``shared/``."""
+    if not managed_dir.is_dir():
+        raise OperatorCommandError(f"{managed_dir} is not a folder.")
+    return ManagedFolder.at(managed_dir)
+
+
+def read_registry(*, registry_type: type[RegistryT], path: Path) -> RegistryT:
+    """The registry at ``path``; none when the file is missing."""
+    try:
+        return registry_type.read(path)
+    except SharedRegistryError as error:
+        # Never rewrite a registry this command can't read: it would drop
+        # every entry in it.
+        raise OperatorCommandError(f"{error}. Fix or remove it first.") from error
+
+
+def write_registry(*, path: Path, registry: SharedRegistry) -> None:
+    """Replace the registry file at once, so the server never reads half of it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=path.parent, prefix=f".{path.stem}-", suffix=".json", delete=False
+    ) as handle:
+        handle.write(registry.model_dump_json(indent=2) + "\n")
+    temporary = Path(handle.name)
+    try:
+        # Readable by the server's user, whatever the caller's umask.
+        temporary.chmod(0o644)
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise

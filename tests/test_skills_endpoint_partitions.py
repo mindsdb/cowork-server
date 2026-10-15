@@ -88,17 +88,23 @@ def test_renaming_into_or_editing_a_builtin_is_refused(scoped):
     assert delete.value.status_code == 403
 
 
-def test_with_shared_skills_a_builtin_copy_stays_editable(scoped, skills_root):
+def test_with_shared_skills_a_builtin_copy_is_the_operator_views(scoped, skills_root):
+    """Skills shared: the base store's builtin copy is mutable, but nobody
+    created it, so only the operator view edits it."""
     import shutil
 
-    from cowork.services.skills import BUILTIN_SKILLS_DIR
+    from cowork.services.skills import BUILTIN_SKILLS_DIR, SHARED_SKILL_REFUSAL
 
     shutil.copytree(BUILTIN_SKILLS_DIR / _builtin(), skills_root / _builtin())
-    for scope in (_person(resources=frozenset()), LOCAL_SCOPE):
+    person = _person(resources=frozenset())
+    for scope, editable in ((person, False), (LOCAL_SCOPE, True)):
         listed = {s["id"]: s for s in skills_ep.list_skills(scoped(scope), None)["skills"]}
-        assert listed[_builtin()]["capabilities"]["canEdit"] is True
+        assert listed[_builtin()]["capabilities"]["canEdit"] is editable
 
+    with pytest.raises(HTTPException) as refused:
+        skills_ep.update_skill(_builtin(), SkillUpdateRequest(instructions="mine now"), scoped(person), None)
+    assert (refused.value.status_code, refused.value.detail) == (403, SHARED_SKILL_REFUSAL)
     edited = skills_ep.update_skill(
-        _builtin(), SkillUpdateRequest(instructions="mine now"), scoped(_person(resources=frozenset())), None
+        _builtin(), SkillUpdateRequest(instructions="the operator's"), scoped(LOCAL_SCOPE), None
     )
-    assert edited["declarative"] == "mine now"
+    assert edited["declarative"] == "the operator's"

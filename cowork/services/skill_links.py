@@ -333,8 +333,10 @@ def reconcile_project(
 def sync_turn_skill_links(*, skills_dir: Path, wanted: dict[str, Path]) -> None:
     """Make ``skills_dir`` hold exactly one link per wanted skill, for one turn.
 
-    ``wanted`` maps each skill's slug to its directory in the asker's own
-    store (select_turn_skills). Every other link is removed, including one
+    ``wanted`` maps each skill's slug to its directory: in the asker's own
+    store (select_turn_skills), or, for the folder of skills others share with
+    the asker, in each creator's own store (shared_turn_skills). Every other
+    link is removed, including one
     that points into another store under a wanted slug, and links left by an
     earlier fan-out from the unkeyed store; a link already pointing at its
     wanted directory is kept. A real directory is left alone, so a skill the
