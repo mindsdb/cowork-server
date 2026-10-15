@@ -77,13 +77,13 @@ class LayeredDataVault:
     entry whose connection is gone is skipped.
 
     Only the scope's own entries can change: a save or delete of a managed or
-    shared one raises SharedConnectionError, and so does a create under a
-    name the registry still shares for one of the scope's own (``shared_by_own``)
-    that is gone, and a save or delete of an own entry
-    the changer may not change where the own vault is deployment-wide
-    (Changer.may_change): someone else's for a person, and any for a turn
-    with no person. Every other save and delete goes to the own vault,
-    a turn's included, so what the agent saves in a turn outlives the turn.
+    shared one raises SharedConnectionError. So does a create under a name
+    the registry still shares for one of the scope's own that is gone
+    (``shared_by_own``), and a save or delete of an own entry the changer may
+    not change where the own vault is deployment-wide (Changer.may_change):
+    someone else's for a person, and any for a turn with no person. Every
+    other save and delete goes to the own vault, a turn's included, so what
+    the agent saves in a turn outlives the turn.
     With a ``changer``, every save records the connection's creator in
     CREATED_BY_FIELD: a create stamps the changer's (Changer.creator), and an
     update keeps the stored value, whatever the saved fields say.
