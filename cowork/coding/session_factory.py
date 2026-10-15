@@ -51,6 +51,7 @@ class LocalSessionPreparation:
     guidance: str
     playbook_summary: str | None
     environment: dict[str, str]
+    workspace_warning: str | None = None
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,7 @@ _PREPARED_FIELDS = (
     "repository_root",
     "base_revision",
     "source_dirty",
+    "workspace_warning",
     "guidance_summary",
     "developer_instructions",
     "resolved_skills",
@@ -460,6 +462,7 @@ class CodingSessionFactory:
                 guidance="",
                 playbook_summary=None,
                 environment={},
+                workspace_warning=prepared.warning,
             )
 
         selected_project = self._selected_project(project, request.resource_ids)
@@ -556,6 +559,7 @@ class CodingSessionFactory:
             repository_root=primary.repository_root,
             base_revision=primary.base_revision,
             source_dirty=primary.source_dirty,
+            workspace_warning=preparation.workspace_warning,
             guidance_summary=" · ".join(
                 part for part in (preparation.playbook_summary, skill_resolution.summary) if part
             ) or None,

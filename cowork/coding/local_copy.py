@@ -101,6 +101,8 @@ class PreparedLocalCopy:
     source: Path
     workspace: Path
     baseline: Path
+    # Folders left out of the copy, relative to the source, for the task to rebuild.
+    omitted: tuple[str, ...] = ()
 
 
 class LocalCopyManager:
