@@ -1106,6 +1106,7 @@ async def test_produce_direct_persists_before_emitting_and_roots_metadata(monkey
         lifecycle=SimpleNamespace(discarded=False),
         conv_id=conv_id,
         original_content="Hello",
+        question="Hello",
         route=route,
         buffer=buffer,
     )
@@ -1161,6 +1162,7 @@ async def test_produce_direct_answers_a_full_pool_with_a_timed_retry(monkeypatch
         lifecycle=SimpleNamespace(discarded=False),
         conv_id=_uuid4(),
         original_content="Hello",
+        question="Hello",
         route=RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text="Hi."),
         buffer=buffer,
     )
@@ -1205,6 +1207,7 @@ async def test_streaming_direct_response_registers_its_shared_redis_buffer(monke
         conversation_id=conversation_id,
         turn_id=3,
         original_content="Hello",
+        question="Hello",
         route=RouteDecision(
             route=DIRECT_CONTEXT,
             reason="router_direct_response",
@@ -1218,6 +1221,145 @@ async def test_streaming_direct_response_registers_its_shared_redis_buffer(monke
     assert recorded["correlation_id"].startswith("direct-")
     assert recorded["org_id"] == "org-1"
     assert recorded["user_id"] == "user-1"
+
+
+# --- a direct answer's figure sources ------------------------------------------
+
+_OVERTIME_QUESTION = "What does an hour of overtime cost over 2 shifts?"
+_OVERTIME_ANSWER = "About $30 an hour, so $60 over 2 shifts."
+
+
+def _saving_conversation_service(monkeypatch, saved: dict):
+    from uuid import uuid4 as _uuid4
+
+    import cowork.handlers.responses as responses
+
+    def save_assistant_turn(cid, text, events, harness=None):
+        saved["events"] = events
+        return SimpleNamespace(id=_uuid4())
+
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            save_user_message=lambda cid, content, pending=False: SimpleNamespace(id=_uuid4()),
+            save_assistant_turn=save_assistant_turn,
+        ),
+    )
+
+
+class _DirectBuffer:
+    def __init__(self):
+        self.frames = []
+        self.closed = None
+        self.is_closed = False
+
+    async def append(self, kind, record):
+        self.frames.append(record["sse"])
+
+    async def close(self, reason):
+        self.closed = reason
+        self.is_closed = True
+
+    def events(self) -> list[dict]:
+        import json
+
+        return [json.loads(frame.split("data: ", 1)[1]) for frame in self.frames]
+
+
+async def _produce_direct_answer(monkeypatch, *, text: str, saved: dict) -> _DirectBuffer:
+    from uuid import uuid4 as _uuid4
+
+    handler = _routing_handler(monkeypatch)
+    _saving_conversation_service(monkeypatch, saved)
+    buffer = _DirectBuffer()
+    await handler._produce_direct(
+        lifecycle=SimpleNamespace(discarded=False),
+        conv_id=_uuid4(),
+        original_content=_OVERTIME_QUESTION,
+        question=_OVERTIME_QUESTION,
+        route=RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text=text),
+        buffer=buffer,
+    )
+    return buffer
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_carries_its_figure_sources_live_and_saved(monkeypatch):
+    saved: dict = {}
+
+    buffer = await _produce_direct_answer(monkeypatch, text=_OVERTIME_ANSWER, saved=saved)
+
+    events = buffer.events()
+    assert [e["type"] for e in events] == [
+        "response.created", "response.output_text.delta", "response.figure_sources", "response.completed",
+    ]
+    assert [e["sequence_number"] for e in events] == [1, 2, 3, 4]
+    sources = events[2]
+    assert sources["item_id"] == events[1]["item_id"]
+    assert sources["steps"] == []
+    assert {f["text"]: f["origin"] for f in sources["figures"]} == {"$30": "none", "$60": "none", "2": "question"}
+    assert [e["type"] for e in saved["events"]] == [
+        "response.output_text.delta", "response.figure_sources", "response.completed",
+    ]
+    assert saved["events"][1] == sources
+    assert buffer.closed == "completed"
+
+
+@pytest.mark.asyncio
+async def test_a_direct_answer_without_figures_streams_as_before(monkeypatch):
+    saved: dict = {}
+
+    buffer = await _produce_direct_answer(monkeypatch, text="Hi.", saved=saved)
+
+    events = buffer.events()
+    assert [e["type"] for e in events] == ["response.created", "response.output_text.delta", "response.completed"]
+    assert events[-1]["sequence_number"] == 3
+    assert [e["type"] for e in saved["events"]] == ["response.output_text.delta", "response.completed"]
+
+
+@pytest.mark.asyncio
+async def test_a_matcher_failure_leaves_the_direct_answer_whole(monkeypatch, caplog):
+    import cowork.harnesses.anton_harness.stream_formatter as formatter
+
+    def broken(**_kwargs):
+        raise ValueError("boom")
+
+    monkeypatch.setattr(formatter, "find_figure_sources", broken)
+    saved: dict = {}
+
+    buffer = await _produce_direct_answer(monkeypatch, text=_OVERTIME_ANSWER, saved=saved)
+
+    assert [e["type"] for e in buffer.events()] == [
+        "response.created", "response.output_text.delta", "response.completed",
+    ]
+    assert buffer.closed == "completed"
+    assert [r for r in caplog.records if r.name == formatter.logger.name and r.levelname == "ERROR"]
+
+
+@pytest.mark.asyncio
+async def test_a_non_streaming_direct_answer_returns_and_saves_its_figure_sources(monkeypatch):
+    from uuid import uuid4 as _uuid4
+
+    handler = _routing_handler(monkeypatch)
+    saved: dict = {}
+    _saving_conversation_service(monkeypatch, saved)
+
+    response = await handler._handle_direct_response(
+        request=SimpleNamespace(stream=False),
+        conversation_id=_uuid4(),
+        turn_id=1,
+        original_content=_OVERTIME_QUESTION,
+        question=_OVERTIME_QUESTION,
+        route=RouteDecision(route=DIRECT_CONTEXT, reason="router_direct_response", model="m", text=_OVERTIME_ANSWER),
+    )
+
+    [output] = response.model_dump(mode="json")["output"]
+    assert {f["text"]: f["origin"] for f in output["figure_sources"]["figures"]} == {
+        "$30": "none", "$60": "none", "2": "question",
+    }
+    [saved_sources] = [e for e in saved["events"] if e["type"] == "response.figure_sources"]
+    assert saved_sources["figures"] == output["figure_sources"]["figures"]
 
 
 # --- history view: tool rows become markers, not holes (ENG-1851) -----------

@@ -1,14 +1,23 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
+from dataclasses import asdict, replace
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
+from anton.cloud_turn.__main__ import _clip_result_content
+from anton.core.backends.base import Cell
 
-from cowork.harnesses.anton_harness.agent_files import AgentFiles
+from cowork.harnesses.anton_harness import figure_sources as figure_sources_mod
+from cowork.harnesses.anton_harness.agent_files import AgentFiles, Attachment, NamedFile
 from cowork.harnesses.anton_harness.figure_sources import (
-    MAX_FILE_LITERALS,
+    MAX_FIGURE_SOURCES,
+    MAX_LABELED_DOCUMENTS,
     MAX_QUERY_CHARS,
+    MAX_REQUEST_CHARS,
     Figure,
     FigureOrigin,
     FigureSource,
@@ -17,7 +26,6 @@ from cowork.harnesses.anton_harness.figure_sources import (
     SourceKind,
     TurnStep,
     find_figure_sources,
-    question_text,
 )
 
 
@@ -27,10 +35,7 @@ def _cell(tool_use_id: str, *, code: str, stdout: str, description: str = "", pa
         tool_name="scratchpad",
         action="exec",
         tool_input=json.dumps({"action": "exec", "name": pad, "code": code}),
-        content=json.dumps({
-            "code": code, "stdout": stdout, "stderr": "", "error": None,
-            "description": description, "estimated_time": "", "logs": "",
-        }),
+        content=json.dumps(asdict(Cell(code=code, stdout=stdout, stderr="", error=None, description=description))),
     )
 
 
@@ -38,6 +43,24 @@ def _tool(tool_use_id: str, name: str, tool_input: dict, content: str) -> TurnSt
     return TurnStep(
         tool_use_id=tool_use_id, tool_name=name, action="", tool_input=json.dumps(tool_input), content=content,
     )
+
+
+def _scratchpad(tool_use_id: str, *, action: str, content: str, pad: str = "main", code: str = "") -> TurnStep:
+    """A scratchpad call other than a cell that ran, with the result anton
+    gives the model for it."""
+    tool_input = {"action": action, "name": pad, **({"code": code} if code else {})}
+    return TurnStep(
+        tool_use_id=tool_use_id, tool_name="scratchpad", action=action, tool_input=json.dumps(tool_input),
+        content=content,
+    )
+
+
+def _earlier(step: TurnStep) -> TurnStep:
+    return replace(step, earlier_turn=True)
+
+
+# anton's result for a call it refused to run because its round was cut off.
+DISCARDED = "[error] exec failed — Discarded: the round it belonged to was cut off"
 
 
 READ_STOCK = _cell(
@@ -157,7 +180,7 @@ class TestStepKinds:
         )
 
         assert _only_step(step, answer="340 units in all.") == FigureStep(
-            tool_use_id="toolu_c", kind=SourceKind.step, label="a calculation",
+            tool_use_id="toolu_c", kind=SourceKind.step, label="",
         )
 
     def test_the_data_helper_is_a_query_even_when_its_sql_is_out_of_sight(self):
@@ -228,7 +251,7 @@ class TestStepKinds:
         [step] = find_figure_sources(answer="The ERP holds 250.", question="", steps=[bind, fetch]).steps
 
         assert step == FigureStep(
-            tool_use_id="toolu_b", kind=SourceKind.query, label="a query", requests=["GET {DS_ERP_URL}/inventory"],
+            tool_use_id="toolu_b", kind=SourceKind.query, label="", requests=["GET {DS_ERP_URL}/inventory"],
         )
 
     def test_a_printed_label_that_reads_like_sql_leaves_the_cell_a_file_step(self):
@@ -242,15 +265,91 @@ class TestStepKinds:
 
         assert (step_out.kind, step_out.label, step_out.queries) == (SourceKind.file, "stock.csv", [])
 
-    def test_a_recall_is_memory_and_a_tool_reading_a_path_is_a_file(self):
-        recall = _tool("toolu_r", "recall", {"query": "overtime"}, "Overtime costs 42 an hour")
-        read = _tool("toolu_p", "read_file", {"path": "docs/rates.md"}, "Line 7: 17 units")
+    @pytest.mark.parametrize(("name", "tool_input", "kind", "label"), [
+        ("web_search", {"query": "overtime rate"}, SourceKind.web, "overtime rate"),
+        ("web_fetch", {"url": "https://example.com/rates"}, SourceKind.web, "example.com/rates"),
+        ("read_text_file", {"path": "docs/rates.md"}, SourceKind.file, "rates.md"),
+    ])
+    def test_a_tool_that_reads_the_web_or_a_file_is_a_source(
+        self, name: str, tool_input: dict, kind: SourceKind, label: str,
+    ):
+        step = _tool("toolu_t", name, tool_input, "Overtime costs 42 an hour.")
 
-        sources = find_figure_sources(answer="Overtime costs $42; Line 7 makes 17.", question="", steps=[recall, read])
+        sources = find_figure_sources(answer="Overtime costs $42 an hour.", question="", steps=[step])
+
+        assert _origins(sources) == [("$42", FigureOrigin.step)]
+        assert [(s.kind, s.label) for s in sources.steps] == [(kind, label)]
+
+    @pytest.mark.parametrize("name", [
+        # Earlier answers, verbatim.
+        "recall_history", "recall",
+        # The agent's own artifacts and skills.
+        "open_artifact", "list_artifacts", "create_artifact", "update_artifact", "generate_artifact",
+        "recall_skill", "create_skill_draft", "publish",
+        # What the agent wrote, or the user answered.
+        "memorize", "ask_user", "select_path",
+        # A line about the image, not what it shows.
+        "read_image",
+        # Connection setup.
+        "connect_datasource", "lookup_connector",
+    ])
+    def test_any_other_tools_result_is_not_a_source(self, name: str):
+        step = _tool("toolu_t", name, {"query": "overtime"}, "Overtime typically costs $42 an hour for 12 people.")
+
+        sources = find_figure_sources(answer="Overtime costs $42 an hour for 12 people.", question="", steps=[step])
+
+        assert _origins(sources) == [("$42", FigureOrigin.none), ("12", FigureOrigin.none)]
+        assert sources.steps == []
+
+    def test_a_cell_with_no_description_sends_an_empty_label(self):
+        """The client words an empty label by the kind alone, so a
+        placeholder would read 'From a query: a query'."""
+        query = _cell("toolu_q", code="print(query_minds_data('SELECT qty FROM stock'))", stdout="250\n")
+        web = _cell("toolu_w", code="print(web_search('steel price'))", stdout="Steel is $640 a ton.\n")
+        calc = _cell("toolu_c", code="print(df.qty.max())", stdout="90\n")
+
+        sources = find_figure_sources(answer="250 units, $640 a ton, 90 at most.", question="", steps=[query, web, calc])
 
         assert [(s.kind, s.label) for s in sources.steps] == [
-            (SourceKind.memory, "memory"), (SourceKind.file, "rates.md"),
+            (SourceKind.query, ""), (SourceKind.web, ""), (SourceKind.step, ""),
         ]
+
+
+class TestReadTextFile:
+    def _read(self, *, header: str, body: str = "part,site,qty\nP100,S1,250\nP100,S2,90\n", **arguments) -> TurnStep:
+        return _tool("toolu_t", "read_text_file", {"path": "data/stock.csv", **arguments}, f"{header}\n{body}")
+
+    def test_a_file_it_read_is_a_file_step_with_its_path(self, tmp_path: Path):
+        (tmp_path / "data").mkdir()
+        (tmp_path / "data" / "stock.csv").write_text("part,site,qty\nP100,S1,250\nP100,S2,90\n")
+        step = self._read(header="data/stock.csv — lines 1-3 of 3")
+
+        step_out = _only_step(step, answer="S1 holds 250 units.", files=AgentFiles.on_this_server(tmp_path))
+
+        assert (step_out.kind, step_out.label, step_out.path) == (SourceKind.file, "stock.csv", "data/stock.csv")
+
+    @pytest.mark.parametrize("header", [
+        "data/stock.csv — lines 1-3 of 3",
+        "data/stock.csv — lines 1-3 of 3 (partial; continue with start_line=4)",
+    ])
+    def test_its_line_range_header_is_not_the_files_text(self, header: str):
+        sources = find_figure_sources(answer="The file has 3 rows; S1 holds 250.", question="", steps=[self._read(header=header)])
+
+        assert _origins(sources) == [("3", FigureOrigin.none), ("250", FigureOrigin.step)]
+
+    def test_the_line_range_it_asked_for_does_not_hide_a_value_the_file_holds(self):
+        step = self._read(header="data/stock.csv — lines 1-250 of 900", start_line=1, end_line=250)
+
+        assert _origins(find_figure_sources(answer="S1 holds 250.", question="", steps=[step])) == [
+            ("250", FigureOrigin.step),
+        ]
+
+    def test_a_long_line_marker_is_not_the_files_text(self):
+        step = self._read(header="data/stock.csv — lines 1-1 of 1", body="P100 … [line truncated: 4096 chars] … 250\n")
+
+        sources = find_figure_sources(answer="A line of 4096 characters; S1 holds 250.", question="", steps=[step])
+
+        assert _origins(sources) == [("4096", FigureOrigin.none), ("250", FigureOrigin.step)]
 
 
 class TestQueriesAcrossCells:
@@ -262,17 +361,241 @@ class TestQueriesAcrossCells:
 
         assert (step.tool_use_id, step.queries) == ("toolu_2", ["SELECT qty FROM stock WHERE site = 'S1'"])
 
-    def test_a_reset_scratchpad_forgets_the_strings_its_cells_bound(self):
+    @pytest.mark.parametrize(("action", "content"), [
+        ("reset", "Scratchpad 'main' reset. All state cleared."),
+        ("remove", "Scratchpad 'main' removed."),
+    ])
+    def test_a_reset_that_ran_forgets_the_strings_its_cells_bound(self, action: str, content: str):
         spell = _cell("toolu_1", code="sql = 'SELECT qty FROM stock'", stdout="")
-        reset = TurnStep(
-            tool_use_id="toolu_reset", tool_name="scratchpad", action="reset",
-            tool_input=json.dumps({"action": "reset", "name": "main"}), content="",
-        )
+        reset = _scratchpad("toolu_reset", action=action, content=content)
         run = _cell("toolu_2", code="cur.execute(sql)\nprint(cur.fetchone()[0])", stdout="250\n")
 
         step = find_figure_sources(answer="S1 holds 250.", question="", steps=[spell, reset, run]).steps[0]
 
         assert step.queries == []
+
+    def test_a_reset_anton_discarded_keeps_the_strings_its_cells_bound(self):
+        spell = _cell("toolu_1", code="sql = 'SELECT qty FROM stock'", stdout="")
+        discarded = _scratchpad("toolu_reset", action="reset", content=DISCARDED)
+        run = _cell("toolu_2", code="cur.execute(sql)\nprint(cur.fetchone()[0])", stdout="250\n")
+
+        step = find_figure_sources(answer="S1 holds 250.", question="", steps=[spell, discarded, run]).steps[0]
+
+        assert step.queries == ["SELECT qty FROM stock"]
+
+    def test_a_cell_anton_discarded_neither_binds_names_nor_is_a_step(self):
+        spell = _cell("toolu_1", code="sql = 'SELECT qty FROM stock'", stdout="")
+        discarded = _scratchpad("toolu_x", action="exec", content=DISCARDED, code="sql = 'SELECT 250 FROM other'")
+        run = _cell("toolu_2", code="cur.execute(sql)\nprint(cur.fetchone()[0])", stdout="250\n")
+
+        sources = find_figure_sources(answer="S1 holds 250.", question="", steps=[spell, discarded, run])
+
+        assert [(s.tool_use_id, s.queries) for s in sources.steps] == [("toolu_2", ["SELECT qty FROM stock"])]
+
+    def test_another_scratchpads_strings_are_not_this_ones(self):
+        spell = _cell("toolu_1", code="sql = 'SELECT qty FROM stock'", stdout="", pad="other")
+        run = _cell("toolu_2", code="cur.execute(sql)\nprint(cur.fetchone()[0])", stdout="250\n")
+
+        assert find_figure_sources(answer="S1 holds 250.", question="", steps=[spell, run]).steps[0].queries == []
+
+
+class TestFunctionsAcrossCells:
+    def test_a_helper_an_earlier_cell_defined_makes_its_request_in_the_cell_that_calls_it(self):
+        define = _cell(
+            "toolu_1",
+            code=(
+                "import requests\nBASE = 'https://erp.example.com/api'\n"
+                "def get(path):\n    return requests.get(BASE + path).json()"
+            ),
+            stdout="",
+        )
+        call = _cell("toolu_2", code="print(get('/stock?site=S1')['qty'])", stdout="250\n")
+
+        sources = find_figure_sources(answer="S1 holds 250.", question="", steps=[define, call])
+
+        step = next(step for step in sources.steps if step.tool_use_id == "toolu_2")
+        assert (step.kind, step.requests) == (SourceKind.web, ["GET https://erp.example.com/api{path}"])
+        # The helper's cell follows the cell that called it, as one the data came through.
+        assert [s.tool_use_id for s in _figure(sources, "250").sources] == ["toolu_2", "toolu_1"]
+
+    def test_a_helper_that_runs_a_query_makes_the_calling_cell_a_query_with_its_sql(self):
+        define = _cell(
+            "toolu_1", code="def stock(site):\n    return query_minds_data('SELECT qty FROM stock')", stdout="",
+        )
+        call = _cell("toolu_2", code="print(stock('S1').qty.sum())", stdout="250\n")
+
+        sources = find_figure_sources(answer="S1 holds 250.", question="", steps=[define, call])
+
+        step = next(step for step in sources.steps if step.tool_use_id == "toolu_2")
+        assert (step.kind, step.queries) == (SourceKind.query, ["SELECT qty FROM stock"])
+
+    def test_a_helper_that_reads_a_file_names_the_cell_that_spelled_the_file(self, tmp_path: Path):
+        (tmp_path / "stock.csv").write_text("qty\n250\n90\n")
+        define = _cell("toolu_1", code="def load():\n    return pd.read_csv('stock.csv')", stdout="")
+        call = _cell("toolu_2", code="print(load().qty.sum())", stdout="340\n")
+
+        sources = find_figure_sources(
+            answer="340 units.", question="", steps=[define, call], files=AgentFiles.on_this_server(tmp_path),
+        )
+
+        assert [s.tool_use_id for s in _figure(sources, "340").sources] == ["toolu_2", "toolu_1"]
+        assert (sources.steps[0].kind, sources.steps[0].path) == (SourceKind.file, "stock.csv")
+
+    def test_a_reset_forgets_the_helpers_too(self):
+        define = _cell("toolu_1", code="def stock():\n    return query_minds_data('SELECT qty FROM stock')", stdout="")
+        reset = _scratchpad("toolu_reset", action="reset", content="Scratchpad 'main' reset. All state cleared.")
+        call = _cell("toolu_2", code="print(stock().qty.sum())", stdout="250\n")
+
+        [step] = find_figure_sources(answer="S1 holds 250.", question="", steps=[define, reset, call]).steps
+
+        assert (step.kind, step.queries) == (SourceKind.step, [])
+
+
+class TestTheStepsAFigureWasCalculatedFrom:
+    def test_a_figure_a_later_cell_computed_names_the_cell_that_read_its_data(self, tmp_path: Path):
+        (tmp_path / "stock.csv").write_text("part,site,qty\nP100,S1,250\nP100,S2,90\n")
+        load = _cell("toolu_a", code="import pandas as pd\ndf = pd.read_csv('stock.csv')", stdout="")
+        total = _cell("toolu_b", code="print(df.qty.sum())", stdout="340\n")
+
+        sources = find_figure_sources(
+            answer="There are 340 units across S1 and S2.", question="", steps=[load, total],
+            files=AgentFiles.on_this_server(tmp_path),
+        )
+
+        assert _figure(sources, "340").sources == [
+            FigureSource(tool_use_id="toolu_b"), FigureSource(tool_use_id="toolu_a"),
+        ]
+        assert sources.steps == [
+            FigureStep(tool_use_id="toolu_a", kind=SourceKind.file, label="stock.csv", path="stock.csv"),
+            FigureStep(tool_use_id="toolu_b", kind=SourceKind.step, label=""),
+        ]
+
+    def test_a_sum_of_a_query_cells_frame_names_the_query_with_its_sql(self):
+        query = _cell("toolu_a", code="df = query_minds_data('SELECT site, qty FROM stock')", stdout="")
+        total = _cell("toolu_b", code="print(df.qty.sum())", stdout="340\n")
+
+        sources = find_figure_sources(answer="340 units in all.", question="", steps=[query, total])
+
+        assert [s.tool_use_id for s in _figure(sources, "340").sources] == ["toolu_b", "toolu_a"]
+        assert (sources.steps[0].kind, sources.steps[0].queries) == (SourceKind.query, ["SELECT site, qty FROM stock"])
+
+    def test_a_name_computed_from_read_data_carries_its_cell_on(self):
+        load = _cell("toolu_a", code="df = pd.read_csv('stock.csv')", stdout="")
+        derive = _cell("toolu_b", code="total = int(df.qty.sum())", stdout="")
+        show = _cell("toolu_c", code="print(total)", stdout="340\n")
+
+        sources = find_figure_sources(answer="340 units in all.", question="", steps=[load, derive, show])
+
+        assert [s.tool_use_id for s in _figure(sources, "340").sources] == ["toolu_c", "toolu_a"]
+
+    def test_a_name_rebound_without_read_data_names_no_earlier_cell(self):
+        load = _cell("toolu_a", code="df = pd.read_csv('stock.csv')", stdout="")
+        rebind = _cell("toolu_b", code="df = make_frame(rows)", stdout="")
+        total = _cell("toolu_c", code="print(df.qty.sum())", stdout="340\n")
+
+        sources = find_figure_sources(answer="340 units in all.", question="", steps=[load, rebind, total])
+
+        assert [s.tool_use_id for s in _figure(sources, "340").sources] == ["toolu_c"]
+
+    def test_names_another_scratchpad_bound_are_not_this_ones(self):
+        load = _cell("toolu_a", code="df = pd.read_csv('stock.csv')", stdout="", pad="other")
+        total = _cell("toolu_b", code="print(df.qty.sum())", stdout="340\n")
+
+        sources = find_figure_sources(answer="340 units in all.", question="", steps=[load, total])
+
+        assert [s.tool_use_id for s in _figure(sources, "340").sources] == ["toolu_b"]
+
+    def test_a_reset_forgets_where_names_came_from(self):
+        load = _cell("toolu_a", code="df = pd.read_csv('stock.csv')", stdout="")
+        reset = _scratchpad("toolu_reset", action="reset", content="Scratchpad 'main' reset. All state cleared.")
+        total = _cell("toolu_b", code="print(df.qty.sum())", stdout="340\n")
+
+        sources = find_figure_sources(answer="340 units in all.", question="", steps=[load, reset, total])
+
+        assert [s.tool_use_id for s in _figure(sources, "340").sources] == ["toolu_b"]
+
+    def test_the_read_cells_follow_every_holder(self):
+        load_a = _cell("toolu_a", code="a = pd.read_csv('a.csv')", stdout="")
+        load_b = _cell("toolu_b", code="b = pd.read_csv('b.csv')", stdout="")
+        total = _cell("toolu_c", code="print(a.qty.sum() + b.qty.sum())", stdout="340\n")
+
+        sources = find_figure_sources(answer="340 units in all.", question="", steps=[load_a, load_b, total])
+
+        assert [s.tool_use_id for s in _figure(sources, "340").sources] == ["toolu_c", "toolu_a", "toolu_b"]
+
+    def test_the_cells_a_figure_was_calculated_from_never_push_out_a_holder(self):
+        load = _cell("toolu_load", code="df = pd.read_csv('stock.csv')", stdout="")
+        holders = [_cell(f"toolu_{i}", code="print(df.qty.sum())", stdout="340\n") for i in range(MAX_FIGURE_SOURCES)]
+
+        sources = find_figure_sources(answer="340 units in all.", question="", steps=[load, *holders])
+
+        assert [s.tool_use_id for s in _figure(sources, "340").sources] == [
+            f"toolu_{i}" for i in range(MAX_FIGURE_SOURCES)
+        ]
+        assert "toolu_load" not in [step.tool_use_id for step in sources.steps]
+
+    def test_a_cell_that_read_the_data_and_holds_the_figure_is_named_once(self):
+        load = _cell("toolu_a", code="df = pd.read_csv('stock.csv')\nprint(df)", stdout="   qty\n0  340\n")
+        total = _cell("toolu_b", code="print(df.qty.sum())", stdout="340\n")
+
+        sources = find_figure_sources(answer="340 units in all.", question="", steps=[load, total])
+
+        assert [s.tool_use_id for s in _figure(sources, "340").sources] == ["toolu_a", "toolu_b"]
+
+
+class TestEarlierTurns:
+    def test_an_earlier_turns_step_never_holds_a_figure(self):
+        earlier = _earlier(_cell("toolu_old", code="print(open('stock.csv').read())", stdout="S1,250\nS2,90\n"))
+        now = _cell("toolu_new", code="print(df.qty.max())", stdout="250\n")
+
+        sources = find_figure_sources(answer="S1 holds 250 and S2 holds 90.", question="", steps=[earlier, now])
+
+        assert [s.tool_use_id for s in _figure(sources, "250").sources] == ["toolu_new"]
+        assert _figure(sources, "90").origin is FigureOrigin.none
+        assert [step.tool_use_id for step in sources.steps] == ["toolu_new"]
+
+    def test_an_earlier_turns_web_page_never_holds_a_figure(self):
+        earlier = _earlier(_tool("toolu_old", "web_fetch", {"url": "https://example.com/rates"}, "Overtime: $42 an hour"))
+
+        sources = find_figure_sources(answer="Overtime costs $42 an hour.", question="", steps=[earlier])
+
+        assert _origins(sources) == [("$42", FigureOrigin.none)]
+        assert sources.steps == []
+
+    def test_a_figure_an_earlier_turn_printed_by_coincidence_has_no_source(self):
+        """An earlier turn printed a stock table whose qty column happens to
+        hold 30, 360 and 12. This turn runs no step and works out a cost."""
+        quantities = [250, 90, 30, 410, 75, 12, 360, 88, 140, 55, 64, 300, 18, 220, 95, 47, 130, 66, 210, 150]
+        table = "part,site,qty\n" + "\n".join(f"P{100 + i},S{1 + i % 3},{q}" for i, q in enumerate(quantities))
+        earlier = _earlier(_cell("toolu_t1", code="print(open('stock.csv').read())", stdout=table))
+
+        sources = find_figure_sources(
+            answer="Overtime typically costs $30 an hour, so 12 hours cost $360.",
+            question="What would 12 hours of overtime cost?", steps=[earlier],
+        )
+
+        assert _origins(sources) == [
+            ("$30", FigureOrigin.none), ("12", FigureOrigin.question), ("$360", FigureOrigin.none),
+        ]
+        assert sources.steps == []
+
+    @pytest.mark.parametrize("earlier_first", [True, False])
+    def test_names_an_earlier_turn_bound_reach_this_turns_cells(self, earlier_first: bool):
+        spell = _earlier(_cell("toolu_old", code='base_sql = "SELECT qty FROM stock"', stdout=""))
+        run = _cell("toolu_new", code="""print(query_minds_data(base_sql + " WHERE site = 'S1'"))""", stdout="250\n")
+
+        steps = [spell, run] if earlier_first else [run, spell]
+        [step] = find_figure_sources(answer="S1 holds 250.", question="", steps=steps).steps
+
+        assert (step.tool_use_id, step.queries) == ("toolu_new", ["SELECT qty FROM stock WHERE site = 'S1'"])
+
+    def test_a_sum_of_a_frame_an_earlier_turn_read_names_that_turns_cell(self):
+        load = _earlier(_cell("toolu_old", code="df = pd.read_csv('stock.csv')", stdout=""))
+        total = _cell("toolu_new", code="print(df.qty.sum())", stdout="340\n")
+
+        sources = find_figure_sources(answer="340 units in all.", question="", steps=[load, total])
+
+        assert [s.tool_use_id for s in _figure(sources, "340").sources] == ["toolu_new", "toolu_old"]
 
 
 class TestFilePaths:
@@ -324,7 +647,24 @@ class TestFilePaths:
 
         step_out = _only_step(step, answer="There are 42 rows.", files=AgentFiles.on_this_server(tmp_path))
 
-        assert (step_out.kind, step_out.label, step_out.path) == (SourceKind.step, "a calculation", None)
+        assert (step_out.kind, step_out.label, step_out.path) == (SourceKind.step, "", None)
+
+    @pytest.mark.parametrize("save", [
+        "wb = openpyxl.Workbook()\nwb.active.append([total])\nwb.save('summary.xlsx')",
+        "df.to_excel('summary.xlsx')",
+        "with pd.ExcelWriter('summary.xlsx') as writer:\n    df.to_excel(writer)",
+        "np.savetxt('summary.csv', [total])",
+        "df.to_excel(os.path.join(out_dir, 'summary.xlsx'))",
+    ])
+    def test_a_cell_that_saves_a_workbook_of_its_result_stays_a_step(self, tmp_path: Path, save: str):
+        (tmp_path / "summary.xlsx").write_text("340")
+        (tmp_path / "summary.csv").write_text("340")
+        code = f"total = int(df.qty.sum())\n{save}\nprint(total)"
+        step = _cell("toolu_w", code=code, stdout="340\n")
+
+        step_out = _only_step(step, answer="340 units in all.", files=AgentFiles.on_this_server(tmp_path))
+
+        assert (step_out.kind, step_out.label, step_out.path) == (SourceKind.step, "", None)
 
     def test_a_calculation_that_saves_its_result_is_not_from_that_file(self, tmp_path: Path):
         (tmp_path / "notes.md").write_text("9002")
@@ -334,7 +674,54 @@ class TestFilePaths:
 
         step_out = _only_step(step, answer="The total is 9002.", files=AgentFiles.on_this_server(tmp_path))
 
-        assert (step_out.kind, step_out.label, step_out.path) == (SourceKind.step, "a calculation", None)
+        assert (step_out.kind, step_out.label, step_out.path) == (SourceKind.step, "", None)
+
+    def test_a_document_name_the_cell_only_prints_is_not_a_document_it_read(self, tmp_path: Path):
+        (tmp_path / "rates.csv").write_text("rate\n1.37\n")
+        code = (
+            'r = requests.get("https://api.example.com/v1/rates")\n'
+            "print('Saved to rates.csv')\n"
+            "print(r.json()['rate'])"
+        )
+        step = _cell("toolu_api", code=code, stdout="Saved to rates.csv\n1.37\n")
+
+        step_out = _only_step(step, answer="The rate is 1.37.", files=AgentFiles.on_this_server(tmp_path))
+
+        assert (step_out.kind, step_out.label, step_out.path) == (SourceKind.web, "api.example.com/v1/rates", None)
+
+    def test_a_document_the_cell_reads_and_prints_is_still_read(self, tmp_path: Path):
+        (tmp_path / "stock.csv").write_text("qty\n250\n")
+        code = "df = pd.read_csv('stock.csv')\nprint('stock.csv')\nprint(df.qty.sum())"
+        step = _cell("toolu_r", code=code, stdout="stock.csv\n250\n")
+
+        step_out = _only_step(step, answer="S1 holds 250.", files=AgentFiles.on_this_server(tmp_path))
+
+        assert (step_out.kind, step_out.label, step_out.path) == (SourceKind.file, "stock.csv", "stock.csv")
+
+    def test_the_event_names_the_project_the_turn_ran_in(self, tmp_path: Path):
+        project_id = uuid4()
+
+        sources = find_figure_sources(
+            answer="S1 holds 250.", question="", steps=[READ_STOCK],
+            files=AgentFiles.on_this_server(tmp_path, project_id=project_id),
+        )
+
+        assert sources.project_id == str(project_id)
+        assert find_figure_sources(answer="S1 holds 250.", question="", steps=[READ_STOCK]).project_id is None
+
+    def test_a_file_attached_to_the_conversation_is_named_by_its_id_and_its_name(self, tmp_path: Path):
+        file_id = str(uuid4())
+        stored = tmp_path / "files" / file_id / "stock.csv"
+        stored.parent.mkdir(parents=True)
+        stored.write_text("part,qty\nP100,250\n")
+        project = tmp_path / "project"
+        project.mkdir()
+        step = _cell("toolu_att", code=f"print(open({str(stored)!r}).read())", stdout="part,qty\nP100,250\n")
+        files = AgentFiles.on_this_server(project, attachments=[Attachment(file_id=file_id, stored_path=str(stored))])
+
+        assert _only_step(step, answer="P100: 250 units.", files=files) == FigureStep(
+            tool_use_id="toolu_att", kind=SourceKind.file, label="stock.csv", attachment_id=file_id,
+        )
 
     def test_a_query_whose_result_is_saved_has_no_path(self, tmp_path: Path):
         (tmp_path / "summary.csv").write_text("qty\n250\n")
@@ -361,25 +748,59 @@ class TestFilePaths:
 
         assert (step_out.kind, step_out.label, step_out.path) == (SourceKind.file, "stock.csv", "stock.csv")
 
-    def test_only_the_first_few_document_strings_are_looked_up(self, tmp_path: Path, monkeypatch):
-        (tmp_path / "stock.csv").write_text("qty\n250\n")
-        names = [f"d/f{i}.csv" for i in range(MAX_FILE_LITERALS + 2)] + ["stock.csv"]
-        step = _cell(
-            "toolu_many", code=f"for name in {names!r}:\n    print(pd.read_csv(name).qty.sum())", stdout="250\n",
+
+class TestSeveralDocuments:
+    @pytest.fixture
+    def looked_up(self, monkeypatch) -> list[str]:
+        """The literals AgentFiles.named_file is asked about."""
+        literals: list[str] = []
+        named_file = AgentFiles.named_file
+
+        def spy(self: AgentFiles, literal: str) -> NamedFile | None:
+            literals.append(literal)
+            return named_file(self, literal)
+
+        monkeypatch.setattr(AgentFiles, "named_file", spy)
+        return literals
+
+    @pytest.mark.parametrize(("first", "second"), [("lines.csv", "rates.pdf"), ("rates.pdf", "lines.csv")])
+    def test_a_cell_that_reads_two_documents_names_both_with_no_path_or_page(
+        self, tmp_path: Path, looked_up: list[str], first: str, second: str,
+    ):
+        for name in (first, second):
+            (tmp_path / name).write_text("x")
+        code = f"a = read_document({first!r})\nb = read_document({second!r})\nprint(a, b)"
+        step = _cell("toolu_two", code=code, stdout="--- page 1 ---\nOvertime on Line 7 costs $42 an hour.\n")
+
+        sources = find_figure_sources(
+            answer="Overtime costs $42 an hour.", question="", steps=[step], files=AgentFiles.on_this_server(tmp_path),
         )
-        looked_up: list[str] = []
-        project_path = AgentFiles.project_path
 
-        def spy(self: AgentFiles, literal: str) -> str | None:
-            looked_up.append(literal)
-            return project_path(self, literal)
+        assert sources.steps == [
+            FigureStep(tool_use_id="toolu_two", kind=SourceKind.file, label=f"{first}, {second}"),
+        ]
+        assert _figure(sources, "$42").sources == [FigureSource(tool_use_id="toolu_two", page=None)]
+        assert looked_up == []
 
-        monkeypatch.setattr(AgentFiles, "project_path", spy)
+    def test_one_document_is_looked_up_once(self, tmp_path: Path, looked_up: list[str]):
+        (tmp_path / "stock.csv").write_text("qty\n250\n")
+        step = _cell("toolu_r", code="print(pd.read_csv('stock.csv').qty.sum())", stdout="250\n")
 
         step_out = _only_step(step, answer="S1 holds 250.", files=AgentFiles.on_this_server(tmp_path))
 
-        assert len(looked_up) <= MAX_FILE_LITERALS
-        assert step_out.path is None
+        assert (step_out.path, looked_up) == ("stock.csv", ["stock.csv"])
+
+    def test_past_the_first_few_documents_the_label_counts_the_rest(self, tmp_path: Path, looked_up: list[str]):
+        names = [f"d/f{i}.csv" for i in range(MAX_LABELED_DOCUMENTS + 2)]
+        step = _cell(
+            "toolu_many", code=f"for name in {names!r}:\n    print(pd.read_csv(name).qty.sum())", stdout="250\n",
+        )
+
+        step_out = _only_step(step, answer="S1 holds 250.", files=AgentFiles.on_this_server(tmp_path))
+
+        shown = ", ".join(f"f{i}.csv" for i in range(MAX_LABELED_DOCUMENTS))
+        assert (step_out.label, step_out.path) == (f"{shown} and 2 more", None)
+        assert looked_up == []
 
 
 class TestRedaction:
@@ -409,8 +830,8 @@ print(a.fetchone()[0])
 
         assert step.queries == [
             "SELECT qty FROM postgres_scan('postgresql://***@db.example.com/erp', 'public', 'stock')",
-            "WITH s AS (SELECT * FROM mysql_scan('host=db user=erp password=[redacted], 'stock')) SELECT qty FROM s",
-            "SELECT qty FROM read_csv('https://data.example.com/stock.csv?api_key=[redacted]&region=eu')",
+            "WITH s AS (SELECT * FROM mysql_scan('host=db user=erp password=[redacted]', 'stock')) SELECT qty FROM s",
+            "SELECT qty FROM read_csv('https://data.example.com/stock.csv?...')",
         ]
         assert step.requests == ["GET https://api.example.com/v1/stock"]
         event = step.model_dump_json()
@@ -431,6 +852,245 @@ print(a.fetchone()[0])
 
         assert len(query) == MAX_QUERY_CHARS
         assert query.endswith("…")
+
+    def test_a_long_request_is_cut_to_the_limit(self):
+        path = "/".join(f"segment{i}" for i in range(200))
+        step = _cell("toolu_r", code=f"r = requests.get('https://example.com/{path}')\nprint(r.json()['qty'])", stdout="250\n")
+
+        [request] = _only_step(step, answer="S1 holds 250.").requests
+
+        assert len(request) == MAX_REQUEST_CHARS
+        assert request.startswith("GET https://example.com/segment0/")
+        assert request.endswith("…")
+
+
+def _event(step: TurnStep, *, answer: str = "There are 42 rows.") -> str:
+    """The whole figure_sources event a step's figure gives, as sent."""
+    return find_figure_sources(answer=answer, question="", steps=[step]).model_dump_json()
+
+
+class TestSecretsInUrls:
+    @pytest.mark.parametrize(("url", "secret", "masked"), [
+        (
+            "https://hooks.slack.com/services/T0001/B0002/XyZsecretWebhook",
+            "XyZsecretWebhook", "https://hooks.slack.com/***",
+        ),
+        (
+            "https://discord.com/api/webhooks/123456/XyZsecretWebhook",
+            "XyZsecretWebhook", "https://discord.com/api/webhooks/***",
+        ),
+        (
+            "https://contoso.webhook.office.com/webhookb2/abc@def/IncomingWebhook/XyZsecretWebhook/ghi",
+            "XyZsecretWebhook", "https://contoso.webhook.office.com/***",
+        ),
+        (
+            "https://api.telegram.org/bot123456:XyZsecretBotToken/sendMessage",
+            "XyZsecretBotToken", "https://api.telegram.org/bot***",
+        ),
+        (
+            "https://hooks.slack-gov.com/services/T0001/B0002/XyZsecretWebhook",
+            "XyZsecretWebhook", "https://hooks.slack-gov.com/***",
+        ),
+        (
+            "https://hooks.zapier.com/hooks/catch/123456/XyZsecretHook/",
+            "XyZsecretHook", "https://hooks.zapier.com/***",
+        ),
+        (
+            "https://maker.ifttt.com/trigger/stock/with/key/XyZsecretIftttKey",
+            "XyZsecretIftttKey", "https://maker.ifttt.com/***",
+        ),
+    ])
+    def test_a_url_whose_path_is_a_credential_is_masked_and_not_linked(self, url: str, secret: str, masked: str):
+        step = _cell("toolu_hook", code=f"r = requests.post({url!r}, json=rows)\nprint(len(rows))", stdout="42\n")
+
+        event = _event(step)
+
+        [step_out] = FigureSources.model_validate_json(event).steps
+        assert (step_out.kind, step_out.url, step_out.requests) == (SourceKind.web, None, [f"POST {masked}"])
+        assert secret not in event
+        assert "123456:" not in event
+
+    def test_a_webhook_bound_to_a_name_is_masked_too(self):
+        code = "HOOK = 'https://hooks.slack.com/services/T0001/B0002/XyZsecretWebhook'\nrequests.post(HOOK, json=rows)\nprint(len(rows))"
+
+        event = _event(_cell("toolu_hook", code=code, stdout="42\n"))
+
+        assert "XyZsecretWebhook" not in event
+        assert "T0001" not in event
+
+    def test_a_token_joined_into_a_url_path_reads_as_its_name(self):
+        code = (
+            "TOKEN = 'tok-XyZsecret123'\n"
+            "r = requests.get('https://erp.example.com/api/' + TOKEN + '/orders')\n"
+            "print(len(r.json()))"
+        )
+
+        event = _event(_cell("toolu_t", code=code, stdout="42\n"))
+
+        [step_out] = FigureSources.model_validate_json(event).steps
+        assert step_out.requests == ["GET https://erp.example.com/api/{TOKEN}/orders"]
+        # A URL with a name in place of a part of it is not a page to open.
+        assert step_out.url is None
+        assert "XyZsecret123" not in event
+
+    @pytest.mark.parametrize("password", ["Xk9#2mQ", "Xk9?2mQ", "Xk9/2mQ"])
+    def test_a_url_password_with_a_delimiter_in_it_is_redacted(self, password: str):
+        fetch = _cell(
+            "toolu_web", code=f"r = requests.get('https://erp:{password}@example.com/rates')\nprint(len(r.json()))",
+            stdout="42\n",
+        )
+        sql = f"SELECT qty FROM postgres_scan('postgresql://erp:{password}@db.internal/erp', 'public', 'stock')"
+        query = _cell("toolu_sql", code=f"a = con.execute({sql!r})\nprint(a.fetchone()[0])", stdout="250\n")
+
+        event = find_figure_sources(
+            answer="42 rates; S1 holds 250.", question="", steps=[fetch, query],
+        ).model_dump_json()
+
+        web_step, query_step = FigureSources.model_validate_json(event).steps
+        assert web_step.requests == ["GET https://example.com/rates"]
+        assert (web_step.label, web_step.url) == ("example.com/rates", "https://example.com/rates")
+        assert query_step.queries == [
+            "SELECT qty FROM postgres_scan('postgresql://***@db.internal/erp', 'public', 'stock')",
+        ]
+        assert "Xk9" not in event
+        assert "erp:" not in event
+
+    def test_a_path_with_an_at_sign_is_still_a_link(self):
+        step = _tool("toolu_f", "web_fetch", {"url": "https://www.youtube.com/@mindsdb/videos"}, "42 videos")
+
+        step_out = _only_step(step, answer="There are 42 videos.")
+
+        assert (step_out.url, step_out.label) == ("https://www.youtube.com/@mindsdb/videos", "www.youtube.com/@mindsdb/videos")
+
+
+class TestSecretsInLabels:
+    def test_a_description_that_holds_a_secret_is_redacted_in_the_label(self):
+        step = _cell(
+            "toolu_q", code="print(query_minds_data('SELECT qty FROM stock'))", stdout="42\n",
+            description="Query stock with password=hunter2 and token: tok_XyZ",
+        )
+
+        event = _event(step)
+
+        assert FigureSources.model_validate_json(event).steps[0].label == (
+            "Query stock with password=[redacted] and token: [redacted]"
+        )
+        assert "hunter2" not in event
+        assert "tok_XyZ" not in event
+
+    def test_a_secret_in_a_web_steps_label_and_url_is_never_sent(self):
+        step = _tool(
+            "toolu_f", "web_fetch", {"url": "https://example.com/api/token=XyZsecret/rates"}, "Rate: 42",
+        )
+
+        event = _event(step, answer="The rate is 42.")
+
+        [step_out] = FigureSources.model_validate_json(event).steps
+        assert step_out.url is None
+        assert "XyZsecret" not in event
+
+
+class TestSecretsInQueries:
+    @pytest.mark.parametrize(("literal", "secret"), [
+        ("Server=db;Uid=erp;Pwd=XyZpass9;", "XyZpass9"),
+        ("s3_secret_access_key=XyZsecretKey9", "XyZsecretKey9"),
+        ("{'Authorization': 'Bearer XyZbearer9'}", "XyZbearer9"),
+        ("key_id=AKIAIOSFODNN7EXAMPLE", "AKIAIOSFODNN7EXAMPLE"),
+        ("session=ASIAIOSFODNN7EXAMPLE", "ASIAIOSFODNN7EXAMPLE"),
+        ("gh=ghp_" + "a1B2" * 9, "a1B2a1B2a1B2"),
+        ("slack=xoxb-1234567890-0987654321-XyZslack", "XyZslack"),
+        ("jwt=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.XyZsignature", "XyZsignature"),
+        ("-----BEGIN RSA PRIVATE KEY-----\nMIIXyZpem\n-----END RSA PRIVATE KEY-----", "MIIXyZpem"),
+        (
+            "https://bucket.s3.amazonaws.com/stock.csv?X-Amz-Credential=AKIA%2F&X-Amz-Signature=XyZsig9",
+            "XyZsig9",
+        ),
+        ("https://acct.blob.core.windows.net/c/stock.csv?sv=2024&sig=XyZsas9", "XyZsas9"),
+        ("Authorization: Basic dXNlcjpzM2NyZXQ=", "dXNlcjpzM2NyZXQ="),
+        ("Authorization: Token 9944b09199c62bcf9418ad846dd0e4bbdfc6ee4b", "9944b09199c62bcf"),
+        ("password => XyZhunter22", "XyZhunter22"),
+        ("scott/XyZtiger5@db.example.com:1521/orcl", "XyZtiger5"),
+        ("auth=sk_live_51HXyZabcdefghijklmnop", "XyZabcdefghijklmnop"),
+        ("tok=hf_AbCdEfGhIjKlMnOpQrStUvWxYz12", "AbCdEfGhIjKlMnOpQrStUvWxYz12"),
+        ("at=ya29.a0AfH6SMBxXyZsecretToken123456789", "XyZsecretToken"),
+        ("k=xapp-1-A0123-4567-abcdef0123456789", "abcdef0123456789"),
+        ("host=db user=erp pass=XyZsup3rS3cret db=prod", "XyZsup3rS3cret"),
+        (
+            "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=XyZm9vYmFyU2VjcmV0==;EndpointSuffix=core.windows.net",
+            "XyZm9vYmFyU2VjcmV0",
+        ),
+    ])
+    def test_a_credential_shape_in_sql_is_never_sent(self, literal: str, secret: str):
+        sql = f"SELECT qty FROM read_source('{literal}')"
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        event = _event(step)
+
+        [step_out] = FigureSources.model_validate_json(event).steps
+        assert step_out.queries[0].startswith("SELECT qty FROM read_source('")
+        assert step_out.queries[0].endswith("')")
+        assert secret not in event
+
+    @pytest.mark.parametrize(
+        "filler", ["a" * 60_000, "password" * 7_500, "x://a:" * 10_000, "x://a:''" * 8_192, "eyJ-" * 16_384],
+    )
+    def test_a_long_query_is_redacted_quickly(self, filler: str):
+        sql = f"SELECT qty FROM read_source('{filler}')"
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+        start = time.perf_counter()
+
+        _event(step)
+
+        assert time.perf_counter() - start < 1.0
+
+    def test_a_quoted_passphrase_is_redacted_whole_and_keeps_its_quotes(self):
+        sql = "SELECT qty FROM pg_scan(host='db', password='correct horse battery staple', table='stock')"
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        event = _event(step)
+
+        assert FigureSources.model_validate_json(event).steps[0].queries == [
+            "SELECT qty FROM pg_scan(host='db', password='[redacted]', table='stock')",
+        ]
+        for word in ("correct", "horse", "battery", "staple"):
+            assert word not in event
+
+    def test_a_quoted_passphrase_key_is_a_secret_key(self):
+        sql = "SELECT qty FROM t WHERE passphrase = 'correct horse battery'"
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        event = _event(step)
+
+        assert FigureSources.model_validate_json(event).steps[0].queries == [
+            "SELECT qty FROM t WHERE passphrase = '[redacted]'",
+        ]
+        assert "horse" not in event
+
+    @pytest.mark.parametrize("quote", ["'", '"'])
+    def test_a_quoted_value_with_a_doubled_quote_in_it_is_redacted_whole(self, quote: str):
+        """SQL writes a quote inside a quoted value as two quotes."""
+        value = f"{quote}it{quote}{quote}s XyZs3cret{quote}"
+        sql = f"SELECT qty FROM pg_scan(host='db', password={value}, table='stock')"
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        event = _event(step)
+
+        assert FigureSources.model_validate_json(event).steps[0].queries == [
+            f"SELECT qty FROM pg_scan(host='db', password={quote}[redacted]{quote}, table='stock')",
+        ]
+        assert "XyZs3cret" not in event
+
+    def test_a_uri_password_with_a_doubled_quote_in_it_is_redacted(self):
+        sql = "SELECT qty FROM postgres_scan('postgresql://admin:Pa''XyZss9@db.example.com/prod', 'public', 'stock')"
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        event = _event(step)
+
+        assert FigureSources.model_validate_json(event).steps[0].queries == [
+            "SELECT qty FROM postgres_scan('postgresql://***@db.example.com/prod', 'public', 'stock')",
+        ]
+        assert "XyZss9" not in event
+        assert "admin" not in event
 
 
 class TestFiguresWithoutASource:
@@ -484,6 +1144,16 @@ class TestWhatIsNotAFigure:
 
         assert find_figure_sources(answer=answer, question="", steps=[READ_STOCK]) == FigureSources()
 
+    @pytest.mark.parametrize("filler", ["](" * 32_768, "[^1]" * 16_384, "10/14/2026 " * 6_000])
+    def test_a_long_answer_full_of_skipped_spans_is_read_quickly(self, filler: str):
+        text = filler + " S1 holds 250 units."
+        start = time.perf_counter()
+
+        sources = find_figure_sources(answer=text, question=text, steps=[READ_STOCK])
+
+        assert time.perf_counter() - start < 1.0
+        assert [f.text for f in sources.figures] == ["250"]
+
     def test_an_answer_with_no_numbers_has_no_figures(self):
         assert find_figure_sources(
             answer="The data doesn't hold that.", question="", steps=[READ_STOCK],
@@ -501,15 +1171,505 @@ class TestOffsets:
         assert figure.start == answer.index("250") + 1
 
 
-class TestQuestionText:
-    def test_joins_the_text_parts_of_a_multi_part_question(self):
-        content = [
-            {"type": "input_text", "text": "How many at S1?"},
-            {"type": "input_file", "file_id": "f1"},
-            {"type": "text", "text": "Within 2 days."},
+def _origins(sources: FigureSources) -> list[tuple[str, FigureOrigin]]:
+    return [(f.text, f.origin) for f in sources.figures]
+
+
+def _printed(stdout: str, *, answer: str, code: str = "print(total)") -> list[tuple[str, FigureOrigin]]:
+    return _origins(find_figure_sources(answer=answer, question="", steps=[_cell("toolu_c", code=code, stdout=stdout)]))
+
+
+class TestRanges:
+    def test_both_ends_of_a_hyphen_range_are_figures(self):
+        assert _origins(find_figure_sources(answer="My best estimate is 150-200 units.", question="", steps=[])) == [
+            ("150", FigureOrigin.none), ("200", FigureOrigin.none),
         ]
 
-        assert question_text(content) == "How many at S1?\nWithin 2 days."
+    def test_an_invented_upper_end_is_not_sourced_with_the_lower(self):
+        sources = find_figure_sources(answer="Stock ranges 90-400 units.", question="", steps=[READ_STOCK])
 
-    def test_a_plain_question_is_its_own_text(self):
-        assert question_text("How many?") == "How many?"
+        assert _origins(sources) == [("90", FigureOrigin.step), ("400", FigureOrigin.none)]
+
+    @pytest.mark.parametrize(("answer", "texts"), [
+        ("Overtime costs $30-$45 an hour.", ["$30", "$45"]),
+        ("Overtime costs $10-$20 an hour.", ["$10", "$20"]),
+        ("Demand is 5k-10k units.", ["5k", "10k"]),
+        ("Lead time is 5-10 days.", ["5", "10"]),
+    ])
+    def test_currency_and_scaled_ranges_keep_both_ends(self, answer: str, texts: list[str]):
+        assert [f.text for f in find_figure_sources(answer=answer, question="", steps=[]).figures] == texts
+
+    @pytest.mark.parametrize("answer", [
+        "See question Q-03.", "Order PO-2024-0012 shipped.", "It shipped 10-14-2025.", "Use model A2210-30.",
+        "Part 4711-002 is short.", "Call 555-0100.", "SKU 100-200-300 ships.",
+    ])
+    def test_a_hyphen_inside_an_identifier_or_a_date_still_hides_its_numbers(self, answer: str):
+        assert find_figure_sources(answer=answer, question="", steps=[]) == FigureSources()
+
+    def test_a_percent_range_is_two_positive_figures(self):
+        sources = _printed("low 0.05\nhigh 0.10\n", answer="Margins run 5%-10%.", code="print(df.margin.describe())")
+
+        assert sources == [("5%", FigureOrigin.step), ("10%", FigureOrigin.step)]
+
+    @pytest.mark.parametrize(("answer", "texts"), [
+        ("Balances are -5 and -10.", ["-5", "-10"]),
+        ("The drop was -5%, then -10%.", ["-5%", "-10%"]),
+        ("Use x-160 here.", []),
+    ])
+    def test_a_minus_sign_after_a_space_or_a_word_is_not_a_range_hyphen(self, answer: str, texts: list[str]):
+        assert [f.text for f in find_figure_sources(answer=answer, question="", steps=[]).figures] == texts
+
+    def test_both_ends_of_a_range_in_the_question_are_the_questions(self):
+        sources = find_figure_sources(answer="Yes, 200 units fit.", question="Can we order 150-200 units?", steps=[])
+
+        assert _origins(sources) == [("200", FigureOrigin.question)]
+
+
+class TestQuestionForms:
+    def test_a_figure_in_another_form_than_the_questions_number_is_not_the_questions(self):
+        sources = find_figure_sources(
+            answer="Overtime costs $30 an hour.", question="What would overtime cost over the next 30 days?", steps=[],
+        )
+
+        assert _origins(sources) == [("$30", FigureOrigin.none)]
+
+    def test_a_year_in_the_question_does_not_cover_a_rounded_figure(self):
+        sources = find_figure_sources(answer="About 2k units ship.", question="How many units ship in 2026?", steps=[])
+
+        assert _origins(sources) == [("2k", FigureOrigin.none)]
+
+    def test_a_date_in_the_question_states_no_figure(self):
+        sources = find_figure_sources(answer="14 orders shipped.", question="What shipped on October 14?", steps=[])
+
+        assert _origins(sources) == [("14", FigureOrigin.none)]
+
+    @pytest.mark.parametrize(("answer", "question", "text"), [
+        ("Yes, $30 an hour is the rate.", "Is $30 an hour the overtime rate?", "$30"),
+        ("12% of orders is the target.", "Is the target 12% of orders?", "12%"),
+        ("1,200 units is the cap.", "Is the cap 1200 units?", "1,200"),
+    ])
+    def test_the_same_form_stays_the_questions(self, answer: str, question: str, text: str):
+        sources = find_figure_sources(answer=answer, question=question, steps=[])
+
+        assert _origins(sources) == [(text, FigureOrigin.question)]
+
+
+class TestDates:
+    @pytest.mark.parametrize(("answer", "text"), [
+        ("Maybe 40 units arrive.", "40"),
+        ("Inventory decreased 15 units.", "15"),
+        ("We placed 12 separate orders.", "12"),
+        ("Margin 12 points.", "12"),
+        ("The remaining 12 may arrive late.", "12"),
+    ])
+    def test_a_word_that_starts_like_a_month_does_not_hide_a_figure(self, answer: str, text: str):
+        assert [f.text for f in find_figure_sources(answer=answer, question="", steps=[]).figures] == [text]
+
+    @pytest.mark.parametrize("answer", [
+        "It shipped 10/14/2026.",
+        "It shipped 2026/10/14.",
+        "It shipped 10-14-2026.",
+        "It ships in October 2026.",
+        "It ships in Oct. 2026.",
+        "It ships in Q3 2026.",
+        "It ships in FY 2026.",
+        "It ships in 2026 Q3.",
+        "It ships at 10:30am.",
+        "It ships at 3 PM.",
+        "It ships at 10 a.m. sharp.",
+        "It shipped 12 May.",
+    ])
+    def test_more_date_forms_are_not_figures(self, answer: str):
+        assert find_figure_sources(answer=answer, question="", steps=[]) == FigureSources()
+
+    def test_a_two_part_slash_is_two_figures(self):
+        assert [f.text for f in find_figure_sources(answer="12/15 sites reported.", question="", steps=[]).figures] == [
+            "12", "15",
+        ]
+
+
+class TestNumberForms:
+    @pytest.mark.parametrize(("answer", "stdout", "text"), [
+        ("Orders cost $1.2m in total.", "1234567.89", "$1.2m"),
+        ("The contract is worth $5MM.", "5000000", "$5MM"),
+        ("Orders cost $1.2 Million in total.", "1234567.89", "$1.2 Million"),
+        ("12 % of orders shipped late.", "0.12", "12 %"),
+        ("12 percent of orders shipped late.", "0.125", "12 percent"),
+        ("The new line runs 1.5x faster.", "1.5", "1.5x"),
+        ("The pallet weighs 250kg.", "250", "250kg"),
+        ("Overtime costs C$30 an hour.", "30", "C$30"),
+        ("S1 holds _250_ units.", "250", "250"),
+        ("S1 holds 250 B-grade units.", "250", "250"),
+    ])
+    def test_a_number_form_reads_at_its_value(self, answer: str, stdout: str, text: str):
+        assert _printed(f"{stdout}\n", answer=answer) == [(text, FigureOrigin.step)]
+
+    @pytest.mark.parametrize("answer", ["The site is 250m away.", "Part A2210 needs 32GB.", "See row_250_b."])
+    def test_a_unit_or_name_glued_to_a_number_is_still_not_a_figure(self, answer: str):
+        assert find_figure_sources(answer=answer, question="", steps=[]) == FigureSources()
+
+
+class TestRoundedWholeNumbers:
+    @pytest.mark.parametrize(("answer", "stdout", "origin"), [
+        ("Orders cost about 1,200 dollars.", "1234", FigureOrigin.step),
+        ("Orders cost roughly $1,200,000.", "1234567.89", FigureOrigin.step),
+        ("S1 holds ~250 units.", "247", FigureOrigin.step),
+        ("Orders cost 1,200 dollars.", "1234", FigureOrigin.none),
+        ("S1 holds 250 units.", "247", FigureOrigin.none),
+        ("Orders cost about 1,000 dollars.", "640", FigureOrigin.none),
+        ("Orders cost about 1,000 dollars.", "1040", FigureOrigin.none),
+    ])
+    def test_a_hedged_round_number_matches_to_its_second_significant_digit(
+        self, answer: str, stdout: str, origin: FigureOrigin,
+    ):
+        [(_, found)] = _printed(f"{stdout}\n", answer=answer)
+
+        assert found is origin
+
+
+class TestThousandsSeparators:
+    @pytest.mark.parametrize(("stdout", "answer", "text", "origin"), [
+        ("Total units: 1,250\n", "S1 holds 250 units.", "250", FigureOrigin.none),
+        ("Total units 1,250\n", "S1 holds 250 units.", "250", FigureOrigin.none),
+        ("Revenue: $1,250,000\n", "S1 holds 250 units.", "250", FigureOrigin.none),
+        ("Cost: 3,042.50\n", "Overtime costs $42.50.", "$42.50", FigureOrigin.none),
+        ("qty\n1,250\n", "S1 holds 250 units.", "250", FigureOrigin.none),
+        ("Totals, by site:\n1,250\n", "S1 holds 250 units.", "250", FigureOrigin.none),
+        ("Total units: 1,250\n", "There are 1,250 units.", "1,250", FigureOrigin.step),
+        ("[100,250,300]\n", "S1 holds 250 units.", "250", FigureOrigin.step),
+        ("site_id,qty\n1,250\n2,90\n", "Site 1 holds 250 units.", "250", FigureOrigin.step),
+        ("part,site,qty\nP100,S1,250\n", "S1 holds 250 units.", "250", FigureOrigin.step),
+    ])
+    def test_a_separator_splits_a_number_only_between_fields(
+        self, stdout: str, answer: str, text: str, origin: FigureOrigin,
+    ):
+        step = _cell("toolu_c", code="print(x)", stdout=stdout)
+
+        assert _figure(find_figure_sources(answer=answer, question="", steps=[step]), text).origin is origin
+
+
+class TestEchoedLiterals:
+    @pytest.mark.parametrize(("code", "stdout", "answer", "text"), [
+        ("rate = 29.99\nprint(rate)", "29.99", "Overtime costs $30 an hour.", "$30"),
+        ("growth = 0.05\nprint(growth)", "0.05", "Demand grows 5% a year.", "5%"),
+        ("target = 1_200_000\nprint(target)", "1200000", "The target is $1.2M.", "$1.2M"),
+    ])
+    def test_an_output_equal_to_a_literal_is_not_a_source_even_rounded(
+        self, code: str, stdout: str, answer: str, text: str,
+    ):
+        assert _printed(f"{stdout}\n", answer=answer, code=code) == [(text, FigureOrigin.none)]
+
+    def test_a_literal_near_a_real_value_does_not_hide_it(self):
+        code = "threshold = 249.9\nprint(df[df.qty > threshold].qty.max())"
+
+        assert _printed("250\n", answer="S1 holds 250 units.", code=code) == [("250", FigureOrigin.step)]
+
+
+def _printed_frame(labels: list[int]) -> str:
+    """A stock frame as print(df) shows it, with these row labels."""
+    width = max(len(str(label)) for label in labels)
+    lines = [" " * width + "  part site  qty"]
+    for label in labels:
+        part, site, qty = ("P100", "S1", 250) if label % 2 == 0 else ("P200", "S2", 90)
+        lines.append(f"{label:<{width}}  {part}   {site}  {qty:>3}")
+    return "\n".join(lines) + "\n"
+
+
+_SAMPLE_FULL = (
+    "[sample:DataFrame]\n"
+    "Shape: 40 rows x 3 cols\n"
+    "Columns: ['part', 'site', 'qty']\n"
+    "Dtypes:\npart    object\nsite    object\nqty      int64\n\n"
+    "Describe:\n"
+    "        part site         qty\n"
+    "count     40   40   40.000000\n"
+    "unique     2    2         NaN\n"
+    "top     P100   S1         NaN\n"
+    "freq      20   20         NaN\n"
+    "mean     NaN  NaN  170.000000\n"
+    "std      NaN  NaN   81.019149\n"
+    "min      NaN  NaN   90.000000\n"
+    "25%      NaN  NaN   90.000000\n"
+    "50%      NaN  NaN  170.000000\n"
+    "75%      NaN  NaN  250.000000\n"
+    "max      NaN  NaN  250.000000\n\n"
+    "First 40 rows:\n" + _printed_frame(list(range(40)))
+)
+
+
+class TestFrameRowLabels:
+    @pytest.mark.parametrize(("stdout", "invented"), [
+        (_printed_frame(list(range(40))), "$30"),
+        (_printed_frame(list(range(5))) + "..  ...  ...  ...\n" + _printed_frame(list(range(95, 100))).split("\n", 1)[1]
+         + "\n[100 rows x 3 columns]\n", "$3"),
+        (_SAMPLE_FULL, "$30"),
+        (_SAMPLE_FULL, "25%"),
+        (_printed_frame([18, 37, 35]), "$37"),
+        (_printed_frame([8]), "$8"),
+        ("0    250\n1     90\n2    250\nName: qty, dtype: int64\n", "$2"),
+    ])
+    def test_a_row_label_or_shape_footer_is_not_a_source(self, stdout: str, invented: str):
+        answer = f"S1 holds 250 units; the rate is {invented}."
+
+        assert _printed(stdout, answer=answer) == [("250", FigureOrigin.step), (invented, FigureOrigin.none)]
+
+    @pytest.mark.parametrize("stdout", [
+        # print(df.qty.value_counts())
+        "qty\n250    2\n90     1\nName: count, dtype: int64\n",
+        # print(df.set_index('qty'))
+        "     part site\nqty          \n250  P100   S1\n90   P100   S2\n",
+        # Printed by hand.
+        "250  S1\n90   S2\n",
+    ])
+    def test_values_printed_where_row_labels_go_are_read_unless_they_count_up(self, stdout: str):
+        assert _printed(stdout, answer="S1 holds 250 units and S2 holds 90.", code="print(stock)") == [
+            ("250", FigureOrigin.step), ("90", FigureOrigin.step),
+        ]
+
+
+def _pdf_page(stdout: str) -> int | None:
+    sources = find_figure_sources(
+        answer="Overtime costs $42 an hour.", question="",
+        steps=[_cell("toolu_pdf", code="print(pdf_text('rates.pdf'))", stdout=stdout)],
+    )
+    [source] = _figure(sources, "$42").sources
+    return source.page
+
+
+class TestPdfPages:
+    def test_a_footer_closes_its_page(self):
+        assert _pdf_page("Rates.\nPage 1 of 2\nOvertime costs $42 an hour.\nPage 2 of 2\n") == 2
+
+    def test_a_figure_before_any_header_takes_the_footer_after_it(self):
+        assert _pdf_page("Overtime costs $42 an hour.\nPage 1 of 2\nOther rates.\nPage 2 of 2\n") == 1
+
+    def test_a_page_named_inside_a_line_is_not_a_marker(self):
+        assert _pdf_page("--- page 1 ---\nSee page 12 for terms. Overtime costs $42 an hour.\n") == 1
+
+    def test_an_exact_value_places_the_figure_before_a_rounded_one(self):
+        assert _pdf_page("--- page 1 ---\nLast year: $41.60.\n--- page 2 ---\nOvertime costs $42 an hour.\n") == 2
+
+    def test_pages_counted_from_zero_are_read_from_one(self):
+        assert _pdf_page("--- page 0 ---\nRates.\n--- page 1 ---\nOvertime costs $42 an hour.\n") == 2
+        assert _pdf_page("--- page 0 ---\nOvertime costs $42 an hour.\n") == 1
+
+
+class TestOutOfRangeNumbers:
+    @pytest.mark.parametrize("where", ["output", "answer", "question", "code"])
+    def test_a_token_past_any_real_size_is_not_a_number_and_keeps_the_rest(self, where: str):
+        token = "4E12345678"
+        step = _cell(
+            "toolu_read",
+            code="print(open('stock.csv').read())" + (f"  # part {token}" if where == "code" else ""),
+            stdout="part,site,qty\nP100,S1,250\n" + (f"{token},S9,7\n" if where == "output" else ""),
+        )
+
+        sources = find_figure_sources(
+            answer="S1 holds 250 units." + (f" Part {token} is out." if where == "answer" else ""),
+            question="Stock at S1?" + (f" Part {token}?" if where == "question" else ""),
+            steps=[step],
+        )
+
+        assert _origins(sources) == [("250", FigureOrigin.step)]
+
+
+class TestManyHolders:
+    def test_a_figure_names_at_most_the_first_few_steps_in_step_order(self):
+        steps = [_cell(f"toolu_{i}", code="print(v)", stdout="250\n") for i in range(MAX_FIGURE_SOURCES + 2)]
+
+        sources = find_figure_sources(answer="S1 holds 250 units.", question="", steps=steps)
+
+        expected = [f"toolu_{i}" for i in range(MAX_FIGURE_SOURCES)]
+        assert [s.tool_use_id for s in _figure(sources, "250").sources] == expected
+        assert [step.tool_use_id for step in sources.steps] == expected
+
+    def test_exact_holders_are_kept_before_rounded_ones(self):
+        printed = ["249.8", "250.2", "250", "249.9", "250"]
+        steps = [_cell(f"toolu_{i}", code="print(v)", stdout=f"{value}\n") for i, value in enumerate(printed)]
+
+        sources = find_figure_sources(answer="S1 holds 250 units.", question="", steps=steps)
+
+        assert MAX_FIGURE_SOURCES == 3
+        assert [s.tool_use_id for s in _figure(sources, "250").sources] == ["toolu_0", "toolu_2", "toolu_4"]
+
+    def test_a_large_turn_names_every_holding_step_quickly(self):
+        printed: list[set[int]] = []
+        steps = []
+        for i in range(25):
+            values = [(i * 37 + k * 11) % 2_000 for k in range(800)]
+            printed.append(set(values))
+            steps.append(_cell(f"toolu_{i}", code="print(rows)", stdout="\n".join(f"{v}, {v}.25" for v in values)))
+        answer = "Values: " + ", ".join(str(v) for v in range(0, 2_000, 5)) + "."
+        start = time.perf_counter()
+
+        sources = find_figure_sources(answer=answer, question="", steps=steps)
+
+        assert time.perf_counter() - start < 1.0
+        assert len(sources.figures) == 400
+        for figure in sources.figures:
+            holders = [f"toolu_{i}" for i, values in enumerate(printed) if int(figure.text) in values]
+            assert [s.tool_use_id for s in figure.sources] == holders[:MAX_FIGURE_SOURCES]
+
+
+class TestSigns:
+    def test_a_negative_figure_is_not_sourced_by_a_positive_value(self):
+        assert _printed("160\n", answer="Projected balance at S2: -160 units.") == [("-160", FigureOrigin.none)]
+
+    def test_a_minus_sign_reads_as_a_sign(self):
+        assert _printed("160\n", answer="Projected balance at S2: −160 units.") == [
+            ("−160", FigureOrigin.none),
+        ]
+
+    def test_a_negative_figure_is_sourced_by_a_negative_value(self):
+        assert _printed("balance: -160\n", answer="Projected balance at S2: -160 units.") == [
+            ("-160", FigureOrigin.step),
+        ]
+
+    def test_an_unsigned_figure_is_sourced_by_either_sign(self):
+        assert _printed("balance: -160\n", answer="S2 is 160 units short.") == [("160", FigureOrigin.step)]
+
+
+class TestCitations:
+    def test_citation_markers_are_not_figures(self):
+        answer = (
+            "Steel trades at $640 a ton [1], up from $600 [^2].\n\n"
+            "Sources:\n[1] https://example.com/steel\n[^2]: https://example.com/old"
+        )
+
+        assert [f.text for f in find_figure_sources(answer=answer, question="", steps=[]).figures] == ["$640", "$600"]
+
+
+class TestModelWorkedFigures:
+    def test_a_sum_the_model_works_out_in_its_text_has_no_source(self):
+        sources = find_figure_sources(answer="S1 and S2 hold 340 units in all.", question="", steps=[READ_STOCK])
+
+        assert _origins(sources) == [("340", FigureOrigin.none)]
+        assert sources.steps == []
+
+
+class TestDisplayMath:
+    @pytest.mark.parametrize("math", [
+        "$$250 + 90 = 340$$",
+        "$$\n\\text{total} = 250 + 90\n$$",
+        "\\[250 + 90\\]",
+        "\\(250 + 90\\)",
+    ])
+    def test_numbers_in_display_math_are_not_figures(self, math: str):
+        sources = find_figure_sources(answer=f"The sum {math} gives 77 sites.", question="", steps=[])
+
+        assert [f.text for f in sources.figures] == ["77"]
+
+    def test_a_single_dollar_sign_is_currency(self):
+        sources = find_figure_sources(answer="Overtime costs $30 to $45 an hour.", question="", steps=[])
+
+        assert [f.text for f in sources.figures] == ["$30", "$45"]
+
+    @pytest.mark.parametrize("opener", ["\\[", "\\("])
+    def test_math_left_open_runs_to_the_end_and_is_read_quickly(self, opener: str):
+        text = opener * 32_768 + " S1 holds 250 units."
+        start = time.perf_counter()
+
+        sources = find_figure_sources(answer=text, question=text, steps=[READ_STOCK])
+
+        assert time.perf_counter() - start < 1.0
+        assert sources == FigureSources()
+
+
+class TestUrlsInProse:
+    @pytest.mark.parametrize(("printed", "url"), [
+        ("Source: https://example.com/steel.", "https://example.com/steel"),
+        ("See https://example.com/steel, which lists it.", "https://example.com/steel"),
+        ("Source: **https://example.com/steel**", "https://example.com/steel"),
+        ("Source: `https://example.com/steel`", "https://example.com/steel"),
+        ("[Steel](https://example.com/steel)", "https://example.com/steel"),
+        ("(see https://en.wikipedia.org/wiki/Steel_(alloy))", "https://en.wikipedia.org/wiki/Steel_(alloy)"),
+    ])
+    def test_a_url_a_web_search_printed_leaves_out_the_prose_around_it(self, printed: str, url: str):
+        step = _cell("toolu_web", code="print(web_search('steel price'))", stdout=f"Steel trades at $640 a ton. {printed}\n")
+
+        step_out = _only_step(step, answer="Steel trades at $640 a ton.")
+
+        assert step_out.url == url
+
+    def test_a_web_search_tools_url_leaves_out_the_prose_around_it(self):
+        step = _tool("toolu_s", "web_search", {"query": "steel price"}, "Steel trades at $640 a ton (https://example.com/steel).")
+
+        assert _only_step(step, answer="Steel trades at $640 a ton.").url == "https://example.com/steel"
+
+
+class TestToleratedArguments:
+    """anton runs a cell whose arguments it could read in a tolerant form,
+    and its result still carries the code that ran."""
+
+    @pytest.mark.parametrize("tool_input", ["", '{"action": "exec", "name": "main", "code": "cost = 30\\nprint(cost)"}<|end|>'])
+    def test_a_cell_whose_arguments_do_not_parse_reads_the_code_that_ran(self, tool_input: str):
+        cell = _cell("toolu_c", code="cost = 30\nprint(cost)", stdout="30\n")
+
+        sources = find_figure_sources(answer="Overtime costs $30.", question="", steps=[replace(cell, tool_input=tool_input)])
+
+        assert _origins(sources) == [("$30", FigureOrigin.none)]
+
+    def test_a_query_cell_whose_arguments_are_missing_keeps_its_sql(self):
+        cell = _cell("toolu_q", code="print(query_minds_data('SELECT qty FROM stock'))", stdout="250\n")
+
+        step_out = _only_step(replace(cell, tool_input=""), answer="S1 holds 250.")
+
+        assert (step_out.kind, step_out.queries) == (SourceKind.query, ["SELECT qty FROM stock"])
+
+    def test_arguments_cut_mid_code_keep_their_scratchpad(self):
+        spell = _cell("toolu_1", code="sql = 'SELECT qty FROM stock'", stdout="", pad="calc")
+        code = "# " + "x" * 200 + "\ncur.execute(sql)\nprint(cur.fetchone()[0])"
+        run = _cell("toolu_2", code=code, stdout="250\n", pad="calc")
+        cut = replace(run, tool_input=run.tool_input[:120])
+
+        [step] = find_figure_sources(answer="S1 holds 250.", question="", steps=[spell, cut]).steps
+
+        assert step.queries == ["SELECT qty FROM stock"]
+
+
+class TestClippedResults:
+    """The cloud pod cuts a cell result that is still past its wire limit
+    after shortening each field, which leaves it no longer JSON."""
+
+    def test_what_the_cell_printed_is_read_and_its_error_is_not(self):
+        cell = Cell(
+            code="print(total)", stdout="Total units:\n7777\n€1,250\n", stderr="",
+            error="Traceback: retry 4242 failed " + "E" * 70_000, description="Sum stock",
+        )
+        clipped = _clip_result_content(json.dumps(asdict(cell)))
+        step = TurnStep(
+            tool_use_id="toolu_c", tool_name="scratchpad", action="exec",
+            tool_input=json.dumps({"action": "exec", "name": "main", "code": "print(total)"}), content=clipped,
+        )
+
+        sources = find_figure_sources(answer="7777 units worth €1,250; 4242 retries.", question="", steps=[step])
+
+        assert _origins(sources) == [
+            ("7777", FigureOrigin.step), ("€1,250", FigureOrigin.step), ("4242", FigureOrigin.none),
+        ]
+
+    def test_printed_text_cut_in_the_middle_keeps_what_came_before_the_cut(self):
+        cell = Cell(code="print(total)", stdout="7777\n" + "€" * 16_000, stderr="", error=None, description="")
+        clipped = _clip_result_content(json.dumps(asdict(cell)))
+        step = TurnStep(
+            tool_use_id="toolu_c", tool_name="scratchpad", action="exec",
+            tool_input=json.dumps({"action": "exec", "name": "main", "code": "print(total)"}), content=clipped,
+        )
+
+        assert _origins(find_figure_sources(answer="7777 units.", question="", steps=[step])) == [
+            ("7777", FigureOrigin.step),
+        ]
+
+
+class TestCellResults:
+    def test_a_result_without_printed_output_is_logged_and_holds_nothing(self, caplog):
+        step = replace(
+            _cell("toolu_c", code="print(total)", stdout="250\n"),
+            content=json.dumps({"code": "print(total)", "output": "250\n"}),
+        )
+
+        with caplog.at_level(logging.WARNING, logger=figure_sources_mod.__name__):
+            sources = find_figure_sources(answer="S1 holds 250.", question="", steps=[step])
+
+        assert _origins(sources) == [("250", FigureOrigin.none)]
+        assert len(caplog.records) == 1

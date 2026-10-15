@@ -29,7 +29,7 @@ from cowork.common.settings.user_settings import (
     use_turn_settings,
 )
 from cowork.db.units import busy_retry_seconds, conversation_writes, run_db, run_to_completion
-from cowork.harnesses.base import available_harness_ids, get_harness
+from cowork.harnesses.base import available_harness_ids, get_harness, prompt_text
 from cowork.handlers import jev_shadow
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
@@ -41,9 +41,16 @@ from cowork.handlers.response_routing import (
     decide_route,
     ineligible_reason,
 )
-from cowork.harnesses.anton_harness.figure_sources import question_text
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
-from cowork.harnesses.anton_harness.stream_formatter import SkillCreated, TurnContext, format_responses_stream
+from cowork.schemas.figure_sources import FigureSources
+from cowork.harnesses.anton_harness.stream_formatter import (
+    SkillCreated,
+    TurnContext,
+    TurnEvidence,
+    TurnHistory,
+    find_answer_sources,
+    format_responses_stream,
+)
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.streaming import StreamBuffer, TurnLifecycle, new_buffer, registry, sse_frame
@@ -623,6 +630,7 @@ class ResponsesHandler:
                     conversation_id=start.conversation_id,
                     turn_id=start.turn_id,
                     original_content=original_content,
+                    question=prompt_text(start.harness_input),
                     route=route,
                 )
 
@@ -759,7 +767,7 @@ class ResponsesHandler:
                     # under an id no conversation ever gets (ENG-264).
                     try:
                         conversation = conversation_service.create_conversation(
-                            topic=self._prompt_text(harness_input)[:80],
+                            topic=prompt_text(harness_input)[:80],
                             project_id=self._resolve_project_id(request, session=session),
                             conversation_id=conv_id,
                             harness=harness_name,
@@ -782,7 +790,7 @@ class ResponsesHandler:
                 # row id, so create a fresh conversation and re-link any
                 # attachments uploaded against the client's id (ENG-264).
                 conversation = conversation_service.create_conversation(
-                    topic=self._prompt_text(harness_input)[:80],
+                    topic=prompt_text(harness_input)[:80],
                     project_id=self._resolve_project_id(request, session=session),
                     harness=harness_name,
                     model=request.model,
@@ -791,7 +799,7 @@ class ResponsesHandler:
                 self._relink_attachments(request.conversation, conversation, session=session)
         else:
             conversation = conversation_service.create_conversation(
-                topic=self._prompt_text(harness_input)[:80],
+                topic=prompt_text(harness_input)[:80],
                 project_id=self._resolve_project_id(request, session=session),
                 harness=harness_name,
                 model=request.model,
@@ -887,7 +895,7 @@ class ResponsesHandler:
             history = [scrubbed_openai_dump(m) for m in gate_rows]
             history.append({
                 "role": "user",
-                "content": scrub_credentials(self._prompt_text(harness_input)),
+                "content": scrub_credentials(prompt_text(harness_input)),
             })
             # The gate's LLM call is the only one a direct turn makes, and it
             # is made outside any ChatSession — so without a trace context it
@@ -1030,17 +1038,25 @@ class ResponsesHandler:
         conversation_id: UUID,
         turn_id: int,
         original_content,
+        question: str,
         route: RouteDecision,
     ) -> AsyncGenerator[str, None] | Response:
-        """Return the router model's direct answer without initializing Anton."""
+        """Return the router model's direct answer without initializing Anton.
+
+        `question` is the text the turn was sent with (prompt_text), which a
+        figure in the answer may repeat."""
         if not request.stream:
             text = route.text
+            sources = await self._direct_figure_sources(answer=text, question=question)
             events = [{
                 "type": "response.output_text.delta",
                 "delta": text,
                 "response_route": route.route,
                 "response_route_reason": route.reason,
-            }, {"type": "response.completed"}]
+            }, *([] if sources is None else [{
+                "type": "response.figure_sources",
+                **sources.model_dump(mode="json"),
+            }]), {"type": "response.completed"}]
 
             def save_turn(session: ScopedSession) -> UUID:
                 service = ConversationService(session)
@@ -1055,7 +1071,7 @@ class ResponsesHandler:
             return Response(
                 status=ResponseStatus.completed,
                 model=route.model,
-                output=[self._build_output(str(anchor_id), text)],
+                output=[self._build_output(str(anchor_id), text, figure_sources=sources)],
             )
 
         # turn_id comes from handle(): same numbering as the delegated path.
@@ -1068,6 +1084,7 @@ class ResponsesHandler:
                 lifecycle=lifecycle,
                 conv_id=conversation_id,
                 original_content=original_content,
+                question=question,
                 route=route,
                 buffer=buffer,
             ),
@@ -1089,12 +1106,21 @@ class ResponsesHandler:
             )
         return sse_from_buffer(handle.buffer, 0)
 
+    @staticmethod
+    async def _direct_figure_sources(*, answer: str, question: str) -> FigureSources | None:
+        """A direct answer's figures, or None when it has none. The router
+        answers from what it knows and runs no step, so each figure is the
+        question's or has no source."""
+        sources = await find_answer_sources(TurnEvidence(answer=answer, question=question))
+        return sources if sources.figures else None
+
     async def _produce_direct(
         self,
         *,
         lifecycle: TurnLifecycle,
         conv_id: UUID,
         original_content,
+        question: str,
         route: RouteDecision,
         buffer,
     ) -> None:
@@ -1119,7 +1145,7 @@ class ResponsesHandler:
             "response_route_reason": route.reason,
         }
 
-        def save_turn(session: ScopedSession) -> _DirectTurn | None:
+        def save_turn(session: ScopedSession, *, events: list[dict]) -> _DirectTurn | None:
             if lifecycle.discarded:
                 # The turn was deleted while this save waited for a
                 # connection. Its rows would land in the history the delete
@@ -1128,8 +1154,7 @@ class ResponsesHandler:
             service = ConversationService(session)
             user_message = service.save_user_message(conv_id, original_content)
             assistant_message = service.save_assistant_turn(
-                conv_id, route.text, [delta, {"type": "response.completed"}],
-                harness="cowork-direct",
+                conv_id, route.text, events, harness="cowork-direct",
             )
             return _DirectTurn(
                 user_message_id=user_message.id,
@@ -1137,8 +1162,19 @@ class ResponsesHandler:
             )
 
         async def answer() -> None:
+            # Found before the save, which keeps them with the answer.
+            sources = await self._direct_figure_sources(answer=route.text, question=question)
+            sources_frame = None if sources is None else {
+                "type": "response.figure_sources",
+                "sequence_number": 3,
+                "item_id": item_id,
+                **sources.model_dump(mode="json"),
+            }
+            saved_events = [delta, *([] if sources_frame is None else [sources_frame]), {"type": "response.completed"}]
             async with conversation_writes(conv_id):
-                saved = await run_db(save_turn, scope=scope_from_principal(self.principal))
+                saved = await run_db(
+                    partial(save_turn, events=saved_events), scope=scope_from_principal(self.principal),
+                )
             if saved is not None:
                 lifecycle.saved_question = True
             if saved is None or lifecycle.discarded:
@@ -1157,6 +1193,8 @@ class ResponsesHandler:
                 "response": response.model_dump(),
             })})
             await buffer.append("sse", {"sse": sse_frame("response.output_text.delta", delta)})
+            if sources_frame is not None:
+                await buffer.append("sse", {"sse": sse_frame("response.figure_sources", sources_frame)})
             completed_response = Response(
                 id=response.id,
                 created_at=response.created_at,
@@ -1166,7 +1204,7 @@ class ResponsesHandler:
             ).model_dump()
             completed_frame = {
                 "type": "response.completed",
-                "sequence_number": 3,
+                "sequence_number": 3 if sources_frame is None else 4,
                 "response": completed_response,
             }
             # The persisted row's real id, at the frame root (not
@@ -1239,7 +1277,7 @@ class ResponsesHandler:
             return self._produce_remote(
                 lifecycle=lifecycle,
                 conv_id=conv_id,
-                input_text=self._prompt_text(harness_input),
+                input_text=prompt_text(harness_input),
                 original_content=original_content,
                 model=model,
                 harness_id=harness_id,
@@ -1339,15 +1377,26 @@ class ResponsesHandler:
 
     @staticmethod
     def _remote_agent_files(session: ScopedSession, conv_id: UUID) -> AgentFiles | None:
-        """Where the pod's scratchpad works, as this server finds it: the
-        conversation's folder in its project on the shared mount.
+        """What the pod's scratchpad reads, as this server finds it: the
+        conversation's folder in its project on the shared mount, placed in
+        the pod by the same project path the turn's job carries
+        (_remote_workspace), the project the turn runs in, and the files
+        attached to the conversation, which the pod reads from that folder.
 
-        None on a lookup failure, so the turn's figure sources name no file
-        paths rather than the turn failing.
+        None on a lookup failure, so the turn's figure sources name no files
+        rather than the turn failing.
         """
+        from cowork.harnesses.anton_harness.agent_files import conversation_attachments
+
         try:
             conversation = ConversationService(session).get_conversation(conv_id)
-            return AgentFiles.in_cloud_pod(conversation.project.path, conv_id)
+            return AgentFiles.in_cloud_pod(
+                conversation.project.path,
+                conversation_id=conv_id,
+                workspace_rel_path=ResponsesHandler._remote_workspace(session, conv_id).get("workspace_rel_path"),
+                project_id=conversation.project_id,
+                attachments=conversation_attachments(session, conversation_id=conv_id),
+            )
         except Exception:
             logger.exception("[responses] failed to resolve the agent's files", extra=log_context(conversation_id=conv_id))
             return None
@@ -1661,6 +1710,10 @@ class ResponsesHandler:
         )
 
         def event_sink(event_type: str, data: dict) -> None:
+            if event_type == "response.turn_history":
+                # Already kept as this turn's tool rows (turn_rows), which
+                # are saved as rows, never as an event.
+                return
             # Same event log the in-process path records, so the client
             # rebuilds the thinking block + steps identically on reload.
             # at_ms is stamped at receipt (the pod sends no timestamps), so
@@ -1908,7 +1961,7 @@ class ResponsesHandler:
             # re-reading it when the reply arrives could map the count onto a
             # different list.
             seed = await run_db(partial(self._read_remote_turn_inputs, conv_id=conv_id), scope=scope)
-            yield TurnContext(question=question_text(original_content), files=seed.files)
+            yield TurnContext(question=input_text, files=seed.files, history=seed.history)
             if seed.artifacts is not None:
                 # The worker writes artifacts into the shared tree while this
                 # turn runs, so cowork-server does the same before/after diff
@@ -1963,12 +2016,16 @@ class ResponsesHandler:
                 elif kind == "turn_memory":
                     await save_memory(data.get("entries") or [])
                 elif kind == "turn_history":
+                    pod_rows = data.get("rows")
                     # Slice-assign, not extend: the pod emits one frame per
                     # turn, so a repeated frame must replace the rows rather
                     # than double them. Sanitized at the boundary — the pod
                     # is semi-trusted and these rows reach both the DB and
                     # every later turn's LLM context.
-                    turn_rows[:] = sanitize_turn_history_rows(data.get("rows"))
+                    turn_rows[:] = sanitize_turn_history_rows(pod_rows)
+                    # The formatter finds the answer's figures in every tool's
+                    # results, read before the replay caps trimmed them.
+                    yield TurnHistory(list(turn_rows), read=pod_rows if isinstance(pod_rows, list) else None)
                 elif kind == "turn_compaction":
                     await save_compaction(data, seed.seed_info)
                 elif kind == "turn_skill":
@@ -2700,10 +2757,13 @@ class ResponsesHandler:
         collected_text: list[str] = []
         collected_events: list[dict] = []
         turn_rows: list[dict] = []
+        # The answer's figure_sources event, which the response carries too.
+        figure_sources: FigureSources | None = None
         # Send time captured before the turn
         sent_at = datetime.now(timezone.utc)
 
         def event_sink(event_type: str, data: dict) -> None:
+            nonlocal figure_sources
             if event_type == "response.turn_history":
                 # Id-checked even though we produced these ourselves: an
                 # unreplayable id here is permanent for the conversation, and
@@ -2712,6 +2772,8 @@ class ResponsesHandler:
                 return
             collected_events.append(data)
             accumulate_answer_text(collected_text, event_type, data)
+            if event_type == "response.figure_sources":
+                figure_sources = FigureSources.model_validate(data)
 
         try:
             async for _ in self._get_harness().formatter(stream, model, event_sink):
@@ -2798,7 +2860,7 @@ class ResponsesHandler:
         return Response(
             status=ResponseStatus.completed,
             model=model,
-            output=[self._build_output(str(anchor_id), assistant_text)],
+            output=[self._build_output(str(anchor_id), assistant_text, figure_sources=figure_sources)],
         )
 
     def _build_harness_input(self, request: ResponsesRequest, *, session: ScopedSession) -> list[dict]:
@@ -2900,10 +2962,6 @@ class ResponsesHandler:
         }
 
     @staticmethod
-    def _prompt_text(harness_input: list[dict]) -> str:
-        return " ".join(b["text"] for b in harness_input if b.get("type") == "text")
-
-    @staticmethod
     def _extract_original_content(request: ResponsesRequest) -> str | list:
         if isinstance(request.input, str):
             return request.input
@@ -2917,11 +2975,12 @@ class ResponsesHandler:
         return ""
 
     @staticmethod
-    def _build_output(item_id: str, text: str) -> ResponseOutput:
+    def _build_output(item_id: str, text: str, *, figure_sources: FigureSources | None = None) -> ResponseOutput:
         return ResponseOutput(
             id=item_id,
             status=ResponseStatus.completed,
             content=[ResponseOutputContent(text=text)],
+            figure_sources=figure_sources,
         )
 
 

@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 from uuid import uuid4
 
+import pytest
 from anton.core.llm.provider import (
     StreamTextDelta,
     StreamToolResult,
@@ -12,7 +13,7 @@ from anton.core.llm.provider import (
     StreamToolUseStart,
 )
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
-from cowork.harnesses.anton_harness.stream_formatter import TurnContext, format_responses_stream
+from cowork.harnesses.anton_harness.stream_formatter import TurnContext, TurnHistory, format_responses_stream
 
 
 async def _events(*items):
@@ -75,9 +76,10 @@ class TestFigureSourcesEvent:
         assert types[-2:] == ["response.figure_sources", "response.completed"]
         payload = events[-2][1]
         assert payload["item_id"] == events[-1][1]["response"]["output"][0]["id"]
+        assert payload["project_id"] is None
         assert payload["steps"] == [{
             "tool_use_id": "toolu_read", "kind": "file", "label": "stock.csv",
-            "path": None, "url": None, "queries": [], "requests": [],
+            "path": None, "attachment_id": None, "url": None, "queries": [], "requests": [],
         }]
         by_text = {f["text"]: f for f in payload["figures"]}
         assert by_text["250"]["origin"] == "step"
@@ -99,7 +101,7 @@ class TestFigureSourcesEvent:
         events = await _run(
             *_read_stock_cell(),
             StreamTextDelta(text="Site S1 holds 250 units."),
-            files=AgentFiles.in_cloud_pod(tmp_path, conversation_id),
+            files=AgentFiles.in_cloud_pod(tmp_path, conversation_id=conversation_id, workspace_rel_path=None),
         )
 
         payload = next(data for event_type, data in events if event_type == "response.figure_sources")
@@ -217,3 +219,359 @@ class TestFigureSourcesSurviveReload:
         content = assistant["content"]
         assert [content[f["start"]:f["end"]] for f in saved[0]["figures"]] == ["250", "$30"]
         assert [step["tool_use_id"] for step in saved[0]["steps"]] == ["toolu_read"]
+
+
+def _tool_rows(tool_use_id: str, name: str, tool_input: dict, result) -> list[dict]:
+    """One tool call and its result as history rows hold them."""
+    return [
+        {"role": "assistant", "content": [{"type": "tool_use", "id": tool_use_id, "name": name, "input": tool_input}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": result}]},
+    ]
+
+
+def _tool_call(tool_use_id: str, name: str, tool_input: dict) -> list:
+    return [
+        StreamToolUseStart(id=tool_use_id, name=name),
+        StreamToolUseDelta(id=tool_use_id, json_delta=json.dumps(tool_input)),
+        StreamToolUseEnd(id=tool_use_id),
+    ]
+
+
+async def _run_turn(context: TurnContext, *items) -> list[tuple[str, dict]]:
+    return _parse_sse([
+        chunk async for chunk in format_responses_stream(_events(context, *items), model="test-model")
+    ])
+
+
+def _figures(events: list[tuple[str, dict]]) -> dict:
+    """The answer's figure_sources payload, or {} when the turn has none."""
+    return next((data for event_type, data in events if event_type == "response.figure_sources"), {})
+
+
+def _by_text(payload: dict) -> dict[str, dict]:
+    return {figure["text"]: figure for figure in payload["figures"]}
+
+
+class TestStepsFromTheTurnsToolRows:
+    """anton streams a result only for the scratchpad. Every other tool's
+    result reaches the formatter in the turn's tool rows."""
+
+    async def test_a_figure_a_web_page_or_a_file_read_holds_names_that_step(self):
+        rows = [
+            *_tool_rows("toolu_web", "web_fetch", {"url": "https://example.com/rates"}, "Overtime rate: $42 per hour"),
+            *_tool_rows(
+                "toolu_file", "read_text_file", {"path": "/workspace/stock.csv"},
+                [{"type": "text", "text": "part,site,qty\nP100,S1,250\n"}],
+            ),
+        ]
+
+        events = await _run_turn(
+            TurnContext(question="What does overtime cost, and what is at S1?"),
+            *_tool_call("toolu_web", "web_fetch", {"url": "https://example.com/rates"}),
+            *_tool_call("toolu_file", "read_text_file", {"path": "/workspace/stock.csv"}),
+            StreamTextDelta(text="Overtime costs $42 an hour and S1 holds 250 units."),
+            TurnHistory(rows),
+        )
+
+        payload = _figures(events)
+        figures = _by_text(payload)
+        assert figures["$42"]["sources"] == [{"tool_use_id": "toolu_web", "page": None}]
+        assert figures["250"]["sources"] == [{"tool_use_id": "toolu_file", "page": None}]
+        steps = {step["tool_use_id"]: step for step in payload["steps"]}
+        assert (steps["toolu_web"]["kind"], steps["toolu_web"]["url"]) == ("web", "https://example.com/rates")
+        assert (steps["toolu_file"]["kind"], steps["toolu_file"]["label"]) == ("file", "stock.csv")
+
+    async def test_a_streamed_scratchpad_result_stays_one_step(self):
+        cell_result = "[output]\npart,site,qty\nP100,S1,250\n"
+
+        events = await _run_turn(
+            TurnContext(question="What is at S1?"),
+            *_read_stock_cell(),
+            StreamTextDelta(text="S1 holds 250 units."),
+            TurnHistory(_tool_rows(
+                "toolu_read", "scratchpad", {"action": "exec", "code": "print(open('/workspace/stock.csv').read())"},
+                cell_result,
+            )),
+        )
+
+        assert [step["tool_use_id"] for step in _figures(events)["steps"]] == ["toolu_read"]
+
+    async def test_the_users_answer_to_the_agents_question_is_not_a_step(self):
+        events = await _run_turn(
+            TurnContext(question="What does overtime cost?"),
+            *_tool_call("toolu_ask", "ask_user", {"prompt": "Which rate?"}),
+            StreamTextDelta(text="At $42 an hour."),
+            TurnHistory(_tool_rows("toolu_ask", "ask_user", {"prompt": "Which rate?"}, "The user answered: $42")),
+        )
+
+        assert _figures(events)["steps"] == []
+
+    @pytest.mark.parametrize(("name", "tool_input", "result"), [
+        (
+            "recall_history", {"query": "overtime rate"},
+            "--- turn 2 ---\n[user] What does overtime cost?\n[assistant] Overtime typically costs about $30 an hour.",
+        ),
+        (
+            "open_artifact", {"slug": "overtime-plan"},
+            json.dumps({
+                "path": "/p/.anton/artifacts/overtime-plan", "files": ["report.md"],
+                "primary_content": "# Plan\nOvertime at $30 an hour for 12 people.",
+            }),
+        ),
+    ])
+    async def test_the_agents_own_earlier_writing_is_not_a_step(self, name: str, tool_input: dict, result: str):
+        events = await _run_turn(
+            TurnContext(question="What did we say overtime costs?"),
+            *_tool_call("toolu_own", name, tool_input),
+            StreamTextDelta(text="Overtime costs $30 an hour."),
+            TurnHistory(_tool_rows("toolu_own", name, tool_input, result)),
+        )
+
+        payload = _figures(events)
+        assert _by_text(payload)["$30"]["origin"] == "none"
+        assert payload["steps"] == []
+
+    async def test_a_cell_only_the_rows_carry_is_read_by_what_it_printed(self):
+        tool_input = {"action": "exec", "name": "main", "code": "print(open('/workspace/stock.csv').read())"}
+        result = "[output]\npart,site,qty\nP100,S1,250\n\n[logs]\nHTTP Request: GET /stock 200 OK"
+
+        events = await _run_turn(
+            TurnContext(question="What is at S1?"),
+            StreamTextDelta(text="S1 holds 250 units; the API answered 200."),
+            TurnHistory(_tool_rows("toolu_rows", "scratchpad", tool_input, result)),
+        )
+
+        figures = _by_text(_figures(events))
+        assert figures["250"]["sources"] == [{"tool_use_id": "toolu_rows", "page": None}]
+        assert figures["200"]["origin"] == "none"
+
+
+def _earlier_cell(tool_use_id: str = "toolu_earlier") -> list[dict]:
+    """An earlier turn's cell as replayed history holds it: anton hands the
+    model each part of the result under a label."""
+    tool_input = {
+        "action": "exec", "name": "main", "code": "print(open('/workspace/stock.csv').read())",
+        "one_line_description": "Read stock.csv",
+    }
+    result = "[output]\npart,site,qty\nP100,S1,250\nP100,S2,90\n\n[logs]\nHTTP Request: GET /stock 200 OK"
+    return [
+        {"role": "user", "content": "[2026-10-01 09:00] What is at S1 and S2?"},
+        *_tool_rows(tool_use_id, "scratchpad", tool_input, result),
+        {"role": "assistant", "content": "S1 holds 250 units and S2 holds 90."},
+    ]
+
+
+class TestStepsFromEarlierTurns:
+    async def test_a_figure_an_earlier_turn_printed_has_no_source_when_no_step_of_this_turn_holds_it(self):
+        """Turn 1 printed a stock table that happens to hold 30, 360 and 12.
+        Turn 2 runs no step and works out an overtime cost."""
+        quantities = [250, 90, 30, 410, 75, 12, 360, 88, 140, 55, 64, 300, 18, 220, 95, 47, 130, 66, 210, 150]
+        table = "part,site,qty\n" + "\n".join(f"P{100 + i},S{1 + i % 3},{q}" for i, q in enumerate(quantities))
+        tool_input = {
+            "action": "exec", "name": "main", "code": "print(open('stock.csv').read())",
+            "one_line_description": "Read stock.csv",
+        }
+        history = [
+            {"role": "user", "content": "[2026-10-01 09:00] What is in stock?"},
+            *_tool_rows("toolu_t1", "scratchpad", tool_input, "[output]\n" + table),
+            {"role": "assistant", "content": "Here is the stock by part."},
+        ]
+
+        events = await _run_turn(
+            TurnContext(question="What would 12 hours of overtime cost?", history=history),
+            StreamTextDelta(text="Overtime typically costs $30 an hour, so 12 hours cost $360."),
+        )
+
+        payload = _figures(events)
+        assert [(f["text"], f["origin"], f["sources"]) for f in payload["figures"]] == [
+            ("$30", "none", []), ("12", "question", []), ("$360", "none", []),
+        ]
+        assert payload["steps"] == []
+
+    async def test_a_call_anton_discarded_in_an_earlier_turn_binds_no_names(self):
+        spell = {"action": "exec", "name": "main", "code": 'base_sql = "SELECT qty FROM stock"'}
+        history = _tool_rows(
+            "toolu_cut", "scratchpad", spell, "[error] exec failed — Discarded: the round it belonged to was cut off",
+        )
+        code = "print(query_minds_data(base_sql))"
+        cell = {"code": code, "stdout": "250\n", "stderr": "", "error": None, "description": ""}
+
+        events = await _run_turn(
+            TurnContext(question="How many?", history=history),
+            StreamToolUseStart(id="toolu_q", name="scratchpad"),
+            StreamToolUseDelta(id="toolu_q", json_delta=json.dumps({"action": "exec", "name": "main", "code": code})),
+            StreamToolUseEnd(id="toolu_q"),
+            StreamToolResult(name="scratchpad", content=json.dumps(cell), action="exec", id="toolu_q"),
+            StreamTextDelta(text="S1 holds 250 units."),
+        )
+
+        [step] = _figures(events)["steps"]
+        assert (step["tool_use_id"], step["queries"]) == ("toolu_q", [])
+
+    async def test_a_figure_this_turn_and_an_earlier_turn_printed_names_only_this_turns_step(self):
+        events = await _run_turn(
+            TurnContext(question="Check S1 again.", history=_earlier_cell()),
+            *_read_stock_cell(),
+            StreamTextDelta(text="S1 still holds 250 units."),
+        )
+
+        payload = _figures(events)
+        assert _by_text(payload)["250"]["sources"] == [{"tool_use_id": "toolu_read", "page": None}]
+        assert [step["tool_use_id"] for step in payload["steps"]] == ["toolu_read"]
+
+    async def test_a_name_an_earlier_turns_cell_bound_reaches_this_turns_cell(self):
+        tool_input = {"action": "exec", "name": "main", "code": "df = pd.read_csv('stock.csv')"}
+        history = _tool_rows("toolu_load", "scratchpad", tool_input, "[output]\n")
+        code = "print(df.qty.sum())"
+        cell = {"code": code, "stdout": "340\n", "stderr": "", "error": None, "description": ""}
+
+        events = await _run_turn(
+            TurnContext(question="And in all?", history=history),
+            StreamToolUseStart(id="toolu_sum", name="scratchpad"),
+            StreamToolUseDelta(id="toolu_sum", json_delta=json.dumps({"action": "exec", "name": "main", "code": code})),
+            StreamToolUseEnd(id="toolu_sum"),
+            StreamToolResult(name="scratchpad", content=json.dumps(cell), action="exec", id="toolu_sum"),
+            StreamTextDelta(text="340 units in all."),
+        )
+
+        payload = _figures(events)
+        assert _by_text(payload)["340"]["sources"] == [
+            {"tool_use_id": "toolu_sum", "page": None}, {"tool_use_id": "toolu_load", "page": None},
+        ]
+        assert [(step["tool_use_id"], step["kind"], step["label"]) for step in payload["steps"]] == [
+            ("toolu_load", "file", "stock.csv"), ("toolu_sum", "step", ""),
+        ]
+
+
+class TestQuestionText:
+    async def test_a_value_the_user_typed_answering_the_agent_counts_as_the_question(self):
+        from anton.core.interaction.elicit import AskAnswer
+        from anton.core.llm.provider import StreamAskUserAnswered
+
+        events = await _run_turn(
+            TurnContext(question="What does overtime cost?"),
+            StreamAskUserAnswered(id="q1", answer=AskAnswer(status="answered", values=("$50",), text="$42")),
+            StreamTextDelta(text="At $42 an hour rather than $50."),
+        )
+
+        figures = _by_text(_figures(events))
+        assert figures["$42"]["origin"] == "question"
+        # A picked option is the agent's own wording.
+        assert figures["$50"]["origin"] == "none"
+
+    async def test_context_the_client_appends_for_the_agent_is_not_the_question(self):
+        sent = (
+            "How many units ship over 2 weeks?\n\n"
+            "[Notion pages added for this message — Anton-only context, do not echo back]\n"
+            "The user just added the following Notion page(s).\n"
+            "--- Notion page: Plan, https://www.notion.so/plan ---\n"
+            "Overtime is $30 an hour.\n"
+            "--- end of page ---"
+        )
+
+        events = await _run_turn(TurnContext(question=sent), StreamTextDelta(text="Over 2 weeks, at $30 an hour."))
+
+        figures = _by_text(_figures(events))
+        assert figures["2"]["origin"] == "question"
+        assert figures["$30"]["origin"] == "none"
+
+
+class TestAnswersWithoutSources:
+    async def test_a_cell_whose_arguments_the_pod_cut_still_reads_its_code(self):
+        """The pod cuts a call's arguments at 65,536 characters; the cell's
+        result still carries its code, so a figure the code states is not
+        sourced to the cell that only printed it back."""
+        code = "# " + "x" * 70_000 + "\nprint(250)"
+        cell = {"code": code, "stdout": "250\n", "stderr": "", "error": None, "description": ""}
+        args = json.dumps({"action": "exec", "name": "main", "code": code})[:65_536]
+
+        events = await _run_turn(
+            TurnContext(question="How many?"),
+            StreamToolUseStart(id="toolu_cut", name="scratchpad"),
+            StreamToolUseDelta(id="toolu_cut", json_delta=args),
+            StreamToolUseEnd(id="toolu_cut"),
+            StreamToolResult(name="scratchpad", content=json.dumps(cell), action="exec", id="toolu_cut"),
+            StreamTextDelta(text="There are 250."),
+        )
+
+        assert _by_text(_figures(events))["250"]["origin"] == "none"
+
+    async def test_antons_failure_reply_gets_no_sources(self):
+        events = await _run_turn(
+            TurnContext(question="How many?"),
+            StreamTextDelta(text="An unexpected error occurred: Server returned 413 Payload Too Large"),
+        )
+
+        types = [event_type for event_type, _ in events]
+        assert "response.figure_sources" not in types
+        assert types[-1] == "response.completed"
+
+
+class TestTheInProcessHandlerSavesTheSources:
+    """ResponsesHandler._produce runs a turn through the real formatter and
+    saves its events with the answer, whatever the UI's
+    show_figure_sources setting."""
+
+    @staticmethod
+    async def _produce(items: list) -> tuple[list[str], list[dict]]:
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock, patch
+
+        from cowork.handlers.responses import ResponsesHandler
+
+        async def stream_response(**_kwargs):
+            for item in items:
+                yield item
+
+        harness = SimpleNamespace(
+            id="anton", formatter=staticmethod(format_responses_stream), stream_response=stream_response,
+        )
+        handler = object.__new__(ResponsesHandler)
+        handler.principal = None
+        handler.harness = harness
+        frames: list[str] = []
+
+        class Buffer:
+            async def append(self, _kind, data):
+                frames.append(data["sse"])
+
+            async def close(self, _status):
+                pass
+
+        with (
+            patch("cowork.handlers.responses.ConversationService") as conversations,
+            patch("cowork.handlers.responses.get_harness", return_value=harness),
+        ):
+            conversations.return_value.get_conversation.return_value = MagicMock()
+            conversations.return_value.save_user_message.return_value = SimpleNamespace(id=uuid4())
+            conversations.return_value.save_assistant_turn.return_value = SimpleNamespace(id=uuid4())
+            await handler._produce(
+                conv_id=uuid4(), harness_input=[{"type": "text", "text": "How many at S1?"}],
+                original_content="How many at S1?", model="anton", disabled=None,
+                harness_name="anton", harness_id="anton", buffer=Buffer(),
+            )
+            [saved_call] = conversations.return_value.save_assistant_turn.call_args_list
+        return frames, saved_call.args[2]
+
+    async def test_the_saved_answer_carries_its_figure_sources(self):
+        frames, saved = await self._produce([
+            TurnContext(question="How many at S1?"), *_read_stock_cell(), StreamTextDelta(text="S1 holds 250 units."),
+        ])
+
+        [figure_sources] = [event for event in saved if event.get("type") == "response.figure_sources"]
+        assert [(f["text"], f["sources"]) for f in figure_sources["figures"]] == [
+            ("250", [{"tool_use_id": "toolu_read", "page": None}]),
+        ]
+        assert any(frame.startswith("event: response.figure_sources") for frame in frames)
+
+    async def test_the_answer_carries_them_with_the_setting_off(self):
+        from cowork.common.settings.user_settings import UserSettings, use_turn_settings
+        from cowork.db.scoped import LOCAL_SCOPE
+
+        with use_turn_settings(LOCAL_SCOPE, UserSettings(show_figure_sources=False)):
+            frames, saved = await self._produce([
+                TurnContext(question="How many at S1?"), *_read_stock_cell(), StreamTextDelta(text="S1 holds 250 units."),
+            ])
+
+        assert [event.get("type") for event in saved].count("response.figure_sources") == 1
+        assert any(frame.startswith("event: response.figure_sources") for frame in frames)

@@ -20,9 +20,8 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import current_settings_scope
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.units import run_db, run_to_completion, unit_session
-from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
-from cowork.harnesses.anton_harness.agent_files import AgentFiles
-from cowork.harnesses.anton_harness.figure_sources import question_text
+from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, prompt_text, register
+from cowork.harnesses.anton_harness.agent_files import AgentFiles, read_conversation_attachments
 from cowork.harnesses.anton_harness.stream_formatter import (
     ArtifactCreated,
     SkillCreated,
@@ -734,7 +733,14 @@ class AntonHarness:
             if "trace_metadata" in _turn_params:
                 turn_kwargs["trace_metadata"] = trace_metadata
             yield TurnContext(
-                question=question_text(list(input)), files=AgentFiles.on_this_server(project_path),
+                question=prompt_text(input),
+                files=AgentFiles.on_this_server(
+                    project_path,
+                    project_id=conv_project_id,
+                    attachments=await read_conversation_attachments(conversation_id=conv_id, scope=_units_scope()),
+                ),
+                # A copy: the session appends this turn to its own list.
+                history=list(getattr(session, "history", ())),
             )
             async for event in session.turn_stream(self._to_anton_input(input), **turn_kwargs):
                 # Under context pressure anton summarizes history mid-turn,
