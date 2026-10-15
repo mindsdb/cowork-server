@@ -793,6 +793,14 @@ class UserSettings(Settings):
             "stopping to ask. Turn off for a more cautious, ask-first agent."
         ),
     )
+    first_take_enabled: bool = Field(
+        default=True,
+        title="Instant first take",
+        description=(
+            "While the agent works, show a quick reply on the fast model saying "
+            "what it is about to do (ENG-3406). Replaced as soon as the agent speaks."
+        ),
+    )
     # ── Advanced agent budgets ──
     # Overlaid onto AntonSettings per conversation (anton_harness.harness);
     # anton's own CLI defaults (25/3) are lower — Cowork deliberately runs
