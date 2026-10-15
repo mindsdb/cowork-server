@@ -206,14 +206,3 @@ def list_schedule_events(schedule_id: UUID, scoped: ScopedSessionDep, limit: int
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     return {"events": [ScheduleEventResponse.serialize(e) for e in service.events(schedule_id, limit=limit)]}
-
-
-@router.get("/{schedule_id}/events")
-def list_schedule_events(schedule_id: UUID, scoped: ScopedSessionDep, limit: int = 100):
-    """The schedule's lifecycle: created, edited, paused, resumed, auto-paused."""
-    service = ScheduleService(scoped)
-    try:
-        service.get_schedule(schedule_id)
-    except ValueError as e:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
-    return {"events": [ScheduleEventResponse.serialize(e) for e in service.events(schedule_id, limit=limit)]}
