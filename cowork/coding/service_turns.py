@@ -24,6 +24,7 @@ from cowork.coding.control_errors import StateConflict
 from cowork.coding.control_models import TERMINAL_RUN_STATUSES, RunStatus, RuntimeCommand, RuntimeEvent, TaskRun
 from cowork.coding.engines.base import EngineCredentials, EngineInputReference, EngineSession
 from cowork.coding.reasoning import ModelLevels
+from cowork.coding.project_workspaces import roots_overlap
 from cowork.coding.session_factory import PendingLocalSession
 from cowork.coding.turns import RunningTurn, fail_turn, mark_running
 from cowork.coding.workspace import WorkspaceError
@@ -243,13 +244,13 @@ class CodingTurnOperations:
         return self.remote.acknowledge_command(run_id, command_id, computer_id, lease_id, epoch, result, error)
 
     def _in_place_conflict(self, session_id: str, roots: set[Path]) -> bool:
-        """Whether another active in-place task works in any of ``roots``.
+        """Whether another active in-place task works in, inside or around any of ``roots``.
 
         Two agents editing one checkout would overwrite each other, so only
-        one in-place task per repository runs at a time. Call with
-        ``self._lock`` held so two starts cannot both pass.
+        one in-place task per folder runs at a time, and a folder overlaps
+        any folder it contains. Call with ``self._lock`` held so two starts
+        cannot both pass.
         """
-        targets = {root.resolve() for root in roots}
         for other_id in self._running:
             if other_id == session_id:
                 continue
@@ -260,7 +261,7 @@ class CodingTurnOperations:
             if other.workspace_mode != WorkspaceMode.in_place:
                 continue
             try:
-                if self._in_place_roots(other) & targets:
+                if any(roots_overlap(mine, theirs) for mine in roots for theirs in self._in_place_roots(other)):
                     return True
             except (KeyError, WorkspaceError):
                 continue

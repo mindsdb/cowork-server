@@ -58,8 +58,8 @@ class ProjectTaskOperations:
     def diff(self, session_id: str):
         session = self.get_session(session_id)
         if session.workspaces:
-            return self.project_workspaces.diff(session.workspaces)
-        return self.workspaces.diff(session.workspace_path, session.base_revision)
+            return self.project_workspaces.diff(session.workspaces, session.id)
+        return self.workspaces.diff(session.workspace_path, session.base_revision, baseline_key=session.id)
 
     def review_file_action(self, session_id: str, folder_id: str | None, path: str, action: str):
         with self.maintenance_session(
@@ -78,8 +78,8 @@ class ProjectTaskOperations:
                     raise WorkspaceError("Review actions require a Git task workspace")
                 self.workspaces.review_file_action(session.workspace_path, path, action)
             if session.workspaces:
-                return self.project_workspaces.diff(session.workspaces)
-            return self.workspaces.diff(session.workspace_path, session.base_revision)
+                return self.project_workspaces.diff(session.workspaces, session.id)
+            return self.workspaces.diff(session.workspace_path, session.base_revision, baseline_key=session.id)
 
     def create_branch(self, session_id: str, name: str):
         with self.maintenance_session(

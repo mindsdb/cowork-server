@@ -198,8 +198,10 @@ def test_invalid_attachments_are_rejected_before_the_task_is_created(tmp_path: P
     ],
 )
 def test_a_folder_preparation_would_refuse_is_rejected_before_the_task_is_created(
-    folder: str, allow_folder_copy: bool, message: str, tmp_path: Path
+    folder: str, allow_folder_copy: bool, message: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # Where in place is not offered (Windows today), a folder without Git history is copied.
+    monkeypatch.setattr("cowork.coding.workspace_mode._IN_PLACE_PLATFORMS", frozenset())
     (tmp_path / "plain").mkdir()
     service = service_with(tmp_path, FakeEngine())
     with pytest.raises(WorkspaceError, match=message):

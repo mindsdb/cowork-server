@@ -61,7 +61,7 @@ from cowork.coding.service_delivery import CodingDeliveryOperations
 from cowork.coding.service_terminals import CodingTerminalOperations
 from cowork.coding.service_turns import CodingTurnOperations
 from cowork.coding.service_workspace_files import CodingWorkspaceFilesOperations
-from cowork.coding.session_factory import CodingSessionFactory
+from cowork.coding.session_factory import CodingSessionFactory, can_fork_workspace
 from cowork.coding.session_lifecycle import SessionLifecycleOperations
 from cowork.coding.shells import shell_inventory
 from cowork.coding.skill_library import SkillLibraryService
@@ -290,8 +290,10 @@ class CodingService(
     def capabilities(self) -> list[EngineCapabilities]:
         return self.registry.capabilities()
 
-    def workspace_mode_options(self, project_id: str | None, computer_id: str | None) -> WorkspaceModeOptions:
-        """The workspace modes a new task on this project and computer could use.
+    def workspace_mode_options(
+        self, project_id: str | None, computer_id: str | None, path: str | None = None,
+    ) -> WorkspaceModeOptions:
+        """The workspace modes a new task on this project, folder and computer could use.
 
         A task with no computer chosen is shown as running here, matching the
         composer's default target.
@@ -301,6 +303,7 @@ class CodingService(
             project.default_workspace_mode if project else None,
             runs_locally=computer_id in {None, self.control.local_computer.id},
             org_mode=_org_mode(),
+            git_backed=project is not None or not path or self.workspaces.is_git_backed(path),
         )
 
     def inspect_workspace(self, path: str) -> WorkspaceInspection:
@@ -364,7 +367,8 @@ class CodingService(
             "computer_status": computer.status.value,
             "computer_is_local": is_local,
             "task_capabilities": TaskCapabilities(**{
-                capability.value: is_local or capability in available
+                capability.value: (is_local or capability in available)
+                and (capability != TaskCapability.fork or can_fork_workspace(session))
                 for capability in TaskCapability
             }),
             "runtime_epoch": run.epoch,
@@ -430,6 +434,8 @@ class CodingService(
 
     def fork_session(self, session_id: str, credentials: EngineCredentials) -> CodingSession:
         session = self._prepared_session(session_id)
+        if not can_fork_workspace(session):
+            raise StateConflict("A task working in a folder without Git cannot be forked; start a new task instead")
         self._require_task_capability(session, TaskCapability.fork)
         return self.get_session(self.lifecycle.fork_session(session_id, credentials).id)
 

@@ -15,7 +15,7 @@ from cowork.coding.contracts import (
     utc_now,
 )
 from cowork.coding.control_errors import StateConflict
-from cowork.coding.session_factory import IN_PLACE_PROJECT_INSTRUCTION, ISOLATED_PROJECT_INSTRUCTION
+from cowork.coding.session_factory import IN_PLACE_PROJECT_INSTRUCTION, ISOLATED_PROJECT_INSTRUCTION, can_fork_workspace
 from cowork.coding.engines.base import EngineCredentials
 from cowork.coding.control_models import RunStatus
 from cowork.coding.control_service import ControlPlaneService
@@ -116,6 +116,8 @@ class SessionLifecycleOperations:
                 return self._fork_reserved(parent, credentials)
 
     def _fork_reserved(self, parent: CodingSession, credentials: EngineCredentials) -> CodingSession:
+        if not can_fork_workspace(parent):
+            raise StateConflict("A task working in a folder without Git cannot be forked; start a new task instead")
         new_id = str(uuid.uuid4())
         project = self.execution_project(parent)
         parent_task = self.control.store.get_task(parent.task_id) if parent.task_id else None

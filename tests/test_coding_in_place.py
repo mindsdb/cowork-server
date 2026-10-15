@@ -111,20 +111,6 @@ def test_a_subfolder_runs_in_its_repository(tmp_path: Path) -> None:
     assert Path(session.workspace_path) == repo.resolve()
 
 
-@pytest.mark.parametrize("kind", ["plain", "empty-repo"])
-def test_a_folder_review_cannot_compare_against_is_refused_before_the_task_exists(tmp_path: Path, kind: str) -> None:
-    folder = tmp_path / kind
-    folder.mkdir()
-    if kind == "empty-repo":
-        git(folder, "init")
-    service = service_with(tmp_path, FakeEngine())
-
-    with pytest.raises(WorkspaceError, match="choose Worktree"):
-        in_place(service, folder)
-
-    assert service.list_sessions().items == []
-
-
 def test_existing_changes_are_called_out_when_the_task_starts(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     (repo / "README.md").write_text("mine\n", encoding="utf-8")
@@ -319,16 +305,20 @@ def test_in_place_project_tasks_are_refused_where_they_cannot_work(tmp_path: Pat
     with pytest.raises(ValueError, match="Branch choices"):
         start_project_task(service, project.id, repository_setup=TaskRepositorySetup(branch="feature/x"))
 
-    plain = tmp_path / "notes"
-    plain.mkdir()
-    mixed = service.projects.create(ProjectCreateRequest(
-        name="Mixed",
-        folders=[ProjectFolder(id="notes", name="Notes", path=str(plain))],
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    make_repo(outer / "inner")
+    nested = service.projects.create(ProjectCreateRequest(
+        name="Nested",
+        folders=[
+            ProjectFolder(id="outer", name="Outer", path=str(outer)),
+            ProjectFolder(id="inner", name="Inner", path=str(outer / "inner")),
+        ],
         default_engine_id="fake",
         default_model="fake-model",
     ))
-    with pytest.raises(WorkspaceError, match="Notes: Working in the original folder needs a Git repository"):
-        start_project_task(service, mixed.id)
+    with pytest.raises(WorkspaceError, match="Two project folders overlap"):
+        start_project_task(service, nested.id)
 
     remote = service.projects.create(ProjectCreateRequest(
         name="Remote",

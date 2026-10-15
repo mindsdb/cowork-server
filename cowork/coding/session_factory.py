@@ -108,6 +108,18 @@ def _adopt_preparation(current: CodingSession, prepared: CodingSession) -> None:
     current.additional_dirs = list(dict.fromkeys([*prepared.additional_dirs, *current.additional_dirs]))
 
 
+def can_fork_workspace(session: CodingSession) -> bool:
+    """A fork copies a task's changes into a worktree, which needs Git under every folder.
+
+    An in-place task on a folder without Git has only a review baseline, and
+    a fork sharing its folder would collide with it.
+    """
+    if session.workspace_mode != WorkspaceMode.in_place:
+        return True
+    workspaces = session.workspaces or [session]
+    return all(item.base_revision for item in workspaces)
+
+
 def task_title(prompt: str) -> str:
     """Return a compact, readable title without cutting off abruptly."""
     compact = " ".join(prompt.strip().split())
@@ -256,6 +268,9 @@ class CodingSessionFactory:
                 project.default_workspace_mode if project else None,
                 runs_locally=runs_locally,
                 org_mode=_org_mode(),
+                # A folder with no Git runs in place; project folders keep
+                # the choice, and a plain one among them is still copied.
+                git_backed=project is not None or self.workspaces.is_git_backed(request.path or ""),
             )
             if workspace_mode == WorkspaceMode.in_place and request.repository_setup is not None:
                 raise ValueError("Branch choices start an isolated worktree; choose Worktree")
@@ -492,7 +507,7 @@ class CodingSessionFactory:
         requested_dirs = validate_directories(request.additional_dirs)
         if project is None:
             prepared = (
-                self.workspaces.prepare_in_place(request.path or "")
+                self.workspaces.prepare_in_place(request.path or "", session_id)
                 if workspace_mode == WorkspaceMode.in_place
                 else self.workspaces.prepare(session_id, request.path or "", request.allow_folder_copy)
             )
@@ -735,6 +750,11 @@ class CodingSessionFactory:
             text = "Working in the original folder; the agent's changes are made there directly." + (
                 " It already had uncommitted changes, which appear in this task's review alongside the agent's."
                 if session.source_dirty
+                else ""
+            ) + (
+                " There is no Git history here, so review compares against a snapshot taken now;"
+                " large and binary files show as changed without a line diff."
+                if not can_fork_workspace(session)
                 else ""
             )
         elif count > 1:
