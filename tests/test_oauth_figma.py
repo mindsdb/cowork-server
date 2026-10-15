@@ -97,6 +97,16 @@ def test_spec_requests_only_read_scopes():
     assert all(scope.endswith(":read") for scope in scopes)
 
 
+def test_usage_notes_reach_the_agent_with_the_oauth_header_and_current_endpoints():
+    from cowork.services.connectors.specs._registry import registry
+
+    notes = registry.usage_notes_for(["figma"])["figma"]
+
+    assert "Authorization: Bearer" in notes
+    assert "/v2/teams/{team_id}/folders" in notes
+    assert "/v2/folders/{folder_id}/files" in notes
+
+
 class _FakeVault:
     def __init__(self, path):
         self._path = path
