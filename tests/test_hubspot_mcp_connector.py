@@ -37,10 +37,10 @@ def _vault(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "cowork.api.v1.endpoints.connectors.connections.ConnectorSettings", fake_settings,
     )
-    # ConnectionsService (used by patch_access_mode's local-mode branch) finds
-    # its vault through persist.own_vault_root, which reads persist's own
-    # ConnectorSettings import, separate from the one above — both must point
-    # at the same test vault.
+    # Every save and ConnectionsService (patch_access_mode's local-mode
+    # branch) find the vault through persist.own_vault_root, which reads
+    # persist's own ConnectorSettings import; the route's own import above is
+    # what a delete's revoke reads. Both must point at the same test vault.
     monkeypatch.setattr(
         "cowork.services.connectors.persist.ConnectorSettings", fake_settings,
     )

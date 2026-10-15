@@ -202,7 +202,7 @@ def test_a_create_stamps_the_person_and_never_the_requests_value(trusted):
     assert _stored(ALICE)[CREATED_BY_FIELD] == SUB_A
 
 
-def test_every_update_keeps_the_stored_creator(trusted, monkeypatch):
+def test_every_update_keeps_the_stored_creator(trusted):
     persist_connection("postgres", None, "erp", dict(ERP), scope=ALICE)
     service = ConnectionsService(ALICE)
 
@@ -438,7 +438,7 @@ def test_a_malformed_registry_shares_nothing_and_says_so(sharing, caplog, owned_
     assert errors and str(sharing.shared_connections_file) in errors[0]
 
 
-def test_the_registry_is_read_only_where_connections_are_personal(sharing, monkeypatch):
+def test_only_a_scope_with_personal_connections_reads_the_registry(sharing):
     """Where connections are shared the base vault already holds everyone's:
     a person's scope that keeps connections shared reads no registry."""
     bob = _person(partition=PARTITION_B, sub=SUB_B, resources=SHARED_RESOURCES)
