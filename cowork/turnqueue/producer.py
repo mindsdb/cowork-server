@@ -113,32 +113,22 @@ def _trace_block(*, user_id: str | None = None, org_id: str | None = None) -> di
         return {}
 
 
-#: The per-task limits a web turn runs under, by their UserSettings names. The
-#: pod applies them in place of anton's own defaults, as the desktop harness
-#: overlays them onto anton's settings for an in-process turn.
-_TURN_LIMIT_SETTINGS = ("max_tool_rounds", "max_continuations", "max_turn_tokens")
-
-
 def _limits_block(scope: TenantScope) -> dict[str, int] | None:
-    """The tenant's resolved per-task limits, for the job's params.
+    """The per-task limits this tenant's turns run under, for the job's params.
 
-    None when they can't be read: the pod then keeps anton's own defaults, which
-    is what every web turn ran under before this block existed. Not a reason to
-    fail the turn.
+    The same values the desktop harness overlays for an in-process turn:
+    the deployment defaults while the tenant's limits switch is off, its own
+    values once it's on. None when they can't be read: the pod then keeps
+    anton's own defaults, which is what every web turn ran under before this
+    block existed. Not a reason to fail the turn.
     """
-    from cowork.common.settings.user_settings import get_user_settings
+    from cowork.common.settings.user_settings import effective_turn_limits, get_user_settings
 
     try:
-        user = get_user_settings(scope)
+        return effective_turn_limits(get_user_settings(scope))._asdict()
     except Exception:
         logger.warning("could not read the turn's limits; the pod keeps its defaults", exc_info=True)
         return None
-    block = {}
-    for name in _TURN_LIMIT_SETTINGS:
-        value = getattr(user, name, None)
-        if isinstance(value, int) and not isinstance(value, bool):
-            block[name] = value
-    return block or None
 
 
 def _request_wire_size(params: dict) -> int:
