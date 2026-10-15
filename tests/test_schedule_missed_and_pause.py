@@ -79,7 +79,7 @@ def _utc(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
-def _poll(engine, now: datetime | None = None, *, monkeypatch=None) -> list[UUID]:
+def _poll(engine) -> list[UUID]:
     import cowork.scheduler as scheduler
 
     with Session(engine) as session:
@@ -331,8 +331,6 @@ def test_giving_a_missed_one_off_a_new_time_schedules_it_again(engine):
 
 
 def test_a_one_off_that_ran_is_done_not_paused(engine):
-    import cowork.scheduler as scheduler
-
     now = datetime.now(timezone.utc)
     schedule_id = _schedule(engine, cadence="once", next_run_at=now - timedelta(minutes=1))
     [claimed] = _poll(engine)
