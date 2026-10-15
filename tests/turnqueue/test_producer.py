@@ -8,6 +8,8 @@ import pytest
 from cowork.handlers import turn_errors as te
 from cowork.turnqueue import producer as prod
 
+from _fakes import QueuedPipeline
+
 
 @pytest.fixture(autouse=True)
 def _stub_llm_mint(monkeypatch):
@@ -39,6 +41,8 @@ class FakeRedis:
     async def hset(self, key, mapping=None): return 1
     async def expire(self, key, seconds): return 1
     async def delete(self, *keys): return len(keys)
+    async def xrevrange(self, key, count=None): return []
+    def pipeline(self, transaction=True): return QueuedPipeline(self)
 
     async def xadd(self, stream, fields):
         self.added.append((stream, fields))
@@ -444,6 +448,41 @@ async def test_stream_remote_replies_omits_oauth_block_when_no_connections(monke
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
     assert "oauth" not in params
+    assert "connectors" not in params
+
+
+@pytest.mark.asyncio
+async def test_stream_remote_replies_attaches_connector_usage_notes(monkeypatch):
+    from cowork.services.connectors.specs._registry import registry
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    async def fake_list_active_connections(**kw):
+        return [{"engine": "google_drive", "name": "work"}, {"engine": "gmail", "name": "me"}]
+
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+    monkeypatch.setattr(
+        registry, "usage_notes_for",
+        lambda engines: {e: f"NOTE-{e}" for e in engines if e == "google_drive"},
+    )
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
+    ))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params["connectors"] == {"google_drive": {"usage_notes": "NOTE-google_drive"}}
+
+
+def test_connectors_block_is_none_when_nothing_has_notes(monkeypatch):
+    from cowork.services.connectors.specs._registry import registry
+
+    assert prod._connectors_block(None) is None
+    assert prod._connectors_block({"connections": []}) is None
+    monkeypatch.setattr(registry, "usage_notes_for", lambda engines: {})
+    assert prod._connectors_block({"connections": [{"engine": "gmail", "name": "me"}]}) is None
 
 
 @pytest.mark.asyncio
@@ -868,6 +907,12 @@ class SilentRedis:
 
     async def delete(self, *keys):
         return len(keys)
+
+    async def xrevrange(self, key, count=None):
+        return []
+
+    def pipeline(self, transaction=True):
+        return QueuedPipeline(self)
 
     async def xadd(self, stream, fields):
         self.added.append((stream, fields))
@@ -1462,3 +1507,152 @@ async def test_tool_messages_defaults_to_false(monkeypatch):
     await _drain(prod.stream_remote_replies(conversation_id="conv-1", org_id=None, user_id=None,
                                             input_text="hi", model="m"))
     assert json.loads(fake.added[0][1]["payload"])["params"]["tool_messages"] is False
+
+
+_REPLY_STREAM = "scratchpad:reply:conv-1"
+_AUTHORIZED = ("progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"})
+
+
+def _foreign_reply(kind):
+    """A reply to an earlier turn of the same conversation."""
+    return {"payload": json.dumps({"correlation_id": "an-earlier-turn", "kind": kind, "data": {}})}
+
+
+async def _controller_redis(monkeypatch, *, earlier, answer, before_each_read=None):
+    """A real stream store holding `earlier` replies, whose job XADD has the
+    controller answer this turn ("r") with `answer`. Records each XREAD's
+    start ids, with the block cut short so a quiet read returns quickly."""
+    import fakeredis.aioredis
+
+    client = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    for fields in earlier:
+        await client.xadd(_REPLY_STREAM, fields)
+    xadd, xread = client.xadd, client.xread
+
+    async def answering_xadd(name, fields, *args, **kwargs):
+        entry_id = await xadd(name, fields, *args, **kwargs)
+        if name == "scratchpad:requests:conv-1":
+            for kind, data in answer:
+                await xadd(_REPLY_STREAM, _reply(kind, data))
+        return entry_id
+
+    reads = []
+
+    async def recorded_xread(streams, count=None, block=None):
+        reads.append(dict(streams))
+        if before_each_read is not None:
+            await before_each_read(xadd)
+        return await xread(streams, count=count, block=20)
+
+    monkeypatch.setattr(client, "xadd", answering_xadd)
+    monkeypatch.setattr(client, "xread", recorded_xread)
+    monkeypatch.setattr(prod, "get_redis", lambda: client)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+    return client, reads
+
+
+@pytest.mark.asyncio
+async def test_a_turn_reads_only_the_replies_written_after_its_job(monkeypatch):
+    """The reply stream keeps a conversation's earlier turns' replies for an
+    hour. A turn starts reading after the newest one, so it neither re-reads
+    them nor fails on a kind this build does not know."""
+    client, reads = await _controller_redis(
+        monkeypatch,
+        earlier=[_foreign_reply("turn_delta"), _foreign_reply("turn_future"), _foreign_reply("turn_completed")],
+        answer=[_AUTHORIZED, ("turn_delta", {"text": "hi"}), ("turn_completed", {})],
+    )
+    (newest_earlier_id, _fields), = await client.xrevrange(_REPLY_STREAM, count=1)
+
+    items = await asyncio.wait_for(_drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+    ), include_policy=True), timeout=5)
+
+    assert items == [_AUTHORIZED, ("turn_delta", {"text": "hi"}), ("turn_completed", {})]
+    assert reads[0] == {_REPLY_STREAM: newest_earlier_id}
+
+
+@pytest.mark.asyncio
+async def test_a_conversations_first_turn_reads_its_reply_stream_from_the_start(monkeypatch):
+    _client, reads = await _controller_redis(
+        monkeypatch, earlier=[], answer=[_AUTHORIZED, ("turn_completed", {})],
+    )
+
+    items = await asyncio.wait_for(_drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+    )), timeout=5)
+
+    assert items == [("turn_completed", {})]
+    assert reads[0] == {_REPLY_STREAM: "0-0"}
+
+
+@pytest.mark.asyncio
+async def test_an_earlier_turns_late_replies_are_skipped_and_keep_no_turn_alive(monkeypatch):
+    """A previous turn still finishing can write after this turn's start id.
+    Its replies are skipped by correlation id and are not this turn's
+    progress: once they stop, the first quiet read past the idle bound,
+    counted from this turn's start, ends the turn."""
+    monkeypatch.setenv("COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS", "0.3")
+    late_replies = 8
+
+    async def an_earlier_turn_writes(xadd):
+        nonlocal late_replies
+        if late_replies:
+            late_replies -= 1
+            await asyncio.sleep(0.05)
+            await xadd(_REPLY_STREAM, _foreign_reply("turn_delta"))
+
+    _client, reads = await _controller_redis(
+        monkeypatch, earlier=[_foreign_reply("turn_delta")], answer=[],
+        before_each_read=an_earlier_turn_writes,
+    )
+
+    items = await asyncio.wait_for(_drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+    )), timeout=5)
+
+    (kind, data), = items
+    assert kind == "turn_failed"
+    assert data["error"] == prod.UNRESPONSIVE_WORKER_ERROR
+    # Eight reads each returned a late reply, and the first quiet one ended it.
+    assert len(reads) == 9
+
+
+@pytest.mark.asyncio
+async def test_an_earlier_turns_reply_of_an_unknown_kind_after_the_start_id_is_skipped(monkeypatch):
+    """An earlier turn still finishing after Stop can write a kind this build
+    does not know after this turn's start id. It is another turn's reply, so
+    it is skipped before its kind is validated, and this turn completes."""
+    replied = False
+
+    async def an_earlier_turn_then_this_one_replies(xadd):
+        nonlocal replied
+        if not replied:
+            replied = True
+            await xadd(_REPLY_STREAM, _foreign_reply("turn_future"))
+            for kind, data in (_AUTHORIZED, ("turn_completed", {})):
+                await xadd(_REPLY_STREAM, _reply(kind, data))
+
+    _client, _reads = await _controller_redis(
+        monkeypatch, earlier=[], answer=[], before_each_read=an_earlier_turn_then_this_one_replies,
+    )
+
+    items = await asyncio.wait_for(_drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+    )), timeout=5)
+
+    assert items == [("turn_completed", {})]
+
+
+@pytest.mark.asyncio
+async def test_this_turns_own_reply_of_an_unknown_kind_still_fails_it(monkeypatch):
+    """Only another turn's reply is skipped unread. A kind this build does not
+    know on this turn's own reply means the controller and this build
+    disagree, and it fails the turn rather than being ignored."""
+    from pydantic import ValidationError
+
+    await _controller_redis(monkeypatch, earlier=[], answer=[_AUTHORIZED, ("turn_future", {})])
+
+    with pytest.raises(ValidationError, match="kind"):
+        await asyncio.wait_for(_drain(prod.stream_remote_replies(
+            conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+        )), timeout=5)

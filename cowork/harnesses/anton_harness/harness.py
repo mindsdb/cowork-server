@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+from typing import TYPE_CHECKING
 from uuid import UUID
 
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
@@ -13,7 +14,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from cowork.build_info import account_kwargs, supported_kwargs, surface_kwarg
 from cowork.common.chat_session import build_chat_session, close_session_scratchpads
 from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
-from cowork.common.logger import get_logger
+from cowork.common.logger import get_logger, log_context
 from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import current_settings_scope
@@ -22,13 +23,16 @@ from cowork.db.units import run_db, run_to_completion, unit_session
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
 from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
 from cowork.models.conversation import Conversation
-from cowork.models.message import Message
 from cowork.models.skill import Skill
-from cowork.harnesses.anton_harness.scratchpad_cell_replay import extract_scratchpad_cells_from_message_events
+from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REPLAY_ROLES, extract_scratchpad_cells
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
+from cowork.services.connectors.specs._registry import registry
 from cowork.services.projects import display_label
 from cowork.streaming.liveness import ModelWaitTicker
+
+if TYPE_CHECKING:
+    from cowork.services.conversations import ReplayHistory
 
 
 logger = get_logger(__name__)
@@ -254,6 +258,49 @@ def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_d
     return filtered
 
 
+def _picked_files_guidance(picked_by_connection: dict[str, list[dict]]) -> str:
+    """Prompt text naming the Google-Picker-granted Drive files, or "".
+
+    A plain files.list()/files.search() call does NOT return these files (the
+    google_drive connector's drive.file scope only covers files the app
+    created itself, plus these specifically granted ones), so the agent has
+    to be told about them by name. The general Drive API rules
+    (supportsAllDrives, corpora) are not here: they apply to every Drive
+    connection and come from google_drive.json's usage_notes.
+    """
+    if not picked_by_connection:
+        return ""
+
+    def _describe(f: dict, conn_name: str) -> str:
+        line = f"- {f.get('name', 'untitled')} (id: {f.get('id')}, connection: {conn_name}"
+        resource_key = f.get("resourceKey") or f.get("resource_key")
+        if resource_key:
+            line += f", resourceKey: {resource_key}"
+        return line + ")"
+
+    picked_lines = [
+        _describe(f, conn_name)
+        for conn_name, files in picked_by_connection.items()
+        for f in files
+    ]
+    return (
+        "\n\nIMPORTANT — additional Google Drive files the user has explicitly granted "
+        "access to via the Google Picker, which a plain files.list()/files.search() call "
+        "will NOT return (the google_drive connector's scope only covers files this app "
+        "created itself, plus these specifically granted ones):\n"
+        + "\n".join(picked_lines)
+        + "\nWhenever you list, search, or enumerate Drive files for the user, you MUST "
+        "include every file above IN ADDITION to whatever files.list()/files.search() "
+        "returns — do not report only the API call's results. To read one of these "
+        "files' content, call files.get(fileId=...) directly with its id above; do not "
+        "expect it to appear in a files.list() response first. If a file above has a "
+        "resourceKey listed, you MUST send it or the call will fail with a 404 notFound "
+        "even though access was actually granted — either add header "
+        "'X-Goog-Drive-Resource-Keys: <id>/<resourceKey>' to the request, or pass "
+        "resourceKey=<resourceKey> as a query parameter."
+    )
+
+
 def _turn_style_context(channel: ChannelContext | None) -> str:
     """Lead block of the system-prompt suffix: desktop guidance for UI turns,
     support-chat guidance for channel turns.
@@ -321,6 +368,32 @@ def _turn_style_context(channel: ChannelContext | None) -> str:
     )
 
 
+_PROJECT_FILE_READ_RULE = (
+    "You can read, search, extract from and analyse any of these project files without asking. "
+)
+
+
+def _project_file_actions_rule(act_first: bool) -> str:
+    """When the agent must ask before acting on project files.
+
+    Follows the "Act first, ask later" setting: a blanket ask-first rule here
+    outweighs anton's act-first discipline, which sits earlier in the prompt,
+    and the agent then asks before writing a file the user asked it to create.
+    Reading never needs permission, whatever the setting.
+    """
+    if not act_first:
+        return (
+            _PROJECT_FILE_READ_RULE
+            + "Ask the user for permission before you create, change, move or delete any of these files. "
+        )
+    return (
+        _PROJECT_FILE_READ_RULE
+        + "Create the files the user asks for and change the files they ask you to change "
+        "without asking for permission first. "
+        "Ask the user before deleting files or overwriting files they did not ask you to change. "
+    )
+
+
 # How a file the agent cannot reach gets to it. Stated on EVERY turn, not
 # just turns that have attachments — the project context above tells the agent
 # what it may not access and used to say nothing about how access is granted,
@@ -361,10 +434,12 @@ def _attached_files(session: ScopedSession, *, conversation_id: UUID) -> list[_A
     return [_AttachedFile(path=row.path or "", filename=row.filename) for row in rows]
 
 
-def _replay_messages(session: ScopedSession, *, conversation_id: UUID) -> list[Message]:
+def _replay_history(session: ScopedSession, *, conversation_id: UUID) -> "ReplayHistory":
     from cowork.services.conversations import ConversationService
 
-    return ConversationService(session).get_replay_messages(conversation_id)
+    return ConversationService(session).get_replay_history(
+        conversation_id, event_roles=SCRATCHPAD_REPLAY_ROLES,
+    )
 
 
 def _archived_messages(session: ScopedSession, *, conversation_id: UUID) -> list[dict]:
@@ -408,10 +483,10 @@ async def _read_attachments(conversation, *, scope: TenantScope | None) -> list[
         # the user no files were uploaded (the Cyberdeck bug this helper
         # exists to fix). Log it so the failure is diagnosable.
         logger.warning(
-            "Failed to build conversation attachment context for conversation %s; "
+            "Failed to build conversation attachment context; "
             "the agent will not see attached files this turn",
-            getattr(conversation, "id", "<unknown>"),
             exc_info=True,
+            extra=log_context(conversation_id=getattr(conversation, "id", None)),
         )
         return None
 
@@ -588,8 +663,8 @@ class AntonHarness:
                     )
                 except Exception:
                     logger.exception(
-                        "[anton_harness] failed to persist history compaction for conversation %s",
-                        conv_id,
+                        "[anton_harness] failed to persist history compaction",
+                        extra=log_context(conversation_id=conv_id),
                     )
             try:
                 changes = turn_artifact_changes(
@@ -613,7 +688,13 @@ class AntonHarness:
                         scope=turn_scope,
                     )
             except Exception:
-                logger.warning("Could not index artifacts created this turn", exc_info=True)
+                logger.warning(
+                    "Could not index artifacts created this turn",
+                    exc_info=True,
+                    extra=log_context(
+                        conversation_id=conv_id, project_id=conv_project_id, artifact_slugs=new_slugs or None,
+                    ),
+                )
             skill_drafts = finalize_turn_skill_drafts(project_path, before_drafts, before_strays)
 
         try:
@@ -1056,11 +1137,13 @@ class AntonHarness:
         )
         # Canonical order (ConversationService._MESSAGE_ORDER: seq, role, id);
         # the bare `conversation.messages` relationship is unordered and would
-        # scramble a turn's tool_use/tool_result block-rows. Each message's
-        # events come loaded with it, for the scratchpad cells replayed below.
-        ordered_messages = await run_db(
-            partial(_replay_messages, conversation_id=conversation.id), scope=_units_scope(),
+        # scramble a turn's tool_use/tool_result block-rows. The same unit
+        # reads the stored scratchpad events the cells below are rebuilt from,
+        # and only those.
+        history = await run_db(
+            partial(_replay_history, conversation_id=conversation.id), scope=_units_scope(),
         )
+        ordered_messages = history.messages
 
         project_context = (
             # Conversational only. The next line hands the agent the real path,
@@ -1070,9 +1153,8 @@ class AntonHarness:
             f"(the artifacts under `{str(artifacts_dir)}` are the exception). "
             "Everything else in .anton/ is off limits. Do not mention the .anton/ directory in your responses. "
             "You can perform operations on these files via the scratchpad. "
-            "You can freely read any of these project files. "
-            "If you need to perform any actions on these files, ask the user for permission first. "
-            "The only other files that you are allowed to access are any items that are attached to the conversation. "
+            + _project_file_actions_rule(anton_settings.act_first)
+            + "The only other files that you are allowed to access are any items that are attached to the conversation. "
             "Access to any files not attached to the conversation or located outside the project is strictly forbidden. "
             "You can read text files with `read_text_file`, or in the scratchpad when that is more efficient (for example, when the data goes straight into scratchpad code or the file needs special parsing). Use the scratchpad for everything else you do with files. "
             f"Your scratchpad's working directory is {str(base)} — bare relative paths like `open('data.csv')` resolve from the project root."
@@ -1157,78 +1239,33 @@ class AntonHarness:
         # that predate the MCP client, and promoting it to anton's `main` is
         # a separate release step (ENG-1816). An unguarded import would turn
         # that window into a failure on EVERY turn, not just MCP ones.
+        # This turn's connections, listed once for MCP discovery and the usage notes.
+        vault_connections = data_vault.list_connections() if data_vault is not None else []
         mcp_tool_defs: list = []
         mcp_sessions: list = []
         mcp_wiring = _anton_mcp_wiring() if data_vault is not None else None
         if mcp_wiring is not None:
             mcp_tool_defs, mcp_sessions = await mcp_wiring.discover_mcp_tools_async(
-                data_vault, data_vault.list_connections()
+                data_vault, vault_connections
             )
 
         try:
-            # TODO: Add guidance for integrations
-
-            # Google Drive's google_drive connector uses the drive.file OAuth
-            # scope, which only covers files the app created itself, plus files
-            # the user explicitly granted access to via the Google Picker
-            # (persisted as a `_picked_files` vault field — see
-            # cowork/services/connectors/connections.py). A plain
-            # files.list()/files.search() call does NOT return the latter, so
-            # without calling them out by name here the agent has no way to
-            # know they're reachable at all — the scratchpad's env carries only the
-            # raw JSON, which isn't enough for the agent to notice or act on.
-            #
-            # Parsing `_picked_files` and applying the project-scoping rule is
-            # connector logic, not agent logic, so it lives in
-            # ConnectionsService.picked_files_by_project().
+            # Google Drive: Picker-granted files are per-project connection data
+            # (ConnectionsService.picked_files_by_project), so they are rendered
+            # here rather than from the connector spec.
             integration_guidance = ""
-            picked_by_connection: dict[str, list[dict]] = {}
+            connector_usage_notes: dict[str, str] = {}
             if data_vault is not None:
-                picked_by_connection = service.picked_files_by_project(data_vault, conversation.project.name)
+                integration_guidance = _picked_files_guidance(
+                    service.picked_files_by_project(data_vault, conversation.project.name)
+                )
+                # Agent-facing API notes for this turn's connected engines.
+                # `data_vault` is already filtered by `disabled_connections`.
+                connector_usage_notes = registry.usage_notes_for(
+                    c["engine"] for c in vault_connections
+                )
 
-                if picked_by_connection:
-                    def _describe(f: dict, conn_name: str) -> str:
-                        line = f"- {f.get('name', 'untitled')} (id: {f.get('id')}, connection: {conn_name}"
-                        resource_key = f.get("resourceKey") or f.get("resource_key")
-                        if resource_key:
-                            line += f", resourceKey: {resource_key}"
-                        return line + ")"
-
-                    picked_lines = [
-                        _describe(f, conn_name)
-                        for conn_name, files in picked_by_connection.items()
-                        for f in files
-                    ]
-                    integration_guidance = (
-                        "\n\nIMPORTANT — additional Google Drive files the user has explicitly granted "
-                        "access to via the Google Picker, which a plain files.list()/files.search() call "
-                        "will NOT return (the google_drive connector's scope only covers files this app "
-                        "created itself, plus these specifically granted ones):\n"
-                        + "\n".join(picked_lines)
-                        + "\nWhenever you list, search, or enumerate Drive files for the user, you MUST "
-                        "include every file above IN ADDITION to whatever files.list()/files.search() "
-                        "returns — do not report only the API call's results. To read one of these "
-                        "files' content, call files.get(fileId=...) directly with its id above; do not "
-                        "expect it to appear in a files.list() response first. If a file above has a "
-                        "resourceKey listed, you MUST send it or the call will fail with a 404 notFound "
-                        "even though access was actually granted — either add header "
-                        "'X-Goog-Drive-Resource-Keys: <id>/<resourceKey>' to the request, or pass "
-                        "resourceKey=<resourceKey> as a query parameter. Some of these files may live in "
-                        "a Shared Drive rather than the user's My Drive — Drive API calls silently return "
-                        "404 notFound for Shared Drive items unless you pass supportsAllDrives=true (and, "
-                        "for files.list()/files.search(), also includeItemsFromAllDrives=true). Always "
-                        "include both params on any Drive API call touching these files; they're no-ops "
-                        "for regular files, so there's no downside to always sending them. CRITICAL: when "
-                        "calling files.list()/files.search(), do NOT pass corpora='allDrives' — unlike "
-                        "supportsAllDrives/includeItemsFromAllDrives, that parameter is NOT properly scoped "
-                        "by this connector's restricted OAuth grant and will return files across the user's "
-                        "entire Google account that this app was never actually given access to. Omit "
-                        "corpora entirely (or use corpora='user') — combined with "
-                        "includeItemsFromAllDrives=true and supportsAllDrives=true, that already correctly "
-                        "surfaces every file this app can legitimately see, Shared Drive items included."
-                    )
-
-            cells = extract_scratchpad_cells_from_message_events(ordered_messages)
+            cells = extract_scratchpad_cells(history.events)
             os.environ["ANTON_SCRATCHPAD_PERSIST_SESSION"] = "true"
 
             replayable = [m for m in ordered_messages if m.role in {"user", "assistant"}]
@@ -1264,6 +1301,10 @@ class AntonHarness:
                 ),
                 workspace=workspace,
                 data_vault=data_vault,
+                # Dropped, not raised, on an anton that predates the field: the
+                # uv.lock pin and the anton-agent floor must include it, or the
+                # Drive API rules are lost.
+                **supported_kwargs(ChatSessionConfig, connector_usage_notes=connector_usage_notes),
                 **overlay_kwargs,
                 initial_history=initial_history,
                 # history_store=history_store,

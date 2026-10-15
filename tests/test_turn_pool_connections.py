@@ -790,6 +790,53 @@ async def test_a_channel_turns_saves_wait_for_the_conversations_write_lock(monke
     assert reply == "ok"
 
 
+async def test_a_channel_turn_does_not_load_the_conversations_history(monkeypatch):
+    """The harness reads history in units of its own. Loading every message
+    row through the relationship here would run on the event loop on each
+    channel turn, and nothing reads it."""
+    runtime = object.__new__(channel_runtime.AntonChannelRuntime)
+
+    class _Conversation:
+        id = uuid4()
+
+        @property
+        def messages(self):
+            raise AssertionError("a channel turn must not load conversation.messages")
+
+    event = SimpleNamespace(message=SimpleNamespace(content="hi", is_group=False, sender_name=None, attachments=[]))
+
+    class _Answers:
+        def stream_response(self, **_kwargs):
+            return None
+
+        async def formatter(self, stream, model, event_sink):
+            delta = {"type": "response.output_text.delta", "delta": "ok"}
+            event_sink(delta["type"], delta)
+            yield "event: response.output_text.delta\ndata: {}\n\n"
+
+    class _Service:
+        def __init__(self, session):
+            pass
+
+        def save_user_message(self, conversation_id, content, created_at=None):
+            return None
+
+        def save_assistant_turn(self, conversation_id, text, events, harness=None, tool_rows=None):
+            return None
+
+    async def text_only(scoped, adapter, event, text):
+        return [{"type": "text", "text": text}]
+
+    monkeypatch.setattr(runtime, "resolve_turn_harness", lambda scoped, conversation: "anton", raising=False)
+    monkeypatch.setattr(runtime, "build_input_blocks", text_only, raising=False)
+    monkeypatch.setattr(channel_runtime, "get_harness", lambda harness_id: _Answers())
+    monkeypatch.setattr(channel_runtime, "ConversationService", _Service)
+
+    reply, _ = await asyncio.wait_for(runtime._run_anton(None, _Conversation(), event), timeout=5)
+
+    assert reply == "ok"
+
+
 async def test_a_turn_deleted_while_its_save_waits_saves_nothing(one_connection_pool, monkeypatch):
     """A turn delete that lands while the turn-end unit waits for a connection
     stops the save before it writes: no answer lands in the history the

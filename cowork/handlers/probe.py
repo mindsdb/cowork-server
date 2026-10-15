@@ -14,6 +14,7 @@ from uuid import UUID
 
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
+from cowork.common.logger import log_context
 from cowork.common.settings.user_settings import UserSettings
 from cowork.handlers.turn_errors import server_busy_message
 from cowork.schemas.responses import Role
@@ -154,7 +155,7 @@ class ProbeHandler:
                 # Same outcome as a refused save: the form keeps the probe's
                 # result, and only its narrative is missing from the
                 # conversation.
-                logger.exception("Could not save the probe turn for conversation %s", conversation_id)
+                logger.exception("Could not save the probe turn", extra=log_context(conversation_id=conversation_id))
                 return None
 
         async def _completed(conversation_id: UUID | None, response_fields: dict) -> str:
@@ -280,9 +281,11 @@ class ProbeHandler:
             if spec is None:
                 try:
                     vault = vault_for_scope(self.scope)
+                    extends_name = form_spec.get("_extends_connection")
                     slug = persist_connection(
-                        connector_id, method, name, credentials,
-                        label=connection_label, user_label=connection_user_label, vault=vault,
+                        connector_id, method, extends_name or name, credentials,
+                        label=connection_label, user_label=connection_user_label,
+                        extends=bool(extends_name), vault=vault,
                     )
                     saved_record = vault.read_record(connector_id, slug) or {}
                     saved_user_label = str(saved_record.get("fields", {}).get("_user_label", "")).strip() or None
@@ -365,6 +368,7 @@ class ProbeHandler:
                 workspace=workspace,
                 form_spec=form_spec,
                 skipped=skipped,
+                usage_notes=registry.usage_notes_for([connector_id]).get(connector_id),
                 web_tool_kwargs=web_tools,
             )
             try:

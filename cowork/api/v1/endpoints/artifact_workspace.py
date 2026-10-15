@@ -490,6 +490,7 @@ async def _sync_live_artifact(
     the artifact's modified state visible for a manual retry.
     """
     from cowork.services.publish import (
+        PublishOwnedByOtherUser,
         desktop_publish_credential,
         publish_artifact,
         published_artifact_access,
@@ -552,6 +553,10 @@ async def _sync_live_artifact(
     except asyncio.CancelledError:
         publish_abandoned = publish_started
         raise
+    except PublishOwnedByOtherUser:
+        # Repeats on every save of this artifact, so no traceback.
+        logger.warning("Could not synchronize live artifact %s: another account owns its report", folder)
+        return False
     except Exception:
         logger.warning("Could not synchronize live artifact %s", folder, exc_info=True)
         return False
