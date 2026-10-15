@@ -13,9 +13,10 @@ it) and ``shared``, and every change they try answers 403 with the shared
 sentence, a delete before its OAuth revoke. Its creator sees it shared and
 changes, reconnects and deletes it as before, and everyone sees each change.
 
-With connections shared, everyone reads the one base vault, and only an
-entry's creator changes it; an entry with no creator only the operator view.
-The desktop and hosted org tenancy keep every route as before.
+With connections shared, everyone reads the one base vault. A person
+changes only an entry they created, the operator view changes any, and a
+turn with no person, such as a scheduled run, changes none. The desktop and
+hosted org tenancy keep every route as before.
 """
 from __future__ import annotations
 
@@ -36,7 +37,7 @@ from cowork.api.v1.endpoints.connectors import connections as connections_ep
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import use_settings_scope
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
-from cowork.db.scoped import LOCAL_SCOPE, TenantScope
+from cowork.db.scoped import LOCAL_SCOPE, TenantScope, scope_from_principal, service_principal_for
 from cowork.db.session import get_open_session
 from cowork.harnesses.anton_harness.tools import _cowork_label_connection
 from cowork.models.conversation import Conversation
@@ -471,15 +472,16 @@ async def test_where_all_are_shared_only_the_creator_changes_an_entry(all_shared
     revoked = _no_revoke(monkeypatch)
 
     await _every_change_is_refused(BOB_SHARED)
-    await _every_change_is_refused(LOCAL_SCOPE)
     assert revoked == []
 
     # Everyone uses it, and the API says who can't change it.
     assert vault_for_scope(BOB_SHARED).load("postgres", "erp")["host"] == "erp.example"
     bobs = await connections_ep.list_connections(BOB_SHARED, None)
     alices = await connections_ep.list_connections(ALICE_SHARED, None)
+    operators = await connections_ep.list_connections(LOCAL_SCOPE, None)
     assert [(c.name, c.managed, c.shared) for c in bobs] == [("erp", True, False)]
     assert [(c.name, c.managed, c.shared) for c in alices] == [("erp", False, False)]
+    assert [(c.name, c.managed, c.shared) for c in operators] == [("erp", False, False)]
 
     await connections_ep.patch_access_mode(
         "postgres", "erp", connections_ep.PatchAccessModeBody(access_mode="write"), ALICE_SHARED, None
@@ -487,6 +489,64 @@ async def test_where_all_are_shared_only_the_creator_changes_an_entry(all_shared
     assert vault_for_scope(BOB_SHARED).load("postgres", "erp")["_access_mode"] == "write"
     await connections_ep.delete_connection("postgres", "erp", ALICE_SHARED, None)
     assert own_vault_for_scope(LOCAL_SCOPE).read_record("postgres", "erp") is None
+
+
+async def test_where_all_are_shared_the_operator_view_changes_anyones_entry(all_shared, monkeypatch):
+    """A creator who left can't hold a leaked credential out of reach: the
+    operator view rotates, relabels and deletes their entry, and the stamp
+    stays the creator's."""
+    persist_connection("postgres", None, "erp", dict(ERP), scope=ALICE_SHARED)
+    revoked = _no_revoke(monkeypatch)
+
+    connections_ep.patch_connection_token(
+        "postgres", "erp", connections_ep.PatchTokenBody(access_token="rotated"), LOCAL_SCOPE
+    )
+    assert set_connection_label("postgres", "erp", "Finance", scope=LOCAL_SCOPE) == "Finance"
+    stored = _stored(LOCAL_SCOPE)
+    assert (stored[CREATED_BY_FIELD], stored["access_token"], stored["_user_label"]) == (
+        SUB_A,
+        "rotated",
+        "Finance",
+    )
+
+    await connections_ep.delete_connection("postgres", "erp", LOCAL_SCOPE, None)
+    assert len(revoked) == 1
+    assert own_vault_for_scope(LOCAL_SCOPE).read_record("postgres", "erp") is None
+
+
+async def test_a_turn_with_no_person_changes_no_saved_connection(all_shared, monkeypatch, stores):
+    """Schedules shared: a scheduled run has no person, so its turn binds the
+    scope with none. That turn is no operator: its agent can't relabel,
+    overwrite or delete any entry in the base vault, the operator's own
+    included, and what it saves records no creator."""
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", "")
+    get_app_settings.cache_clear()
+    assert scope_from_principal(service_principal_for(None, SUB_B)) == LOCAL_SCOPE
+    persist_connection("postgres", None, "erp", dict(ERP), scope=LOCAL_SCOPE)
+    persist_connection("postgres", None, "alices", dict(ERP), scope=ALICE_SHARED)
+
+    with use_settings_scope(LOCAL_SCOPE):
+        for name in ("erp", "alices"):
+            labeled = await _cowork_label_connection(
+                None, {"engine": "postgres", "name": name, "label": "Run's"}
+            )
+            assert labeled == f"label_connection: {SHARED_CONNECTION_REFUSAL}"
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=stores, scope=LOCAL_SCOPE) as turn:
+        vault = turn.config.data_vault
+        for name in ("erp", "alices"):
+            assert not vault.can_change("postgres", name)
+            with pytest.raises(SharedConnectionError):
+                vault.save("postgres", name, {**ERP, "password": "replaced"})
+            with pytest.raises(SharedConnectionError):
+                vault.delete("postgres", name)
+        vault.save("mysql", "from-the-run", {"host": "run.example"})
+
+    for name in ("erp", "alices"):
+        assert _stored(LOCAL_SCOPE, name)["password"] == ERP["password"]
+        assert _stored(LOCAL_SCOPE, name)["_user_label"] != "Run's"
+    assert CREATED_BY_FIELD not in _stored(LOCAL_SCOPE, "from-the-run", "mysql")
+    # The operator view's own request still changes them.
+    assert set_connection_label("postgres", "erp", "Ops", scope=LOCAL_SCOPE) == "Ops"
 
 
 async def test_where_all_are_shared_an_entry_with_no_creator_is_the_operators(all_shared, monkeypatch):

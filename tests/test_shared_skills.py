@@ -15,9 +15,9 @@ skill's own metadata. Its creator sees it ``shared`` with every capability and
 edits, disables and deletes it as before, and everyone sees each change; its
 rename is refused until it is unshared.
 
-With skills shared, everyone reads the one base store, and only a skill's
-creator changes it; one with no creator only the operator view. The desktop
-and hosted org tenancy keep every skills route as before.
+With skills shared, everyone reads the one base store. A person changes only
+a skill they created, and the operator view changes any. The desktop and
+hosted org tenancy keep every skills route as before.
 """
 from __future__ import annotations
 
@@ -473,13 +473,12 @@ def test_where_all_are_shared_only_the_creator_changes_a_skill(all_shared, scope
     assert _stored(LOCAL_SCOPE, "bob-upload")[META_CREATED_BY] == SUB_B
 
     _every_change_but_create_is_refused(scoped, BOB_SHARED, "team-notes")
-    _every_change_but_create_is_refused(scoped, LOCAL_SCOPE, "team-notes")
     _every_change_but_create_is_refused(scoped, ALICE_SHARED, "bob-upload")
 
     # Everyone lists it, and the capabilities say who can change it.
     for scope, capabilities in (
         (BOB_SHARED, NO_CAPABILITY),
-        (LOCAL_SCOPE, NO_CAPABILITY),
+        (LOCAL_SCOPE, EVERY_CAPABILITY),
         (ALICE_SHARED, EVERY_CAPABILITY),
     ):
         listed = _listed(scoped, scope)["team-notes"]
@@ -492,6 +491,23 @@ def test_where_all_are_shared_only_the_creator_changes_a_skill(all_shared, scope
     assert _stored(LOCAL_SCOPE, "team-notes-v2")[META_CREATED_BY] == SUB_A
     skills_ep.delete_skill("team-notes-v2", alice, None)
     assert "team-notes-v2" not in _listed(scoped, BOB_SHARED)
+
+
+def test_where_all_are_shared_the_operator_view_changes_anyones_skill(all_shared, scoped):
+    """A creator who left can't hold their skill out of the operator's reach:
+    the operator view edits, disables, renames and deletes it, and the stamp
+    stays the creator's."""
+    skills_ep.create_skill(SkillCreateRequest(label="team-notes", instructions="Alice's."), scoped(ALICE_SHARED), None)
+    operator = scoped(LOCAL_SCOPE)
+
+    skills_ep.update_skill("team-notes", SkillUpdateRequest(instructions="The operator's."), operator, None)
+    skills_ep.update_skill("team-notes", SkillUpdateRequest(enabled=False), operator, None)
+    renamed = skills_ep.update_skill("team-notes", SkillUpdateRequest(label="team-notes-v2"), operator, None)
+    assert (renamed["declarative"], renamed["enabled"]) == ("The operator's.", False)
+    assert _stored(LOCAL_SCOPE, "team-notes-v2")[META_CREATED_BY] == SUB_A
+
+    skills_ep.delete_skill("team-notes-v2", operator, None)
+    assert "team-notes-v2" not in _listed(scoped, ALICE_SHARED)
 
 
 def test_where_all_are_shared_a_skill_with_no_creator_is_the_operators(all_shared, scoped):

@@ -846,11 +846,15 @@ async def _cowork_label_connection(session: Any, tc_input: dict) -> str:
 
     try:
         from cowork.common.settings.user_settings import current_settings_scope
-        from cowork.services.connectors.persist import set_connection_label
+        from cowork.services.connectors.persist import set_connection_label, turn_vault_for_scope
 
-        # The turn's own vault: the label lands on the asker's connection, and
-        # an unbound turn on a partitioned deployment is refused.
-        stored = set_connection_label(engine, name, label, scope=current_settings_scope())
+        # The turn's own vault: the label lands on the asker's connection, an
+        # unbound turn on a partitioned deployment is refused, and a turn with
+        # no person changes no connection already saved.
+        scope = current_settings_scope()
+        stored = set_connection_label(
+            engine, name, label, vault=turn_vault_for_scope(scope), scope=scope
+        )
     except SharedConnectionError as exc:
         # A connection the asker can't change, such as one shared with them.
         return f"label_connection: {exc}"

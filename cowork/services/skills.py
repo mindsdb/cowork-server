@@ -478,9 +478,9 @@ class SkillService:
     Where skills are personal, a person also reads the skills others share
     with them (shared_with_owner), live from each creator's own store and
     read-only; the creator still changes theirs, except its name while it is
-    shared. Where skills are shared, only a skill's creator changes it
-    (may_change). All of it is the general store's alone: the Code store's
-    skills are never shared.
+    shared. Where skills are shared, a person changes only a skill they
+    created, and the operator view any (may_change). All of it is the
+    general store's alone: the Code store's skills are never shared.
     """
 
     store_name = "skills"
@@ -662,8 +662,8 @@ class SkillService:
         """Whether the owner may change ``skill``, one of the store's own:
         always, except in the deployment's base store every person reads
         (skills left shared on a deployment that trusts identity headers),
-        where only its creator may, and the operator view only one with no
-        creator (cowork.creators.Changer.may_change)."""
+        where a person may change only a skill they created and the operator
+        view any (cowork.creators.Changer.may_change)."""
         return self._changer is None or self._changer.may_change(skill.created_by)
 
     def _refuse_unless_changeable(self, skill: Skill | None) -> None:

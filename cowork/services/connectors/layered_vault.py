@@ -62,8 +62,9 @@ class LayeredDataVault:
 
     Only the scope's own entries can change: a save or delete of a managed or
     shared one raises SharedConnectionError, and so does one of an own entry
-    the changer didn't create where the own vault is deployment-wide
-    (Changer.may_change). Every other save and delete goes to the own vault,
+    the changer may not change where the own vault is deployment-wide
+    (Changer.may_change): someone else's for a person, and any for a turn
+    with no person. Every other save and delete goes to the own vault,
     a turn's included, so what the agent saves in a turn outlives the turn.
     With a ``changer``, every save records the connection's creator in
     CREATED_BY_FIELD: a create stamps the changer's (Changer.creator), and an
@@ -117,8 +118,9 @@ class LayeredDataVault:
 
     def can_change(self, engine: str, name: str) -> bool:
         """Whether a save or delete of (engine, name) goes through: false for a
-        managed or shared entry, and for an own entry the changer didn't create
-        where the own vault is deployment-wide. True for one nobody holds."""
+        managed or shared entry, and for an own entry the changer may not
+        change where the own vault is deployment-wide (Changer.may_change).
+        True for one nobody holds."""
         return self._may_change(self._find(engine, name))
 
     def is_shared(self, engine: str, name: str) -> bool:

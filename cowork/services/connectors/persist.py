@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 from anton.utils.datasources import default_user_label, ensure_unique_user_label
 
 from cowork.common.settings.app_settings import ConnectorSettings, get_app_settings
-from cowork.creators import changer_for
+from cowork.creators import Changer, changer_for, turn_changer_for
 from cowork.managed import (
     ManagedFolder,
     SharedConnection,
@@ -78,7 +78,8 @@ def _shared_from(entry: SharedConnection) -> SharedFrom:
 
 
 def vault_for_scope(scope: "TenantScope | None" = None):
-    """``scope``'s saved connections, for reading and for saving.
+    """``scope``'s saved connections, for reading and for saving, in a
+    request or an operator command.
 
     On the desktop without a managed folder, and in org tenancy, that is its
     own vault (own_vault_for_scope). With COWORK_MANAGED_DIR set or
@@ -86,10 +87,19 @@ def vault_for_scope(scope: "TenantScope | None" = None):
     folder's connections, the scope's own, then the ones others share with a
     person whose connections are personal (``shared/connections.json``).
     Every save there records its creator, and a save or delete of a
-    connection the scope can't change raises SharedConnectionError.
+    connection the scope can't change raises SharedConnectionError. A scope
+    with no person is the operator view (cowork.creators.changer_for).
     """
     from cowork.db.personal_resources import PersonalResource
 
+    return _vault_changed_by(
+        scope=scope, changer=changer_for(scope, resource=PersonalResource.CONNECTIONS)
+    )
+
+
+def _vault_changed_by(*, scope: "TenantScope | None", changer: Changer | None):
+    """vault_for_scope's vault for ``scope``, whose saves and deletes
+    ``changer`` makes."""
     own = own_vault_for_scope(scope)
     managed = managed_folder()
     if managed is None and not get_app_settings().trust_identity_headers:
@@ -107,7 +117,7 @@ def vault_for_scope(scope: "TenantScope | None" = None):
         shared_by_own=frozenset(
             (entry.engine, entry.name) for entry in registry if entry.partition_id == own_partition
         ),
-        changer=changer_for(scope, resource=PersonalResource.CONNECTIONS),
+        changer=changer,
     )
 
 
@@ -120,9 +130,16 @@ def turn_vault_for_scope(scope: "TenantScope | None"):
     connections over either and the ones others share after them, and a
     refusal for ``scope=None`` on a partitioned deployment, so an unbound
     turn reads nobody's connections. A save through it, such as the agent's
-    own in a turn, lands in the scope's own vault and outlives the turn.
+    own in a turn, lands in the scope's own vault and outlives the turn. A
+    turn with no person, such as a scheduled run where schedules are shared,
+    is not the operator view: it changes no connection already in the base
+    vault (cowork.creators.turn_changer_for).
     """
-    return vault_for_scope(scope)
+    from cowork.db.personal_resources import PersonalResource
+
+    return _vault_changed_by(
+        scope=scope, changer=turn_changer_for(scope, resource=PersonalResource.CONNECTIONS)
+    )
 
 
 def persist_connection(
