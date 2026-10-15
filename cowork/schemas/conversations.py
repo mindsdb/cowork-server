@@ -44,6 +44,8 @@ class ConversationListItem(CamelResponse):
     harness: str | None = None
     model: str | None = None
     reasoning_effort: str | None = None
+    # The schedule this conversation is a run of, if it is one.
+    scheduled_id: UUID | None = None
 
 
 class ConversationItemsPage(CamelResponse):

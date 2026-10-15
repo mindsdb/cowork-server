@@ -56,68 +56,133 @@ def _conversation(session: Session, *, topic: str = "run"):
     return conv
 
 
-# --- ENG-770: wire the schedule↔conversation link so the client can collapse a
-# schedule's run-conversations into one grouped task row. The server never sent
-# runs_index, so the grouping was dead on the client and every run listed
-# separately.
+# --- Which conversations are a schedule's runs. The conversation list says
+# so per conversation (scheduled_id), so the desktop groups a schedule's runs
+# into one row, and the schedule poll does not carry every run's id.
 
-def test_runs_index_maps_run_conversations_to_schedules():
-    session = _session()
-    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
-    s1 = _schedule(session, title="A")
-    s2 = _schedule(session, title="B")
-    c1, c2, c3 = _conversation(session), _conversation(session), _conversation(session)
-    for sched, conv in ((s1, c1), (s1, c2), (s2, c3)):
-        run = run_service.create_run(sched.id, is_manual=False)
-        run_service.set_run_conversation(run.id, conv.id)
-
-    assert run_service.runs_index([s1.id, s2.id]) == {
-        str(c1.id): str(s1.id),
-        str(c2.id): str(s1.id),
-        str(c3.id): str(s2.id),
-    }
-
-
-def test_runs_index_skips_runs_without_a_conversation():
-    session = _session()
-    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
-    schedule = _schedule(session)
-    run_service.create_run(schedule.id, is_manual=False)  # no conversation attached yet
-
-    assert run_service.runs_index([schedule.id]) == {}
-
-
-def test_runs_index_limited_to_the_given_schedules():
-    session = _session()
-    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
-    s1 = _schedule(session, title="A")
-    s2 = _schedule(session, title="B")
-    c1, c2 = _conversation(session), _conversation(session)
-    for sched, conv in ((s1, c1), (s2, c2)):
-        run = run_service.create_run(sched.id, is_manual=False)
-        run_service.set_run_conversation(run.id, conv.id)
-
-    # Only s1 requested → s2's run is excluded; empty input → empty map.
-    assert run_service.runs_index([s1.id]) == {str(c1.id): str(s1.id)}
-    assert run_service.runs_index([]) == {}
-
-
-def test_list_schedules_endpoint_includes_runs_index():
-    from cowork.api.v1.endpoints.schedules import list_schedules
-
-    session = _session()
-    scoped = ScopedSession(session, SYSTEM_SCOPE)
-    run_service = ScheduleRunService(scoped)
-    schedule = _schedule(session, title="Daily report")
+def _run_with_conversation(session, run_service, schedule):
     conv = _conversation(session)
     run = run_service.create_run(schedule.id, is_manual=False)
     run_service.set_run_conversation(run.id, conv.id)
+    return conv
 
-    body = list_schedules(scoped)
 
-    assert [s["id"] for s in body["schedules"]] == [schedule.id]
-    # runs_index is str-keyed so it survives JSON round-trip to the client.
-    assert body["runs_index"] == {str(conv.id): str(schedule.id)}
+def test_conversations_name_the_schedule_they_are_runs_of():
+    session = _session()
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
+    s1, s2 = _schedule(session, title="A"), _schedule(session, title="B")
+    c1 = _run_with_conversation(session, run_service, s1)
+    c2 = _run_with_conversation(session, run_service, s1)
+    c3 = _run_with_conversation(session, run_service, s2)
+    ordinary = _conversation(session, topic="chat")
+    unattached = run_service.create_run(s1.id, is_manual=False)  # no conversation yet
+
+    assert unattached is not None
+    assert run_service.schedules_for_conversations([c1.id, c2.id, c3.id, ordinary.id]) == {
+        c1.id: s1.id, c2.id: s1.id, c3.id: s2.id,
+    }
+    assert run_service.schedules_for_conversations([]) == {}
+
+
+def test_the_lookup_stays_inside_the_callers_schedules():
+    from cowork.db.scoped import TenantScope
+
+    session = _session()
+    mine = _schedule(session, title="mine")
+    theirs = _schedule(session, title="theirs")
+    for schedule, user in ((mine, "u1"), (theirs, "u2")):
+        schedule.org_id, schedule.created_by = "o1", user
+        session.add(schedule)
+    session.commit()
+    run_service = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE))
+    c_mine = _run_with_conversation(session, run_service, mine)
+    c_theirs = _run_with_conversation(session, run_service, theirs)
+
+    scoped = ScheduleRunService(ScopedSession(session, TenantScope(org_mode=True, org_id="o1", user_id="u1")))
+    assert scoped.schedules_for_conversations([c_mine.id, c_theirs.id]) == {c_mine.id: mine.id}
+
+
+def test_a_page_of_conversations_does_not_load_a_long_history(monkeypatch):
+    """A schedule with thousands of runs, and a page of three conversations:
+    the lookup asks about those three, and the schedule poll carries a count,
+    not the history."""
+    from sqlalchemy import event
+
+    from cowork.api.v1.endpoints.schedules import list_schedules
+    from cowork.models.conversation import Conversation
+    from cowork.models.schedule import ScheduleRun
+
+    session = _session()
+    schedule = _schedule(session)
+    conversations = [Conversation(topic=f"run {n}", project_id=GENERAL_PROJECT_ID) for n in range(3000)]
+    session.add_all(conversations)
+    session.flush()
+    started = datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc)
+    session.add_all([
+        ScheduleRun(schedule_id=schedule.id, started_at=started, status=RunStatus.success, conversation_id=c.id)
+        for c in conversations
+    ])
+    session.commit()
+    page = [c.id for c in conversations[-3:]]
+    statements: list[tuple[str, tuple]] = []
+    event.listen(
+        session.get_bind(), "before_cursor_execute",
+        lambda _conn, _cur, statement, params, _ctx, _many: statements.append((statement, params)),
+    )
+
+    found = ScheduleRunService(ScopedSession(session, SYSTEM_SCOPE)).schedules_for_conversations(page)
+    lookups = [s for s in statements if "schedule_runs" in s[0]]
+
+    assert found == {cid: schedule.id for cid in page}
+    assert len(lookups) == 1
+    # One parameter per conversation on the page, not one per run.
+    assert len(lookups[0][1]) == len(page)
+
+    body = list_schedules(ScopedSession(session, SYSTEM_SCOPE))
+    [listed] = body["schedules"]
+    assert listed["runCount"] == 3000
+    assert "runs_index" not in body
+
+
+def test_the_lookup_uses_the_conversation_index():
+    from sqlalchemy import text
+
+    session = _session()
+    plan = session.exec(text(
+        "EXPLAIN QUERY PLAN SELECT schedule_id FROM schedule_runs WHERE conversation_id IN ('a', 'b')"
+    )).fetchall()
+    assert any("ix_schedule_runs_conversation_id" in str(row) for row in plan), plan
+
+
+def test_the_conversation_list_reports_scheduled_id(monkeypatch):
+    import asyncio
+
+    import test_turn_pool_connections as turn_pool
+
+    from cowork.db.units import unit_session
+
+    async def main(schedule_id):
+        with unit_session(scope=SYSTEM_SCOPE) as session:
+            run_service = ScheduleRunService(session)
+            from cowork.services.conversations import ConversationService
+
+            conv = ConversationService(session).create_conversation(topic="run", project_id=GENERAL_PROJECT_ID)
+            chat = ConversationService(session).create_conversation(topic="chat", project_id=GENERAL_PROJECT_ID)
+            run = run_service.create_run(schedule_id, is_manual=False)
+            run_service.set_run_conversation(run.id, conv.id)
+            conv_id, chat_id = conv.id, chat.id
+        async with turn_pool._client() as client:
+            listed = (await client.get("/api/v1/conversations/", params={"project": "all", "limit": 200})).json()
+            one = (await client.get(f"/api/v1/conversations/{conv_id}")).json()
+        return conv_id, chat_id, listed, one
+
+    with turn_pool._a_daily_schedule(due=datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc)) as schedule_id:
+        conv_id, chat_id, listed, one = asyncio.run(main(schedule_id))
+
+    by_id = {c["id"]: c for c in listed["conversations"]}
+    assert by_id[str(conv_id)]["scheduledId"] == str(schedule_id)
+    assert by_id[str(chat_id)]["scheduledId"] is None
+    assert one["scheduledId"] == str(schedule_id)
 
 
 def test_has_running_run_false_when_no_runs():
@@ -638,7 +703,7 @@ def test_execute_schedule_disables_corrupt_org_row_instead_of_looping(monkeypatc
 # only truthful signal — without it a cancelled or failed run is recorded as
 # success.
 
-def test_turn_terminal_reason_reads_the_terminal_record(tmp_path, monkeypatch):
+def test_turn_evidence_reads_the_terminal_record(tmp_path, monkeypatch):
     import asyncio
     from types import SimpleNamespace
 
@@ -656,10 +721,13 @@ def test_turn_terminal_reason_reads_the_terminal_record(tmp_path, monkeypatch):
         scheduler_mod, "registry",
         SimpleNamespace(get=lambda cid: SimpleNamespace(buffer=buf)),
     )
-    assert asyncio.run(scheduler_mod._turn_terminal_reason("c1")) == "cancelled"
+    evidence = asyncio.run(scheduler_mod._turn_evidence("c1"))
+    assert evidence.reason == "cancelled"
+    # Nothing but the turn's start was written before it ended.
+    assert evidence.acted is False
 
 
-def test_turn_terminal_reason_with_real_registry_cancel(tmp_path):
+def test_turn_evidence_with_real_registry_cancel(tmp_path):
     """End-to-end through the real registry: cancel a producer that swallows
     its CancelledError the way handlers/responses._produce does. The task
     ends NOT-cancelled — which is exactly why task state can't be the
@@ -698,19 +766,21 @@ def test_turn_terminal_reason_with_real_registry_cancel(tmp_path):
         await registry.cancel(conversation_id)
         assert handle.task.done()
         assert handle.task.cancelled() is False  # the swallowed cancel
-        return await scheduler_mod._turn_terminal_reason(conversation_id)
+        return (await scheduler_mod._turn_evidence(conversation_id)).reason
 
     assert asyncio.run(main()) == "cancelled"
 
 
-def test_turn_terminal_reason_none_without_handle(monkeypatch):
+def test_turn_evidence_unknown_without_handle(monkeypatch):
     import asyncio
     from types import SimpleNamespace
 
     import cowork.scheduler as scheduler_mod
 
     monkeypatch.setattr(scheduler_mod, "registry", SimpleNamespace(get=lambda cid: None))
-    assert asyncio.run(scheduler_mod._turn_terminal_reason("c1")) is None
+    evidence = asyncio.run(scheduler_mod._turn_evidence("c1"))
+    # Nothing is known, so nothing is assumed: it may have acted.
+    assert (evidence.reason, evidence.acted) == (None, True)
 
 
 def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
@@ -738,10 +808,10 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
 
     monkeypatch.setattr(responses_mod, "ResponsesHandler", FakeHandler)
 
-    async def _terminal(_conversation_id):
-        return reason
+    async def _evidence(_conversation_id):
+        return scheduler_mod._TurnEvidence(reason=reason, acted=True)
 
-    monkeypatch.setattr(scheduler_mod, "_turn_terminal_reason", _terminal)
+    monkeypatch.setattr(scheduler_mod, "_turn_evidence", _evidence)
 
     session = get_open_session()
     schedule = ScheduleService(ScopedSession(session, SYSTEM_SCOPE)).create_schedule(
@@ -755,6 +825,11 @@ def _execute_with_terminal(monkeypatch, reason, *, is_manual=False):
         enabled=True,
     )
     schedule_id = schedule.id
+    # Created schedules start at their next future slot; put this one back
+    # where a cron claim finds it, due.
+    schedule.next_run_at = datetime(2026, 6, 25, 9, 0, tzinfo=timezone.utc)
+    session.add(schedule)
+    session.commit()
     original_next = ensure_utc(schedule.next_run_at)
     session.close()
 
@@ -833,7 +908,7 @@ def test_a_database_error_in_a_runs_last_writes_logs_its_schedule_and_conversati
     def connection_lost(session, **kwargs):
         raise OperationalError("UPDATE schedule_runs SET private_statement_marker", {}, Exception(driver_text))
 
-    monkeypatch.setattr(scheduler_mod, "_record_turn_outcome", connection_lost)
+    monkeypatch.setattr(scheduler_mod, "_record_attempt_end", connection_lost)
     monkeypatch.setattr(scheduler_mod, "_finish_run", connection_lost)
     logged = owned_logger(scheduler_mod.logger.name)
 
@@ -851,7 +926,7 @@ def test_a_database_error_in_a_runs_last_writes_logs_its_schedule_and_conversati
         assert (record.schedule_id, record.conversation_id) == (str(schedule_id), str(conversation_id))
         assert record.exc_info is None
         assert driver_text not in repr(record.__dict__)
-    # The run's failure is logged first, then the finish write's.
+    # The run's end is logged first, then the fallback finish write's.
     assert errors[0].lineno < errors[1].lineno
     lines = [line for line in logged.output().splitlines() if "Database operation failed" in line]
     assert len(lines) == 2
@@ -1017,52 +1092,11 @@ def test_missed_runs_leaves_just_due_once_enabled_to_run():
     schedule = _schedule(session, cadence="once", next_run_at=now - timedelta(seconds=30))
     scoped = ScopedSession(session, SYSTEM_SCOPE)
 
-    _handle_missed_runs(scoped)
+    _handle_missed_runs(scoped, now)
 
     session.refresh(schedule)
     assert schedule.enabled is True
     assert [s.id for s in _due_schedules(scoped, now)] == [schedule.id]
-
-
-@pytest.mark.parametrize(
-    ("policy", "late", "runs"),
-    [
-        # The default runs a one-off the app was closed for, inside the lookback.
-        ("run_latest_once", timedelta(hours=2), True),
-        ("run_latest_once", timedelta(days=6), True),
-        ("run_latest_once", timedelta(days=8), False),
-        # `skip` only runs one that is barely late.
-        ("skip", timedelta(minutes=30), True),
-        ("skip", timedelta(hours=2), False),
-    ],
-)
-def test_a_missed_once_runs_or_is_skipped_by_its_policy(policy, late, runs):
-    from cowork.models.schedule import ScheduleOccurrence
-    from cowork.scheduler import _due_schedules, _handle_missed_runs
-
-    session = _session()
-    now = datetime.now(timezone.utc)
-    schedule = _schedule(session, cadence="once", next_run_at=now - late)
-    schedule.missed_run_policy = policy
-    session.add(schedule)
-    session.commit()
-    scoped = ScopedSession(session, SYSTEM_SCOPE)
-
-    _handle_missed_runs(scoped)
-
-    session.refresh(schedule)
-    assert schedule.enabled is runs
-    due_ids = [s.id for s in _due_schedules(scoped, now)]
-    assert (schedule.id in due_ids) is runs
-    skipped = session.exec(
-        select(ScheduleOccurrence).where(ScheduleOccurrence.schedule_id == schedule.id)
-    ).all()
-    if runs:
-        assert skipped == []
-    else:
-        # Disabled without running carries a missed-run signal and a record.
-        assert schedule.missed_runs == 1
-        assert [o.status for o in skipped] == ["skipped"]
 
 
 # --- A poll runs in a worker thread beside the run's units, so a run can end
@@ -1085,7 +1119,8 @@ def test_a_poll_skips_a_slot_its_run_used_up_after_the_poll_read_it(tmp_path, mo
     this poll has read the schedule and before it asks whether a run is
     active. The poll then sees the slot as used: a Stopped daily run does not
     start again, and neither does a one-off whose claim disabled it."""
-    from cowork.scheduler import _claim_slot, _finish_run, _poll, _record_turn_outcome, _start_attempt
+    from cowork.scheduler import _AttemptEnd, _claim_slot, _poll, _record_attempt_end, _start_attempt
+    from cowork.schemas.schedules import AttemptOutcome
 
     engine = _file_engine(tmp_path)
     with Session(engine) as session:
@@ -1103,12 +1138,13 @@ def test_a_poll_skips_a_slot_its_run_used_up_after_the_poll_read_it(tmp_path, mo
                 scoped = ScopedSession(run_session, SYSTEM_SCOPE)
                 occurrence_id = _claim_slot(scoped, scoped.get(Schedule, schedule_id))
                 attempt = _start_attempt(scoped, occurrence_id=occurrence_id, is_manual=False)
-                outcome = _record_turn_outcome(
-                    scoped, schedule_id=schedule_id, reason=reason, conversation_id=None,
-                    occurrence_id=occurrence_id, attempt=attempt.number,
+                outcome = (
+                    AttemptOutcome.cancelled if reason == "cancelled" else AttemptOutcome.failed_during_execution
                 )
-                _finish_run(
-                    scoped, run_id=attempt.run_id, conversation_id=None, error=outcome.error, status=outcome.status,
+                _record_attempt_end(
+                    scoped, attempt=attempt, occurrence_id=occurrence_id,
+                    end=_AttemptEnd(outcome=outcome, error=None if reason == "cancelled" else "boom"),
+                    retry_delay=None, conversation_id=None,
                 )
         return has_active_run(self, asked_id)
 
