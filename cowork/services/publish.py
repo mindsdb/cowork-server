@@ -41,8 +41,10 @@ from anton.publish_access import resolve_publish_target as _anton_resolve_publis
 from cowork.services.artifacts import (
     _content_mtime,
     _load_published_map,
+    PUBLISHABLE_STATIC_SUFFIXES,
     _scan_artifact_dirs,
     html_artifacts,
+    is_non_content_path,
     resolve_artifact_path,
 )
 
@@ -303,11 +305,12 @@ def list_publishable() -> dict:
 # source of truth) and are imported at the top of this module.
 
 
-# Static artifact extensions a user can publish to a MindsHub web page.
-# `.html` is served as-is; `.md` is rendered to a styled HTML page first
-# (see `_render_markdown_to_html`). Fullstack artifacts bypass this — they
-# publish their directory regardless of the primary file's suffix.
-PUBLISHABLE_STATIC_SUFFIXES = (".html", ".md")
+def is_publishable_static(target: Path, artifacts_base: Path) -> bool:
+    """A non-fullstack target publishes only when it is an HTML/Markdown file
+    that is artifact content (not README, a generation input or a revision copy)."""
+    return target.suffix.lower() in PUBLISHABLE_STATIC_SUFFIXES and not is_non_content_path(
+        target, artifacts_base
+    )
 
 # What Share and the agent's publish tool report for a full-stack artifact when
 # the publish URL is not MindsHub's service (`is_mindshub_publish_url`).
@@ -452,8 +455,8 @@ def publish_artifact(
     publish_target, published_dir, published_key, is_fullstack = _resolve_publish_target(
         artifact, container_dirs=[artifacts_base]
     )
-    if not is_fullstack and publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
-        raise ValueError("Only HTML and Markdown artifacts can be published")
+    if not is_fullstack and not is_publishable_static(publish_target, artifacts_base):
+        raise ValueError("Only HTML and Markdown artifact content can be published")
     # Refuse before anything is built: `anton.publisher.publish` puts the
     # artifact's datasource credentials, in plaintext, in the body of a
     # full-stack upload, and a service that can't run the app would receive
@@ -636,7 +639,7 @@ def compute_publish_md5(artifact: Path, *, artifacts_base: Path) -> str | None:
         )
     except Exception:
         return None
-    if not is_fullstack and publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
+    if not is_fullstack and not is_publishable_static(publish_target, artifacts_base):
         return None
     try:
         from anton.publisher import _zip_fullstack, _zip_html
