@@ -18,6 +18,14 @@ from cowork.creators import Changer
 from cowork.managed import SharedConnection
 
 SHARED_CONNECTION_REFUSAL = "This connection is shared with you and can't be changed here."
+# A create under a name the registry still shares for one of the reader's
+# own connections that is gone. The server never writes the registry, so the
+# new connection would be shared with everyone without the operator sharing
+# it.
+STILL_SHARED_CONNECTION_REFUSAL = (
+    "This name is still shared for a connection of yours that is gone. "
+    "Ask your operator to stop sharing it before you use the name again."
+)
 
 # The bookkeeping field that records who created a connection: the person's
 # sub. A leading underscore keeps it out of the agent's environment (anton's
@@ -33,16 +41,19 @@ LABEL_FIELDS = frozenset({"_user_label", "_label"})
 
 
 class SharedConnectionError(PermissionError):
-    """A save or a delete reached a connection the saver can't change.
+    """A save or a delete reached a connection the saver can't change, or a
+    create a name the registry still shares.
 
-    The server answers it with 403 and SHARED_CONNECTION_REFUSAL
-    (cowork.server.create_app's exception handler).
+    The server answers it with 403 and ``detail``, SHARED_CONNECTION_REFUSAL
+    or STILL_SHARED_CONNECTION_REFUSAL (cowork.server.create_app's exception
+    handler).
     """
 
-    def __init__(self, *, engine: str, name: str) -> None:
-        super().__init__(SHARED_CONNECTION_REFUSAL)
+    def __init__(self, *, engine: str, name: str, detail: str = SHARED_CONNECTION_REFUSAL) -> None:
+        super().__init__(detail)
         self.engine = engine
         self.name = name
+        self.detail = detail
 
 
 @dataclass(frozen=True)
@@ -66,7 +77,9 @@ class LayeredDataVault:
     entry whose connection is gone is skipped.
 
     Only the scope's own entries can change: a save or delete of a managed or
-    shared one raises SharedConnectionError, and so does one of an own entry
+    shared one raises SharedConnectionError, and so does a create under a
+    name the registry still shares for one of the scope's own (``shared_by_own``)
+    that is gone, and a save or delete of an own entry
     the changer may not change where the own vault is deployment-wide
     (Changer.may_change): someone else's for a person, and any for a turn
     with no person. Every other save and delete goes to the own vault,
@@ -165,6 +178,10 @@ class LayeredDataVault:
         found = self._find(engine, name)
         if not self._may_change(found):
             raise SharedConnectionError(engine=engine, name=name)
+        if found.record is None and (engine, name) in self._shared_by_own:
+            raise SharedConnectionError(
+                engine=engine, name=name, detail=STILL_SHARED_CONNECTION_REFUSAL
+            )
         return self._own.save(
             engine, name, self._stamped(found, credentials), secure_keys=secure_keys
         )

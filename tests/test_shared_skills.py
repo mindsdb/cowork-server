@@ -48,6 +48,7 @@ from cowork.services.skills import (
     BUILTIN_SKILL_SLUGS,
     SHARED_SKILL_REFUSAL,
     SHARED_SKILL_RENAME_REFUSAL,
+    STILL_SHARED_SKILL_REFUSAL,
     SkillImmutableError,
     SkillService,
     link_turn_skills,
@@ -334,6 +335,31 @@ def test_alice_renames_her_shared_skill_only_after_unsharing_it(sharing, scoped)
     _write_registry(sharing, [])
     renamed = skills_ep.update_skill(SHARED, SkillUpdateRequest(label="team-report-v2"), alice, None)
     assert renamed["id"] == "team-report-v2"
+
+
+def test_a_name_still_shared_for_a_deleted_skill_is_never_taken_again(sharing, scoped):
+    """Alice deletes her shared skill, and its registry entry stays until the
+    operator unshares it. A create, upload or rename into that name would
+    share the new skill with everyone without the operator sharing it, so
+    each is refused until then."""
+    alice = scoped(ALICE)
+    skills_ep.delete_skill(SHARED, alice, None)
+    SkillService(ALICE).create_skill("private-notes", "Alice's private notes, never shared.")
+
+    for call in (
+        lambda: skills_ep.update_skill("private-notes", SkillUpdateRequest(label=SHARED), alice, None),
+        lambda: skills_ep.create_skill(SkillCreateRequest(label=SHARED, instructions="x"), alice, None),
+        lambda: skills_ep._upload_skill_bytes(_skill_md(SHARED, "x").encode(), "SKILL.md", alice, None),
+        lambda: skills_ep._upload_skill_bytes(_zip(SHARED, "x"), "skill.zip", alice, None),
+    ):
+        _refused(call, STILL_SHARED_SKILL_REFUSAL)
+    assert not (SkillService(ALICE).root / SHARED).exists()
+    assert SHARED not in _listed(scoped, BOB)
+
+    _write_registry(sharing, [])
+    renamed = skills_ep.update_skill("private-notes", SkillUpdateRequest(label=SHARED), alice, None)
+    assert (renamed["id"], renamed["shared"]) == (SHARED, False)
+    assert SHARED not in _listed(scoped, BOB)
 
 
 def test_bobs_turn_links_alices_shared_skill_and_not_her_unshared_one(sharing, stores):

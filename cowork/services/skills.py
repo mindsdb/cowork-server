@@ -76,6 +76,14 @@ SHARED_SKILL_REFUSAL = "This skill is shared with you and can't be changed here.
 # A shared skill's registry entry names it by slug, its only identity, and the
 # server never writes the registry, so a rename would quietly stop sharing it.
 SHARED_SKILL_RENAME_REFUSAL = "Stop sharing this skill before you rename it."
+# A create, upload or rename into a name the registry still shares for one of
+# the owner's own skills that is gone. The server never writes the registry,
+# so the new skill would be shared with everyone without the operator sharing
+# it.
+STILL_SHARED_SKILL_REFUSAL = (
+    "This name is still shared for a skill of yours that is gone. "
+    "Ask your operator to stop sharing it before you use the name again."
+)
 
 
 # Per-file cap (matches the skill-draft cap): filters mispackaged data blobs and
@@ -684,6 +692,14 @@ class SkillService:
         if self._changer.creator is not None:
             metadata[META_CREATED_BY] = self._changer.creator
 
+    def _refuse_if_still_shared(self, slug: str) -> None:
+        """Refuse a new skill of the owner's at ``slug``, which the store
+        doesn't hold, while the registry still shares that name of theirs
+        (shared_by_owner): it would be shared with everyone without the
+        operator sharing it. Answers STILL_SHARED_SKILL_REFUSAL."""
+        if slug in self.shared_by_owner():
+            raise SkillImmutableError(STILL_SHARED_SKILL_REFUSAL)
+
     def as_own(self, skill: Skill) -> VisibleSkill:
         """``skill``, one of the store's own, as its owner sees it."""
         return VisibleSkill(
@@ -961,6 +977,7 @@ class SkillService:
             raise ValueError(f"Skill name {label!r} is reserved for MindsHub Code.")
         if self._skill_dir(label).exists():
             raise SkillAlreadyExistsError(f"A skill named '{label}' already exists.")
+        self._refuse_if_still_shared(label)
 
         metadata = self._build_metadata(label, name, datetime.now(UTC))
         self._apply_metadata_flags(metadata, enabled, projects)
@@ -1026,6 +1043,8 @@ class SkillService:
         renaming = new_slug != skill.name
         if renaming and self._skill_dir(new_slug).exists():
             raise SkillAlreadyExistsError(f"A skill named '{new_slug}' already exists.")
+        if renaming:
+            self._refuse_if_still_shared(new_slug)
 
         candidate = skill.model_copy(deep=True)
         candidate.name = new_slug
@@ -1162,6 +1181,7 @@ class SkillService:
             before_persist(skill.name)
         if self._skill_dir(skill.name).exists():
             raise FileExistsError(f"A skill named '{skill.name}' already exists.")
+        self._refuse_if_still_shared(skill.name)
 
         metadata = dict(skill.metadata)
         metadata.setdefault(META_CREATED_AT, datetime.now(UTC).isoformat())

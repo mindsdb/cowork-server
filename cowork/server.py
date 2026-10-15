@@ -27,7 +27,7 @@ from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
 from cowork.managed import SharedRegistryError, cortex_takes_managed_layer, managed_folder
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
-from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL, SharedConnectionError
+from cowork.services.connectors.layered_vault import SharedConnectionError
 from cowork.streaming import TurnInProgress
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import cowork_home
@@ -357,12 +357,13 @@ def create_app() -> FastAPI:
     async def _turn_in_progress(request, exc):
         return JSONResponse(TURN_IN_PROGRESS.model_dump(), status_code=exc.status_code)
 
-    # A save or delete that reached a connection the caller can't change
-    # (LayeredDataVault). The connections routes refuse one up front; this
-    # answers the same for a save whose derived name lands on one.
+    # A save or delete that reached a connection the caller can't change, or
+    # a create under a name the registry still shares (LayeredDataVault). The
+    # connections routes refuse a change up front; this answers the same for
+    # a save whose derived name lands on one, and the create.
     @app.exception_handler(SharedConnectionError)
-    async def _shared_connection(request, exc):
-        return JSONResponse({"detail": SHARED_CONNECTION_REFUSAL}, status_code=403)
+    async def _shared_connection(request, exc: SharedConnectionError):
+        return JSONResponse({"detail": exc.detail}, status_code=403)
 
     # Bearer-token auth. On by default in local mode (see AppSettings.
     # require_auth). Token is auto-generated on first startup when

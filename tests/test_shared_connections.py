@@ -50,6 +50,7 @@ from cowork.services.connectors.connections import ConnectionsService
 from cowork.services.connectors.layered_vault import (
     CREATED_BY_FIELD,
     SHARED_CONNECTION_REFUSAL,
+    STILL_SHARED_CONNECTION_REFUSAL,
     LayeredDataVault,
     SharedConnectionError,
 )
@@ -442,6 +443,37 @@ async def test_where_all_are_shared_a_pasted_connection_never_lands_on_someone_e
     assert answer.startswith(f"Updated connection `postgres-{bobs}`"), answer
     assert _stored(LOCAL_SCOPE, bobs)["password"] == "rotatedSecret1"
     assert own_vault_for_scope(LOCAL_SCOPE).read_record("postgres", "erp") == alices
+
+
+async def test_a_name_still_shared_for_a_deleted_connection_is_never_taken_again(sharing, monkeypatch):
+    """Alice deletes her shared connection, and its registry entry stays
+    until the operator unshares it. A new connection of hers under that name
+    would be shared with everyone without the operator sharing it, so its
+    save is refused until then."""
+    _no_revoke(monkeypatch)
+    await connections_ep.delete_connection("postgres", "erp", ALICE, None)
+    admin = {**ERP, "user": "admin", "password": "adminSecret123"}
+
+    with pytest.raises(SharedConnectionError) as refused:
+        persist_connection("postgres", None, "erp", dict(admin), scope=ALICE)
+    assert str(refused.value) == STILL_SHARED_CONNECTION_REFUSAL
+    monkeypatch.setenv("COWORK_AUTH_TOKEN", TOKEN)
+    get_app_settings.cache_clear()
+    client = TestClient(
+        cowork_server.create_app(), base_url="http://127.0.0.1:26866", client=("127.0.0.1", 54321)
+    )
+    response = client.post(
+        "/api/v1/connectors/connections/save",
+        headers={"Authorization": f"Bearer {TOKEN}", "X-User-Id": SUB_A, "X-Organization-Id": DEPLOYMENT},
+        json={"connector_id": "postgres", "method": None, "name": "erp", "values": admin},
+    )
+    assert (response.status_code, response.json()) == (403, {"detail": STILL_SHARED_CONNECTION_REFUSAL})
+    assert own_vault_for_scope(ALICE).read_record("postgres", "erp") is None
+    assert ("postgres", "erp") not in _names(vault_for_scope(BOB))
+
+    _write_registry(sharing, [])
+    assert persist_connection("postgres", None, "erp", dict(admin), scope=ALICE) == "erp"
+    assert ("postgres", "erp") not in _names(vault_for_scope(BOB))
 
 
 def test_only_registry_entries_of_existing_connections_are_read(sharing):
