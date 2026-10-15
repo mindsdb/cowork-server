@@ -1420,7 +1420,7 @@ class ResponsesHandler:
             settings = get_user_settings(session.scope)
             if not settings.memory_enabled or settings.memory_mode == "off":
                 logger.info("[responses] memory is off; dropped %d memory entr(ies) for conversation %s",
-                            len(entries), conv_id)
+                            len(entries), conv_id, extra=log_context(conversation_id=conv_id))
                 return
             conversation = ConversationService(session).get_conversation(conv_id)
             from cowork.models.project import Project
