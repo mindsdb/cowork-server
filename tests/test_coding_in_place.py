@@ -179,6 +179,89 @@ def test_a_follow_up_waits_while_another_in_place_task_runs_in_the_repository(tm
     wait_for_status(service, second.id, SessionStatus.completed)
 
 
+def test_discarding_a_finished_task_is_refused_while_another_works_in_the_folder(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    first = wait_for_status(service, in_place(service, repo, "First").id, SessionStatus.completed)
+    engine.block_until_release = True
+    try:
+        second = in_place(service, repo, "Second")
+        assert engine.started.wait(timeout=3)
+        # The second task edits the file the first one's review still lists.
+        (repo / "README.md").write_text("second task's work\n", encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="Another task is working in this folder"):
+            service.review_file_action(first.id, None, "README.md", "discard")
+        with pytest.raises(RuntimeError, match="Another task is working in this folder"):
+            service.commit(first.id, "Commit someone else's work")
+        assert (repo / "README.md").read_text(encoding="utf-8") == "second task's work\n"
+    finally:
+        engine.release_events.set()
+    wait_for_status(service, second.id, SessionStatus.completed)
+
+
+def test_a_turn_cannot_start_while_another_task_changes_the_folder(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    service = service_with(tmp_path, FakeEngine())
+    first = wait_for_status(service, in_place(service, repo, "First").id, SessionStatus.completed)
+    second = wait_for_status(service, in_place(service, repo, "Second").id, SessionStatus.completed)
+
+    with service._maintenance_session(first.id, "busy"):
+        with pytest.raises(RuntimeError, match="Another task is changing files in this folder"):
+            in_place(service, repo, "Third")
+        with pytest.raises(RuntimeError, match="Another task is changing files in this folder"):
+            service.submit_turn(second.id, "Follow up", CREDS)
+        with pytest.raises(RuntimeError, match="Another task is changing files in this folder"):
+            service.review_file_action(second.id, None, "README.md", "discard")
+
+    # The reservation ends with the operation, even one that failed.
+    with pytest.raises(ValueError):
+        with service._maintenance_session(first.id, "busy"):
+            raise ValueError("operation failed")
+    wait_for_status(service, service.submit_turn(second.id, "Follow up", CREDS).id, SessionStatus.completed)
+
+
+def test_a_repository_inside_another_is_coordinated_with_it(tmp_path: Path) -> None:
+    outer = repository(tmp_path)
+    inner_parent = tmp_path / "inner-parent"
+    inner_parent.mkdir()
+    inner = repository(inner_parent)
+    nested = outer / "vendor" / "inner"
+    nested.parent.mkdir()
+    inner.rename(nested)
+    service = service_with(tmp_path, FakeEngine())
+    outer_task = wait_for_status(service, in_place(service, outer, "Outer").id, SessionStatus.completed)
+
+    with service._maintenance_session(outer_task.id, "busy"):
+        with pytest.raises(RuntimeError, match="Another task is changing files in this folder"):
+            in_place(service, nested, "Inner")
+
+
+def test_applying_a_worktree_task_waits_for_an_in_place_task_in_its_source(tmp_path: Path) -> None:
+    repo = repository(tmp_path)
+    engine = FakeEngine()
+    service = service_with(tmp_path, engine)
+    isolated = wait_for_status(
+        service,
+        service.create_session(SessionCreateRequest(path=str(repo), prompt="Isolated"), CREDS, "fake", "fake-model").id,
+        SessionStatus.completed,
+    )
+    (Path(isolated.workspace_path) / "README.md").write_text("isolated change\n", encoding="utf-8")
+    engine.block_until_release = True
+    try:
+        active = in_place(service, repo, "In place")
+        assert engine.started.wait(timeout=3)
+        (repo / "README.md").write_text("in-place work\n", encoding="utf-8")
+
+        with pytest.raises(RuntimeError, match="Another task is working in this folder"):
+            service.apply_to_source(isolated.id)
+        assert (repo / "README.md").read_text(encoding="utf-8") == "in-place work\n"
+    finally:
+        engine.release_events.set()
+    wait_for_status(service, active.id, SessionStatus.completed)
+
+
 def test_apply_explains_the_changes_are_already_in_the_folder(tmp_path: Path) -> None:
     repo = repository(tmp_path)
     service = service_with(tmp_path, FakeEngine())

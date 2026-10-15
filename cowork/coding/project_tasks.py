@@ -149,6 +149,7 @@ class ProjectTaskOperations:
         with self.maintenance_session(
             session_id,
             "Wait for the active turn to finish before applying task changes",
+            touches_source=True,
         ) as session:
             if session.workspaces:
                 applied = self.project_workspaces.apply(session.id, session.workspaces)
