@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -8,6 +9,7 @@ from functools import partial
 from typing import TYPE_CHECKING, TypeVar
 from uuid import UUID, uuid4
 
+import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
@@ -21,11 +23,18 @@ from cowork.db.scoped import (
     unsafe_unscoped_session,
 )
 from cowork.db.units import run_db
-from cowork.models.schedule import Schedule, ScheduleOccurrence
-from cowork.schedule_timing import advance_occurrence, overdue_slots
-from cowork.schemas.schedules import Cadence, MissedRunPolicy, OccurrenceStatus, RunStatus, resolve_schedule_model
-from cowork.services.schedules import ScheduleOccurrenceService, ScheduleRunService, ScheduleService
+from cowork.models.schedule import Schedule, ScheduleSkippedPeriod
+from cowork.schedule_timing import missed_slots, next_future_occurrence
+from cowork.schemas.schedules import AttemptOutcome, Cadence, RunStatus, resolve_schedule_model
+from cowork.services.schedules import (
+    ScheduleOccurrenceService,
+    ScheduleRunService,
+    ScheduleService,
+    Settlement,
+    StartedAttempt,
+)
 from cowork.streaming.registry import registry
+from cowork.streaming.stop import CANCEL_FLAG_TTL_SECONDS, remote_backend, stop_turn
 
 if TYPE_CHECKING:
     from cowork.principal import Principal
@@ -37,56 +46,53 @@ T = TypeVar("T")
 _POLL_INTERVAL_SECONDS = 30
 # Upper bound on a single run. A hung agent (stuck tool call, wedged stream)
 # must not keep its ScheduleRun in `running` forever — that would block the
-# schedule from ever firing again. On timeout the run is recorded as failed.
+# schedule from ever firing again. On timeout the turn is stopped and the run
+# recorded as interrupted. The registry's idle watchdog only bounds a turn
+# that stops making progress; this bounds one that keeps going.
 _MAX_RUN_DURATION_SECONDS = 600
-# How long a run's last writes, its outcome and its finish, keep asking for a
-# database connection while the pool is full. They must land: a run left at
-# `running` stops its schedule firing until a restart, and an outcome never
-# recorded leaves its slot due, so the slot would run a second time. Each try
-# already waits POOL_TIMEOUT for a connection; the pause between tries only
-# keeps a refusal that comes back at once from spinning.
+# How long a run's last writes keep asking for a database connection while
+# the pool is full. They must land: a run left at `running` reads as busy,
+# and an outcome never recorded leaves its occurrence held until its lease
+# lapses. Each try already waits POOL_TIMEOUT for a connection; the pause
+# between tries only keeps a refusal that comes back at once from spinning.
 _BOOKKEEPING_DEADLINE_SECONDS = _MAX_RUN_DURATION_SECONDS
 _BOOKKEEPING_RETRY_PAUSE_SECONDS = 1.0
 # A cron occurrence gets this many attempts before it settles failed, with
-# these pauses before the second and later attempts. A manual run gets one:
-# the user is watching and can press Run again.
+# these pauses before the second and later attempts. Only an attempt that
+# failed before it acted is tried again. A manual run gets one: the user is
+# watching and can press Run again.
 _MAX_CRON_ATTEMPTS = 3
 _RETRY_DELAYS_SECONDS = (60, 300)
 _MANUAL_MAX_ATTEMPTS = 1
-# Occurrences this process runs at once. A due slot past the cap stays due and
-# a later poll claims it, rather than every due task starting a turn together.
+# Scheduled runs this process executes at once (see _Admission).
 _MAX_CONCURRENT_RUNS = 3
-# How long an attempt may hold its occurrence before a poll presumes the
-# process running it died: the turn's own bound, plus the time its last writes
-# may spend waiting for a connection, plus slack.
-_LEASE_SECONDS = _MAX_RUN_DURATION_SECONDS + _BOOKKEEPING_DEADLINE_SECONDS + 60
+# An attempt renews its lease this often while it runs. One whose lease
+# lapses is presumed dead: its process exited, or has been out of touch with
+# the database for several renewals.
+_LEASE_SECONDS = 300
+_LEASE_RENEW_SECONDS = 60
+# How long a stop waits for the turn before saying it is late; the schedule
+# stays held until the turn does stop. A pod cannot confirm it stopped, so
+# its schedule is held for as long as the stop request stays live.
+_STOP_GRACE_SECONDS = 30
+_REMOTE_STOP_GRACE_SECONDS = CANCEL_FLAG_TTL_SECONDS
 _scheduler_task: asyncio.Task | None = None
-# Occurrences this process is running now; the poll sizes its claims by it and
-# never reaps one of its own.
-_inflight: set[UUID] = set()
 
 _RECURRING_CADENCES = {Cadence.hourly, Cadence.daily, Cadence.weekly, Cadence.weekdays}
 
-# How late a slot may be and still count as on time rather than missed. The
-# `skip` policy still runs a slot this late, and a one-off under it is
-# disabled only once it is later than this. The poll runs every 30s, so an
-# on-time slot is never close to it.
-_LATE_GRACE_SECONDS = 60 * 60
-# Missed slots older than this are never run, whatever the policy; they are
-# counted in missed_runs only.
+# A one-off may start up to this late on its own. At this lateness or more
+# (the app was not running when its time came) it is shown as missed, and
+# runs only when the user presses Run now.
+_ONCE_LATE_LIMIT = timedelta(hours=1)
+# A recurring schedule that missed slots runs the latest one once, when that
+# slot is no older than this; every other missed slot is passed over.
 _MISSED_RUN_LOOKBACK = timedelta(days=7)
-# The most missed slots `bounded_catch_up` will run after an outage.
-_MAX_CATCH_UP = 10
-# Cron occurrences in a row that may settle failed before the schedule pauses
-# itself. Retries within one occurrence count once.
-_MAX_FAILED_OCCURRENCES = 3
 
 # Freshness guard (ENG-688): if a successful manual "run now" finished this
 # recently before a due cron slot, the slot is skipped instead of executed,
-# so both runs don't publish the same output twice. Only manual runs count: a
-# cron run is its own slot, and counting it would skip the slots a catch-up
-# runs back to back. Hourly gets a tighter window so a run finishing mid-hour
-# never suppresses the next slot.
+# so both runs don't publish the same output twice. Only manual runs count:
+# a cron run is its own slot. Hourly gets a tighter window so a run
+# finishing mid-hour never suppresses the next slot.
 _FRESHNESS_WINDOW_SECONDS = {
     Cadence.once: 60 * 60,
     Cadence.hourly: 30 * 60,
@@ -105,9 +111,7 @@ def _advance_next_run_at(schedule: Schedule, session) -> None:
     if schedule.cadence not in _RECURRING_CADENCES:
         return
 
-    # One slot on, not straight past now: a catch-up runs the missed slots in
-    # turn, and the missed-run policy repositions anything else left behind.
-    schedule.next_run_at = advance_occurrence(
+    schedule.next_run_at = next_future_occurrence(
         schedule.cadence,
         schedule.next_run_at,
         schedule.timezone,
@@ -136,111 +140,92 @@ def _apply_success_write_back(
     session.add(schedule)
 
 
-def _select_missed(policy: str, slots: list[datetime], now: datetime) -> list[datetime]:
-    """Which of a schedule's overdue slots (oldest first, all inside the
-    lookback) its missed-run policy runs."""
-    if not slots:
-        return []
-    if policy == MissedRunPolicy.skip:
-        latest = slots[-1]
-        return [latest] if (now - latest).total_seconds() <= _LATE_GRACE_SECONDS else []
-    if policy == MissedRunPolicy.bounded_catch_up:
-        return slots[-_MAX_CATCH_UP:]
-    return slots[-1:]
+def _locked_schedule(session: ScopedSession, schedule_id: UUID) -> Schedule | None:
+    """The schedule as the database holds it now, locked until the caller's
+    commit on Postgres, so a pause or another poller's write waits for it,
+    or it for them. SQLite runs one writer at a time anyway."""
+    return session.exec(
+        session.select(Schedule)
+        .where(Schedule.id == schedule_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).first()
 
 
-def _record_skipped(session, schedule_id, slots: list[datetime]) -> None:
-    """Stage one settled `skipped` occurrence per slot passed over, so the
-    history shows what did not run. A slot already recorded is left as is."""
-    if not slots:
-        return
-    keys = {_slot_key(slot): slot for slot in slots}
-    taken = set(
-        session.exec(
-            session.select(ScheduleOccurrence.occurrence_key)
-            .where(ScheduleOccurrence.schedule_id == schedule_id)
-            .where(ScheduleOccurrence.occurrence_key.in_(list(keys)))  # type: ignore[attr-defined]
-        ).all()
-    )
-    now = datetime.now(timezone.utc)
-    for key, slot in keys.items():
-        if key in taken:
-            continue
-        session.add(
-            ScheduleOccurrence(
-                schedule_id=schedule_id,
-                occurrence_key=key,
-                trigger_source="cron",
-                scheduled_for=slot,
-                status=OccurrenceStatus.skipped,
-                settled_at=now,
-            )
-        )
+def _catch_up(session: ScopedSession, schedule_id: UUID, now: datetime) -> None:
+    """Bring one schedule that fell behind up to date, in one commit.
 
-
-def _handle_missed_once(session, schedule: Schedule, next_run: datetime, now: datetime) -> None:
-    """A one-off whose time passed runs at the next opportunity, unless it is
-    too late for its policy; then it is disabled and recorded as skipped."""
-    late = now - next_run
-    limit = (
-        timedelta(seconds=_LATE_GRACE_SECONDS)
-        if schedule.missed_run_policy == MissedRunPolicy.skip
-        else _MISSED_RUN_LOOKBACK
-    )
-    if late <= limit:
-        return
-    schedule.missed_runs += 1
-    schedule.enabled = False
-    session.add(schedule)
-    _record_skipped(session, schedule.id, [next_run])
-
-
-def _handle_missed_recurring(session, schedule: Schedule, next_run: datetime, now: datetime) -> None:
-    """Move a recurring schedule's slot to the first missed slot its policy
-    runs, or past now when it runs none, and record the rest as skipped.
-
-    The due-check then claims the selected slots one at a time, as each
-    occurrence settles. Applying the policy again to a schedule it already
-    moved changes nothing, so a poll that repeats it is harmless.
+    A recurring schedule moves its slot to the latest missed one inside the
+    lookback, which the due-check then runs once, or past now when there is
+    none; the slots passed over are summarized. A one-off at or past the
+    late limit is marked missed. Done under the schedule's lock and against
+    its current row, so a repeat (this poll's next pass, or another poller)
+    finds nothing left to do and records nothing twice.
     """
-    older, recent, future = overdue_slots(
-        schedule.cadence,
-        next_run,
-        schedule.timezone,
-        now=now,
-        since=now - _MISSED_RUN_LOOKBACK,
-    )
-    selected = _select_missed(schedule.missed_run_policy, recent, now)
-    passed_over = [slot for slot in recent if slot not in selected]
-    if not older and not passed_over:
+    schedule = _locked_schedule(session, schedule_id)
+    if schedule is None or not schedule.enabled or schedule.paused_at or schedule.auto_paused_at:
+        session.rollback()
         return
-    schedule.missed_runs += older + len(passed_over)
-    schedule.next_run_at = selected[0] if selected else future
-    session.add(schedule)
-    _record_skipped(session, schedule.id, passed_over)
+    seen = schedule.next_run_at
+    next_run = ensure_utc(seen)
+    if next_run > now:
+        session.rollback()
+        return
+    if schedule.cadence == Cadence.once:
+        if now - next_run < _ONCE_LATE_LIMIT:
+            session.rollback()
+            return
+        moved = dict(enabled=False, missed_at=now)
+        first = last = next_run
+        count, reason = 1, "one_off_missed"
+    elif schedule.cadence in _RECURRING_CADENCES:
+        missed = missed_slots(
+            schedule.cadence, next_run, schedule.timezone, now=now, lookback=_MISSED_RUN_LOOKBACK,
+        )
+        if not missed.skipped:
+            session.rollback()
+            return
+        moved = dict(next_run_at=missed.run or missed.future)
+        first, last = missed.first_skipped, missed.last_skipped
+        count, reason = missed.skipped, "offline"
+    else:
+        session.rollback()
+        return
+    # Conditional on the slot this read: SQLite takes no row lock, so a
+    # second poller that read the same row before this commit must not
+    # record the same stretch again.
+    landed = unsafe_unscoped_session(session).execute(
+        sa.update(Schedule)
+        .where(Schedule.id == schedule_id, Schedule.next_run_at == seen, Schedule.enabled == sa.true())
+        .values(missed_runs=Schedule.missed_runs + count, **moved)
+        .execution_options(synchronize_session=False)
+    ).rowcount
+    if not landed:
+        session.rollback()
+        return
+    session.add(ScheduleSkippedPeriod(
+        schedule_id=schedule_id, first_slot=first, last_slot=last, slot_count=count, reason=reason,
+    ))
+    session.commit()
+    logger.info(f"Schedule {schedule_id}: passed over {count} missed slot(s) ({reason})")
 
 
-def _handle_missed_runs(session) -> None:
-    """Apply each schedule's missed-run policy to the slots it missed.
+def _handle_missed_runs(session: ScopedSession, now: datetime) -> None:
+    """Bring every schedule that fell behind up to date (_catch_up).
 
     A schedule with an occurrence in flight is left alone: its slot is not
-    due again until that occurrence settles, and the policy then sees every
-    slot that passed meanwhile.
+    due again until that occurrence settles, and the next poll then sees
+    every slot that passed meanwhile.
     """
-    now = datetime.now(timezone.utc)
     occurrences = ScheduleOccurrenceService(session)
-    for schedule in ScheduleService(session).list_schedules():
-        if not schedule.enabled:
-            continue
-        next_run = ensure_utc(schedule.next_run_at)
-        if next_run >= now or occurrences.has_active(schedule.id):
-            continue
-        if schedule.cadence == Cadence.once:
-            _handle_missed_once(session, schedule, next_run, now)
-        elif schedule.cadence in _RECURRING_CADENCES:
-            _handle_missed_recurring(session, schedule, next_run, now)
-
+    behind = [
+        s.id for s in ScheduleService(session).list_schedules()
+        if s.enabled and ensure_utc(s.next_run_at) <= now
+    ]
     session.commit()
+    for schedule_id in behind:
+        if not occurrences.has_active(schedule_id):
+            _catch_up(session, schedule_id, now)
 
 
 def _principal_for_schedule(schedule: Schedule) -> Principal | None:
@@ -273,20 +258,84 @@ class _ScheduledTurn:
 
 
 @dataclass(frozen=True)
-class _RunOutcome:
-    """How a finished turn is recorded on its run."""
+class _TurnEvidence:
+    """What a finished turn's own stream says about how it went."""
 
-    status: RunStatus | None = None
-    error: str | None = None
+    # The terminal record's reason, or None when there is no terminal record.
+    reason: str | None
+    # Whether the stream holds anything beyond the turn's start, its progress
+    # frames and its failure: an answer, a tool call, anything the agent did.
+    acted: bool
 
 
 @dataclass(frozen=True)
-class _Attempt:
-    """The attempt a run is: which schedule, and which try at its occurrence."""
+class _AttemptEnd:
+    """How an attempt ended, by what is known of its execution."""
 
-    run_id: UUID
-    schedule_id: UUID
-    number: int
+    outcome: AttemptOutcome
+    error: str | None = None
+    # Whether the same failure could go differently next time. Only an
+    # attempt that failed before execution is ever tried again.
+    retryable: bool = False
+
+
+# Frames a turn writes before its agent can do anything, and its failure. A
+# failed turn whose stream holds nothing else failed before it acted.
+_PRE_EXECUTION_EVENTS = frozenset({
+    "response.created", "response.in_progress", "response.queued", "response.failed",
+})
+
+
+class _Admission:
+    """Scheduled runs this process executes at once, cron and run-now alike.
+
+    A due slot past the cap stays due and a later poll claims it; a run-now
+    past the cap is refused with a reason. Each process keeps its own count:
+    this bounds one process's load, not the fleet's.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._lock = threading.Lock()
+        self._held: set[UUID] = set()
+        self._reserved = 0
+
+    def free(self) -> int:
+        with self._lock:
+            return max(self._limit - len(self._held) - self._reserved, 0)
+
+    def holds(self, occurrence_id: UUID) -> bool:
+        with self._lock:
+            return occurrence_id in self._held
+
+    def admit(self, occurrence_id: UUID) -> None:
+        """Count an occurrence the caller already sized against free()."""
+        with self._lock:
+            self._held.add(occurrence_id)
+
+    def reserve(self) -> bool:
+        """Hold a place for a run-now before it claims, or False when full."""
+        with self._lock:
+            if len(self._held) + self._reserved >= self._limit:
+                return False
+            self._reserved += 1
+            return True
+
+    def fill(self, occurrence_id: UUID) -> None:
+        with self._lock:
+            self._reserved -= 1
+            self._held.add(occurrence_id)
+
+    def unreserve(self) -> None:
+        with self._lock:
+            self._reserved -= 1
+
+    def release(self, occurrence_id: UUID) -> None:
+        with self._lock:
+            self._held.discard(occurrence_id)
+
+
+admission = _Admission(_MAX_CONCURRENT_RUNS)
 
 
 def _slot_key(scheduled_for: datetime) -> str:
@@ -307,6 +356,18 @@ def _claim_slot(session: ScopedSession, schedule: Schedule) -> UUID | None:
     """
     scheduled_for = ensure_utc(schedule.next_run_at)
     schedule_id = schedule.id
+    # Claimed against the row as it stands under its lock: a pause, or a
+    # poller that already moved the slot on, leaves nothing to claim.
+    schedule = _locked_schedule(session, schedule_id)
+    if (
+        schedule is None
+        or not schedule.enabled
+        or schedule.paused_at is not None
+        or schedule.auto_paused_at is not None
+        or ensure_utc(schedule.next_run_at) != scheduled_for
+    ):
+        session.rollback()
+        return None
     _advance_next_run_at(schedule, session)
     occurrence = ScheduleOccurrenceService(session).claim(
         schedule_id,
@@ -322,15 +383,15 @@ def _claim_slot(session: ScopedSession, schedule: Schedule) -> UUID | None:
 def claim_manual_run(session: ScopedSession, schedule_id: UUID) -> UUID | None:
     """Claim a run-now occurrence, or None while the schedule is busy.
 
-    Running a one-off now uses it up: it is disabled in the same commit as the
-    claim, so its scheduled slot does not fire a second time. A refused claim
-    rolls that back and leaves the one-off as it was. A recurring schedule
-    keeps its slot; the freshness guard skips a slot due right after a manual
-    success.
+    Running a one-off now uses it up, missed or not: it is disabled in the
+    same commit as the claim, so its own time does not fire it a second time.
+    A refused claim rolls that back. A recurring schedule keeps its slot; the
+    freshness guard skips a slot due right after a manual success.
     """
     schedule = session.get(Schedule, schedule_id)
-    if schedule is not None and schedule.cadence == Cadence.once and schedule.enabled:
+    if schedule is not None and schedule.cadence == Cadence.once:
         schedule.enabled = False
+        schedule.missed_at = None
         session.add(schedule)
     occurrence = ScheduleOccurrenceService(session).claim(
         schedule_id,
@@ -349,13 +410,24 @@ def _claim_for_schedule(session: ScopedSession, *, schedule_id: UUID, is_manual:
     return _claim_slot(session, ScheduleService(session).get_schedule(schedule_id))
 
 
-def _start_attempt(session: ScopedSession, *, occurrence_id: UUID, is_manual: bool) -> _Attempt | None:
-    run = ScheduleOccurrenceService(session).start_attempt(
+def _start_attempt(session: ScopedSession, *, occurrence_id: UUID, is_manual: bool) -> StartedAttempt | None:
+    return ScheduleOccurrenceService(session).start_attempt(
         occurrence_id, is_manual=is_manual, lease_seconds=_LEASE_SECONDS
     )
-    if run is None:
-        return None
-    return _Attempt(run_id=run.id, schedule_id=run.schedule_id, number=run.attempt or 1)
+
+
+def _renew_lease(session: ScopedSession, *, occurrence_id: UUID, token: str) -> bool:
+    return ScheduleOccurrenceService(session).renew(occurrence_id, token, lease_seconds=_LEASE_SECONDS)
+
+
+def _begin_execution(session: ScopedSession, *, attempt: StartedAttempt, occurrence_id: UUID) -> bool:
+    return ScheduleOccurrenceService(session).begin_execution(
+        attempt, occurrence_id, lease_seconds=_LEASE_SECONDS
+    )
+
+
+def _request_stop(session: ScopedSession, *, run_id: UUID) -> None:
+    ScheduleOccurrenceService(session).request_stop(run_id)
 
 
 def _read_schedule(session: ScopedSession, *, schedule_id: UUID) -> _ScheduledTurn:
@@ -406,99 +478,75 @@ def _link_conversation(
     return conversation_id
 
 
-def _settle_occurrence(
-    session: ScopedSession, *, occurrence_id: UUID | None, attempt: int, outcome: _RunOutcome, retryable: bool,
-) -> None:
-    """Stage where the attempt leaves its occurrence: settled, or waiting for
-    its next attempt. The caller commits."""
-    if occurrence_id is None:
-        return
-    occurrences = ScheduleOccurrenceService(session)
-    if outcome.status == RunStatus.cancelled:
-        # The user stopped it; trying again would undo that.
-        occurrences.settle(occurrence_id, OccurrenceStatus.cancelled)
-    elif outcome.status == RunStatus.failed:
-        occurrences.fail_attempt(
-            occurrence_id,
-            error=outcome.error or "Run failed",
-            retry_delay=_retry_delay(attempt) if retryable else None,
-        )
-    else:
-        occurrences.settle(occurrence_id, OccurrenceStatus.success)
-    _count_settlement(session, occurrence_id)
+def _run_status(outcome: AttemptOutcome) -> RunStatus:
+    if outcome == AttemptOutcome.completed:
+        return RunStatus.success
+    if outcome == AttemptOutcome.cancelled:
+        return RunStatus.cancelled
+    return RunStatus.failed
 
 
-def _count_settlement(session: ScopedSession, occurrence_id: UUID) -> None:
-    """Stage the schedule's failure streak for an occurrence that just settled,
-    and pause the schedule when the streak reaches its limit.
-
-    Only cron occurrences that settle failed extend the streak; a success of
-    either kind ends it. A cancelled or skipped occurrence leaves it as is,
-    and so does a manual failure, which the user saw happen.
-    """
-    occurrence = ScheduleOccurrenceService(session).get(occurrence_id)
-    if occurrence is None or occurrence.status == OccurrenceStatus.active:
-        return
-    schedule = session.get(Schedule, occurrence.schedule_id)
-    if schedule is None:
-        return
-    if occurrence.status == OccurrenceStatus.success:
-        schedule.consecutive_failures = 0
-    elif occurrence.status == OccurrenceStatus.failed and occurrence.trigger_source != "manual":
-        schedule.consecutive_failures += 1
-        if schedule.consecutive_failures >= _MAX_FAILED_OCCURRENCES and schedule.enabled:
-            schedule.enabled = False
-            schedule.auto_paused_at = datetime.now(timezone.utc)
-            logger.warning(
-                f"Schedule {schedule.id} paused after {schedule.consecutive_failures} failed runs in a row"
-            )
-    else:
-        return
-    session.add(schedule)
-
-
-def _record_turn_outcome(
+def _stage_attempt_end(
     session: ScopedSession,
     *,
-    schedule_id: UUID,
-    reason: str | None,
+    attempt: StartedAttempt,
+    occurrence_id: UUID,
+    end: _AttemptEnd,
+    retry_delay: float | None,
     conversation_id: UUID | None,
-    occurrence_id: UUID | None = None,
-    attempt: int = 1,
-) -> _RunOutcome:
-    schedule_service = ScheduleService(session)
+) -> Settlement:
+    occurrences = ScheduleOccurrenceService(session)
     run_service = ScheduleRunService(session)
-    # Read again: the schedule may have changed while the turn ran.
-    schedule = schedule_service.get_schedule(schedule_id)
-    outcome = _RunOutcome()
-    if reason == "cancelled":
-        outcome = _RunOutcome(status=RunStatus.cancelled)
-        logger.info(f"Schedule {schedule_id} run was cancelled")
-    elif reason is not None and reason != "completed":
-        outcome = _RunOutcome(
-            status=RunStatus.failed,
-            error="Run did not complete — open the run's task for details.",
-        )
-        schedule.last_error = outcome.error
-        session.add(schedule)
-    else:
-        _apply_success_write_back(schedule, run_service, conversation_id, session)
-    _settle_occurrence(session, occurrence_id=occurrence_id, attempt=attempt, outcome=outcome, retryable=True)
+    settlement = occurrences.end_attempt(
+        occurrence_id, attempt.token, outcome=end.outcome, error=end.error, retry_delay=retry_delay,
+    )
+    if settlement != Settlement.lost:
+        # Read again: the schedule may have changed while the turn ran.
+        schedule = ScheduleService(session).get_schedule(attempt.schedule_id)
+        if end.outcome == AttemptOutcome.completed:
+            _apply_success_write_back(schedule, run_service, conversation_id, session)
+        elif end.outcome != AttemptOutcome.cancelled:
+            schedule.last_error = end.error
+            session.add(schedule)
+    run_service.end_run(
+        attempt.run_id,
+        status=_run_status(end.outcome),
+        error=end.error,
+        outcome=end.outcome,
+        conversation_id=conversation_id,
+    )
+    return settlement
 
+
+def _record_attempt_end(session: ScopedSession, **kwargs) -> Settlement:
+    """Record how the attempt ended, on its run, its occurrence and its
+    schedule, in one commit.
+
+    Lands on the occurrence and the schedule only while the attempt still
+    holds its occurrence; a holder that was reaped while out of touch writes
+    nothing there, so a settlement is never counted twice.
+    """
     try:
+        settlement = _stage_attempt_end(session, **kwargs)
         session.commit()
     except IntegrityError:
-        # Only the success write-back stages a foreign-key write (the
-        # last_result pointer), so this is the user's delete landing
-        # between still_exists' read and this commit — the delete's
-        # release already nulled the column. Redo the write-back without
-        # the pointer so the bookkeeping and the settlement survive.
+        # Only the conversation pointers stage a foreign-key write, so this is
+        # the user's delete landing between still_exists' read and this
+        # commit; the delete's release already nulled the columns. Redo it
+        # without them so the bookkeeping and the settlement survive.
         session.rollback()
-        schedule = schedule_service.get_schedule(schedule_id)
-        _apply_success_write_back(schedule, run_service, None, session)
-        _settle_occurrence(session, occurrence_id=occurrence_id, attempt=attempt, outcome=outcome, retryable=True)
+        settlement = _stage_attempt_end(session, **{**kwargs, "conversation_id": None})
         session.commit()
-    return outcome
+    return settlement
+
+
+def _finish_run(session: ScopedSession, *, run_id: UUID, end: _AttemptEnd) -> None:
+    """End the run alone, when its full record could not be written. Its
+    occurrence keeps its lease and is reaped once that lapses."""
+    if ScheduleRunService(session).end_run(
+        run_id, status=_run_status(end.outcome), error=end.error, outcome=end.outcome,
+    ):
+        session.commit()
 
 
 def _is_retryable(exc: BaseException) -> bool:
@@ -512,30 +560,6 @@ def _is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, ValueError) and "not found" in str(exc).lower():
         return False
     return True
-
-
-def _record_attempt_error(
-    session: ScopedSession, *, schedule_id: UUID, occurrence_id: UUID, attempt: int, error: str, retryable: bool,
-) -> None:
-    schedule = ScheduleService(session).get_schedule(schedule_id)
-    schedule.last_error = error
-    session.add(schedule)
-    _settle_occurrence(
-        session,
-        occurrence_id=occurrence_id,
-        attempt=attempt,
-        outcome=_RunOutcome(status=RunStatus.failed, error=error),
-        retryable=retryable,
-    )
-    session.commit()
-
-
-def _finish_run(
-    session: ScopedSession, *, run_id: UUID, conversation_id: UUID | None, error: str | None, status: RunStatus | None,
-) -> None:
-    ScheduleRunService(session).finish_run(
-        run_id, conversation_id=conversation_id, error=error, status=status
-    )
 
 
 async def _until_it_lands(unit: Callable[[ScopedSession], T], *, schedule_id: UUID) -> T:
@@ -557,6 +581,45 @@ async def _until_it_lands(unit: Callable[[ScopedSession], T], *, schedule_id: UU
                 f"Schedule {schedule_id}: no database connection freed to record its run; trying again"
             )
             await asyncio.sleep(_BOOKKEEPING_RETRY_PAUSE_SECONDS)
+
+
+class _LeaseKeeper:
+    """Renews an attempt's lease while it runs, so a long run, or one still
+    stopping, is never taken for a dead one and its occurrence handed on."""
+
+    def __init__(self, occurrence_id: UUID, token: str, schedule_id: UUID) -> None:
+        self._occurrence_id = occurrence_id
+        self._token = token
+        self._schedule_id = schedule_id
+        self._task: asyncio.Task | None = None
+
+    def start(self) -> None:
+        self._task = asyncio.create_task(self._renew())
+
+    async def stop(self) -> None:
+        if self._task is None:
+            return
+        self._task.cancel()
+        await asyncio.gather(self._task, return_exceptions=True)
+
+    async def _renew(self) -> None:
+        while True:
+            await asyncio.sleep(_LEASE_RENEW_SECONDS)
+            try:
+                held = await run_db(
+                    partial(_renew_lease, occurrence_id=self._occurrence_id, token=self._token),
+                    scope=SYSTEM_SCOPE,
+                )
+            except Exception:
+                # The next renewal tries again; the lease has slack for a few.
+                logger.warning(f"Schedule {self._schedule_id}: could not renew its run's lease", exc_info=True)
+                continue
+            if not held:
+                logger.warning(
+                    f"Schedule {self._schedule_id}: occurrence {self._occurrence_id} was taken back "
+                    "while its run was out of touch; its outcome will not be recorded on it"
+                )
+                return
 
 
 async def execute_schedule(
@@ -593,11 +656,11 @@ async def run_occurrence(
     conversation_id: UUID | None = None,
 ) -> None:
     """Run the next attempt at a claimed occurrence and record how it went."""
-    _inflight.add(occurrence_id)
+    admission.admit(occurrence_id)
     try:
         await _run_attempt(occurrence_id, is_manual=is_manual, conversation_id=conversation_id)
     finally:
-        _inflight.discard(occurrence_id)
+        admission.release(occurrence_id)
 
 
 async def _run_attempt(
@@ -610,16 +673,12 @@ async def _run_attempt(
 
     Each read and write is its own database unit, so the run holds no pooled
     connection across the permission check or while its turn runs, and a
-    wait for a connection never stalls the event loop. A unit commits when
-    it ends, so a failure in one leaves the earlier ones written. The last
-    two, the turn's outcome and the run's finish, try again while the pool is
-    full (_until_it_lands). An attempt that fails hands its occurrence back
-    for a later poll to try again, until its attempts are spent.
+    wait for a connection never stalls the event loop. The attempt's lease is
+    renewed for as long as it runs. Its end is recorded in one unit that
+    tries again while the pool is full (_until_it_lands). An attempt that
+    failed before execution hands its occurrence back for a later poll to try
+    again, until its attempts are spent; any other failure settles it.
     """
-    from cowork.handlers.responses import ResponsesHandler
-    from cowork.schemas.responses import ResponsesRequest
-    from cowork.services.product_permissions import require_product_permission
-
     try:
         attempt = await run_db(
             partial(_start_attempt, occurrence_id=occurrence_id, is_manual=is_manual), scope=SYSTEM_SCOPE,
@@ -634,17 +693,76 @@ async def _run_attempt(
     if attempt is None:
         return
     schedule_id = attempt.schedule_id
-    run_id = attempt.run_id
+    lease = _LeaseKeeper(occurrence_id, attempt.token, schedule_id)
+    lease.start()
+    end = _AttemptEnd(outcome=AttemptOutcome.uncertain, error="Run ended without saying how.")
+    try:
+        end, conversation_id = await _execute_attempt(
+            attempt, occurrence_id, is_manual=is_manual, conversation_id=conversation_id,
+        )
+    except Exception as exc:
+        # _execute_attempt answers every failure it can place; this is one
+        # it could not, so nothing is assumed about what ran.
+        logger.exception(
+            "Schedule run failed: %s", exc,
+            extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+        )
+    finally:
+        retry_delay = (
+            _retry_delay(attempt.number)
+            if end.retryable and end.outcome == AttemptOutcome.failed_before_execution
+            else None
+        )
+        try:
+            await _until_it_lands(
+                partial(
+                    _record_attempt_end, attempt=attempt, occurrence_id=occurrence_id, end=end,
+                    retry_delay=retry_delay, conversation_id=conversation_id,
+                ),
+                schedule_id=schedule_id,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to record how the run ended",
+                extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+            )
+            try:
+                # The run must not strand at `running`; the occurrence keeps
+                # its lease and is reaped once it lapses.
+                await _until_it_lands(partial(_finish_run, run_id=attempt.run_id, end=end), schedule_id=schedule_id)
+            except Exception:
+                logger.exception(
+                    "Failed to finish the run record",
+                    extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+                )
+        await lease.stop()
 
-    error: str | None = None
-    final_status: RunStatus | None = None
+
+async def _execute_attempt(
+    attempt: StartedAttempt,
+    occurrence_id: UUID,
+    *,
+    is_manual: bool,
+    conversation_id: UUID | None,
+) -> tuple[_AttemptEnd, UUID | None]:
+    """Set the attempt's turn up, hand it to the agent, and say how it ended.
+
+    Everything before the hand-off is known not to have acted, so its
+    failures may be tried again. The hand-off is recorded first, so a process
+    that dies past it leaves a run the reaper will not replay.
+    """
+    from cowork.handlers.responses import ResponsesHandler
+    from cowork.schemas.responses import ResponsesRequest
+    from cowork.services.product_permissions import require_product_permission
+
+    schedule_id = attempt.schedule_id
     try:
         scheduled = await run_db(partial(_read_schedule, schedule_id=schedule_id), scope=SYSTEM_SCOPE)
 
         await require_product_permission(scope_from_principal(scheduled.principal), "product.execute")
 
         conversation_id = await run_db(
-            partial(_link_conversation, run_id=run_id, scheduled=scheduled, conversation_id=conversation_id),
+            partial(_link_conversation, run_id=attempt.run_id, scheduled=scheduled, conversation_id=conversation_id),
             scope=SYSTEM_SCOPE,
         )
 
@@ -656,7 +774,7 @@ async def _run_attempt(
             # `schedule.model` is the "default" sentinel for every task the UI
             # creates, not a servable id. Resolve it to None so the harness
             # applies the account's configured default models instead of
-            # overriding every role with the literal string (ENG-2353).
+            # overriding every role with the literal string.
             input=scheduled.prompt,
             model=resolve_schedule_model(scheduled.model),
             stream=True,
@@ -664,42 +782,29 @@ async def _run_attempt(
             trace_tags=["scheduled_task", f"trigger:{trigger}"],
             trace_metadata={
                 "schedule_id": str(schedule_id),
-                "schedule_run_id": str(run_id),
+                "schedule_run_id": str(attempt.run_id),
                 "schedule_occurrence_id": str(occurrence_id),
                 "trigger_type": trigger,
                 "attempt": str(attempt.number),
             },
         )
-        async def _drain_run() -> None:
-            # The schedule-derived principal is what lets the turn (and the
-            # remote backend's per-tenant key mint) run in org mode with no
-            # request in flight. The handler opens its own short sessions.
-            stream = await ResponsesHandler(principal=scheduled.principal, interactive=False).handle(request)
-            async for _ in stream:
-                pass
 
-        try:
-            await asyncio.wait_for(_drain_run(), timeout=_MAX_RUN_DURATION_SECONDS)
-        except asyncio.TimeoutError as exc:
-            raise RuntimeError(
-                f"Run exceeded max duration of {_MAX_RUN_DURATION_SECONDS}s and was aborted."
-            ) from exc
+        if not await run_db(
+            partial(_begin_execution, attempt=attempt, occurrence_id=occurrence_id), scope=SYSTEM_SCOPE,
+        ):
+            # Taken back while it was setting up: whoever holds the
+            # occurrence now decides what runs. This attempt never acted.
+            logger.warning(f"Schedule {schedule_id}: run lost its occurrence before it started; not running it")
+            return _AttemptEnd(
+                outcome=AttemptOutcome.failed_before_execution,
+                error="Run was taken over before it started.",
+            ), conversation_id
 
-        # A cancel or a producer failure closes the stream normally from the
-        # consumer's side (the producer runs detached and even swallows its
-        # own CancelledError, so handle.task.cancelled() stays False). The
-        # buffer's terminal record is the only truthful signal of how the
-        # turn ended — without it every run is recorded as success.
-        reason = await _turn_terminal_reason(str(conversation_id))
-        outcome = await _until_it_lands(
-            partial(
-                _record_turn_outcome, schedule_id=schedule_id, reason=reason,
-                conversation_id=conversation_id, occurrence_id=occurrence_id, attempt=attempt.number,
-            ),
-            schedule_id=schedule_id,
-        )
-        final_status, error = outcome.status, outcome.error
-
+        # The schedule-derived principal is what lets the turn (and the remote
+        # backend's per-tenant key mint) run in org mode with no request in
+        # flight. The handler opens its own short sessions. A raise here comes
+        # before the turn's producer exists, so nothing has acted yet.
+        stream = await ResponsesHandler(principal=scheduled.principal, interactive=False).handle(request)
     except Exception as exc:
         error = str(exc) or type(exc).__name__
         # The ids travel as record attributes: a database error's sanitized
@@ -708,57 +813,140 @@ async def _run_attempt(
             "Schedule run failed: %s", error,
             extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
         )
-        try:
-            await _until_it_lands(
-                partial(
-                    _record_attempt_error, schedule_id=schedule_id, occurrence_id=occurrence_id,
-                    attempt=attempt.number, error=error, retryable=_is_retryable(exc),
-                ),
-                schedule_id=schedule_id,
-            )
-        except Exception:
-            # The occurrence keeps its lease; a later poll reaps it.
-            logger.exception(
-                "Failed to record the attempt's error",
-                extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
-            )
-    finally:
-        try:
-            # This write must always land or the run strands at `running`.
-            # Its own unit starts clean, whatever failed above.
-            await _until_it_lands(
-                partial(
-                    _finish_run, run_id=run_id, conversation_id=conversation_id,
-                    error=error, status=final_status,
-                ),
-                schedule_id=schedule_id,
-            )
-        except Exception:
-            logger.exception(
-                "Failed to finish the run record",
-                extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
-            )
+        return _AttemptEnd(
+            outcome=AttemptOutcome.failed_before_execution, error=error, retryable=_is_retryable(exc),
+        ), conversation_id
+
+    async def _drain() -> None:
+        async for _ in stream:
+            pass
+
+    timed_out = False
+    lost_track = False
+    try:
+        await asyncio.wait_for(_drain(), timeout=_MAX_RUN_DURATION_SECONDS)
+    except asyncio.TimeoutError:
+        timed_out = True
+        logger.warning(
+            f"Schedule {schedule_id}: run exceeded {_MAX_RUN_DURATION_SECONDS}s; stopping it",
+            extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+        )
+    except Exception:
+        # The tail broke, which says nothing about the turn: it may still be
+        # running. Stop it rather than leave it running unwatched.
+        lost_track = True
+        logger.exception(
+            "Lost the scheduled run's stream; stopping its turn",
+            extra=log_context(schedule_id=schedule_id, conversation_id=conversation_id),
+        )
+    if timed_out or lost_track:
+        await _stop_turn(str(conversation_id), run_id=attempt.run_id, schedule_id=schedule_id)
+
+    # A cancel or a producer failure closes the stream normally from the
+    # consumer's side (the producer runs detached and even swallows its own
+    # CancelledError, so handle.task.cancelled() stays False). The buffer is
+    # the only truthful account of how the turn ended — without it every run
+    # is recorded as success.
+    evidence = await _turn_evidence(str(conversation_id))
+    return _classify(evidence, timed_out=timed_out), conversation_id
 
 
-async def _turn_terminal_reason(conversation_id: str) -> str | None:
-    """Terminal reason ("completed" | "cancelled" | "error" | …) of the turn
-    that just ended on this conversation, or None when unavailable.
+async def _stop_turn(conversation_id: str, *, run_id: UUID, schedule_id: UUID) -> None:
+    """Stop the run's turn the way the Stop button does, saved as
+    interrupted, and return once it has stopped.
 
-    Only call after the turn's stream has been fully drained: the buffer is
-    closed then, so tailing from the last record returns immediately."""
+    The occurrence stays held (its lease is renewed) until then, so no retry
+    or run-now starts beside a turn still running here. A turn running in a
+    pod cannot confirm it stopped: the occurrence is held for as long as the
+    stop request stays live, and the run's outcome makes no claim either way.
+    """
+    try:
+        await run_db(partial(_request_stop, run_id=run_id), scope=SYSTEM_SCOPE)
+    except Exception:
+        logger.warning(f"Schedule {schedule_id}: could not record the stop request", exc_info=True)
+    handle = registry.get(conversation_id)
+    if handle is None or not handle.is_running:
+        return
+    stopping = asyncio.ensure_future(stop_turn(handle, timed_out=True))
+    try:
+        await asyncio.wait_for(asyncio.shield(stopping), timeout=_STOP_GRACE_SECONDS)
+    except asyncio.TimeoutError:
+        logger.error(
+            f"Schedule {schedule_id}: its turn did not stop within {_STOP_GRACE_SECONDS}s; "
+            "holding the schedule until it does"
+        )
+    except Exception:
+        logger.exception(f"Schedule {schedule_id}: stopping its turn failed; holding the schedule until it ends")
+    await asyncio.wait({handle.task})
+    if remote_backend():
+        await asyncio.sleep(_REMOTE_STOP_GRACE_SECONDS)
+
+
+_DURATION_ERROR = (
+    f"Run exceeded the {_MAX_RUN_DURATION_SECONDS // 60}-minute limit and was stopped. "
+    "Some of its actions may have completed — open the run to check before running it again."
+)
+_INTERRUPTED_ERROR = (
+    "Run was interrupted before it finished. Some of its actions may have completed — "
+    "open the run to check before running it again."
+)
+_FAILED_DURING_ERROR = "Run did not complete — open the run's task for details."
+_FAILED_BEFORE_ERROR = "Run failed before it started work — open the run's task for details."
+_UNCERTAIN_ERROR = (
+    "Run ended without a record of how it finished. Open the run to check what it did "
+    "before running it again."
+)
+
+
+def _classify(evidence: _TurnEvidence, *, timed_out: bool) -> _AttemptEnd:
+    """What the turn's ending says about whether it acted."""
+    if timed_out:
+        return _AttemptEnd(outcome=AttemptOutcome.interrupted, error=_DURATION_ERROR)
+    reason = evidence.reason
+    if reason == "completed":
+        return _AttemptEnd(outcome=AttemptOutcome.completed)
+    if reason == "cancelled":
+        logger.info("Scheduled run was cancelled")
+        return _AttemptEnd(outcome=AttemptOutcome.cancelled)
+    if reason in ("interrupted", "restart"):
+        return _AttemptEnd(outcome=AttemptOutcome.interrupted, error=_INTERRUPTED_ERROR)
+    if reason is None:
+        return _AttemptEnd(outcome=AttemptOutcome.uncertain, error=_UNCERTAIN_ERROR)
+    if not evidence.acted:
+        return _AttemptEnd(
+            outcome=AttemptOutcome.failed_before_execution, error=_FAILED_BEFORE_ERROR, retryable=True,
+        )
+    return _AttemptEnd(outcome=AttemptOutcome.failed_during_execution, error=_FAILED_DURING_ERROR)
+
+
+def _sse_events(record) -> list[str]:
+    sse = record.data.get("sse") if isinstance(record.data, dict) else None
+    if not isinstance(sse, str):
+        return []
+    return [line[len("event:"):].strip() for line in sse.splitlines() if line.startswith("event:")]
+
+
+async def _turn_evidence(conversation_id: str) -> _TurnEvidence:
+    """How the turn that just ended on this conversation went, from its
+    buffer: the terminal reason, and whether anything beyond its start and
+    failure was written. Unknown (no reason, acted) when unavailable.
+
+    Only call after the turn's stream has ended: the buffer is closed then,
+    so reading it returns at the terminal record."""
     handle = registry.get(conversation_id)
     if handle is None or not handle.buffer.is_closed:
-        return None
+        return _TurnEvidence(reason=None, acted=True)
+    acted = False
     try:
-        buffer = handle.buffer
-        async for rec in buffer.tail(max(buffer.latest_seq - 1, 0)):
+        async for rec in handle.buffer.tail(0):
             if rec.is_terminal:
-                return str(rec.data.get("reason") or "") or None
+                return _TurnEvidence(reason=str(rec.data.get("reason") or "") or None, acted=acted)
+            events = _sse_events(rec)
+            if not events or any(event not in _PRE_EXECUTION_EVENTS for event in events):
+                acted = True
     except Exception:
-        logger.exception(
-            f"Could not read terminal state for conversation {conversation_id}"
-        )
-    return None
+        logger.exception(f"Could not read terminal state for conversation {conversation_id}")
+    return _TurnEvidence(reason=None, acted=True)
 
 
 def _ran_recently(schedule: Schedule, run_service: ScheduleRunService, now: datetime) -> bool:
@@ -811,34 +999,33 @@ def _due_schedules(session, now: datetime) -> list[Schedule]:
     return due
 
 
-_LEASE_EXPIRED_ERROR = "Run stopped responding and was abandoned."
+_LEASE_EXPIRED_ERROR = (
+    "Run stopped responding and was abandoned. If it had started work, some of its "
+    "actions may have completed — open the run to check before running it again."
+)
 
 
 def _reap_expired_leases(session: ScopedSession, now: datetime) -> None:
-    """Hand back occurrences whose process died holding them.
+    """Take back occurrences whose holder stopped renewing its lease.
 
-    The attempt it was running is recorded failed, and the occurrence gets
-    its next attempt as any failed attempt would. One this process is still
-    running is left alone.
+    An attempt that never handed its turn to the agent is tried again; one
+    that did may have acted, so its occurrence settles without a replay. One
+    this process is running is left alone, and one whose holder renewed or
+    settled since this poll read it is too (ScheduleOccurrenceService.reap).
     """
     occurrences = ScheduleOccurrenceService(session)
-    expired = [o for o in occurrences.expired_leases(now) if o.id not in _inflight]
-    for occurrence in expired:
-        run = occurrences.running_attempt(occurrence.id)
-        if run is not None:
-            run.status = RunStatus.failed
-            run.error = _LEASE_EXPIRED_ERROR
-            run.finished_at = now
-            session.add(run)
-        logger.warning(f"Schedule {occurrence.schedule_id}: occurrence {occurrence.id} lease expired; reaping it")
-        occurrences.fail_attempt(
-            occurrence.id,
-            error=_LEASE_EXPIRED_ERROR,
-            retry_delay=_retry_delay(occurrence.attempts) if occurrence.attempts else 0,
+    for lease in occurrences.expired_leases(now):
+        if admission.holds(lease.occurrence_id):
+            continue
+        settlement = occurrences.reap(
+            lease, now=now, error=_LEASE_EXPIRED_ERROR,
+            retry_delay=lambda attempts: _retry_delay(attempts) if attempts else 0,
         )
-        _count_settlement(session, occurrence.id)
-    if expired:
-        session.commit()
+        if settlement != Settlement.lost:
+            logger.warning(
+                f"Schedule {lease.schedule_id}: occurrence {lease.occurrence_id} lease expired; "
+                f"reaped it ({settlement.value})"
+            )
 
 
 def _poll(session: ScopedSession, capacity: int = _MAX_CONCURRENT_RUNS) -> list[UUID]:
@@ -849,8 +1036,8 @@ def _poll(session: ScopedSession, capacity: int = _MAX_CONCURRENT_RUNS) -> list[
     """
     now = datetime.now(timezone.utc)
     _reap_expired_leases(session, now)
-    _handle_missed_runs(session)
-    ready = [o for o in ScheduleOccurrenceService(session).ready_for_attempt(now) if o not in _inflight]
+    _handle_missed_runs(session, now)
+    ready = [o for o in ScheduleOccurrenceService(session).ready_for_attempt(now) if not admission.holds(o)]
     ready = ready[: max(capacity, 0)]
     for schedule in _due_schedules(session, now):
         if len(ready) >= capacity:
@@ -865,7 +1052,7 @@ async def _scheduler_loop() -> None:
     logger.info("Scheduler loop started")
     while True:
         await asyncio.sleep(_POLL_INTERVAL_SECONDS)
-        capacity = _MAX_CONCURRENT_RUNS - len(_inflight)
+        capacity = admission.free()
         try:
             # A unit in a worker thread: when the pool has no connection to
             # give, the poll is refused after POOL_TIMEOUT instead of stalling
@@ -881,15 +1068,15 @@ async def _scheduler_loop() -> None:
         for occurrence_id in ready:
             # Counted before the task starts, so the next poll sizes its
             # claims by it even if the task has not run yet.
-            _inflight.add(occurrence_id)
+            admission.admit(occurrence_id)
             asyncio.create_task(run_occurrence(occurrence_id, is_manual=False))
 
 
 def boot_reap_cutoff(org_mode: bool, now: datetime | None = None) -> datetime | None:
     """Which running runs a starting server may reap: all of them on the
-    desktop, where it is the only process, or only those older than a lease
-    in org mode, where another replica may still be running the rest. Leases
-    release those once they lapse."""
+    desktop, where it is the only process, or in org mode, where another
+    replica may still be running them, only runs from before occurrences that
+    are older than a lease. Leases release the rest once they lapse."""
     if not org_mode:
         return None
     return (now or datetime.now(timezone.utc)) - timedelta(seconds=_LEASE_SECONDS)

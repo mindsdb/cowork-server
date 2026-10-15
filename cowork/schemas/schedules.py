@@ -58,21 +58,56 @@ class OccurrenceStatus(str, Enum):
     success = "success"
     failed = "failed"
     cancelled = "cancelled"
-    # A slot that came due while the app was closed and the missed-run policy
-    # chose not to run. Recorded so the history shows it was passed over.
-    skipped = "skipped"
 
 
-class MissedRunPolicy(str, Enum):
-    """What a recurring schedule does with slots that passed while it could
-    not run (the app was closed, or the machine asleep)."""
+class AttemptOutcome(str, Enum):
+    """What is known about an attempt's execution when it ended.
 
-    # Run nothing that was missed; only a slot that is barely late still runs.
-    skip = "skip"
-    # Run the most recent missed slot once and skip the rest.
-    run_latest_once = "run_latest_once"
-    # Run up to a bounded number of the most recent missed slots, in order.
-    bounded_catch_up = "bounded_catch_up"
+    Only ``failed_before_execution`` is proof the agent did nothing, so it is
+    the only failure that may be tried again automatically. Every other
+    failure keeps its output for review and is not replayed.
+    """
+
+    completed = "completed"
+    # Failed before the agent could act: setup, permission, or a turn whose
+    # stream shows nothing but its start and its failure.
+    failed_before_execution = "failed_before_execution"
+    # Failed after the agent may have acted.
+    failed_during_execution = "failed_during_execution"
+    # Stopped by the scheduler's duration bound, or its process went away,
+    # after the agent may have acted.
+    interrupted = "interrupted"
+    # Stopped by the user.
+    cancelled = "cancelled"
+    # No terminal record says how the turn ended.
+    uncertain = "uncertain"
+
+
+class ScheduleState(str, Enum):
+    """What a schedule will do next, for display."""
+
+    active = "active"
+    # The user paused it: nothing starts on its own until it is resumed.
+    paused = "paused"
+    # Repeated failures paused it.
+    auto_paused = "auto_paused"
+    # A one-off whose time passed while the app could not run it, by too much
+    # to run on its own. Run now still runs it.
+    missed = "missed"
+    # A one-off that has run, or is running.
+    done = "done"
+
+
+def schedule_state(schedule) -> ScheduleState:
+    if schedule.auto_paused_at is not None:
+        return ScheduleState.auto_paused
+    if schedule.paused_at is not None:
+        return ScheduleState.paused
+    if schedule.missed_at is not None:
+        return ScheduleState.missed
+    if not schedule.enabled:
+        return ScheduleState.done if schedule.cadence == Cadence.once else ScheduleState.paused
+    return ScheduleState.active
 
 
 class ScheduleCreateRequest(CamelRequest):
@@ -84,7 +119,6 @@ class ScheduleCreateRequest(CamelRequest):
     timezone: str = "UTC"
     project_id: UUID | None = None
     enabled: bool = True
-    missed_run_policy: MissedRunPolicy = MissedRunPolicy.run_latest_once
 
 
 class ScheduleUpdateRequest(CamelRequest):
@@ -96,7 +130,14 @@ class ScheduleUpdateRequest(CamelRequest):
     timezone: str | None = None
     project_id: UUID | None = None
     enabled: bool | None = None
-    missed_run_policy: MissedRunPolicy | None = None
+
+
+class SkippedPeriodResponse(CamelResponse):
+    first_slot: datetime
+    last_slot: datetime
+    slot_count: int
+    reason: str
+    created_at: datetime | None
 
 
 class ScheduleResponse(CamelResponse):
@@ -113,9 +154,14 @@ class ScheduleResponse(CamelResponse):
     last_result_conversation_id: UUID | None
     last_error: str | None
     missed_runs: int
-    missed_run_policy: str = MissedRunPolicy.run_latest_once
     consecutive_failures: int = 0
     auto_paused_at: datetime | None = None
+    paused_at: datetime | None = None
+    missed_at: datetime | None = None
+    # Filled by the endpoints: the derived ScheduleState, and the most recent
+    # stretch of slots it passed over without running.
+    state: ScheduleState = ScheduleState.active
+    last_skipped: SkippedPeriodResponse | None = None
     # Not a Schedule column — endpoints fill it from ScheduleRunService so the
     # UI can show an in-flight run (manual or cron).
     running: bool = False
@@ -137,4 +183,7 @@ class ScheduleRunResponse(CamelResponse):
     is_manual: bool
     occurrence_id: UUID | None = None
     attempt: int | None = None
+    outcome: AttemptOutcome | None = None
+    execution_started_at: datetime | None = None
+    stop_requested_at: datetime | None = None
     created_at: datetime | None
