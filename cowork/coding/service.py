@@ -254,9 +254,9 @@ class CodingService(
             except Exception:
                 logger.exception("Could not expire stale coding control-plane state")
 
-    def workspace_usage_page(self) -> WorkspaceUsagePage:
+    def workspace_usage_page(self, session_id: str | None = None) -> WorkspaceUsagePage:
         """Approximate storage Cowork manages for each task, measured in the background."""
-        return self.workspace_usage.snapshot()
+        return self.workspace_usage.snapshot(session_id)
 
     def capabilities(self) -> list[EngineCapabilities]:
         return self.registry.capabilities()
