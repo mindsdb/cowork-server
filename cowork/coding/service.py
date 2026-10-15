@@ -408,10 +408,11 @@ class CodingService(
             # Archiving is an explicit "done for now", so its disk is reclaimed
             # straight away. The workspace comes back if the task is reopened.
             try:
-                if self.retention.release(session_id):
-                    updated = self.get_session(session_id)
+                self.retention.release(session_id)
             except Exception:
                 logger.exception("Could not release the workspace of archived coding task %s", session_id)
+            # Released, or kept with the reason recorded.
+            updated = self.get_session(session_id)
         return updated
 
     def set_pinned(self, session_id: str, pinned: bool) -> CodingSession:
