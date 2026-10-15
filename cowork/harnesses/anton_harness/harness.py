@@ -80,10 +80,8 @@ def _vault_scratch_dir() -> Path:
 #: Settings copied from the Cowork DB onto anton's own settings object, in
 #: order. The last three are non-nullable ints with defaults — unlike the
 #: entries above them, ``db_val`` is never None, so they ALWAYS override anton's
-#: own 25/3 defaults (and any ANTON_* env value) for Cowork sessions.
-#: ``max_turn_tokens`` is the per-turn spend ceiling (ENG-1286); it overlays the
-#: SAME value anton defaults to rather than a looser one, because the
-#: distribution that sized it was measured on this traffic.
+#: own defaults (and any ANTON_* env value) for Cowork sessions.
+#: ``max_turn_tokens`` is the per-turn spend ceiling.
 _OVERLAID_SETTINGS: tuple[str, ...] = (
     "planning_provider", "planning_model",
     "coding_provider", "coding_model",

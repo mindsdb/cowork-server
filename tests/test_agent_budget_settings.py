@@ -1,11 +1,10 @@
 """Agent budget settings (max_tool_rounds / max_continuations / max_turn_tokens).
 
-Cowork defaults these HIGHER than anton's own CoreSettings defaults (25/3):
-long knowledge-work tasks routinely need 30-50 tool rounds, and at anton's
-defaults the agent stops mid-task to ask "want me to continue?" — which in
-unattended contexts (evals, channels, scheduled work) is a dead end. The DB
-value is overlaid onto AntonSettings per conversation, so it must round-trip
-the settings service as an int and reject junk that would break sessions.
+The defaults are safety limits for a turn that never finishes, equal to anton's
+own CoreSettings defaults; a normal task never reaches them, so it doesn't stop
+mid-task to ask "want me to continue?". The DB value is overlaid onto
+AntonSettings per conversation, so it must round-trip the settings service as
+an int and reject junk that would break sessions.
 """
 
 import pytest
@@ -43,10 +42,9 @@ def _clear_app_settings_cache():
         get_app_settings.cache_clear()
 
 
-def test_defaults_are_50_and_5():
+def test_defaults_are_the_safety_limits():
     s = UserSettings()
-    assert s.max_tool_rounds == 50
-    assert s.max_continuations == 5
+    assert (s.max_tool_rounds, s.max_continuations, s.max_turn_tokens) == (250, 10, 25_000_000)
 
 
 def test_hosted_deployments_can_lower_defaults_via_env(monkeypatch):
@@ -122,7 +120,7 @@ def test_settings_service_round_trip():
         except ValueError:
             pass
         session.close()
-    assert UserSettings().max_tool_rounds == 50  # back to Cowork default
+    assert UserSettings().max_tool_rounds == 250  # back to the default
 
 
 def test_budget_env_vars_not_synced_from_dotenv():
@@ -156,29 +154,21 @@ def test_anton_settings_accepts_overlay():
 # ── Per-turn spend ceiling (ENG-1286) ──────────────────────────────────────
 
 
-def test_turn_token_ceiling_default_is_1_25m():
-    assert UserSettings().max_turn_tokens == 1_250_000
-
-
-def test_turn_token_ceiling_default_matches_anton_rather_than_exceeding_it():
-    """Deliberately EQUAL to anton's default, unlike the other two budgets.
-
-    max_tool_rounds/max_continuations run looser here than anton's CLI defaults
-    on purpose. This one must not: the per-turn distribution that produced
-    1,250,000 was measured on Cowork traffic, so it already reflects those
-    looser round budgets. Raising it here would loosen the ceiling against the
-    exact population it was sized on.
-    """
+def test_defaults_match_antons_own():
+    """Desktop and the web pod, which runs anton's defaults, get the same limits."""
     from anton.core.settings import CoreSettings
 
-    core = CoreSettings()
-    if not hasattr(core, "max_turn_tokens"):
+    core = CoreSettings(_env_file=None)
+    if core.max_turn_tokens == 1_250_000:
         pytest.skip(
-            "pinned anton predates ENG-1286's max_turn_tokens — this assertion "
-            "activates at the weekly release, and its passing is the signal "
-            "that the merge-order note in the PR body is satisfied"
+            "pinned anton predates the safety-limit defaults; this assertion "
+            "activates when they reach anton main, and its passing is the "
+            "signal that the merge-order note in the PR body is satisfied"
         )
-    assert UserSettings().max_turn_tokens == core.max_turn_tokens
+    s = UserSettings()
+    assert (s.max_tool_rounds, s.max_continuations, s.max_turn_tokens) == (
+        core.max_tool_rounds, core.max_continuations, core.max_turn_tokens
+    )
 
 
 def test_hosted_deployments_can_lower_the_ceiling_via_env(monkeypatch):
@@ -203,11 +193,10 @@ def test_the_top_of_the_range_is_the_no_limit_setting():
     """"No limit" in the UI writes the MAX, not a sentinel.
 
     At 50_000_000 the ceiling is effectively — not literally — off. A turn makes
-    roughly `max_tool_rounds x (max_continuations + 1)` LLM calls; at this
-    repo's defaults (50 x 6 = ~306) that reaches 50M at ~163k per call, which is
-    BELOW the ~190k a long conversation carries. It has never happened (largest
-    turn in 30 days: 8.26M) because real turns end and compaction intervenes,
-    but "the step cap always lands first" is not a guarantee.
+    roughly `max_tool_rounds x (max_continuations + 1)` LLM calls; at the
+    defaults (250 x 11 = ~2,750) that reaches 50M at ~18k per call, far below
+    the ~190k a long conversation carries, so "the step cap always lands first"
+    is not a guarantee.
 
     The top of the range being the off switch used to be a problem because it
     was undiscoverable; the checkbox fixes that, which is why the

@@ -75,6 +75,6 @@ deployment:
     # conservatively. Changing these requires a pod restart (env is read once
     # per process).
     # - name: COWORK_DEFAULT_MAX_TOOL_ROUNDS
-    #   value: "50"
+    #   value: "250"
     # - name: COWORK_DEFAULT_MAX_CONTINUATIONS
-    #   value: "5"
+    #   value: "10"
