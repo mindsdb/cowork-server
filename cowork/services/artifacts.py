@@ -40,7 +40,7 @@ from cowork.common.paths import (
     dir_unlink,
 )
 from cowork.common.settings.app_settings import get_app_settings
-from anton.core.artifacts.internal_files import NON_CONTENT_NAMES, REVISIONS_DIRNAME
+from anton.core.artifacts.internal_files import NON_CONTENT_NAMES, REVISIONS_DIRNAME, is_bytecode_name
 from anton.core.artifacts.store import iter_content_files
 
 if TYPE_CHECKING:
@@ -316,6 +316,9 @@ def _user_files_with_mtimes(folder: Path) -> list[tuple[Path, int]]:
                 entry_top = top if top is not None else entry.name
                 # First path component only: `static/prd.md` is content.
                 if entry_top in NON_CONTENT_NAMES:
+                    continue
+                # Bytecode at any depth: imports leave it next to any module.
+                if is_bytecode_name(entry.name):
                     continue
                 try:
                     if entry.is_dir(follow_symlinks=False):
@@ -1700,7 +1703,8 @@ _PUBLISHABLE_LIST_LIMIT = 40
 def is_non_content_path(path: Path, container: Path) -> bool:
     """True when `path` is not artifact content: its first component inside the
     artifact folder is in anton's `NON_CONTENT_NAMES` (`static/prd.md` is
-    content), or it lies in a revision journal at any depth.
+    content), it lies in a revision journal at any depth, or it is Python
+    bytecode at any depth inside the artifact folder.
 
     `container` is an artifacts dir whose direct children are artifact folders.
     A path outside it is not judged here and returns False.
@@ -1709,7 +1713,11 @@ def is_non_content_path(path: Path, container: Path) -> bool:
         parts = path.resolve().relative_to(container.resolve()).parts
     except (OSError, ValueError, RuntimeError):
         return False
-    return REVISIONS_DIRNAME in parts or (len(parts) > 1 and parts[1] in NON_CONTENT_NAMES)
+    return (
+        REVISIONS_DIRNAME in parts
+        or (len(parts) > 1 and parts[1] in NON_CONTENT_NAMES)
+        or any(is_bytecode_name(part) for part in parts[1:])
+    )
 
 
 class _PublishableCandidate(NamedTuple):
