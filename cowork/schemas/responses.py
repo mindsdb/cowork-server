@@ -82,8 +82,18 @@ class ResponseStatus(str, Enum):
 
 
 class IncompleteDetails(BaseModel):
-    # anton's `ended_by`, e.g. "spend_ceiling" or "round_cap".
-    reason: str
+    # A str, not a Literal: a new hand-back in anton must not break the final frame.
+    reason: str = Field(
+        description=(
+            "Why the turn stopped before it finished (anton's `ended_by`): "
+            "`spend_ceiling` (the token budget), `round_cap` (the step limit), "
+            "`handback_budget` (automatic continuations ran out), "
+            "`handback_verifier_failure` (the completion check returned no verdict), "
+            "`handback_stuck` (the completion check judged the task stuck) or "
+            "`retry_exhausted` (repeated errors). Treat any other value as a stop "
+            "for an unlisted reason."
+        ),
+    )
 
 
 class ResponseOutput(BaseModel):
