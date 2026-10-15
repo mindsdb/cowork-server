@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+from uuid import uuid4
 
 from anton.core.llm.provider import (
     StreamTextDelta,
@@ -9,7 +11,8 @@ from anton.core.llm.provider import (
     StreamToolUseEnd,
     StreamToolUseStart,
 )
-from cowork.harnesses.anton_harness.stream_formatter import TurnQuestion, format_responses_stream
+from cowork.harnesses.anton_harness.agent_files import AgentFiles
+from cowork.harnesses.anton_harness.stream_formatter import TurnContext, format_responses_stream
 
 
 async def _events(*items):
@@ -43,14 +46,16 @@ def _read_stock_cell(tool_use_id: str = "toolu_read") -> list:
     ]
 
 
-async def _run(*items, question: str = "", sink: list | None = None) -> list[tuple[str, dict]]:
+async def _run(
+    *items, question: str = "", files: AgentFiles | None = None, sink: list | None = None,
+) -> list[tuple[str, dict]]:
     def event_sink(event_type: str, data: dict) -> None:
         if sink is not None:
             sink.append((event_type, data))
 
     return _parse_sse([
         chunk async for chunk in format_responses_stream(
-            _events(TurnQuestion(text=question), *items), model="test-model", event_sink=event_sink,
+            _events(TurnContext(question=question, files=files), *items), model="test-model", event_sink=event_sink,
         )
     ])
 
@@ -70,11 +75,13 @@ class TestFigureSourcesEvent:
         assert types[-2:] == ["response.figure_sources", "response.completed"]
         payload = events[-2][1]
         assert payload["item_id"] == events[-1][1]["response"]["output"][0]["id"]
+        assert payload["steps"] == [{
+            "tool_use_id": "toolu_read", "kind": "file", "label": "stock.csv",
+            "path": None, "url": None, "queries": [], "requests": [],
+        }]
         by_text = {f["text"]: f for f in payload["figures"]}
         assert by_text["250"]["origin"] == "step"
-        assert by_text["250"]["sources"] == [
-            {"tool_use_id": "toolu_read", "kind": "file", "label": "stock.csv", "page": None},
-        ]
+        assert by_text["250"]["sources"] == [{"tool_use_id": "toolu_read", "page": None}]
         answer = "Site S1 holds 250 units; overtime costs $30."
         assert by_text["$30"] == {
             "start": answer.index("$30"), "end": answer.index("$30") + 3, "text": "$30", "origin": "none", "sources": [],
@@ -83,7 +90,22 @@ class TestFigureSourcesEvent:
         # comes back on reload.
         assert ("response.figure_sources", payload) in sink
 
-    async def test_the_question_event_streams_nothing_and_marks_figures_it_states(self):
+    async def test_a_file_the_pod_read_carries_its_path_in_the_project(self, tmp_path: Path):
+        conversation_id = uuid4()
+        workspace = tmp_path / "conversations" / str(conversation_id)
+        workspace.mkdir(parents=True)
+        (workspace / "stock.csv").write_text("part,site,qty\nP100,S1,250\n")
+
+        events = await _run(
+            *_read_stock_cell(),
+            StreamTextDelta(text="Site S1 holds 250 units."),
+            files=AgentFiles.in_cloud_pod(tmp_path, conversation_id),
+        )
+
+        payload = next(data for event_type, data in events if event_type == "response.figure_sources")
+        assert payload["steps"][0]["path"] == f"conversations/{conversation_id}/stock.csv"
+
+    async def test_the_context_event_streams_nothing_and_marks_figures_the_question_states(self):
         sink: list = []
 
         events = await _run(
@@ -137,6 +159,25 @@ class TestFigureSourcesEvent:
             if r.name == formatter.logger.name and r.levelname == "ERROR"
         ]
 
+    async def test_the_sources_are_found_off_the_event_loop(self, monkeypatch):
+        import threading
+
+        import cowork.harnesses.anton_harness.stream_formatter as formatter
+
+        found_on: list[threading.Thread] = []
+        find_figure_sources = formatter.find_figure_sources
+
+        def recording(**kwargs):
+            found_on.append(threading.current_thread())
+            return find_figure_sources(**kwargs)
+
+        monkeypatch.setattr(formatter, "find_figure_sources", recording)
+
+        events = await _run(*_read_stock_cell(), StreamTextDelta(text="S1 holds 250 units."))
+
+        assert found_on and found_on[0] is not threading.current_thread()
+        assert "response.figure_sources" in [event_type for event_type, _ in events]
+
 
 class TestFigureSourcesSurviveReload:
     async def test_the_saved_turn_returns_the_same_figures_and_their_text(self):
@@ -175,3 +216,4 @@ class TestFigureSourcesSurviveReload:
         assert types.index("response.figure_sources") == types.index("response.completed") - 1
         content = assistant["content"]
         assert [content[f["start"]:f["end"]] for f in saved[0]["figures"]] == ["250", "$30"]
+        assert [step["tool_use_id"] for step in saved[0]["steps"]] == ["toolu_read"]

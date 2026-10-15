@@ -11,7 +11,8 @@ from types import SimpleNamespace
 import cowork.services.artifact_autopublish as autopublish
 import cowork.services.task_objects as task_objects
 from cowork.harnesses.anton_harness.harness import AntonHarness
-from cowork.harnesses.anton_harness.stream_formatter import TurnHistory
+from cowork.harnesses.anton_harness.agent_files import AgentFiles
+from cowork.harnesses.anton_harness.stream_formatter import TurnContext, TurnHistory
 
 
 class StreamContextCompacted:
@@ -99,3 +100,10 @@ def test_captures_tool_rows_without_compaction(monkeypatch):
 def test_skips_capture_after_midturn_compaction(monkeypatch):
     events = _drive(monkeypatch, compact=True)
     assert not any(isinstance(e, TurnHistory) for e in events)
+
+
+def test_the_turn_opens_with_its_question_and_the_project_the_scratchpad_works_in(monkeypatch):
+    events = _drive(monkeypatch, compact=False)
+
+    assert events[0] == TurnContext(question="hi", files=AgentFiles.on_this_server("/tmp"))
+    assert not any(isinstance(e, TurnContext) for e in events[1:])

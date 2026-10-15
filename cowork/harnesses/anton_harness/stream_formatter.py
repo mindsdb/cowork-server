@@ -14,6 +14,7 @@ Emits typed events:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -21,7 +22,8 @@ import uuid
 from dataclasses import dataclass
 from typing import AsyncIterator, Callable, Optional
 
-from cowork.harnesses.anton_harness.figure_sources import TurnStep, find_figure_sources
+from cowork.harnesses.anton_harness.agent_files import AgentFiles
+from cowork.harnesses.anton_harness.figure_sources import FigureSources, TurnStep, find_figure_sources
 from cowork.schemas.responses import (
     Response,
     ResponseOutput,
@@ -58,13 +60,16 @@ class TurnHistory:
 
 
 @dataclass
-class TurnQuestion:
-    """Synthetic pre-turn event: the text of the question the turn answers.
-    Every producer of a turn's stream yields it first. Never emitted as SSE:
-    the formatter keeps it so that a figure the answer repeats from the
-    question is marked as the question's rather than as having no source."""
+class TurnContext:
+    """Synthetic pre-turn event: what the formatter needs to know about the
+    turn that its other events don't carry. Every producer of a turn's stream
+    yields it first. Never emitted as SSE: the formatter keeps the question so
+    that a figure the answer repeats from it is marked as the question's
+    rather than as having no source, and ``files`` to find the project file a
+    figure's step read (None when the producer can't know the project)."""
 
-    text: str
+    question: str
+    files: AgentFiles | None = None
 
 
 @dataclass
@@ -246,6 +251,7 @@ async def format_responses_stream(
     tool_inputs: dict[str, str] = {}
     turn_steps: list[TurnStep] = []
     question = ""
+    agent_files: AgentFiles | None = None
 
     resp = Response(id=resp_id, model=model, status=ResponseStatus.created)
     seq += 1
@@ -629,8 +635,9 @@ async def format_responses_stream(
                 except Exception:
                     pass
 
-        elif isinstance(event, TurnQuestion):
-            question = event.text
+        elif isinstance(event, TurnContext):
+            question = event.question
+            agent_files = event.files
 
         elif isinstance(event, SkillCreated):
             seq += 1
@@ -666,19 +673,23 @@ async def format_responses_stream(
 
     full_text = "".join(collected_text)
     try:
-        figures = find_figure_sources(answer=full_text, question=question, steps=turn_steps)
+        # Off the event loop: finding a step's file reads the disk, a shared
+        # mount in org mode, and every other request waits on the loop.
+        sources = await asyncio.to_thread(
+            find_figure_sources, answer=full_text, question=question, steps=turn_steps, files=agent_files,
+        )
     except Exception:
         # The sources annotate an answer that is already whole; failing to
         # find them must not fail the answer.
         logger.exception("[stream_formatter] could not find the answer's figure sources")
-        figures = []
-    if figures:
+        sources = FigureSources()
+    if sources.figures:
         seq += 1
         yield _event("response.figure_sources", {
             "type": "response.figure_sources",
             "sequence_number": seq,
             "item_id": msg_id,
-            "figures": [figure.model_dump(mode="json") for figure in figures],
+            **sources.model_dump(mode="json"),
         })
     resp_completed = Response(
         id=resp_id,

@@ -14,6 +14,11 @@ A step whose own input states the figure (a cell that prints a literal it was
 given, or a memorize call) is not a source for it: its output only echoes what
 the model wrote. A figure the model works out in its own text, without a step
 printing it, has no source.
+
+Each step a figure names is described once: its kind, a short label, the
+project file it read, the web page it reached, and the SQL and HTTP requests
+its code shows (``cell_queries``). Everything in that description passes
+through ``_redacted`` before it leaves this module.
 """
 
 from __future__ import annotations
@@ -26,8 +31,19 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, Field
+
+from cowork.coding.redaction import redact_text
+from cowork.common.history_scrub import scrub_credentials
+from cowork.harnesses.anton_harness.agent_files import AgentFiles
+from cowork.harnesses.anton_harness.cell_queries import CellReading, read_cell, strip_url
+
+MAX_QUERY_CHARS = 4_000
+MAX_REQUEST_CHARS = 500
+# The most document strings of one step looked up on disk.
+MAX_FILE_LITERALS = 3
 
 
 class FigureOrigin(StrEnum):
@@ -44,12 +60,29 @@ class SourceKind(StrEnum):
     step = "step"
 
 
-class FigureSource(BaseModel):
-    """One step whose output holds a figure."""
+class FigureStep(BaseModel):
+    """A step at least one figure in the answer names."""
 
     tool_use_id: str
     kind: SourceKind
     label: str
+    # The project-relative POSIX path of a file the step read, when that file
+    # is inside the conversation's project and exists when the turn ends.
+    path: str | None = None
+    # The http(s) URL of the web page the step reached, without its user,
+    # password, query string or fragment.
+    url: str | None = None
+    # The SQL statements and "METHOD url-template" requests the step's code
+    # shows, in code order, redacted.
+    queries: list[str] = Field(default_factory=list)
+    requests: list[str] = Field(default_factory=list)
+
+
+class FigureSource(BaseModel):
+    """A step whose output holds a figure, named by its entry in
+    ``FigureSources.steps``."""
+
+    tool_use_id: str
     page: int | None = None
 
 
@@ -66,6 +99,13 @@ class Figure(BaseModel):
     text: str
     origin: FigureOrigin
     sources: list[FigureSource] = Field(default_factory=list)
+
+
+class FigureSources(BaseModel):
+    """The figures in an answer and, once each, the steps they name."""
+
+    steps: list[FigureStep] = Field(default_factory=list)
+    figures: list[Figure] = Field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -126,48 +166,55 @@ _ANSWER_SKIPS = (
 
 _PAGE = re.compile(r"\bpage\s*[:#]?\s*(\d+)", re.IGNORECASE)
 _URL = re.compile(r"https?://[^\s'\"<>)\]]+")
+_HTTP_URL = re.compile(r"https?://", re.IGNORECASE)
+# A string that names a document: a path, without a scheme, ending in one of
+# the extensions a cell reads data from.
 _DOCUMENT = re.compile(
-    r"""['"]([^'"\n]*?\.(?:csv|tsv|xlsx|xls|pdf|txt|json|md|docx|parquet))['"]""",
-    re.IGNORECASE,
+    r"(?!\w+://)[^'\"\n]*\.(?:csv|tsv|xlsx|xls|pdf|txt|json|md|docx|parquet)", re.IGNORECASE,
 )
-# A cell that reaches connected data: anton's data helper, SQL, a saved
-# connection's DS_ variables, or a database cursor.
-_QUERY = re.compile(
-    r"query_minds_data\(|\bselect\b[\s\S]+?\bfrom\b|\bDS_[A-Z0-9_]+|\bread_sql|\.execute\(",
-    re.IGNORECASE,
-)
-_WEB_CALL = re.compile(r"\bweb_(?:search|fetch)\(")
+# A saved connection's variable, which a request template reads its base URL
+# or credentials from.
+_DS_VARIABLE = re.compile(r"\bDS_[A-Z0-9_]+")
+# A URL's user and password, whatever comes before the ://. A quote ends the
+# match, so it never runs past a string literal in SQL.
+_USERINFO = re.compile(r"(://)[^\s/?#'\"]*@")
+# A scratchpad action that clears the cell namespace the next cell reads.
+_NAMESPACE_RESETS = frozenset({"reset", "remove"})
 
 
-def find_figure_sources(*, answer: str, question: str, steps: Sequence[TurnStep]) -> list[Figure]:
-    """Return every figure in ``answer`` with its origin, in answer order."""
-    figures = _numbers(answer, skips=_skipped_spans(answer))
-    if not figures:
-        return []
-    described_steps = [(step, _describe(step)) for step in steps]
-    described_steps = [(step, described) for step, described in described_steps if described is not None]
+def find_figure_sources(
+    *, answer: str, question: str, steps: Sequence[TurnStep], files: AgentFiles | None = None,
+) -> FigureSources:
+    """Every figure in ``answer`` with its origin, in answer order, and the
+    steps they name in step order. ``files`` finds the project file a step
+    read; without it no step carries a path."""
+    numbers = _numbers(answer, skips=_skipped_spans(answer))
+    if not numbers:
+        return FigureSources()
+    described = _describe_steps(steps)
     question_values = [n.value for n in _numbers(question)]
-    result: list[Figure] = []
-    for figure in figures:
-        sources = [
-            _source(step, described, figure)
-            for step, described in described_steps
-            if _holds(described, figure)
-        ]
-        if sources:
+    named: set[int] = set()
+    figures: list[Figure] = []
+    for number in numbers:
+        holders = [index for index, step in enumerate(described) if _holds(step, number)]
+        named.update(holders)
+        if holders:
             origin = FigureOrigin.step
-        elif any(_same_value(value, figure) for value in question_values):
+        elif any(_same_value(value, number) for value in question_values):
             origin = FigureOrigin.question
         else:
             origin = FigureOrigin.none
-        result.append(Figure(
-            start=_utf16_offset(answer, figure.start),
-            end=_utf16_offset(answer, figure.end),
-            text=answer[figure.start:figure.end],
+        figures.append(Figure(
+            start=_utf16_offset(answer, number.start),
+            end=_utf16_offset(answer, number.end),
+            text=answer[number.start:number.end],
             origin=origin,
-            sources=sources,
+            sources=[_source(described[index], number) for index in holders],
         ))
-    return result
+    return FigureSources(
+        steps=[_figure_step(described[index], files=files) for index in sorted(named)],
+        figures=figures,
+    )
 
 
 def question_text(content: str | list[Any]) -> str:
@@ -183,34 +230,143 @@ def question_text(content: str | list[Any]) -> str:
 
 @dataclass(frozen=True)
 class _DescribedStep:
+    tool_use_id: str
     kind: SourceKind
     label: str
+    url: str | None
+    # The first MAX_FILE_LITERALS strings that name a document the step read
+    # (not one it wrote), in code order; the first that resolves into the
+    # project gives the step its path.
+    file_literals: tuple[str, ...]
+    queries: tuple[str, ...]
+    requests: tuple[str, ...]
     output: str
     output_numbers: tuple[_Number, ...]
     input_values: frozenset[Decimal]
     document_has_pages: bool
 
 
-def _describe(step: TurnStep) -> _DescribedStep | None:
-    """The step's kind, label and output, or None for a scratchpad action other
-    than running a cell, whose output repeats earlier cells or none."""
-    tool_input = _parse_object(step.tool_input) or {}
-    if step.tool_name == "scratchpad":
+def _describe_steps(steps: Sequence[TurnStep]) -> list[_DescribedStep]:
+    """Each step that can be a source, in step order. A scratchpad action
+    other than running a cell is not one: its output repeats earlier cells or
+    is empty. Each named scratchpad keeps the strings its cells bind, so a
+    cell can run a query an earlier cell spelled."""
+    names_by_pad: dict[str, dict[str, str]] = {}
+    described: list[_DescribedStep] = []
+    for step in steps:
+        tool_input = _parse_object(step.tool_input) or {}
+        if step.tool_name != "scratchpad":
+            described.append(_describe_tool(step, tool_input))
+            continue
+        pad = str(tool_input.get("name") or "")
+        if step.action in _NAMESPACE_RESETS:
+            names_by_pad.pop(pad, None)
         if step.action != "exec":
-            return None
+            continue
         code = str(tool_input.get("code") or "")
-        cell = _parse_object(step.content)
-        output = str(cell.get("stdout") or "") if cell is not None else step.content
-        description = str(cell.get("description") or "") if cell is not None else ""
-        kind, label = _classify_cell(code, output, description)
-        literals = code
+        reading = read_cell(code, names=names_by_pad.get(pad, {}))
+        names_by_pad[pad] = dict(reading.names)
+        described.append(_describe_cell(step, code=code, reading=reading))
+    return described
+
+
+def _describe_cell(step: TurnStep, *, code: str, reading: CellReading) -> _DescribedStep:
+    """A cell's kind, in order: a web tool call; a query (SQL, the data
+    helper, a saved connection's variable, or a request that names one); a
+    document it reads (a file it writes is not one); a request to, or a
+    string holding, a literal http(s) URL; else a step."""
+    cell = _parse_object(step.content)
+    output = str(cell.get("stdout") or "") if cell is not None else step.content
+    description = str(cell.get("description") or "") if cell is not None else ""
+    written = set(reading.written_files)
+    documents = tuple(
+        text for text in dict.fromkeys(reading.strings) if text not in written and _DOCUMENT.fullmatch(text)
+    )[:MAX_FILE_LITERALS]
+    web_page = next(
+        (url for url in (*(r.url for r in reading.requests), *reading.strings) if _HTTP_URL.match(url)), None,
+    )
+    url = None
+    if reading.calls_web_tool:
+        found = _URL.search(output)
+        url = _web_url(found.group(0) if found else web_page)
+        kind, label = SourceKind.web, _web_label(url) if url else description or "a web search"
+    elif (
+        reading.queries
+        or reading.calls_query_minds_data
+        or any(_DS_VARIABLE.fullmatch(name) for name in reading.environment_variables)
+        or any(_DS_VARIABLE.search(request.url) for request in reading.requests)
+    ):
+        kind, label = SourceKind.query, description or "a query"
+    elif documents:
+        kind, label = SourceKind.file, _basename(documents[0])
+    elif web_page is not None:
+        url = _web_url(web_page)
+        kind, label = SourceKind.web, _web_label(web_page)
     else:
-        output = step.content
-        kind, label = _classify_tool(step.tool_name, tool_input, output)
-        literals = step.tool_input
-    return _DescribedStep(
+        kind, label = SourceKind.step, description or "a calculation"
+    return _described(
+        step,
         kind=kind,
         label=label,
+        url=url,
+        file_literals=documents,
+        queries=reading.queries,
+        requests=tuple(str(request) for request in reading.requests),
+        output=output,
+        literals=code,
+    )
+
+
+def _describe_tool(step: TurnStep, tool_input: dict[str, Any]) -> _DescribedStep:
+    output = step.content
+    url = None
+    file_literals: tuple[str, ...] = ()
+    if step.tool_name in ("web_search", "web_fetch"):
+        found = _URL.search(output)
+        url = _web_url(str(tool_input.get("url") or "") or (found.group(0) if found else None))
+        kind = SourceKind.web
+        label = _web_label(url) if url else str(tool_input.get("query") or step.tool_name)
+    elif "recall" in step.tool_name:
+        kind, label = SourceKind.memory, "memory"
+    else:
+        path = tool_input.get("path") or tool_input.get("file_path")
+        if isinstance(path, str) and path:
+            kind, label, file_literals = SourceKind.file, _basename(path), (path,)
+        else:
+            kind, label = SourceKind.step, step.tool_name
+    return _described(
+        step,
+        kind=kind,
+        label=label,
+        url=url,
+        file_literals=file_literals,
+        queries=(),
+        requests=(),
+        output=output,
+        literals=step.tool_input,
+    )
+
+
+def _described(
+    step: TurnStep,
+    *,
+    kind: SourceKind,
+    label: str,
+    url: str | None,
+    file_literals: tuple[str, ...],
+    queries: tuple[str, ...],
+    requests: tuple[str, ...],
+    output: str,
+    literals: str,
+) -> _DescribedStep:
+    return _DescribedStep(
+        tool_use_id=step.tool_use_id,
+        kind=kind,
+        label=label,
+        url=url,
+        file_literals=file_literals,
+        queries=queries,
+        requests=requests,
         output=output,
         output_numbers=tuple(_numbers(output) + _numbers(output, pattern=_PLAIN_NUMBER)),
         input_values=frozenset(n.value for n in _numbers(literals)),
@@ -218,32 +374,61 @@ def _describe(step: TurnStep) -> _DescribedStep | None:
     )
 
 
-def _classify_cell(code: str, output: str, description: str) -> tuple[SourceKind, str]:
-    if _WEB_CALL.search(code):
-        url = _URL.search(output) or _URL.search(code)
-        return SourceKind.web, url.group(0) if url else description or "a web search"
-    if _QUERY.search(code):
-        return SourceKind.query, description or "a query"
-    document = _DOCUMENT.search(code)
-    if document:
-        return SourceKind.file, posixpath.basename(document.group(1))
-    url = _URL.search(code)
-    if url:
-        return SourceKind.web, url.group(0)
-    return SourceKind.step, description or "a calculation"
+def _figure_step(step: _DescribedStep, *, files: AgentFiles | None) -> FigureStep:
+    """The step as the event lists it. Its path is looked up only here, once
+    a figure names it, since that reads the disk."""
+    label, path = step.label, None
+    if files is not None:
+        for literal in step.file_literals:
+            path = files.project_path(literal)
+            if path is not None:
+                if step.kind is SourceKind.file:
+                    label = _basename(literal)
+                break
+    return FigureStep(
+        tool_use_id=step.tool_use_id,
+        kind=step.kind,
+        label=_redacted(label),
+        path=path,
+        url=_redacted(step.url) if step.url else None,
+        queries=[_capped(_redacted(query), MAX_QUERY_CHARS) for query in step.queries],
+        requests=[_capped(_redacted(request), MAX_REQUEST_CHARS) for request in step.requests],
+    )
 
 
-def _classify_tool(name: str, tool_input: dict[str, Any], output: str) -> tuple[SourceKind, str]:
-    if name in ("web_search", "web_fetch"):
-        found = _URL.search(output)
-        url = tool_input.get("url") or (found.group(0) if found else "")
-        return SourceKind.web, str(url or tool_input.get("query") or name)
-    if "recall" in name:
-        return SourceKind.memory, "memory"
-    path = tool_input.get("path") or tool_input.get("file_path")
-    if isinstance(path, str) and path:
-        return SourceKind.file, posixpath.basename(path)
-    return SourceKind.step, name
+def _redacted(text: str) -> str:
+    """``text`` without credentials: a URL's user and password, the values of
+    saved connections' secret fields and known key shapes
+    (``scrub_credentials``), and the value of any key=value pair whose key
+    names a secret (``redact_text``)."""
+    return redact_text(scrub_credentials(_USERINFO.sub(r"\1***@", text)))
+
+
+def _capped(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+def _web_url(url: str | None) -> str | None:
+    """``url`` as a link the event can carry: http(s), with no user, password,
+    query string or fragment, and no placeholder left in it."""
+    if not url or not _HTTP_URL.match(url):
+        return None
+    stripped = strip_url(url)
+    return None if "{" in stripped else stripped
+
+
+def _web_label(url: str) -> str:
+    """A web address shown as host and path, without its query string."""
+    stripped = strip_url(url)
+    try:
+        parts = urlsplit(stripped)
+    except ValueError:
+        return stripped
+    return (parts.netloc + parts.path).rstrip("/") or stripped
+
+
+def _basename(path: str) -> str:
+    return posixpath.basename(path.replace("\\", "/"))
 
 
 def _holds(step: _DescribedStep, figure: _Number) -> bool:
@@ -252,11 +437,9 @@ def _holds(step: _DescribedStep, figure: _Number) -> bool:
     return any(_same_value(number.value, figure) for number in step.output_numbers)
 
 
-def _source(step: TurnStep, described: _DescribedStep, figure: _Number) -> FigureSource:
-    page = None
-    if described.document_has_pages:
-        page = _page_of(described, figure)
-    return FigureSource(tool_use_id=step.tool_use_id, kind=described.kind, label=described.label, page=page)
+def _source(step: _DescribedStep, figure: _Number) -> FigureSource:
+    page = _page_of(step, figure) if step.document_has_pages else None
+    return FigureSource(tool_use_id=step.tool_use_id, page=page)
 
 
 def _page_of(step: _DescribedStep, figure: _Number) -> int | None:

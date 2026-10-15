@@ -779,11 +779,12 @@ async def test_a_cancel_during_a_memory_save_waits_for_it_then_saves_the_turn(mo
 
 
 def _no_workspace_or_memory_units(monkeypatch):
-    """Staging, the project memory read and the workspace lookup do nothing.
+    """Staging, the project memory read and the workspace lookups do nothing.
     The fake unit session cannot run them, and each would log an error."""
     monkeypatch.setattr(ResponsesHandler, "_stage_remote_workspace_files", staticmethod(lambda session, conv_id: None))
     monkeypatch.setattr(ResponsesHandler, "_remote_memory", staticmethod(lambda session, conv_id: {}))
     monkeypatch.setattr(ResponsesHandler, "_remote_workspace", staticmethod(lambda session, conv_id: {}))
+    monkeypatch.setattr(ResponsesHandler, "_remote_agent_files", staticmethod(lambda session, conv_id: None))
 
 
 @pytest.mark.asyncio
@@ -1670,6 +1671,51 @@ async def test_produce_remote_streams_desktop_step_vocabulary(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_produce_remote_gives_a_figures_step_the_project_path_of_the_file_the_pod_read(
+    monkeypatch, tmp_path,
+):
+    """The pod reads /workspace/stock.csv, which is the conversation's folder
+    in the project on the shared mount, so the answer's figure names the step
+    with the file's place in the project."""
+    import json
+
+    from cowork.harnesses.anton_harness.agent_files import AgentFiles
+
+    conv_id = uuid4()
+    workspace = tmp_path / "conversations" / str(conv_id)
+    workspace.mkdir(parents=True)
+    (workspace / "stock.csv").write_text("part,site,qty\nP100,S1,250\n")
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    handler._remote_memory = lambda session, conv_id: None
+    handler._remote_agent_files = lambda session, conv_id: AgentFiles.in_cloud_pod(tmp_path, conv_id)
+    code = "print(open('/workspace/stock.csv').read())"
+    cell = {"code": code, "stdout": "part,site,qty\nP100,S1,250\n", "stderr": "", "error": None, "description": ""}
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_step", {"step": "tool_start", "id": "t1", "name": "scratchpad"}
+        yield "turn_step", {"step": "tool_end", "id": "t1", "args": json.dumps({"action": "exec", "code": code})}
+        yield "turn_step", {
+            "step": "tool_result", "id": "t1", "name": "scratchpad", "action": "exec", "content": json.dumps(cell),
+        }
+        yield "turn_delta", {"text": "Site S1 holds 250 units."}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=conv_id, input_text="How many at S1?", original_content="How many at S1?",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    [sources] = [e for e in saved["events"] if e.get("type") == "response.figure_sources"]
+    assert [(step["tool_use_id"], step["path"]) for step in sources["steps"]] == [
+        ("t1", f"conversations/{conv_id}/stock.csv"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_produce_remote_stages_workspace_files(monkeypatch):
     """Wiring guard: the remote produce path must stage attachments +
     instructions into the workspace before the turn — removing that call
@@ -1882,6 +1928,22 @@ def test_remote_artifacts_context_diffs_the_project_base(monkeypatch, tmp_path):
     assert ctx[1] == project_dir / ".anton" / "artifacts"
     assert ctx[2] == str(conversation.project_id)
     assert ctx[3] == "proj"
+
+
+def test_remote_agent_files_place_the_pod_in_the_conversations_folder(monkeypatch, tmp_path):
+    from cowork.harnesses.anton_harness.agent_files import AgentFiles
+
+    project_dir = tmp_path / "proj"
+    _patch_conversation_service(monkeypatch, _conversation_at(project_dir))
+    conv_id = uuid4()
+
+    assert ResponsesHandler._remote_agent_files(None, conv_id) == AgentFiles.in_cloud_pod(project_dir, conv_id)
+
+
+def test_remote_agent_files_are_none_when_the_project_cannot_be_read(monkeypatch):
+    _patch_conversation_service(monkeypatch, SimpleNamespace(project=None))
+
+    assert ResponsesHandler._remote_agent_files(None, uuid4()) is None
 
 
 def test_stage_remote_workspace_files_creates_the_project_artifacts_base(monkeypatch, tmp_path):

@@ -37,7 +37,7 @@ async def remote_turn_events(
     Mutates turn_rows in place; raises RemoteTurnFailed on a worker failure."""
     from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
     from cowork.handlers._turn_history import sanitize_turn_history_rows
-    from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnQuestion
+    from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnContext
     from cowork.services.task_objects import (
         index_turn_artifacts,
         publish_and_card_turn_artifacts,
@@ -45,7 +45,7 @@ async def remote_turn_events(
         snapshot_artifact_state,
     )
 
-    yield TurnQuestion(text=input_text)
+    yield TurnContext(question=input_text, files=ResponsesHandler._remote_agent_files(session, conv_id))
     # A channel turn never goes through handle(), which registers these for
     # a web turn; the seed history below is scrubbed against them.
     await register_vault_secrets(session.scope)

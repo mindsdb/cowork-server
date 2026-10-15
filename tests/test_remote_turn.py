@@ -7,7 +7,8 @@ from uuid import uuid4
 import pytest
 
 import cowork.turnqueue.remote_turn as remote_turn_mod
-from cowork.harnesses.anton_harness.stream_formatter import TurnQuestion
+from cowork.harnesses.anton_harness.agent_files import AgentFiles
+from cowork.harnesses.anton_harness.stream_formatter import TurnContext
 from cowork.turnqueue.remote_turn import RemoteTurnFailed, remote_turn_events
 
 
@@ -21,7 +22,8 @@ class _FakeSession:
 
 
 def _fake_handler(
-    monkeypatch, *, persist_turn_memory=None, remote_artifacts_context=None, remote_seed_history=None
+    monkeypatch, *, persist_turn_memory=None, remote_artifacts_context=None, remote_seed_history=None,
+    remote_agent_files=None,
 ):
     """Replace ResponsesHandler with a stand-in exposing only the methods
     remote_turn_events calls, resolved at call time like every other name here."""
@@ -31,6 +33,7 @@ def _fake_handler(
             "_remote_seed_history": staticmethod(remote_seed_history or (lambda s, c: ([], None))),
             "_persist_remote_compaction": staticmethod(lambda s, *, conv_id, data, seed_info: None),
             "_remote_workspace": staticmethod(lambda s, c: {}),
+            "_remote_agent_files": staticmethod(remote_agent_files or (lambda s, c: None)),
             "_remote_started_at": staticmethod(lambda s, c: None),
             "_persist_turn_memory": staticmethod(persist_turn_memory or (lambda s, c, e: None)),
         },
@@ -38,12 +41,12 @@ def _fake_handler(
 
 
 async def _drain(gen):
-    """The turn's events after the question every turn opens with, which
-    test_the_turn_opens_with_its_question pins."""
+    """The turn's events after the context every turn opens with, which
+    test_the_turn_opens_with_its_context pins."""
     events = []
     try:
         async for event in gen:
-            if not isinstance(event, TurnQuestion):
+            if not isinstance(event, TurnContext):
                 events.append(event)
     except RemoteTurnFailed as exc:
         return events, exc
@@ -51,8 +54,10 @@ async def _drain(gen):
 
 
 @pytest.mark.asyncio
-async def test_the_turn_opens_with_its_question(monkeypatch):
-    _fake_handler(monkeypatch)
+async def test_the_turn_opens_with_its_context(monkeypatch, tmp_path):
+    conv_id = uuid4()
+    files = AgentFiles.in_cloud_pod(tmp_path, conv_id)
+    _fake_handler(monkeypatch, remote_agent_files=lambda s, c: files if c == conv_id else None)
 
     async def fake_replies(**kwargs):
         yield "turn_delta", {"text": "There are 250."}
@@ -61,12 +66,12 @@ async def test_the_turn_opens_with_its_question(monkeypatch):
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
 
     events = [event async for event in remote_turn_events(
-        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        session=_FakeSession(), conv_id=conv_id, org_id="org-123", user_id=None,
         input_text="How many at S1?", model="anton", turn_rows=[],
     )]
 
-    assert events[0] == TurnQuestion(text="How many at S1?")
-    assert not any(isinstance(event, TurnQuestion) for event in events[1:])
+    assert events[0] == TurnContext(question="How many at S1?", files=files)
+    assert not any(isinstance(event, TurnContext) for event in events[1:])
 
 
 @pytest.mark.asyncio

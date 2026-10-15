@@ -42,7 +42,8 @@ from cowork.handlers.response_routing import (
     ineligible_reason,
 )
 from cowork.harnesses.anton_harness.figure_sources import question_text
-from cowork.harnesses.anton_harness.stream_formatter import SkillCreated, TurnQuestion, format_responses_stream
+from cowork.harnesses.anton_harness.agent_files import AgentFiles
+from cowork.harnesses.anton_harness.stream_formatter import SkillCreated, TurnContext, format_responses_stream
 from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.streaming import StreamBuffer, TurnLifecycle, new_buffer, registry, sse_frame
@@ -493,6 +494,9 @@ class _RemoteTurnInputs:
     # they could not be resolved (_remote_workspace).
     workspace: dict
     started_at: str | None
+    # Where the pod's scratchpad works, as this server finds it in the
+    # project, or None when it could not be resolved (_remote_agent_files).
+    files: AgentFiles | None
 
 
 @dataclass
@@ -1334,6 +1338,21 @@ class ResponsesHandler:
             return {}
 
     @staticmethod
+    def _remote_agent_files(session: ScopedSession, conv_id: UUID) -> AgentFiles | None:
+        """Where the pod's scratchpad works, as this server finds it: the
+        conversation's folder in its project on the shared mount.
+
+        None on a lookup failure, so the turn's figure sources name no file
+        paths rather than the turn failing.
+        """
+        try:
+            conversation = ConversationService(session).get_conversation(conv_id)
+            return AgentFiles.in_cloud_pod(conversation.project.path, conv_id)
+        except Exception:
+            logger.exception("[responses] failed to resolve the agent's files", extra=log_context(conversation_id=conv_id))
+            return None
+
+    @staticmethod
     def _remote_artifacts_context(session: ScopedSession, conv_id: UUID):
         """`(conversation, artifacts_base, project_id, project_name)` for the
         remote turn's end-of-turn artifact bookkeeping, or None if unavailable.
@@ -1470,6 +1489,7 @@ class ResponsesHandler:
             memory=self._remote_memory(session, conv_id),
             workspace=self._remote_workspace(session, conv_id),
             started_at=self._remote_started_at(session, conv_id),
+            files=self._remote_agent_files(session, conv_id),
         )
 
     @staticmethod
@@ -1883,13 +1903,12 @@ class ResponsesHandler:
                 snapshot_artifact_state,
             )
 
-            yield TurnQuestion(text=question_text(original_content))
-
             # Read once and held for the whole turn: the pod counts its
             # compaction against exactly the history seeded here, so
             # re-reading it when the reply arrives could map the count onto a
             # different list.
             seed = await run_db(partial(self._read_remote_turn_inputs, conv_id=conv_id), scope=scope)
+            yield TurnContext(question=question_text(original_content), files=seed.files)
             if seed.artifacts is not None:
                 # The worker writes artifacts into the shared tree while this
                 # turn runs, so cowork-server does the same before/after diff
