@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import subprocess
 import threading
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -185,22 +186,33 @@ def test_a_folder_copy_whose_inner_checkout_has_staged_changes_is_kept(tmp_path:
     assert (workspace / "app" / "a.txt").read_text(encoding="utf-8") == "staged\n"
 
 
-def test_releasing_idle_tasks_is_off_unless_turned_on(tmp_path: Path) -> None:
-    assert CodingSettings().workspace_retention_enabled is False
-    assert RetentionPolicy().enabled is False
+def test_idle_tasks_are_released_after_two_weeks_beyond_the_ten_most_recent(tmp_path: Path) -> None:
+    settings = CodingSettings()
+    assert settings.workspace_retention_enabled is True
+    assert settings.workspace_keep_count == 10
+    assert settings.workspace_min_idle_hours == 14 * 24
+    assert RetentionPolicy() == RetentionPolicy(enabled=True, keep_count=10, min_idle=timedelta(days=14))
     repo = repository(tmp_path)
     service = service_with(tmp_path, FakeEngine())
-    created = service.create_session(SessionCreateRequest(path=str(repo), prompt="Go"), CREDS, "fake", "fake-model")
-    wait_for_status(service, created.id, SessionStatus.completed)
-    service.store.update_session(
-        created.id,
-        lambda current: setattr(current, "updated_at", current.updated_at.replace(year=2000)),
-        touch_updated_at=False,
-    )
 
-    assert service.retention.run_policy(RetentionPolicy(keep_count=0)) == []
+    def task(idle: timedelta) -> str:
+        created = service.create_session(SessionCreateRequest(path=str(repo), prompt="Go"), CREDS, "fake", "fake-model")
+        wait_for_status(service, created.id, SessionStatus.completed)
+        service.store.update_session(
+            created.id,
+            lambda current: setattr(current, "updated_at", current.updated_at - idle),
+            touch_updated_at=False,
+        )
+        return created.id
+
+    stale, recent = task(timedelta(days=15)), task(timedelta(days=13))
+
+    assert service.retention.run_policy(RetentionPolicy(keep_count=0)) == [stale]
+    assert service.get_session(stale).workspace_released_at is not None
+    assert Path(service.get_session(recent).workspace_path).is_dir()
+    # Under the default policy both are among the ten most recent, so both are kept.
+    service.ensure_workspace(stale)
     assert service.run_workspace_retention() == []
-    assert Path(service.get_session(created.id).workspace_path).is_dir()
 
 
 def test_a_kept_workspace_says_why_and_a_failed_rebuild_is_reported(tmp_path: Path) -> None:
