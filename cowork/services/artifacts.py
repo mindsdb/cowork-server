@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import heapq
 import json
 import logging
 import mimetypes
@@ -25,7 +26,7 @@ import uuid
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator
+from typing import TYPE_CHECKING, Iterator, NamedTuple
 
 from urllib.parse import quote
 
@@ -39,7 +40,8 @@ from cowork.common.paths import (
     dir_unlink,
 )
 from cowork.common.settings.app_settings import get_app_settings
-from anton.core.artifacts.internal_files import NON_CONTENT_NAMES
+from anton.core.artifacts.internal_files import NON_CONTENT_NAMES, REVISIONS_DIRNAME
+from anton.core.artifacts.store import iter_content_files
 
 if TYPE_CHECKING:
     from cowork.db.scoped import ScopedSession
@@ -757,7 +759,7 @@ def serve_url_for(
     return ""
 
 
-def _candidate_relative_artifacts(raw_path: str) -> list[Path]:
+def _candidate_relative_artifacts(raw_path: str, artifact_dirs: list[Path]) -> list[Path]:
     text = (raw_path or "").strip().replace("\\", "/")
     while text.startswith("./"):
         text = text[2:]
@@ -767,7 +769,7 @@ def _candidate_relative_artifacts(raw_path: str) -> list[Path]:
     if text.startswith("artifacts/"):
         text = text[len("artifacts/"):]
     matches: dict[str, Path] = {}
-    for art_root in _scan_artifact_dirs():
+    for art_root in artifact_dirs:
         try:
             target = (art_root / text).resolve()
             target.relative_to(art_root.resolve())
@@ -812,7 +814,7 @@ def resolve_artifact_path(raw_path: str, *, allow_dir: bool = False) -> Path | N
                 return resolved
         raise FileNotFoundError("Artifact is not in a known artifacts directory")
 
-    matches = _candidate_relative_artifacts(raw_path)
+    matches = _candidate_relative_artifacts(raw_path, _scan_artifact_dirs())
     if len(matches) == 1:
         return matches[0]
     if len(matches) > 1:
@@ -1439,7 +1441,7 @@ def artifact_status_for_resolved(artifact: Path) -> dict:
     # Fullstack artifacts keep their primary file in a `static/` subdir, so a
     # naive `artifact.parent` would land there instead of the artifact root
     # (where metadata.json + .published.json actually live) — climb via
-    # `_artifact_root_for` like `mount_preview`/`html_artifacts` do.
+    # `_artifact_root_for` like `mount_preview` does.
     folder = artifact if artifact.is_dir() else _artifact_root_for(artifact)
     card = card_for_folder(folder)
     if card is None:
@@ -1687,57 +1689,120 @@ def get_preview_mount(token: str) -> Path | None:
     return _PREVIEW_MOUNTS.get(token)
 
 
+# Static artifact extensions a user can publish to a MindsHub web page.
+# `.html` is served as-is; `.md` is rendered to a styled HTML page first
+# (see `publish._render_markdown_to_html`). Fullstack artifacts bypass this —
+# they publish their directory regardless of the primary file's suffix.
+PUBLISHABLE_STATIC_SUFFIXES = (".html", ".md")
+_PUBLISHABLE_LIST_LIMIT = 40
+
+
+def is_non_content_path(path: Path, container: Path) -> bool:
+    """True when `path` is not artifact content: its first component inside the
+    artifact folder is in anton's `NON_CONTENT_NAMES` (`static/prd.md` is
+    content), or it lies in a revision journal at any depth.
+
+    `container` is an artifacts dir whose direct children are artifact folders.
+    A path outside it is not judged here and returns False.
+    """
+    try:
+        parts = path.resolve().relative_to(container.resolve()).parts
+    except (OSError, ValueError, RuntimeError):
+        return False
+    return REVISIONS_DIRNAME in parts or (len(parts) > 1 and parts[1] in NON_CONTENT_NAMES)
+
+
+class _PublishableCandidate(NamedTuple):
+    mtime_ns: int
+    path: Path
+    size: int
+    published_dir: Path
+    title: str
+
+
+def _humanize(name: str) -> str:
+    return name.replace("_", " ").replace("-", " ").title()
+
+
+def _publishable_in_folder(
+    folder: Path, container: Path, fullstack_types: frozenset[str]
+) -> list[_PublishableCandidate]:
+    """Publishable candidates of one artifact folder: one per static page, or a
+    single entry for a fullstack app."""
+    # `iter_content_files` already drops top-level non-content names; only a
+    # nested revision journal is left to skip.
+    pages = [
+        (path, st)
+        for path, st in iter_content_files(folder)
+        if path.suffix.lower() in PUBLISHABLE_STATIC_SUFFIXES
+        and REVISIONS_DIRNAME not in path.relative_to(folder).parts
+    ]
+    meta = _load_metadata(folder) if (folder / "metadata.json").is_file() else None
+    if (meta or {}).get("type") not in fullstack_types:
+        return [
+            _PublishableCandidate(st.st_mtime_ns, path, st.st_size, path.parent, _humanize(path.stem))
+            for path, st in pages
+        ]
+
+    # Fullstack apps are found by their metadata, not by having a page, so an
+    # app whose primary is not HTML/Markdown is still listed.
+    newest = max(pages, key=lambda page: page[1].st_mtime_ns, default=None)
+    primary = meta.get("primary")
+    entry_path = folder / primary if primary else None
+    if entry_path is None or not entry_path.is_file() or is_non_content_path(entry_path, container):
+        entry_path = newest[0] if newest else None
+    if entry_path is None:
+        return []
+    try:
+        st = entry_path.stat()
+    except OSError:
+        return []
+    mtime_ns = newest[1].st_mtime_ns if newest else st.st_mtime_ns
+    title = meta.get("name") or _humanize(folder.name)
+    return [_PublishableCandidate(mtime_ns, entry_path, st.st_size, folder, title)]
+
+
 def html_artifacts() -> list[dict]:
-    """List every publishable file (HTML + Markdown) under every project's
-    artifacts tree.
+    """List the most recently changed publishable files (HTML + Markdown)
+    across every project's artifacts tree.
 
     `.md` files publish as rendered HTML pages (see `publish.py`), so they
     belong in this list alongside `.html`. Fullstack apps keep their pages
     inside `static/`; they're surfaced as a single entry per artifact root
-    (titled by the root's metadata), not one row per page.
+    (titled by the root's metadata), not one row per page. Non-content files
+    (README, generation inputs, revision copies) and symlinks are not listed.
     """
-    out = []
-    seen: set[str] = set()
-    seen_roots: set[str] = set()
     fullstack_types = _fullstack_types()
-    for art_root in _scan_artifact_dirs():
-        if not art_root.exists():
+    candidates: list[_PublishableCandidate] = []
+    for container in _scan_artifact_dirs():
+        try:
+            with os.scandir(container) as it:
+                entries = list(it)
+        except OSError:
             continue
-        candidates = [p for ext in ("*.html", "*.md") for p in art_root.rglob(ext)]
-        for path in sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True):
-            key = str(path.resolve())
-            if key in seen:
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    candidates.extend(_publishable_in_folder(path, container, fullstack_types))
+                elif entry.is_file(follow_symlinks=False) and path.suffix.lower() in PUBLISHABLE_STATIC_SUFFIXES:
+                    # Legacy loose file directly in the container.
+                    st = entry.stat(follow_symlinks=False)
+                    candidates.append(
+                        _PublishableCandidate(st.st_mtime_ns, path, st.st_size, container, _humanize(path.stem))
+                    )
+            except OSError:
                 continue
-
-            # Group fullstack apps by their artifact root — one entry per app.
-            artifact_root = _artifact_root_for(path)
-            meta = _load_metadata(artifact_root) if (artifact_root / "metadata.json").is_file() else None
-            if (meta or {}).get("type") in fullstack_types:
-                root_key = str(artifact_root.resolve())
-                if root_key in seen_roots:
-                    continue
-                seen_roots.add(root_key)
-                primary_hint = meta.get("primary") or ""
-                entry_path = (artifact_root / primary_hint) if primary_hint else path
-                if not entry_path.is_file():
-                    entry_path = path
-                seen.add(str(entry_path.resolve()))
-                out.append({
-                    "title": meta.get("name") or artifact_root.name.replace("_", " ").replace("-", " ").title(),
-                    "path": str(entry_path),
-                    "bytes": entry_path.stat().st_size if entry_path.is_file() else 0,
-                    "publishedUrl": _published_url_for(artifact_root, entry_path),
-                })
-                continue
-
-            seen.add(key)
-            out.append({
-                "title": path.stem.replace("_", " ").replace("-", " ").title(),
-                "path": str(path),
-                "bytes": path.stat().st_size,
-                "publishedUrl": _published_url_for(path.parent, path),
-            })
-    return out[:40]
+    newest = heapq.nlargest(_PUBLISHABLE_LIST_LIMIT, candidates, key=lambda c: c.mtime_ns)
+    return [
+        {
+            "title": c.title,
+            "path": str(c.path),
+            "bytes": c.size,
+            "publishedUrl": _published_url_for(c.published_dir, c.path),
+        }
+        for c in newest
+    ]
 
 
 # ─── Backend-artifact auto-launch ─────────────────────────────────

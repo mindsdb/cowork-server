@@ -110,7 +110,7 @@ def health() -> dict:
         # development an older published sidecar can still answer /health while
         # returning 404 for every Code Mode route. Keep this list additive so a
         # client can require the capability it needs before adopting a sidecar.
-        "capabilities": ["coding"],
+        "capabilities": ["coding", "pending-credential-clear"],
         "anton_available": True,
         "mode": "anton",
         "server_version": _pkg_version("cowork-server"),
