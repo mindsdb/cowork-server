@@ -8,6 +8,11 @@ per schedule. Each ScheduleRun is now one numbered attempt at an occurrence,
 unique per (occurrence_id, attempt). Runs written before this revision keep
 NULL in both columns.
 
+Each hand-off of an occurrence is conditional on its lease_token, so a stale
+holder or reaper cannot overwrite a newer holder. A run records when it handed
+its turn to the agent (execution_started_at) and how it ended (outcome), which
+is what decides whether a failed attempt may be tried again.
+
 Revision ID: bb263d8b3b42
 Revises: 3e4b5f7586d3
 Create Date: 2026-10-14 00:00:00.000000
@@ -54,6 +59,7 @@ def upgrade() -> None:
             sa.Column("max_attempts", sa.Integer(), nullable=False),
             sa.Column("next_attempt_at", sa.DateTime(timezone=True), nullable=True),
             sa.Column("lease_expires_at", sa.DateTime(timezone=True), nullable=True),
+            sa.Column("lease_token", sa.String(length=36), nullable=True),
             sa.Column("settled_at", sa.DateTime(timezone=True), nullable=True),
             sa.Column("error", sa.String(), nullable=True),
             sa.ForeignKeyConstraint(["schedule_id"], ["schedules.id"], ondelete="CASCADE"),
@@ -83,6 +89,9 @@ def upgrade() -> None:
         with op.batch_alter_table("schedule_runs", schema=None) as batch:
             batch.add_column(sa.Column("occurrence_id", sa.Uuid(), nullable=True))
             batch.add_column(sa.Column("attempt", sa.Integer(), nullable=True))
+            batch.add_column(sa.Column("execution_started_at", sa.DateTime(timezone=True), nullable=True))
+            batch.add_column(sa.Column("stop_requested_at", sa.DateTime(timezone=True), nullable=True))
+            batch.add_column(sa.Column("outcome", sa.String(), nullable=True))
             batch.create_foreign_key(
                 _RUN_FK, "schedule_occurrences", ["occurrence_id"], ["id"], ondelete="CASCADE"
             )
@@ -96,6 +105,9 @@ def downgrade() -> None:
         batch.drop_index(_RUN_IX)
         batch.drop_constraint(_RUN_UQ, type_="unique")
         batch.drop_constraint(_RUN_FK, type_="foreignkey")
+        batch.drop_column("outcome")
+        batch.drop_column("stop_requested_at")
+        batch.drop_column("execution_started_at")
         batch.drop_column("attempt")
         batch.drop_column("occurrence_id")
     op.drop_index("ix_schedule_occurrences_status_next_attempt", table_name="schedule_occurrences")
