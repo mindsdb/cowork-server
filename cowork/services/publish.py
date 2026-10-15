@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+from fastapi import HTTPException
 from pydantic import SecretStr
 
 from cowork.common.paths import cowork_home, pod_local_only
@@ -26,7 +27,11 @@ from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings  # noqa: F401
 
 from cowork.services.connectors.persist import vault_for_scope
-from cowork.services.providers import is_mindshub_publish_url, publish_url_for_endpoint
+from cowork.services.providers import (
+    is_mindshub_publish_url,
+    normalize_publish_url,
+    publish_url_for_endpoint,
+)
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
 from anton.minds_client import describe_minds_connection_error
 from anton.publish_access import access_from_owner_side
@@ -36,8 +41,10 @@ from anton.publish_access import resolve_publish_target as _anton_resolve_publis
 from cowork.services.artifacts import (
     _content_mtime,
     _load_published_map,
+    PUBLISHABLE_STATIC_SUFFIXES,
     _scan_artifact_dirs,
     html_artifacts,
+    is_non_content_path,
     resolve_artifact_path,
 )
 
@@ -58,6 +65,26 @@ class PublisherUnavailable(RuntimeError):
     this replaced, which broke once upstream error text could itself contain
     that word (e.g. an HTTP 503 reason phrase or a timeout advice string).
     """
+
+
+# The upload service's 409 for a report that belongs to another account; the
+# renderer matches on the code.
+OWNED_BY_OTHER_USER_CODE = "artifact_owned_by_other_user"
+OWNED_BY_OTHER_USER_MESSAGE = "This artifact was published by another owner."
+
+
+class PublishOwnedByOtherUser(HTTPException):
+    """The upload service refused the publish: another account owns this report.
+
+    An HTTPException, like ProductPermissionDenied, so any route that lets it
+    through answers 409 with the code. Nobody retries it with a fresh
+    report_id, which would publish a copy under a new URL.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            409, detail={"code": OWNED_BY_OTHER_USER_CODE, "message": OWNED_BY_OTHER_USER_MESSAGE},
+        )
 
 
 def raise_publish_permission_error(exc: Exception) -> None:
@@ -245,6 +272,9 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
          SettingService, which passes DB rows as init kwargs);
       2. the ``publish_url`` setting;
       3. the host derived from the active provider endpoint.
+
+    A result on the retired 4nton.ai host becomes the prod publish host
+    (`normalize_publish_url`): a saved setting may still name it.
     """
     oai_host = (urlparse(settings.openai_base_url or "").hostname or "").lower()
     if oai_host.startswith("api") and oai_host.endswith(".mindshub.ai"):
@@ -253,7 +283,9 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
     else:
         endpoint, api_key = settings.minds_url, _secret_str(settings.minds_api_key)
     env_publish_url = os.environ.get("ANTON_PUBLISH_URL", "").strip()
-    publish_url = env_publish_url or settings.publish_url or publish_url_for_endpoint(endpoint)
+    publish_url = normalize_publish_url(
+        env_publish_url or settings.publish_url or publish_url_for_endpoint(endpoint)
+    )
     return publish_url, api_key
 
 
@@ -273,11 +305,12 @@ def list_publishable() -> dict:
 # source of truth) and are imported at the top of this module.
 
 
-# Static artifact extensions a user can publish to a MindsHub web page.
-# `.html` is served as-is; `.md` is rendered to a styled HTML page first
-# (see `_render_markdown_to_html`). Fullstack artifacts bypass this — they
-# publish their directory regardless of the primary file's suffix.
-PUBLISHABLE_STATIC_SUFFIXES = (".html", ".md")
+def is_publishable_static(target: Path, artifacts_base: Path) -> bool:
+    """A non-fullstack target publishes only when it is an HTML/Markdown file
+    that is artifact content (not README, a generation input or a revision copy)."""
+    return target.suffix.lower() in PUBLISHABLE_STATIC_SUFFIXES and not is_non_content_path(
+        target, artifacts_base
+    )
 
 # What Share and the agent's publish tool report for a full-stack artifact when
 # the publish URL is not MindsHub's service (`is_mindshub_publish_url`).
@@ -422,8 +455,8 @@ def publish_artifact(
     publish_target, published_dir, published_key, is_fullstack = _resolve_publish_target(
         artifact, container_dirs=[artifacts_base]
     )
-    if not is_fullstack and publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
-        raise ValueError("Only HTML and Markdown artifacts can be published")
+    if not is_fullstack and not is_publishable_static(publish_target, artifacts_base):
+        raise ValueError("Only HTML and Markdown artifact content can be published")
     # Refuse before anything is built: `anton.publisher.publish` puts the
     # artifact's datasource credentials, in plaintext, in the body of a
     # full-stack upload, and a service that can't run the app would receive
@@ -432,7 +465,7 @@ def publish_artifact(
         raise ValueError(FULLSTACK_PUBLISH_UNSUPPORTED)
 
     try:
-        from anton.publisher import publish
+        from anton.publisher import ArtifactOwnedByOtherUserError, publish
     except Exception as exc:
         raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
@@ -496,7 +529,14 @@ def publish_artifact(
             # Org-keyed: the persisted vault is per organization, and an
             # unscoped lookup would resolve to the shared namespace root.
             vault=vault_for_scope(scope),
+            # While the password is unchanged anton re-sends the hash stored
+            # here, so a content-only re-publish keeps viewers' password grants.
+            previous_access=previous if isinstance(previous, dict) else None,
         )
+    except ArtifactOwnedByOtherUserError as exc:
+        # Not a failure to log or wrap: the upload service holds this
+        # report_id for another account.
+        raise PublishOwnedByOtherUser() from exc
     except Exception as exc:
         raise_publish_permission_error(exc)
         logger.exception("Publishing failed")
@@ -515,6 +555,9 @@ def publish_artifact(
         if md_tmp_dir is not None:
             md_tmp_dir.cleanup()
 
+    # Owner-side state for the next publish, stored in the entry below and
+    # never part of the response.
+    password_hash = result.pop("password_hash", None)
     view_url = result.get("view_url", "")
     returned_report_id = result.get("report_id", "")
     if returned_report_id:
@@ -528,7 +571,9 @@ def publish_artifact(
         # Owner-side only — .published.json never enters the bundle. `owner_side`
         # carries `mode` (+ `access_password`/`pwd_version` for password, or
         # `emails`/`org_allowed`/`access_version` for restricted), and always
-        # `requires_password` for back-compat with older readers.
+        # `requires_password` for back-compat with older readers. Password mode
+        # also keeps the `password_hash` anton sent, handed back as
+        # `previous_access` on the next publish.
         entry: dict[str, Any] = {
             "report_id": returned_report_id,
             "url": view_url,
@@ -548,6 +593,8 @@ def publish_artifact(
             "published": True,
             **owner_side,
         }
+        if password_hash:
+            entry["password_hash"] = password_hash
         published_map[published_key] = entry
         _write_published_map(published_json, published_map)
         state = _load_state()
@@ -592,7 +639,7 @@ def compute_publish_md5(artifact: Path, *, artifacts_base: Path) -> str | None:
         )
     except Exception:
         return None
-    if not is_fullstack and publish_target.suffix.lower() not in PUBLISHABLE_STATIC_SUFFIXES:
+    if not is_fullstack and not is_publishable_static(publish_target, artifacts_base):
         return None
     try:
         from anton.publisher import _zip_fullstack, _zip_html
