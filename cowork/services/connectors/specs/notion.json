@@ -19,6 +19,7 @@
     "workspace"
   ],
   "description": "Read Notion pages, databases, and blocks in your workspace, and edit them once you allow it.",
+  "usage_notes": "A connection made with Notion sign-in (MCP) gives you Notion's tools, named `notion__<tool>`; use them rather than raw HTTP calls. To read a page you have a URL or id for, call `notion__notion-fetch` with it directly; do not search for it first. `notion__notion-search` needs a non-empty query; to browse without one, use `notion__notion-list-recent-pages`, `notion__notion-list-shared-pages`, `notion__notion-list-private-pages` or `notion__notion-list-favorite-pages`. Leave out optional arguments you have no value for; never send an empty string (an empty `cursor` is rejected as an invalid cursor). New connections are read-only: create, update and comment tools only appear once the user allows editing on the connection, so say that instead of promising a change.\nA connection with an `INTEGRATION_SECRET` field (an internal integration, no MCP tools) uses the REST API at `https://api.notion.com/v1`: send `Authorization: Bearer <INTEGRATION_SECRET>` and `Notion-Version: <NOTION_VERSION>` (default `2022-06-28`). An integration only sees pages explicitly shared with it.",
   "category": "productivity",
   "logo": "doc",
   "logo_color": "#000000",

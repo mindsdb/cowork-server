@@ -106,9 +106,10 @@ async def fetch_page(access_token: str, page: str) -> dict[str, Any]:
 
 
 def describe_project_pages(pages_by_connection: dict[str, list[dict]]) -> str:
-    """System-prompt guidance naming the Notion pages added to the current
-    project, so the agent can read them in any later turn, not only in the
-    message they were added with. Empty when there are none."""
+    """System-prompt list of the Notion pages added to the current project,
+    so the agent can read them in any later turn, not only in the message
+    they were added with. Empty when there are none. How to read a page is
+    in notion.json's usage_notes; this is per-project data only."""
     lines = [
         f"- {page.get('name') or 'Untitled'} (url: {page.get('url') or page.get('id')}, connection: {conn_name})"
         for conn_name, pages in pages_by_connection.items()
@@ -120,6 +121,5 @@ def describe_project_pages(pages_by_connection: dict[str, list[dict]]) -> str:
     return (
         "\n\nNotion pages the user added to this project's files:\n"
         + "\n".join(lines)
-        + "\nWhen the user refers to the project's files, documents or pages, these are included. "
-        "Read one with the Notion connection's notion-fetch tool, passing its URL; do not search for it first."
+        + "\nWhen the user refers to the project's files, documents or pages, these are included."
     )

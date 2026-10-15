@@ -237,10 +237,16 @@ class TestProjectPages:
         notion = service.picked_files_by_project(LocalDataVault(tmp_path), "alpha", engine="notion")
         assert list(drive) == ["me-gmail-com"] and list(notion) == ["mcp-ws"]
 
-    def test_the_agent_is_told_each_page_url_and_how_to_read_it(self):
+    def test_the_agent_is_told_each_page_url(self):
         text = describe_project_pages({"mcp-ws": [{"id": "p1", "name": "ML Research", "url": "https://www.notion.so/p1"}]})
         assert "- ML Research (url: https://www.notion.so/p1, connection: mcp-ws)" in text
-        assert "notion-fetch" in text
+
+    def test_how_to_read_a_page_comes_from_the_spec_usage_notes(self):
+        from cowork.services.connectors.specs._registry import registry
+
+        notes = registry.usage_notes_for(["notion"])["notion"]
+        assert "notion__notion-fetch" in notes
+        assert "notion-fetch" not in describe_project_pages({"mcp-ws": [{"id": "p1", "url": "https://www.notion.so/p1"}]})
 
     def test_no_pages_adds_nothing_to_the_prompt(self):
         assert describe_project_pages({}) == ""
