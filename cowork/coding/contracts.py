@@ -427,6 +427,13 @@ class CodingSession(BaseModel):
     terminal_tabs: list[TerminalTab] = Field(default_factory=list, max_length=12)
     pinned: bool = False
     archived: bool = False
+    # Set while the task's workspace is removed to reclaim disk. Paths above
+    # stay as they were; the workspace is rebuilt there when next needed.
+    workspace_released_at: datetime | None = None
+    # Why the last release kept the workspace, and why the last rebuild of a
+    # released one failed; both clear when the next attempt succeeds.
+    workspace_kept_reason: str | None = None
+    workspace_restore_error: str | None = None
     last_error: str | None = None
     event_count: int = 0
     created_at: datetime = Field(default_factory=utc_now)
