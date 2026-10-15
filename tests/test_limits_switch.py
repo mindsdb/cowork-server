@@ -221,3 +221,81 @@ def test_the_settings_response_carries_the_safety_limits(engine, monkeypatch):
     assert rows["limits_enabled"].default is None
     assert rows["greeting"].default is None
     assert svc.get_setting("max_tool_rounds").default == "300"
+
+
+@pytest.fixture()
+def org_tenancy(monkeypatch):
+    monkeypatch.setenv("COWORK_TENANCY_MODE", "org")
+    get_app_settings.cache_clear()
+    yield
+    get_app_settings.cache_clear()
+
+
+def test_in_org_tenancy_a_global_budget_row_turns_nothing_on(engine, org_tenancy):
+    """A global row in an org deployment predates the per-org scopes: no org
+    chose it, and a global switch would reach every org without its own."""
+    with Session(engine) as s:
+        s.add(Setting(key="max_turn_tokens", value="900000"))
+        s.add(Setting(key="max_tool_rounds", value="12", scope="org", org_id=ORG_A))
+        s.commit()
+
+    assert enable_limits_for_saved_budgets(Session(engine)) is True
+    assert _switch_rows(engine) == {("org", ORG_A, None, "True")}
+    org_c = SettingService(Session(engine), TenantScope(org_mode=True, org_id=ORG_C)).load()
+    assert org_c.limits_enabled is False
+    assert effective_turn_limits(org_c) == _defaults()
+
+
+@pytest.mark.parametrize("save", ["upsert", "save_all"])
+def test_saving_a_budget_turns_the_switch_on_at_once(engine, save):
+    """No reboot needed: a renderer that predates the switch saves only the budget."""
+    svc = SettingService(Session(engine), TenantScope(org_mode=True, org_id=ORG_A))
+    if save == "upsert":
+        svc.upsert_setting("max_tool_rounds", "12")
+    else:
+        svc.save_all({"max_tool_rounds": "12", "publish_url": "https://view.example.com"})
+
+    assert _switch_rows(engine) == {("org", ORG_A, None, "True")}
+    assert effective_turn_limits(svc.load()).max_tool_rounds == 12
+
+
+@pytest.mark.parametrize("save", ["upsert", "save_all"])
+def test_saving_a_budget_leaves_a_switch_turned_off_alone(engine, save):
+    svc = SettingService(Session(engine), TenantScope(org_mode=True, org_id=ORG_A))
+    svc.upsert_setting("limits_enabled", "false")
+    if save == "upsert":
+        svc.upsert_setting("max_tool_rounds", "12")
+    else:
+        svc.save_all({"max_tool_rounds": "12"})
+
+    assert _switch_rows(engine) == {("org", ORG_A, None, "False")}
+    assert effective_turn_limits(svc.load()) == _defaults()
+
+
+def test_saving_the_switch_off_with_a_budget_keeps_it_off(engine):
+    svc = SettingService(Session(engine), LOCAL_SCOPE)
+    svc.save_all({"limits_enabled": "false", "max_tool_rounds": "12"})
+    assert _switch_rows(engine) == {(None, None, None, "False")}
+
+
+def test_a_boot_turns_on_the_switch_for_a_saved_budget(tmp_path, monkeypatch):
+    """Through the real startup path, on its own database and COWORK_HOME."""
+    import sqlite3
+
+    from cowork.dev_setup import run_dev_setup
+
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
+    monkeypatch.setenv("DATABASE_URI", f"sqlite:///{tmp_path / 'cowork.db'}")
+    get_app_settings.cache_clear()
+
+    run_dev_setup()
+    with sqlite3.connect(tmp_path / "cowork.db") as db:
+        db.execute(
+            "INSERT INTO settings (id, key, value, created_at, modified_at) "
+            "VALUES ('b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0', 'max_tool_rounds', '12', datetime('now'), datetime('now'))"
+        )
+    run_dev_setup()
+
+    with sqlite3.connect(tmp_path / "cowork.db") as db:
+        rows = db.execute("SELECT value, scope FROM settings WHERE key = 'limits_enabled'").fetchall()
+    assert rows == [("True", None)]

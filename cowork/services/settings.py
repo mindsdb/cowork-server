@@ -313,12 +313,25 @@ class SettingService:
             return field_val.value, validated
         return (str(field_val) if field_val is not None else value), validated
 
+    def _opt_in_with_budgets(self, keys) -> None:
+        """Saving a budget turns the limits switch on at that scope, unless the
+        switch is already stored there, or staged by the same write (an
+        explicit off stays off). Without this, a budget saved by a renderer
+        that predates the switch would be ignored until the next boot's
+        ``enable_limits_for_saved_budgets``. Call after staging the write's
+        rows: the lookup below sees them through autoflush."""
+        if not set(keys) & set(BUDGET_SETTING_KEYS):
+            return
+        if self._own_row("limits_enabled") is None:
+            self.session.add(self._new_row("limits_enabled", "True"))
+
     def upsert_setting(self, key: str, value: str) -> SettingResponse:
         self._require_writable()
         store_val, validated = self._encode_for_store(key, value)
         self._require_write_target(key)
         try:
             self._write_row(key, store_val)
+            self._opt_in_with_budgets([key])
             self.session.commit()
         except Exception:
             self.session.rollback()
@@ -350,6 +363,7 @@ class SettingService:
         try:
             for key, store_val in encoded.items():
                 self._write_row(key, store_val)
+            self._opt_in_with_budgets(encoded)
             if encoded:
                 self.session.commit()
         except Exception:

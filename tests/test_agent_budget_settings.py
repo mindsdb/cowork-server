@@ -117,10 +117,12 @@ def test_settings_service_round_trip():
         # The test DB is shared session-wide — never leak the 75 row (or the
         # cache invalidation that goes with it) into later tests, even when
         # an assertion above fails.
-        try:
-            service.delete_setting("max_tool_rounds")
-        except ValueError:
-            pass
+        # Saving a budget also stores limits_enabled; remove it too.
+        for key in ("max_tool_rounds", "limits_enabled"):
+            try:
+                service.delete_setting(key)
+            except ValueError:
+                pass
         session.close()
     assert UserSettings().max_tool_rounds == 50  # back to Cowork default
 

@@ -25,7 +25,7 @@ import datetime as dt
 import logging
 from pathlib import Path
 
-from cowork.common.settings.app_settings import default_minds_api_host
+from cowork.common.settings.app_settings import default_minds_api_host, get_app_settings
 
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
@@ -210,10 +210,17 @@ def enable_limits_for_saved_budgets(session: Session) -> bool:
     that already has the switch, on or off, is left alone, so turning it off
     sticks. Idempotent and sentinel-free: it also catches a budget saved later
     by a renderer that predates the switch. Returns True if any row was written.
+
+    In org tenancy, global (unscoped) rows are skipped: they predate the
+    per-org scopes, so they are no org's choice, and a global switch would
+    reach every org without its own. A local install's rows are global, and
+    are its own choice.
     """
     rows = session.exec(
         select(Setting).where(Setting.key.in_((*BUDGET_SETTING_KEYS, "limits_enabled")))
     ).all()
+    if get_app_settings().tenancy_mode == "org":
+        rows = [r for r in rows if r.scope is not None]
     has_switch = {(r.scope, r.org_id, r.user_id) for r in rows if r.key == "limits_enabled"}
     pending = {
         (r.scope, r.org_id, r.user_id)
