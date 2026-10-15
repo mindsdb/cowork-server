@@ -1492,7 +1492,7 @@ class TestManyHolders:
         assert MAX_FIGURE_SOURCES == 3
         assert [s.tool_use_id for s in _figure(sources, "250").sources] == ["toolu_0", "toolu_2", "toolu_4"]
 
-    def test_a_large_turn_names_every_holding_step_quickly(self):
+    def test_a_large_turn_names_every_holding_step_quickly(self, monkeypatch):
         printed: list[set[int]] = []
         steps = []
         for i in range(25):
@@ -1500,11 +1500,24 @@ class TestManyHolders:
             printed.append(set(values))
             steps.append(_cell(f"toolu_{i}", code="print(rows)", stdout="\n".join(f"{v}, {v}.25" for v in values)))
         answer = "Values: " + ", ".join(str(v) for v in range(0, 2_000, 5)) + "."
+        compared = 0
+        same_value = figure_sources_mod._same_value
+
+        def counted(*args, **kwargs):
+            nonlocal compared
+            compared += 1
+            return same_value(*args, **kwargs)
+
+        monkeypatch.setattr(figure_sources_mod, "_same_value", counted)
         start = time.perf_counter()
 
         sources = find_figure_sources(answer=answer, question="", steps=steps)
 
-        assert time.perf_counter() - start < 1.0
+        # A scan of every output value per figure and step compares 400 x 25 x
+        # 1,600 times; the sorted index compares none. The time bound leaves
+        # room for a coverage run on a slow CI runner.
+        assert compared < 400 * 25
+        assert time.perf_counter() - start < 5.0
         assert len(sources.figures) == 400
         for figure in sources.figures:
             holders = [f"toolu_{i}" for i, values in enumerate(printed) if int(figure.text) in values]
