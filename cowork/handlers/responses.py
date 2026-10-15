@@ -2778,10 +2778,9 @@ class ResponsesHandler:
             (e.get("response") for e in reversed(collected_events) if e.get("type") == "response.completed"),
             None,
         ) or {}
-        incomplete = final.get("incomplete_details")
         return Response(
-            status=ResponseStatus.incomplete if incomplete else ResponseStatus.completed,
-            incomplete_details=incomplete,
+            status=final.get("status") or ResponseStatus.completed,
+            incomplete_details=final.get("incomplete_details"),
             model=model,
             output=[self._build_output(str(anchor_id), assistant_text)],
         )
