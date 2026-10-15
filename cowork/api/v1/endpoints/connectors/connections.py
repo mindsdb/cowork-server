@@ -10,8 +10,7 @@ from pydantic import BaseModel
 
 from cowork.api.v1.permissions import AuthenticatedInOrgMode, LoopbackOnly, require
 from cowork.common.settings.app_settings import ConnectorSettings, OAuthSettings
-from cowork.db.scoped import TenantScope, get_tenant_scope, scoped_storage_root
-from cowork.managed import MANAGED_CONNECTION_REFUSAL, ManagedConnectionError
+from cowork.db.scoped import TenantScope, get_tenant_scope
 from cowork.schemas.connectors import (
     ConnectionDetailResponse,
     ConnectionSummaryResponse,
@@ -26,9 +25,10 @@ from cowork.services.connectors.developer_validation import (
     validate_developer_connection,
 )
 from cowork.services.connectors.identity import oauth_default_label
+from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL, SharedConnectionError
 from cowork.services.connectors.oauth import auth_proxy
 from cowork.services.connectors.oauth.google import oauth_service
-from cowork.services.connectors.persist import persist_connection, with_managed_connections
+from cowork.services.connectors.persist import persist_connection, vault_for_scope
 from cowork.services.connectors.specs._registry import registry
 
 _log = logging.getLogger("cowork.connectors.connections")
@@ -40,13 +40,15 @@ router = APIRouter()
 ScopeDep = Annotated[TenantScope, Depends(get_tenant_scope)]
 
 
-def _refuse_managed(scope: TenantScope, engine: str, name: str) -> None:
-    """Refuse every change to a connection the operator's managed folder
-    provides, before any other step: a delete's OAuth revoke would otherwise
+def _refuse_unchangeable(scope: TenantScope, engine: str, name: str) -> None:
+    """Refuse every change to a connection the caller can't change
+    (ConnectionsService.can_change): the operator's managed ones, one someone
+    else shares, and where connections are shared one the caller didn't
+    create. Before any other step: a delete's OAuth revoke would otherwise
     reach the provider first. The vault refuses the write itself too
     (LayeredDataVault), answered with the same 403 by create_app's handler."""
-    if ConnectionsService(scope).is_managed(engine, name):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=MANAGED_CONNECTION_REFUSAL)
+    if not ConnectionsService(scope).can_change(engine, name):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=SHARED_CONNECTION_REFUSAL)
 
 
 # AuthenticatedInOrgMode: in org mode this forwards to auth_proxy.proxy_catalogue,
@@ -168,14 +170,10 @@ def _persist_direct_connection(
     if registry.get_connector(body.connector_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Unknown connector: {body.connector_id}")
     if body.name.strip():
-        _refuse_managed(scope, body.connector_id, body.name.strip())
+        _refuse_unchangeable(scope, body.connector_id, body.name.strip())
     if body.method in {"browser_oauth_builtin", "oauth"} or values.get("refresh_token"):
         values["auth_type"] = "oauth"
-    from pathlib import Path
-    from anton.core.datasources.data_vault import LocalDataVault
-    vault = with_managed_connections(
-        LocalDataVault(scoped_storage_root(Path(ConnectorSettings().vault_dir), scope, store="data-vault"))
-    )
+    vault = vault_for_scope(scope)
     try:
         # default_label gives a brand-new OAuth connection's tile a
         # meaningful title (the account/org/workspace name the provider
@@ -203,9 +201,9 @@ def _persist_direct_connection(
             vault=vault,
             scope=scope,
         )
-    except ManagedConnectionError:
-        # A derived name that lands on a managed connection: create_app's
-        # handler answers it with 403, not the 500 below.
+    except SharedConnectionError:
+        # A derived name that lands on a connection the caller can't change:
+        # create_app's handler answers it with 403, not the 500 below.
         raise
     except Exception:
         _log.exception("Failed to save connection %s", body.connector_id)
@@ -228,7 +226,7 @@ async def delete_connection(engine: str, name: str, scope: ScopeDep, request: Re
         # credential proxy as the other OAuth Connector Lifecycle endpoints.
         await auth_proxy.proxy_delete(engine, name, request, OAuthSettings())
         return
-    _refuse_managed(scope, engine, name)
+    _refuse_unchangeable(scope, engine, name)
     try:
         # revoke() makes a blocking provider HTTP call (up to its own 10s
         # timeout) - off the event loop, since this handler is now async for
@@ -279,7 +277,7 @@ def patch_connection_token(engine: str, name: str, body: PatchTokenBody, scope: 
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
             detail="Token refresh is not applicable in org mode; auth manages the token lifecycle server-side.",
         )
-    _refuse_managed(scope, engine, name)
+    _refuse_unchangeable(scope, engine, name)
     updates = {
         k: v for k, v in body.model_dump().items()
         if v is not None and k in _PATCH_TOKEN_VAULT_FIELDS
@@ -314,7 +312,7 @@ async def patch_picked_files(engine: str, name: str, body: PatchPickedFilesBody,
     if scope.org_mode:
         merged = await auth_proxy.proxy_picked_files(engine, name, files, request, OAuthSettings())
         return {"ok": True, "files": merged}
-    _refuse_managed(scope, engine, name)
+    _refuse_unchangeable(scope, engine, name)
     merged = ConnectionsService(scope).merge_picked_files(engine, name, files)
     if merged is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
@@ -342,7 +340,7 @@ def delete_picked_file(engine: str, name: str, file_id: str, project: str, scope
     a Drive reference row. Only removes the file from `project`'s rail;
     if the file is tagged to other projects too, it stays visible there
     (see remove_picked_file's docstring)."""
-    _refuse_managed(scope, engine, name)
+    _refuse_unchangeable(scope, engine, name)
     remaining = ConnectionsService(scope).remove_picked_file(engine, name, file_id, project)
     if remaining is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
@@ -382,7 +380,7 @@ async def patch_access_mode(engine: str, name: str, body: PatchAccessModeBody, s
         )
     if scope.org_mode:
         return await auth_proxy.proxy_access_mode(engine, name, body.access_mode, request, OAuthSettings())
-    _refuse_managed(scope, engine, name)
+    _refuse_unchangeable(scope, engine, name)
     if not ConnectionsService(scope).patch_token(engine, name, {"_access_mode": body.access_mode}):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Connection not found.")
     return {"ok": True, "access_mode": body.access_mode}

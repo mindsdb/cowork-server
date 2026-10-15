@@ -10,8 +10,8 @@ from cowork.services.connectors.identity import (
     VAULT_KEEP_SENTINEL as _SENTINEL,
     connection_display_name,
 )
-from cowork.services.connectors.layered_vault import LayeredDataVault
-from cowork.services.connectors.persist import own_vault_root, with_managed_connections
+from cowork.services.connectors.layered_vault import CREATED_BY_FIELD, LayeredDataVault
+from cowork.services.connectors.persist import own_vault_root, vault_for_scope
 from cowork.services.connectors.specs._registry import registry
 from cowork.services.connectors.vault_lock import discard_lock, lock_for
 
@@ -25,17 +25,18 @@ class ConnectionsService:
     recovered from anywhere else). The module-level ``service`` singleton
     below is LOCAL-MODE ONLY and must never be used to serve an org request.
 
-    The operator's managed connections are layered over the scope's own
-    (with_managed_connections): listed and read with them, marked
-    ``managed``, and every write to one raises ManagedConnectionError.
+    Every read and write goes through vault_for_scope, so a scope lists and
+    reads the operator's managed connections and the ones others share with
+    it beside its own. ``managed`` marks a connection the caller can't
+    change, ``shared`` one in the shared-connection registry, and every
+    write to one the caller can't change raises SharedConnectionError.
     """
 
     def __init__(self, scope: TenantScope | None = None) -> None:
         self.scope = scope
 
     def _vault(self):
-        from anton.core.datasources.data_vault import LocalDataVault
-        return with_managed_connections(LocalDataVault(own_vault_root(self.scope)))
+        return vault_for_scope(self.scope)
 
     def _lock(self, engine: str, name: str):
         """The record lock every read-modify-write here takes, keyed by this
@@ -43,12 +44,19 @@ class ConnectionsService:
         return lock_for(vault_root=own_vault_root(self.scope), engine=engine, name=name)
 
     @staticmethod
-    def _is_managed_in(vault, engine: str, name: str) -> bool:
-        return isinstance(vault, LayeredDataVault) and vault.is_managed(engine, name)
+    def _can_change_in(vault, engine: str, name: str) -> bool:
+        return not isinstance(vault, LayeredDataVault) or vault.can_change(engine, name)
 
-    def is_managed(self, engine: str, name: str) -> bool:
-        """Whether the operator's managed folder provides this connection."""
-        return self._is_managed_in(self._vault(), engine, name)
+    @staticmethod
+    def _is_shared_in(vault, engine: str, name: str) -> bool:
+        return isinstance(vault, LayeredDataVault) and vault.is_shared(engine, name)
+
+    def can_change(self, engine: str, name: str) -> bool:
+        """Whether the caller may save or delete this connection: false for
+        the operator's managed ones, for one someone else shares, and where
+        connections are shared for one the caller didn't create
+        (LayeredDataVault.can_change). True for one that doesn't exist."""
+        return self._can_change_in(self._vault(), engine, name)
 
     def _read_record(self, vault, engine: str, name: str) -> dict | None:
         """Full on-disk record via read_record() when the vault supports
@@ -92,7 +100,8 @@ class ConnectionsService:
                 logo=spec.logo if spec else None,
                 logo_color=spec.logo_color if spec else None,
                 status=(fields or {}).get("status"),
-                managed=self._is_managed_in(vault, engine, name),
+                managed=not self._can_change_in(vault, engine, name),
+                shared=self._is_shared_in(vault, engine, name),
             ))
         return result
 
@@ -128,6 +137,8 @@ class ConnectionsService:
         # again and treat it as an explicit value, closing an unintended loop.
         fields.pop("_user_label", None)
         fields.pop("_label", None)
+        # Who created it is the vault's bookkeeping, not a credential field.
+        fields.pop(CREATED_BY_FIELD, None)
         return ConnectionDetailResponse(
             engine=record.get("engine", engine),
             name=record.get("name", name),
@@ -139,7 +150,8 @@ class ConnectionsService:
             method=fields.pop("_method", None),
             fields=fields,
             secure_keys=masked_keys,
-            managed=self._is_managed_in(vault, engine, name),
+            managed=not self._can_change_in(vault, engine, name),
+            shared=self._is_shared_in(vault, engine, name),
         )
 
     def runtime_fields(self, engine: str, name: str) -> dict | None:

@@ -245,8 +245,11 @@ class ConnectionSummaryResponse(BaseModel):
     # when healthy. Lets the catalogue card show a warning without requiring
     # the client to fetch each connection's full detail first.
     status: str | None = None
-    # Provided by the operator's managed folder: read-only for everyone here.
+    # The caller can't change it: the operator's own, or one someone else
+    # shares (ConnectionsService.can_change).
     managed: bool = False
+    # In the shared-connection registry: its creator sees it shared too.
+    shared: bool = False
 
 
 class ConnectionDetailResponse(BaseModel):
@@ -264,8 +267,11 @@ class ConnectionDetailResponse(BaseModel):
     # Names of fields in `fields` that were masked with VAULT_KEEP_SENTINEL —
     # lets the client show a "saved" indicator instead of the raw sentinel.
     secure_keys: list[str] = Field(default_factory=list, serialization_alias="secureKeys")
-    # Provided by the operator's managed folder: read-only for everyone here.
+    # The caller can't change it: the operator's own, or one someone else
+    # shares (ConnectionsService.can_change).
     managed: bool = False
+    # In the shared-connection registry: its creator sees it shared too.
+    shared: bool = False
 
 
 class DirectSaveRequest(BaseModel):

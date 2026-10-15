@@ -5,12 +5,14 @@ sends: memory print shows what that person's agent learned and nothing of
 the other's, and after memory clear it shows nothing learned. skills share
 moves a person's skill into the managed folder, where the author loses edit
 like everyone else. skills snapshot lists what the person's agent sees, with
-a sha256 that stays the same while the skills do. connections share copies a
-person's connection into the managed folder for everyone.
+a sha256 that stays the same while the skills do. connections share adds a
+person's connection to the shared-connection registry, where everyone else
+reads it from the person's own vault, and unshare takes it out again.
 """
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -296,25 +298,59 @@ def test_a_snapshot_takes_a_managed_skill_over_a_same_named_own_one(stack, capsy
 # ── connections ─────────────────────────────────────────────────────────────
 
 
-def test_share_connection_copies_it_for_everyone(stack, capsys):
+def _share(person: Person, name: str, folder: Path, capsys, *, action: str = "share") -> tuple[int, str, str]:
+    return _run(
+        connections_ops.main,
+        [action, *_arguments(person), "--name", name, "--managed-dir", str(folder)],
+        capsys,
+    )
+
+
+def _registry(folder: Path) -> list[dict]:
+    return json.loads((folder / "shared" / "connections.json").read_text())
+
+
+def test_share_connection_adds_it_to_the_registry_for_everyone(stack, capsys):
     own_vault_for_scope(personal_scope(ALICE)).save(
         "postgres", "erp", {"host": "erp.example", "password": "erpSecret"}, secure_keys=["password"]
     )
 
-    status, out, _ = _run(
-        connections_ops.main,
-        ["share", *_arguments(ALICE), "--name", "erp", "--managed-dir", str(stack.vault_dir)],
-        capsys,
-    )
+    status, out, _ = _share(ALICE, "erp", stack.root, capsys)
 
     assert status == 0
-    assert out.startswith(f"Copied connection postgres/erp of user {SUB_A} into {stack.vault_dir}")
-    copied = LocalDataVault(stack.vault_dir).read_record("postgres", "erp")
-    assert copied["fields"]["password"] == "erpSecret" and copied["secure_keys"] == ["password"]
+    registry_file = stack.root / "shared" / "connections.json"
+    assert out == (
+        f"Shared connection postgres/erp of user {SUB_A} with everyone, read-only: "
+        f"added it to {registry_file}.\n"
+    )
+    assert _registry(stack.root) == [
+        {"user_id": SUB_A, "partition_id": ALICE.partition_id, "engine": "postgres", "name": "erp"}
+    ]
+    assert registry_file.stat().st_mode & 0o777 == 0o644
+    # Nothing is copied: the operator's own connections stay as they were.
+    assert LocalDataVault(stack.vault_dir).list_connections() == []
     bob_vault = vault_for_scope(personal_scope(BOB))
-    assert bob_vault.is_managed("postgres", "erp")
+    assert not bob_vault.can_change("postgres", "erp")
+    assert bob_vault.is_shared("postgres", "erp")
     assert bob_vault.load("postgres", "erp")["host"] == "erp.example"
-    # The author's own entry stays in their vault, behind the managed one.
+    assert vault_for_scope(personal_scope(ALICE)).can_change("postgres", "erp")
+
+
+def test_unshare_connection_removes_it_and_keeps_the_persons_own(stack, capsys):
+    own_vault_for_scope(personal_scope(ALICE)).save("postgres", "erp", {"host": "erp.example"})
+    own_vault_for_scope(personal_scope(BOB)).save("mysql", "crm", {"host": "crm.example"})
+    _share(ALICE, "erp", stack.root, capsys)
+    _share(BOB, "crm", stack.root, capsys)
+
+    status, out, _ = _share(ALICE, "erp", stack.root, capsys, action="unshare")
+
+    assert status == 0
+    assert out == (
+        f"Stopped sharing connection postgres/erp of user {SUB_A}: removed it from "
+        f"{stack.root / 'shared' / 'connections.json'}. Their own connection stays in their vault.\n"
+    )
+    assert [(entry["engine"], entry["name"]) for entry in _registry(stack.root)] == [("mysql", "crm")]
+    assert vault_for_scope(personal_scope(BOB)).read_record("postgres", "erp") is None
     assert own_vault_for_scope(personal_scope(ALICE)).read_record("postgres", "erp") is not None
 
 
@@ -324,11 +360,61 @@ def test_share_connection_refuses_an_unknown_or_ambiguous_name(stack, capsys):
     own.save("mysql", "shared-name", {"host": "b"})
 
     for name, message in (("missing", "no saved connection named missing"), ("shared-name", "mysql, postgres")):
-        status, out, err = _run(
-            connections_ops.main,
-            ["share", *_arguments(ALICE), "--name", name, "--managed-dir", str(stack.vault_dir)],
-            capsys,
-        )
+        status, out, err = _share(ALICE, name, stack.root, capsys)
         assert status == 1 and out == ""
         assert message in err
-    assert LocalDataVault(stack.vault_dir).list_connections() == []
+    assert not (stack.root / "shared" / "connections.json").exists()
+
+
+def test_share_connection_refuses_one_already_shared_or_hidden(stack, capsys):
+    own_vault_for_scope(personal_scope(ALICE)).save("postgres", "erp", {"host": "alice.example"})
+    own_vault_for_scope(personal_scope(BOB)).save("postgres", "erp", {"host": "bob.example"})
+    own_vault_for_scope(personal_scope(BOB)).save("postgres", "warehouse", {"host": "bob.example"})
+    LocalDataVault(stack.vault_dir).save("postgres", "warehouse", {"host": "operator.example"})
+    _share(ALICE, "erp", stack.root, capsys)
+
+    for person, name, message in (
+        (ALICE, "erp", f"Connection postgres/erp of user {SUB_A} is already shared."),
+        (BOB, "erp", f"User {SUB_A} already shares a postgres connection named erp."),
+        (BOB, "warehouse", "The managed folder already provides a postgres connection named warehouse."),
+    ):
+        status, out, err = _share(person, name, stack.root, capsys)
+        assert (status, out) == (1, "")
+        assert message in err
+    assert len(_registry(stack.root)) == 1
+
+
+def test_unshare_connection_refuses_a_name_the_person_shares_none_of(stack, capsys):
+    own_vault_for_scope(personal_scope(ALICE)).save("postgres", "erp", {"host": "erp.example"})
+    _share(ALICE, "erp", stack.root, capsys)
+
+    status, out, err = _share(BOB, "erp", stack.root, capsys, action="unshare")
+
+    assert (status, out) == (1, "")
+    assert f"User {SUB_B} shares no connection named erp." in err
+    assert len(_registry(stack.root)) == 1
+
+
+def test_a_malformed_registry_is_never_rewritten(stack, capsys):
+    own_vault_for_scope(personal_scope(ALICE)).save("postgres", "erp", {"host": "erp.example"})
+    registry_file = stack.root / "shared" / "connections.json"
+    registry_file.parent.mkdir()
+    registry_file.write_text('{"not": "a list"}')
+
+    for action in ("share", "unshare"):
+        status, out, err = _share(ALICE, "erp", stack.root, capsys, action=action)
+        assert (status, out) == (1, "")
+        assert "is not a list of shared connections" in err
+    assert registry_file.read_text() == '{"not": "a list"}'
+
+
+def test_share_connection_refuses_where_connections_are_shared(stack, monkeypatch, capsys):
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", "skills,memory,settings")
+    get_app_settings.cache_clear()
+    own_vault_for_scope(personal_scope(ALICE)).save("postgres", "erp", {"host": "erp.example"})
+
+    status, out, err = _share(ALICE, "erp", stack.root, capsys)
+
+    assert (status, out) == (1, "")
+    assert "COWORK_PERSONAL_RESOURCES leaves connections shared" in err
+    assert not (stack.root / "shared" / "connections.json").exists()

@@ -1,13 +1,16 @@
 """COWORK_MANAGED_DIR at startup.
 
 create_app refuses a managed folder in org tenancy, one that is missing or
-lacks memory/, skills/ or data-vault/, naming each missing folder, and one an
-anton without the read-only memory layer would silently drop. A complete
-folder starts and says what it holds. With the setting unset or blank, the
-desktop and hosted servers start as before.
+lacks memory/, skills/ or data-vault/, naming each missing folder, one whose
+shared-connection registry is malformed, naming the file, and one an anton
+without the read-only memory layer would silently drop. A folder with no
+shared/ starts: an operator who shares nothing needs none. A complete folder
+starts and says what it holds. With the setting unset or blank, the desktop
+and hosted servers start as before.
 """
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 
@@ -18,6 +21,13 @@ import pytest
 import cowork.server as cowork_server
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.managed import ManagedFolder, cortex_takes_managed_layer, managed_folder
+
+SHARED_ENTRY = {
+    "user_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
+    "partition_id": "44e92829-e701-599b-88f9-69f5bf1165eb",
+    "engine": "postgres",
+    "name": "erp",
+}
 
 
 @pytest.fixture
@@ -111,6 +121,8 @@ def test_a_complete_folder_starts_and_says_what_it_holds(managed_dir, caplog, ow
     from anton.core.datasources.data_vault import LocalDataVault
 
     LocalDataVault(managed_dir.vault_dir).save("postgres", "warehouse", {"host": "db"})
+    managed_dir.shared_dir.mkdir()
+    managed_dir.shared_connections_file.write_text(json.dumps([SHARED_ENTRY]))
 
     owned_logger("cowork.common.logger", level=logging.INFO)
     cowork_server.create_app()
@@ -119,14 +131,37 @@ def test_a_complete_folder_starts_and_says_what_it_holds(managed_dir, caplog, ow
         for record in caplog.records
         if record.name == "cowork.common.logger" and record.levelno == logging.INFO
     ]
-    assert f"managed folder: {managed_dir.root} (1 skills, 1 connections)" in lines
+    assert (
+        f"managed folder: {managed_dir.root} (1 skills, 1 connections, 1 shared connections)" in lines
+    )
 
 
-def test_the_folder_model_names_its_three_folders(tmp_path):
+def test_a_folder_with_no_shared_folder_starts_sharing_nothing(managed_dir):
+    assert not managed_dir.shared_dir.exists()
+    cowork_server.create_app()
+    assert managed_dir.shared_connections().root == ()
+
+
+@pytest.mark.parametrize(
+    "content",
+    ['{"user_id": "x"}', "[{\"engine\": \"postgres\"}]", "not json"],
+    ids=["not-a-list", "missing-fields", "not-json"],
+)
+def test_a_malformed_registry_is_refused_naming_the_file(managed_dir, content):
+    managed_dir.shared_dir.mkdir()
+    managed_dir.shared_connections_file.write_text(content)
+    with pytest.raises(RuntimeError, match="shared-connection registry is malformed") as refused:
+        cowork_server.create_app()
+    assert str(managed_dir.shared_connections_file) in str(refused.value)
+
+
+def test_the_folder_model_names_its_folders(tmp_path):
     folder = ManagedFolder.at(tmp_path)
-    assert (folder.memory_dir, folder.skills_dir, folder.vault_dir) == (
+    assert (folder.memory_dir, folder.skills_dir, folder.vault_dir, folder.shared_dir) == (
         tmp_path / "memory",
         tmp_path / "skills",
         tmp_path / "data-vault",
+        tmp_path / "shared",
     )
+    assert folder.shared_connections_file == tmp_path / "shared" / "connections.json"
     assert folder.missing_dirs() == [tmp_path / "memory", tmp_path / "skills", tmp_path / "data-vault"]

@@ -1,10 +1,11 @@
 """The managed folder's connections.
 
 Every vault read layers them over the reader's own (LayeredDataVault): the
-connections API lists and reads them with ``managed`` true and their secrets
-masked, a same-named entry of the person's own stays hidden, and every
-mutating route refuses one with 403 and the operator sentence, a delete before
-its OAuth revoke. A turn reads them with the person's own, and a connection
+connections API lists and reads them with ``managed`` true, ``shared`` false
+and their secrets masked, a same-named entry of the person's own stays
+hidden, and every mutating route refuses one with 403 and the sentence every
+connection the caller can't change answers, a delete before its OAuth
+revoke. A turn reads them with the person's own, and a connection
 the agent saves in the turn lands in the person's own vault and outlives the
 turn. With no managed folder, every vault is the scope's own, as before.
 """
@@ -23,13 +24,16 @@ from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES
 from cowork.db.scoped import LOCAL_SCOPE, TenantScope
 from cowork.db.session import get_open_session
-from cowork.managed import MANAGED_CONNECTION_REFUSAL, ManagedConnectionError
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.principal import personal_partition_id
 from cowork.schemas.connectors import DirectSaveRequest, PatchPickedFilesBody
 from cowork.services.connectors.connections import ConnectionsService
-from cowork.services.connectors.layered_vault import LayeredDataVault
+from cowork.services.connectors.layered_vault import (
+    SHARED_CONNECTION_REFUSAL,
+    LayeredDataVault,
+    SharedConnectionError,
+)
 from cowork.services.connectors.persist import own_vault_for_scope, vault_for_scope
 from cowork.services.connectors.vault_secrets import register_vault_secrets
 from tests._turns import built_turn
@@ -82,14 +86,14 @@ def _refused(call) -> None:
     with pytest.raises(HTTPException) as refused:
         call()
     assert refused.value.status_code == 403
-    assert refused.value.detail == MANAGED_CONNECTION_REFUSAL
+    assert refused.value.detail == SHARED_CONNECTION_REFUSAL
 
 
 async def _refused_async(call) -> None:
     with pytest.raises(HTTPException) as refused:
         await call()
     assert refused.value.status_code == 403
-    assert refused.value.detail == MANAGED_CONNECTION_REFUSAL
+    assert refused.value.detail == SHARED_CONNECTION_REFUSAL
 
 
 # ── listing and reading ─────────────────────────────────────────────────────
@@ -104,9 +108,11 @@ async def test_managed_connections_are_listed_and_read_as_managed(warehouse):
     assert set(by_name) == {("postgres", "warehouse"), ("postgres", "sales")}
     assert by_name[("postgres", "warehouse")].managed is True
     assert by_name[("postgres", "sales")].managed is False
+    assert not any(c.shared for c in listed)
 
     detail = await connections_ep.get_connection("postgres", "warehouse", ALICE, None)
     assert detail.managed is True
+    assert detail.shared is False
     assert detail.fields["host"] == "db.example"
     assert MANAGED_SECRET not in detail.fields.values()
     assert "hidden-own-secret" not in detail.fields.values()
@@ -182,11 +188,11 @@ async def test_the_persons_own_connection_is_deleted_and_revoked_as_before(wareh
 
 def test_the_vault_refuses_a_managed_save_or_delete(warehouse):
     vault = vault_for_scope(ALICE)
-    with pytest.raises(ManagedConnectionError):
+    with pytest.raises(SharedConnectionError):
         vault.save("postgres", "warehouse", {"host": "x"})
-    with pytest.raises(ManagedConnectionError):
+    with pytest.raises(SharedConnectionError):
         vault.delete("postgres", "warehouse")
-    with pytest.raises(ManagedConnectionError):
+    with pytest.raises(SharedConnectionError):
         ConnectionsService(ALICE).patch_token("postgres", "warehouse", {"status": "x"})
 
 
@@ -209,7 +215,7 @@ def test_a_save_whose_derived_name_lands_on_a_managed_connection_answers_403(mon
     )
 
     assert response.status_code == 403
-    assert response.json() == {"detail": MANAGED_CONNECTION_REFUSAL}
+    assert response.json() == {"detail": SHARED_CONNECTION_REFUSAL}
     assert own_vault_for_scope(LOCAL_SCOPE).list_connections() == []
 
 
@@ -238,7 +244,7 @@ async def test_a_turn_reads_managed_connections_and_keeps_what_it_saves(
         # What anton's connect_new_datasource does with a connection the
         # person pastes into the chat.
         vault.save("mysql", "pasted", {"host": "pasted.example", "password": "p"}, secure_keys=["password"])
-        with pytest.raises(ManagedConnectionError):
+        with pytest.raises(SharedConnectionError):
             vault.save("postgres", "warehouse", {"host": "x"})
 
     assert own_vault_for_scope(ALICE).read_record("mysql", "pasted")["fields"]["host"] == "pasted.example"

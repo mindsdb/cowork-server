@@ -11,47 +11,90 @@ Every turn gets what it holds, whoever asked it:
   read-only skill roots, after its own. SkillService lists them as built-in,
   and their names are reserved: every change to one is refused with
   MANAGED_SKILL_REFUSAL.
-- ``data-vault/`` holds saved connections in the vault's own file format.
-  ``cowork.services.connectors.persist.vault_for_scope`` layers them over the
-  reader's own connections (LayeredDataVault), and every change to one is
-  refused with MANAGED_CONNECTION_REFUSAL.
+- ``data-vault/`` holds the operator's own saved connections, in the vault's
+  own file format. ``cowork.services.connectors.persist.vault_for_scope``
+  layers them over the reader's own connections (LayeredDataVault), and every
+  change to one is refused with
+  cowork.services.connectors.layered_vault.SHARED_CONNECTION_REFUSAL.
+- ``shared/connections.json`` lists the connections people share
+  (SharedConnections): each entry names one person's own saved connection,
+  which everyone else reads live from that person's vault and can't change.
+  ``python -m cowork.ops.connections share|unshare`` writes it; the server
+  only reads it. A missing file, or a missing ``shared/`` folder, shares
+  nothing.
 
 create_app refuses to start when the setting names a folder that is missing,
-or one of the three folders in it, so a missing mount can never free the
-reserved names.
+or one of memory/, skills/ and data-vault/ in it, so a missing mount can never
+free the reserved names, and when ``shared/connections.json`` is malformed.
 """
 
 from __future__ import annotations
 
 import inspect
 from pathlib import Path
+from uuid import UUID
 
 from anton.core.tools.skill_format import SKILL_FILE
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, RootModel, ValidationError, field_validator
 
 from cowork.common.settings.app_settings import get_app_settings
 
 MANAGED_SKILL_REFUSAL = "This skill is provided by your operator and can't be changed here."
-MANAGED_CONNECTION_REFUSAL = (
-    "This connection is provided by your operator and can't be changed here."
-)
 
 
-class ManagedConnectionError(PermissionError):
-    """A save or a delete reached a connection the managed folder provides.
+class SharedConnection(BaseModel):
+    """One person's saved connection, shared with everyone on the deployment:
+    one entry of ``shared/connections.json``."""
 
-    The server answers it with 403 and MANAGED_CONNECTION_REFUSAL
-    (cowork.server.create_app's exception handler).
-    """
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
-    def __init__(self, *, engine: str, name: str) -> None:
-        super().__init__(MANAGED_CONNECTION_REFUSAL)
-        self.engine = engine
-        self.name = name
+    # The person who created it: their sub, and their partition
+    # (cowork.principal.personal_partition_id), whose vault holds it.
+    user_id: str
+    partition_id: str
+    engine: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+
+    @field_validator("user_id", "partition_id")
+    @classmethod
+    def _canonical_uuid(cls, value: str) -> str:
+        return str(UUID(value))
+
+
+class SharedConnectionsError(ValueError):
+    """``shared/connections.json`` exists but can't be read as SharedConnections."""
+
+
+class SharedConnections(RootModel[tuple[SharedConnection, ...]]):
+    """The shared-connection registry, in file order. For an engine and name
+    two people share, everyone else reads the first entry."""
+
+    model_config = ConfigDict(frozen=True)
+
+    @classmethod
+    def read(cls, path: Path) -> SharedConnections:
+        """The registry at ``path``, or none when the file is missing.
+
+        Raises SharedConnectionsError for a file that can't be read or isn't a
+        JSON list of entries, naming the file and what is wrong with it.
+        """
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            return cls(())
+        except OSError as error:
+            raise SharedConnectionsError(f"{path} can't be read: {error}") from error
+        try:
+            return cls.model_validate_json(raw)
+        except ValidationError as error:
+            raise SharedConnectionsError(
+                f"{path} is not a list of shared connections "
+                f"(user_id, partition_id, engine, name): {error}"
+            ) from error
 
 
 class ManagedFolder(BaseModel):
-    """The managed folder and the three folders in it."""
+    """The managed folder and the folders in it."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -59,6 +102,7 @@ class ManagedFolder(BaseModel):
     memory_dir: Path
     skills_dir: Path
     vault_dir: Path
+    shared_dir: Path
 
     @classmethod
     def at(cls, root: Path) -> ManagedFolder:
@@ -67,15 +111,27 @@ class ManagedFolder(BaseModel):
             memory_dir=root / "memory",
             skills_dir=root / "skills",
             vault_dir=root / "data-vault",
+            shared_dir=root / "shared",
         )
 
     def missing_dirs(self) -> list[Path]:
-        """The root and each folder in it that is not a directory, in that order."""
+        """The root and each of memory/, skills/ and data-vault/ that is not a
+        directory, in that order. ``shared/`` is not required: an operator
+        who shares no connection needs none."""
         return [
             path
             for path in (self.root, self.memory_dir, self.skills_dir, self.vault_dir)
             if not path.is_dir()
         ]
+
+    @property
+    def shared_connections_file(self) -> Path:
+        return self.shared_dir / "connections.json"
+
+    def shared_connections(self) -> SharedConnections:
+        """The shared-connection registry; raises SharedConnectionsError when
+        the file is malformed (SharedConnections.read)."""
+        return SharedConnections.read(self.shared_connections_file)
 
     def skill_dirs(self) -> dict[str, Path]:
         """Each managed skill's folder, by slug, sorted.

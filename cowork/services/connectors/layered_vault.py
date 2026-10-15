@@ -1,44 +1,171 @@
-"""The operator's managed connections layered over one scope's own vault.
+"""Every saved connection one scope reads, and who may change each one.
 
-Every reader that resolves a scope's saved connections through
-``cowork.services.connectors.persist.vault_for_scope`` gets this vault while
-COWORK_MANAGED_DIR is set: in-process turns, an artifact's live backend, the
-connections API and request-entry secret scrubbing. It satisfies anton's
-DataVault protocol, so anton reads it as it reads its own vault.
+``cowork.services.connectors.persist.vault_for_scope`` gives every reader this
+vault on a deployment that trusts identity headers or has a managed folder:
+in-process turns, an artifact's live backend, the connections API and
+request-entry secret scrubbing. It satisfies anton's DataVault protocol, so
+anton reads it as it reads its own vault.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, NamedTuple
 
 from anton.core.datasources.data_vault import DataVault
+from pydantic import BaseModel, ConfigDict
 
-from cowork.managed import ManagedConnectionError
+from cowork.managed import SharedConnection
+
+SHARED_CONNECTION_REFUSAL = "This connection is shared with you and can't be changed here."
+
+# The bookkeeping field that records who created a connection: the person's
+# sub. A leading underscore keeps it out of the agent's environment (anton's
+# DataVault.env_for and inject_env skip `_` fields) and out of the
+# Connected Data Sources listing; ConnectionsService.get drops it from the
+# API's fields.
+CREATED_BY_FIELD = "_created_by"
+
+
+class SharedConnectionError(PermissionError):
+    """A save or a delete reached a connection the saver can't change.
+
+    The server answers it with 403 and SHARED_CONNECTION_REFUSAL
+    (cowork.server.create_app's exception handler).
+    """
+
+    def __init__(self, *, engine: str, name: str) -> None:
+        super().__init__(SHARED_CONNECTION_REFUSAL)
+        self.engine = engine
+        self.name = name
+
+
+class Saver(BaseModel):
+    """Who saves through a vault on a deployment that trusts identity headers."""
+
+    model_config = ConfigDict(frozen=True)
+
+    # The person's sub; None for the operator view (a request with no person)
+    # and for a person's partition acting with no user.
+    user_id: str | None
+    operator_view: bool
+    # The vault is the deployment's base vault, which every person reads
+    # (connections shared): only an entry's creator changes it there, and an
+    # entry with no creator only the operator view.
+    deployment_wide: bool
+
+
+@dataclass(frozen=True)
+class SharedFrom:
+    """A registry entry of someone else's, with that person's own vault."""
+
+    entry: SharedConnection
+    vault: DataVault
+
+
+class _Found(NamedTuple):
+    vault: DataVault
+    record: dict[str, Any] | None
 
 
 class LayeredDataVault:
-    """The managed vault's entries first, then the scope's own.
+    """The connections one scope reads, in order: the managed folder's
+    (``managed``), the scope's own (``own``), then the ones other people share
+    with it (``shared``), each read live from its creator's own vault. A
+    same-named entry earlier in that order hides a later one, and a shared
+    entry whose connection is gone is skipped.
 
-    An (engine, name) the managed vault holds is read from it and hides a
-    same-named entry of the scope's own. A save or delete of such an entry
-    raises ManagedConnectionError, so it never reaches either vault; every
-    other save and delete goes to the scope's own vault, a turn's included,
-    so what the agent saves in a turn outlives the turn.
+    Only the scope's own entries can change: a save or delete of a managed or
+    shared one raises SharedConnectionError, and so does one of an own entry
+    the saver didn't create where the own vault is deployment-wide. Every
+    other save and delete goes to the own vault, a turn's included, so what
+    the agent saves in a turn outlives the turn. With a ``saver``, every save
+    records the connection's creator in CREATED_BY_FIELD: a create stamps the
+    saver's sub (none for the operator view), and an update keeps the stored
+    value, whatever the saved fields say.
     """
 
-    def __init__(self, *, managed: DataVault, own: DataVault) -> None:
-        self._managed = managed
+    def __init__(
+        self,
+        *,
+        own: DataVault,
+        managed: DataVault | None = None,
+        shared: tuple[SharedFrom, ...] = (),
+        shared_by_own: frozenset[tuple[str, str]] = frozenset(),
+        saver: Saver | None = None,
+    ) -> None:
         self._own = own
+        self._managed = managed
+        self._shared = shared
+        self._shared_by_own = shared_by_own
+        self._saver = saver
 
-    def is_managed(self, engine: str, name: str) -> bool:
-        return self._managed.read_record(engine, name) is not None
+    def _find(self, engine: str, name: str) -> _Found:
+        """The vault that answers for (engine, name), with its record; the
+        own vault and no record when none holds it."""
+        if self._managed is not None:
+            record = self._managed.read_record(engine, name)
+            if record is not None:
+                return _Found(self._managed, record)
+        record = self._own.read_record(engine, name)
+        if record is not None:
+            return _Found(self._own, record)
+        for source in self._shared:
+            if (source.entry.engine, source.entry.name) == (engine, name):
+                record = source.vault.read_record(engine, name)
+                if record is not None:
+                    return _Found(source.vault, record)
+        return _Found(self._own, None)
 
-    def _reader(self, engine: str, name: str) -> DataVault:
-        return self._managed if self.is_managed(engine, name) else self._own
+    @staticmethod
+    def _creator(record: dict[str, Any]) -> str | None:
+        return str((record.get("fields") or {}).get(CREATED_BY_FIELD) or "") or None
 
-    def _refuse_managed(self, engine: str, name: str) -> None:
-        if self.is_managed(engine, name):
-            raise ManagedConnectionError(engine=engine, name=name)
+    def _saver_may_change(self, record: dict[str, Any]) -> bool:
+        """Whether the saver may change this record of the own vault."""
+        if self._saver is None or not self._saver.deployment_wide:
+            return True
+        creator = self._creator(record)
+        if self._saver.operator_view:
+            return creator is None
+        return creator is not None and creator == self._saver.user_id
+
+    def _may_change(self, found: _Found) -> bool:
+        if found.vault is not self._own:
+            return False
+        return found.record is None or self._saver_may_change(found.record)
+
+    def can_change(self, engine: str, name: str) -> bool:
+        """Whether a save or delete of (engine, name) goes through: false for a
+        managed or shared entry, and for an own entry the saver didn't create
+        where the own vault is deployment-wide. True for one nobody holds."""
+        return self._may_change(self._find(engine, name))
+
+    def is_shared(self, engine: str, name: str) -> bool:
+        """Whether (engine, name) is in the shared-connection registry: one
+        someone shares with this scope, or one of the scope's own it shares."""
+        found = self._find(engine, name)
+        if found.record is None or found.vault is self._managed:
+            return False
+        if found.vault is self._own:
+            return (engine, name) in self._shared_by_own
+        return True
+
+    def _stamped(self, found: _Found, credentials: dict[str, str]) -> dict[str, str]:
+        """``credentials`` with CREATED_BY_FIELD as the record keeps it: the
+        stored creator on an update, the saver's sub on a create, and none
+        where neither names one. Never the value the caller passed."""
+        fields = dict(credentials)
+        if self._saver is None:
+            return fields
+        if found.record is not None:
+            creator = self._creator(found.record)
+        else:
+            creator = None if self._saver.operator_view else self._saver.user_id
+        fields.pop(CREATED_BY_FIELD, None)
+        if creator is not None:
+            fields[CREATED_BY_FIELD] = creator
+        return fields
 
     def save(
         self,
@@ -48,34 +175,57 @@ class LayeredDataVault:
         *,
         secure_keys: list[str] | None = None,
     ) -> object:
-        self._refuse_managed(engine, name)
-        return self._own.save(engine, name, credentials, secure_keys=secure_keys)
+        found = self._find(engine, name)
+        if not self._may_change(found):
+            raise SharedConnectionError(engine=engine, name=name)
+        return self._own.save(
+            engine, name, self._stamped(found, credentials), secure_keys=secure_keys
+        )
 
     def load(self, engine: str, name: str) -> dict[str, str] | None:
-        return self._reader(engine, name).load(engine, name)
+        return self._find(engine, name).vault.load(engine, name)
 
     def read_record(self, engine: str, name: str) -> dict[str, Any] | None:
-        return self._reader(engine, name).read_record(engine, name)
+        return self._find(engine, name).record
 
     def delete(self, engine: str, name: str) -> bool:
-        self._refuse_managed(engine, name)
+        if not self._may_change(self._find(engine, name)):
+            raise SharedConnectionError(engine=engine, name=name)
         return self._own.delete(engine, name)
 
     def list_connections(self) -> list[dict[str, str]]:
-        managed = self._managed.list_connections()
-        taken = {(entry["engine"], entry["name"]) for entry in managed}
-        own = [
-            entry
-            for entry in self._own.list_connections()
-            if (entry["engine"], entry["name"]) not in taken
-        ]
-        return [*managed, *own]
+        listed: list[dict[str, str]] = []
+        taken: set[tuple[str, str]] = set()
+        for vault in (self._managed, self._own):
+            if vault is None:
+                continue
+            for entry in vault.list_connections():
+                key = (entry["engine"], entry["name"])
+                if key not in taken:
+                    taken.add(key)
+                    listed.append(entry)
+        for source in self._shared:
+            key = (source.entry.engine, source.entry.name)
+            if key in taken:
+                continue
+            record = source.vault.read_record(*key)
+            if record is None:
+                continue
+            taken.add(key)
+            listed.append(
+                {
+                    "engine": source.entry.engine,
+                    "name": source.entry.name,
+                    "created_at": record.get("created_at", ""),
+                }
+            )
+        return listed
 
     def env_for(self, engine: str, name: str, *, flat: bool = False) -> dict[str, str] | None:
-        return self._reader(engine, name).env_for(engine, name, flat=flat)
+        return self._find(engine, name).vault.env_for(engine, name, flat=flat)
 
     def inject_env(self, engine: str, name: str, *, flat: bool = False) -> list[str] | None:
-        return self._reader(engine, name).inject_env(engine, name, flat=flat)
+        return self._find(engine, name).vault.inject_env(engine, name, flat=flat)
 
     def clear_ds_env(self) -> None:
         self._own.clear_ds_env()

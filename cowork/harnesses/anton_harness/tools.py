@@ -842,6 +842,8 @@ async def _cowork_label_connection(session: Any, tc_input: dict) -> str:
     label = str(tc_input.get("label", "")).strip()
     if not engine or not name or not label:
         return "label_connection: `engine`, `name`, and `label` are all required."
+    from cowork.services.connectors.layered_vault import SharedConnectionError
+
     try:
         from cowork.common.settings.user_settings import current_settings_scope
         from cowork.services.connectors.persist import set_connection_label
@@ -849,6 +851,9 @@ async def _cowork_label_connection(session: Any, tc_input: dict) -> str:
         # The turn's own vault: the label lands on the asker's connection, and
         # an unbound turn on a partitioned deployment is refused.
         stored = set_connection_label(engine, name, label, scope=current_settings_scope())
+    except SharedConnectionError as exc:
+        # A connection the asker can't change, such as one shared with them.
+        return f"label_connection: {exc}"
     except Exception as exc:
         logger.exception("Cowork label_connection failed")
         return f"label_connection: could not set label ({exc})"

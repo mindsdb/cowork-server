@@ -24,14 +24,10 @@ from cowork.db.personal_resources import check_personal_resource_dependencies
 from cowork.db.scoped import MissingTenantScopeError
 from cowork.db.units import DatabaseBusy, busy_retry_seconds
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
-from cowork.managed import (
-    MANAGED_CONNECTION_REFUSAL,
-    ManagedConnectionError,
-    cortex_takes_managed_layer,
-    managed_folder,
-)
+from cowork.managed import SharedConnectionsError, cortex_takes_managed_layer, managed_folder
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
+from cowork.services.connectors.layered_vault import SHARED_CONNECTION_REFUSAL, SharedConnectionError
 from cowork.streaming import TurnInProgress
 from cowork.common.logger import find_database_error, relayed_error, setup_logging
 from cowork.common.paths import cowork_home
@@ -361,12 +357,12 @@ def create_app() -> FastAPI:
     async def _turn_in_progress(request, exc):
         return JSONResponse(TURN_IN_PROGRESS.model_dump(), status_code=exc.status_code)
 
-    # A save or delete that reached a connection the operator's managed folder
-    # provides (LayeredDataVault). The connections routes refuse one up front;
-    # this answers the same for a save whose derived name lands on one.
-    @app.exception_handler(ManagedConnectionError)
-    async def _managed_connection(request, exc):
-        return JSONResponse({"detail": MANAGED_CONNECTION_REFUSAL}, status_code=403)
+    # A save or delete that reached a connection the caller can't change
+    # (LayeredDataVault). The connections routes refuse one up front; this
+    # answers the same for a save whose derived name lands on one.
+    @app.exception_handler(SharedConnectionError)
+    async def _shared_connection(request, exc):
+        return JSONResponse({"detail": SHARED_CONNECTION_REFUSAL}, status_code=403)
 
     # Bearer-token auth. On by default in local mode (see AppSettings.
     # require_auth). Token is auto-generated on first startup when
@@ -424,13 +420,23 @@ def create_app() -> FastAPI:
                 "read-only memory layer. The installed anton has none, so the "
                 "managed rules would reach no turn."
             )
+        # A malformed registry stops the start, where the operator sees it. One
+        # broken later shares nothing until fixed (read_shared_connections).
+        try:
+            shared = managed.shared_connections()
+        except SharedConnectionsError as error:
+            raise RuntimeError(
+                f"COWORK_MANAGED_DIR's shared-connection registry is malformed: {error}. "
+                "Fix or remove the file; a missing one shares nothing."
+            ) from error
         from anton.core.datasources.data_vault import LocalDataVault
 
         logger.info(
-            "managed folder: %s (%d skills, %d connections)",
+            "managed folder: %s (%d skills, %d connections, %d shared connections)",
             managed.root,
             len(managed.skill_slugs()),
             len(LocalDataVault(managed.vault_dir).list_connections()),
+            len(shared.root),
         )
 
     # Org mode, or local tenancy that trusts identity headers: build a

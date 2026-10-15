@@ -7,25 +7,34 @@ save that never overwrites a different account.
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from anton.utils.datasources import default_user_label, ensure_unique_user_label
 
-from cowork.common.settings.app_settings import ConnectorSettings
-from cowork.managed import managed_folder
+from cowork.common.settings.app_settings import ConnectorSettings, get_app_settings
+from cowork.managed import (
+    ManagedFolder,
+    SharedConnection,
+    SharedConnections,
+    SharedConnectionsError,
+    managed_folder,
+)
 from cowork.services.connectors.identity import (
     derive_connection_name,
     resolve_keep_sentinels,
     resolve_unique_slug,
     secure_keys_for,
 )
-from cowork.services.connectors.layered_vault import LayeredDataVault
+from cowork.services.connectors.layered_vault import LayeredDataVault, Saver, SharedFrom
 from cowork.services.connectors.vault_lock import lock_for
 
 if TYPE_CHECKING:
     from cowork.db.scoped import TenantScope
+
+logger = logging.getLogger(__name__)
 
 
 def own_vault_root(scope: "TenantScope | None" = None) -> Path:
@@ -48,27 +57,86 @@ def own_vault_for_scope(scope: "TenantScope | None" = None):
     return LocalDataVault(own_vault_root(scope))
 
 
-def with_managed_connections(own):
-    """``own`` with the operator's managed connections layered over it while
-    COWORK_MANAGED_DIR is set (LayeredDataVault), else ``own`` itself.
+def read_shared_connections(managed: ManagedFolder) -> SharedConnections:
+    """The managed folder's shared-connection registry, read live.
 
-    In the layered vault a managed entry reads first, and a save or delete of
-    one raises ManagedConnectionError. Every vault a scope reads or saves
-    through goes through here.
+    A malformed registry shares nothing and logs an error naming the file:
+    every turn and request goes on with the reader's own connections, and
+    nobody reads anyone else's. create_app refuses to start on one, so this
+    is a registry broken after the server started.
     """
-    managed = managed_folder()
-    if managed is None:
-        return own
-    from anton.core.datasources.data_vault import LocalDataVault
+    try:
+        return managed.shared_connections()
+    except SharedConnectionsError as error:
+        logger.error("no connection is shared until the registry is fixed: %s", error)
+        return SharedConnections(())
 
-    return LayeredDataVault(managed=LocalDataVault(managed.vault_dir), own=own)
+
+def _registry_for(scope: "TenantScope | None", managed: ManagedFolder | None) -> SharedConnections:
+    """The shared-connection registry ``scope`` reads. Only a person's scope
+    that keeps connections personal reads one: where connections are shared,
+    the base vault already holds everyone's."""
+    from cowork.db.personal_resources import PersonalResource
+
+    if (
+        managed is None
+        or scope is None
+        or not scope.personal
+        or not scope.partitioned_for(PersonalResource.CONNECTIONS)
+    ):
+        return SharedConnections(())
+    return read_shared_connections(managed)
+
+
+def _shared_from(entry: SharedConnection) -> SharedFrom:
+    """A registry entry with its creator's own vault, never their layered one."""
+    from cowork.db.scoped import scope_for_identity
+
+    creator = scope_for_identity(org_id=entry.partition_id, user_id=entry.user_id)
+    return SharedFrom(entry=entry, vault=own_vault_for_scope(creator))
+
+
+def _saver_for(scope: "TenantScope") -> Saver:
+    from cowork.db.personal_resources import PersonalResource
+
+    return Saver(
+        user_id=scope.user_id if scope.personal else None,
+        operator_view=not scope.personal,
+        deployment_wide=not scope.partitioned_for(PersonalResource.CONNECTIONS),
+    )
 
 
 def vault_for_scope(scope: "TenantScope | None" = None):
-    """``scope``'s saved connections, for reading and for saving: its own
-    vault (own_vault_for_scope) with the managed ones over it
-    (with_managed_connections)."""
-    return with_managed_connections(own_vault_for_scope(scope))
+    """``scope``'s saved connections, for reading and for saving.
+
+    On the desktop and in org tenancy without a managed folder, that is its
+    own vault (own_vault_for_scope). With COWORK_MANAGED_DIR set or
+    COWORK_TRUST_IDENTITY_HEADERS on, it is a LayeredDataVault: the managed
+    folder's connections, the scope's own, then the ones others share with a
+    person whose connections are personal (``shared/connections.json``).
+    Every save there records its creator, and a save or delete of a
+    connection the scope can't change raises SharedConnectionError.
+    """
+    own = own_vault_for_scope(scope)
+    managed = managed_folder()
+    trusted = get_app_settings().trust_identity_headers
+    if managed is None and not trusted:
+        return own
+    from anton.core.datasources.data_vault import LocalDataVault
+
+    registry = _registry_for(scope, managed).root
+    own_partition = None if scope is None else scope.org_id
+    return LayeredDataVault(
+        own=own,
+        managed=None if managed is None else LocalDataVault(managed.vault_dir),
+        shared=tuple(
+            _shared_from(entry) for entry in registry if entry.partition_id != own_partition
+        ),
+        shared_by_own=frozenset(
+            (entry.engine, entry.name) for entry in registry if entry.partition_id == own_partition
+        ),
+        saver=_saver_for(scope) if trusted and scope is not None else None,
+    )
 
 
 def turn_vault_for_scope(scope: "TenantScope | None"):
@@ -77,10 +145,10 @@ def turn_vault_for_scope(scope: "TenantScope | None"):
 
     That is vault_for_scope's: the person's own where connections are
     personal, the base vault where they are shared, the operator's managed
-    connections over either, and a refusal for ``scope=None`` on a
-    partitioned deployment, so an unbound turn reads nobody's connections.
-    A save through it, such as the agent's own in a turn, lands in the
-    scope's own vault and outlives the turn.
+    connections over either and the ones others share after them, and a
+    refusal for ``scope=None`` on a partitioned deployment, so an unbound
+    turn reads nobody's connections. A save through it, such as the agent's
+    own in a turn, lands in the scope's own vault and outlives the turn.
     """
     return vault_for_scope(scope)
 
