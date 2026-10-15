@@ -23,7 +23,7 @@ from uuid import UUID
 from cowork.services.artifact_locks import LOCKS_DIRNAME, acquire, release
 from cowork.services.artifact_publish_key import PublishKey
 from cowork.services.product_permissions import ProductPermissionDenied, ProductPermissionUnavailable
-from cowork.services.publish import publish_artifact
+from cowork.services.publish import PublishOwnedByOtherUser, publish_artifact
 
 if TYPE_CHECKING:
     from cowork.services.artifact_ownership import OwnerResolution
@@ -353,6 +353,13 @@ async def _publish_one(
         # retry is attempted — the next turn reads the record and sees the real
         # state. The TTL is what eventually frees the slug.
         _record("timeout", slug=slug, timeout_s=f"{timeout_s:.1f}")
+        return False
+    except PublishOwnedByOtherUser:
+        # The upload service holds this report_id for another account, so a
+        # retry cannot succeed and a fresh report_id would publish a copy. A
+        # skip like `not_owner`, not a failure; no thread is left running.
+        release(artifacts_base, slug)
+        _record("skipped", slug=slug, reason="owned_by_other_user")
         return False
     except Exception as exc:
         # A synchronous failure (a 502 a second in, ValueError from the target

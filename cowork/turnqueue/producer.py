@@ -19,11 +19,13 @@ from cowork.build_info import KEY_ANTON_VERSION, account_ids, build_trace_metada
 from cowork.handlers.turn_errors import (
     RESET_AT_CODES,
     WORKER_UNRESPONSIVE_TYPE_NAME,
+    remote_error_label,
     remote_turn_error,
 )
 from cowork.services.providers import minds_chat_base_url
 from cowork.db.scoped import TenantScope
 from cowork.services import product_permissions
+from cowork.services.connectors.specs._registry import registry
 from cowork.services.product_permissions import require_product_permission
 from cowork.turnqueue.auth_keys import (
     list_active_connections,
@@ -32,7 +34,7 @@ from cowork.turnqueue.auth_keys import (
     mint_turn_key_details,
     register_datasource_grants,
 )
-from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnReply
+from cowork.turnqueue.models import MAX_DATASOURCE_CONNECTIONS, TurnJob, TurnReply, TurnReplyHeader
 from cowork.streaming.turn_index import record_turn
 from cowork.turnqueue.redis_client import cancel_cause_key, cancel_flag_key, get_redis, reply_stream_key
 from cowork.common.settings.app_settings import TurnQueueSettings, default_turn_minds_api_host, get_app_settings
@@ -224,6 +226,21 @@ async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
     return {
         "connections": connections,
     }
+
+
+def _connectors_block(oauth_connections: dict | None) -> dict | None:
+    """The turn's `connectors` block: {engine: {"usage_notes": ...}} for the
+    engines of this turn's connections whose spec declares usage notes. None
+    when there is nothing to send; the key is then left out of params, like
+    `oauth`.
+
+    Built from the same, already disabled-filtered, connection list as the
+    `oauth` block: anton renders notes only for engines its vault connects,
+    and on web that vault is built from `oauth` alone.
+    """
+    connections = (oauth_connections or {}).get("connections") or []
+    notes = registry.usage_notes_for(dict.fromkeys(c.get("engine") for c in connections))
+    return {engine: {"usage_notes": text} for engine, text in notes.items()} or None
 
 
 def _refuse_datasource_grants(reason: str) -> product_permissions.ProductPermissionUnavailable:
@@ -572,6 +589,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # second one. Org/cloud mode only: local-mode turns build in-process
     # and never reach this function at all.
     oauth_block = {**oauth_connections, "turn_key": llm_block.get("api_key", "")} if oauth_connections else None
+    connectors_block = _connectors_block(oauth_connections)
 
     # Org-relative, never absolute. cowork-server sees the shared tree at
     # <root>/<org_id> while the pod mounts its own org's access point AT
@@ -601,6 +619,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # Absent entirely (not an empty dict) when there's nothing to
               # offer — see _mint_oauth_block's docstring for why.
               **({"oauth": oauth_block} if oauth_block else {}),
+              # Agent-facing usage notes for this turn's connected engines; absent
+              # entirely when none has notes.
+              **({"connectors": connectors_block} if connectors_block else {}),
               **({"datasource": datasource_block} if datasource_block else {}),
               # Conversation creation time, ISO 8601. The pod is fresh every
               # turn and would otherwise stamp today's date into the system
@@ -627,6 +648,13 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         project_id=project_id,
         params=params,
     )
+    # Read replies from after the reply stream's newest entry as it is now,
+    # before the job is queued. The controller cannot answer a job that is not
+    # queued yet, so every reply to this turn lands after that entry, and the
+    # earlier turns' replies the stream still holds (until the conversation has
+    # been quiet for an hour) are never read.
+    tail = await r.xrevrange(reply_stream, count=1)
+    last_id = tail[0][0] if tail else "0-0"
     # Registry first: a conversation whose stream exists but isn't registered would
     # be invisible to the controller. The reverse is harmless, it prunes empty queues.
     await r.sadd(f"{settings.jobs_stream}:queues", conversation_id)
@@ -640,12 +668,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         org_id=org_id, user_id=user_id, client=r,
     )
 
-    last_id = "0-0"
     authorized_workspace_mode = None
     idle_timeout = settings.reply_idle_timeout_seconds
     last_reply_at = time.monotonic()
     while True:
-        resp = await r.xread({reply_stream: last_id}, count=10, block=5000)
+        resp = await r.xread({reply_stream: last_id}, count=100, block=5000)
         if not resp:
             # Unbounded, this loop spun forever whenever the worker was down:
             # only a terminal reply ends the turn, so the SSE response never
@@ -663,12 +690,15 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
         for _stream, entries in resp:
             for entry_id, fields in entries:
                 last_id = entry_id
-                reply = TurnReply.model_validate_json(fields["payload"])
-                if reply.correlation_id != corr:
-                    # Deliberately does NOT refresh the idle clock: liveness
-                    # means "this turn is progressing", and another turn's
-                    # replies say nothing about ours.
+                if TurnReplyHeader.model_validate_json(fields["payload"]).correlation_id != corr:
+                    # Skipped before its kind is validated: an earlier turn
+                    # still finishing after Stop or the idle timeout can write
+                    # a kind this build does not know, and that must not fail
+                    # this turn. Deliberately does NOT refresh the idle clock:
+                    # liveness means "this turn is progressing", and another
+                    # turn's replies say nothing about ours.
                     continue
+                reply = TurnReply.model_validate_json(fields["payload"])
                 last_reply_at = time.monotonic()
                 kind = reply.kind
                 data = reply.data or {}
@@ -707,8 +737,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                     if reset_at is not None:
                         data["reset_at"] = reset_at
                     logger.warning(
-                        "Remote turn failed conversation=%s correlation_id=%s error=%s",
-                        conversation_id, corr, data.get("error"),
+                        "Remote turn failed conversation=%s correlation_id=%s error_type=%s error_code=%s",
+                        conversation_id, corr, remote_error_label(error=data.get("error")), code,
                     )
                 if kind in ("turn_delta", "turn_step", "turn_memory", "turn_skill",
                             "turn_history", "turn_compaction", "turn_completed", "turn_failed"):
