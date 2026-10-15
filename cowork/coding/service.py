@@ -29,6 +29,7 @@ from cowork.coding.contracts import (
     TaskCapabilities,
     TaskCapability,
     WorkspaceInspection,
+    WorkspaceMode,
     WorkspaceModeOptions,
 )
 from cowork.coding.control_errors import StateConflict
@@ -69,7 +70,7 @@ from cowork.coding.task_delivery import TaskDeliveryService
 from cowork.coding.terminal_service import TaskTerminalService
 from cowork.coding.turns import RunningTurn, TurnExecutor, fail_turn
 from cowork.coding.workspace import WorkspaceError, WorkspaceManager, _org_mode
-from cowork.coding.workspace_mode import workspace_mode_options
+from cowork.coding.workspace_mode import without_in_place, workspace_mode_options
 from cowork.common.settings.app_settings import get_app_settings
 
 logger = logging.getLogger(__name__)
@@ -256,19 +257,29 @@ class CodingService(
     def capabilities(self) -> list[EngineCapabilities]:
         return self.registry.capabilities()
 
-    def workspace_mode_options(self, project_id: str | None, computer_id: str | None) -> WorkspaceModeOptions:
+    def workspace_mode_options(
+        self, project_id: str | None, computer_id: str | None, path: str | None = None,
+    ) -> WorkspaceModeOptions:
         """The workspace modes a new task on this project and computer could use.
 
         A task with no computer chosen is shown as running here, matching the
-        composer's default target.
+        composer's default target. Given the folder a folder task would use,
+        the answer also reflects whether that folder can be worked in
+        directly, checked the same way creating the task checks it.
         """
         project = self.projects.get(project_id) if project_id else None
-        return workspace_mode_options(
+        options = workspace_mode_options(
             project.default_workspace_mode if project else None,
             runs_locally=computer_id in {None, self.control.local_computer.id},
             org_mode=_org_mode(),
             project_task=project is not None,
         )
+        if project is None and path and WorkspaceMode.in_place in options.supported:
+            try:
+                self.workspaces.in_place_root(path)
+            except WorkspaceError as exc:
+                return without_in_place(options, str(exc))
+        return options
 
     def inspect_workspace(self, path: str) -> WorkspaceInspection:
         return self.workspaces.inspect(path)

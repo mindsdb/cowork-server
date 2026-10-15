@@ -78,9 +78,28 @@ def workspace_mode_options(
 ) -> WorkspaceModeOptions:
     """What a client may offer for a new task, resolved the way creation resolves it."""
     context = {"runs_locally": runs_locally, "org_mode": org_mode, "project_task": project_task, "platform": platform}
+    supported = supported_workspace_modes(**context)
     return WorkspaceModeOptions(
-        supported=list(supported_workspace_modes(**context)),
+        supported=list(supported),
         default=resolve_workspace_mode(None, project_default, **context),
+        in_place_unavailable_reason=(
+            None
+            if WorkspaceMode.in_place in supported
+            else _unsupported_message(
+                WorkspaceMode.in_place, runs_locally=runs_locally, org_mode=org_mode, project_task=project_task,
+            )
+        ),
+    )
+
+
+def without_in_place(options: WorkspaceModeOptions, reason: str) -> WorkspaceModeOptions:
+    """``options`` for a folder that cannot be worked in directly."""
+    if WorkspaceMode.in_place not in options.supported:
+        return options
+    return WorkspaceModeOptions(
+        supported=[mode for mode in options.supported if mode != WorkspaceMode.in_place],
+        default=WorkspaceMode.worktree if options.default == WorkspaceMode.in_place else options.default,
+        in_place_unavailable_reason=reason,
     )
 
 

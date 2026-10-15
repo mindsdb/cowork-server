@@ -51,6 +51,8 @@ class WorkspaceModeOptions(BaseModel):
 
     supported: list[WorkspaceMode]
     default: WorkspaceMode
+    # Why working in the original folder is not offered, when it is not.
+    in_place_unavailable_reason: str | None = None
 
 
 class PermissionMode(str, Enum):

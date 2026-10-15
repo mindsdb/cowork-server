@@ -234,9 +234,10 @@ def engines():
 def workspace_modes(
     project_id: str | None = Query(default=None, min_length=1, max_length=128),
     computer_id: str | None = Query(default=None, min_length=1, max_length=128),
+    path: str | None = Query(default=None, min_length=1, max_length=32_768),
 ):
-    """Which workspace modes the composer may offer for a new task."""
-    return _call(_service().workspace_mode_options, project_id, computer_id)
+    """Which workspace modes the composer may offer for a new task, optionally for one folder."""
+    return _call(_service().workspace_mode_options, project_id, computer_id, path)
 
 
 @router.get("/models")
