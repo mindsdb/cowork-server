@@ -98,6 +98,12 @@ class PortAllocator:
             return False
 
 
+def roots_overlap(left: Path, right: Path) -> bool:
+    """Whether one folder is, or contains, the other."""
+    left, right = left.resolve(), right.resolve()
+    return left == right or left in right.parents or right in left.parents
+
+
 def is_git_workspace(workspace: TaskWorkspace) -> bool:
     """Whether review, branch and commit actions can run in this task folder.
 
@@ -235,7 +241,8 @@ class ProjectWorkspaceManager:
         """Each project folder and the repository an in-place task would work in.
 
         In place means the user's own checkouts, so every resource needs one
-        on this computer, in a Git repository with a commit; nothing is cloned.
+        on this computer; nothing is cloned. Folders must not overlap, or two
+        folders of one task would review the same files.
         """
         roots: list[tuple[ProjectFolder, Path]] = []
         for resource in project.resources:
@@ -251,8 +258,9 @@ class ProjectWorkspaceManager:
             except WorkspaceError as exc:
                 raise WorkspaceError(f"{folder.name}: {exc}") from exc
             roots.append((folder, root))
-        if len({root for _, root in roots}) != len(roots):
-            raise WorkspaceError("Two project folders are in the same repository, so they cannot both work in place; choose Worktree")
+        for index, (_, root) in enumerate(roots):
+            if any(roots_overlap(root, other) for _, other in roots[index + 1:]):
+                raise WorkspaceError("Two project folders overlap, so they cannot both work in place; choose Worktree")
         return roots
 
     def prepare_in_place(self, session_id: str, project: CodeProject) -> PreparedProjectWorkspace:
@@ -264,7 +272,7 @@ class ProjectWorkspaceManager:
         with self._lock:
             prepared: list[TaskWorkspace] = []
             for folder, root in self.in_place_roots(project):
-                item = self.workspaces.prepare_in_place(str(root))
+                item = self.workspaces.prepare_in_place(str(root), self._key(session_id, folder.id))
                 prepared.append(TaskWorkspace(
                     folder_id=folder.id,
                     folder_name=folder.name,
@@ -516,10 +524,11 @@ class ProjectWorkspaceManager:
     ) -> list[CommandResult]:
         return self.commands.run(project, tuple(workspaces), phase, ports, on_start, on_result, stop)
 
-    def diff(self, workspaces: list[TaskWorkspace]) -> list[DiffFile]:
+    def diff(self, workspaces: list[TaskWorkspace], session_id: str | None = None) -> list[DiffFile]:
         files: list[DiffFile] = []
         for workspace in workspaces:
-            for file in self.workspaces.diff(workspace.workspace_path, workspace.base_revision):
+            baseline_key = self._key(session_id, workspace.folder_id) if session_id else None
+            for file in self.workspaces.diff(workspace.workspace_path, workspace.base_revision, baseline_key=baseline_key):
                 files.append(file.model_copy(update={"folder_id": workspace.folder_id, "folder_name": workspace.folder_name}))
         return files
 

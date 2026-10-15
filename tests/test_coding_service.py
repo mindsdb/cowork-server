@@ -1252,7 +1252,9 @@ def test_local_context_exhaustion_recovers_ready_with_a_fresh_agent_session(tmp_
     )
 
 
-def test_non_git_session_reports_its_isolated_local_copy(tmp_path: Path) -> None:
+def test_non_git_session_reports_its_isolated_local_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Where in place is not offered (Windows today), a folder without Git history is copied.
+    monkeypatch.setattr("cowork.coding.workspace_mode._IN_PLACE_PLATFORMS", frozenset())
     folder = tmp_path / "plain-folder"
     folder.mkdir()
     service = service_with(tmp_path, FakeEngine())
@@ -1276,7 +1278,9 @@ def test_non_git_session_reports_its_isolated_local_copy(tmp_path: Path) -> None
     assert created.source_path == str(folder.resolve())
 
 
-def test_repository_without_commits_can_start_a_coding_session(tmp_path: Path) -> None:
+def test_repository_without_commits_can_start_a_coding_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Where in place is not offered (Windows today), a folder without Git history is copied.
+    monkeypatch.setattr("cowork.coding.workspace_mode._IN_PLACE_PLATFORMS", frozenset())
     repo = tmp_path / "unborn-repo"
     repo.mkdir()
     git(repo, "init")

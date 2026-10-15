@@ -21,6 +21,7 @@ from cowork.coding.contracts import (
     WorkspaceKind,
 )
 from cowork.coding.git_transport import ALLOWED_GIT_PROTOCOLS
+from cowork.coding.folder_baseline import FolderBaselineError, FolderBaselines
 from cowork.coding.local_copy import LocalCopyError, LocalCopyManager, PreparedLocalCopy, _force_remove
 from cowork.coding.workspace_key import managed_key
 from cowork.common.paths import O_NOFOLLOW, open_fd
@@ -215,6 +216,7 @@ class WorkspaceManager:
         self.snapshots_root = root / "snapshots"
         self.git = git or GitRunner()
         self.local_copies = LocalCopyManager(root, self.worktrees_root)
+        self.folder_baselines = FolderBaselines(root / "in-place-baselines")
         self._mutation_lock = threading.RLock()
         self.worktrees_root.mkdir(parents=True, exist_ok=True)
         self.snapshots_root.mkdir(parents=True, exist_ok=True)
@@ -262,25 +264,49 @@ class WorkspaceManager:
             raise WorkspaceError("Local folder isolation was not enabled for this request")
 
     def in_place_root(self, raw_path: str) -> Path:
-        """Return the repository an in-place task on ``raw_path`` works in.
+        """Return the folder an in-place task on ``raw_path`` works in.
 
-        Review compares an in-place task against the commit it started from,
-        so the folder must be in a Git repository that has one.
+        Inside a Git repository with a commit that is the repository, so a
+        subfolder runs in its repository and review compares against a commit.
+        Otherwise it is the folder itself, reviewed against a baseline taken
+        when the task starts.
         """
         path = self._resolve_existing(raw_path)
         if path is None or not path.is_dir():
             raise WorkspaceError("Choose an existing local folder")
         root = self._git_root(path)
-        if root is None:
-            raise WorkspaceError("Working in the original folder needs a Git repository; choose Worktree")
-        if self._head_revision(root) is None:
-            raise WorkspaceError("Working in the original folder needs a repository with a commit; choose Worktree")
-        return root
+        if root is not None and self._head_revision(root) is not None:
+            return root
+        return root or path
 
-    def prepare_in_place(self, raw_path: str) -> PreparedWorkspace:
-        """Point a task at the user's repository itself; nothing is created."""
+    def is_git_backed(self, raw_path: str) -> bool:
+        """Whether a worktree can isolate this folder: it is in a repository with a commit, or holds repositories."""
+        path = self._resolve_existing(raw_path)
+        if path is None or not path.is_dir():
+            return False
+        root = self._git_root(path)
+        if root is not None:
+            return self._head_revision(root) is not None
+        return bool(self._inner_repositories(path))
+
+    def prepare_in_place(self, raw_path: str, key: str) -> PreparedWorkspace:
+        """Point a task at the user's folder itself; nothing is copied.
+
+        A folder without Git history gets a baseline under ``key`` for review.
+        """
         root = self.in_place_root(raw_path)
         inspection = self.inspect(str(root))
+        if inspection.revision is None:
+            self.folder_baselines.capture(key, root)
+            return PreparedWorkspace(
+                source_path=root,
+                workspace_path=root,
+                kind=WorkspaceKind.direct_folder,
+                repository_root=None,
+                base_revision=None,
+                source_dirty=False,
+                warning=None,
+            )
         return PreparedWorkspace(
             source_path=root,
             workspace_path=root,
@@ -436,8 +462,15 @@ class WorkspaceManager:
                 warning=None,
             )
 
-    def diff(self, workspace_path: str, base_revision: str | None) -> list[DiffFile]:
+    def diff(
+        self, workspace_path: str, base_revision: str | None, *, baseline_key: str | None = None,
+    ) -> list[DiffFile]:
         root = Path(workspace_path)
+        if not base_revision and baseline_key and self.folder_baselines.exists(baseline_key):
+            try:
+                return self.folder_baselines.diff(baseline_key, root)
+            except FolderBaselineError as exc:
+                raise WorkspaceError(str(exc)) from exc
         if not base_revision:
             try:
                 return self.local_copies.diff(root)
@@ -781,6 +814,10 @@ class WorkspaceManager:
         base_revision: str | None,
     ) -> None:
         with self._mutation_lock:
+            if kind == WorkspaceKind.direct_folder:
+                # The folder is the user's; only the review baseline is ours.
+                self.folder_baselines.discard(session_id)
+                return
             if kind == WorkspaceKind.local_copy:
                 try:
                     self.local_copies.cleanup(
@@ -1032,6 +1069,7 @@ class WorkspaceManager:
             self.legacy_worktrees_root,
             self.local_copies.legacy_copies_root,
             self.local_copies.baselines_root,
+            self.folder_baselines.root,
         )
         for workspace_root in managed_roots:
             task_root = workspace_root / relative

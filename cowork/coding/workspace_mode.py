@@ -25,16 +25,20 @@ def supported_workspace_modes(
     *,
     runs_locally: bool,
     org_mode: bool,
+    git_backed: bool = True,
     platform: str | None = None,
 ) -> tuple[WorkspaceMode, ...]:
     """Modes the computer running a task can prepare for it.
 
     A web runtime computer has no user checkout to work in, and on a local
-    computer org mode refuses local workspaces altogether.
+    computer org mode refuses local workspaces altogether. A folder with no
+    Git to make a worktree from runs in place wherever that is offered, and
+    is copied where it is not.
     """
-    if runs_locally and not org_mode and (platform or sys.platform) in _IN_PLACE_PLATFORMS:
-        return (WorkspaceMode.worktree, WorkspaceMode.in_place)
-    return (WorkspaceMode.worktree,)
+    in_place = runs_locally and not org_mode and (platform or sys.platform) in _IN_PLACE_PLATFORMS
+    if not git_backed:
+        return (WorkspaceMode.in_place,) if in_place else (WorkspaceMode.worktree,)
+    return (WorkspaceMode.worktree, WorkspaceMode.in_place) if in_place else (WorkspaceMode.worktree,)
 
 
 def resolve_workspace_mode(
@@ -43,6 +47,7 @@ def resolve_workspace_mode(
     *,
     runs_locally: bool,
     org_mode: bool,
+    git_backed: bool = True,
     platform: str | None = None,
 ) -> WorkspaceMode:
     """Return the mode for a new task.
@@ -51,13 +56,19 @@ def resolve_workspace_mode(
     preference, so a computer that cannot honour it falls back to its own
     default.
     """
-    supported = supported_workspace_modes(runs_locally=runs_locally, org_mode=org_mode, platform=platform)
+    supported = supported_workspace_modes(
+        runs_locally=runs_locally, org_mode=org_mode, git_backed=git_backed, platform=platform,
+    )
     if requested is not None:
         if requested not in supported:
-            raise ValueError(_unsupported_message(requested, runs_locally=runs_locally, org_mode=org_mode))
+            raise ValueError(_unsupported_message(
+                requested, runs_locally=runs_locally, org_mode=org_mode, git_backed=git_backed,
+            ))
         return requested
     if project_default is not None and project_default in supported:
         return project_default
+    if len(supported) == 1:
+        return supported[0]
     return _LOCAL_DEFAULT if runs_locally and not org_mode else _RUNTIME_DEFAULT
 
 
@@ -66,17 +77,20 @@ def workspace_mode_options(
     *,
     runs_locally: bool,
     org_mode: bool,
+    git_backed: bool = True,
     platform: str | None = None,
 ) -> WorkspaceModeOptions:
     """What a client may offer for a new task, resolved the way creation resolves it."""
-    context = {"runs_locally": runs_locally, "org_mode": org_mode, "platform": platform}
+    context = {"runs_locally": runs_locally, "org_mode": org_mode, "git_backed": git_backed, "platform": platform}
     return WorkspaceModeOptions(
         supported=list(supported_workspace_modes(**context)),
         default=resolve_workspace_mode(None, project_default, **context),
     )
 
 
-def _unsupported_message(mode: WorkspaceMode, *, runs_locally: bool, org_mode: bool) -> str:
+def _unsupported_message(mode: WorkspaceMode, *, runs_locally: bool, org_mode: bool, git_backed: bool) -> str:
+    if mode == WorkspaceMode.worktree and not git_backed:
+        return "This folder has no Git repository to make a worktree from, so it works in place; choose Local"
     if mode == WorkspaceMode.in_place:
         if org_mode or not runs_locally:
             return "Tasks on another computer run in an isolated worktree; choose Worktree"
