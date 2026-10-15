@@ -289,6 +289,7 @@ def test_overlay_applies_every_budget_to_a_real_anton_settings():
 
     a = AntonSettings(_env_file=None)
     user = UserSettings.model_validate({
+        "limits_enabled": "true",
         "max_tool_rounds": "80", "max_continuations": "2",
         "max_turn_tokens": "900000",
     })
@@ -331,7 +332,7 @@ def test_overlay_survives_a_field_the_pinned_anton_does_not_have():
         setattr(old, "max_turn_tokens", 1_250_000)
 
     applied = _overlay_user_settings(
-        old, UserSettings.model_validate({"max_tool_rounds": "80"})
+        old, UserSettings.model_validate({"limits_enabled": "true", "max_tool_rounds": "80"})
     )
     assert applied == ["max_tool_rounds"]
     assert old.max_tool_rounds == 80
