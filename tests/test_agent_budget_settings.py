@@ -161,9 +161,10 @@ def test_defaults_match_antons_own():
     core = CoreSettings(_env_file=None)
     if core.max_turn_tokens == 1_250_000:
         pytest.skip(
-            "pinned anton predates the safety-limit defaults; this assertion "
-            "activates when they reach anton main, and its passing is the "
-            "signal that the merge-order note in the PR body is satisfied"
+            "the anton this environment resolves predates the safety-limit "
+            "defaults; this assertion activates once the [tool.uv.sources] "
+            "anton rev (images, uv sync --frozen) or the anton-agent floor "
+            "(desktop installs) moves to an anton release that carries them"
         )
     s = UserSettings()
     assert (s.max_tool_rounds, s.max_continuations, s.max_turn_tokens) == (
