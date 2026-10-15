@@ -157,6 +157,7 @@ async def format_responses_stream(
         StreamToolUseDelta,
         StreamToolUseEnd,
         StreamToolUseStart,
+        StreamTurnEnded,
     )
 
     # StreamReasoningDelta is newer than the rest — it arrived with the
@@ -175,13 +176,6 @@ async def format_responses_stream(
     except ImportError:
         class StreamReasoningDelta:  # type: ignore[no-redef]
             """Placeholder for pre-ENG-1109 anton; never instantiated."""
-
-    # Same guard, same reason: an anton without it never hands back a reason.
-    try:
-        from anton.core.llm.provider import StreamTurnEnded
-    except ImportError:
-        class StreamTurnEnded:  # type: ignore[no-redef]
-            """Placeholder for pre-ENG-3436 anton; never instantiated."""
 
     resp_id = f"resp-{uuid.uuid4().hex[:12]}"
     msg_id = f"msg-{uuid.uuid4().hex[:12]}"

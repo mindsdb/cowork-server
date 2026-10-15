@@ -1057,20 +1057,11 @@ def test_step_stream_events_unknown_step_yields_nothing():
 
 
 def test_step_stream_events_turn_ended_carries_the_reason():
-    provider = pytest.importorskip("anton.core.llm.provider")
-    if not hasattr(provider, "StreamTurnEnded"):
-        pytest.skip("anton build predates StreamTurnEnded (ENG-3436)")
+    from anton.core.llm.provider import StreamTurnEnded
 
     events = prod.step_stream_events({"step": "turn_ended", "ended_by": "round_cap"})
-    assert events == [provider.StreamTurnEnded(ended_by="round_cap")]
+    assert events == [StreamTurnEnded(ended_by="round_cap")]
     assert prod.step_stream_events({"step": "turn_ended"}) == []
-
-
-def test_step_stream_events_turn_ended_without_anton_support(monkeypatch):
-    import anton.core.llm.provider as provider_mod
-
-    monkeypatch.delattr(provider_mod, "StreamTurnEnded", raising=False)
-    assert prod.step_stream_events({"step": "turn_ended", "ended_by": "round_cap"}) == []
 
 
 def test_step_stream_events_ask_user_becomes_a_question():

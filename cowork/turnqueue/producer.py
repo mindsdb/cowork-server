@@ -411,6 +411,7 @@ def step_stream_events(data: dict) -> list:
         StreamToolUseDelta,
         StreamToolUseEnd,
         StreamToolUseStart,
+        StreamTurnEnded,
         ToolCall,
     )
     from anton.core.interaction.elicit import AskAnswer, AskOption, AskRequest
@@ -485,11 +486,6 @@ def step_stream_events(data: dict) -> list:
             text=str(data.get("text") or ""),
         ))]
     if step == "turn_ended":
-        # Guarded like the formatter's import: an older anton has no such event.
-        try:
-            from anton.core.llm.provider import StreamTurnEnded
-        except ImportError:
-            return []
         ended_by = data.get("ended_by")
         return [StreamTurnEnded(ended_by=ended_by)] if isinstance(ended_by, str) and ended_by else []
     # `ask_user_answer_rejected` is the pod's verdict on one answer; only

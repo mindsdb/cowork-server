@@ -10,19 +10,8 @@ from uuid import uuid4
 
 import pytest
 
-from anton.core.llm.provider import StreamTextDelta
+from anton.core.llm.provider import StreamTextDelta, StreamTurnEnded
 from cowork.harnesses.anton_harness.stream_formatter import format_responses_stream
-
-# Same guard as production: older anton builds have no StreamTurnEnded.
-try:
-    from anton.core.llm.provider import StreamTurnEnded
-except ImportError:
-    StreamTurnEnded = None
-
-needs_turn_ended = pytest.mark.skipif(
-    StreamTurnEnded is None,
-    reason="anton build predates StreamTurnEnded (ENG-3436)",
-)
 
 REASONS = [
     "spend_ceiling",
@@ -45,7 +34,6 @@ async def _final(*items, event_sink=None) -> dict:
     return json.loads(chunks[-1].split("data:", 1)[1])
 
 
-@needs_turn_ended
 @pytest.mark.parametrize("reason", REASONS)
 async def test_handback_marks_the_final_event_incomplete(reason):
     final = await _final(StreamTextDelta(text="Stopped at a limit."), StreamTurnEnded(ended_by=reason))
@@ -63,7 +51,6 @@ async def test_finished_turn_carries_no_reason():
     assert resp["incomplete_details"] is None
 
 
-@needs_turn_ended
 async def test_reason_is_persisted_for_reload():
     # Reload replays the events event_sink recorded, so the reason must be there.
     recorded = []
@@ -74,16 +61,6 @@ async def test_reason_is_persisted_for_reload():
     event_type, data = recorded[-1]
     assert event_type == "response.completed"
     assert data["response"]["incomplete_details"] == {"reason": "round_cap"}
-
-
-async def test_formatter_survives_anton_without_turn_ended(monkeypatch):
-    # The formatter runs on every turn; an unguarded import would break all chat.
-    import anton.core.llm.provider as provider_mod
-
-    monkeypatch.delattr(provider_mod, "StreamTurnEnded", raising=False)
-    resp = (await _final(StreamTextDelta(text="hello")))["response"]
-    assert resp["status"] == "completed"
-    assert resp["output"][0]["content"][0]["text"] == "hello"
 
 
 def _collect_handler():
@@ -113,7 +90,6 @@ def _run_collect(*items):
         ))
 
 
-@needs_turn_ended
 def test_non_streaming_response_carries_the_reason():
     resp = _run_collect(StreamTextDelta(text="Stopped."), StreamTurnEnded(ended_by="handback_stuck"))
     assert resp.status.value == "incomplete"
