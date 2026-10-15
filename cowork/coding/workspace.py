@@ -73,6 +73,19 @@ _DEPENDENCY_DIRS = frozenset({
 _REPOSITORY_SEARCH_DEPTH = 3
 
 
+# Left-out folders worth telling the user about; caches rebuild on their own.
+_INSTALLED_DEPENDENCY_DIRS = frozenset({"node_modules", ".venv", "venv"})
+
+
+def _omitted_warning(omitted: tuple[str, ...]) -> str | None:
+    omitted = tuple(path for path in omitted if PurePosixPath(path).name in _INSTALLED_DEPENDENCY_DIRS)
+    if not omitted:
+        return None
+    shown = ", ".join(omitted[:3])
+    more = f" and {len(omitted) - 3} more" if len(omitted) > 3 else ""
+    return f"Dependency folders were left out of this task's copy and need rebuilding: {shown}{more}."
+
+
 def _org_mode() -> bool:
     return get_app_settings().tenancy_mode == "org"
 
@@ -901,7 +914,7 @@ class WorkspaceManager:
             repository_root=None,
             base_revision=None,
             source_dirty=False,
-            warning=None,
+            warning=_omitted_warning(prepared.omitted),
         )
 
     def _prepare_folder_copy(self, key: str, source: Path) -> PreparedLocalCopy:
@@ -910,7 +923,9 @@ class WorkspaceManager:
         Copying a folder of repositories duplicated every checkout with its
         dependencies. A worktree shares the repository's objects and leaves
         ignored files out, and the folder copy around it keeps review and
-        handoff exactly as they are for any other folder.
+        handoff exactly as they are for any other folder. Dependency folders
+        are left out and named in ``omitted``; every other ignored file, such
+        as a ``.env``, is copied.
         """
         repositories = self._inner_repositories(source)
         if not repositories:
@@ -923,7 +938,7 @@ class WorkspaceManager:
         workspace.parent.mkdir(parents=True, exist_ok=True)
         baseline.parent.mkdir(parents=True, exist_ok=True)
         try:
-            self._materialize_repository_folder(source, workspace, repositories)
+            omitted = self._materialize_repository_folder(source, workspace, repositories)
             self._baseline_from(workspace, baseline, source, repositories)
         except GitUnavailableError:
             self._discard_repository_folder(source, workspace, baseline)
@@ -931,7 +946,7 @@ class WorkspaceManager:
         except Exception:
             self._discard_repository_folder(source, workspace, baseline)
             raise
-        return PreparedLocalCopy(source=source, workspace=workspace, baseline=baseline)
+        return PreparedLocalCopy(source=source, workspace=workspace, baseline=baseline, omitted=tuple(omitted))
 
     def _fork_repository_folder(self, key: str, source: Path, current: Path) -> PreparedLocalCopy:
         """Fork a folder-of-repositories copy without sharing the parent's worktrees."""
@@ -975,9 +990,11 @@ class WorkspaceManager:
                     pending.append((path, depth + 1))
         return sorted(found)
 
-    def _materialize_repository_folder(self, source: Path, target: Path, repositories: list[Path]) -> None:
+    def _materialize_repository_folder(self, source: Path, target: Path, repositories: list[Path]) -> list[str]:
+        """Build the task folder, returning the dependency folders it left out."""
         repository_paths = {repository.relative_to(source) for repository in repositories}
         ancestors = {parent for path in repository_paths for parent in path.parents if parent != Path(".")}
+        omitted: list[str] = []
 
         def build(relative: Path) -> None:
             (target / relative).mkdir(parents=True, exist_ok=True)
@@ -990,9 +1007,11 @@ class WorkspaceManager:
                     destination.symlink_to(os.readlink(entry.path))
                 elif entry.is_dir(follow_symlinks=False):
                     if child in repository_paths:
-                        self._check_out_repository(source / child, destination)
+                        omitted.extend(
+                            f"{child.as_posix()}/{path}" for path in self._check_out_repository(source / child, destination)
+                        )
                     elif entry.name in _DEPENDENCY_DIRS:
-                        continue
+                        omitted.append(child.as_posix())
                     elif child in ancestors:
                         build(child)
                     else:
@@ -1002,9 +1021,13 @@ class WorkspaceManager:
                 # Sockets, pipes and devices cannot be copied; review ignores them too.
 
         build(Path("."))
+        return sorted(omitted)
 
-    def _check_out_repository(self, repository: Path, target: Path) -> None:
-        """Check out one inner repository as a worktree with its local changes."""
+    def _check_out_repository(self, repository: Path, target: Path) -> list[str]:
+        """Check out one inner repository as a worktree with its local and ignored files.
+
+        Returns the ignored dependency folders it left out, relative to the repository.
+        """
         head = self._head_revision(repository)
         if head is not None:
             self.git.run(repository, "worktree", "add", "--detach", str(target), head)
@@ -1013,7 +1036,7 @@ class WorkspaceManager:
                     from cowork.coding.source_changes import copy_source_changes
 
                     copy_source_changes(self, repository, target, head)
-                return
+                return self._copy_ignored(repository, target)
             except WorkspaceError as exc:
                 # Changes too large or unusual to carry over as a patch: copy
                 # this repository as before rather than start without them.
@@ -1022,6 +1045,39 @@ class WorkspaceManager:
                 self.git.run(repository, "worktree", "prune", check=False)
                 _force_remove(target)
         self.local_copies._copy_tree(repository, target)
+        return []
+
+    def _copy_ignored(self, repository: Path, target: Path) -> list[str]:
+        """Copy a repository's ignored files into its worktree, except dependency folders.
+
+        A worktree holds only what Git tracks. Ignored files such as ``.env``
+        or local configuration are part of how the folder works, so they are
+        carried over; dependency folders are rebuilt by setup instead.
+        """
+        listed = self.git.run(
+            repository, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z",
+        ).stdout
+        omitted: list[str] = []
+        for raw in filter(None, listed.split("\0")):
+            relative = Path(raw.rstrip("/"))
+            if any(part in _DEPENDENCY_DIRS for part in relative.parts):
+                omitted.append(relative.as_posix())
+                continue
+            source_entry = repository / relative
+            destination = target / relative
+            if destination.exists() or destination.is_symlink():
+                continue
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                if source_entry.is_symlink():
+                    destination.symlink_to(os.readlink(source_entry))
+                elif source_entry.is_dir():
+                    self.local_copies._copy_tree(source_entry, destination)
+                elif source_entry.is_file():
+                    shutil.copy2(source_entry, destination)
+            except OSError as exc:
+                raise WorkspaceError(f"Could not copy the ignored file {relative.as_posix()}: {exc}") from exc
+        return omitted
 
     def _baseline_from(self, workspace: Path, baseline: Path, source: Path, repositories: list[Path]) -> None:
         """Snapshot a freshly built copy as its baseline, without worktree links.
