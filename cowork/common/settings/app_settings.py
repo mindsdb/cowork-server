@@ -542,12 +542,15 @@ class TurnQueueSettings(Settings):
         default=600.0,
         description=(
             "Fail a remote turn after this many seconds with no reply for it on the reply "
-            "stream (worker down, crashed, or wedged). Generous on purpose: the reply "
-            "protocol has no heartbeat, so a long tool run legitimately produces no reply "
-            "for minutes — tighten it once the pod sends one. <= 0 disables the bound, "
-            "which means an unresponsive worker leaves the turn spinning forever."
-            " An open ask_user question produces no reply either: keep this above the "
-            "pod's question timeout (ANTON_CLOUD_ASK_USER_TIMEOUT_SECONDS, 300 s)."
+            "stream (worker down, crashed, or wedged). scratchpad-controller relays a busy "
+            "pod's heartbeat as a `worker_alive` progress reply once a minute "
+            "(LIVENESS_RELAY_SECONDS), which counts as a reply here, so a long tool run or "
+            "an open ask_user question no longer goes quiet; keep this well above that "
+            "interval. A controller too old to relay sends nothing during either, so until "
+            "every controller does, keep this above the longest quiet step and above the "
+            "pod's question timeout (ANTON_CLOUD_ASK_USER_TIMEOUT_SECONDS, 300 s). <= 0 "
+            "disables the bound, which means an unresponsive worker leaves the turn "
+            "spinning forever."
         ),
     )  # COWORK_TURN_REPLY_IDLE_TIMEOUT_SECONDS
     auth_internal_base_url: str = Field(
