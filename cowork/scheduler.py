@@ -23,11 +23,12 @@ from cowork.db.scoped import (
     unsafe_unscoped_session,
 )
 from cowork.db.units import run_db
-from cowork.models.schedule import Schedule, ScheduleSkippedPeriod
+from cowork.models.schedule import Schedule, ScheduleSkippedPeriod, ScheduleVersion
 from cowork.schedule_timing import missed_slots, next_future_occurrence
 from cowork.schemas.schedules import AttemptOutcome, Cadence, RunStatus, resolve_schedule_model
 from cowork.services.schedules import (
     ScheduleOccurrenceService,
+    current_version,
     ScheduleRunService,
     ScheduleService,
     Settlement,
@@ -218,10 +219,7 @@ def _handle_missed_runs(session: ScopedSession, now: datetime) -> None:
     every slot that passed meanwhile.
     """
     occurrences = ScheduleOccurrenceService(session)
-    behind = [
-        s.id for s in ScheduleService(session).list_schedules()
-        if s.enabled and ensure_utc(s.next_run_at) <= now
-    ]
+    behind = [s.id for s in ScheduleService(session).due(now)]
     session.commit()
     for schedule_id in behind:
         if not occurrences.has_active(schedule_id):
@@ -255,6 +253,7 @@ class _ScheduledTurn:
     prompt: str
     model: str | None
     project_id: UUID | None
+    version: int
 
 
 @dataclass(frozen=True)
@@ -368,6 +367,7 @@ def _claim_slot(session: ScopedSession, schedule: Schedule) -> UUID | None:
     ):
         session.rollback()
         return None
+    version_id = current_version(session, schedule).id
     _advance_next_run_at(schedule, session)
     occurrence = ScheduleOccurrenceService(session).claim(
         schedule_id,
@@ -376,6 +376,7 @@ def _claim_slot(session: ScopedSession, schedule: Schedule) -> UUID | None:
         scheduled_for=scheduled_for,
         max_attempts=_MAX_CRON_ATTEMPTS,
         lease_seconds=_LEASE_SECONDS,
+        version_id=version_id,
     )
     return occurrence.id if occurrence else None
 
@@ -388,8 +389,11 @@ def claim_manual_run(session: ScopedSession, schedule_id: UUID) -> UUID | None:
     A refused claim rolls that back. A recurring schedule keeps its slot; the
     freshness guard skips a slot due right after a manual success.
     """
-    schedule = session.get(Schedule, schedule_id)
-    if schedule is not None and schedule.cadence == Cadence.once:
+    schedule = _locked_schedule(session, schedule_id)
+    if schedule is None:
+        session.rollback()
+        return None
+    if schedule.cadence == Cadence.once:
         schedule.enabled = False
         schedule.missed_at = None
         session.add(schedule)
@@ -400,6 +404,7 @@ def claim_manual_run(session: ScopedSession, schedule_id: UUID) -> UUID | None:
         scheduled_for=datetime.now(timezone.utc),
         max_attempts=_MANUAL_MAX_ATTEMPTS,
         lease_seconds=_LEASE_SECONDS,
+        version_id=current_version(session, schedule).id,
     )
     return occurrence.id if occurrence else None
 
@@ -430,7 +435,10 @@ def _request_stop(session: ScopedSession, *, run_id: UUID) -> None:
     ScheduleOccurrenceService(session).request_stop(run_id)
 
 
-def _read_schedule(session: ScopedSession, *, schedule_id: UUID) -> _ScheduledTurn:
+def _read_schedule(session: ScopedSession, *, schedule_id: UUID, occurrence_id: UUID) -> _ScheduledTurn:
+    """What the attempt runs: its occurrence's version. The identity it runs
+    as, and the title its conversation takes, are read from the schedule as
+    it is now."""
     schedule = ScheduleService(session).get_schedule(schedule_id)
     # A scheduled run has no request, so it derives its tenant identity from
     # the schedule row (see _principal_for_schedule). None in local mode.
@@ -445,12 +453,19 @@ def _read_schedule(session: ScopedSession, *, schedule_id: UUID) -> _ScheduledTu
         session.add(schedule)
         session.commit()
         raise
+    occurrence = ScheduleOccurrenceService(session).get(occurrence_id)
+    version = (
+        session.get(ScheduleVersion, occurrence.version_id)
+        if occurrence is not None and occurrence.version_id is not None
+        else None
+    ) or current_version(session, schedule)
     return _ScheduledTurn(
         principal=principal,
         title=schedule.title,
-        prompt=schedule.prompt,
-        model=schedule.model,
-        project_id=schedule.project_id,
+        prompt=version.prompt,
+        model=version.model,
+        project_id=version.project_id,
+        version=version.number,
     )
 
 
@@ -757,7 +772,9 @@ async def _execute_attempt(
 
     schedule_id = attempt.schedule_id
     try:
-        scheduled = await run_db(partial(_read_schedule, schedule_id=schedule_id), scope=SYSTEM_SCOPE)
+        scheduled = await run_db(
+            partial(_read_schedule, schedule_id=schedule_id, occurrence_id=occurrence_id), scope=SYSTEM_SCOPE,
+        )
 
         await require_product_permission(scope_from_principal(scheduled.principal), "product.execute")
 
@@ -786,6 +803,7 @@ async def _execute_attempt(
                 "schedule_occurrence_id": str(occurrence_id),
                 "trigger_type": trigger,
                 "attempt": str(attempt.number),
+                "schedule_version": str(scheduled.version),
             },
         )
 
@@ -967,7 +985,7 @@ def _due_schedules(session, now: datetime) -> list[Schedule]:
     occurrences = ScheduleOccurrenceService(session)
     due: list[Schedule] = []
     skipped = False
-    for s in ScheduleService(session).list_schedules():
+    for s in ScheduleService(session).due(now):
         # Gate on ANY occurrence in flight, manual included, or waiting for a
         # retry: the slot is deferred, not consumed, and once the occurrence
         # settles the freshness guard decides whether it still fires. The

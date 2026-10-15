@@ -14,12 +14,57 @@ from cowork.common.logger import get_logger
 from cowork.db.scoped import ScopedSession, unsafe_unscoped_session
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
-from cowork.models.schedule import Schedule, ScheduleOccurrence, ScheduleRun, ScheduleSkippedPeriod
+from cowork.models.schedule import (
+    Schedule,
+    ScheduleEvent,
+    ScheduleOccurrence,
+    ScheduleRun,
+    ScheduleSkippedPeriod,
+    ScheduleVersion,
+)
 from cowork.schedule_timing import normalize_next_run
 from cowork.schemas.schedules import AttemptOutcome, Cadence, OccurrenceStatus, RunStatus
 
 
 logger = get_logger(__name__)
+
+# The settings a version holds: an edit that changes any of them makes a new
+# version. A rename, a new start time or a pause does not.
+VERSION_FIELDS = ("prompt", "model", "project_id", "cadence", "timezone")
+
+
+def record_schedule_event(session: ScopedSession, schedule_id: UUID, kind: str, detail: dict | None = None) -> None:
+    """Stage a lifecycle event. The actor is the request's user, or NULL when
+    the scheduler itself acts (or on the desktop, which has no user id)."""
+    session.add(ScheduleEvent(
+        schedule_id=schedule_id, kind=kind, actor=getattr(session.scope, "user_id", None), detail=detail,
+    ))
+
+
+def _new_version(session: ScopedSession, schedule: Schedule, number: int) -> ScheduleVersion:
+    version = ScheduleVersion(
+        schedule_id=schedule.id, number=number, prompt=schedule.prompt, model=schedule.model,
+        project_id=schedule.project_id, cadence=schedule.cadence, timezone=schedule.timezone or "UTC",
+    )
+    session.add(version)
+    return version
+
+
+def current_version(session: ScopedSession, schedule: Schedule) -> ScheduleVersion:
+    """The schedule's latest version, staged from its fields first if it has
+    none (a row written before versions, or by hand). Read in the caller's
+    transaction, so a claim holding the schedule's row lock sees the version
+    of the last committed edit, never one half-written."""
+    version = unsafe_unscoped_session(session).execute(
+        sa.select(ScheduleVersion)
+        .where(ScheduleVersion.schedule_id == schedule.id)
+        .order_by(ScheduleVersion.number.desc())  # type: ignore[attr-defined]
+        .limit(1)
+    ).scalars().first()
+    if version is None:
+        version = _new_version(session, schedule, 1)
+        session.flush()
+    return version
 
 
 class ScheduleService:
@@ -53,6 +98,34 @@ class ScheduleService:
         if project_id is not None:
             query = query.where(Schedule.project_id == project_id)
         return list(self.session.exec(query).all())
+
+    def due(self, now: datetime) -> list[Schedule]:
+        """Enabled schedules whose slot has come, read through the
+        (enabled, next_run_at) index instead of every schedule."""
+        return list(
+            self.session.exec(
+                self._owned_select()
+                .where(Schedule.enabled == True)  # noqa: E712
+                .where(Schedule.next_run_at <= now)
+            ).all()
+        )
+
+    def events(self, schedule_id: UUID, limit: int = 100) -> list[ScheduleEvent]:
+        if self._owned(schedule_id) is None:
+            return []
+        return list(
+            self.session.exec(
+                self.session.select(ScheduleEvent)
+                .where(ScheduleEvent.schedule_id == schedule_id)
+                .order_by(ScheduleEvent.created_at.desc())  # type: ignore[union-attr]
+                .limit(limit)
+            ).all()
+        )
+
+    def current_version_number(self, schedule_id: UUID) -> int | None:
+        return unsafe_unscoped_session(self.session).execute(
+            sa.select(sa.func.max(ScheduleVersion.number)).where(ScheduleVersion.schedule_id == schedule_id)
+        ).scalar()
 
     def get_schedule(self, schedule_id: UUID) -> Schedule:
         schedule = self._owned(schedule_id)
@@ -88,6 +161,9 @@ class ScheduleService:
             paused_at=None if enabled else datetime.now(timezone_.utc),
         )
         self.session.add(schedule)
+        self.session.flush()
+        _new_version(self.session, schedule, 1)
+        record_schedule_event(self.session, schedule.id, "created", {"version": 1})
         self.session.commit()
         self.session.refresh(schedule)
         return schedule
@@ -106,9 +182,23 @@ class ScheduleService:
         # sent must not pause it again.
         was_on = self._runs_on_its_own(schedule)
         given = {k for k, v in kwargs.items() if v is not None}
+        changed = sorted(
+            field for field in given
+            if hasattr(schedule, field) and getattr(schedule, field) != kwargs[field]
+        )
         for field in given:
             if hasattr(schedule, field):
                 setattr(schedule, field, kwargs[field])
+        if any(field in VERSION_FIELDS for field in changed):
+            # Written in the edit's own commit, so a claim reads the old
+            # version or this one, never a mix of the two.
+            number = (self.current_version_number(schedule.id) or 0) + 1
+            _new_version(self.session, schedule, number)
+        if changed:
+            record_schedule_event(
+                self.session, schedule.id, "edited",
+                {"fields": changed, "version": self.current_version_number(schedule.id)},
+            )
         if {"cadence", "timezone", "next_run_at"} & given:
             # The slot follows the edit at once, rather than firing on the old
             # cadence or reading a start already in the past as a missed run.
@@ -195,7 +285,8 @@ class ScheduleService:
             schedule.paused_at = now
         self.session.add(schedule)
         self.session.flush()
-        ScheduleOccurrenceService(self.session).cancel_pending(schedule.id, error="Paused before it ran.")
+        cancelled = ScheduleOccurrenceService(self.session).cancel_pending(schedule.id, error="Paused before it ran.")
+        record_schedule_event(self.session, schedule.id, "paused", {"cancelled_pending": cancelled})
         self.session.commit()
         self.session.refresh(schedule)
         return schedule
@@ -209,6 +300,7 @@ class ScheduleService:
         recurring schedule waits for its next slot. A one-off whose time has
         passed cannot wait for anything; run it now or give it a new time."""
         now = datetime.now(timezone_.utc)
+        was_auto_paused = schedule.auto_paused_at is not None
         if schedule.cadence == Cadence.once and _utc(schedule.next_run_at) <= now:
             raise ScheduleConflict(
                 "This one-time task's time has passed. Run it now, or edit it to give it a new time."
@@ -224,6 +316,7 @@ class ScheduleService:
         # A retry that was being scheduled as the pause landed never starts
         # while paused (start_attempt checks); drop it, so the next slot can.
         ScheduleOccurrenceService(self.session).cancel_pending(schedule.id, error="Paused before it ran.")
+        record_schedule_event(self.session, schedule.id, "resumed", {"from_auto_pause": was_auto_paused})
         self.session.commit()
         self.session.refresh(schedule)
         return schedule
@@ -475,6 +568,27 @@ class ScheduleRunService:
         self.session.commit()
         return len(runs)
 
+    def run_context(self, runs: list[ScheduleRun]) -> dict[UUID, dict]:
+        """For each run at an occurrence: what fired it, the slot it ran for,
+        and the version it ran. Read through the occurrence, which every
+        attempt at it shares, rather than copied onto each run."""
+        occurrence_ids = {r.occurrence_id for r in runs if r.occurrence_id is not None}
+        if not occurrence_ids:
+            return {}
+        rows = unsafe_unscoped_session(self.session).execute(
+            sa.select(
+                ScheduleOccurrence.id, ScheduleOccurrence.trigger_source, ScheduleOccurrence.scheduled_for,
+                ScheduleVersion.number,
+            )
+            .select_from(ScheduleOccurrence)
+            .outerjoin(ScheduleVersion, ScheduleVersion.id == ScheduleOccurrence.version_id)
+            .where(ScheduleOccurrence.id.in_(occurrence_ids))  # type: ignore[union-attr]
+        ).all()
+        return {
+            row[0]: {"trigger": row[1], "scheduled_for": _utc(row[2]), "version": row[3]}
+            for row in rows
+        }
+
     def list_runs(self, schedule_id: UUID, limit: int = 100) -> list[ScheduleRun]:
         # Anchor on parent visibility (child table, request-reachable).
         _stmt = self.session.select(Schedule).where(Schedule.id == schedule_id)
@@ -573,6 +687,7 @@ class ScheduleOccurrenceService:
         scheduled_for: datetime,
         max_attempts: int,
         lease_seconds: float,
+        version_id: UUID | None = None,
     ) -> ScheduleOccurrence | None:
         """Insert the occurrence and commit it with whatever the caller staged.
 
@@ -595,6 +710,7 @@ class ScheduleOccurrenceService:
             next_attempt_at=now,
             lease_expires_at=now + timedelta(seconds=lease_seconds),
             lease_token=_new_token(),
+            version_id=version_id,
         )
         self.session.add(occurrence)
         try:
@@ -834,6 +950,10 @@ class ScheduleOccurrenceService:
             .values(enabled=False, auto_paused_at=datetime.now(timezone.utc))
         ).rowcount
         if paused:
+            self.session.add(ScheduleEvent(
+                schedule_id=schedule_id, kind="auto_paused", actor=None,
+                detail={"failed_runs": MAX_FAILED_OCCURRENCES, "occurrence_id": str(row["id"])},
+            ))
             logger.warning(f"Schedule {schedule_id} paused after {MAX_FAILED_OCCURRENCES} failed runs in a row")
 
     def ready_for_attempt(self, now: datetime) -> list[UUID]:

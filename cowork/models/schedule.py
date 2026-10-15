@@ -8,7 +8,14 @@ from cowork.models.base import BaseSQLModel
 
 
 class Schedule(BaseSQLModel, table=True):
+    """A task and when it runs. Its fields are the editor's current state; what
+    each occurrence runs is the ScheduleVersion it was claimed against."""
+
     __tablename__ = "schedules"
+    __table_args__ = (
+        # The poll's due-scan: enabled schedules whose slot has come.
+        sa.Index("ix_schedules_enabled_next_run_at", "enabled", "next_run_at"),
+    )
 
     title: str = Field(description="Display name for the schedule")
     prompt: str = Field(description="The prompt to run on each execution")
@@ -79,6 +86,43 @@ class Schedule(BaseSQLModel, table=True):
     skipped_periods: list["ScheduleSkippedPeriod"] = Relationship(
         sa_relationship_kwargs={"cascade": "all, delete-orphan"},
     )
+    versions: list["ScheduleVersion"] = Relationship(
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
+    events: list["ScheduleEvent"] = Relationship(
+        sa_relationship_kwargs={"cascade": "all, delete-orphan"},
+    )
+
+
+class ScheduleVersion(BaseSQLModel, table=True):
+    """What a schedule ran, as of one edit: written once, never changed.
+
+    An occurrence is claimed against the current version and every attempt at
+    it runs that version, so an edit takes effect from the next occurrence.
+    Holds the explicit settings only. Credentials, permissions, the project's
+    files and what "default" model resolves to are read when the run starts.
+    """
+
+    __tablename__ = "schedule_versions"
+    __table_args__ = (
+        sa.UniqueConstraint("schedule_id", "number", name="uq_schedule_versions_number"),
+    )
+
+    schedule_id: UUID = Field(
+        sa_column=sa.Column(
+            sa.Uuid(),
+            sa.ForeignKey("schedules.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+        description="Parent schedule",
+    )
+    number: int = Field(description="1 for the schedule as created, then one more per edit to these fields")
+    prompt: str = Field(description="The prompt this version runs")
+    model: str = Field(description='The configured model, or the "default" sentinel')
+    project_id: UUID = Field(sa_type=sa.Uuid(), description="The project this version runs in")
+    cadence: str = Field(description="The cadence this version ran on")
+    timezone: str = Field(description="The time zone its slots were computed in")
 
 
 class ScheduleSkippedPeriod(BaseSQLModel, table=True):
@@ -174,6 +218,16 @@ class ScheduleOccurrence(BaseSQLModel, table=True):
         description="UTC datetime the occurrence reached its final status",
     )
     error: str | None = Field(default=None, description="Error from the last failed attempt")
+    version_id: UUID | None = Field(
+        default=None,
+        sa_column=sa.Column(
+            sa.Uuid(),
+            sa.ForeignKey("schedule_versions.id"),
+            nullable=True,
+            index=True,
+        ),
+        description="The settings every attempt at this occurrence runs; NULL only on occurrences from before versions",
+    )
 
 
 class ScheduleRun(BaseSQLModel, table=True):
@@ -236,3 +290,23 @@ class ScheduleRun(BaseSQLModel, table=True):
         default=None,
         description="How the attempt ended, by what is known of its execution (AttemptOutcome)",
     )
+
+
+class ScheduleEvent(BaseSQLModel, table=True):
+    """A change in a schedule's life: created, edited, paused, resumed, or
+    auto-paused. Runs are recorded separately, as occurrences and attempts."""
+
+    __tablename__ = "schedule_events"
+
+    schedule_id: UUID = Field(
+        sa_column=sa.Column(
+            sa.Uuid(),
+            sa.ForeignKey("schedules.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+        description="Parent schedule",
+    )
+    kind: str = Field(description="created | edited | paused | resumed | auto_paused")
+    actor: str | None = Field(default=None, max_length=64, description="User who caused it; NULL for the scheduler")
+    detail: dict | None = Field(default=None, sa_column=sa.Column(sa.JSON(), nullable=True), description="What changed")

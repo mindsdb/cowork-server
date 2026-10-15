@@ -162,6 +162,8 @@ class ScheduleResponse(CamelResponse):
     # stretch of slots it passed over without running.
     state: ScheduleState = ScheduleState.active
     last_skipped: SkippedPeriodResponse | None = None
+    # The number of the version the next occurrence will run.
+    version: int | None = None
     # Not a Schedule column — endpoints fill it from ScheduleRunService so the
     # UI can show an in-flight run (manual or cron).
     running: bool = False
@@ -183,7 +185,21 @@ class ScheduleRunResponse(CamelResponse):
     is_manual: bool
     occurrence_id: UUID | None = None
     attempt: int | None = None
+    # Read through the occurrence (ScheduleRunService.run_context): what fired
+    # it, the slot it ran for, and the version it ran.
+    trigger: str | None = None
+    scheduled_for: datetime | None = None
+    version: int | None = None
     outcome: AttemptOutcome | None = None
     execution_started_at: datetime | None = None
     stop_requested_at: datetime | None = None
+    created_at: datetime | None
+
+
+class ScheduleEventResponse(CamelResponse):
+    id: UUID
+    schedule_id: UUID
+    kind: str
+    actor: str | None
+    detail: dict | None
     created_at: datetime | None
