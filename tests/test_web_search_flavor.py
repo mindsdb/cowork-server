@@ -4,10 +4,11 @@ The flavor an ``OpenAIProvider`` is constructed with decides whether anton
 passes web_search / web_fetch as a native provider capability or registers its
 own handler-dispatched fallback (which needs an Exa/Brave key Cowork never asks
 for). It is not a web-tools-only knob: ``FLAVOR_OPENAI`` also switches the
-transport to the Responses API, so only MindsHub — whose passthrough serves
-native web tools over chat.completions — opts in here by default. An
-openai_compatible deployment that sets COWORK_OPENAI_COMPATIBLE_API=responses
-moves its planning and coding roles onto ``FLAVOR_OPENAI``.
+transport to the Responses API. MindsHub's passthrough serves native web tools
+over chat.completions; direct OpenAI gets them on the Responses API once the
+installed anton's Responses transport is ready. An openai_compatible deployment
+that sets COWORK_OPENAI_COMPATIBLE_API=responses moves its planning and coding
+roles onto ``FLAVOR_OPENAI``.
 """
 
 from pydantic import SecretStr
@@ -55,11 +56,9 @@ class TestWebSearchFlavorRouting:
 
         assert client.planning_provider.native_web_tools() == WEB_TOOLS
 
-    def test_byok_openai_stays_on_chat_completions(self, monkeypatch):
-        # Direct OpenAI keeps the generic flavor: the flavor that would enable
-        # its native web tools also moves the transport to the Responses API,
-        # which loses truncation reporting, tool_result images and trace
-        # headers. Native search here waits on those gaps closing in anton.
+    def test_byok_openai_routes_web_tools_natively_on_responses(self, monkeypatch):
+        # Direct OpenAI runs on the Responses API (FLAVOR_OPENAI), which
+        # carries OpenAI's native web search.
         settings = UserSettings(
             planning_provider=Provider.OPENAI,
             coding_provider=Provider.OPENAI,
@@ -69,7 +68,14 @@ class TestWebSearchFlavorRouting:
 
         client = providers.build_llm_client()
 
-        assert client.planning_provider.native_web_tools() == set()
+        # An anton without the Responses marker keeps chat.completions, where
+        # direct OpenAI has no native web tools.
+        from anton.core.llm.openai import OpenAIProvider
+
+        ready = getattr(OpenAIProvider, "RESPONSES_TRANSPORT_READY", False) is True
+        expected = WEB_TOOLS if ready else set()
+        assert client.planning_provider.native_web_tools() == expected
+        assert client.coding_provider.native_web_tools() == expected
 
     def test_openai_compatible_third_party_is_generic(self, monkeypatch):
         # A third-party openai-compatible endpoint has no native web search and

@@ -325,20 +325,24 @@ class DatabaseSettings(Settings):
         description="The database connection URI",
     )  # DATABASE_URI
 
-    # Connection pool configurations
+    # Connection pool configurations. These read their bare names: a
+    # DATABASE_ prefix is not honored for them. SQLite engines are built
+    # without them and keep SQLAlchemy's own pool (5 plus 10, a 30 s wait),
+    # but POOL_TIMEOUT still bounds every database unit (cowork.db.units).
     max_overflow: int = Field(
         default=20, description="The maximum overflow size of the database connection pool"
-    )  # DATABASE_MAX_OVERFLOW
-    pool_pre_ping: bool = Field(default=True, description="Whether to enable pool pre-ping")  # DATABASE_POOL_PRE_PING
-    pool_recycle: int = Field(default=300, description="The pool recycle time in seconds")  # DATABASE_POOL_RECYCLE
-    pool_size: int = Field(default=20, description="The size of the database connection pool")  # DATABASE_POOL_SIZE
-    pool_timeout: int = Field(default=300, description="The pool timeout in seconds")  # DATABASE_POOL_TIMEOUT
-
-    # Query timeout configurations
-    query_timeout: int = Field(default=300, description="The query timeout in seconds")  # DATABASE_QUERY_TIMEOUT
-    statement_timeout: int = Field(
-        default=300000, description="The statement timeout in milliseconds"
-    )  # DATABASE_STATEMENT_TIMEOUT
+    )  # MAX_OVERFLOW
+    pool_pre_ping: bool = Field(default=True, description="Whether to enable pool pre-ping")  # POOL_PRE_PING
+    pool_recycle: int = Field(default=300, description="The pool recycle time in seconds")  # POOL_RECYCLE
+    pool_size: int = Field(default=20, description="The size of the database connection pool")  # POOL_SIZE
+    pool_timeout: int = Field(
+        default=5,
+        ge=1,
+        description=(
+            "Seconds a request waits for a pooled connection before it is refused "
+            "with 503. Short, so a full pool answers within seconds."
+        ),
+    )  # POOL_TIMEOUT
 
 
 class ProjectSettings(Settings):
@@ -602,6 +606,22 @@ class TurnQueueSettings(Settings):
             "alias the env serves. Empty = the minds-cloud coding default (CODING_MODEL_DEFAULTS)."
         ),
     )  # COWORK_TURN_MINDS_CODING_MODEL
+    datasource_enabled: bool = Field(
+        default=False,
+        description=(
+            "Enable version-bound datasource grants for cloud turns. Keep false "
+            "until the controller and pod support the datasource block."
+        ),
+    )  # COWORK_TURN_DATASOURCE_ENABLED
+    datasource_producer_key_id: str = Field(
+        default="",
+        description="Key id for the dedicated datasource producer service role.",
+    )  # COWORK_TURN_DATASOURCE_PRODUCER_KEY_ID
+    datasource_producer_key: str = Field(
+        default="",
+        repr=False,
+        description="Secret for the dedicated datasource producer service role.",
+    )  # COWORK_TURN_DATASOURCE_PRODUCER_KEY
 
 
 # The OpenAI API an openai_compatible provider's planning and coding roles call.
@@ -914,7 +934,7 @@ class AppSettings(Settings):
         description="Default for the per-user 'Max Tokens per Task' agent budget.",
     )  # COWORK_DEFAULT_MAX_TURN_TOKENS
 
-    database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_*
+    database: DatabaseSettings = Field(default_factory=DatabaseSettings)  # DATABASE_URI; the other fields read their bare names
     project: ProjectSettings = Field(default_factory=ProjectSettings)  # PROJECT_*
     file: FileSettings = Field(default_factory=FileSettings)  # FILE_*
     storage: StorageSettings = Field(default_factory=StorageSettings)  # STORAGE_*

@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
+from fastapi import HTTPException
 from pydantic import SecretStr
 
 from cowork.common.paths import cowork_home, pod_local_only
@@ -27,7 +28,11 @@ from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings  # noqa: F401
 
 from cowork.services.connectors.persist import vault_for_scope
-from cowork.services.providers import is_mindshub_publish_url, publish_url_for_endpoint
+from cowork.services.providers import (
+    is_mindshub_publish_url,
+    normalize_publish_url,
+    publish_url_for_endpoint,
+)
 from cowork.common.settings.user_settings import Provider, get_user_settings, provider_api_key
 from anton.minds_client import describe_minds_connection_error
 from anton.publisher import PUBLISH_JOB_BUDGET_S, PublishJobFailed
@@ -60,6 +65,26 @@ class PublisherUnavailable(RuntimeError):
     this replaced, which broke once upstream error text could itself contain
     that word (e.g. an HTTP 503 reason phrase or a timeout advice string).
     """
+
+
+# The upload service's 409 for a report that belongs to another account; the
+# renderer matches on the code.
+OWNED_BY_OTHER_USER_CODE = "artifact_owned_by_other_user"
+OWNED_BY_OTHER_USER_MESSAGE = "This artifact was published by another owner."
+
+
+class PublishOwnedByOtherUser(HTTPException):
+    """The upload service refused the publish: another account owns this report.
+
+    An HTTPException, like ProductPermissionDenied, so any route that lets it
+    through answers 409 with the code. Nobody retries it with a fresh
+    report_id, which would publish a copy under a new URL.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            409, detail={"code": OWNED_BY_OTHER_USER_CODE, "message": OWNED_BY_OTHER_USER_MESSAGE},
+        )
 
 
 def raise_publish_permission_error(exc: Exception) -> None:
@@ -255,6 +280,9 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
          SettingService, which passes DB rows as init kwargs);
       2. the ``publish_url`` setting;
       3. the host derived from the active provider endpoint.
+
+    A result on the retired 4nton.ai host becomes the prod publish host
+    (`normalize_publish_url`): a saved setting may still name it.
     """
     oai_host = (urlparse(settings.openai_base_url or "").hostname or "").lower()
     if oai_host.startswith("api") and oai_host.endswith(".mindshub.ai"):
@@ -263,7 +291,9 @@ def _resolve_publish_endpoint(settings) -> tuple[str, str]:
     else:
         endpoint, api_key = settings.minds_url, _secret_str(settings.minds_api_key)
     env_publish_url = os.environ.get("ANTON_PUBLISH_URL", "").strip()
-    publish_url = env_publish_url or settings.publish_url or publish_url_for_endpoint(endpoint)
+    publish_url = normalize_publish_url(
+        env_publish_url or settings.publish_url or publish_url_for_endpoint(endpoint)
+    )
     return publish_url, api_key
 
 
@@ -450,7 +480,7 @@ def publish_artifact(
         raise ValueError(FULLSTACK_PUBLISH_UNSUPPORTED)
 
     try:
-        from anton.publisher import publish
+        from anton.publisher import ArtifactOwnedByOtherUserError, publish
     except Exception as exc:
         raise PublisherUnavailable("Anton publisher is unavailable") from exc
 
@@ -514,9 +544,16 @@ def publish_artifact(
             # Org-keyed: the persisted vault is per organization, and an
             # unscoped lookup would resolve to the shared namespace root.
             vault=vault_for_scope(scope),
+            # While the password is unchanged anton re-sends the hash stored
+            # here, so a content-only re-publish keeps viewers' password grants.
+            previous_access=previous if isinstance(previous, dict) else None,
             job_budget_s=job_budget_s,
             on_job_accepted=on_job_accepted,
         )
+    except ArtifactOwnedByOtherUserError as exc:
+        # Not a failure to log or wrap: the upload service holds this
+        # report_id for another account.
+        raise PublishOwnedByOtherUser() from exc
     except Exception as exc:
         raise_publish_permission_error(exc)
         logger.exception("Publishing failed")
@@ -535,6 +572,9 @@ def publish_artifact(
         if md_tmp_dir is not None:
             md_tmp_dir.cleanup()
 
+    # Owner-side state for the next publish, stored in the entry below and
+    # never part of the response.
+    password_hash = result.pop("password_hash", None)
     view_url = result.get("view_url", "")
     returned_report_id = result.get("report_id", "")
     if returned_report_id:
@@ -548,7 +588,9 @@ def publish_artifact(
         # Owner-side only — .published.json never enters the bundle. `owner_side`
         # carries `mode` (+ `access_password`/`pwd_version` for password, or
         # `emails`/`org_allowed`/`access_version` for restricted), and always
-        # `requires_password` for back-compat with older readers.
+        # `requires_password` for back-compat with older readers. Password mode
+        # also keeps the `password_hash` anton sent, handed back as
+        # `previous_access` on the next publish.
         entry: dict[str, Any] = {
             "report_id": returned_report_id,
             "url": view_url,
@@ -568,6 +610,8 @@ def publish_artifact(
             "published": True,
             **owner_side,
         }
+        if password_hash:
+            entry["password_hash"] = password_hash
         published_map[published_key] = entry
         _write_published_map(published_json, published_map)
         state = _load_state()

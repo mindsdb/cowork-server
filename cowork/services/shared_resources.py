@@ -167,6 +167,7 @@ def _database_lock_engine(bind: Any) -> Any:
                 poolclass=NullPool,
                 pool_pre_ping=settings.database.pool_pre_ping,
                 isolation_level="AUTOCOMMIT",
+                hide_parameters=True,
                 connect_args={
                     "connect_timeout": max(
                         1,

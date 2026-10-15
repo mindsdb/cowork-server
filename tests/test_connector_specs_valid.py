@@ -13,11 +13,13 @@ validates clean. Hence the explicit unknown-key check below.
 """
 
 import json
+import re
 from pathlib import Path
 
 import pytest
 
 from cowork.schemas.connectors import (
+    CloudMethod,
     ConnectorField,
     ConnectorForm,
     ConnectorMethod,
@@ -27,6 +29,10 @@ from cowork.services.connectors.specs._registry import ConnectorSpecRegistry
 
 SPECS_DIR = Path(__file__).parent.parent / "cowork" / "services" / "connectors" / "specs"
 SPEC_FILES = sorted(SPECS_DIR.glob("*.json"))
+
+# About 400 tokens. usage_notes are not truncated at runtime, so this is the
+# only guard on their size.
+USAGE_NOTES_MAX_CHARS = 1600
 
 # Keys present in shipped specs that no model declares, so validation drops
 # them. Allowed here so this suite goes green on the existing corpus rather
@@ -49,6 +55,7 @@ LEGACY_EXTRA_KEYS = {
     "method": {"name_from"},
     "field": set(),
     "spec": set(),
+    "cloud": set(),
 }
 
 KNOWN_KEYS = {
@@ -56,6 +63,7 @@ KNOWN_KEYS = {
     "form": set(ConnectorForm.model_fields) | LEGACY_EXTRA_KEYS["form"],
     "method": set(ConnectorMethod.model_fields) | LEGACY_EXTRA_KEYS["method"],
     "field": set(ConnectorField.model_fields) | LEGACY_EXTRA_KEYS["field"],
+    "cloud": set(CloudMethod.model_fields) | LEGACY_EXTRA_KEYS["cloud"],
 }
 
 
@@ -130,6 +138,10 @@ def test_spec_has_no_unknown_keys(path: Path):
         check("method", method, f"{path.stem}.form.methods[{i}]")
         for j, field in enumerate(method.get("fields") or []):
             check("field", field, f"{path.stem}.form.methods[{i}].fields[{j}]")
+        cloud = method.get("cloud") or {}
+        check("cloud", cloud, f"{path.stem}.form.methods[{i}].cloud")
+        for j, field in enumerate(cloud.get("fields") or []):
+            check("field", field, f"{path.stem}.form.methods[{i}].cloud.fields[{j}]")
     for j, field in enumerate(form.get("fields") or []):
         check("field", field, f"{path.stem}.form.fields[{j}]")
 
@@ -223,3 +235,257 @@ class TestLangfuseSpec:
     def _field(spec, name):
         method = next(m for m in spec.form.methods if m.id == "api-key")
         return next(f for f in method.fields if f.name == name)
+
+
+# usage_notes are inserted under a `###` heading in the agent's prompt, so a
+# `#`/`##`/`###` line of their own would break its structure. Code is exempt: a
+# `# comment` in a fence or an indented block is a code comment, not a heading.
+# Known limitation: code nested inside list items is not modelled; every line
+# indented by 4+ spaces or a tab counts as code.
+_HEADING = re.compile(r" {0,3}#{1,3}(\s|$)")
+_FENCE_OPEN = re.compile(r" {0,3}(`{3,}|~{3,})")
+_INDENTED_CODE = re.compile(r" {4}|\t")
+
+
+def _headings_outside_fences(text: str) -> list[str]:
+    found: list[str] = []
+    fence = ""
+    for line in text.splitlines():
+        if fence:
+            closing = re.fullmatch(r" {0,3}(" + fence[0] + r"{%d,})\s*" % len(fence), line)
+            if closing:
+                fence = ""
+            continue
+        opening = _FENCE_OPEN.match(line)
+        if opening:
+            fence = opening.group(1)
+        elif not _INDENTED_CODE.match(line) and _HEADING.match(line):
+            found.append(line)
+    return found
+
+
+def test_heading_check_ignores_comments_inside_code_fences():
+    assert _headings_outside_fences("Use it.\n```python\n# step 1\nx = 1\n```\n") == []
+    assert _headings_outside_fences("## Quirks\nUse it.") == ["## Quirks"]
+    assert _headings_outside_fences("#### deep\n#hashtag") == []
+
+
+def test_heading_check_ignores_comments_inside_indented_code():
+    assert _headings_outside_fences("Run:\n\n    # step 1\n    x = 1\n") == []
+    assert _headings_outside_fences("Run:\n\n\t# step 1\n") == []
+    # Up to three leading spaces still make a heading.
+    assert _headings_outside_fences("   ## Quirks") == ["   ## Quirks"]
+
+
+def test_heading_check_follows_fence_rules():
+    assert _headings_outside_fences("~~~\n# step 1\n~~~\n") == []
+    # A fence closes only on its own character, with at least its own length.
+    assert _headings_outside_fences("~~~\n```\n# x\n~~~\n") == []
+    assert _headings_outside_fences("```\n~~~\n# x\n```\n") == []
+    assert _headings_outside_fences("````\n```\n# x\n````\n") == []
+    assert _headings_outside_fences("````\n```\n````\n# x\n") == ["# x"]
+    # Four leading spaces make it indented code, not a fence opener.
+    assert _headings_outside_fences("    ```\n# x\n") == ["# x"]
+    # Text after a closing fence's run makes it a content line, not a closer.
+    assert _headings_outside_fences("```\n``` not a close\n# x\n```\n") == []
+
+
+@pytest.mark.parametrize("path", SPEC_FILES, ids=lambda p: p.stem)
+def test_usage_notes_have_no_top_level_headings(path: Path):
+    notes = json.loads(path.read_text(encoding="utf-8")).get("usage_notes")
+    # The type itself is checked by test_spec_is_valid_json_and_matches_the_schema.
+    if not isinstance(notes, str):
+        return
+    assert not _headings_outside_fences(notes), (
+        f"{path.name}: usage_notes must not contain #, ## or ### headings outside "
+        "code fences — they are rendered under a ### heading in the agent's prompt"
+    )
+
+
+@pytest.mark.parametrize("path", SPEC_FILES, ids=lambda p: p.stem)
+def test_usage_notes_fit_the_length_limit(path: Path):
+    notes = json.loads(path.read_text(encoding="utf-8")).get("usage_notes")
+    if not isinstance(notes, str):
+        return
+    assert len(notes) <= USAGE_NOTES_MAX_CHARS, (
+        f"{path.name}: usage_notes is {len(notes)} chars, over the {USAGE_NOTES_MAX_CHARS} limit. "
+        "They are sent in the system prompt on every LLM call for each connected engine; "
+        "keep only what the agent cannot guess."
+    )
+
+
+# The two connectors enabled for cloud execution. Every other method
+# in the corpus carries no `cloud` block and is therefore desktop-only.
+CLOUD_DATABASE_METHODS = {"postgres": "host-port", "mysql": "host-password"}
+
+# The desktop fields as (name, type, required, secret, default), pinned from
+# the specs before the cloud blocks existed. The cloud block is a second,
+# independent list: if a cloud edit ever reaches the desktop list, this says so.
+DESKTOP_FIELDS = {
+    "postgres": {
+        "connection-string": [("connection_uri", "password", True, True, None)],
+        "host-port": [
+            ("host", "text", True, False, None),
+            ("port", "text", True, False, "5432"),
+            ("database", "text", True, False, None),
+            ("username", "text", True, False, None),
+            ("password", "password", True, True, None),
+            ("ssl_enabled", "boolean", False, False, "true"),
+        ],
+    },
+    "mysql": {
+        "host-password": [
+            ("host", "text", True, False, None),
+            ("port", "text", True, False, "3306"),
+            ("database", "text", True, False, None),
+            ("username", "text", True, False, None),
+            ("password", "password", True, True, None),
+            ("use_ssl", "boolean", False, False, "false"),
+            ("ssl_ca_cert", "textarea", False, False, None),
+        ],
+        "connection-string": [
+            ("connection_string", "textarea", True, True, None),
+            ("ssl_ca_cert", "textarea", False, False, None),
+        ],
+    },
+}
+
+@pytest.mark.parametrize("path", SPEC_FILES, ids=lambda p: p.stem)
+def test_no_other_method_declares_cloud_support(path: Path):
+    """Only the methods in CLOUD_DATABASE_METHODS carry a `cloud` block."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.setdefault("id", path.stem)
+    spec = ConnectorSpecResponse(**data)
+    for method in spec.form.methods or []:
+        if CLOUD_DATABASE_METHODS.get(spec.id) != method.id:
+            assert method.cloud is None, f"{spec.id}.{method.id} declares cloud support"
+
+
+#: What each cloud form collects. PostgreSQL alone names a schema.
+CLOUD_DATABASE_FIELDS = {
+    "postgres": {"host", "port", "database", "schema", "username", "password", "tls_verify"},
+    "mysql": {"host", "port", "database", "username", "password", "tls_verify"},
+}
+
+# Guidance each connector's desktop copy gives for choices the hosted path
+# does not offer. None of it may appear in the cloud copy.
+DESKTOP_ONLY_PHRASES = {
+    "postgres": ["sslmode=disable", "leave SSL off", "127.0.0.1", "localhost"],
+    "mysql": ["127.0.0.1", "Use SSL", "SSL CA Certificate"],
+}
+
+
+class TestCloudDatabaseSpecs:
+    """The cloud blocks on postgres and mysql.
+
+    The desktop forms offer choices the hosted path does not: an SSL on/off
+    toggle, a CA field, a localhost server. An edit that collapses the two forms back
+    together is the failure this class exists to catch.
+    """
+
+    @pytest.fixture(
+        params=sorted(CLOUD_DATABASE_METHODS), ids=sorted(CLOUD_DATABASE_METHODS)
+    )
+    def connector_id(self, request):
+        return request.param
+
+    @pytest.fixture
+    def spec(self, connector_id):
+        s = ConnectorSpecRegistry(SPECS_DIR).get_connector(connector_id)
+        assert s is not None, f"{connector_id} spec did not load"
+        return s
+
+    def test_only_the_password_method_declares_cloud_support(self, spec, connector_id):
+        declared = [m.id for m in spec.form.methods if m.cloud is not None]
+        assert declared == [CLOUD_DATABASE_METHODS[connector_id]]
+
+    def test_the_connection_string_method_stays_desktop_only(self, spec):
+        """A raw DSN is never persisted on the hosted path, so the method that
+        collects one has no cloud form to submit."""
+        method = next(m for m in spec.form.methods if m.id == "connection-string")
+        assert method.cloud is None
+
+    def test_cloud_is_not_advertised_before_the_adapters_are_proven(
+        self, spec, connector_id
+    ):
+        assert self._cloud(spec, connector_id).available is False
+
+    def test_the_form_asks_one_yes_or_no_about_certificates(self, spec, connector_id):
+        """The cloud form collects a connection and one question about trust:
+        verify the certificate, or take the server's default, which encrypts
+        where it is offered and checks nothing. The modes that need a pasted
+        certificate or turn encryption off have no answer most people can give,
+        so the form does not ask them."""
+        fields = {f.name: f for f in self._cloud(spec, connector_id).fields}
+        assert set(fields) == CLOUD_DATABASE_FIELDS[connector_id]
+        assert fields["tls_verify"].type == "boolean"
+        assert fields["tls_verify"].required is False
+        assert fields["tls_verify"].checkbox_label, "the checkbox needs its sentence"
+        # Unchecked unless the person checks it: a default would decide for
+        # them, and `"false"` reads as true to a checkbox.
+        assert fields["tls_verify"].default is None
+
+    def test_only_postgresql_asks_for_a_schema(self, spec, connector_id):
+        """A PostgreSQL database holds many schemas, so a connection may name
+        the one it reads. MySQL's database is already its schema, and asking
+        twice would leave a reader unable to say which won."""
+        field = next(
+            (f for f in self._cloud(spec, connector_id).fields if f.name == "schema"), None
+        )
+        if connector_id != "postgres":
+            assert field is None
+            return
+        assert field is not None and field.required is False
+
+    def test_cloud_copy_never_inherits_desktop_only_guidance(self, spec, connector_id):
+        """Each phrase must still be in the desktop copy, so the guard cannot
+        pass because the desktop text changed rather than the cloud text."""
+        desktop = " ".join(
+            f"{m.description or ''} {m.how_to or ''}" for m in spec.form.methods
+        ).lower()
+        cloud = self._cloud(spec, connector_id)
+        copy = " ".join(
+            [cloud.description or "", cloud.how_to or ""]
+            + [f.description or "" for f in cloud.fields]
+        ).lower()
+        for phrase in DESKTOP_ONLY_PHRASES[connector_id]:
+            assert phrase.lower() in desktop, f"{phrase!r} left the desktop copy"
+            assert phrase.lower() not in copy, f"cloud copy inherited {phrase!r}"
+
+    def test_desktop_fields_are_untouched(self, spec, connector_id):
+        for method in spec.form.methods:
+            expected = DESKTOP_FIELDS[connector_id][method.id]
+            assert [
+                (f.name, f.type, f.required, f.secret, f.default) for f in method.fields
+            ] == expected
+
+    @staticmethod
+    def _cloud(spec, connector_id):
+        wanted = CLOUD_DATABASE_METHODS[connector_id]
+        method = next(m for m in spec.form.methods if m.id == wanted)
+        assert method.cloud is not None
+        return method.cloud
+
+
+class TestMySQLCloudProducts:
+    """MySQL compatibility is claimed by product, not by the connector's name."""
+
+    @pytest.fixture
+    def method(self):
+        spec = ConnectorSpecRegistry(SPECS_DIR).get_connector("mysql")
+        assert spec is not None, "mysql spec did not load"
+        return next(m for m in spec.form.methods if m.id == "host-password")
+
+    def test_cloud_copy_names_the_products_it_accepts(self, method):
+        """The spec's own aliases and description cover MariaDB and Percona for
+        desktop discovery, so the cloud block has to say they are refused."""
+        copy = f"{method.cloud.description} {method.cloud.how_to}"
+        assert "Oracle MySQL 8 or 9" in copy
+        assert "MariaDB" in copy
+        assert "Percona" in copy
+        assert "refused" in copy
+
+    def test_desktop_copy_makes_no_claim_about_the_hosted_path(self, method):
+        """It previously promised the password is never transmitted to Anton's
+        servers, which the cloud relay makes false."""
+        assert "never transmits it to Anton's servers" not in (method.how_to or "")
