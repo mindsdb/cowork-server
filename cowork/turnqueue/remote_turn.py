@@ -37,7 +37,7 @@ async def remote_turn_events(
     Mutates turn_rows in place; raises RemoteTurnFailed on a worker failure."""
     from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
     from cowork.handlers._turn_history import sanitize_turn_history_rows
-    from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated
+    from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnContext, TurnHistory
     from cowork.services.task_objects import (
         index_turn_artifacts,
         publish_and_card_turn_artifacts,
@@ -49,6 +49,7 @@ async def remote_turn_events(
     # a web turn; the seed history below is scrubbed against them.
     await register_vault_secrets(session.scope)
     seeded_history, seed_info = ResponsesHandler._remote_seed_history(session, conv_id)
+    yield TurnContext(question=input_text, files=ResponsesHandler._remote_agent_files(session, conv_id), history=seeded_history)
     artifacts = ResponsesHandler._remote_artifacts_context(session, conv_id)
     before_slugs, before_mtimes = (
         snapshot_artifact_state(artifacts[1]) if artifacts else (set(), {})
@@ -84,7 +85,11 @@ async def remote_turn_events(
             elif kind == "turn_memory":
                 ResponsesHandler._persist_turn_memory(session, conv_id, data.get("entries") or [])
             elif kind == "turn_history":
-                turn_rows[:] = sanitize_turn_history_rows(data.get("rows"))
+                pod_rows = data.get("rows")
+                turn_rows[:] = sanitize_turn_history_rows(pod_rows)
+                # The formatter finds the answer's figures in every tool's
+                # results, read before the replay caps trimmed them.
+                yield TurnHistory(list(turn_rows), read=pod_rows if isinstance(pod_rows, list) else None)
             elif kind == "turn_compaction":
                 ResponsesHandler._persist_remote_compaction(
                     session, conv_id=conv_id, data=data, seed_info=seed_info,
