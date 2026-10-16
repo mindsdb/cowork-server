@@ -83,7 +83,11 @@ def run_dev_setup() -> None:
             session.commit()
 
     # Migrate .env settings to DB (one-time, idempotent).
-    from cowork.migrations import backfill_minds_url, normalize_retired_harness_rows
+    from cowork.migrations import (
+        backfill_minds_url,
+        enable_limits_for_saved_budgets,
+        normalize_retired_harness_rows,
+    )
 
     with SQLSession(engine) as session:
         _migrate_env_to_db_if_local(session)
@@ -95,6 +99,9 @@ def run_dev_setup() -> None:
         # Repair settings rows naming a harness we no longer ship, so the
         # read-side tolerance in UserSettings is a fallback, not the norm.
         normalize_retired_harness_rows(session)
+        # A budget saved before the limits switch existed keeps applying:
+        # turn the switch on at that row's scope. Every boot, all tenancies.
+        enable_limits_for_saved_budgets(session)
 
     # Migrate harness-local memory into ~/.cowork/memory, then create the
     # canonical slot files. Desktop-only: both write the unkeyed root; org-mode

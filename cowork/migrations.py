@@ -25,8 +25,9 @@ import datetime as dt
 import logging
 from pathlib import Path
 
-from cowork.common.settings.app_settings import default_minds_api_host
+from cowork.common.settings.app_settings import default_minds_api_host, get_app_settings
 
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 from pydantic import ValidationError
 
@@ -34,6 +35,7 @@ from anton.core.tools.skill_format import normalize_name, DESC_MAX
 from cowork.common.paths import cowork_home
 from cowork.common.settings import invalidate_user_settings_cache
 from cowork.common.settings.user_settings import (
+    BUDGET_SETTING_KEYS,
     ENV_ALIAS_TO_SETTING,
     UserSettings,
     normalize_provider_value,
@@ -196,6 +198,49 @@ def normalize_retired_harness_rows(session: Session) -> bool:
         session.commit()
         invalidate_user_settings_cache()
     return bool(changed)
+
+
+def enable_limits_for_saved_budgets(session: Session) -> bool:
+    """Turn ``limits_enabled`` on wherever a budget was saved without it.
+
+    Only a user's Save in Settings (or a direct settings API call) stores a
+    budget row, so one means the user chose a limit. For each scope (global,
+    org, or user row) that holds a budget row and no ``limits_enabled`` row,
+    this writes ``limits_enabled=True`` at that scope, as a Save would. A scope
+    that already has the switch, on or off, is left alone, so turning it off
+    sticks. Idempotent and sentinel-free: it also catches a budget saved later
+    by a renderer that predates the switch. Returns True if any row was written.
+
+    In org tenancy, global (unscoped) rows are skipped: they predate the
+    per-org scopes, so they are no org's choice, and a global switch would
+    reach every org without its own. A local install's rows are global, and
+    are its own choice.
+    """
+    rows = session.exec(
+        select(Setting).where(Setting.key.in_((*BUDGET_SETTING_KEYS, "limits_enabled")))
+    ).all()
+    if get_app_settings().tenancy_mode == "org":
+        rows = [r for r in rows if r.scope is not None]
+    has_switch = {(r.scope, r.org_id, r.user_id) for r in rows if r.key == "limits_enabled"}
+    pending = {
+        (r.scope, r.org_id, r.user_id)
+        for r in rows
+        if r.key != "limits_enabled"
+    } - has_switch
+    written = 0
+    for scope, org_id, user_id in sorted(pending, key=lambda k: tuple(v or "" for v in k)):
+        # Each insert on its own: replicas booting together race on the same
+        # scope, and the unique index turns the loser's insert into a no-op.
+        try:
+            session.add(Setting(key="limits_enabled", value="True", scope=scope, org_id=org_id, user_id=user_id))
+            session.commit()
+            written += 1
+        except IntegrityError:
+            session.rollback()
+    if written:
+        invalidate_user_settings_cache()
+        logger.info("settings: turned limits_enabled on for %d scope(s) with a saved budget", written)
+    return bool(written)
 
 
 def backfill_minds_url(session: Session) -> bool:

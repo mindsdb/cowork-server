@@ -17,7 +17,7 @@ from cowork.common.history_scrub import scrub_credentials, scrubbed_openai_dump
 from cowork.common.logger import get_logger, log_context
 from cowork.common.paths import cowork_home, pod_local_only
 from cowork.common.settings.app_settings import get_app_settings
-from cowork.common.settings.user_settings import current_settings_scope
+from cowork.common.settings.user_settings import current_settings_scope, effective_turn_limits
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.units import run_db, run_to_completion, unit_session
 from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, prompt_text, register
@@ -111,6 +111,9 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
 
     Returns the attrs actually applied, so a caller or test can assert on it.
 
+    The three budgets come from ``effective_turn_limits``, so the
+    ``limits_enabled`` switch decides them.
+
     **The skew guard is the load-bearing part.** anton is pinned as a git dep on
     ``branch = "main"`` (see ``[tool.uv.sources]``), so cowork-server can ship a
     setting whose field has only reached anton's ``staging`` — it arrives on
@@ -121,8 +124,9 @@ def _overlay_user_settings(anton_settings, user) -> list[str]:
     missing setting.
     """
     applied: list[str] = []
+    limits = effective_turn_limits(user)._asdict()
     for attr in _OVERLAID_SETTINGS:
-        db_val = getattr(user, attr, None)
+        db_val = limits[attr] if attr in limits else getattr(user, attr, None)
         if db_val is None:
             continue
         if not hasattr(anton_settings, attr):
