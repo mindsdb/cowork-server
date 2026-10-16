@@ -7,6 +7,8 @@ from uuid import uuid4
 import pytest
 
 import cowork.turnqueue.remote_turn as remote_turn_mod
+from cowork.harnesses.anton_harness.agent_files import AgentFiles
+from cowork.harnesses.anton_harness.stream_formatter import TurnContext, TurnHistory
 from cowork.turnqueue.remote_turn import RemoteTurnFailed, remote_turn_events
 
 
@@ -20,7 +22,8 @@ class _FakeSession:
 
 
 def _fake_handler(
-    monkeypatch, *, persist_turn_memory=None, remote_artifacts_context=None, remote_seed_history=None
+    monkeypatch, *, persist_turn_memory=None, remote_artifacts_context=None, remote_seed_history=None,
+    remote_agent_files=None,
 ):
     """Replace ResponsesHandler with a stand-in exposing only the methods
     remote_turn_events calls, resolved at call time like every other name here."""
@@ -30,6 +33,7 @@ def _fake_handler(
             "_remote_seed_history": staticmethod(remote_seed_history or (lambda s, c: ([], None))),
             "_persist_remote_compaction": staticmethod(lambda s, *, conv_id, data, seed_info: None),
             "_remote_workspace": staticmethod(lambda s, c: {}),
+            "_remote_agent_files": staticmethod(remote_agent_files or (lambda s, c: None)),
             "_remote_started_at": staticmethod(lambda s, c: None),
             "_persist_turn_memory": staticmethod(persist_turn_memory or (lambda s, c, e: None)),
         },
@@ -37,13 +41,37 @@ def _fake_handler(
 
 
 async def _drain(gen):
+    """The turn's events after the context every turn opens with, which
+    test_the_turn_opens_with_its_context pins."""
     events = []
     try:
         async for event in gen:
-            events.append(event)
+            if not isinstance(event, TurnContext):
+                events.append(event)
     except RemoteTurnFailed as exc:
         return events, exc
     return events, None
+
+
+@pytest.mark.asyncio
+async def test_the_turn_opens_with_its_context(monkeypatch, tmp_path):
+    conv_id = uuid4()
+    files = AgentFiles.in_cloud_pod(tmp_path, conversation_id=conv_id, workspace_rel_path="projects/general")
+    _fake_handler(monkeypatch, remote_agent_files=lambda s, c: files if c == conv_id else None)
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "There are 250."}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    events = [event async for event in remote_turn_events(
+        session=_FakeSession(), conv_id=conv_id, org_id="org-123", user_id=None,
+        input_text="How many at S1?", model="anton", turn_rows=[],
+    )]
+
+    assert events[0] == TurnContext(question="How many at S1?", files=files)
+    assert not any(isinstance(event, TurnContext) for event in events[1:])
 
 
 @pytest.mark.asyncio
@@ -134,6 +162,59 @@ async def test_turn_history_mutates_the_callers_turn_rows_list(monkeypatch):
     ))
 
     assert turn_rows == rows
+
+
+@pytest.mark.asyncio
+async def test_turn_history_reaches_the_formatter_as_the_pod_sent_it(monkeypatch):
+    """The formatter finds the answer's figures in every tool's result, so it
+    reads the rows before the replay caps trim them; the caller saves the
+    trimmed ones."""
+    _fake_handler(monkeypatch)
+    page = "Overtime rate: $42 per hour.\n" + "filler " * 4_000
+    rows = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "w1", "name": "web_fetch", "input": {"url": "https://example.com/rates"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "w1", "content": page}]},
+    ]
+
+    async def fake_replies(**kwargs):
+        yield "turn_history", {"rows": rows}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    turn_rows = []
+    events, _ = await _drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="What does overtime cost?", model="anton", turn_rows=turn_rows,
+    ))
+
+    [history] = [event for event in events if isinstance(event, TurnHistory)]
+    assert history.read == rows
+    assert history.rows == turn_rows
+    assert turn_rows[1]["content"][0]["content"].startswith("[tool output omitted")
+
+
+@pytest.mark.asyncio
+async def test_the_turns_context_carries_the_history_the_pod_is_seeded_with(monkeypatch):
+    seeded = [
+        {"role": "user", "content": "What is at S1?"},
+        {"role": "assistant", "content": "S1 holds 250 units."},
+    ]
+    _fake_handler(monkeypatch, remote_seed_history=lambda s, c: (seeded, None))
+
+    async def fake_replies(**kwargs):
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    events = [event async for event in remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="And at S2?", model="anton", turn_rows=[],
+    )]
+
+    assert isinstance(events[0], TurnContext)
+    assert events[0].history == seeded
 
 
 @pytest.mark.asyncio
