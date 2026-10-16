@@ -30,7 +30,7 @@ from cowork.models.message import Message
 from cowork.models.message_event import MessageEvent
 from cowork.models.project import Project
 from cowork.schemas.conversations import ConversationItemsPage
-from cowork.schemas.figure_sources import EarlierAnswer, FigureSources
+from cowork.schemas.figure_sources import EarlierAnswer
 from cowork.schemas.responses import Role
 from cowork.services.channel_bindings import ChannelBindingService
 from cowork.services.schedules import ScheduleService
@@ -1118,7 +1118,7 @@ class ConversationService:
 
         An answer is a visible assistant message that is not pending; one
         without the event (no figures, or a turn that stopped or failed)
-        still takes one of the places. An event that does not read as one is
+        still takes one of the places. An event whose figures do not read is
         skipped with a warning. Raises ValueError, as get_conversation does,
         for a conversation the caller does not own."""
         # Anchor the parent: Message has no org_id, so tenancy comes from
@@ -1131,15 +1131,17 @@ class ConversationService:
             # matches too, and would read as an event with no figures.
             if not (isinstance(row.event_data, dict) and row.event_data.get("type") == "response.figure_sources"):
                 continue
+            # EarlierAnswer reads only the figures and ignores the steps, so a
+            # step whose kind this build lacks does not skip the answer.
             try:
-                sources = FigureSources.model_validate(row.event_data)
+                answer = EarlierAnswer.model_validate(row.event_data)
             except ValidationError:
                 logger.warning(
                     "Skipped an earlier answer's figure_sources event that does not read as one",
                     extra=log_context(conversation_id=conversation_id),
                 )
                 continue
-            earlier.append(EarlierAnswer(figures=sources.figures))
+            earlier.append(answer)
         return earlier
 
     def _earlier_answer_events(self, conversation_id: UUID, *, answers: int) -> ScopedSelect:

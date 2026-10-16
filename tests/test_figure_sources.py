@@ -488,6 +488,49 @@ class TestReadTextFile:
             ("toolu_req", SourceKind.step, ["GET {url}"]),
         ]
 
+    @pytest.mark.parametrize("read", [
+        "total = sum(pd.read_csv(os.path.join('data', f)).qty.sum() for f in os.listdir('data'))",
+        "total = sum(pd.read_csv(Path('data') / f.name).qty.sum() for f in Path('data').iterdir())",
+        "total = sum(pd.read_csv(os.path.join('data', row['file'])).qty.sum() for row in manifest)",
+        "total = pd.read_csv(f'data\\\\{name}').qty.sum()",
+        "total = pd.read_csv('data/{}'.format(name)).qty.sum()",
+        "total = sum(pd.read_csv(f).qty.sum() for f in glob.glob('data/*'))",
+    ], ids=["joined-name", "path-attribute", "joined-subscript", "backslash", "format-positional", "glob"])
+    def test_a_cell_that_reads_a_memory_file_and_a_file_by_a_run_time_path_stays_a_step(self, read: str):
+        """A file read whose path the cell builds at run time may read the
+        customer's data, as a request whose URL it builds may fetch it. The
+        cell reader names that path data/{f}, which ends in no document's
+        extension, so without this rule the cell reads as one whose only
+        source is the memory file."""
+        code = (
+            "import glob, os, pandas as pd\nfrom pathlib import Path\nnotes = open('.anton/memory/lessons.md').read()\n"
+            f"{read}\nprint(total)"
+        )
+        cell = _cell("toolu_csv", code=code, stdout="4812\n")
+
+        sources = find_figure_sources(answer="Stock totals 4,812 units.", question="", steps=[cell])
+
+        assert _origins(sources) == [("4,812", FigureOrigin.step)]
+        assert [(step.tool_use_id, step.kind) for step in sources.steps] == [("toolu_csv", SourceKind.step)]
+
+    @pytest.mark.parametrize("code", [
+        "notes = open('.anton/memory/lessons.md').read()\nextra = open(f'.anton/memory/{topic}.md').read()\n"
+        "print(notes, extra)",
+        "notes = open('.anton/memory/lessons.md').read()\nwith open(f'out/{name}.txt', 'w') as fh:\n"
+        "    fh.write(notes)\nprint(notes)",
+        "notes = open('.anton/memory/lessons.md').read()\nprint(f'{done}/{total} lessons')\nprint(notes)",
+    ], ids=["a-memory-file-by-a-run-time-path", "a-file-it-writes", "a-printed-caption"])
+    def test_a_run_time_string_that_names_no_file_read_outside_memory_leaves_the_cell_out(self, code: str):
+        """A run-time path inside the memory folder, a file the cell writes
+        and a caption it prints read none of the customer's data, so the
+        cell still prints only what the agent memorized."""
+        cell = _cell("toolu_mem", code=code, stdout="Overtime costs 30 dollars an hour.\n")
+
+        sources = find_figure_sources(answer="Overtime costs $30 an hour.", question="", steps=[cell])
+
+        assert _origins(sources) == [("$30", FigureOrigin.none)]
+        assert sources.steps == []
+
     @pytest.mark.parametrize("cells", [
         [("toolu_load", "notes = open('.anton/memory/lessons.md').read()"), ("toolu_print", "print(notes)")],
         [
@@ -540,8 +583,9 @@ class TestReadTextFile:
         assert [(step.kind, step.label) for step in sources.steps] == [(SourceKind.file, "lessons.md")]
 
 
-# HubSpot's search tool as anton registers it for a connection.
+# HubSpot's search and query tools as anton registers them for a connection.
 SEARCH_CRM_OBJECTS = namespaced_tool_name("hubspot", "search_crm_objects")
+QUERY_CRM_DATA = namespaced_tool_name("hubspot", "query_crm_data")
 DEALS_ANSWER = "Your open deals total $61,150: Acme at $48,250 and Globex at $12,900."
 
 
@@ -602,8 +646,9 @@ class TestConnectorTools:
         assert sources.steps == []
 
     def test_a_write_tools_output_is_not_a_source(self):
-        """A write tool echoes what the model wrote, and the defaults the
-        server filled in are not the customer's records."""
+        """A write tool's name can't tell a view from a write, so none counts.
+        This create echoes what the model wrote, and the defaults the server
+        filled in are not the customer's records."""
         create = _tool(
             "toolu_hs", namespaced_tool_name("hubspot", "manage_crm_objects"),
             {"action": "CREATE", "objectType": "deals", "properties": {"dealname": "Globex", "amount": "75000"}},
@@ -665,6 +710,40 @@ class TestConnectorTools:
             ("$48,250", FigureOrigin.step), ("12%", FigureOrigin.none), ("5", FigureOrigin.none),
         ]
 
+    def test_a_date_time_the_calls_filter_states_echoes_no_figure(self):
+        """Read as numbers, a filter's date-time would make the records'
+        values equal to its hour, minutes or seconds read as echoes of the
+        input: here the minutes of 23:59:59."""
+        search = _tool(
+            "toolu_hs", SEARCH_CRM_OBJECTS,
+            {"objectType": "deals", "filterGroups": [{"filters": [
+                {"propertyName": "closedate", "operator": "LTE", "value": "2026-03-31T23:59:59Z"},
+            ]}]},
+            json.dumps({"total": 59, "results": []}),
+        )
+
+        sources = find_figure_sources(answer="59 deals closed in Q1.", question="", steps=[search])
+
+        assert _origins(sources) == [("59", FigureOrigin.step)]
+
+    @pytest.mark.parametrize(("arguments", "queries"), [
+        (
+            {"sql": "SELECT dealname, amount FROM deals WHERE dealstage = 'contractsent' AND token = 'XyZs3cr3t'"},
+            ["SELECT dealname, amount FROM deals WHERE dealstage = 'contractsent' AND token = '[redacted]'"],
+        ),
+        ({"objectType": "deals"}, []),
+    ], ids=["with-its-statement", "without-one"])
+    def test_a_connector_query_lists_the_statement_it_ran_redacted(self, arguments: dict, queries: list[str]):
+        """HubSpot's query_crm_data takes a SQL-shaped statement as its sql
+        argument, which the step lists as a cell's SQL is listed."""
+        query = _tool("toolu_hs", QUERY_CRM_DATA, arguments, HUBSPOT_DEALS)
+
+        event = _event(query, answer="Acme's deal is $48,250.")
+
+        [step] = FigureSources.model_validate_json(event).steps
+        assert (step.kind, step.label, step.queries) == (SourceKind.query, "hubspot: query_crm_data", queries)
+        assert "XyZs3cr3t" not in event
+
     def test_an_earlier_turns_connector_step_holds_no_figure(self):
         earlier = _earlier(_tool("toolu_old", SEARCH_CRM_OBJECTS, SEARCH_DEALS, HUBSPOT_DEALS))
 
@@ -674,10 +753,10 @@ class TestConnectorTools:
         assert sources.steps == []
 
     def test_an_anton_that_cannot_classify_connector_tools_counts_none(self, tmp_path: Path):
-        """Desktop installs resolve anton from the anton-agent floor, whose
-        anton.core.mcp has no returns_records and no names module. The module
-        still imports there, and only the tools anton runs itself are
-        evidence."""
+        """A PyPI-channel desktop install resolves anton from the anton-agent
+        floor, whose anton.core.mcp has no returns_records and no names
+        module. The module still imports there, and only the tools anton runs
+        itself are evidence."""
         program = textwrap.dedent(f"""
             import sys
             import anton.core.mcp.access
@@ -2021,6 +2100,64 @@ class TestSecretsInQueries:
             f"SELECT qty FROM t WHERE {redacted}",
         ]
 
+    @pytest.mark.parametrize(("text", "masked"), [
+        ("ALTER LOGIN sa WITH PASSWORD = N'correct horse'", "ALTER LOGIN sa WITH PASSWORD = [redacted]'"),
+        ("CREATE LOGIN bob WITH PASSWORD=N'Tr0ub,4dor'", "CREATE LOGIN bob WITH PASSWORD=[redacted]'"),
+        ("CALL connect(password => E'a b')", "CALL connect(password => [redacted]')"),
+        ("SET PASSWORD = _utf8mb4'a b'", "SET PASSWORD = [redacted]'"),
+        # After a quoted key the unquoted-value rule does not read again, so the introducer and both quotes stay.
+        ("{\"password\": N'a b'}", "{\"password\": N'[redacted]'}"),
+        ("CALL connect('secret' => E'a b')", "CALL connect('secret' => E'[redacted]')"),
+    ], ids=[
+        "national-string", "national-string-with-a-comma", "escape-string-after-a-fat-arrow", "charset-introducer",
+        "national-string-after-a-quoted-key", "escape-string-after-a-quoted-key",
+    ])
+    @pytest.mark.parametrize("where", ["label", "query"])
+    def test_a_quoted_value_after_a_string_introducer_is_redacted_whole(self, text: str, masked: str, where: str):
+        """A string's introducer may stand between the = and the value's
+        quote, as SQL Server's scripts write PASSWORD=N'...'. Read as an
+        unquoted value, the password would end at its first space or comma
+        and leave the rest."""
+        sql = f"SELECT qty FROM stock -- {text}"
+        step = _cell(
+            "toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n",
+            description=f"Run {text}" if where == "label" else "Read stock",
+        )
+
+        event = _event(step)
+
+        [step_out] = FigureSources.model_validate_json(event).steps
+        if where == "label":
+            assert step_out.label == f"Run {masked}"
+        else:
+            assert step_out.queries == [f"SELECT qty FROM stock -- {masked}"]
+        for secret in ("horse", "4dor", "a b"):
+            assert secret not in event
+
+    @pytest.mark.parametrize(("sql", "masked"), [
+        (
+            "SELECT * FROM read_source('host=db;pwd=_XyZsecret') WHERE qty > 5 AND region = 'west'",
+            "SELECT * FROM read_source('host=db;pwd=[redacted]') WHERE qty > 5 AND region = 'west'",
+        ),
+        (
+            "SELECT * FROM read_source('host=db password=_XyZTr0ub4dor') WHERE qty > 5",
+            "SELECT * FROM read_source('host=db password=[redacted]') WHERE qty > 5",
+        ),
+    ], ids=["after-a-semicolon", "after-a-space"])
+    def test_an_unquoted_secret_starting_with_an_underscore_keeps_the_query_after_its_literal(
+        self, sql: str, masked: str,
+    ):
+        """A value that starts with _ right before the quote that closes its
+        literal is not a _charset introducer. Read as one, that quote would
+        open a quoted value running to the next quote and mask the rest of
+        the query."""
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        event = _event(step)
+
+        assert FigureSources.model_validate_json(event).steps[0].queries == [masked]
+        assert "XyZ" not in event
+
     @pytest.mark.parametrize(
         "filler",
         [
@@ -2042,13 +2179,20 @@ class TestSecretsInQueries:
             # after each masked password.
             ("password for " + "x" * 250 + " ") * 380, "identified with p by\t" * 4_800,
             ('identified with "' + "p" * 60 + " ") * 850, "identified by x replace " * 2_700,
+            # URL users holding an @ in every other character up to the user
+            # window, before a short or a long password; introducers after a
+            # secret key with no quote after them; and EZConnect logins
+            # before a placeholder's first character.
+            ("://" + "a@" * 128 + ":") * 1_000, ("://" + "a@" * 128 + ":" + "p" * 1_100 + " ") * 160,
+            "password=N" * 25_000, ("password=_" + "x" * 40) * 5_000, "a/b@{" * 50_000,
         ],
         ids=[
             "word", "secret-key", "userinfo", "quoted-userinfo", "jwt",
             "doubled-quote-user", "long-user", "ezconnect-quoted", "query-string", "ezconnect-quoted-user",
             "ezconnect-near-miss-keys", "open-brace-value", "ezconnect-proxy", "ezconnect-proxy-open-quote",
             "quoted-user", "keyword-password-for", "keyword-identified", "keyword-open-quoted-plugin",
-            "keyword-replace",
+            "keyword-replace", "user-with-at-signs", "long-password-after-a-user-with-at-signs",
+            "introducer-without-a-quote", "charset-introducer-without-a-quote", "ezconnect-placeholder-host",
         ],
     )
     def test_a_long_query_is_redacted_quickly(self, filler: str):
@@ -2241,6 +2385,27 @@ class TestSecretsInQueries:
         assert "XyZ" not in event
         assert "scott" not in event
 
+    @pytest.mark.parametrize(("call", "host"), [
+        ("cur.execute(f\"SELECT qty FROM oracle_scan('scott/XyZtiger@{host}:1521/orcl')\")", "{host}"),
+        (
+            "cur.execute(\"SELECT qty FROM oracle_scan('scott/XyZtiger@%(host)s:1521/orcl')\", {'host': host})",
+            "%(host)s",
+        ),
+        ("cur.execute(\"SELECT qty FROM oracle_scan('scott/XyZtiger@$HOST:1521/orcl')\")", "$HOST"),
+    ], ids=["fstring-placeholder", "query-parameter", "variable"])
+    def test_an_ezconnect_login_before_a_placeholder_host_is_masked(self, call: str, host: str):
+        """The code may fill the host in when the query runs, as the URL rules
+        already mask a login before {host}."""
+        step = _cell("toolu_k", code=f"{call}\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        event = _event(step)
+
+        assert FigureSources.model_validate_json(event).steps[0].queries == [
+            f"SELECT qty FROM oracle_scan('***@{host}:1521/orcl')",
+        ]
+        assert "XyZ" not in event
+        assert "scott" not in event
+
     @pytest.mark.parametrize("sql", [
         "SELECT qty FROM read_source(E'postgres://o\\'XyZbrien:XyZpw@db.example/x')",
         "SELECT qty FROM read_source('postgres://o\"XyZbrien:XyZpw@db.example/x')",
@@ -2257,6 +2422,140 @@ class TestSecretsInQueries:
         [query] = FigureSources.model_validate_json(event).steps[0].queries
         assert "://***@" in query
         assert "XyZ" not in event
+
+    @pytest.mark.parametrize(("url", "masked", "masked_sql"), [
+        (
+            "snowflake://XyZjane.doe@corp.com:XyZHunter2Pw@acct/db", "snowflake://***@acct/db",
+            "SELECT qty FROM read_source('snowflake://***@acct/db')",
+        ),
+        (
+            "postgresql://XyZadmin@srv:XyZHunter2Pw@db.example.com/erp", "postgresql://***@db.example.com/erp",
+            "SELECT qty FROM read_source('postgresql://***@db.example.com/erp')",
+        ),
+        (
+            "postgresql://XyZadmin%40srv:XyZHunter2Pw@db.example.com/erp", "postgresql://***@db.example.com/erp",
+            "SELECT qty FROM read_source('postgresql://***@db.example.com/erp')",
+        ),
+        # A password over 1,024 characters masks the whole non-whitespace span, the
+        # host and the literal's closing quote included.
+        (
+            "snowflake://XyZjane.doe@corp.com:XyZ" + "p" * 1_100 + "@acct/db", "snowflake://***",
+            "SELECT qty FROM read_source('snowflake://***",
+        ),
+        (
+            "postgresql://XyZadmin@srv:XyZ" + "p" * 1_100 + "@db.example.com/erp", "postgresql://***",
+            "SELECT qty FROM read_source('postgresql://***",
+        ),
+    ], ids=[
+        "email-user", "user-at-server", "percent-encoded-at-sign",
+        "email-user-long-password", "user-at-server-long-password",
+    ])
+    @pytest.mark.parametrize("where", ["label", "query"])
+    def test_a_uri_user_holding_an_at_sign_is_masked_with_its_password(
+        self, url: str, masked: str, masked_sql: str, where: str,
+    ):
+        """urllib reads a URL's user and password up to the last @ before its
+        path, and SQLAlchemy reads the user up to its first : and the
+        password up to the next @. Both read an email login or a user@server
+        login that stands unencoded before the password as the user."""
+        sql = f"SELECT qty FROM read_source('{url}')"
+        step = _cell(
+            "toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n",
+            description=f"Read {url}" if where == "label" else "Read stock",
+        )
+
+        event = _event(step)
+
+        [step_out] = FigureSources.model_validate_json(event).steps
+        if where == "label":
+            assert step_out.label == f"Read {masked}"
+        else:
+            assert step_out.queries == [masked_sql]
+        assert "XyZ" not in event
+        assert "ppppp" not in event
+
+    @pytest.mark.parametrize(("url", "masked", "password_parts"), [
+        ("mysql://app@db.internal:3306/sales?password=P@ssw0rd", "mysql://***@db.internal:3306/sales?...", ["ssw0rd"]),
+        (
+            "postgresql://app@db.example.com:5432/erp?sslmode=require&password=Tr0ub@dor9",
+            "postgresql://***@db.example.com:5432/erp?...", ["Tr0ub", "dor9"],
+        ),
+    ], ids=["mysql", "postgresql"])
+    @pytest.mark.parametrize("where", ["label", "query"])
+    def test_a_query_strings_password_holding_an_at_sign_after_a_user_and_a_port_is_masked(
+        self, url: str, masked: str, password_parts: list[str], where: str,
+    ):
+        """urllib reads these URLs' user as app and leaves password=... in the
+        query string. Read as a user that holds an @ and a password up to the
+        query string's @, db.internal:3306/sales?password=P would be masked
+        as the user and password, and the password's part after its @ would
+        show."""
+        sql = f"SELECT qty FROM read_source('{url}')"
+        step = _cell(
+            "toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n",
+            description=f"Read {url}" if where == "label" else "Read stock",
+        )
+
+        event = _event(step)
+
+        [step_out] = FigureSources.model_validate_json(event).steps
+        if where == "label":
+            assert step_out.label == f"Read {masked}"
+        else:
+            assert step_out.queries == [f"SELECT qty FROM read_source('{masked}')"]
+        for part in password_parts:
+            assert part not in event
+
+    @pytest.mark.parametrize(("sql", "masked"), [
+        (
+            "SELECT qty FROM read_source('postgresql://app@db.example.com:5432/erp','password=Tr0ub@dor9')",
+            "SELECT qty FROM read_source('postgresql://***@db.example.com:5432/erp','password=[redacted]')",
+        ),
+        (
+            "SELECT qty FROM read_source('{\"dsn\":\"mysql://app@db.internal:3306/sales\",\"password\":\"Tr0ub@dor9\"}')",
+            "SELECT qty FROM read_source('{\"dsn\":\"mysql://***@db.internal:3306/sales\",\"password\":\"[redacted]\"}')",
+        ),
+        (
+            "SELECT qty FROM read_source('jdbc:sqlserver://app@db:1433;databaseName=erp;password=Tr0ub@dor9')",
+            "SELECT qty FROM read_source('jdbc:sqlserver://***@db:1433;databaseName=erp;password=[redacted]')",
+        ),
+    ], ids=["next-literal", "compact-json", "semicolon-parameter"])
+    @pytest.mark.parametrize("where", ["label", "query"])
+    def test_a_secret_after_a_user_host_and_port_in_the_same_run_is_masked_whole(
+        self, sql: str, masked: str, where: str,
+    ):
+        """A URL with a user, a host and a port and no password, followed with
+        no space by a secret key's value that holds an @. Read as a user that
+        holds an @ and a password up to that @, the URL and the key would be
+        masked as one login and the value's part after its @ would show."""
+        step = _cell(
+            "toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n",
+            description=f"Run {sql}" if where == "label" else "Read stock",
+        )
+
+        event = _event(step)
+
+        [step_out] = FigureSources.model_validate_json(event).steps
+        if where == "label":
+            assert step_out.label == f"Run {masked}"
+        else:
+            assert step_out.queries == [masked]
+        assert "dor9" not in event
+
+    def test_a_password_holding_an_at_sign_and_a_hash_after_a_user_with_no_at_sign_is_masked_whole(self):
+        """A user with no @ is read first, so its password runs to the last @
+        even past a # in it."""
+        url = "postgresql://app:Tr0ub@dor#9@db.example.com/erp"
+        step = _cell(
+            "toolu_k", code="cur.execute('SELECT qty FROM stock')\nprint(cur.fetchone()[0])", stdout="42\n",
+            description=f"Read {url}",
+        )
+
+        event = _event(step)
+
+        [step_out] = FigureSources.model_validate_json(event).steps
+        assert step_out.label == "Read postgresql://***@db.example.com/erp"
+        assert "dor" not in event
 
     @pytest.mark.parametrize(("source", "masked"), [
         (
@@ -2755,6 +3054,33 @@ class TestFrameRowLabels:
         ]
 
     @pytest.mark.parametrize("stdout", [
+        # The prints are pandas 3.0.6's. pandas leaves a column before a key for its minus sign, so an
+        # inner key starts a column right of a negative one above it, or a column left of a positive one.
+        # print(df.groupby(['year', 'days_late'])[['orders']].sum())
+        "                orders\nyear days_late        \n2023 -2             14\n      0             61\n"
+        "      3              9\n2024 -2             11\n      0             58\n      3              7\n"
+        "2025  0             66\n      3              5\n",
+        # print(df.groupby(['year', 'days_late'])['orders'].sum())
+        "year  days_late\n2023  -2           14\n       0           61\n       3            9\n"
+        "2024  -2           11\n       0           58\n       3            7\n2025   0           66\n"
+        "       3            5\nName: orders, dtype: int64\n",
+        # print(df.set_index(['year', 'days_late'])), its rows unsorted.
+        "                orders\nyear days_late        \n2023  0             61\n     -2             14\n"
+        "2024  0             58\n     -2             11\n2025  3              5\n     -2              9\n",
+        # print(df.set_index(['year', 'days_late'])['orders'])
+        "year  days_late\n2023   0           61\n      -2           14\n2024   0           58\n"
+        "      -2           11\n2025   3            5\n      -2            9\nName: orders, dtype: int64\n",
+    ], ids=[
+        "frame, a negative key first", "Series, a negative key first",
+        "frame, a negative key under a positive one", "Series, a negative key under a positive one",
+    ])
+    def test_a_multiindex_whose_inner_keys_hold_a_negative_number_is_read(self, stdout: str):
+        assert _printed(stdout, answer="In 2025, 9 orders shipped early; 2024 had 58.") == [
+            ("2025", FigureOrigin.step), ("9", FigureOrigin.step),
+            ("2024", FigureOrigin.step), ("58", FigureOrigin.step),
+        ]
+
+    @pytest.mark.parametrize("stdout", [
         # The prints are pandas 3.0.6's, of 100 rows indexed by year.
         # print(df.set_index('year')['v'])
         "year\n1990     0\n1991     1\n1992     2\n1993     3\n1994     4\n        ..\n2085    95\n2086    96\n"
@@ -2828,17 +3154,46 @@ class TestFrameRowLabels:
             ("2600", FigureOrigin.step), ("2024", FigureOrigin.step), ("2", FigureOrigin.none),
         ]
 
-    @pytest.mark.parametrize("stdout", [
+    @pytest.mark.parametrize(("stdout", "answer", "origins"), [
         # The prints are pandas 3.0.6's: print(df.groupby('year')[['sales']].sum()), then a second frame.
         # print(pd.DataFrame({2023: [10, 20], 2024: [30, 40]}))
-        "      sales\nyear       \n2023   4600\n2024   5200\n   2023  2024\n0    10    30\n1    20    40\n",
+        (
+            "      sales\nyear       \n2023   4600\n2024   5200\n   2023  2024\n0    10    30\n1    20    40\n",
+            "Sales were 4600 in 2023; the rate is $1.",
+            [("4600", FigureOrigin.step), ("2023", FigureOrigin.step), ("$1", FigureOrigin.none)],
+        ),
         # print(pd.DataFrame({'p50': [11, 12], 'p90': [13, 14]})), whose header is as wide as the rows above it.
-        "      sales\nyear       \n2023   4600\n2024   5200\n   p50  p90\n0   11   13\n1   12   14\n",
-    ], ids=["a header wider than the rows above", "a header as wide as the rows above"])
-    def test_a_frame_printed_after_a_named_index_keeps_its_own_row_numbers(self, stdout: str):
-        assert _printed(stdout, answer="Sales were 4600 in 2023; the rate is $1.") == [
-            ("4600", FigureOrigin.step), ("2023", FigureOrigin.step), ("$1", FigureOrigin.none),
-        ]
+        (
+            "      sales\nyear       \n2023   4600\n2024   5200\n   p50  p90\n0   11   13\n1   12   14\n",
+            "Sales were 4600 in 2023; the rate is $1.",
+            [("4600", FigureOrigin.step), ("2023", FigureOrigin.step), ("$1", FigureOrigin.none)],
+        ),
+        # print(df.groupby('store')[['units']].sum()), then print(df[['q3', 'units']]) of 10 rows, whose
+        # header is as wide as the rows above it, indented past their one-digit keys and holds a digit.
+        (
+            "       units\nstore       \n1        162\n2        158\n   q3  units\n0  51     12\n1  69     23\n"
+            "2  93     31\n3  88     29\n4  64     41\n5  52     32\n6  90     43\n7  81     48\n8  66     35\n"
+            "9  95     26\n",
+            "Store 1 sold 162 units; Q3 scores ranged across 7 stores.",
+            [("1", FigureOrigin.step), ("162", FigureOrigin.step), ("7", FigureOrigin.none)],
+        ),
+        # print(df.groupby('store')[['units']].sum()), then print(df[['q3']]) of 10 floats, whose header is
+        # as wide as the rows above it and starts a column right of where their value starts.
+        (
+            "       units\nstore       \n1        162\n2        158\n          q3\n0  51.234568\n1  69.512346\n"
+            "2  93.751234\n3  88.012346\n4  64.125123\n5  52.501235\n6  90.250123\n7  81.750123\n8  66.501234\n"
+            "9  95.001234\n",
+            "Store 1 sold 162 units; Q3 scores came from 7 stores.",
+            [("1", FigureOrigin.step), ("162", FigureOrigin.step), ("7", FigureOrigin.none)],
+        ),
+    ], ids=[
+        "a header wider than the rows above", "a header as wide as the rows above", "a header past short keys",
+        "a header a column right of a field",
+    ])
+    def test_a_frame_printed_after_a_named_index_keeps_its_own_row_numbers(
+        self, stdout: str, answer: str, origins: list[tuple[str, FigureOrigin]],
+    ):
+        assert _printed(stdout, answer=answer) == origins
 
     def test_values_printed_one_space_before_a_negative_value_are_read(self):
         # print() puts one space between its arguments, as a frame row puts

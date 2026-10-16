@@ -793,19 +793,38 @@ class TestStatementsInOneString:
 
     # Snowflake ends a // comment at the line end; BigQuery and ClickHouse
     # read # and a -- with no space after it as comments; Postgres escapes a
-    # quote in an E'' string but not in a double-quoted name; Postgres reads
-    # [ as an array, whose string may hold a ]. Each database ends the query
+    # quote with a backslash in an E'' or e'' string but not in a
+    # double-quoted name or a standard string (all three read a doubled quote
+    # as one), and an E that ends a name or a keyword opens no E'' string
+    # (LIKE'\', €E'\', t$E'\'); Postgres reads [ as an array, whose string
+    # may hold a ]; Postgres takes any non-ASCII character in a dollar tag,
+    # and reads one before $$ as part of a name. Each database ends the query
     # at the ; and runs the statement that sets a password.
     @pytest.mark.parametrize("sql", [
         "SELECT qty FROM stock // it's\n; CREATE USER bob PASSWORD 'XyZhunter2'",
         "SELECT qty FROM stock //* note\n; CREATE USER bob PASSWORD 'XyZhunter2' -- */",
         "SELECT qty FROM stock --it's\nWHERE a = 1 # /* note\n; CREATE USER bob IDENTIFIED BY 'XyZhunter2'",
         "SELECT qty FROM stock WHERE note = E'it\\'s' AND \"col\\\" = 1; CREATE USER bob PASSWORD 'XyZhunter2'",
+        "SELECT E'\\'', '\\' FROM stock; ALTER ROLE bob PASSWORD $p$XyZhunter2$p$; SELECT ''",
+        "SELECT e'\\'', '\\' FROM stock; ALTER ROLE bob PASSWORD $p$XyZhunter2$p$; SELECT ''",
+        "SELECT E'\\'' AS \"\\\", '\\' FROM t; ALTER ROLE bob PASSWORD $p$XyZhunter2$p$; SELECT ''",
+        "SELECT E'it''s\\'', '\\' FROM t; ALTER ROLE bob PASSWORD $p$XyZhunter2$p$; SELECT ''",
+        "SELECT E'\\'' AS a FROM t WHERE b LIKE'\\'; ALTER ROLE bob PASSWORD $p$XyZhunter2$p$; SELECT ''",
+        "SELECT E'\\'' AS a FROM t WHERE b = €E'\\'; ALTER ROLE bob PASSWORD $p$XyZhunter2$p$; SELECT ''",
+        "SELECT E'\\'' AS a FROM t WHERE b = t$E'\\'; ALTER ROLE bob PASSWORD $p$XyZhunter2$p$; SELECT ''",
         "SELECT ARRAY['a]'] FROM stock; CREATE USER bob PASSWORD 'XyZhunter2'",
         'SELECT data["a]"] FROM stock; CREATE USER bob IDENTIFIED BY \'XyZhunter2\'',
+        "SELECT $é$it's$é$ FROM stock; ALTER ROLE bob PASSWORD $p$XyZhunter2$p$; SELECT ''",
+        "SELECT $a€$it's$a€$ FROM t; ALTER ROLE bob PASSWORD $p$XyZhunter2$p$; SELECT ''",
+        "SELECT $$/*$$ AS €$$ FROM stock; ALTER ROLE bob PASSWORD 'XyZhunter2'; SELECT $$*/$$ FROM stock",
     ], ids=[
         "double-slash-comment", "double-slash-before-a-block-comment", "hash-and-dashdash-comments",
-        "e-string-beside-a-quoted-name", "array-of-a-string-with-a-bracket", "subscript-of-a-name-with-a-bracket",
+        "e-string-beside-a-quoted-name", "e-string-beside-a-standard-string",
+        "lowercase-e-string-beside-a-standard-string", "e-string-beside-a-quoted-name-and-a-standard-string",
+        "e-string-with-a-doubled-quote-beside-a-standard-string", "keyword-ending-in-e-before-a-string",
+        "non-ascii-name-ending-in-e-before-a-string", "name-with-a-dollar-ending-in-e-before-a-string",
+        "array-of-a-string-with-a-bracket", "subscript-of-a-name-with-a-bracket", "non-ascii-dollar-tag",
+        "dollar-tag-ending-in-a-non-ascii-symbol", "non-ascii-name-before-a-dollar-quote",
     ])
     def test_a_statement_another_database_ends_at_a_semicolon_lists_nothing(self, sql: str):
         assert read_cell(f"cur.execute({sql!r})", names={}).queries == ()
@@ -906,8 +925,8 @@ class TestStatementsInOneString:
     # [ (a bracket a quote ends) or $ (dollar quoting). A query with none of
     # them reads alike under every reading, so it is read once.
     @pytest.mark.parametrize(("where", "reads"), [
-        ("", 1), ("AND note = 'a\\b'", 3), ("-- note\n", 2), ("AND note = 'a#b'", 3), ("AND note = 'a//b'", 2),
-        ("AND a[1] = 2", 2), ("AND note = $$a$$", 2), ("AND note = 'a\\b #c //d --e [f] $g$'", 48),
+        ("", 1), ("AND note = 'a\\b'", 4), ("-- note\n", 2), ("AND note = 'a#b'", 3), ("AND note = 'a//b'", 2),
+        ("AND a[1] = 2", 2), ("AND note = $$a$$", 2), ("AND note = 'a\\b #c //d --e [f] $g$'", 64),
     ], ids=["none", "backslash", "dashdash", "hash", "double-slash", "bracket", "dollar", "every-mark"])
     def test_only_the_readings_a_querys_characters_can_tell_apart_run(
         self, where: str, reads: int, monkeypatch: pytest.MonkeyPatch,
@@ -938,7 +957,9 @@ class TestStatementsInOneString:
     # of them would.
     def test_the_readings_that_run_split_every_text_as_all_of_them_do(self):
         rng = random.Random(3433)
-        for alphabet in ("'\"`[]$;-#/*\\\n aSx\x01", "';- \nSELECTFROMa", "'\";-/ \n", "[]';\"", "$;'a \n", "\\';\"-#\n "):
+        for alphabet in (
+            "'\"`[]$;-#/*\\\n aSxE\x01é€", "';- \nSELECTFROMa", "'\";-/ \n", "[]';\"", "$;'a \né€", "\\';\"-#\n E",
+        ):
             for _ in range(500):
                 text = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 60)))
                 assert cell_queries_mod._statements(text) == _split_by_every_reading(text), text

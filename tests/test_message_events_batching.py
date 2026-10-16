@@ -576,6 +576,25 @@ def test_a_malformed_figure_sources_event_is_skipped_not_raised(session, convers
     assert [r.levelname for r in caplog.records if r.name == "cowork.services.conversations"] == ["WARNING"]
 
 
+@pytest.mark.parametrize("kind", ["memory", "unknown_kind"], ids=["removed", "newer"])
+def test_an_answer_whose_step_kind_this_build_lacks_still_gives_its_figures(session, conversation, caplog, kind):
+    """A saved step can carry a kind this build no longer has (memory, which
+    earlier builds wrote) or does not have yet (a newer release's, read after
+    a rollback). The read uses only the figures, so such a step does not
+    skip the answer."""
+    service = ConversationService(session)
+    event = _figure_sources_event("4,600")
+    event["steps"] = [{"tool_use_id": "toolu_1", "kind": kind, "label": "notes.md"}]
+    event["figures"][0]["sources"] = [{"tool_use_id": "toolu_1"}]
+    _save_turn(service, conversation, answer="4,600", events=[event])
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.conversations"):
+        answers = service.get_earlier_answers(conversation.id, answers=20)
+
+    assert _texts(answers) == [["4,600"]]
+    assert [r for r in caplog.records if r.name == "cowork.services.conversations"] == []
+
+
 def test_a_text_delta_whose_whole_text_is_the_event_type_is_not_read(session, conversation):
     """The SQL filter finds the type, quotes and all, in a text delta that
     holds nothing else, and such a row reads as an event with no figures."""

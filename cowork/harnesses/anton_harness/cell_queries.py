@@ -42,14 +42,18 @@ it. A string bound to a name is a candidate where the code reads that name on
 its own, not where it binds it, so a base query that ``+``, ``+=`` or an
 f-string extends is not one. A candidate counts when, past its comments, it
 starts with SELECT or a WITH ... AS ( common table expression, reads FROM, and
-does not end like a sentence: that drops ``df.query('qty > 5')``, DDL, writes
-and a printed label such as ``"With rows from stock.csv:"``. A candidate that
-counts is split at each ``;`` outside a string literal, a quoted name, a
+does not end like a sentence: that drops ``df.query('qty > 5')``, DDL, a write
+that starts with its own keyword such as INSERT, and a printed label such as
+``"With rows from stock.csv:"``. Only the opening keyword is read, so a write
+after a common table expression (``WITH old AS (...) DELETE ...``) and a
+``SELECT ... INTO`` count as queries and are listed. A candidate that counts
+is split at each ``;`` outside a string literal, a quoted name, a
 dollar-quoted string or a comment, and a statement is listed only when it
 counts by the same rule, so a statement after a query in the same string (DDL
-that sets a password, a write) is not. The split is read with both backslash
-quote rules, for both quotes or for single quotes only (a Postgres ``E''``
-string beside a double-quoted name), and with four line-comment rules: the
+that sets a password, a write that starts with its own keyword) is not. The
+split is read with both backslash quote rules, for both quotes, for single
+quotes only (a Postgres ``E''`` string beside a double-quoted name) or for
+``E''`` only (beside a standard string), and with four line-comment rules: the
 standard ``--``; MySQL's, which requires whitespace or a control character
 after ``--`` and also recognizes ``#``; BigQuery's and ClickHouse's ``#``
 beside any ``--``; and Snowflake's ``//`` beside ``--``. When any reading
@@ -62,15 +66,25 @@ A reading runs only when the string holds a character that can make it split
 differently (a backslash, ``--``, ``#``, ``//``, ``[`` or ``$``), so a query
 with none of them is read once. The split still misses a ``;`` inside a
 bracket before any quote, which SQLite and SQL Server read as part of a name
-and Postgres and MySQL as the end of a statement; a ``;`` after a lone
-carriage return in a ``--`` comment, where every reading ends the comment and
-SQLite reads it on to the line end; a ``'`` inside Oracle's alternative
-quoting (``q'[...]'``), which every reading reads as the end of the string;
-and a ``;`` between backticks, which every reading reads as inside a quoted
-name while Postgres reads a backtick as an operator character. The
-credential sweep masks the password a statement listed by such a miss sets
-with ``IDENTIFIED BY``, or with a quoted value after a secret key's name
-such as ``PASSWORD`` or ``SECRET`` (``figure_sources._redacted``).
+and Postgres and MySQL as the end of a statement; a ``]]`` inside a bracket,
+which SQL Server reads as a ``]`` in the name and every reading as its end; a
+``;`` or a quote after a lone carriage return in a comment, where every
+reading ends the comment and SQLite (``--``) and MySQL (``--`` and ``#``)
+read it on to the line feed; a quote inside Oracle's alternative quoting
+(``q'[...]'``) or a BigQuery triple-quoted string (``'''...'''``, or the
+same with double quotes), which every reading reads as the end of the
+string; a backslash-escaped backtick in a quoted name, which BigQuery and
+ClickHouse read as part of the name and every reading as its end; an ``E''``
+string right after a dollar-quoted string, which Postgres reads as one and
+the reading for ``E''`` only as a standard string after a name; an ``E''``
+string right after a digit (``1E'...'``), whose digit and E the reading for
+``E''`` only reads as a name and Postgres 14 as a number and an ``E''``
+string (newer versions reject the number); and a ``;`` between backticks,
+which every reading reads as inside a quoted name while Postgres reads a
+backtick as an operator character. The credential sweep masks the password
+a statement listed by such a miss sets with ``IDENTIFIED BY``, or with a
+quoted value after a secret key's name such as ``PASSWORD`` or ``SECRET``
+(``figure_sources._redacted``).
 
 A function the cell defines keeps the queries, requests and environment reads
 its body shows, so a later cell that calls it makes them too. Rebinding one
@@ -176,7 +190,8 @@ _SQL_CTE = re.compile(
 _SQL_FROM = re.compile(r"\bfrom\b", re.IGNORECASE)
 # A name in backticks or brackets, a dollar-quoted string, which only the
 # $tag$ that opened it closes (a $ inside a name and a $1 parameter open
-# none), or a comment, inside which a ; ends no statement, or a ; that does.
+# none; Postgres reads any non-ASCII character as part of a name or a tag),
+# or a comment, inside which a ; ends no statement, or a ; that does.
 # A name, string or comment left open runs to the end of the text, so the
 # scan stays linear.
 _SQL_QUOTED_NAME = r"`[^`]*+`?|\[[^\]]*+\]?"
@@ -184,7 +199,10 @@ _SQL_QUOTED_NAME = r"`[^`]*+`?|\[[^\]]*+\]?"
 # a subscript, whose string literal may hold a ] (ARRAY['a]']). A ; inside a
 # bracket before any quote stays inside it here too, so [a;b] keeps its query.
 _SQL_QUOTED_NAME_TO_A_QUOTE = r"`[^`]*+`?|\[[^\]'\"]*+\]?"
-_SQL_DOLLAR_STRING = r"(?<![\w$])\$(?P<tag>(?:[A-Za-z_]\w*)?)\$.*?(?:\$(?P=tag)\$|\Z)"
+_SQL_DOLLAR_STRING = (
+    r"(?<![\w$\x80-\U0010ffff])\$(?P<tag>(?:[A-Za-z_\x80-\U0010ffff][\w\x80-\U0010ffff]*)?)\$"
+    r".*?(?:\$(?P=tag)\$|\Z)"
+)
 
 
 @dataclass(frozen=True)
@@ -199,11 +217,17 @@ class _SqlRule:
 
 # Postgres escapes a quote in an E'' string but not in a double-quoted name,
 # as MySQL with ANSI_QUOTES does, and MySQL's NO_BACKSLASH_ESCAPES mode reads
-# no backslash escape. Without a backslash these read alike.
+# no backslash escape. Postgres escapes none in a standard string either, so
+# the last form reads escapes only in a string an E opens, where an E after a
+# name character is part of the name. Without a backslash these read alike.
 _SQL_QUOTES = (
     _SqlRule(pattern=r"'(?:''|\\.|[^'\\])*+'?|\"(?:\"\"|\\.|[^\"\\])*+\"?"),
     _SqlRule(pattern=r"'(?:''|[^'])*+'?|\"(?:\"\"|[^\"])*+\"?", marks=frozenset({"\\"})),
     _SqlRule(pattern=r"'(?:''|\\.|[^'\\])*+'?|\"(?:\"\"|[^\"])*+\"?", marks=frozenset({"\\"})),
+    _SqlRule(
+        pattern=r"(?<![\w$\x80-\U0010ffff])[Ee]'(?:''|\\.|[^'\\])*+'?|'(?:''|[^'])*+'?|\"(?:\"\"|[^\"])*+\"?",
+        marks=frozenset({"\\"}),
+    ),
 )
 # MySQL recognizes -- only before a space or control character, and # starts
 # a comment there. BigQuery and ClickHouse read # and any -- as comments, and
@@ -1430,9 +1454,9 @@ def _queries(texts: Iterable[str]) -> tuple[str, ...]:
     dedented and stripped. A text that reads as a query is split into its
     statements (_statements), and only those that read as a query themselves
     are listed, so a statement after a query in the same text (DDL that sets
-    a password, a write) is listed only where the database ends a statement
-    at a ``;`` that _statements reads as inside a literal, a quoted name or a
-    comment."""
+    a password, a write that starts with its own keyword) is listed only
+    where the database ends a statement at a ``;`` that _statements reads as
+    inside a literal, a quoted name or a comment."""
     statements = (
         textwrap.dedent(statement).strip()
         for text in dict.fromkeys(texts) if is_sql(text)

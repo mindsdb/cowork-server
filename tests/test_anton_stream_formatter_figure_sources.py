@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -1196,8 +1197,11 @@ class TestAnswersWithoutSources:
         ([], [StreamTextDelta(text="\n")]),
     ], ids=["whole-answer", "after-a-tool-round", "after-partial-text", "followed-by-a-blank-delta"])
     async def test_antons_failure_reply_gets_no_sources(self, before: list, after: list):
-        """anton streams its failure reply as one delta and ends the turn on
-        it, after whatever the turn streamed first."""
+        """Final anton releases through 2.26.10.14.1 (the anton-agent floor)
+        and older pod images stream their failure reply as one delta and end
+        the turn on it, after whatever the turn streamed first. From
+        mindsdb/anton#569 on, the turn raises instead, so this check can go
+        once the floor and the pod image both carry #569."""
         events = await _run_turn(
             TurnContext(question="How many?"),
             *before,
@@ -1355,10 +1359,7 @@ async def _every_input_shape(*, compacted: bool) -> str:
     total = "print(df.qty.sum())"
     history = [
         {"role": "user", "content": "Load the stock."},
-        *_tool_rows(
-            "toolu_load", "scratchpad", {"action": "exec", "name": "main", "code": load},
-            "Code executed successfully (no output).",
-        ),
+        *_cell_rows("toolu_load", code=load, stdout=""),
         *_cell_rows("toolu_old", code="print(80 * 101)", stdout="8080\n"),
         {"role": "assistant", "content": "Loaded."},
         {"content": 5},
@@ -1381,11 +1382,7 @@ async def _every_input_shape(*, compacted: bool) -> str:
             {"type": "tool_result", "tool_use_id": "toolu_bad", "content": "rate 91", "is_error": True},
         ]},
         *_tool_rows("toolu_failed", "web_fetch", {"url": "https://down.example/"}, "Rate 64 per hour"),
-        *_tool_rows(
-            "toolu_rowcell", "scratchpad",
-            {"action": "exec", "name": "main", "code": "print(5000 + 150)", "one_line_description": "Row cell"},
-            "[output]\n5150\n\n[logs]\nok\n",
-        ),
+        *_cell_rows("toolu_rowcell", code="print(5000 + 150)", stdout="5150\n", logs="ok\n", description="Row cell"),
     ]
     read = [
         *rows,
@@ -1393,13 +1390,13 @@ async def _every_input_shape(*, compacted: bool) -> str:
         {"role": "user", "content": [{"type": "tool_result"}]},
         {"content": [{"type": "tool_use", "id": "z", "name": "web_fetch", "input": "nope"}]},
     ]
-    sum_cell = {"code": total, "stdout": "340\n", "stderr": "", "error": None, "description": "Sum stock"}
-    cut_cell = {"code": "print(77 * 101)", "stdout": "7777\n", "stderr": "", "error": None, "description": ""}
-    bare_cell = {"code": "print(6 * 7 * 100)", "stdout": "4200\n", "stderr": "", "error": None, "description": ""}
+    sum_cell = asdict(Cell(code=total, stdout="340\n", stderr="", error=None, description="Sum stock"))
+    cut_cell = asdict(Cell(code="print(77 * 101)", stdout="7777\n", stderr="", error=None))
+    bare_cell = asdict(Cell(code="print(6 * 7 * 100)", stdout="4200\n", stderr="", error=None))
     setup = "client = httpx.Client(base_url='https://erp.example.com')"
     fetch = "print(client.get('/stock?token=synthetic-secret').text)"
-    setup_cell = {"code": setup, "stdout": "", "stderr": "", "error": None, "description": "Open ERP client"}
-    fetch_cell = {"code": fetch, "stdout": "612\n", "stderr": "", "error": None, "description": "Fetch stock"}
+    setup_cell = asdict(Cell(code=setup, stdout="", stderr="", error=None, description="Open ERP client"))
+    fetch_cell = asdict(Cell(code=fetch, stdout="612\n", stderr="", error=None, description="Fetch stock"))
     frames = [
         chunk async for chunk in format_responses_stream(_events(
             TurnContext(question="What is the total, the rate and S1?", history=history),

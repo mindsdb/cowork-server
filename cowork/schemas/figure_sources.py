@@ -56,7 +56,8 @@ class FigureStep(BaseModel):
     # credential, such as a webhook's.
     url: str | None = None
     # The SQL statements and "METHOD url-template" requests the step's code
-    # shows, in code order, redacted.
+    # shows, in code order, or the statement a connector call sent as its sql
+    # argument, redacted.
     queries: list[str] = Field(default_factory=list)
     requests: list[str] = Field(default_factory=list)
 

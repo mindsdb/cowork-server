@@ -205,8 +205,8 @@ class TurnEvidence:
     # mid-way (the stream carried a StreamContextCompacted) and no tool rows
     # arrived for it (no TurnHistory): their results never reached the
     # formatter. A producer whose anton predates ChatSession.turn_messages
-    # (an older cloud pod, or a desktop install on the anton floor) sends
-    # no rows after a compaction. Empty otherwise.
+    # (an older cloud pod, or a PyPI-channel desktop install on the anton
+    # floor) sends no rows after a compaction. Empty otherwise.
     calls_without_rows: tuple[EvidenceCall, ...] = ()
     # The figures the conversation's last answers list (TurnContext
     # .earlier_answers), which a figure no step holds may repeat.
@@ -294,7 +294,10 @@ def classify_cell_status(content: str) -> str:
 
 
 # anton's reply when every attempt at the turn failed: its error, not an answer
-# (the fallback reply in anton core.session's turn loop).
+# (the fallback reply in anton core.session's turn loop). Final anton releases
+# through 2.26.10.14.1 (the anton-agent floor in pyproject.toml) and older pod
+# images still send it; from mindsdb/anton#569 on, the turn raises instead. The
+# check can go once the floor and the pod image both carry #569.
 _ANTON_FAILURE_REPLY = "An unexpected error occurred: "
 
 # The header over each block the client appends, for the agent only, to the
@@ -647,8 +650,11 @@ async def format_responses_stream(
     successful_tool_calls: set[str] = set()
     compacted = False
     # Whether the turn's last text is anton's failure reply, which carries no
-    # figures. anton streams that reply as one delta and ends the turn on it,
-    # so each delta with visible text sets or clears this.
+    # figures. Final anton releases through 2.26.10.14.1 (the anton-agent
+    # floor) and older pod images stream that reply as one delta and end the
+    # turn on it, so each delta with visible text sets or clears this. From
+    # mindsdb/anton#569 on, the turn raises instead, so this can go once the
+    # floor and the pod image both carry #569.
     failure_reply = False
 
     resp = Response(id=resp_id, model=model, status=ResponseStatus.created)

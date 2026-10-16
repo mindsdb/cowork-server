@@ -54,16 +54,17 @@ counts are steps: the web tools and read_text_file
 customer's records. A connector tool is an MCP tool anton registers under its
 engine's name, and anton's ``returns_records`` says which ones return
 records, such as CRM objects or campaign analytics. A connector tool that
-returns docs, schema or account details is no step, nor is a write tool,
-whose result echoes what the model wrote plus defaults the server filled in,
-nor a tool of an engine anton has not classified. Every other tool hands back
-the agent's own text (an earlier answer, an artifact it wrote, a memory), the
-user's answer, or a status line. A read_text_file of a file in anton's memory
-folder (``.anton/memory``) is no step either: it reads back what the agent
-memorized. Nor is a cell whose only source would be the memory files it, or
-an earlier cell, read (``_describe_cell``). The formatter passes on a call of
-any of these tools only when its tool_done said ok=True: a failed call's
-result is the error the tool or anton wrote, which can quote numbers.
+returns docs, schema or account details is no step, nor is a write tool:
+some write tools can also view records, but a tool's name can't tell a view
+from a write, so none counts. Nor is a tool of an engine anton has not
+classified. Every other tool hands back the agent's own text (an earlier
+answer, an artifact it wrote, a memory), the user's answer, or a status
+line. A read_text_file of a file in anton's memory folder (``.anton/memory``)
+is no step either: it reads back what the agent memorized. Nor is a cell
+whose only source would be the memory files it, or an earlier cell, read
+(``_describe_cell``). The formatter passes on a call of any of these tools
+only when its tool_done said ok=True: a failed call's result is the error
+the tool or anton wrote, which can quote numbers.
 
 A step whose own input states the figure (a cell that prints a literal it was
 given) is not a source for it: its output only echoes what the model wrote.
@@ -71,15 +72,18 @@ For the same reason an output value equal to a number its input states is not
 read at all. Nor is a number inside an ISO date-time in a connector tool's
 records: a record's timestamps are not figures, and the minutes of the
 created and last-changed times every record carries would source almost any
-small number. A figure the model works out in its own text, without a step
-printing it, has no source.
+small number. A date-time in a connector call's input, such as a filter's,
+states no number either, so a record's value equal to its hour, minutes or
+seconds is still read. A figure the model works out in its own text, without
+a step printing it, has no source.
 
 Each step a figure names is described once: its kind, a short label, the file
 it read, the web page it reached, and the SQL and HTTP requests its code shows
-(``cell_queries``). Its label, web page, SQL and requests pass through
-``_redacted``, a best-effort credential sweep, before they leave this module.
-Its file is named by its place in the project or by its files-store id, never
-by the text the code spelled.
+(``cell_queries``) or, for a connector tool, the statement its call ran. Its
+label, web page, SQL and requests pass through ``_redacted``, a best-effort
+credential sweep, before they leave this module. Its file is named by its
+place in the project or by its files-store id, never by the text the code
+spelled.
 """
 
 from __future__ import annotations
@@ -127,9 +131,9 @@ try:
     from anton.core.mcp.access import returns_records
     from anton.core.mcp.names import parse_namespaced_tool_name
 except ImportError:
-    # Desktop installs resolve anton from the anton-agent floor in
-    # pyproject.toml, whose anton cannot say which connector tools return
-    # the customer's records. There no connector tool is evidence
+    # A PyPI-channel desktop install resolves anton from the anton-agent
+    # floor in pyproject.toml, whose anton cannot say which connector tools
+    # return the customer's records. There no connector tool is evidence
     # (_records_tool).
     returns_records = None
     parse_namespaced_tool_name = None
@@ -194,9 +198,10 @@ def _path(value: object) -> str | None:
 class ToolArguments(BaseModel):
     """What the matcher reads from a tool call's arguments: the scratchpad
     it runs in and the code it runs, the page a web call fetches or the
-    query it searches, and the file a read names. Every other argument is
-    left out, and a value of the wrong type reads as text (or as no path),
-    so arguments always read."""
+    query it searches, the file a read names, and the SQL-shaped statement a
+    connector tool runs (HubSpot's query_crm_data takes it as sql). Every
+    other argument is left out, and a value of the wrong type reads as text
+    (or as no path), so arguments always read."""
 
     model_config = ConfigDict(frozen=True, extra="ignore")
 
@@ -205,6 +210,7 @@ class ToolArguments(BaseModel):
     url: Annotated[str, BeforeValidator(_text)] = ""
     query: Annotated[str, BeforeValidator(_text)] = ""
     path: Annotated[str | None, BeforeValidator(_path)] = None
+    sql: Annotated[str, BeforeValidator(_text)] = ""
 
     @classmethod
     def from_call(cls, *, arguments: Mapping[str, Any]) -> ToolArguments:
@@ -400,6 +406,8 @@ _SERIES_FOOTER = re.compile(r"(?:Name|Length|Freq|dtype): ")
 # A MultiIndex row whose outer keys pandas leaves blank, since the row above
 # shows them: indented and holding a value.
 _INNER_ROW = re.compile(r"[ \t]+\S.*\d")
+# Where a field of a printed row starts: a character after a space or a tab.
+_FIELD_START = re.compile(r"(?<=[ \t])\S")
 # The row pandas prints where it cuts a long frame or Series: ".." under a
 # Series' labels, "...  ..  .." across a frame.
 _TRUNCATED = re.compile(r"[ \t]*\.\.\.?(?:[ \t]+\.\.\.?)*[ \t]*")
@@ -422,6 +430,11 @@ _URL_TRAILERS = frozenset(".,;:!?*_~")
 _DOCUMENT = re.compile(
     r"(?!\w+://)[^'\"\n]*\.(?:csv|tsv|xlsx|xls|pdf|txt|json|md|docx|parquet)", re.IGNORECASE,
 )
+# A part of a string the code fills in when the cell runs, which the cell
+# reader writes as that code in braces (data/{f} for os.path.join("data", f),
+# data/{f.name} for Path("data") / f.name) or leaves as empty braces
+# ("data/{}".format(name)), or a glob's * (glob.glob("data/*")).
+_RUN_TIME_PART = re.compile(r"\{[^{}]*\}|\*")
 # A saved connection's variable, which a request template reads its base URL
 # or credentials from.
 _DS_VARIABLE = re.compile(r"\bDS_[A-Z0-9_]+")
@@ -474,17 +487,30 @@ _QUERY_CHAR = r"(?:[^\s'\"]|''|\"\")"
 # the user name, the password may hold /, ? or #, as a database URI's may; a
 # quote may be password data under the enclosing SQL dialect. Keep it in
 # the bounded scan; ambiguous detail is safer to redact than to expose. A
-# user, with a password or alone, may hold a quote. Linear: a match starts
-# only at ://, and each attempt reads at most 256 characters of user and
-# 1,024 characters of password.
-_USERINFO = re.compile(rf"(://)(?:{_USER_CHAR}{{0,256}}:\S{{0,1024}}|{_USER_CHAR}{{0,256}})@")
+# user, with a password or alone, may hold a quote. A user before a password
+# may also hold an @ (an email login, or a user@server login), which
+# SQLAlchemy reads up to its first : and the password up to the next @. Such
+# a user's password runs to an @ before any /, ?, #, ;, comma, & or quote.
+# Past one, a user, a host and a port before a path, a query string, a
+# parameter or the next literal that holds an @
+# (mysql://app@db:3306/s?password=P@ss, 'mysql://app@db:3306/s','pw=P@ss')
+# would read as one user and password, and the password's part after its @
+# would show; urllib reads the user as app there, and the key rules mask the
+# value. A user with no @ is tried first, so its password still runs to the
+# last @. Linear: a match starts only at ://, and each attempt reads at most
+# 256 characters of user and 1,024 characters of password. The user holds no
+# :, so it ends at a : in one place only.
+_USERINFO = re.compile(
+    rf"(://)(?:{_USER_CHAR}{{0,256}}:\S{{0,1024}}|(?:{_USER_CHAR}|@){{0,256}}:[^\s/?#;,&'\"]{{0,1024}}"
+    rf"|{_USER_CHAR}{{0,256}})@"
+)
 # On overflow, mask the whole non-whitespace span, including its host and
 # any quotes. Without the enclosing SQL dialect a quote may be password
 # data, even when not doubled or escaped. Omit excess detail rather than
 # leave part of that credential visible. Linear: the password run is
 # possessive, so an attempt that fails read fewer than 1,025 password
 # characters, and one that succeeds consumes all it read.
-_LONG_USERINFO = re.compile(rf"(://){_USER_CHAR}{{0,256}}:\S{{1025,}}+")
+_LONG_USERINFO = re.compile(rf"(://)(?:{_USER_CHAR}|@){{0,256}}:\S{{1025,}}+")
 # A user over 256 characters overflows the same way, once a : or an @ ends it.
 # A short password may hold a :// and a long run after it, so this rule runs
 # after _USERINFO has masked the user and password around that run. Linear:
@@ -496,8 +522,9 @@ _LONG_USER = re.compile(rf"(://){_USER_CHAR}{{257,}}+[:@]\S*+")
 # character but a lone " (a quoted user, as a quoted name, holds at most 128).
 # A proxy login names the user it connects as in brackets after the user,
 # double-quoted or not (proxy[scott]/pw@host, proxy["Scott Lee"]/pw@host).
-# The host may be a name, an address, an IPv6 address in brackets or a
-# connect descriptor in parentheses (pw@(DESCRIPTION=...)). Linear: an
+# The host may be a name, an address, an IPv6 address in brackets, a
+# connect descriptor in parentheses (pw@(DESCRIPTION=...)) or a placeholder
+# the code fills in ({host}, %(host)s, $HOST). Linear: an
 # unquoted user is at most 128 characters of one word. A quoted user starts
 # at a quote no quote comes right before, reads at most 128 units and gives
 # none back, so it ends at the first lone quote and at most one reaches each
@@ -511,7 +538,7 @@ _LONG_USER = re.compile(rf"(://){_USER_CHAR}{{257,}}+[:@]\S*+")
 _EZCONNECT = re.compile(
     r"(?<![\w$#./:-])(?:[A-Za-z_][\w$#]{0,127}|(?<!\")\"(?:[^\"\n]|\"\"){1,128}+\")"
     r"(?:\[(?:\"(?:[^\"\n]|\"\"){1,128}+\"|[^\]\s/@]{1,128}+)\])?"
-    r"/(?:\"(?:[^\"\n]|\"\")*+\"|(?P<bare>(?:[^\s/@'\"]|''|\"\")++))@(?=[\w./(\[-])"
+    r"/(?:\"(?:[^\"\n]|\"\")*+\"|(?P<bare>(?:[^\s/@'\"]|''|\"\")++))@(?=[\w./(\[{$%-])"
 )
 # Hosts whose URL path is itself a credential: Slack (and GovSlack), Discord,
 # Microsoft Teams and Zapier webhooks, IFTTT's Maker key, and a Telegram
@@ -552,25 +579,29 @@ _QUOTED_VALUE = (
     r"(?:(?P<single>')(?:''|\\[\s\S]|[^'\\])*+(?P<single_close>')?"
     r"|(?P<double>\")(?:\"\"|\\[\s\S]|[^\"\\])*+(?P<double_close>\")?)"
 )
-# A secret key's value in quotes after its key, the key quoted or not:
-# password='a b c', "token": "x", 'Authorization': 'Bearer x'.
-_QUOTED_SECRET = re.compile(
-    rf"(?P<key>(?<![\w.-])[\"']?{_SENSITIVE_NAME}[\"']?{_ASSIGN}){_QUOTED_VALUE}",
-    re.IGNORECASE,
-)
-# The rules below mask a password a SQL statement sets with a keyword rather
-# than a key=value pair, which a split the readings miss can list after a
-# query (cell_queries._statements) and a string literal can hold.
-#
-# A string's introducer before its opening quote: Postgres's E'', a national
-# N'' string or MySQL's _charset'' (_utf8mb4'x'). It stays with the key.
-_INTRODUCER = r"(?:(?:[EeNn]|_\w{1,32}+)(?=['\"]))?"
 # A value's opening quote, followed by the value's first character rather
 # than a space, a comma or a ). The quote that closes a literal ending in a
 # keyword and a space ('Your password ' || name) is followed by one of
 # those, so it is not read as the opening quote of a value that would run on
 # to the next quote or the end of the text.
 _VALUE_START = r"(?=['\"](?:['\"]|[^\s,)]))"
+# A string's introducer before a value's opening quote: Postgres's E'', a
+# national N'' string or MySQL's _charset'' (_utf8mb4'x'). It stays with the
+# key. An unquoted value that starts with _ before the quote that closes its
+# literal (pwd=_x') is no introducer when a space, a comma or a ) follows
+# that quote.
+_INTRODUCER = rf"(?:(?:[EeNn]|_\w{{1,32}}+){_VALUE_START})?"
+# A secret key's value in quotes after its key, the key quoted or not, with
+# or without a string's introducer: password='a b c', "token": "x",
+# 'Authorization': 'Bearer x', PASSWORD=N'a b'.
+_QUOTED_SECRET = re.compile(
+    rf"(?P<key>(?<![\w.-])[\"']?{_SENSITIVE_NAME}[\"']?{_ASSIGN}{_INTRODUCER}){_QUOTED_VALUE}",
+    re.IGNORECASE,
+)
+# The rules below mask a password a SQL statement sets with a keyword rather
+# than a key=value pair, which a split the readings miss can list after a
+# query (cell_queries._statements) and a string literal can hold.
+#
 # A quoted value after a secret key's name and whitespace, the key quoted or
 # not (Postgres's CREATE ROLE ... PASSWORD 'x', DuckDB's CREATE SECRET (...,
 # SECRET 'x', SESSION_TOKEN 'y'), a foreign server's OPTIONS (password 'x')),
@@ -927,6 +958,18 @@ def _in_memory_folder(*, path: str) -> bool:
     )
 
 
+def _run_time_path(*, text: str) -> bool:
+    """Whether ``text``, a string the cell reader found, is a path outside a
+    memory folder that the code fills in when the cell runs: it holds a
+    part the reader writes in braces, or a glob's * (``_RUN_TIME_PART``),
+    and a slash or a backslash."""
+    return (
+        _RUN_TIME_PART.search(text) is not None
+        and ("/" in text or "\\" in text)
+        and not _in_memory_folder(path=text)
+    )
+
+
 def _latest_cells(steps: Sequence[TurnStep], *, limit: int) -> Sequence[TurnStep]:
     """``steps`` from the ``limit``-th last cell that ran on, or all of them
     when fewer cells ran."""
@@ -993,16 +1036,24 @@ def _describe_cell(
     step making no request, whose only sources are the memory files it read
     and ``memory_cells``, the earlier cells this rule left out: what it
     prints is what the agent memorized, read here or in an earlier cell. A
-    request whose URL the code builds at run time may fetch live data, so a
-    cell that makes one stays a step.
+    request whose URL the code builds at run time may fetch live data, and
+    so may a file read whose path the code builds at run time outside the
+    memory folder (``_run_time_path``: data/{f} for os.path.join("data",
+    f)), though that path ends in no document's extension. So a cell that
+    makes such a request, or holds such a path that it neither writes to
+    nor only prints, stays a step.
 
     The rule misses what the cell reader does not see: a cell that also
     computes a figure from numbers its code writes, or loads data through a
     call the reader does not classify (a library's download, a pickle, a
-    query held in a name), is left out with its figures; and a memory path
-    the code builds from a name (f"{MEM}/lessons.md") or finds by listing
-    the folder (os.listdir(".anton/memory")) is read as any other file, so
-    the cell names it or stays a step."""
+    query held in a name) or from a path a name holds alone (pd.read_csv(f)
+    for each f in files), for which the reader names no string, is left out
+    with its figures; and a memory path the code builds from a name
+    (f"{MEM}/lessons.md") or finds by listing the folder
+    (os.listdir(".anton/memory")) is read as any other file, so the cell
+    names it or stays a step. A string with a part the code fills in and a
+    slash that names no file (key = f"{region}/{year}") keeps a cell that
+    reads only memory files a step too."""
     output = cell.stdout if cell is not None else ""
     description = cell.description if cell is not None else ""
     # A separately printed caption is not a pandas index name. Keep line
@@ -1033,7 +1084,12 @@ def _describe_cell(
     elif web_page is not None:
         url = _web_url(web_page)
         kind, label = SourceKind.web, _web_label(web_page)
-    elif not reading.requests and (read or drawn_from) and drawn_from <= memory_cells:
+    elif (
+        not reading.requests
+        and not any(_run_time_path(text=text) for text in reading.strings if text not in not_read)
+        and (read or drawn_from)
+        and drawn_from <= memory_cells
+    ):
         return None
     else:
         kind, label = SourceKind.step, description
@@ -1054,9 +1110,10 @@ def _describe_cell(
 def _describe_tool(step: TurnStep) -> _DescribedStep:
     """A call of a tool ``is_evidence_tool`` counts: a web search or fetch;
     a connector tool that returns the customer's records, a query named by
-    its engine, connection and tool, whose result is read as the tool
-    returned it less its ISO date-times and may only echo the call's input;
-    or read_text_file, a file read by its path, where the line-range header
+    its engine, connection and tool that lists the statement the call ran
+    when its arguments hold one as sql, whose result and input are read
+    less their ISO date-times and whose result may only echo its input; or
+    read_text_file, a file read by its path, where the line-range header
     and shortened-line marks are not the file's text and the line range it
     asked for is not a figure the model wrote. A read without a path is a
     step named by the tool."""
@@ -1064,6 +1121,7 @@ def _describe_tool(step: TurnStep) -> _DescribedStep:
     output, literals = step.content, step.tool_input.text
     url = None
     documents: tuple[str, ...] = ()
+    queries: tuple[str, ...] = ()
     connector = _records_tool(name=step.tool_name)
     if step.tool_name in WEB_TOOLS:
         url = _web_url(arguments.url or _found_url(output))
@@ -1071,10 +1129,14 @@ def _describe_tool(step: TurnStep) -> _DescribedStep:
         label = _web_label(url) if url else arguments.query
     elif connector is not None:
         kind, label = SourceKind.query, _connector_label(parts=connector)
+        queries = (arguments.sql,) if arguments.sql else ()
         # A record's timestamps are not figures, and their minutes and zone
-        # offsets would source almost any small number. Each is blanked in
-        # place, so every other number keeps its offset.
-        output = _ISO_DATETIME.sub(lambda match: " " * len(match.group(0)), output)
+        # offsets would source almost any small number. A date-time in the
+        # call's input, such as a filter's, would make the records' values
+        # equal to its hour, minutes or seconds read as echoes. Each is
+        # blanked in place, so every other number keeps its offset.
+        output = _ISO_DATETIME.sub(_blanked, output)
+        literals = _ISO_DATETIME.sub(_blanked, literals)
     else:
         output = _SHORTENED_LINE.sub("", _TEXT_RANGE_HEADER.sub("", output))
         path = arguments.path
@@ -1088,11 +1150,16 @@ def _describe_tool(step: TurnStep) -> _DescribedStep:
         label=label,
         url=url,
         documents=documents,
-        queries=(),
+        queries=queries,
         requests=(),
         output=output,
         literals=literals,
     )
+
+
+def _blanked(match: re.Match[str]) -> str:
+    """``match``'s text as spaces, so every other number keeps its offset."""
+    return " " * len(match.group(0))
 
 
 def _described(
@@ -1182,17 +1249,20 @@ def _redacted(text: str) -> str:
       xapp-), Stripe secret and restricted keys (sk_, rk_), Hugging Face
       (hf_) and Google OAuth (ya29.) tokens, JWTs and PEM private keys;
     - a URL's user and password, the user holding a doubled or escaped
-      quote, or a lone quote before a letter, a digit or an underscore (on
-      overflow, a password over 1,024 characters or a user over 256, its
-      whole non-whitespace span, including ambiguous SQL quotes, even when
-      the password holds an @), an Oracle EZConnect string's user and
+      quote, a lone quote before a letter, a digit or an underscore, or,
+      before a password with no raw /, ?, #, ;, comma, & or quote ahead of
+      its @, an @ (jane@corp.com:pw@host) (on overflow, a password of which over 1,024
+      characters reach this sweep or a user over 256, its whole
+      non-whitespace span, including ambiguous SQL quotes, even when the
+      password holds an @), an Oracle EZConnect string's user and
       password, either one double-quoted or not, a proxy login's bracketed
-      user, quoted or not, included, before a host name, an IPv6 address or
-      a connect descriptor (and when an unquoted password holds a secret
-      key's name and =, : or =>, the part after the @ up to where a key's
-      value ends), a URL's query string and fragment after a path of any
-      length, and the path of a Slack, Discord, Teams, Zapier, IFTTT or
-      Telegram bot URL;
+      user, quoted or not, included, before a host name, an IPv6 address, a
+      connect descriptor or a placeholder the code fills in ({host},
+      %(host)s, $HOST) (and when an unquoted password holds a secret key's
+      name and =, : or =>, the part after the @ up to where a key's value
+      ends), a URL's query string and fragment after a path of any length,
+      and the path of a Slack, Discord, Teams, Zapier, IFTTT or Telegram bot
+      URL;
     - a bearer token;
     - a password a SQL statement sets with a keyword (``_KEYWORD_SECRET``,
       ``_IDENTIFIED_BY``, ``_REPLACED_SECRET``): a quoted value after a
@@ -1208,8 +1278,12 @@ def _redacted(text: str) -> str:
       key, private key, authorization, credential, cookie or signature, or
       whose last part is pass or sig, on its own or after _, - or . (pass,
       db_pass, sig; not dbpass) (``_SENSITIVE_NAME``). A quoted value keeps
-      its quotes, and an ODBC value in braces (Pwd={a;b}) is masked to its
-      closing brace.
+      its quotes, and a string's introducer before them stays after a
+      quoted key ("password": N'a b' becomes "password": N'[redacted]').
+      After an unquoted key, the unquoted-value rule masks the introducer
+      and the mask again, so only the closing quote stays (PASSWORD=N'a b'
+      becomes PASSWORD=[redacted]'). An ODBC value in braces (Pwd={a;b}) is
+      masked to its closing brace.
 
     It does not redact, and these go through as written:
 
@@ -1225,6 +1299,24 @@ def _redacted(text: str) -> str:
       masked;
     - a URL with no scheme (//bob:pw@host): every user and password rule
       starts at ://;
+    - the part of a URL password over 1,024 characters before a raw # or ?
+      in it, in a web step's label, link and request
+      (https://bob:Tr0ub4dor#<1,100 characters>@host reads
+      https://bob:Tr0ub4dor): ``strip_url`` keeps a user and password too
+      long for its window and cuts the URL at that # or ?, so the text that
+      reaches this sweep has no @ and a password under 1,025 characters;
+    - a password that holds a /, ?, #, ;, comma, & or quote after a user
+      that holds an @, and the user's part after its @
+      (snowflake://jane@corp.com:Pw/x@acct reads
+      snowflake://***@corp.com:Pw/x@acct): such a user's password runs only
+      to an @ before any of them, so that a user, a host and a port before a
+      path, query string, parameter or next literal that holds an @
+      (mysql://app@db:3306/s?password=P@ss) are not read as one user and
+      password;
+    - the part of a query string's value after its last @, after a user
+      with no @ and a password (postgresql://app:pw@db/x?password=P@ss reads
+      postgresql://***@ss): that user's password, which may hold /, ? or #,
+      runs to the last @;
     - the part of an unquoted EZConnect password after an @ in it
       (scott/pw@x@host): the rule ends the password at its first @;
     - an EZConnect login whose user is over 128 characters, or that comes
@@ -1243,18 +1335,21 @@ def _redacted(text: str) -> str:
       closes a literal ending in the keyword ('Your password ' || name);
     - a password set after a secret key's name in dollar quotes (PASSWORD
       $$x$$), with no space or with a comment between the name and the
-      value (PASSWORD'x', PASSWORD /* c */ 'x'), or through MySQL's
-      PASSWORD() function (SET PASSWORD FOR bob = PASSWORD('x')):
-      ``_KEYWORD_SECRET`` reads only a quote right after the name's
-      whitespace or the =.
+      value (PASSWORD'x', PASSWORD /* c */ 'x'), after TO (SET
+      s3_secret_access_key TO 'x'), or through MySQL's PASSWORD() function
+      (SET PASSWORD FOR bob = PASSWORD('x')): ``_KEYWORD_SECRET`` reads only
+      a quote right after the name's whitespace or the =;
+    - a password after IDENTIFIED BY with a comment between the two words
+      (IDENTIFIED/**/BY x, IDENTIFIED -- c<newline>BY x):
+      ``_IDENTIFIED_BY`` reads only whitespace between its words.
 
     It masks more than the secret in these cases, on display only:
 
     - a password over 1,024 characters, a user over 256, a password followed
-      by more than 1,024 characters of host and path, or a host:port
-      followed by more than 1,024 characters of path: everything after the
-      :// up to the next space is masked, quotes and the SQL after them
-      included;
+      by more than 1,024 characters of host and path, or a host:port, with
+      or without a user before it, followed by more than 1,024 characters of
+      path: everything after the :// up to the next space is masked, quotes
+      and the SQL after them included;
     - any :// followed by more than 256 characters with no /, ?, #, @ or :
       in them, then a : or an @ (a long JDBC property list,
       jdbc:sqlserver://h;a=b;...;keyStoreLocation=C:\\k): everything after
@@ -1264,6 +1359,10 @@ def _redacted(text: str) -> str:
       masked with the URL's user, unless a quote that no letter, digit or
       underscore follows ends the user name first ('s3://bucket','me@corp'
       stays);
+    - a URL's host and port with no user before them, when an @ follows in
+      the same run of non-whitespace (https://h:8443/u/a@b): the host reads
+      as a user and the port and path up to the last @ as its password, and
+      both are masked;
     - a value after a column or key name that holds a secret word, or
       whose last part is pass or sig, though it names no secret
       (password_hint = 'pet name', signature_count = 5, email_signature:
@@ -1277,6 +1376,16 @@ def _redacted(text: str) -> str:
       followed by an @ ("Col Name"/a@x), or a subscripted column divided
       by anything followed by an @ (a[1]/b@x), reads as an EZConnect string
       and becomes ***@x;
+    - a word divided by a word followed by an @ and a letter, a digit, {,
+      $ or % (revenue/unit@five, revenue/unit@$5, a/b@{x}, growth/yr@%5):
+      it reads as an EZConnect login before a host, or before a
+      placeholder the code fills in, and becomes ***@five or ***@$5;
+    - an unquoted secret value that starts with _ or is a lone E or N,
+      right before the quote that closes its literal, when a character
+      other than a space, a comma or a ) follows that quote
+      ('Password=_x';...): it reads as a string's introducer, so that quote
+      opens a quoted value that runs to the next quote or the end of the
+      text, and the mask takes the SQL in between;
     - a secret key's value that opens with a brace and has no closing
       brace: it is masked to the end of its line;
     - the word after "identified by" in prose ("rows identified by
@@ -1385,12 +1494,14 @@ def _web_label(url: str) -> str:
     password ends urlsplit's host there instead, and the rest of it reads as
     a port that does not parse. So when the port does not parse, the label
     is built from what follows the last @, or is the stripped URL when no @
-    is left, which ``_redacted`` masks as a long user or password; a port
-    out of range reads the same way. urlsplit lowercases the host and writes
-    the port as a number (Example.COM:08080 reads example.com:8080). A long
-    password whose part before the / reads as a port
-    (bob:8080/<over 1,024 characters>@host) still shows in the label as a
-    host and a path."""
+    is left; a port out of range reads the same way. ``_redacted`` masks
+    that stripped URL as a long user or password only when over 1,024
+    characters of the password are left in it: a raw # or ? earlier in a
+    long password, where strip_url cuts, leaves the part before it in the
+    label. urlsplit lowercases the host and writes the port as a number
+    (Example.COM:08080 reads example.com:8080). A long password whose part
+    before the / reads as a port (bob:8080/<over 1,024 characters>@host)
+    still shows in the label as a host and a path."""
     stripped = strip_url(url)
     try:
         parts = urlsplit(stripped)
@@ -1636,9 +1747,21 @@ def _unlabeled(output: str) -> str:
     with no colon that the cell's code does not write as a literal, such as
     print(title) with a title a function returned, which reads as the
     index's name (``_describe_cell`` blanks a caption the code spells, as in
-    print("Results"), before this runs); and a frame whose columns have a
-    name, after reset_index() and a sort, since its header is not indented
-    or the columns' level names sit between it and the rows."""
+    print("Results"), before this runs); a frame whose columns have a name,
+    after reset_index() and a sort, since its header is not indented or the
+    columns' level names sit between it and the rows; a frame printed right
+    after a print whose index has a name, when its header is as wide as that
+    print's first row and its column name holds a digit, is as wide as one
+    of that row's values and starts where that value starts ("          q3"
+    under "1         22"), or one column off it where a minus sign stands in
+    that value or in the column name ("          q3" under "1        -16",
+    "         -12" under "1         13"), since the header reads as an inner
+    MultiIndex row and the frame's rows join the named run; and a Series whose
+    index has no name that anton's sample() prints after a sort
+    (sample(df.qty.nlargest(3))), since sample() prints the rows with
+    to_string() under its "Head (10):" or "First 3:" caption, with no
+    footer, so rows out of order read as values printed by hand where
+    labels go."""
     lines = output.split("\n")
     labels = [_ROW_LABEL.match(line) for line in lines]
     index = 0
@@ -1647,17 +1770,20 @@ def _unlabeled(output: str) -> str:
             index += 1
             continue
         first = index
-        # pandas aligns an inner row with the rows around it and indents it
-        # past the outer key, so it is as wide as the run's first row and its
-        # indent is wider than that row's key. The next print's indented
-        # header joins the run only when it passes both and holds a digit, as
-        # a column much wider than its short name with a digit can.
+        # pandas aligns an inner row with the rows around it and leaves its
+        # outer keys blank, so it is as wide as the run's first row and its
+        # key starts where one of that row's later fields starts
+        # (``_starts_at_a_field``). The next print's indented header joins
+        # the run only when it passes both and holds a digit, as a column
+        # name as wide as the value above it and starting where it starts
+        # can.
+        field_starts = _field_starts(lines[first], after=labels[first].end())
         while index < len(lines) and (
             labels[index] is not None
             or _TRUNCATED.fullmatch(lines[index]) is not None
             or (
                 len(lines[index]) == len(lines[first])
-                and len(lines[index]) - len(lines[index].lstrip()) > labels[first].end()
+                and _starts_at_a_field(lines[index], first_row=lines[first], field_starts=field_starts)
                 and _INNER_ROW.match(lines[index]) is not None
             )
         ):
@@ -1679,7 +1805,27 @@ def _unlabeled(output: str) -> str:
         ):
             for row, label in run:
                 lines[row] = " " * label.end() + lines[row][label.end():]
-    return _SHAPE.sub(lambda match: " " * len(match.group(0)), "\n".join(lines))
+    return _SHAPE.sub(_blanked, "\n".join(lines))
+
+
+def _field_starts(line: str, *, after: int) -> set[int]:
+    """Each column where a field of ``line`` past column ``after`` starts."""
+    return {match.start() for match in _FIELD_START.finditer(line) if match.start() > after}
+
+
+def _starts_at_a_field(line: str, *, first_row: str, field_starts: Set[int]) -> bool:
+    """Whether ``line`` starts where pandas starts an inner MultiIndex key
+    under ``first_row``, whose later fields start at ``field_starts``: at
+    one of them, or a column off one where a minus sign stands. pandas
+    leaves a column before a key for its minus sign, so a -2 under a 0
+    starts a column left of the 0, and a 0 under a -2 a column right of the
+    -2's minus sign."""
+    indent = len(line) - len(line.lstrip())
+    return (
+        indent in field_starts
+        or (indent + 1 in field_starts and line[indent] == "-")
+        or (indent - 1 in field_starts and first_row[indent - 1] == "-")
+    )
 
 
 def _names_index(line: str, *, header: str, over_footer: bool) -> bool:

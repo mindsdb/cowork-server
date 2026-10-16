@@ -273,12 +273,12 @@ def _captured_turn_history(*, session: "ChatSession", seed_len: int | None, comp
     figures in them, and the next turn replays this one as text only. A turn
     that did not compact stores its rows.
 
-    An anton without `turn_messages` (desktop installs resolve anton from the
-    floor in pyproject.toml) gets the slice of `session.history` past
-    `seed_len`, and no rows after a compaction: the compaction replaced the
-    list, so the slice could drop rows or keep a tool_result whose tool_use
-    was folded away. A session with neither `turn_messages` nor `history`
-    has no rows.
+    An anton without `turn_messages` (PyPI-channel desktop installs resolve
+    anton from the floor in pyproject.toml) gets the slice of
+    `session.history` past `seed_len`, and no rows after a compaction: the
+    compaction replaced the list, so the slice could drop rows or keep a
+    tool_result whose tool_use was folded away. A session with neither
+    `turn_messages` nor `history` has no rows.
     """
     if hasattr(session, "turn_messages"):
         turn_slice = session.turn_messages()
@@ -1143,9 +1143,10 @@ class AntonHarness:
             return path if path.is_absolute() else base / path
 
         artifacts_dir = anton_dir / "artifacts"
-        # Skills the agent builds stage here (sibling of artifacts, under the
-        # off-limits .anton/) — never the live skills store, so a built skill is
-        # surfaced as a draft card rather than auto-saved.
+        # Skills the agent builds stage here, a sibling of artifacts and the one
+        # .anton/ folder besides the artifacts the agent writes in. It is never
+        # the live skills store, so a built skill is surfaced as a draft card
+        # rather than auto-saved.
         skill_drafts_dir = anton_dir / "skill_drafts"
         context_dir = _settings_path(getattr(anton_settings, "context_dir", None), anton_dir / "context")
         episodes_dir = anton_dir / "episodes"
@@ -1207,7 +1208,8 @@ class AntonHarness:
             # so the name here never has to resolve to anything (ENG-1676).
             f"You are operating in the project {display_label(conversation.project)}. "
             f"You have access to all of the files in the project at {str(base)} except for the .anton/ directory "
-            f"(the artifacts under `{str(artifacts_dir)}` are the exception). "
+            f"(the artifacts under `{str(artifacts_dir)}` and the skill drafts under `{str(skill_drafts_dir)}` "
+            "are the exceptions). "
             "Everything else in .anton/ is off limits. Do not mention the .anton/ directory in your responses. "
             "You can perform operations on these files via the scratchpad. "
             + _project_file_actions_rule(anton_settings.act_first)
