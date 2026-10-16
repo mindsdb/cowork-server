@@ -428,6 +428,7 @@ class RedisStreamBuffer(StreamBuffer):
         rec = self._record(fields)
         self._next_seq = rec.seq + 1
         self._closed = rec.is_terminal
+        self._finishing = _is_final_client_frame(rec.type, rec.data)
 
     async def _terminate_as_orphan(self) -> AsyncIterator[TurnRecord]:
         """Close an abandoned turn, and yield the terminal record.
