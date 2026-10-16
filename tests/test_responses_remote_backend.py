@@ -1730,7 +1730,8 @@ def _saved_figures(saved) -> dict[str, dict]:
 
 
 @pytest.mark.asyncio
-async def test_produce_remote_finds_a_figure_in_a_tool_result_only_the_pods_rows_carry(monkeypatch):
+@pytest.mark.parametrize("ok", [True, False, None])
+async def test_produce_remote_finds_a_figure_in_a_tool_result_only_the_pods_rows_carry(monkeypatch, ok):
     """The pod streams a result only for the scratchpad, so a web page's
     arrives in the turn's rows. The figure is found in the page as the agent
     read it, though the rows saved for replay cap it."""
@@ -1749,6 +1750,7 @@ async def test_produce_remote_finds_a_figure_in_a_tool_result_only_the_pods_rows
     async def fake_replies(**kwargs):
         yield "turn_step", {"step": "tool_start", "id": "w1", "name": "web_fetch"}
         yield "turn_step", {"step": "tool_end", "id": "w1", "args": json.dumps({"url": "https://example.com/rates"})}
+        yield "turn_step", {"step": "progress", "phase": "tool_done", "id": "w1", "ok": ok}
         yield "turn_delta", {"text": "Overtime costs $42 an hour."}
         yield "turn_history", {"rows": rows}
         yield "turn_completed", {}
@@ -1760,7 +1762,9 @@ async def test_produce_remote_finds_a_figure_in_a_tool_result_only_the_pods_rows
         model="anton", harness_id="anton", buffer=_FakeBuffer(),
     )
 
-    assert _saved_figures(saved)["$42"]["sources"] == [{"tool_use_id": "w1", "page": None}]
+    figure = _saved_figures(saved)["$42"]
+    assert figure["sources"] == ([{"tool_use_id": "w1", "page": None}] if ok is True else [])
+    assert figure["origin"] == ("step" if ok is True else "none")
     # Saved once, as the turn's tool rows, capped for replay.
     assert saved["tool_rows"][1]["content"][0]["content"].startswith("[tool output omitted")
     assert not [e for e in saved["events"] if e.get("type") == "response.turn_history"]
