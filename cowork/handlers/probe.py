@@ -335,6 +335,33 @@ class ProbeHandler:
                 yield await _completed(db_conversation_id, {"status": "success", "user_label": saved_user_label})
                 return
 
+            # A follow-up step is probed with the fields of the connection it
+            # extends too; the save below still merges them once, under the vault lock.
+            probe_credentials = credentials
+            saved_only_fields: set[str] = set()
+            if extends_name:
+                try:
+                    target = vault_for_scope(self.scope).read_record(connector_id, extends_name)
+                except Exception as exc:
+                    logger.warning("Could not read connection %s to extend: %s", extends_name, exc)
+                    yield _delta(f"Could not read `{extends_name}`: `{exc}`.")
+                    yield await _completed(db_conversation_id, {"status": "failed"})
+                    return
+                if target is None:
+                    missing = f"No {connector_id} connection named {extends_name!r} to add these fields to."
+                    yield _delta(missing)
+                    yield _patch_delta({"form_id": form_id, "form_error": missing})
+                    yield await _completed(db_conversation_id, {"status": "failed"})
+                    return
+                stored = {k: v for k, v in target.get("fields", {}).items() if not k.startswith("_")}
+                probe_credentials = {**stored, **credentials}
+                step_field_names: set[str] = set()
+                field_lists = [form_spec.get("fields") or []]
+                field_lists += [m.get("fields") or [] for m in form_spec.get("methods") or [] if isinstance(m, dict)]
+                for fields in field_lists:
+                    step_field_names.update(f.get("name") for f in fields if isinstance(f, dict))
+                saved_only_fields = set(stored) - step_field_names
+
             # Probe path: build workspace + LLM client
             if workspace_path is None:
                 _temp_workspace_dir = tempfile.mkdtemp(prefix="cowork-probe-")
@@ -391,13 +418,14 @@ class ProbeHandler:
 
             probe = CredentialProbe(
                 engine=connector_id,
-                credentials=credentials,
+                credentials=probe_credentials,
                 llm_client=llm_client,
                 workspace=workspace,
                 form_spec=form_spec,
                 skipped=skipped,
                 usage_notes=registry.usage_notes_for([connector_id]).get(connector_id),
                 web_tool_kwargs=web_tools,
+                saved_fields=sorted(saved_only_fields),
             )
             try:
                 async for kind, payload in probe.run():
@@ -411,13 +439,15 @@ class ProbeHandler:
                         })
                     elif kind == "field_status":
                         field_name = (payload or {}).get("name")
-                        if field_name:
+                        # A patch for a field the form doesn't hold would add it,
+                        # untyped, so a saved secret typed there would show.
+                        if field_name and field_name not in saved_only_fields:
                             status_val = (payload or {}).get("status")
                             mid = (payload or {}).get("method_id")
                             yield _patch_delta(_field_patch(form_id, mid, field_name, {"status": status_val}))
                     elif kind == "remove_field":
                         field_name = (payload or {}).get("name")
-                        if field_name:
+                        if field_name and field_name not in saved_only_fields:
                             mid = (payload or {}).get("method_id")
                             yield _patch_delta(_field_patch(form_id, mid, field_name, None))
                     elif kind == "switch_method":
