@@ -44,6 +44,20 @@ async def request_remote_cancel(correlation_id: str, *, stalled: bool = False) -
         await pipe.execute()
 
 
+async def cancel_conversation_turn(conversation_id: str) -> bool:
+    """Ask the pod running this conversation's current turn to stop, from any
+    replica and without its local producer. Returns whether a cancel was
+    issued: never on the in-process backend, where no pod outlives the
+    process that ran the turn, nor when no turn is recorded for it."""
+    if not remote_backend():
+        return False
+    turn = await get_turn(conversation_id)
+    if turn is None:
+        return False
+    await request_remote_cancel(turn["correlation_id"])
+    return True
+
+
 async def stop_turn(handle: RunHandle, *, stalled: bool = False, timed_out: bool = False) -> bool:
     """Stop the turn behind ``handle``. Returns whether a cancel was issued.
 

@@ -140,20 +140,25 @@ def run_schedule_now(schedule_id: UUID, scoped: ScopedSessionDep, background_tas
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
 
-    from cowork.scheduler import admission, claim_manual_run, run_occurrence
+    from cowork.scheduler import RunCapReached, admission, claim_manual_run, run_occurrence
     from cowork.services.conversations import ConversationService
 
+    too_many = HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail="Too many scheduled tasks are running right now. Run this one when one of them finishes.",
+    )
     # Counted with the cron runs: a run-now past the cap would start one more
     # turn than this process runs at once.
     if not admission.reserve():
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Too many scheduled tasks are running right now. Run this one when one of them finishes.",
-        )
+        raise too_many
     try:
         # Claim before creating anything: a schedule already running (or
         # waiting to retry) refuses a second run rather than overlapping it.
         occurrence_id = claim_manual_run(scoped, schedule.id)
+    except RunCapReached:
+        # The organization's runs on every replica, not only this one's.
+        admission.unreserve()
+        raise too_many
     except BaseException:
         admission.unreserve()
         raise
