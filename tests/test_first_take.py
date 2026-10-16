@@ -1,5 +1,5 @@
 """The instant first take: a short reply on the gate's model that fills the
-wait on a delegated turn and heads Anton's steps until the turn ends."""
+wait on a delegated turn and hands over to Anton as soon as Anton speaks."""
 
 from __future__ import annotations
 
@@ -269,11 +269,16 @@ async def test_cancel_before_any_stream_writes_nothing():
     assert buffer.frames == []
 
 
-def test_what_takes_it_off_screen():
+def test_what_takes_its_place():
+    def frame(kind, **data):
+        return f"event: {kind}\ndata: {json.dumps({'type': kind, **data})}\n\n"
+
+    assert ft.clears_take("response.output_text.delta", frame("response.output_text.delta", delta="Here"))
+    assert not ft.clears_take("response.output_text.delta", frame("response.output_text.delta", delta="\n\n"))
     for kind in ("response.ask_user", "response.completed", "response.failed"):
-        assert ft.clears_take(kind)
-    for kind in ("response.created", "response.output_text.delta", "response.in_progress", None):
-        assert not ft.clears_take(kind)
+        assert ft.clears_take(kind, frame(kind))
+    for kind in ("response.created", "response.in_progress", "response.artifact_created"):
+        assert not ft.clears_take(kind, frame(kind))
 
 
 # ── where it starts ────────────────────────────────────────────────────────
@@ -458,10 +463,9 @@ def test_the_setting_defaults_on():
 
 
 @pytest.mark.asyncio
-async def test_the_take_stays_through_antons_words_and_clears_at_the_end():
+async def test_the_turn_clears_it_right_before_anton_speaks():
     """In-process producer, end to end: created, then the take's words, then
-    Anton's words with the take still up, then its clear as the turn ends.
-    Nothing of it reaches the saved turn."""
+    its clear, then Anton's first words. Nothing of it reaches the saved turn."""
     from unittest.mock import MagicMock, patch
     from types import SimpleNamespace
     from uuid import uuid4
@@ -497,7 +501,7 @@ async def test_the_take_stays_through_antons_words_and_clears_at_the_end():
 
     kinds = [frame.split("\n", 1)[0].removeprefix("event: ") for frame in buffer.frames]
     assert kinds[0] == "response.created"
-    assert kinds.index(ft.DELTA) < kinds.index("response.output_text.delta") < kinds.index(ft.CLEARED)
+    assert kinds.index(ft.DELTA) < kinds.index(ft.CLEARED) < kinds.index("response.output_text.delta")
     assert kinds.count(ft.CLEARED) == 1
     assert all(k not in kinds[kinds.index(ft.CLEARED) + 1:] for k in (ft.DELTA, ft.DONE))
     saved_text = json.dumps([str(c) for c in conv_svc.return_value.save_assistant_turn.call_args_list])

@@ -4,8 +4,9 @@ A delegated turn shows nothing until Anton's first model call speaks, which is
 seconds on a quick turn and much longer when it goes straight to tools. The
 first take fills that gap: a short, tool-free reply on the gate's fast model,
 started alongside the gate, saying what the user asked for and that the work is
-under way. The renderer shows it muted above the thinking block, so the steps
-read under it, until Anton asks the user something or the turn ends.
+under way. The renderer shows it muted above the thinking block until Anton
+writes its own text, asks the user something, or the turn ends: one sentence on
+screen at a time, never two.
 
 It is a placeholder, never an answer:
 
@@ -58,9 +59,9 @@ _TOTAL_SECONDS = 12.0
 _SYSTEM_PROMPT = """You write the first, instant reply in Cowork, an assistant
 that analyzes data, connects to services, runs code and builds things for the
 user. The full assistant is already working on the user's latest message, and
-yours is what the user reads above its work while it runs.
+yours is what the user reads until it starts writing.
 
-Show in one or two short sentences (under 40 words) that you understood what
+Show in one short sentence (under 30 words) that you understood what
 they asked for, and say what you are going to look at or do. Write as the one
 doing the work, in the user's language, plain text, no markdown, no emoji.
 
@@ -120,10 +121,18 @@ DONE = "response.first_take.done"
 CLEARED = "response.first_take.cleared"
 
 
-def clears_take(event_type: str | None) -> bool:
-    """Whether a turn frame takes the first take off screen. Anton's own text
-    does not: it streams into the thinking block, which the take heads."""
-    return event_type in {"response.ask_user", "response.completed", "response.failed"}
+def clears_take(event_type: str | None, sse: str) -> bool:
+    """Whether a turn frame takes the first take's place: Anton's own words, a
+    question, or the turn's end. A blank text delta is not Anton speaking."""
+    if event_type in {"response.ask_user", "response.completed", "response.failed"}:
+        return True
+    if event_type != "response.output_text.delta":
+        return False
+    try:
+        data = json.loads(sse.split("data: ", 1)[1])
+    except (IndexError, ValueError):
+        return True
+    return bool(str(data.get("delta") or "").strip())
 
 
 class FirstTake:
@@ -217,7 +226,7 @@ class FirstTake:
             outcome = type(exc).__name__
         finally:
             if outcome not in {"shown", "empty", "withdrawn"} and self._first_word_at is not None:
-                # A cut-off fragment must not stay above the steps all turn.
+                # A cut-off fragment must not stay on screen.
                 self._queue.put_nowait(_sse(CLEARED, {}))
             self._queue.put_nowait(_FINISHED)
             # warning, not info: deployments log at WARNING, and this line is

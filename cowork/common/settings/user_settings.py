@@ -803,7 +803,7 @@ class UserSettings(Settings):
         title="Instant first take",
         description=(
             "While the agent works, show a quick reply on the fast model saying "
-            "what it is about to do, above its steps until the turn ends."
+            "what it is about to do, until the agent starts writing."
         ),
     )
     # ── Advanced agent budgets ──

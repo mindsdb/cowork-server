@@ -2216,7 +2216,7 @@ class ResponsesHandler:
                 replies_as_stream_events(), model or "", event_sink,
             ):
                 event_type = self._sse_event_type(sse)
-                if first_take is not None and first_take_clears(event_type):
+                if first_take is not None and first_take_clears(event_type, sse):
                     await first_take.clear(buffer)
                 if first:
                     # The formatter's created frame lacks conversation_id +
@@ -2552,7 +2552,7 @@ class ResponsesHandler:
                         sse_string, conv_id, harness_id, question_id, run_id=lifecycle.identity.run_id,
                     )
                     event_type = self._sse_event_type(sse_string)
-                    if first_take is not None and first_take_clears(event_type):
+                    if first_take is not None and first_take_clears(event_type, sse_string):
                         await first_take.clear(buffer)
                     if event_type == "response.completed":
                         # The formatter yields its terminal frame last, once its
