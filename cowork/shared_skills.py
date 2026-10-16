@@ -28,6 +28,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
+from cowork.common.paths import open_fd
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.managed import (
     SharedRegistryError,
@@ -92,7 +93,7 @@ def change_shared_skills(*, change: Callable[[SharedSkills], SharedSkills]) -> S
 
     path = shared_skills_file()
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(_lock_file(path), os.O_RDWR | os.O_CREAT, 0o644)
+    descriptor = open_fd(_lock_file(path), os.O_RDWR | os.O_CREAT, 0o644)
     try:
         deadline = time.monotonic() + SHARED_SKILLS_LOCK_TIMEOUT
         while True:
