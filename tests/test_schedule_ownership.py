@@ -719,3 +719,38 @@ async def test_run_now_is_refused_while_this_process_is_at_its_limit(monkeypatch
 
 def ensure_utc(value: datetime) -> datetime:
     return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
+def test_a_run_whose_occurrence_is_taken_back_stops_its_turn(tmp_path, monkeypatch, fast_scheduler):
+    """The holder lost its lease while its turn was still running: whoever
+    took the occurrence decides what runs now, so the turn is stopped rather
+    than left running unwatched beside it."""
+    import cowork.handlers.responses as responses_mod
+
+    scheduler = fast_scheduler
+    producer = _Producer(tmp_path, endless=True)
+    monkeypatch.setattr(responses_mod, "ResponsesHandler", producer.handler())
+    monkeypatch.setattr(scheduler, "_renew_lease", lambda session, **kwargs: False)
+    schedule_id = _app_schedule()
+
+    asyncio.run(asyncio.wait_for(scheduler.execute_schedule(schedule_id), timeout=10))
+
+    [handle] = producer.handles
+    assert handle.task.done()
+    assert handle.lifecycle.timed_out
+    [_occurrence], [run] = _app_state(schedule_id)
+    assert run.outcome == AttemptOutcome.interrupted
+
+
+def test_the_run_bound_clears_the_controllers_own_on_the_remote_backend(monkeypatch):
+    """A turn in a pod is already bounded by the controller, start included.
+    The run's bound sits above it so a turn that uses its budget ends on the
+    controller's terms; in process, the bound is the run's own."""
+    import cowork.scheduler as scheduler
+
+    monkeypatch.setattr(scheduler, "remote_backend", lambda: False)
+    assert scheduler._run_duration_limit() == scheduler._MAX_RUN_DURATION_SECONDS
+
+    monkeypatch.setattr(scheduler, "remote_backend", lambda: True)
+    assert scheduler._run_duration_limit() > scheduler._REMOTE_TURN_BUDGET_SECONDS
+    assert "15-minute" in scheduler._duration_error()
