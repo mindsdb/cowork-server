@@ -372,23 +372,69 @@ _TEXT_RANGE_HEADER = re.compile(r"\A[^\n]* — (?:lines \d+-\d+ of \d+[^\n]*|emp
 _SHORTENED_LINE = re.compile(r"\[line truncated: \d+ chars\]")
 
 _REDACTED = "[redacted]"
-# The rules below bound how far each part of a match may run, so that text a
-# cell spells (up to cell_queries.MAX_STRING_CHARS) is redacted in time that
-# grows with its length, whatever it holds.
+# The rules below bound how far each part of a match may run, or let a match
+# that has started consume all it read, so that text a cell spells (up to
+# cell_queries.MAX_STRING_CHARS) is redacted in time that grows with its
+# length, whatever it holds. Each rule's comment says why it is linear.
 #
+# One character of a URL's user name, and of its query string. Without the
+# enclosing SQL dialect a quote in a user name may be part of it: doubled as
+# SQL writes it (o''brien), escaped with a backslash as MySQL and a Postgres
+# E'' string write it (o\'brien), or the quote that does not close the
+# literal around it (o"brien inside '...'). A lone quote joins a user name
+# only before a letter, a digit or an underscore, which the quote that
+# closes a literal rarely has after it. So a user name does not run on into
+# the next literal or JSON member ('http://h','token=a@b'), where it would
+# take that key's name and leave the part of its value after the @
+# unmasked. In a query string a doubled quote counts as one character. In
+# both, the branches start with different characters, or a lone quote is
+# never followed by the quote a doubled one starts with, so a run of them
+# reads one way only.
+_USER_CHAR = r"(?:[^\s/?#'\"@:]|''|\"\"|['\"](?=\w))"
+_QUERY_CHAR = r"(?:[^\s'\"]|''|\"\")"
 # A URL's user and password, whatever comes before the ://. Once a : has ended
 # the user name, the password may hold /, ? or #, as a database URI's may; a
 # quote may be password data under the enclosing SQL dialect. Keep it in
-# the bounded scan; ambiguous detail is safer to redact than to expose.
-_USERINFO = re.compile(r"(://)(?:[^\s/?#'\"@:]{0,256}:\S{0,1024}|[^\s/?#'\"@]{0,256})@")
+# the bounded scan; ambiguous detail is safer to redact than to expose. A
+# user, with a password or alone, may hold a quote. Linear: a match starts
+# only at ://, and each attempt reads at most 256 characters of user and
+# 1,024 characters of password.
+_USERINFO = re.compile(rf"(://)(?:{_USER_CHAR}{{0,256}}:\S{{0,1024}}|{_USER_CHAR}{{0,256}})@")
 # On overflow, mask the whole non-whitespace span, including its host and
 # any quotes. Without the enclosing SQL dialect a quote may be password
 # data, even when not doubled or escaped. Omit excess detail rather than
-# leave part of that credential visible. Possessive matching stays linear.
-_LONG_USERINFO = re.compile(r"(://)[^\s/?#'\"@:]{0,256}:\S{1025,}+")
+# leave part of that credential visible. Linear: the password run is
+# possessive, so an attempt that fails read fewer than 1,025 password
+# characters, and one that succeeds consumes all it read.
+_LONG_USERINFO = re.compile(rf"(://){_USER_CHAR}{{0,256}}:\S{{1025,}}+")
+# A user over 256 characters overflows the same way, once a : or an @ ends it.
+# A short password may hold a :// and a long run after it, so this rule runs
+# after _USERINFO has masked the user and password around that run. Linear:
+# the user run holds no : or /, so the runs after two :// never overlap.
+_LONG_USER = re.compile(rf"(://){_USER_CHAR}{{257,}}+[:@]\S*+")
 # An Oracle EZConnect string, user/password@host[:port][/service], whose user
-# starts where a word starts, so a URL's path is never read as one.
-_EZCONNECT = re.compile(r"(?<![\w$#./:-])[A-Za-z_][\w$#]{0,127}/[^\s/@'\"]{1,1024}@(?=[\w./-])")
+# starts where a word starts, so a URL's path is never read as one. Oracle
+# lets a user or a password be double-quoted, and then it may hold any
+# character but a lone " (a quoted user, as a quoted name, holds at most 128).
+# A proxy login names the user it connects as in brackets after the user,
+# double-quoted or not (proxy[scott]/pw@host, proxy["Scott Lee"]/pw@host).
+# The host may be a name, an address, an IPv6 address in brackets or a
+# connect descriptor in parentheses (pw@(DESCRIPTION=...)). Linear: an
+# unquoted user is at most 128 characters of one word. A quoted user starts
+# at a quote no quote comes right before, reads at most 128 units and gives
+# none back, so it ends at the first lone quote and at most one reaches each
+# /. The bracketed name, quoted or not, reads at most 128 units and gives
+# none back, and each [ tries its two forms once. An unquoted password holds
+# no /, so each / starts at most one. A quoted password ends at a run of
+# quotes of odd length, while one that runs on needs an even run, so of the
+# quoted passwords that reach a character, at most one runs on. An unquoted
+# password that holds a secret key's name is masked as a key's value
+# (``_masked_ezconnect``).
+_EZCONNECT = re.compile(
+    r"(?<![\w$#./:-])(?:[A-Za-z_][\w$#]{0,127}|(?<!\")\"(?:[^\"\n]|\"\"){1,128}+\")"
+    r"(?:\[(?:\"(?:[^\"\n]|\"\"){1,128}+\"|[^\]\s/@]{1,128}+)\])?"
+    r"/(?:\"(?:[^\"\n]|\"\")*+\"|(?P<bare>(?:[^\s/@'\"]|''|\"\")++))@(?=[\w./(\[-])"
+)
 # Hosts whose URL path is itself a credential: Slack (and GovSlack), Discord,
 # Microsoft Teams and Zapier webhooks, IFTTT's Maker key, and a Telegram
 # bot's API, whose path holds the bot's token. What follows the part that
@@ -401,15 +447,20 @@ _SECRET_URL_PATH = re.compile(
     re.IGNORECASE,
 )
 # A URL's query string and fragment, which can carry a key or a signature (a
-# presigned S3 or Azure URL).
-_QUERY_STRING = re.compile(r"(://[^\s'\"?#]{0,2048}+)[?#][^\s'\"]*+")
+# presigned S3 or Azure URL), after a path of any length. Linear: both parts
+# are possessive or optional, so a match never fails once it has found a ://,
+# and it consumes every character it read.
+_QUERY_STRING = re.compile(rf"(://(?:[^\s'\"?#]|''|\"\")*+)(?P<query>[?#]{_QUERY_CHAR}*+)?")
 # A key that names a secret, as a word of its own or a part of one, starting
 # where a word starts: password, Pwd, s3_secret_access_key, X-Api-Key,
-# private_key, passphrase, AccountKey. "pass" counts only as the key's last
-# part (pass, db_pass), so pass_rate and passenger are not secret keys.
+# private_key, passphrase, AccountKey, X-Amz-Signature, SharedAccessSignature.
+# "pass" and "sig" count only as the key's last part (pass, db_pass, sig, as
+# an Azure SAS writes it), so pass_rate, passenger and sigma are not secret
+# keys.
 _SENSITIVE_NAME = (
     r"(?<![\w.-])[\w.-]{0,64}(?:password|passwd|passphrase|pwd|secret|token|api[_-]?key|access[_-]?key"
-    r"|account[_-]?key|private[_-]?key|authorization|credential|cookie|(?<![a-z0-9])pass(?![\w.-]))[\w.-]{0,64}+"
+    r"|account[_-]?key|private[_-]?key|authorization|credential|cookie|signature"
+    r"|(?<![a-z0-9])(?:pass|sig)(?![\w.-]))[\w.-]{0,64}+"
 )
 # What joins a key to its value: =, :, or => as Ruby and PHP write it. Once
 # => matched, the = is never read alone, which would take the > as a value.
@@ -428,13 +479,21 @@ _QUOTED_SECRET = re.compile(
 # A secret key's unquoted value, up to a space, a comma, a semicolon, an
 # ampersand, or a quote that closes the literal around it. An HTTP auth
 # scheme before the value (Basic, Bearer, Token, any word followed by a
-# token-shaped value) is redacted with it.
+# token-shaped value) is redacted with it. An ODBC value in braces may hold
+# any of those, so a value that opens with { reads to the } that closes it
+# (}} is a brace inside it), or to the end of the line. Linear: the braced
+# part is possessive and never fails once its { matched.
 _BARE_SECRET = re.compile(
     rf"(?P<key>{_SENSITIVE_NAME}{_ASSIGN})"
     r"(?:[A-Za-z][\w-]{0,31}[ \t]+(?=[A-Za-z0-9._~+/=-]{8}))?"
-    r"[^\s,;&'\"](?:[^\s,;&'\"]|['\"](?=[^\s,;&)\]}'\"]))*+",
+    r"(?:\{(?:\}\}|[^}\r\n])*+\}?|[^\s,;&'\"])(?:[^\s,;&'\"]|['\"](?=[^\s,;&)\]}'\"]))*+",
     re.IGNORECASE,
 )
+# A secret key's name and what joins it to a value, inside an unquoted
+# EZConnect password. Linear: it fails at once where no word starts, and a
+# word start reads at most 64 characters each side of a secret word, inside
+# the word that starts there.
+_KEY_IN_PASSWORD = re.compile(rf"{_SENSITIVE_NAME}{_ASSIGN}", re.IGNORECASE)
 # A bearer token no key names.
 _BEARER = re.compile(r"\b(?P<scheme>bearer[ \t]+)[A-Za-z0-9._~+/=-]{8,}+", re.IGNORECASE)
 # Credential shapes no key names: AWS access keys; GitHub, Slack (bot, user
@@ -828,18 +887,84 @@ def _redacted(text: str) -> str:
       (ghp_, gho_, ghu_, ghs_, ghr_, github_pat_), Slack tokens (xox?-,
       xapp-), Stripe secret and restricted keys (sk_, rk_), Hugging Face
       (hf_) and Google OAuth (ya29.) tokens, JWTs and PEM private keys;
-    - a URL's user and password (on overflow, its whole non-whitespace
-      span, including ambiguous SQL quotes),
-      an Oracle EZConnect string's password, a URL's query string and
-      fragment, and the path of a Slack, Discord, Teams, Zapier, IFTTT or
+    - a URL's user and password, the user holding a doubled or escaped
+      quote, or a lone quote before a letter, a digit or an underscore (on
+      overflow, a password over 1,024 characters or a user over 256, its
+      whole non-whitespace span, including ambiguous SQL quotes, even when
+      the password holds an @), an Oracle EZConnect string's user and
+      password, either one double-quoted or not, a proxy login's bracketed
+      user, quoted or not, included, before a host name, an IPv6 address or
+      a connect descriptor (and when an unquoted password holds a secret
+      key's name and =, : or =>, the part after the @ up to where a key's
+      value ends), a URL's query string and fragment after a path of any
+      length, and the path of a Slack, Discord, Teams, Zapier, IFTTT or
       Telegram bot URL;
     - a bearer token;
     - the value of a key=value, key: value or key => value pair, quoted or
       not, with any auth scheme before it, whose key's name holds password,
       passwd, passphrase, pwd, secret, token, api key, access key, account
-      key, private key, authorization, credential or cookie, or whose last
-      part is pass, on its own or after _, - or . (pass, db_pass; not
-      dbpass) (``_SENSITIVE_NAME``). A quoted value keeps its quotes.
+      key, private key, authorization, credential, cookie or signature, or
+      whose last part is pass or sig, on its own or after _, - or . (pass,
+      db_pass, sig; not dbpass) (``_SENSITIVE_NAME``). A quoted value keeps
+      its quotes, and an ODBC value in braces (Pwd={a;b}) is masked to its
+      closing brace.
+
+    It does not redact, and these go through as written:
+
+    - the part after the quote of a URL query value that holds a quote
+      other than the one around its string literal (sig=ab"cd inside
+      '...'), or a backslash-escaped quote as MySQL writes it (sig=ab\\'cd):
+      the rule stops at either quote, and telling which quote opened the
+      literal would take a parser;
+    - a URL's query string after a space, a lone quote or a
+      backslash-escaped quote in its path (/Q3 sales.csv?k=v,
+      /O\\'Brien.csv?k=v): the query string rule ends the path there, so
+      only a value whose key names a secret (sig=, X-Amz-Signature=) is
+      masked;
+    - a URL with no scheme (//bob:pw@host): every user and password rule
+      starts at ://;
+    - the part of an unquoted EZConnect password after an @ in it
+      (scott/pw@x@host): the rule ends the password at its first @;
+    - an EZConnect login whose user is over 128 characters, or that comes
+      right after a scheme or a colon (oracle://scott/pw@host,
+      jdbc:oracle:thin:scott/pw@host): the rule reads a user of at most 128
+      characters, only where a word starts, so a URL's path is never read
+      as one;
+    - the value of a key whose name has more than 64 characters before or
+      after the secret word in it: ``_SENSITIVE_NAME`` reads at most 64 on
+      each side, which keeps it linear.
+
+    It masks more than the secret in these cases, on display only:
+
+    - a password over 1,024 characters, a user over 256, a password followed
+      by more than 1,024 characters of host and path, or a host:port
+      followed by more than 1,024 characters of path: everything after the
+      :// up to the next space is masked, quotes and the SQL after them
+      included;
+    - any :// followed by more than 256 characters with no /, ?, #, @ or :
+      in them, then a : or an @ (a long JDBC property list,
+      jdbc:sqlserver://h;a=b;...;keyStoreLocation=C:\\k): everything after
+      the :// is masked the same way;
+    - text after a URL's host with no / before an @ in the same run of
+      non-whitespace (s3://bucket,me@corp): it reads as a user name and is
+      masked with the URL's user, unless a quote that no letter, digit or
+      underscore follows ends the user name first ('s3://bucket','me@corp'
+      stays);
+    - a value after a column or key name that holds a secret word, or
+      whose last part is pass or sig, though it names no secret
+      (password_hint = 'pet name', signature_count = 5, email_signature:
+      Thanks, p.sig = 0.05): it reads as that key's value;
+    - an EZConnect host after a password that holds a secret key's name,
+      and what follows the host up to a space, a comma, a semicolon, an
+      ampersand or a quote: it is masked as that key's value, and
+      password= stands in for the password;
+    - a column divided by a double-quoted name followed by an @
+      (a/"Col Name"@x), a double-quoted column divided by anything
+      followed by an @ ("Col Name"/a@x), or a subscripted column divided
+      by anything followed by an @ (a[1]/b@x), reads as an EZConnect string
+      and becomes ***@x;
+    - a secret key's value that opens with a brace and has no closing
+      brace: it is masked to the end of its line.
 
     A connector whose credential has a key name or shape not listed here
     adds it to ``_SENSITIVE_NAME`` or ``_SECRET_SHAPE``, with a case in
@@ -847,15 +972,40 @@ def _redacted(text: str) -> str:
     # Whole shapes must be removed before a named-value replacement can
     # erase a delimiter, such as a PEM key's BEGIN line.
     text = _SECRET_SHAPE.sub(_REDACTED, scrub_credentials(text))
-    text = _USERINFO.sub(r"\1***@", text)
+    # The long-password rule runs first: a shorter rule would stop at an @
+    # inside a long password and leave the rest of it. The long-user rule
+    # runs after the short one: run first, it would read a long run after a
+    # :// inside a short password as a user and take the @ the short rule
+    # ends at, leaving the user and the start of the password.
     text = _LONG_USERINFO.sub(r"\1***", text)
-    text = _EZCONNECT.sub("***@", text)
+    text = _USERINFO.sub(r"\1***@", text)
+    text = _LONG_USER.sub(r"\1***", text)
+    text = _EZCONNECT.sub(_masked_ezconnect, text)
     text = _SECRET_URL_PATH.sub(r"\g<service>***", text)
-    text = _QUERY_STRING.sub(r"\1?...", text)
+    text = _QUERY_STRING.sub(_masked_query_string, text)
     text = _QUOTED_SECRET.sub(_redacted_quoted_value, text)
     text = _BARE_SECRET.sub(lambda match: match["key"] + _REDACTED, text)
     text = _BEARER.sub(lambda match: match["scheme"] + _REDACTED, text)
     return text
+
+
+def _masked_ezconnect(match: re.Match[str]) -> str:
+    """An ``_EZCONNECT`` match with its user and password masked. An
+    unquoted password that holds a secret key's name and =, : or =>
+    (scott/password=Tr0ub@dor) may instead be that key and a value that runs
+    past the @. Then a fixed key, password=, stands in for the password, with
+    the mask as its value, so ``_BARE_SECRET`` masks that value and what
+    follows it up to where a value ends, the part after the @ included. The
+    key's own name is not kept: it may be the password itself
+    (scott/Kz9_token=@host) or its start (scott/MyPwd:Tr0ub@host)."""
+    key = _KEY_IN_PASSWORD.search(match["bare"] or "")
+    return "***@" if key is None else "***/password=***@"
+
+
+def _masked_query_string(match: re.Match[str]) -> str:
+    """A ``_QUERY_STRING`` match with its query string and fragment masked,
+    or the URL as written when it has neither."""
+    return match[1] + ("?..." if match["query"] else "")
 
 
 def _redacted_quoted_value(match: re.Match[str]) -> str:
@@ -897,13 +1047,36 @@ def _web_url(url: str | None) -> str | None:
 
 
 def _web_label(url: str) -> str:
-    """A web address shown as host and path, without its query string."""
+    """A web address shown as host, port and path, without its user,
+    password or query string. strip_url keeps a user or a password too long
+    for its window, so the host is urlsplit's hostname, which leaves out a
+    user and password that end at the @. A /, ? or # inside such a user or
+    password ends urlsplit's host there instead, and the rest of it reads as
+    a port that does not parse. So when the port does not parse, the label
+    is built from what follows the last @, or is the stripped URL when no @
+    is left, which ``_redacted`` masks as a long user or password; a port
+    out of range reads the same way. urlsplit lowercases the host and writes
+    the port as a number (Example.COM:08080 reads example.com:8080). A long
+    password whose part before the / reads as a port
+    (bob:8080/<over 1,024 characters>@host) still shows in the label as a
+    host and a path."""
     stripped = strip_url(url)
     try:
         parts = urlsplit(stripped)
     except ValueError:
         return stripped
-    return (parts.netloc + parts.path).rstrip("/") or stripped
+    try:
+        port = parts.port
+    except ValueError:
+        if "@" in stripped:
+            return _web_label("https://" + stripped.rpartition("@")[2])
+        return stripped
+    host = parts.hostname or ""
+    if ":" in host:
+        host = f"[{host}]"
+    if port is not None:
+        host += f":{port}"
+    return (host + parts.path).rstrip("/") or stripped
 
 
 def _documents_label(documents: Sequence[str]) -> str:

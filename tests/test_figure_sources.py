@@ -1150,6 +1150,42 @@ class TestSecretsInLabels:
         assert "hunter2" not in event
         assert "tok_XyZ" not in event
 
+    @pytest.mark.parametrize(("url", "label"), [
+        ("https://bob:" + "p" * 1_100 + "XyZs3cr3t@example.com/page", "example.com/page"),
+        ("https://bob:p''" + "p" * 1_100 + "XyZs3cr3t@example.com/page", "example.com/page"),
+        ("https://" + "u" * 300 + "XyZs3cr3t:pw@example.com/page", "example.com/page"),
+        ("https://" + "u" * 300 + "XyZs3cr3t@example.com/page", "example.com/page"),
+        ("https://bob:" + "p" * 1_100 + "/XyZs3cr3t/XyZb@example.com/page", "example.com/page"),
+        ("https://XyZbob:" + "p" * 1_100 + "?XyZs3cr3t@example.com/page", "https://***"),
+        ("https://" + "u" * 300 + "XyZuser:p/XyZs3cr3t@example.com/page", "example.com/page"),
+    ], ids=[
+        "long-password", "long-password-with-a-doubled-quote", "long-user", "long-user-alone",
+        "long-password-with-a-slash", "long-password-with-a-question-mark", "long-user-with-a-slash-in-the-password",
+    ])
+    def test_a_long_user_or_password_is_left_out_of_a_web_steps_label(self, url: str, label: str):
+        """The label is the host and path, read without the user and password
+        of any length. A /, ? or # inside a long password ends urlsplit's host
+        there, so the label is built from what follows the last @, or is the
+        masked URL when the query string's cut took the @."""
+        step = _tool("toolu_f", "web_fetch", {"url": url}, "It sold 4,812 units.")
+
+        event = _event(step, answer="It sold 4,812 units.")
+
+        [step_out] = FigureSources.model_validate_json(event).steps
+        assert (step_out.label, step_out.url) == (label, None)
+        assert "XyZ" not in event
+
+    @pytest.mark.parametrize(("url", "label"), [
+        ("https://example.com:8443/rates?k=1", "example.com:8443/rates"),
+        ("https://bob:pw@[::1]:8443/rates", "[::1]:8443/rates"),
+    ], ids=["port", "ipv6-host"])
+    def test_a_web_steps_label_keeps_the_hosts_port(self, url: str, label: str):
+        step = _tool("toolu_f", "web_fetch", {"url": url}, "Rate: 42")
+
+        [step_out] = FigureSources.model_validate_json(_event(step, answer="The rate is 42.")).steps
+
+        assert step_out.label == label
+
     def test_a_secret_in_a_web_steps_label_and_url_is_never_sent(self):
         step = _tool(
             "toolu_f", "web_fetch", {"url": "https://example.com/api/token=XyZsecret/rates"}, "Rate: 42",
@@ -1255,6 +1291,7 @@ class TestSecretsInQueries:
         ("rk=rk_test_51HXyZabcdefghij", "XyZabcdefghij"),
         ("slack=xoxp-1234567890-XyZslackuser", "XyZslackuser"),
         ("Bearer XyZabcdefghijk", "XyZabcdefghijk"),
+        ("Driver={ODBC Driver 18};Server=db;Uid=erp;Pwd={ab;XyZpass9};", "XyZpass9"),
     ])
     def test_a_credential_shape_in_sql_is_never_sent(self, literal: str, secret: str):
         sql = f"SELECT qty FROM read_source('{literal}')"
@@ -1270,13 +1307,23 @@ class TestSecretsInQueries:
     @pytest.mark.parametrize("form", ["{key}='XyZv9alue'", '"{key}": "XyZv9alue"', "{key}=XyZv9alue"])
     @pytest.mark.parametrize("key", [
         "password", "passwd", "passphrase", "pwd", "secret", "token", "api_key", "apikey", "X-Api-Key", "access_key",
-        "account_key", "private_key", "authorization", "credential", "cookie", "pass", "db_pass",
+        "account_key", "private_key", "authorization", "credential", "cookie", "pass", "db_pass", "signature",
+        "X-Amz-Signature", "sig", "x_sig",
     ])
     def test_each_listed_key_word_is_redacted(self, key: str, form: str):
         sql = f"SELECT qty FROM read_source({form.format(key=key)})"
         step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
 
         assert "XyZv9alue" not in _event(step)
+
+    @pytest.mark.parametrize("key", ["sigma", "signal", "design", "sig_level", "pass_rate", "passenger"])
+    def test_a_key_holding_pass_or_sig_but_not_as_its_last_part_is_not_a_secret_key(self, key: str):
+        """pass and sig name a secret only as a key's last part, so these
+        columns keep their values."""
+        sql = f"SELECT qty FROM stock WHERE {key}=0.5 AND {key}: 0.5"
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        assert FigureSources.model_validate_json(_event(step)).steps[0].queries == [sql]
 
     @pytest.mark.parametrize("length", [1_025, 5_000])
     def test_a_url_password_longer_than_the_userinfo_window_is_masked(self, length: int):
@@ -1337,8 +1384,27 @@ class TestSecretsInQueries:
 
     @pytest.mark.parametrize(
         "filler",
-        ["a" * 100_000, "password" * 7_500, "x://a:" * 25_000, "x://a:''" * 10_240, "eyJ-" * 65_536],
-        ids=["word", "secret-key", "userinfo", "quoted-userinfo", "jwt"],
+        [
+            "a" * 100_000, "password" * 7_500, "x://a:" * 25_000, "x://a:''" * 10_240, "eyJ-" * 65_536,
+            # Many :// or many EZConnect starts, from each of which a URL or
+            # EZConnect rule reads up to its window or to the end of the run,
+            # or an EZConnect password with many words that almost name a
+            # secret key: a rule that read the same text again from each
+            # start would take time that grows with the square of the length.
+            ("x://''x:" * 125 + " ") * 63, ("x://" + "a" * 300 + "/") * 200, 'a/"' + ' b/""' * 13_000,
+            "x:///" * 13_000, ' "' + 'a""' * 21_000, "a/" + ("#" + "x" * 60 + "passwor") * 1_500 + "@a",
+            # A braced value left open, a proxy login's bracket before each /,
+            # closed or with its quote left open, and URL users holding lone
+            # and escaped quotes.
+            "pwd={" + "x;" * 50_000, ("a[" + "b" * 127 + "]/") * 700, ('a["' + "b" * 127 + "/") * 700,
+            "x://o'b\\\"c" * 12_500,
+        ],
+        ids=[
+            "word", "secret-key", "userinfo", "quoted-userinfo", "jwt",
+            "doubled-quote-user", "long-user", "ezconnect-quoted", "query-string", "ezconnect-quoted-user",
+            "ezconnect-near-miss-keys", "open-brace-value", "ezconnect-proxy", "ezconnect-proxy-open-quote",
+            "quoted-user",
+        ],
     )
     def test_a_long_query_is_redacted_quickly(self, filler: str):
         sql = f"SELECT qty FROM read_source('{filler}')"
@@ -1397,6 +1463,229 @@ class TestSecretsInQueries:
         ]
         assert "XyZss9" not in event
         assert "admin" not in event
+
+    @pytest.mark.parametrize("password", [
+        "a" * 10 + "@XyZ" + "b" * 1_100,
+        "a" * 10 + "@XyZ''" + "b" * 1_100,
+    ], ids=["at-sign", "at-sign-and-doubled-quote"])
+    def test_a_long_uri_password_with_an_at_sign_in_it_is_masked_whole(self, password: str):
+        """A shorter rule would stop at the @ inside the password and leave
+        the rest of it."""
+        sql = f"SELECT qty FROM postgres_scan('postgresql://u:{password}@db.example/x', 'public', 'stock')"
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        event = _event(step)
+
+        assert FigureSources.model_validate_json(event).steps[0].queries == [
+            "SELECT qty FROM postgres_scan('postgresql://*** 'public', 'stock')",
+        ]
+        assert "XyZ" not in event
+        assert "u:" not in event
+
+    @pytest.mark.parametrize(("url", "masked"), [
+        ("postgresql://o''brien:XyZpw@db.example/x", "postgresql://***@db.example/x')"),
+        ("postgresql://" + "u" * 300 + ":XyZpw@db.example/x", "postgresql://***"),
+        ("https://ab''XyZtok@github.example/x.csv", "https://***@github.example/x.csv')"),
+        ('https://ab""XyZtok@github.example/x.csv', "https://***@github.example/x.csv')"),
+    ], ids=["doubled-quote-in-user", "long-user", "user-only-doubled-quote", "user-only-doubled-double-quote"])
+    def test_a_uri_user_with_a_doubled_quote_or_over_256_characters_is_masked(self, url: str, masked: str):
+        sql = f"SELECT qty FROM read_source('{url}')"
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        event = _event(step)
+
+        assert FigureSources.model_validate_json(event).steps[0].queries == [f"SELECT qty FROM read_source('{masked}"]
+        assert "XyZ" not in event
+
+    @pytest.mark.parametrize("password", [
+        "XyZ://" + "b" * 300,
+        "XyZsec://" + "b" * 300 + ":tail",
+    ], ids=["long-run-then-at-sign", "long-run-then-colon"])
+    def test_a_short_uri_password_holding_a_scheme_is_masked_with_its_user(self, password: str):
+        """The run of over 256 characters after the :// inside the password
+        is not read as a long user name, which would mask from that :// on
+        and leave the user and the start of the password visible."""
+        sql = f"SELECT qty FROM read_source('postgresql://bob:{password}@db.example/x')"
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        event = _event(step)
+
+        assert FigureSources.model_validate_json(event).steps[0].queries == [
+            "SELECT qty FROM read_source('postgresql://***@db.example/x')",
+        ]
+        assert "XyZ" not in event
+        assert "bob:" not in event
+
+    @pytest.mark.parametrize(("login", "masked"), [
+        ('"XyZuser"/password=Tr0ub@XyZdor', "***/password=[redacted]"),
+        ("XyZuser/password=Tr0ub" + "x" * 1_100 + "@XyZdor", "***/password=[redacted]"),
+        ("XyZuser/password=Tr0ub@XyZdor", "***/password=[redacted]"),
+        ("XyZuser/DB_Token:Tr0ub@XyZdor", "***/password=[redacted]"),
+        ('"XyZuser"/#password=Tr0ub@XyZdor', "***/password=[redacted]"),
+        ("XyZuser/''password=Tr0ub@XyZdor", "***/password=[redacted]"),
+        ("XyZuser/XyZpw&password=Tr0ub@XyZdor", "***/password=[redacted]"),
+        ("XyZuser/password=Tr0ub&XyZpw@XyZdor", "***/password=[redacted]"),
+        ("XyZuser/XyZs3cr3t_token=@db.example:1521/orcl", "***/password=[redacted]"),
+        ("XyZuser/XyZPwd:XyZs3cr3t@db.example:1521/orcl", "***/password=[redacted]"),
+    ], ids=[
+        "double-quoted-user", "long-value", "short-value", "colon-and-capitals", "key-after-a-mark",
+        "key-after-a-doubled-quote", "password-before-the-key", "password-after-the-keys-value",
+        "password-is-a-key-name", "password-starts-with-a-key-name",
+    ])
+    def test_an_ezconnect_password_holding_a_secret_key_is_masked_with_the_keys_whole_value(
+        self, login: str, masked: str,
+    ):
+        """A word, a / and then text holding a secret key's name and = read
+        both as an EZConnect login and as a key and its value, whose value
+        runs past the @. The user, the whole password and the whole value
+        are masked. The key's name may be the password itself, or its start,
+        so a fixed key name stands in for it."""
+        sql = f"SELECT qty FROM oracle_scan('{login}')"
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        event = _event(step)
+
+        assert FigureSources.model_validate_json(event).steps[0].queries == [
+            f"SELECT qty FROM oracle_scan('{masked}')",
+        ]
+        assert "XyZ" not in event
+
+    @pytest.mark.parametrize("login", [
+        'scott/"XyZtiger"@', "scott/" + "t" * 1_100 + "XyZ@", "scott/ti''XyZger@",
+        '"Scott"/XyZtiger@', '"O""Brien"/"XyZtiger"@', "proxy[XyZscott]/XyZtiger@", 'proxy["XyZ scott"]/XyZtiger@',
+    ], ids=[
+        "double-quoted", "long", "doubled-quote", "double-quoted-user", "double-quoted-user-and-password",
+        "proxy-user", "double-quoted-proxy-user",
+    ])
+    def test_an_ezconnect_login_quoted_long_or_with_a_doubled_quote_is_masked(self, login: str):
+        sql = f"SELECT qty FROM oracle_scan('{login}db.example:1521/orcl')"
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        event = _event(step)
+
+        assert FigureSources.model_validate_json(event).steps[0].queries == [
+            "SELECT qty FROM oracle_scan('***@db.example:1521/orcl')",
+        ]
+        assert "XyZ" not in event
+
+    @pytest.mark.parametrize(("host", "masked"), [
+        (
+            "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=db.example)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=orcl)))",
+            "***@(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=db.example)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=orcl)))",
+        ),
+        ("[::1]:1521/orcl", "***@[::1]:1521/orcl"),
+    ], ids=["connect-descriptor", "ipv6-host"])
+    @pytest.mark.parametrize("where", ["label", "query"])
+    def test_an_ezconnect_login_before_a_connect_descriptor_or_an_ipv6_host_is_masked(
+        self, host: str, masked: str, where: str,
+    ):
+        login = f"scott/XyZtiger@{host}"
+        sql = f"SELECT qty FROM oracle_scan('{login}')"
+        step = _cell(
+            "toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n",
+            description=f"Connect {login}" if where == "label" else "Read stock",
+        )
+
+        event = _event(step)
+
+        [step_out] = FigureSources.model_validate_json(event).steps
+        if where == "label":
+            assert step_out.label == f"Connect {masked}"
+        else:
+            assert step_out.queries == [f"SELECT qty FROM oracle_scan('{masked}')"]
+        assert "XyZ" not in event
+        assert "scott" not in event
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT qty FROM read_source(E'postgres://o\\'XyZbrien:XyZpw@db.example/x')",
+        "SELECT qty FROM read_source('postgres://o\"XyZbrien:XyZpw@db.example/x')",
+        "SELECT qty FROM read_source(E'https://ab\\'XyZtok@github.example/x.csv')",
+        "SELECT qty FROM read_source('https://ab\"XyZtok@github.example/x.csv')",
+    ], ids=["backslash-quote-in-user", "lone-double-quote-in-user", "user-only-backslash-quote", "user-only-lone-quote"])
+    def test_a_uri_user_with_an_escaped_or_lone_quote_is_masked(self, sql: str):
+        """Without the SQL dialect a quote in a URL's user name may be part of
+        it, as it may be in the password."""
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        event = _event(step)
+
+        [query] = FigureSources.model_validate_json(event).steps[0].queries
+        assert "://***@" in query
+        assert "XyZ" not in event
+
+    @pytest.mark.parametrize(("source", "masked"), [
+        (
+            "api_read('{\"url\":\"https://api.example\",\"password\":\"Tr0ub@XyZdor\"}')",
+            "api_read('{\"url\":\"https://api.example\",\"password\":\"[redacted]\"}')",
+        ),
+        ("read_source('http://h','token=Tr0ub@XyZdor')", "read_source('http://h','token=[redacted]')"),
+        (
+            "read_source('http://h','" + "x" * 300 + "@a',password='XyZone XyZtwo')",
+            "read_source('http://h','" + "x" * 300 + "@a',password='[redacted]')",
+        ),
+        ("read_source(['http://h'],password='Tr0ub@XyZdor')", "read_source(['http://h'],password='[redacted]')"),
+        (
+            "read_source({'endpoint':'http://minio','password':'Tr0ub@XyZdor'})",
+            "read_source({'endpoint':'http://minio','password':'[redacted]'})",
+        ),
+    ], ids=["json-member", "next-argument", "long-next-argument", "after-a-bracket", "python-dict"])
+    @pytest.mark.parametrize("where", ["label", "query"])
+    def test_a_quote_that_closes_a_url_keeps_the_next_secret_keys_name(self, source: str, masked: str, where: str):
+        """The quote that closes a literal holding a URL ends the URL's user
+        name, so the user name does not run on into the next literal and take
+        the name of the key whose value holds an @."""
+        sql = f"SELECT qty FROM {source}"
+        step = _cell(
+            "toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n",
+            description=f"Read {source}" if where == "label" else "Read stock",
+        )
+
+        event = _event(step)
+
+        [step_out] = FigureSources.model_validate_json(event).steps
+        if where == "label":
+            assert step_out.label == f"Read {masked}"
+        else:
+            assert step_out.queries == [f"SELECT qty FROM {masked}"]
+        assert "XyZ" not in event
+
+    @pytest.mark.parametrize("source", [
+        "https://acct.blob.core.windows.net/c/Q3 sales.csv?sv=2024-05-04&sp=r&sig=XyZs3cr3t",
+        "E'https://acct.blob.core.windows.net/c/O\\'Brien.csv?sv=2024-05-04&sp=r&sig=XyZs3cr3t",
+        'https://acct.blob.core.windows.net/c/a"b.csv?sv=2024-05-04&sp=r&sig=XyZs3cr3t',
+        "BlobEndpoint=https://acct.blob.core.windows.net/;SharedAccessSignature=sv=2024-05-04&sp=r&sig=XyZs3cr3t",
+        "https://b.s3.amazonaws.com/Q3 sales.csv?X-Amz-Credential=AKIA%2F&X-Amz-Signature=XyZs3cr3t",
+        "https://storage.googleapis.com/b/Q3 sales.csv?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Signature=XyZs3cr3t",
+    ], ids=[
+        "space-in-path", "backslash-quote-in-path", "lone-double-quote-in-path", "azure-connection-string",
+        "s3-presigned-space-in-path", "gcs-signed-space-in-path",
+    ])
+    def test_a_url_signature_the_query_string_rule_misses_is_masked_by_its_key(self, source: str):
+        """A space or a quote in a URL's path ends the query string rule's
+        path before the ?, and a connection string's signature has no URL
+        query at all; the signature's own key still names it."""
+        literal = source if source.startswith("E'") else f"'{source}"
+        sql = f"SELECT qty FROM read_csv({literal}')"
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        event = _event(step)
+
+        assert FigureSources.model_validate_json(event).steps[0].queries
+        assert "XyZs3cr3t" not in event
+
+    @pytest.mark.parametrize(("url", "masked"), [
+        ("https://h.example/" + "a" * 2_100 + "?sig=XyZsig", "https://h.example/" + "a" * 2_100 + "?..."),
+        ("https://h.example/x.csv?sig=ab''XyZsig", "https://h.example/x.csv?..."),
+        ("https://h.example/o''x.csv?sig=XyZsig", "https://h.example/o''x.csv?..."),
+    ], ids=["long-path", "doubled-quote-in-query", "doubled-quote-in-path"])
+    def test_a_query_string_after_a_long_or_quoted_path_is_masked(self, url: str, masked: str):
+        sql = f"SELECT qty FROM read_csv('{url}')"
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        event = _event(step)
+
+        assert FigureSources.model_validate_json(event).steps[0].queries == [f"SELECT qty FROM read_csv('{masked}')"]
+        assert "XyZsig" not in event
 
 
 class TestFiguresWithoutASource:
