@@ -545,3 +545,103 @@ def test_boot_reaps_everything_on_the_desktop_but_only_stale_legacy_runs_in_org_
         assert session.get(ScheduleRun, live_id).status == RunStatus.running
         assert session.get(ScheduleRun, held.run_id).status == RunStatus.running
         assert session.get(ScheduleOccurrence, occurrence_id).status == OccurrenceStatus.active
+
+
+# --- Abandoned turns and the per-organization cap --------------------------
+
+
+@pytest.mark.parametrize("executed", [False, True])
+def test_the_poll_reports_a_reaped_turn_that_may_still_be_running(tmp_path, executed):
+    """A reaped attempt that reached the agent may still be running in a pod
+    whose replica died; the poll names its conversation so that pod is told
+    to stop. One that never reached the agent has nothing to stop."""
+    from uuid import uuid4
+
+    from cowork.scheduler import _poll
+
+    engine = _engine(tmp_path)
+    schedule_id = _schedule(engine, next_run_at=datetime.now(timezone.utc) + timedelta(hours=1))
+    occurrence_id = _claim(engine, schedule_id, "slot:a")
+    conversation_id = uuid4()
+    with Session(engine) as session:
+        occurrences = ScheduleOccurrenceService(_scoped(session))
+        started = occurrences.start_attempt(occurrence_id, is_manual=False, lease_seconds=60)
+        run = session.get(ScheduleRun, started.run_id)
+        run.conversation_id = conversation_id
+        session.add(run)
+        session.commit()
+        if executed:
+            assert occurrences.begin_execution(started, occurrence_id, lease_seconds=-1)
+        else:
+            occurrences.renew(occurrence_id, started.token, lease_seconds=-1)
+
+    abandoned: list[str] = []
+    with Session(engine) as session:
+        _poll(_scoped(session), abandoned=abandoned)
+
+    assert abandoned == ([str(conversation_id)] if executed else [])
+
+
+def test_cancelling_an_abandoned_turn_flags_its_pod_only_on_the_remote_backend(monkeypatch):
+    import cowork.streaming.stop as stop
+
+    cancelled: list[str] = []
+
+    async def fake_cancel(correlation_id, *, stalled=False):
+        cancelled.append(correlation_id)
+
+    async def fake_get_turn(conversation_id):
+        return {"correlation_id": f"corr-{conversation_id}"} if conversation_id == "known" else None
+
+    monkeypatch.setattr(stop, "request_remote_cancel", fake_cancel)
+    monkeypatch.setattr(stop, "get_turn", fake_get_turn)
+
+    monkeypatch.setattr(stop, "remote_backend", lambda: False)
+    assert asyncio.run(stop.cancel_conversation_turn("known")) is False
+
+    monkeypatch.setattr(stop, "remote_backend", lambda: True)
+    assert asyncio.run(stop.cancel_conversation_turn("unknown")) is False
+    assert asyncio.run(stop.cancel_conversation_turn("known")) is True
+    assert cancelled == ["corr-known"]
+
+
+def _org_schedule(engine, org_id: str, title: str) -> UUID:
+    with Session(engine) as session:
+        schedule = Schedule(
+            title=title, prompt="Summarize", cadence="daily",
+            next_run_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+            model="default", project_id=GENERAL_PROJECT_ID, org_id=org_id, created_by="user-1",
+        )
+        session.add(schedule)
+        session.commit()
+        return schedule.id
+
+
+def test_an_organization_at_its_limit_claims_nothing_more_until_one_settles(tmp_path, monkeypatch):
+    """The limit holds across replicas because it is counted in the
+    database: past it a due slot stays due, a run-now is refused, and another
+    organization is unaffected."""
+    import cowork.scheduler as scheduler
+
+    monkeypatch.setattr(scheduler, "_MAX_ORG_ACTIVE_OCCURRENCES", 2)
+    engine = _engine(tmp_path)
+    busy = [_org_schedule(engine, "org-a", f"a{n}") for n in range(3)]
+    other = _org_schedule(engine, "org-b", "b")
+
+    def claim(schedule_id):
+        with Session(engine) as session:
+            return scheduler._claim_slot(_scoped(session), session.get(Schedule, schedule_id))
+
+    first, second, third = (claim(s) for s in busy)
+    assert first is not None and second is not None
+    assert third is None
+    with Session(engine) as session:
+        assert session.get(Schedule, busy[2]).next_run_at < datetime.now(timezone.utc).replace(tzinfo=None)
+        with pytest.raises(scheduler.RunCapReached):
+            scheduler.claim_manual_run(_scoped(session), busy[2])
+    assert claim(other) is not None
+
+    with Session(engine) as session:
+        ScheduleOccurrenceService(_scoped(session)).settle(first, OccurrenceStatus.success)
+        session.commit()
+    assert claim(busy[2]) is not None
