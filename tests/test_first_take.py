@@ -186,6 +186,45 @@ async def test_a_slow_model_is_dropped(monkeypatch):
     assert buffer.frames == []
 
 
+async def _take_text(pieces) -> tuple[str, list[str]]:
+    buffer = _Buffer()
+    take = _take(_Provider(pieces)).start()
+    take.attach(buffer)
+    await _settle()
+    events = buffer.events()
+    return "".join(d.get("delta", "") for _, d in events), [e for e, _ in events]
+
+
+@pytest.mark.asyncio
+async def test_a_repeated_sentence_is_cut_after_the_first():
+    # As streamed live: the same sentence twice, no space between.
+    pieces = ["I", "’ll", " write", " and", " run", " it", ".", "I", "’ll", " write", " and", " run", " it", "."]
+    text, kinds = await _take_text(pieces)
+    assert text == "I’ll write and run it."
+    assert kinds[-1] == ft.DONE
+
+
+@pytest.mark.asyncio
+async def test_only_the_first_of_two_sentences_is_shown():
+    text, _ = await _take_text(["I'll pull your sales. ", "Then I'll chart them."])
+    assert text.strip() == "I'll pull your sales."
+    text, _ = await _take_text(["Voy a escribir el script", "».", "Voy a escribir"])
+    assert text == "Voy a escribir el script»."
+
+
+@pytest.mark.asyncio
+async def test_a_decimal_or_abbreviation_does_not_end_the_sentence():
+    text, _ = await _take_text(["I'll check Python 3", ".", "12 notes, e.g. the", " changelog."])
+    assert text == "I'll check Python 3.12 notes, e.g. the changelog."
+
+
+def test_where_the_first_sentence_ends():
+    assert ft._first_sentence_end("I'll pull it.") is None
+    assert ft._first_sentence_end("I'll pull it.I'll") == len("I'll pull it.")
+    assert ft._first_sentence_end("Done! ¿Qué") == len("Done!")
+    assert ft._first_sentence_end("Version 3.12 is") is None
+
+
 @pytest.mark.asyncio
 async def test_it_logs_its_outcome_and_time_to_first_word(caplog):
     buffer = _Buffer()

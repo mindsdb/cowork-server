@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 
 from cowork.handlers.response_routing import (
@@ -109,6 +110,21 @@ def take_history(history: list[dict]) -> list[dict]:
 def _shippable(text: str) -> bool:
     """Whether the take so far may stay on screen, by the gate's own guards."""
     return not (names_foreign_product(text) or denies_our_product(text) or names_gate_tool(text))
+
+
+_SENTENCE_END = re.compile(r"[.!?…]+[\"'»”’)\]]*")
+
+
+def _first_sentence_end(text: str) -> int | None:
+    """Where the first sentence ends once a second one starts, else None.
+
+    A capital (or ¿ ¡) after the punctuation starts one, so "3.12" and "e.g.
+    the" don't; the model's occasional "...output.I'll write..." repeat does."""
+    for match in _SENTENCE_END.finditer(text):
+        rest = text[match.end():].lstrip()
+        if rest and (rest[0].isupper() or rest[0] in "¿¡"):
+            return match.end()
+    return None
 
 
 def _sse(event_type: str, data: dict) -> str:
@@ -266,6 +282,13 @@ class FirstTake:
                 delta = event.text if text else event.text.lstrip()
                 if not delta:
                     continue
+                cut = _first_sentence_end(text + delta)
+                if cut is not None:
+                    # One sentence only: a second one, or the first repeated,
+                    # never reaches the screen.
+                    delta = (text + delta)[len(text):cut]
+                    if not delta:
+                        break
                 text += delta
                 if not _shippable(text):
                     # Same guards as the gate's answers. Words already shown
@@ -277,6 +300,8 @@ class FirstTake:
                 if self._first_word_at is None:
                     self._first_word_at = time.monotonic()
                 self._queue.put_nowait(_sse(DELTA, {"delta": delta}))
+                if cut is not None:
+                    break
         finally:
             await _close(events)
         if not text.strip():
