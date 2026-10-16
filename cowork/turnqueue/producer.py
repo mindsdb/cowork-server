@@ -411,6 +411,7 @@ def step_stream_events(data: dict) -> list:
         StreamToolUseDelta,
         StreamToolUseEnd,
         StreamToolUseStart,
+        StreamTurnEnded,
         ToolCall,
     )
     from anton.core.interaction.elicit import AskAnswer, AskOption, AskRequest
@@ -484,6 +485,9 @@ def step_stream_events(data: dict) -> list:
             values=tuple(v for v in data.get("values") or [] if isinstance(v, str)),
             text=str(data.get("text") or ""),
         ))]
+    if step == "turn_ended":
+        ended_by = data.get("ended_by")
+        return [StreamTurnEnded(ended_by=ended_by)] if isinstance(ended_by, str) and ended_by else []
     # `ask_user_answer_rejected` is the pod's verdict on one answer; only
     # /answer reads it (turnqueue/answers.py), nothing renders it.
     return []

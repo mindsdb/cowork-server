@@ -21,13 +21,20 @@ from cowork.common.settings.user_settings import current_settings_scope
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope, tenant_scope_required
 from cowork.db.units import run_db, run_to_completion, unit_session
-from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, register
+from cowork.harnesses.base import ChannelContext, FileInputBlock, TextInputBlock, prompt_text, register
+from cowork.harnesses.anton_harness.agent_files import AgentFiles, read_conversation_attachments
 from cowork.harnesses.memory.turn_layout import (
     TurnMemoryLayout,
     empty_turn_memory,
     person_turn_memory,
 )
-from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnHistory, format_responses_stream
+from cowork.harnesses.anton_harness.stream_formatter import (
+    ArtifactCreated,
+    SkillCreated,
+    TurnContext,
+    TurnHistory,
+    format_responses_stream,
+)
 from cowork.managed import managed_folder
 from cowork.models.conversation import Conversation
 from cowork.models.skill import Skill
@@ -774,6 +781,16 @@ class AntonHarness:
                 turn_kwargs["trace_tags"] = trace_tags
             if "trace_metadata" in _turn_params:
                 turn_kwargs["trace_metadata"] = trace_metadata
+            yield TurnContext(
+                question=prompt_text(input),
+                files=AgentFiles.on_this_server(
+                    project_path,
+                    project_id=conv_project_id,
+                    attachments=await read_conversation_attachments(conversation_id=conv_id, scope=_units_scope()),
+                ),
+                # A copy: the session appends this turn to its own list.
+                history=list(getattr(session, "history", ())),
+            )
             async for event in session.turn_stream(self._to_anton_input(input), **turn_kwargs):
                 # Under context pressure anton summarizes history mid-turn,
                 # reassigning session.history and invalidating seed_len.
