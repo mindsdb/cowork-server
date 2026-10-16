@@ -285,11 +285,41 @@ The server is designed to be **agent-agnostic** — core features (projects, con
 
 A **harness** adapts an external agent library (Anton today) to the cowork-server interface. All harnesses implement the `HarnessProvider` protocol (`harnesses/base.py`), which exposes streaming responses, skill sync, and memory operations. The active harness is selected via the `harness` user setting. To add a new agent, implement the protocol and register it with the `@register` decorator.
 
-**Each turn's scratchpads exit when the turn ends.** The Anton harness builds a fresh `ChatSession` for every turn, and each scratchpad that session starts is a child process of the server. When the turn completes, fails or is stopped, `close_session_scratchpads` (`cowork/common/chat_session.py`) kills those processes. A Stop pressed while a cell is running does not end the turn yet: anton kills that cell's scratchpad and the turn carries on until it ends by itself, which ENG-3078 tracks. The next turn starts a new process, which reloads the variables the old one saved to the conversation's namespace snapshot after every cell. Only the scratchpads close: full-stack backends the agent launched keep running. Anything a cell starts in the scratchpad's process group, such as a default `subprocess.Popen` child or a thread, dies with it, so a long-lived service belongs in `launch_backend`. A child started with `start_new_session=True` or `setsid` escapes: it keeps running and holds two of the server's pipe descriptors until it exits. The connector probe closes its scratchpads the same way, and shutdown waits up to 5 seconds for closes still running. A scratchpad runs as `python <tmp>/anton_scratchpad_<random>.py`, so `pgrep -f anton_scratchpad_` counts the live ones; it should drop to 0 once no turn is running.
+**Each turn's scratchpads exit when the turn ends.** The Anton harness builds a fresh `ChatSession` for every turn, and each scratchpad that session starts is a child process of the server. When the turn completes, fails or is stopped, `close_session_scratchpads` (`cowork/common/chat_session.py`) kills those processes. A Stop or an opted-in client disconnect also interrupts a running cell and ends its turn; the harness does not start another model step. The next turn starts a new process, which reloads the variables the old one saved to the conversation's namespace snapshot after every cell. Only the scratchpads close: full-stack backends the agent launched keep running. Anything a cell starts in the scratchpad's process group, such as a default `subprocess.Popen` child or a thread, dies with it, so a long-lived service belongs in `launch_backend`. A child started with `start_new_session=True` or `setsid` escapes: it keeps running and holds two of the server's pipe descriptors until it exits. The connector probe closes its scratchpads the same way, and shutdown waits up to 5 seconds for closes still running. A scratchpad runs as `python <tmp>/anton_scratchpad_<random>.py`, so `pgrep -f anton_scratchpad_` counts the live ones; it should drop to 0 once no turn is running.
 
 ### Streaming & scheduling
 
 Agent responses stream to clients via **Server-Sent Events** (SSE) on `POST /responses/`. The server tracks in-flight streams and supports cancellation (`/responses/cancel`) and late-join tailing (`/responses/tail`).
+
+A streaming API question can set `"cancel_on_disconnect": true` to stop its own run when the
+originating POST connection closes before the answer finishes. The option is a strict boolean,
+defaults to `false`, and requires `"stream": true`. Browser questions leave it off, so a reload
+still reconnects to the detached answer. Closing a `/responses/tail` observer never cancels a run.
+If a client leaves during routing or setup, that request's cleanup prevents it from leaving a
+live producer behind. Completion and server shutdown retain their existing outcomes.
+
+The root of `response.created` carries a `run_id` UUID for that execution. An API client or proxy
+can send `{"conversation_id": "...", "expected_run_id": "...", "reason": "client_gone"}` to
+`POST /api/v1/responses/cancel`. The guard must match the authorized run; a stale or foreign ID
+returns 404 and cannot stop a successor. Turn numbers can repeat, so they are not cancellation
+guards. Existing Stop calls without `expected_run_id` still cancel the conversation's current
+authorized run. A 200 response reports whether cancellation was requested; the stream's terminal
+event and persisted answer determine the final outcome. Database or worker failures can prevent
+successful finalization.
+
+A proxy that keeps reading upstream after its client leaves must relay the disconnect explicitly.
+The self-hosted recording proxy consumes the option, keeps its upstream connection detached for
+audit records, and sends an exact-run cancel. Its final record comes from the answer's events.
+See [Disconnect ownership and exact-run cancellation](docs/DESIGN.md#disconnect-ownership-and-exact-run-cancellation).
+
+`tests/test_disconnect_transport.py` covers real sockets and a local executing scratchpad.
+For the deployed remote-worker check, use the standard post-deploy identity and `COWORK_BASE_URL`,
+then set `COWORK_RUN_DISCONNECT_WORKER_TEST=true` and `COWORK_DISCONNECT_NAMESPACE` before running
+`uv run pytest -q tests/integration/test_disconnect_worker.py`.
+`COWORK_DISCONNECT_CONTEXT` optionally selects the Kubernetes context. The runner needs read
+access to pods and permission to exec the observer in the worker container. The check starts
+its own bounded cell and observes process/container identity and heartbeat cessation; a
+cancelled SSE event alone cannot pass it. It skips unless explicitly enabled.
 
 `/responses/cancel` takes an optional `reason`. The UI sends `"stalled"` when it heard nothing for its idle window, and the turn then saves as a `response.failed` with code `stalled`, so a reload shows the stall card. Without a reason, or with any other value, the cancel is a Stop and keeps the partial answer with no error row. While anton waits on a model call that sends no output, the server (in cloud, the anton pod) writes a `model_wait` progress frame every 20 to 25 seconds so the turn's idle bounds do not end it. A model call that sends no output for 600 seconds ends the turn with code `model_timeout`; anton's `ANTON_MODEL_CALL_IDLE_TIMEOUT_S` sets that limit, and 0 or less turns it off. [Turn liveness and idle bounds](docs/DESIGN.md#turn-liveness-and-idle-bounds) lists every bound a quiet turn meets and what happens when each one fires.
 
