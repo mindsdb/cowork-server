@@ -779,11 +779,12 @@ async def test_a_cancel_during_a_memory_save_waits_for_it_then_saves_the_turn(mo
 
 
 def _no_workspace_or_memory_units(monkeypatch):
-    """Staging, the project memory read and the workspace lookup do nothing.
+    """Staging, the project memory read and the workspace lookups do nothing.
     The fake unit session cannot run them, and each would log an error."""
     monkeypatch.setattr(ResponsesHandler, "_stage_remote_workspace_files", staticmethod(lambda session, conv_id: None))
     monkeypatch.setattr(ResponsesHandler, "_remote_memory", staticmethod(lambda session, conv_id: {}))
     monkeypatch.setattr(ResponsesHandler, "_remote_workspace", staticmethod(lambda session, conv_id: {}))
+    monkeypatch.setattr(ResponsesHandler, "_remote_agent_files", staticmethod(lambda session, conv_id: None))
 
 
 @pytest.mark.asyncio
@@ -1670,6 +1671,170 @@ async def test_produce_remote_streams_desktop_step_vocabulary(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_produce_remote_gives_a_figures_step_the_project_path_of_the_file_the_pod_read(
+    monkeypatch, tmp_path,
+):
+    """The pod reads /workspace/stock.csv, which is the conversation's folder
+    in the project on the shared mount, so the answer's figure names the step
+    with the file's place in the project."""
+    import json
+
+    from cowork.harnesses.anton_harness.agent_files import AgentFiles
+
+    conv_id = uuid4()
+    workspace = tmp_path / "conversations" / str(conv_id)
+    workspace.mkdir(parents=True)
+    (workspace / "stock.csv").write_text("part,site,qty\nP100,S1,250\n")
+    saved = {}
+    handler = _remote_handler(monkeypatch, saved)
+    handler._remote_memory = lambda session, conv_id: None
+    handler._remote_agent_files = lambda session, conv_id: AgentFiles.in_cloud_pod(
+        tmp_path, conversation_id=conv_id, workspace_rel_path=None,
+    )
+    code = "print(open('/workspace/stock.csv').read())"
+    cell = {"code": code, "stdout": "part,site,qty\nP100,S1,250\n", "stderr": "", "error": None, "description": ""}
+
+    async def fake_replies(**kwargs):
+        yield "progress", {"phase": "workspace_authorized", "workspace_mode": "persistent"}
+        yield "turn_step", {"step": "tool_start", "id": "t1", "name": "scratchpad"}
+        yield "turn_step", {"step": "tool_end", "id": "t1", "args": json.dumps({"action": "exec", "code": code})}
+        yield "turn_step", {
+            "step": "tool_result", "id": "t1", "name": "scratchpad", "action": "exec", "content": json.dumps(cell),
+        }
+        yield "turn_delta", {"text": "Site S1 holds 250 units."}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=conv_id, input_text="How many at S1?", original_content="How many at S1?",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    [sources] = [e for e in saved["events"] if e.get("type") == "response.figure_sources"]
+    assert [(step["tool_use_id"], step["path"]) for step in sources["steps"]] == [
+        ("t1", f"conversations/{conv_id}/stock.csv"),
+    ]
+
+
+def _figure_sources_handler(monkeypatch, saved):
+    handler = _remote_handler(monkeypatch, saved)
+    handler._remote_memory = lambda session, conv_id: None
+    handler._remote_agent_files = lambda session, conv_id: None
+    return handler
+
+
+def _saved_figures(saved) -> dict[str, dict]:
+    [sources] = [e for e in saved["events"] if e.get("type") == "response.figure_sources"]
+    return {figure["text"]: figure for figure in sources["figures"]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ok", [True, False, None])
+async def test_produce_remote_finds_a_figure_in_a_tool_result_only_the_pods_rows_carry(monkeypatch, ok):
+    """The pod streams a result only for the scratchpad, so a web page's
+    arrives in the turn's rows. The figure is found in the page as the agent
+    read it, though the rows saved for replay cap it."""
+    import json
+
+    saved = {}
+    handler = _figure_sources_handler(monkeypatch, saved)
+    page = "Overtime rate: $42 per hour.\n" + "filler " * 4_000
+    rows = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "w1", "name": "web_fetch", "input": {"url": "https://example.com/rates"}},
+        ]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "w1", "content": page}]},
+    ]
+
+    async def fake_replies(**kwargs):
+        yield "turn_step", {"step": "tool_start", "id": "w1", "name": "web_fetch"}
+        yield "turn_step", {"step": "tool_end", "id": "w1", "args": json.dumps({"url": "https://example.com/rates"})}
+        yield "turn_step", {"step": "progress", "phase": "tool_done", "id": "w1", "ok": ok}
+        yield "turn_delta", {"text": "Overtime costs $42 an hour."}
+        yield "turn_history", {"rows": rows}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="What does overtime cost?", original_content="What does overtime cost?",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    figure = _saved_figures(saved)["$42"]
+    assert figure["sources"] == ([{"tool_use_id": "w1", "page": None}] if ok is True else [])
+    assert figure["origin"] == ("step" if ok is True else "none")
+    # Saved once, as the turn's tool rows, capped for replay.
+    assert saved["tool_rows"][1]["content"][0]["content"].startswith("[tool output omitted")
+    assert not [e for e in saved["events"] if e.get("type") == "response.turn_history"]
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_names_the_earlier_turns_cell_a_figure_was_computed_from(monkeypatch):
+    """The seeded history reaches the formatter: this turn's cell sums a frame
+    an earlier turn's cell read, so the figure names both. A figure the
+    answer only repeats from the earlier turn has no source."""
+    import json
+
+    saved = {}
+    handler = _figure_sources_handler(monkeypatch, saved)
+    history = [
+        {"role": "user", "content": "Load the stock."},
+        {"role": "assistant", "content": [{"type": "tool_use", "id": "e1", "name": "scratchpad", "input": {
+            "action": "exec", "name": "main", "code": "df = pd.read_csv('/workspace/stock.csv')\nprint(df)",
+        }}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "e1", "content": (
+            "[output]\n   part site  qty\n0  P100   S1  250\n1  P100   S2   90\n"
+        )}]},
+        {"role": "assistant", "content": "S1 holds 250 units and S2 holds 90."},
+    ]
+    handler._remote_seed_history = lambda session, conv_id: (history, None)
+    code = "print(df.qty.sum())"
+    cell = {"code": code, "stdout": "340\n", "stderr": "", "error": None, "description": ""}
+
+    async def fake_replies(**kwargs):
+        yield "turn_step", {"step": "tool_start", "id": "t1", "name": "scratchpad"}
+        yield "turn_step", {"step": "tool_end", "id": "t1", "args": json.dumps({"action": "exec", "name": "main", "code": code})}
+        yield "turn_step", {
+            "step": "tool_result", "id": "t1", "name": "scratchpad", "action": "exec", "content": json.dumps(cell),
+        }
+        yield "turn_delta", {"text": "250 at S1 plus 90 at S2 make 340."}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="And together?", original_content="And together?",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    figures = _saved_figures(saved)
+    assert figures["340"]["sources"] == [{"tool_use_id": "t1", "page": None}, {"tool_use_id": "e1", "page": None}]
+    assert figures["250"]["origin"] == "none"
+    assert figures["90"]["origin"] == "none"
+
+
+@pytest.mark.asyncio
+async def test_produce_remote_takes_the_question_from_the_text_it_sends_the_pod(monkeypatch):
+    saved = {}
+    handler = _figure_sources_handler(monkeypatch, saved)
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "Nothing ships in the next 3 weeks."}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="What ships in the next 3 weeks?", original_content=[],
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert _saved_figures(saved)["3"]["origin"] == "question"
+
+
+@pytest.mark.asyncio
 async def test_produce_remote_stages_workspace_files(monkeypatch):
     """Wiring guard: the remote produce path must stage attachments +
     instructions into the workspace before the turn — removing that call
@@ -1882,6 +2047,41 @@ def test_remote_artifacts_context_diffs_the_project_base(monkeypatch, tmp_path):
     assert ctx[1] == project_dir / ".anton" / "artifacts"
     assert ctx[2] == str(conversation.project_id)
     assert ctx[3] == "proj"
+
+
+def test_remote_agent_files_place_the_pod_in_the_conversations_folder_with_its_project_and_attachments(
+    monkeypatch, tmp_path,
+):
+    from cowork.harnesses.anton_harness import agent_files as agent_files_mod
+    from cowork.harnesses.anton_harness.agent_files import AgentFiles, Attachment
+
+    project_dir = tmp_path / "proj"
+    conversation = _conversation_at(project_dir)
+    _patch_conversation_service(monkeypatch, conversation)
+    monkeypatch.setattr(
+        ResponsesHandler, "_remote_workspace",
+        staticmethod(lambda session, conv_id: {"project_id": str(conversation.project_id), "workspace_rel_path": "projects/proj"}),
+    )
+    conv_id = uuid4()
+    attachment = Attachment(file_id="f1", stored_path="/files/f1/stock.csv")
+    monkeypatch.setattr(
+        agent_files_mod, "conversation_attachments",
+        lambda session, *, conversation_id: (attachment,) if conversation_id == conv_id else (),
+    )
+
+    assert ResponsesHandler._remote_agent_files(None, conv_id) == AgentFiles.in_cloud_pod(
+        project_dir,
+        conversation_id=conv_id,
+        workspace_rel_path="projects/proj",
+        project_id=conversation.project_id,
+        attachments=[attachment],
+    )
+
+
+def test_remote_agent_files_are_none_when_the_project_cannot_be_read(monkeypatch):
+    _patch_conversation_service(monkeypatch, SimpleNamespace(project=None))
+
+    assert ResponsesHandler._remote_agent_files(None, uuid4()) is None
 
 
 def test_stage_remote_workspace_files_creates_the_project_artifacts_base(monkeypatch, tmp_path):
