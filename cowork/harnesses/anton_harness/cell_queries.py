@@ -47,18 +47,18 @@ and a printed label such as ``"With rows from stock.csv:"``. A candidate that
 counts is split at each ``;`` outside a string literal, a quoted name, a
 dollar-quoted string or a comment, and a statement is listed only when it
 counts by the same rule, so a statement after a query in the same string (DDL
-that sets a password, a write) is not. The split is read twice, with a
-backslash in quotes escaping the next character, as MySQL reads it, and as an
-ordinary character, as Postgres and SQLite read it; when the two split a
-candidate differently, nothing from it is listed. A following statement is
-listed with the query only where the database ends a statement at a ``;``
-that both readings put inside a literal, a quoted name or a comment, such as
-a ``;`` after a quote in a MySQL ``#`` comment, or after a ``--`` that MySQL
-reads as two minus signs (``1--1``).
+that sets a password, a write) is not. The split is read with both backslash
+quote rules and both line-comment rules: MySQL requires whitespace or a
+control character after ``--`` and also recognizes ``#``. When any reading
+splits a candidate differently, nothing from it is listed. Dollar quoting
+is checked both ways too: MySQL may read ``$tag$`` as a bare alias instead.
 
 A function the cell defines keeps the queries, requests and environment reads
-its body shows, so a later cell that calls it makes them too. Each name the
-cell binds notes whether its value comes from data the cell read and which
+its body shows, so a later cell that calls it makes them too. Rebinding one
+of its global inputs drops these details, since Python resolves globals at
+the call and the saved details may be stale. Client base URLs also carry
+between cells, within a bounded namespace. Each name the cell binds notes
+whether its value comes from data the cell read and which
 names from earlier cells it is computed from, so a caller can trace a figure a
 later cell prints back to the cell that read its data.
 """
@@ -71,9 +71,9 @@ import re
 import textwrap
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
-from itertools import pairwise
+from itertools import islice, pairwise
 from types import MappingProxyType
 
 MAX_QUERIES = 3
@@ -91,6 +91,14 @@ MAX_STRING_CHARS = 65_536
 MAX_ALTERNATIVES = 3
 # The most names from earlier cells one binding lists as its inputs.
 MAX_BINDING_INPUTS = 64
+# The most global inputs one function tracks, and the most HTTP clients one
+# scratchpad carries. Past either cap, omit details rather than retain a
+# partially tracked source.
+MAX_FUNCTION_GLOBALS = 64
+MAX_CLIENTS = 64
+# Non-SQL strings kept with a function so its file/URL details appear only
+# when called. Each is also bounded by MAX_STRING_CHARS.
+MAX_FUNCTION_STRINGS = 64
 
 _HTTP_METHODS = frozenset({"get", "post", "put", "patch", "delete", "head", "options"})
 # Modules whose request functions make an HTTP call whatever their URL reads.
@@ -138,7 +146,7 @@ _MUTATORS = frozenset({"append", "extend", "insert", "update", "add"})
 
 # An unclosed /* comments out the rest of the text, as in SQL; ending the
 # match there keeps the scan linear.
-_SQL_COMMENT = re.compile(r"--[^\n]*|/\*.*?(?:\*/|\Z)", re.DOTALL)
+_SQL_COMMENT = re.compile(r"--[^\r\n]*|/\*.*?(?:\*/|\Z)", re.DOTALL)
 _SQL_SELECT = re.compile(r"select\b", re.IGNORECASE)
 # WITH only opens a query as a CTE: a name (bare, quoted or a placeholder),
 # optional column list, then AS (.
@@ -152,16 +160,20 @@ _SQL_FROM = re.compile(r"\bfrom\b", re.IGNORECASE)
 # none), or a comment, inside which a ; ends no statement, or a ; that does.
 # A name, string or comment left open runs to the end of the text, so the
 # scan stays linear.
-_SQL_TOKEN_REST = (
-    r"`[^`]*+`?|\[[^\]]*+\]?|(?<![\w$])\$(?P<tag>(?:[A-Za-z_]\w*)?)\$.*?(?:\$(?P=tag)\$|\Z)"
-    r"|--[^\n]*+|/\*.*?(?:\*/|\Z)|;"
+_SQL_QUOTED_NAME = r"`[^`]*+`?|\[[^\]]*+\]?"
+_SQL_DOLLAR_STRING = r"(?<![\w$])\$(?P<tag>(?:[A-Za-z_]\w*)?)\$.*?(?:\$(?P=tag)\$|\Z)"
+# MySQL recognizes -- only before a space or control character, and # starts
+# a comment there. Its NO_BACKSLASH_ESCAPES mode makes quote and comment
+# rules independent, so check every combination rather than only two scans.
+_SQL_TOKENS = tuple(
+    re.compile(quote + "|" + quoted_name + "|" + comment + r"|/\*.*?(?:\*/|\Z)|;", re.DOTALL)
+    for quote in (
+        r"'(?:''|\\.|[^'\\])*+'?|\"(?:\"\"|\\.|[^\"\\])*+\"?",
+        r"'(?:''|[^'])*+'?|\"(?:\"\"|[^\"])*+\"?",
+    )
+    for comment in (r"--[^\r\n]*+", r"--(?=[\x00-\x20\x7f])[^\r\n]*+|\#[^\r\n]*+")
+    for quoted_name in (_SQL_QUOTED_NAME + "|" + _SQL_DOLLAR_STRING, _SQL_QUOTED_NAME)
 )
-# Those, or a string in single or double quotes read with a backslash
-# escaping the next character, as MySQL reads one.
-_SQL_TOKEN_ESCAPED = re.compile(r"'(?:''|\\.|[^'\\])*+'?|\"(?:\"\"|\\.|[^\"\\])*+\"?|" + _SQL_TOKEN_REST, re.DOTALL)
-# Those, or a string in single or double quotes read with a backslash as an
-# ordinary character, as Postgres and SQLite read one.
-_SQL_TOKEN_PLAIN = re.compile(r"'(?:''|[^'])*+'?|\"(?:\"\"|[^\"])*+\"?|" + _SQL_TOKEN_REST, re.DOTALL)
 
 URL_START = re.compile(r"https?://", re.IGNORECASE)
 # A URL with a scheme and a host but no path, which can carry no token.
@@ -206,11 +218,27 @@ class FunctionReading:
     queries: tuple[str, ...] = ()
     # Up to MAX_REQUESTS requests, each URL at most MAX_STRING_CHARS.
     requests: tuple[HttpRequest, ...] = ()
+    # Non-SQL strings its body reads, excluding labels and write targets,
+    # bounded by MAX_FUNCTION_STRINGS and MAX_STRING_CHARS per string.
+    strings: tuple[str, ...] = ()
+    # Strings used only as printed/drawn labels, with the same bounds as
+    # strings. Keep them separate so a caller does not treat a caption as
+    # a document or as a pandas index name.
+    labels: tuple[str, ...] = ()
+    # Labels literally spelled by this helper or a helper it calls survive
+    # data-global changes. Their callable dependencies still invalidate
+    # them if a wrapper's callee (or print/title itself) is rebound.
+    literal_labels: tuple[str, ...] = ()
+    literal_label_names: tuple[str, ...] = ()
     environment_variables: tuple[str, ...] = ()
     calls_query_minds_data: bool = False
     calls_web_tool: bool = False
     # Whether the body reads data: a file, a query, a request or a web tool.
     reads_data: bool = False
+    # Global names the saved details depend on, including called helpers'
+    # inputs. Rebinding any one invalidates the details. At most
+    # MAX_FUNCTION_GLOBALS; an overflow keeps no query/request details.
+    global_names: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -256,6 +284,9 @@ class CellReading:
     # The functions defined once the cell has run, earlier cells' and this
     # one's, for the next cell.
     functions: Mapping[str, FunctionReading] = field(default_factory=dict)
+    # HTTP client names and sanitized base URLs for the next cell, bounded
+    # by MAX_CLIENTS entries and MAX_STRING_CHARS per URL.
+    clients: Mapping[str, str] = field(default_factory=dict)
     # Each name the cell binds at its top level, as the cell leaves it: by an
     # assignment, a loop or with target, a walrus, a def, a class, an import
     # or a del. A name the cell fills in place (an item or attribute store, or
@@ -271,20 +302,23 @@ class CellReading:
 
 
 _NO_FUNCTIONS: Mapping[str, FunctionReading] = MappingProxyType({})
+_NO_CLIENTS: Mapping[str, str] = MappingProxyType({})
 
 
 def read_cell(
     code: str, *, names: Mapping[str, str], functions: Mapping[str, FunctionReading] = _NO_FUNCTIONS,
+    clients: Mapping[str, str] = _NO_CLIENTS,
 ) -> CellReading:
     """Read ``code`` with ``names`` (the strings earlier cells bound) and
-    ``functions`` (the functions they defined) in scope. Code that does not
+    ``functions`` (the functions they defined) and ``clients`` (their HTTP
+    client base URLs) in scope. Code that does not
     parse never ran, so it reads as nothing; code nested deeper than the
     parser or the reader can walk reads as nothing too."""
     try:
-        reader = _CellReader(code, names=names, functions=functions)
+        reader = _CellReader(code, names=names, functions=functions, clients=clients)
         reader.visit(ast.parse(code))
     except (SyntaxError, ValueError, RecursionError, MemoryError):
-        return CellReading(names=dict(names), functions=dict(functions))
+        return CellReading(names=dict(names), functions=dict(functions), clients=_bounded_clients(clients))
     return CellReading(
         queries=_queries(text for index, text in enumerate(reader.strings) if index not in reader.skipped),
         requests=tuple(_first_unique(reader.requests, limit=MAX_REQUESTS)),
@@ -293,9 +327,10 @@ def read_cell(
         calls_web_tool=reader.web_tool_calls > 0,
         environment_variables=tuple(dict.fromkeys(reader.environment_variables)),
         written_files=tuple(dict.fromkeys(reader.written_files)),
-        labels=_only_labels(reader.strings, labels=reader.labels),
+        labels=_only_labels(reader.strings, labels=reader.labels, bound=reader._bound_strings),
         names=reader.names,
         functions=reader.functions,
+        clients=reader.clients,
         bindings=reader.bindings,
         loaded_names=tuple(reader.loaded_names),
     )
@@ -354,6 +389,11 @@ class _Scope:
     # For each reader table entry the body changed, what puts it back as it
     # was on entry.
     undo: dict[tuple[int, str], Callable[[], None]] = field(default_factory=dict)
+    # The nonlocal names a deferred body reads. Overflow prevents retaining
+    # query/request details that could outlive an untracked global rebind.
+    global_names: dict[str, None] = field(default_factory=dict)
+    literal_label_names: dict[str, None] = field(default_factory=dict)
+    globals_complete: bool = True
 
 
 @dataclass(frozen=True)
@@ -363,6 +403,7 @@ class _Position:
     strings: int
     requests: int
     environment_variables: int
+    written_files: int
     data_helper_calls: int
     web_tool_calls: int
 
@@ -371,7 +412,10 @@ class _CellReader(ast.NodeVisitor):
     """Walks a cell in code order, binding each name assigned a string before
     the code after it reads that name."""
 
-    def __init__(self, code: str, *, names: Mapping[str, str], functions: Mapping[str, FunctionReading]) -> None:
+    def __init__(
+        self, code: str, *, names: Mapping[str, str], functions: Mapping[str, FunctionReading],
+        clients: Mapping[str, str],
+    ) -> None:
         # The cell as UTF-8 and the byte offset each line starts at: a node's
         # col_offset counts bytes, and slicing here costs only the node's size.
         self._code = code.encode()
@@ -380,13 +424,24 @@ class _CellReader(ast.NodeVisitor):
         # clients' base URLs, as the code where the reader stands sees them.
         self.names: dict[str, str] = dict(names)
         self.functions: dict[str, FunctionReading] = dict(functions)
-        self._clients: dict[str, str] = {}
+        self.clients: dict[str, str] = _bounded_clients(clients)
+        # A reverse index avoids walking every function for every assignment.
+        self._dependents: dict[str, set[str]] = {}
+        for name, function in self.functions.items():
+            self._remember_dependencies(name, function=function)
         # Strings a name may still hold from before code that may not have
         # run and that rebound it, besides the one in names.
         self._alternatives: dict[str, tuple[str, ...]] = {}
         self.bindings: dict[str, NameBinding] = {}
         self.loaded_names: dict[str, None] = {}
         self.strings: list[str] = []
+        # Literal strings, rather than rendered globals: a helper's defining
+        # cell retains these descriptive labels for its lineage, even though
+        # its query/request details belong only to a call.
+        self._literal_strings: set[int] = set()
+        # A binding spells a string without reading it. These occurrences
+        # do not prevent a later print(name) from being label-only.
+        self._bound_strings: set[int] = set()
         # Indexes into strings of the ones that are not SQL candidates where
         # they stand: a string a name was bound to runs where the code reads
         # the name on its own, and a label is printed or drawn, not run.
@@ -524,12 +579,28 @@ class _CellReader(ast.NodeVisitor):
             self.visit(decorator)
         self._visit_signature(node.args, returns=node.returns)
         start = self._position()
-        with self._collecting() as origin, self._scope(parameters=_parameters(node.args), runs_now=False):
+        with self._collecting() as origin, self._scope(parameters=_parameters(node.args), runs_now=False) as scope:
             for statement in node.body:
                 self.visit(statement)
-        function = self._function_reading(start, reads_data=origin.calls_read)
+        function = self._function_reading(start, reads_data=origin.calls_read, scope=scope)
+        literal_strings = tuple(dict.fromkeys(
+            text for index, text in enumerate(self.strings[start.strings:], start.strings)
+            if index in self._literal_strings and text in function.strings
+        ))
+        # A def evaluates its signature, not its body. Only a later call may
+        # emit query/request details, after intervening global rebindings
+        # clear them. Keep only non-SQL source literals for the defining
+        # cell's lineage, such as the file its body spells. Rendered globals
+        # here would still expose stale same-cell details.
+        self._rewind(start)
+        self.strings.extend(literal_strings)
+        retained = range(start.strings, len(self.strings))
+        self.skipped.update(retained)
+        self._literal_strings.update(retained)
         self._store(node.name, origin=origin, value=None)
         self._put(self.functions, key=node.name, value=function)
+        if not self._scopes:
+            self._remember_dependencies(node.name, function=function)
 
     visit_AsyncFunctionDef = visit_FunctionDef
 
@@ -566,6 +637,7 @@ class _CellReader(ast.NodeVisitor):
 
     def visit_Constant(self, node: ast.Constant) -> None:
         if isinstance(node.value, str):
+            self._literal_strings.add(len(self.strings))
             self.strings.append(node.value)
 
     def visit_JoinedStr(self, node: ast.JoinedStr) -> None:
@@ -603,7 +675,7 @@ class _CellReader(ast.NodeVisitor):
         if request is not None or _reads_data(name, writes=target is not None):
             self._note_read()
         if isinstance(node.func, ast.Name) and node.func.id in self.functions:
-            self._run(self.functions[node.func.id])
+            self._run(self.functions[node.func.id], name=node.func.id)
         receiver = node.func.value if isinstance(node.func, ast.Attribute) else None
         if name in _MUTATORS and isinstance(receiver, ast.Name):
             with self._collecting() as origin:
@@ -626,9 +698,20 @@ class _CellReader(ast.NodeVisitor):
             for argument in (*node.args, *(keyword.value for keyword in node.keywords)):
                 first = len(self.strings)
                 self.visit(argument)
-                if _is_string_literal(argument) and first < len(self.strings):
+                if isinstance(argument, ast.Name):
+                    # A bound name may have several conditional values, all
+                    # printed here. Unlike a call/f-string, visiting a Name
+                    # cannot append strings from nested reads.
+                    printed = range(first, len(self.strings))
+                    self.skipped.update(printed)
+                    self.labels.update(printed)
+                elif _is_string_literal(argument) and first < len(self.strings):
                     self.skipped.add(first)
                     self.labels.add(first)
+                    if first in self._literal_strings:
+                        callable_name = _root_name(node.func)
+                        if callable_name is not None:
+                            self._note_global(callable_name, literal_label=True)
             return
         self.generic_visit(node)
 
@@ -716,8 +799,8 @@ class _CellReader(ast.NodeVisitor):
         no string, and the object an item or attribute store fills in place."""
         if isinstance(target, ast.Name):
             self._store(target.id, origin=origin, value=value)
-            if client is not None:
-                self._put(self._clients, key=target.id, value=client)
+            if client is not None and len(self.clients) < MAX_CLIENTS:
+                self._put(self.clients, key=target.id, value=client)
         elif isinstance(target, (ast.Tuple, ast.List)):
             for element in target.elts:
                 self._assign_target(element, origin=origin, value=None, client=None)
@@ -733,9 +816,11 @@ class _CellReader(ast.NodeVisitor):
         """Bind ``name`` where the reader stands: to ``value`` when that is a
         string, and at the cell's top level to what ``origin`` drew on. It no
         longer names a function or a client."""
+        if not self._scopes:
+            self._invalidate_dependents(name)
         self._set_name(name, value=value)
         self._put(self.functions, key=name, value=None)
-        self._put(self._clients, key=name, value=None)
+        self._put(self.clients, key=name, value=None)
         if self._scopes:
             self._scopes[-1].names.add(name)
             return
@@ -744,11 +829,27 @@ class _CellReader(ast.NodeVisitor):
             binding = _merged(self.bindings.get(name, NameBinding(inputs=(name,))), binding)
         self.bindings[name] = binding
 
+    def _remember_dependencies(self, name: str, *, function: FunctionReading) -> None:
+        for global_name in function.global_names:
+            self._dependents.setdefault(global_name, set()).add(name)
+
+    def _invalidate_dependents(self, name: str) -> None:
+        for dependent in self._dependents.pop(name, ()):
+            function = self.functions.get(dependent)
+            if function is not None and name in function.global_names:
+                literal_labels = () if name in function.literal_label_names else function.literal_labels
+                self.functions[dependent] = replace(
+                    function, queries=(), requests=(), strings=(), labels=literal_labels,
+                    literal_labels=literal_labels, environment_variables=(),
+                )
+
     def _mutate(self, name: str, *, origin: _Origin) -> None:
         """Note that top-level code put what ``origin`` drew on into the object
         ``name`` holds."""
         if self._is_local(name) or self._deferred():
             return
+        self._invalidate_dependents(name)
+        self._put(self.clients, key=name, value=None)
         if not (origin.calls_read or origin.uses_read or origin.inputs):
             return
         self.bindings[name] = _merged(self.bindings.get(name, NameBinding(inputs=(name,))), origin.binding())
@@ -790,9 +891,12 @@ class _CellReader(ast.NodeVisitor):
             texts = dict.fromkeys((*earlier, *self._alternatives.get(name, ())))
             kept = tuple(text for text in texts if text != current)[:MAX_ALTERNATIVES]
             self._put(self._alternatives, key=name, value=kept or None)
+            # A conditional client rebind may leave either client alive. Do
+            # not carry the last branch's base URL as though it were certain.
+            self._put(self.clients, key=name, value=None)
 
     @contextmanager
-    def _scope(self, *, parameters: Iterable[str], runs_now: bool) -> Iterator[None]:
+    def _scope(self, *, parameters: Iterable[str], runs_now: bool) -> Iterator[_Scope]:
         """Walk a body whose parameters and locals are its own: what it binds
         is put back as it was once the body ends."""
         scope = _Scope(runs_now=runs_now)
@@ -801,7 +905,7 @@ class _CellReader(ast.NodeVisitor):
         try:
             for parameter in parameters:
                 self._store(parameter, origin=_Origin(), value=None)
-            yield
+            yield scope
         finally:
             self._branches = branches
             self._scopes.pop()
@@ -824,6 +928,7 @@ class _CellReader(ast.NodeVisitor):
     def _note_load(self, name: str) -> None:
         """Note what reading ``name`` draws on: the name itself when it comes
         from an earlier cell, or the inputs of the binding this cell gave it."""
+        self._note_global(name)
         if self._is_local(name):
             return
         binding = self.bindings.get(name)
@@ -835,6 +940,29 @@ class _CellReader(ast.NodeVisitor):
             origin = self._origins[-1]
             origin.uses_read = origin.uses_read or (binding is not None and binding.from_read)
             origin.add_inputs(inputs)
+
+    def _note_global(self, name: str, *, from_function: bool = False, literal_label: bool = False) -> None:
+        """Track globals used by a deferred body, including rendered names
+        that are not visited again as standalone strings."""
+        for index in range(len(self._scopes) - 1, -1, -1):
+            scope = self._scopes[index]
+            if not scope.runs_now:
+                if not from_function:
+                    if any(name in local.names for local in self._scopes[index:]):
+                        return
+                    if any(name in outer.names for outer in self._scopes[:index]):
+                        # A closure can also change before the call. Tracking
+                        # its local namespace would require executing the
+                        # enclosing function, so do not freeze its details.
+                        scope.globals_complete = False
+                        return
+                if len(scope.global_names) < MAX_FUNCTION_GLOBALS:
+                    scope.global_names.setdefault(name, None)
+                elif name not in scope.global_names:
+                    scope.globals_complete = False
+                if literal_label and name in scope.global_names:
+                    scope.literal_label_names.setdefault(name, None)
+                return
 
     def _note_read(self) -> None:
         if self._origins:
@@ -848,10 +976,29 @@ class _CellReader(ast.NodeVisitor):
         when called rather than where the code spells it."""
         return any(not scope.runs_now for scope in self._scopes)
 
-    def _run(self, function: FunctionReading) -> None:
+    def _run(self, function: FunctionReading, *, name: str) -> None:
         """Count a call to a function the cell or an earlier one defined: it
         runs the queries and requests its body shows."""
         self.strings.extend(function.queries)
+        start = len(self.strings)
+        self.strings.extend(function.strings)
+        self.skipped.update(range(start, len(self.strings)))
+        start = len(self.strings)
+        self.strings.extend(function.labels)
+        printed = range(start, len(self.strings))
+        self.skipped.update(printed)
+        self.labels.update(printed)
+        self._literal_strings.update(
+            index for index in printed if self.strings[index] in function.literal_labels
+        )
+        if function.literal_labels:
+            self._note_global(name, literal_label=True)
+            for dependency in function.literal_label_names:
+                self._note_global(dependency, from_function=True, literal_label=True)
+        for name in function.global_names:
+            # A helper resolves its own globals even when the calling
+            # function has locals with those names.
+            self._note_global(name, from_function=True)
         self.requests.extend(function.requests)
         self.environment_variables.extend(function.environment_variables)
         self.data_helper_calls += function.calls_query_minds_data
@@ -864,25 +1011,64 @@ class _CellReader(ast.NodeVisitor):
             strings=len(self.strings),
             requests=len(self.requests),
             environment_variables=len(self.environment_variables),
+            written_files=len(self.written_files),
             data_helper_calls=self.data_helper_calls,
             web_tool_calls=self.web_tool_calls,
         )
 
-    def _function_reading(self, start: _Position, *, reads_data: bool) -> FunctionReading:
+    def _function_reading(self, start: _Position, *, reads_data: bool, scope: _Scope) -> FunctionReading:
         """What the code walked since ``start``, a function's body, shows."""
         candidates = (
             text for index, text in enumerate(self.strings[start.strings:], start.strings)
             if index not in self.skipped and len(text) <= MAX_STRING_CHARS
         )
         requests = (request for request in self.requests[start.requests:] if len(request.url) <= MAX_STRING_CHARS)
+        body_strings = self.strings[start.strings:]
+        labels = {index for index in range(len(body_strings)) if index + start.strings in self.labels}
+        bound = {index for index in range(len(body_strings)) if index + start.strings in self._bound_strings}
+        label_strings = _only_labels(body_strings, labels=labels, bound=bound)
+        literal_labels = {
+            text for index, text in enumerate(body_strings, start.strings)
+            if index in self.labels and index in self._literal_strings
+        }
+        not_read = {*self.written_files[start.written_files:], *label_strings}
+        strings = (
+            text for text in body_strings
+            if len(text) <= MAX_STRING_CHARS and text not in not_read and not self._is_query(text)
+        )
         return FunctionReading(
-            queries=_queries(candidates),
-            requests=tuple(_first_unique(requests, limit=MAX_REQUESTS)),
-            environment_variables=tuple(dict.fromkeys(self.environment_variables[start.environment_variables:])),
+            queries=_queries(candidates) if scope.globals_complete else (),
+            requests=tuple(_first_unique(requests, limit=MAX_REQUESTS)) if scope.globals_complete else (),
+            strings=tuple(_first_unique(strings, limit=MAX_FUNCTION_STRINGS)) if scope.globals_complete else (),
+            labels=tuple(
+                text for text in label_strings if len(text) <= MAX_STRING_CHARS
+            )[:MAX_FUNCTION_STRINGS] if scope.globals_complete else (),
+            literal_labels=tuple(
+                text for text in label_strings if text in literal_labels and len(text) <= MAX_STRING_CHARS
+            )[:MAX_FUNCTION_STRINGS] if scope.globals_complete else (),
+            literal_label_names=tuple(scope.literal_label_names),
+            environment_variables=(
+                tuple(dict.fromkeys(self.environment_variables[start.environment_variables:]))
+                if scope.globals_complete else ()
+            ),
             calls_query_minds_data=self.data_helper_calls > start.data_helper_calls,
             calls_web_tool=self.web_tool_calls > start.web_tool_calls,
             reads_data=reads_data,
+            global_names=tuple(scope.global_names),
         )
+
+    def _rewind(self, start: _Position) -> None:
+        removed = range(start.strings, len(self.strings))
+        self.skipped.difference_update(removed)
+        self.labels.difference_update(removed)
+        self._literal_strings.difference_update(removed)
+        self._bound_strings.difference_update(removed)
+        del self.strings[start.strings:]
+        del self.requests[start.requests:]
+        del self.environment_variables[start.environment_variables:]
+        del self.written_files[start.written_files:]
+        self.data_helper_calls = start.data_helper_calls
+        self.web_tool_calls = start.web_tool_calls
 
     def _mark_bound(self, *, index: int, rendered: str) -> None:
         """Note ``strings[index]`` as the string a name was just bound to, when
@@ -891,6 +1077,7 @@ class _CellReader(ast.NodeVisitor):
         comes after it and still runs here."""
         if index < len(self.strings) and self.strings[index] == rendered:
             self.skipped.add(index)
+            self._bound_strings.add(index)
 
     def _string(self, node: ast.expr) -> str | None:
         """The string ``node`` stands for, or None when it isn't one."""
@@ -902,6 +1089,7 @@ class _CellReader(ast.NodeVisitor):
         if isinstance(node, ast.JoinedStr):
             return "".join(self._fstring_part(part) for part in node.values)
         if isinstance(node, ast.Name):
+            self._note_global(node.id)
             return self.names.get(node.id)
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             return self._concatenated(_operands(node))
@@ -929,6 +1117,7 @@ class _CellReader(ast.NodeVisitor):
         or a base URL; anything else as it renders, or None when it isn't a
         string."""
         if isinstance(node, ast.Name) and node.id in self.names:
+            self._note_global(node.id)
             bound = self.names[node.id]
             reads_inline = _CONNECTION_PLACEHOLDER.fullmatch(bound) or self._is_query(bound) or _names_a_url(bound)
             return bound if reads_inline else "{" + node.id + "}"
@@ -1019,6 +1208,7 @@ class _CellReader(ast.NodeVisitor):
         if variable is not None:
             return "{" + variable + "}"
         if isinstance(node, ast.Name):
+            self._note_global(node.id)
             bound = self.names.get(node.id)
             if bound is not None and (
                 _CONNECTION_PLACEHOLDER.fullmatch(bound) or (self._is_query(bound) and self._spend(len(bound)))
@@ -1059,7 +1249,7 @@ class _CellReader(ast.NodeVisitor):
         if base is None:
             return None
         rendered = self._string(base)
-        if rendered is not None:
+        if rendered is not None and len(rendered) <= MAX_STRING_CHARS:
             stripped = strip_url(rendered).rstrip("/")
             if _CONNECTION_PLACEHOLDER.fullmatch(stripped) or _BARE_ORIGIN.fullmatch(stripped):
                 return stripped
@@ -1092,7 +1282,7 @@ class _CellReader(ast.NodeVisitor):
         if url is None:
             return None
         template = strip_url(self._text(url))
-        base = self._clients.get(receiver) if receiver is not None else None
+        base = self.clients.get(receiver) if receiver is not None else None
         if base is not None and not URL_START.match(template):
             template = strip_url(base + "/" + template.lstrip("/"))
         if not template or not (receiver in _HTTP_MODULES or base is not None or _names_a_url(template)):
@@ -1159,27 +1349,49 @@ def _queries(texts: Iterable[str]) -> tuple[str, ...]:
 def _statements(text: str) -> list[str]:
     """``text`` split after each ``;`` outside a string literal, a quoted
     name, a dollar-quoted string or a comment; each statement keeps its
-    ``;``. Empty when a backslash in a string in single or double quotes moves
-    a split: MySQL reads it as escaping the next character, Postgres and
-    SQLite as an ordinary one, so where each statement ends depends on the
-    database that runs the text."""
-    ends = _statement_ends(text, token=_SQL_TOKEN_ESCAPED)
-    if ends != _statement_ends(text, token=_SQL_TOKEN_PLAIN):
+    ``;``. Empty when supported quote or comment rules disagree about a
+    split, because no database dialect accompanies the extracted text."""
+    ends = _statement_ends(text, token=_SQL_TOKENS[0])
+    if ends is None or any(ends != _statement_ends(text, token=token) for token in _SQL_TOKENS[1:]):
         return []
     return [text[start:end] for start, end in pairwise([0, *ends, len(text)])]
 
 
-def _statement_ends(text: str, *, token: re.Pattern[str]) -> list[int]:
+def _statement_ends(text: str, *, token: re.Pattern[str]) -> list[int] | None:
     """Where each statement in ``text`` ends, just past each ``;`` that
     ``token`` reads as one."""
-    return [match.end() for match in token.finditer(text) if match.group() == ";"]
+    ends = []
+    for match in token.finditer(text):
+        value = match.group()
+        if value == ";":
+            ends.append(match.end())
+        elif value.startswith("/*") and (
+            (value.endswith("*/") and "/*" in value[2:]) or value.startswith(("/*!", "/*M!"))
+        ):
+            # PostgreSQL nests block comments; MySQL does not, and MySQL /
+            # MariaDB executable comments can run their contents. A dialect
+            # is not available here, so do not attach this batch as SQL.
+            return None
+    return ends
 
 
-def _only_labels(strings: Sequence[str], *, labels: set[int]) -> tuple[str, ...]:
-    """The strings at ``labels`` that the code spells nowhere else, in code
-    order."""
-    elsewhere = {text for index, text in enumerate(strings) if index not in labels}
-    return tuple(dict.fromkeys(text for index, text in enumerate(strings) if index in labels and text not in elsewhere))
+def _bounded_clients(clients: Mapping[str, str]) -> dict[str, str]:
+    return {
+        name: base for name, base in islice(clients.items(), MAX_CLIENTS)
+        if len(base) <= MAX_STRING_CHARS
+    }
+
+
+def _only_labels(strings: Sequence[str], *, labels: set[int], bound: set[int]) -> tuple[str, ...]:
+    """Printed labels, excluding strings also used as source paths. An
+    identifier cannot name a URL, document path or SQL query, and may also
+    occur as Series/column metadata, so those other uses do not erase its
+    known role as a caption."""
+    elsewhere = {text for index, text in enumerate(strings) if index not in labels and index not in bound}
+    return tuple(dict.fromkeys(
+        text for index, text in enumerate(strings)
+        if index in labels and (text not in elsewhere or text.strip().isidentifier())
+    ))
 
 
 def _merged(*bindings: NameBinding) -> NameBinding:

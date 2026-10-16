@@ -127,6 +127,10 @@ class TurnEvidence:
     # The tool_use_ids of this turn's EVIDENCE_TOOLS calls, as the stream
     # announced them. Their results reach the formatter only in tool_rows.
     evidence_calls: tuple[str, ...] = ()
+    # Native tools' history results omit their verdict. Only tool_done.ok
+    # explicitly True establishes successful output; False/None can carry
+    # error text with figures. Scratchpad stdout remains usable on failure.
+    successful_native_calls: frozenset[str] = frozenset()
     # Whether anton compacted the turn's context mid-way (the stream carried
     # a StreamContextCompacted), after which no producer sends the turn's
     # tool rows.
@@ -319,7 +323,10 @@ def _answer_sources(evidence: TurnEvidence) -> FigureSources:
         return FigureSources()
     streamed_ids = {step.tool_use_id for step in evidence.steps}
     from_rows = [step for step in _row_steps(evidence.tool_rows) if step.tool_use_id not in streamed_ids]
-    this_turn = [*evidence.steps, *from_rows]
+    this_turn = [
+        step for step in [*evidence.steps, *from_rows]
+        if step.tool_name not in EVIDENCE_TOOLS or step.tool_use_id in evidence.successful_native_calls
+    ]
     # An earlier turn's cells only pass names, functions and data on to this
     # turn's cells, so a turn that ran no cell reads none of them. Oldest
     # first, so what they bound reaches this turn's cells. An earlier turn's
@@ -537,6 +544,7 @@ async def format_responses_stream(
     user_answers: list[str] = []
     tool_rows: list = []
     evidence_calls: list[str] = []
+    successful_native_calls: set[str] = set()
     compacted = False
     # Whether the turn's last text is anton's failure reply, which carries no
     # figures. anton streams that reply as one delta and ends the turn on it,
@@ -715,6 +723,14 @@ async def format_responses_stream(
             # under PROGRESS_THROTTLE — dropping a scratchpad_done
             # would leave the cell stuck in_progress in the UI.
             phase_str = event.phase or ""
+            if phase_str == "tool_done" and event.id:
+                # ChatSession.turn_stream emits this even when the tool has
+                # no tool_progress. Capture it before UI throttling or name
+                # removal; evidence filtering uses the result's tool name.
+                if event.ok is True:
+                    successful_native_calls.add(event.id)
+                else:
+                    successful_native_calls.discard(event.id)
             # A keep-alive from the cloud pod while a model call is quiet.
             # Never throttled: dropping it lets the idle bounds end a live
             # turn, and it cannot flood the stream: the pod writes one from
@@ -987,6 +1003,7 @@ async def format_responses_stream(
         history=turn_context.history,
         files=turn_context.files,
         evidence_calls=tuple(evidence_calls),
+        successful_native_calls=frozenset(successful_native_calls),
         compacted=compacted,
     ))
     if sources.figures:
