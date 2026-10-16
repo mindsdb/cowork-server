@@ -1274,11 +1274,13 @@ class _DirectBuffer:
 async def _produce_direct_answer(monkeypatch, *, text: str, saved: dict) -> _DirectBuffer:
     from uuid import uuid4 as _uuid4
 
+    import cowork.handlers.responses as responses
+
     handler = _routing_handler(monkeypatch)
     _saving_conversation_service(monkeypatch, saved)
     buffer = _DirectBuffer()
     await handler._produce_direct(
-        lifecycle=SimpleNamespace(discarded=False),
+        lifecycle=responses.TurnLifecycle(),
         conv_id=_uuid4(),
         original_content=_OVERTIME_QUESTION,
         question=_OVERTIME_QUESTION,
