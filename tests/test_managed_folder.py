@@ -2,12 +2,17 @@
 
 create_app refuses a managed folder in org tenancy, one that is missing or
 lacks memory/, skills/ or data-vault/, naming each missing folder, one whose
-shared-connection or shared-skill registry is malformed, naming the file, one whose
-memory/ the server can't read and search, one beside remote turns, and one an
-anton without the read-only memory layer would silently drop. A folder with no
+shared-connection registry is malformed, naming the file, one whose memory/
+the server can't read and search, one beside remote turns, and one an anton
+without the read-only memory layer would silently drop. A folder with no
 shared/ starts: an operator who shares nothing needs none. A complete folder
 starts and says what it holds. With the setting unset or blank, the desktop
 and hosted servers start as before.
+
+The skills people share are listed outside the managed folder, in the shared
+root (cowork.shared_skills). A deployment that keeps skills personal starts
+with a malformed list and warns naming it, and says how many it shares. One
+that trusts no identity header reads no list.
 """
 from __future__ import annotations
 
@@ -23,6 +28,7 @@ import pytest
 import cowork.server as cowork_server
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.managed import ManagedFolder, cortex_takes_managed_layer, managed_folder
+from cowork.shared_skills import read_shared_skills, shared_skills_file
 
 SHARED_ENTRY = {
     "user_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d",
@@ -150,7 +156,6 @@ def test_a_complete_folder_starts_and_says_what_it_holds(managed_dir, caplog, ow
     LocalDataVault(managed_dir.vault_dir).save("postgres", "warehouse", {"host": "db"})
     managed_dir.shared_dir.mkdir()
     managed_dir.shared_connections_file.write_text(json.dumps([SHARED_ENTRY]))
-    managed_dir.shared_skills_file.write_text(json.dumps([SHARED_SKILL_ENTRY, SHARED_SKILL_ENTRY]))
 
     owned_logger("cowork.common.logger", level=logging.INFO)
     cowork_server.create_app()
@@ -159,17 +164,13 @@ def test_a_complete_folder_starts_and_says_what_it_holds(managed_dir, caplog, ow
         for record in caplog.records
         if record.name == "cowork.common.logger" and record.levelno == logging.INFO
     ]
-    assert (
-        f"managed folder: {managed_dir.root} (1 skills, 1 connections, 1 shared connections, "
-        "2 shared skills)" in lines
-    )
+    assert f"managed folder: {managed_dir.root} (1 skills, 1 connections, 1 shared connections)" in lines
 
 
 def test_a_folder_with_no_shared_folder_starts_sharing_nothing(managed_dir):
     assert not managed_dir.shared_dir.exists()
     cowork_server.create_app()
     assert managed_dir.shared_connections().root == ()
-    assert managed_dir.shared_skills().root == ()
 
 
 @pytest.mark.parametrize(
@@ -177,23 +178,75 @@ def test_a_folder_with_no_shared_folder_starts_sharing_nothing(managed_dir):
     ['{"user_id": "x"}', "[{\"engine\": \"postgres\"}]", "not json"],
     ids=["not-a-list", "missing-fields", "not-json"],
 )
-@pytest.mark.parametrize("registry", ["connections", "skills"])
-def test_a_malformed_registry_is_refused_naming_the_file(managed_dir, content, registry):
-    registry_file = getattr(managed_dir, f"shared_{registry}_file")
+def test_a_malformed_registry_is_refused_naming_the_file(managed_dir, content):
     managed_dir.shared_dir.mkdir()
-    registry_file.write_text(content)
+    managed_dir.shared_connections_file.write_text(content)
     with pytest.raises(RuntimeError, match="shared registry is malformed") as refused:
         cowork_server.create_app()
-    assert str(registry_file) in str(refused.value)
+    assert str(managed_dir.shared_connections_file) in str(refused.value)
 
 
-def test_a_skill_entry_naming_no_valid_slug_is_malformed(managed_dir):
-    managed_dir.shared_dir.mkdir()
-    managed_dir.shared_skills_file.write_text(
-        json.dumps([{**SHARED_SKILL_ENTRY, "skill": "../escape"}])
-    )
-    with pytest.raises(RuntimeError, match="is not a list of shared skills"):
-        cowork_server.create_app()
+@pytest.fixture
+def personal_skills(personal_deployment, home, monkeypatch):
+    """A deployment that keeps skills personal, its shared root under the
+    test's folder."""
+    monkeypatch.setenv("COWORK_SHARED_DIR", str(home / "shared-root"))
+    monkeypatch.setenv("COWORK_AUTH_TOKEN", "managed-folder-test-token")
+    get_app_settings.cache_clear()
+    return home
+
+
+def test_a_personal_skills_deployment_says_how_many_skills_are_shared(personal_skills, caplog, owned_logger):
+    shared_skills_file().parent.mkdir(parents=True)
+    shared_skills_file().write_text(json.dumps([SHARED_SKILL_ENTRY]))
+
+    owned_logger("cowork.common.logger", level=logging.INFO)
+    cowork_server.create_app()
+
+    lines = [record.getMessage() for record in caplog.records if record.name == "cowork.common.logger"]
+    assert f"shared skills: 1 in {shared_skills_file()}" in lines
+
+
+def test_a_deployment_that_trusts_no_identity_reads_no_shared_skill_list(
+    home, monkeypatch, caplog, owned_logger
+):
+    """COWORK_PERSONAL_RESOURCES lists skills by default, so the desktop
+    would read the list on every start if the check skipped the trust
+    setting."""
+    monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "false")
+    monkeypatch.delenv("COWORK_PERSONAL_RESOURCES", raising=False)
+    get_app_settings.cache_clear()
+
+    def read_no_list():
+        raise AssertionError("read the shared-skill list")
+
+    monkeypatch.setattr(cowork_server, "read_shared_skills", read_no_list)
+    owned_logger("cowork.common.logger", level=logging.INFO)
+    cowork_server.create_app()
+
+    lines = [record.getMessage() for record in caplog.records if record.name == "cowork.common.logger"]
+    assert not any(line.startswith("shared skills:") for line in lines)
+
+
+@pytest.mark.parametrize(
+    "content",
+    ['{"user_id": "x"}', "not json", json.dumps([{**SHARED_SKILL_ENTRY, "skill": "../escape"}])],
+    ids=["not-a-list", "not-json", "no-valid-slug"],
+)
+def test_a_malformed_shared_skill_list_starts_and_warns_naming_it(
+    personal_skills, managed_dir, caplog, owned_logger, content
+):
+    """With a managed folder too: its own registry check no longer reads the
+    skill list, so a malformed one never stops the start."""
+    shared_skills_file().parent.mkdir(parents=True)
+    shared_skills_file().write_text(content)
+    owned_logger("cowork.shared_skills", level=logging.WARNING)
+
+    cowork_server.create_app()
+
+    warnings = [record.getMessage() for record in caplog.records if record.name == "cowork.shared_skills"]
+    assert warnings and str(shared_skills_file()) in warnings[0]
+    assert read_shared_skills().root == ()
 
 
 def test_the_folder_model_names_its_folders(tmp_path):
@@ -205,5 +258,6 @@ def test_the_folder_model_names_its_folders(tmp_path):
         tmp_path / "shared",
     )
     assert folder.shared_connections_file == tmp_path / "shared" / "connections.json"
-    assert folder.shared_skills_file == tmp_path / "shared" / "skills.json"
+    # The skills people share are listed in the shared root, not here.
+    assert not hasattr(folder, "shared_skills_file")
     assert folder.missing_dirs() == [tmp_path / "memory", tmp_path / "skills", tmp_path / "data-vault"]

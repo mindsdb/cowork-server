@@ -5,19 +5,22 @@ server records its creator's sub in its metadata: a create or upload stamps
 the person, never a value the request or file carries, an edit, rename or
 project-rename rewrite keeps it, and the operator view stamps nobody.
 
-With skills personal, the operator shares one person's skill by listing it in
-the managed folder's ``shared/skills.json``. Everyone else lists it after the
-built-ins, the managed skills and their own, reads it live from its creator's
-store with ``shared`` true and no capability, and every change they try,
-disabling included, answers 403 with the shared sentence. Their turns link it
+With skills personal, a person shares one of their own skills, or hides it
+again, with PUT /api/v1/skills/{skill_id}/sharing, or shares it as they
+create or upload it. Either lists it in ``<COWORK_SHARED_DIR>/shared/skills.json``
+(cowork.shared_skills). Everyone else lists it after the built-ins, the
+managed skills and their own, reads it live from its creator's store with
+``shared`` true and no capability, and every change they try, disabling
+included, answers 403 with the shared sentence. Their turns link it
 read-only, after the managed skills, with the selection rule applied to the
 skill's own metadata. Its creator sees it ``shared`` with every capability and
 edits, disables and deletes it as before, and everyone sees each change; its
-rename is refused until it is unshared.
+rename is refused until it is hidden, and deleting it removes its entry.
 
 With skills shared, everyone reads the one base store. A person changes only
-a skill they created, and the operator view changes any. The desktop and
-hosted org tenancy keep every skills route as before.
+a skill they created, and the operator view changes any; nobody shares one
+skill at a time. The desktop and hosted org tenancy keep every skills route as
+before, and share nothing.
 """
 from __future__ import annotations
 
@@ -29,32 +32,37 @@ from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from sqlalchemy import delete
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
+import cowork.server as cowork_server
+from cowork import shared_skills
 from cowork.api.v1.endpoints import skills as skills_ep
 from cowork.common.settings.app_settings import get_app_settings
 from cowork.db.personal_resources import ALL_PERSONAL_RESOURCES, PersonalResource
 from cowork.db.scoped import LOCAL_SCOPE, ScopedSession, TenantScope
 from cowork.db.session import get_open_session
 from cowork.harnesses.anton_harness.harness import HOST_SKILLS_DIR
-from cowork.managed import SharedSkills, readonly_skill_dirs
+from cowork.managed import readonly_skill_dirs
 from cowork.models.conversation import Conversation
 from cowork.models.project import Project
 from cowork.models.skill import META_CREATED_BY
 from cowork.principal import Principal, personal_partition_id
-from cowork.schemas.skills import SkillCreateRequest, SkillUpdateRequest
+from cowork.schemas.skills import SkillCreateRequest, SkillSharingRequest, SkillUpdateRequest
 from cowork.services.skills import (
     BUILTIN_SKILL_SLUGS,
     SHARED_SKILL_REFUSAL,
     SHARED_SKILL_RENAME_REFUSAL,
-    STILL_SHARED_SKILL_REFUSAL,
+    SKILL_SHARING_BUSY,
+    SKILL_SHARING_UNAVAILABLE,
     SkillImmutableError,
     SkillService,
     agent_skill_names,
     link_turn_skills,
 )
+from tests._fakes import shared_skill_list_lock_held
 from tests._turns import built_turn
 
 DEPLOYMENT = "5f0c7d2e-8b1a-4c3e-9d4f-2a6b8c0e1f3a"
@@ -63,8 +71,13 @@ SUB_B = "22222222-2222-4222-8222-222222222222"
 PARTITION_A = personal_partition_id(DEPLOYMENT, SUB_A)
 PARTITION_B = personal_partition_id(DEPLOYMENT, SUB_B)
 SHARED_RESOURCES = frozenset(ALL_PERSONAL_RESOURCES - {PersonalResource.SKILLS})
-NO_CAPABILITY = {"canEdit": False, "canDelete": False, "canDisable": False}
-EVERY_CAPABILITY = {"canEdit": True, "canDelete": True, "canDisable": True}
+NO_CAPABILITY = {"canEdit": False, "canDelete": False, "canDisable": False, "canShare": False}
+# The caller's own skill where skills are personal: theirs to change and share.
+EVERY_CAPABILITY = {"canEdit": True, "canDelete": True, "canDisable": True, "canShare": True}
+# A skill the caller changes where nobody shares one at a time: skills left
+# shared, the desktop and hosted org tenancy.
+CHANGE_CAPABILITY = {"canEdit": True, "canDelete": True, "canDisable": True, "canShare": False}
+TOKEN = "shared-skills-test-token"
 
 SHARED = "team-report"
 SHARED_BODY = "Write the report the team's way."
@@ -76,6 +89,10 @@ def _person(*, partition: str, sub: str, resources=ALL_PERSONAL_RESOURCES) -> Te
 
 ALICE = _person(partition=PARTITION_A, sub=SUB_A)
 BOB = _person(partition=PARTITION_B, sub=SUB_B)
+# The principals TrustedHeaderMiddleware builds for each: the partition is
+# their org id.
+ALICE_PRINCIPAL = Principal(user_id=SUB_A, org_id=PARTITION_A)
+BOB_PRINCIPAL = Principal(user_id=SUB_B, org_id=PARTITION_B)
 
 
 @pytest.fixture
@@ -121,11 +138,11 @@ def trusted(personal_deployment, stores):
 
 @pytest.fixture
 def sharing(personal_deployment, managed_dir, stores):
-    """Every resource personal, with a managed folder whose registry lists
-    Alice's skill `team-report`, which she created herself."""
+    """Every resource personal, with a managed folder, and a shared-skill
+    list that lists Alice's skill `team-report`, which she created herself."""
     get_app_settings.cache_clear()
     SkillService(ALICE).create_skill(SHARED, SHARED_BODY)
-    _write_registry(managed_dir, [_entry(sub=SUB_A, partition=PARTITION_A, skill=SHARED)])
+    _write_list([_entry(sub=SUB_A, partition=PARTITION_A, skill=SHARED)])
     return managed_dir
 
 
@@ -141,9 +158,15 @@ def _entry(*, sub: str, partition: str, skill: str) -> dict[str, str]:
     return {"user_id": sub, "partition_id": partition, "skill": skill}
 
 
-def _write_registry(managed_dir, entries: list[dict[str, str]]) -> None:
-    managed_dir.shared_dir.mkdir(exist_ok=True)
-    managed_dir.shared_skills_file.write_text(json.dumps(entries))
+def _write_list(entries: list[dict[str, str]]) -> None:
+    path = shared_skills.shared_skills_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(entries))
+
+
+def _list_entries() -> list[dict[str, str]]:
+    path = shared_skills.shared_skills_file()
+    return json.loads(path.read_text()) if path.exists() else []
 
 
 def _skill_md(slug: str, body: str, *, created_by: str | None = None) -> str:
@@ -164,6 +187,16 @@ def _stored(scope: TenantScope, slug: str) -> dict[str, str]:
 
 def _listed(scoped, scope: TenantScope) -> dict[str, dict]:
     return {skill["id"]: skill for skill in skills_ep.list_skills(scoped(scope), None)["skills"]}
+
+
+def _set_sharing(scoped, scope: TenantScope, principal: Principal, slug: str, *, shared: bool) -> dict:
+    return skills_ep.set_skill_sharing(slug, SkillSharingRequest(shared=shared), scoped(scope), principal)
+
+
+def _answers(call, status: int, detail: str) -> None:
+    with pytest.raises(HTTPException) as refused:
+        call()
+    assert (refused.value.status_code, refused.value.detail) == (status, detail)
 
 
 def _links(folder: Path) -> dict[str, Path]:
@@ -311,7 +344,7 @@ def test_alice_changes_her_shared_skill_and_bob_sees_each_change(sharing, scoped
 
 
 def test_unsharing_removes_it_from_bob_and_alice_keeps_it(sharing, scoped):
-    _write_registry(sharing, [])
+    _write_list([])
 
     assert SHARED not in _listed(scoped, BOB)
     alices = _listed(scoped, ALICE)[SHARED]
@@ -319,8 +352,8 @@ def test_unsharing_removes_it_from_bob_and_alice_keeps_it(sharing, scoped):
 
 
 def test_alice_renames_her_shared_skill_only_after_unsharing_it(sharing, scoped):
-    """The registry names a skill by slug, and the server never writes it, so
-    a rename while shared would silently stop sharing it: it is refused."""
+    """The list names a skill by slug, so a rename while shared would
+    silently stop sharing it: it is refused until she hides it herself."""
     alice = scoped(ALICE)
 
     _refused(
@@ -334,34 +367,32 @@ def test_alice_renames_her_shared_skill_only_after_unsharing_it(sharing, scoped)
     kept = skills_ep.update_skill(SHARED, SkillUpdateRequest(label=SHARED, name="Team Report"), alice, None)
     assert (kept["id"], kept["name"]) == (SHARED, "Team Report")
 
-    _write_registry(sharing, [])
+    _set_sharing(scoped, ALICE, ALICE_PRINCIPAL, SHARED, shared=False)
     renamed = skills_ep.update_skill(SHARED, SkillUpdateRequest(label="team-report-v2"), alice, None)
     assert renamed["id"] == "team-report-v2"
 
 
-def test_a_name_still_shared_for_a_deleted_skill_is_never_taken_again(sharing, scoped):
-    """Alice deletes her shared skill, and its registry entry stays until the
-    operator unshares it. A create, upload or rename into that name would
-    share the new skill with everyone without the operator sharing it, so
-    each is refused until then."""
-    alice = scoped(ALICE)
-    skills_ep.delete_skill(SHARED, alice, None)
+@pytest.mark.parametrize("way", ["create", "upload", "upload-zip", "rename"])
+def test_a_new_skill_under_a_gone_shared_name_clears_the_leftover_entry(sharing, scoped, way):
+    """Alice's shared skill is gone, but the list still has her entry for its
+    name: her next skill there, made with Only me, removes the entry first,
+    so it is never shared, and Bob never lists it."""
+    SkillService._rmtree_direct_child(SkillService(ALICE).root, SHARED)
     SkillService(ALICE).create_skill("private-notes", "Alice's private notes, never shared.")
+    alice = scoped(ALICE)
+    make = {
+        "create": lambda: skills_ep.create_skill(SkillCreateRequest(label=SHARED, instructions="x"), alice, None),
+        "upload": lambda: skills_ep._upload_skill_bytes(_skill_md(SHARED, "x").encode(), "SKILL.md", alice, None),
+        "upload-zip": lambda: skills_ep._upload_skill_bytes(_zip(SHARED, "x"), "skill.zip", alice, None),
+        "rename": lambda: skills_ep.update_skill("private-notes", SkillUpdateRequest(label=SHARED), alice, None),
+    }[way]
 
-    for call in (
-        lambda: skills_ep.update_skill("private-notes", SkillUpdateRequest(label=SHARED), alice, None),
-        lambda: skills_ep.create_skill(SkillCreateRequest(label=SHARED, instructions="x"), alice, None),
-        lambda: skills_ep._upload_skill_bytes(_skill_md(SHARED, "x").encode(), "SKILL.md", alice, None),
-        lambda: skills_ep._upload_skill_bytes(_zip(SHARED, "x"), "skill.zip", alice, None),
-    ):
-        _refused(call, STILL_SHARED_SKILL_REFUSAL)
-    assert not (SkillService(ALICE).root / SHARED).exists()
-    assert SHARED not in _listed(scoped, BOB)
+    made = make()
 
-    _write_registry(sharing, [])
-    renamed = skills_ep.update_skill("private-notes", SkillUpdateRequest(label=SHARED), alice, None)
-    assert (renamed["id"], renamed["shared"]) == (SHARED, False)
+    assert (made["id"], made["shared"]) == (SHARED, False)
+    assert _list_entries() == []
     assert SHARED not in _listed(scoped, BOB)
+    assert _listed(scoped, ALICE)[SHARED]["shared"] is False
 
 
 def test_bobs_turn_links_alices_shared_skill_and_not_her_unshared_one(sharing, stores):
@@ -415,8 +446,7 @@ def test_an_earlier_layer_hides_a_later_same_named_one(sharing, scoped):
     SkillService(ALICE).create_skill("operator-name", "Alice's.")
     (sharing.skills_dir / "operator-name").mkdir()
     (sharing.skills_dir / "operator-name" / "SKILL.md").write_text(_skill_md("operator-name", "The operator's."))
-    _write_registry(
-        sharing,
+    _write_list(
         [
             _entry(sub=SUB_A, partition=PARTITION_A, skill=SHARED),
             _entry(sub=SUB_A, partition=PARTITION_A, skill="operator-name"),
@@ -431,6 +461,7 @@ def test_an_earlier_layer_hides_a_later_same_named_one(sharing, scoped):
     # The operator's managed skill hides Alice's.
     assert listed["operator-name"]["declarative"].strip() == "The operator's."
     assert (listed["operator-name"]["isBuiltin"], listed["operator-name"]["shared"]) == (True, False)
+    assert listed["operator-name"]["capabilities"] == NO_CAPABILITY
     # A packaged built-in's name is never someone else's.
     assert listed[builtin]["shared"] is False
     assert bob.shared_with_owner() == {}
@@ -447,7 +478,7 @@ def test_a_skill_the_agent_already_has_is_never_shared(sharing, scoped, stores, 
     slug = sorted(readonly_skill_dirs(SkillStore().builtin_root if root == "anton" else HOST_SKILLS_DIR))[0]
     assert slug in agent_skill_names()
     SkillService(ALICE).create_skill(slug, "Alice's version, for everyone.")
-    _write_registry(sharing, [_entry(sub=SUB_A, partition=PARTITION_A, skill=slug)])
+    _write_list([_entry(sub=SUB_A, partition=PARTITION_A, skill=slug)])
     shared_dir = stores / "bob-turn" / "shared-skills"
 
     assert slug not in SkillService(BOB).shared_with_owner()
@@ -460,10 +491,9 @@ def test_a_skill_the_agent_already_has_is_never_shared(sharing, scoped, stores, 
     assert (created["id"], created["shared"]) == (slug, False)
 
 
-def test_only_registry_entries_of_existing_skills_are_read(sharing, scoped):
+def test_only_list_entries_of_existing_skills_are_read(sharing, scoped):
     SkillService(ALICE).create_skill("alices-private", "Alice's alone.")
-    _write_registry(
-        sharing,
+    _write_list(
         [
             _entry(sub=SUB_A, partition=PARTITION_A, skill=SHARED),
             _entry(sub=SUB_A, partition=PARTITION_A, skill="never-made"),
@@ -477,47 +507,423 @@ def test_only_registry_entries_of_existing_skills_are_read(sharing, scoped):
     assert created["id"] == "never-made"
 
 
-def test_one_rename_reads_the_registry_once(sharing, scoped, monkeypatch):
+def test_one_rename_reads_the_list_once(sharing, scoped, monkeypatch):
     """One request reads ``shared/skills.json`` once, however many of its
-    checks ask what is shared, as the registry's read_live is documented."""
+    checks ask what is shared (SkillService._sharing)."""
     SkillService(ALICE).create_skill("notes", "Alice's notes.")
     reads: list[Path] = []
-    read_live = SharedSkills.read_live.__func__
+    read = shared_skills.read_shared_skills
 
-    def counted(cls, path, *, logger):
-        reads.append(path)
-        return read_live(cls, path, logger=logger)
+    def counted():
+        reads.append(shared_skills.shared_skills_file())
+        return read()
 
-    monkeypatch.setattr(SharedSkills, "read_live", classmethod(counted))
+    monkeypatch.setattr(shared_skills, "read_shared_skills", counted)
 
     renamed = skills_ep.update_skill("notes", SkillUpdateRequest(label="notes-v2"), scoped(ALICE), None)
 
     assert renamed["id"] == "notes-v2"
-    assert reads == [sharing.shared_skills_file]
+    assert reads == [shared_skills.shared_skills_file()]
 
 
-def test_a_malformed_registry_shares_nothing_and_says_so(sharing, scoped, caplog, owned_logger):
-    sharing.shared_skills_file.write_text('{"not": "a list"}')
-    owned_logger("cowork.services.skills", level=logging.ERROR)
+def test_a_malformed_list_shares_nothing_and_says_so(sharing, scoped, caplog, owned_logger):
+    shared_skills.shared_skills_file().write_text('{"not": "a list"}')
+    owned_logger("cowork.shared_skills", level=logging.WARNING)
 
     assert SHARED not in _listed(scoped, BOB)
     assert _listed(scoped, ALICE)[SHARED]["shared"] is False
 
-    errors = [
+    warnings = [
         record.getMessage()
         for record in caplog.records
-        if record.name == "cowork.services.skills" and record.levelno == logging.ERROR
+        if record.name == "cowork.shared_skills" and record.levelno == logging.WARNING
     ]
-    assert errors and str(sharing.shared_skills_file) in errors[0]
+    assert warnings and str(shared_skills.shared_skills_file()) in warnings[0]
 
 
-def test_only_a_scope_with_personal_skills_reads_the_registry(sharing):
+def test_only_a_scope_with_personal_skills_reads_the_list(sharing):
     """Where skills are shared the base store already holds everyone's: a
     person's scope that keeps skills shared, and the operator view, read no
-    registry."""
+    list."""
     bob = _person(partition=PARTITION_B, sub=SUB_B, resources=SHARED_RESOURCES)
     assert SkillService(bob).shared_with_owner() == {}
     assert SkillService(LOCAL_SCOPE).shared_with_owner() == {}
+
+
+# ── a person shares or hides their own skill ───────────────────────────────
+
+
+def _upload(scoped, scope: TenantScope, slug: str, body: str, *, zipped: bool, shared: bool) -> dict:
+    raw = _zip(slug, body) if zipped else _skill_md(slug, body).encode()
+    return skills_ep._upload_skill_bytes(
+        raw, "skill.zip" if zipped else "SKILL.md", scoped(scope), None, shared=shared
+    )
+
+
+def test_alice_shares_her_skill_and_hides_it_again(trusted, scoped):
+    """No managed folder: the list sits in the shared root."""
+    SkillService(ALICE).create_skill(SHARED, SHARED_BODY)
+    listing = skills_ep.list_skills(scoped(ALICE), None)
+    listed = {skill["id"]: skill for skill in listing["skills"]}
+    assert listing["canShare"] is True
+    assert listed[SHARED]["capabilities"] == EVERY_CAPABILITY
+    # A packaged built-in's copy is everyone's already.
+    assert not any(listed[slug]["capabilities"]["canShare"] for slug in BUILTIN_SKILL_SLUGS)
+
+    shared = _set_sharing(scoped, ALICE, ALICE_PRINCIPAL, SHARED, shared=True)
+
+    assert (shared["shared"], shared["capabilities"]) == (True, EVERY_CAPABILITY)
+    assert _list_entries() == [_entry(sub=SUB_A, partition=PARTITION_A, skill=SHARED)]
+    bobs = _listed(scoped, BOB)[SHARED]
+    assert (bobs["shared"], bobs["capabilities"], bobs["declarative"].strip()) == (True, NO_CAPABILITY, SHARED_BODY)
+
+    hidden = _set_sharing(scoped, ALICE, ALICE_PRINCIPAL, SHARED, shared=False)
+
+    assert (hidden["shared"], hidden["capabilities"]) == (False, EVERY_CAPABILITY)
+    assert _list_entries() == []
+    assert SHARED not in _listed(scoped, BOB)
+    assert (SkillService(ALICE).root / SHARED / "SKILL.md").is_file()
+
+
+def test_sharing_or_hiding_twice_writes_nothing(trusted, scoped):
+    SkillService(ALICE).create_skill(SHARED, SHARED_BODY)
+    path = shared_skills.shared_skills_file()
+
+    _set_sharing(scoped, ALICE, ALICE_PRINCIPAL, SHARED, shared=True)
+    written = path.stat().st_ino
+    assert _set_sharing(scoped, ALICE, ALICE_PRINCIPAL, SHARED, shared=True)["shared"] is True
+    assert path.stat().st_ino == written
+
+    _set_sharing(scoped, ALICE, ALICE_PRINCIPAL, SHARED, shared=False)
+    written = path.stat().st_ino
+    assert _set_sharing(scoped, ALICE, ALICE_PRINCIPAL, SHARED, shared=False)["shared"] is False
+    assert path.stat().st_ino == written
+
+
+def test_bob_shares_neither_alices_shared_skill_nor_her_private_one(sharing, scoped):
+    SkillService(ALICE).create_skill("alices-private", "Alice's alone.")
+    before = _list_entries()
+
+    for shared in (True, False):
+        _answers(lambda: _set_sharing(scoped, BOB, BOB_PRINCIPAL, SHARED, shared=shared), 403, SHARED_SKILL_REFUSAL)
+        _answers(
+            lambda: _set_sharing(scoped, BOB, BOB_PRINCIPAL, "alices-private", shared=shared),
+            404,
+            "Skill 'alices-private' not found.",
+        )
+    with pytest.raises(HTTPException) as invalid:
+        _set_sharing(scoped, BOB, BOB_PRINCIPAL, "Not A Slug!", shared=True)
+    assert invalid.value.status_code == 404
+    assert _list_entries() == before
+
+
+def test_a_managed_skills_name_answers_403(sharing, scoped):
+    (sharing.skills_dir / "operator-name").mkdir()
+    (sharing.skills_dir / "operator-name" / "SKILL.md").write_text(_skill_md("operator-name", "The operator's."))
+
+    _answers(
+        lambda: _set_sharing(scoped, ALICE, ALICE_PRINCIPAL, "operator-name", shared=True), 403, SHARED_SKILL_REFUSAL
+    )
+
+
+def test_each_share_check_answers_409_saying_why(sharing, scoped, tmp_path):
+    from anton.core.memory.skills import SkillStore
+
+    alice = SkillService(ALICE)
+    alice.ensure_builtin_skills()
+    builtin = sorted(BUILTIN_SKILL_SLUGS)[0]
+    agent_name = sorted(readonly_skill_dirs(SkillStore().builtin_root))[0]
+    alice.create_skill(agent_name, "Alice's own version.")
+    alice.create_skill("linked", "Holds a link.")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("not for everyone")
+    (alice.root / "linked" / "refs").mkdir()
+    (alice.root / "linked" / "refs" / "notes.txt").symlink_to(secret)
+    alice.create_skill("drifted", "Its name drifted.")
+    skill_file = alice.root / "drifted" / "SKILL.md"
+    skill_file.write_text(skill_file.read_text().replace("name: drifted", "name: something-else"))
+    # Made before Alice shared hers: a create after it is refused.
+    bobs = SkillService(BOB).root / SHARED
+    bobs.mkdir(parents=True)
+    (bobs / "SKILL.md").write_text(_skill_md(SHARED, "Bob's own version."))
+
+    for scope, principal, slug, detail in (
+        (ALICE, ALICE_PRINCIPAL, builtin, f"{builtin} is a built-in skill that everyone already has, so it can't be shared."),
+        (
+            ALICE,
+            ALICE_PRINCIPAL,
+            agent_name,
+            f"Everyone's agent already has a skill named {agent_name}, so sharing yours would reach nobody. "
+            "Rename your skill before you share it.",
+        ),
+        (ALICE, ALICE_PRINCIPAL, "linked", "This skill holds a link, refs/notes.txt. Remove it before you share the skill."),
+        (ALICE, ALICE_PRINCIPAL, "drifted", "Skill drifted can't be read in full, so it can't be shared."),
+        (
+            BOB,
+            BOB_PRINCIPAL,
+            SHARED,
+            f"Someone else already shares a skill named {SHARED}. Rename your skill before you share it.",
+        ),
+    ):
+        _answers(lambda: _set_sharing(scoped, scope, principal, slug, shared=True), 409, detail)
+    assert _list_entries() == [_entry(sub=SUB_A, partition=PARTITION_A, skill=SHARED)]
+
+
+def test_someone_elses_entry_for_a_gone_skill_never_blocks_a_share(sharing, scoped):
+    SkillService._rmtree_direct_child(SkillService(ALICE).root, SHARED)
+    SkillService(BOB).create_skill(SHARED, "Bob's own version.")
+
+    shared = _set_sharing(scoped, BOB, BOB_PRINCIPAL, SHARED, shared=True)
+
+    assert shared["shared"] is True
+    assert _listed(scoped, ALICE)[SHARED]["declarative"].strip() == "Bob's own version."
+
+
+def test_a_busy_list_answers_503_and_writes_nothing(trusted, scoped, monkeypatch):
+    monkeypatch.setattr(shared_skills, "SHARED_SKILLS_LOCK_TIMEOUT", 0.2)
+    SkillService(ALICE).create_skill(SHARED, SHARED_BODY)
+    SkillService(ALICE).create_skill("private-notes", "Alice's.")
+    _write_list([_entry(sub=SUB_A, partition=PARTITION_A, skill="gone-name")])
+    alice = scoped(ALICE)
+
+    with shared_skill_list_lock_held():
+        for shared in (True, False):
+            _answers(lambda: _set_sharing(scoped, ALICE, ALICE_PRINCIPAL, SHARED, shared=shared), 503, SKILL_SHARING_BUSY)
+        _answers(
+            lambda: skills_ep.create_skill(SkillCreateRequest(label="busy-notes", instructions="x", shared=True), alice, None),
+            503,
+            SKILL_SHARING_BUSY,
+        )
+        _answers(lambda: _upload(scoped, ALICE, "busy-upload", "x", zipped=True, shared=True), 503, SKILL_SHARING_BUSY)
+        # A rename into a name her list still has for a gone skill must
+        # clear that entry first.
+        _answers(
+            lambda: skills_ep.update_skill("private-notes", SkillUpdateRequest(label="gone-name"), alice, None),
+            503,
+            SKILL_SHARING_BUSY,
+        )
+
+    root = SkillService(ALICE).root
+    assert not (root / "busy-notes").exists() and not (root / "busy-upload").exists()
+    assert (root / "private-notes").is_dir() and not (root / "gone-name").exists()
+    assert _list_entries() == [_entry(sub=SUB_A, partition=PARTITION_A, skill="gone-name")]
+
+
+def test_deleting_a_shared_skill_stops_sharing_it(sharing, scoped):
+    skills_ep.delete_skill(SHARED, scoped(ALICE), None)
+
+    assert _list_entries() == []
+    created = skills_ep.create_skill(SkillCreateRequest(label=SHARED, instructions="New."), scoped(ALICE), None)
+    assert created["shared"] is False
+    assert SHARED not in _listed(scoped, BOB)
+
+
+def test_a_delete_still_succeeds_when_its_entry_cant_be_removed(sharing, scoped, monkeypatch, caplog, owned_logger):
+    def broken(*, change):
+        raise OSError("the list can't be written")
+
+    monkeypatch.setattr(shared_skills, "change_shared_skills", broken)
+    owned_logger("cowork.services.skills", level=logging.WARNING)
+
+    skills_ep.delete_skill(SHARED, scoped(ALICE), None)
+
+    assert not (SkillService(ALICE).root / SHARED).exists()
+    warnings = [record.getMessage() for record in caplog.records if record.name == "cowork.services.skills"]
+    assert any(SHARED in line and str(shared_skills.shared_skills_file()) in line for line in warnings)
+    # The entry left behind shares nothing: its skill is gone.
+    assert SHARED not in _listed(scoped, BOB)
+
+
+async def test_a_turn_reads_shared_skills_without_a_managed_folder(trusted, monkeypatch, stores):
+    SkillService(ALICE).create_skill(SHARED, SHARED_BODY)
+    SkillService(ALICE).share(SHARED)
+
+    async with built_turn(monkeypatch=monkeypatch, tmp_path=stores, scope=BOB) as turn:
+        roots = turn.config.settings.skills_extra_roots
+        assert roots == [HOST_SKILLS_DIR, turn.scratch / "shared-skills"]
+        assert _links(roots[-1]) == {SHARED: SkillService(ALICE).root.resolve() / SHARED}
+
+
+# ── sharing a skill as it is created ────────────────────────────────────────
+
+
+@pytest.mark.parametrize("way", ["create", "upload", "upload-zip"])
+def test_a_skill_created_shared_reaches_bob_read_only(trusted, scoped, way):
+    if way == "create":
+        created = skills_ep.create_skill(
+            SkillCreateRequest(label=SHARED, instructions=SHARED_BODY, shared=True), scoped(ALICE), None
+        )
+    else:
+        created = _upload(scoped, ALICE, SHARED, SHARED_BODY, zipped=way == "upload-zip", shared=True)
+
+    assert (created["shared"], created["capabilities"]) == (True, EVERY_CAPABILITY)
+    assert _list_entries() == [_entry(sub=SUB_A, partition=PARTITION_A, skill=SHARED)]
+    alices = _listed(scoped, ALICE)[SHARED]
+    assert (alices["shared"], alices["capabilities"]) == (True, EVERY_CAPABILITY)
+    bobs = _listed(scoped, BOB)[SHARED]
+    assert (bobs["shared"], bobs["capabilities"], bobs["declarative"].strip()) == (True, NO_CAPABILITY, SHARED_BODY)
+
+
+def test_a_skill_created_with_only_me_is_shared_with_nobody(trusted, scoped):
+    created = skills_ep.create_skill(SkillCreateRequest(label=SHARED, instructions=SHARED_BODY), scoped(ALICE), None)
+
+    assert (created["shared"], created["capabilities"]) == (False, EVERY_CAPABILITY)
+    assert not shared_skills.shared_skills_file().exists()
+    assert SHARED not in _listed(scoped, BOB)
+
+
+@pytest.mark.parametrize("way", ["create", "upload", "upload-zip"])
+def test_a_skill_created_shared_under_an_agent_skill_name_answers_409(trusted, scoped, way):
+    from anton.core.memory.skills import SkillStore
+
+    slug = sorted(readonly_skill_dirs(SkillStore().builtin_root))[0]
+    detail = (
+        f"Everyone's agent already has a skill named {slug}, so sharing yours would reach nobody. "
+        "Rename your skill before you share it."
+    )
+
+    def make() -> dict:
+        if way == "create":
+            return skills_ep.create_skill(
+                SkillCreateRequest(label=slug, instructions="x", shared=True), scoped(ALICE), None
+            )
+        return _upload(scoped, ALICE, slug, "x", zipped=way == "upload-zip", shared=True)
+
+    _answers(make, 409, detail)
+
+    assert not (SkillService(ALICE).root / slug).exists()
+    assert not shared_skills.shared_skills_file().exists()
+
+
+@pytest.mark.parametrize("way", ["create", "upload", "upload-zip"])
+def test_a_skill_created_shared_is_removed_when_its_entry_cant_be_written(trusted, scoped, monkeypatch, way):
+    def broken(*, change):
+        raise OSError("the list can't be written")
+
+    monkeypatch.setattr(shared_skills, "change_shared_skills", broken)
+
+    with pytest.raises(OSError, match="the list can't be written"):
+        if way == "create":
+            skills_ep.create_skill(SkillCreateRequest(label="new-shared", instructions="x", shared=True), scoped(ALICE), None)
+        else:
+            _upload(scoped, ALICE, "new-shared", "x", zipped=way == "upload-zip", shared=True)
+
+    assert not (SkillService(ALICE).root / "new-shared").exists()
+
+
+def test_where_skills_are_shared_nobody_shares_one_at_a_time(all_shared, scoped):
+    alice = scoped(ALICE_SHARED)
+    skills_ep.create_skill(SkillCreateRequest(label="team-notes", instructions="Alice's."), alice, None)
+    listing = skills_ep.list_skills(alice, None)
+    assert listing["canShare"] is False
+    assert not any(skill["capabilities"]["canShare"] for skill in listing["skills"])
+
+    # The 409's text, which the Cowork toast shows and the README quotes.
+    assert SKILL_SHARING_UNAVAILABLE == (
+        "Sharing one skill at a time isn't available here: every skill is already shared with everyone."
+    )
+    # Unavailable answers before the skill is looked up.
+    for slug in ("team-notes", "never-made"):
+        for shared in (True, False):
+            _answers(
+                lambda: skills_ep.set_skill_sharing(slug, SkillSharingRequest(shared=shared), alice, ALICE_PRINCIPAL),
+                409,
+                SKILL_SHARING_UNAVAILABLE,
+            )
+    _answers(
+        lambda: skills_ep.create_skill(SkillCreateRequest(label="new-shared", instructions="x", shared=True), alice, None),
+        409,
+        SKILL_SHARING_UNAVAILABLE,
+    )
+    _answers(lambda: _upload(scoped, ALICE_SHARED, "new-upload", "x", zipped=True, shared=True), 409, SKILL_SHARING_UNAVAILABLE)
+
+    root = SkillService(LOCAL_SCOPE).root
+    assert not (root / "new-shared").exists() and not (root / "new-upload").exists()
+    assert not shared_skills.shared_skills_file().exists()
+
+
+def test_the_operator_view_shares_nothing(trusted, scoped):
+    # Nor does a person's partition acting with no person in it.
+    no_person = TenantScope(personal=True, org_id=PARTITION_A, user_id=None, personal_resources=ALL_PERSONAL_RESOURCES)
+    assert SkillService(no_person).sharing_available is False
+    operator = scoped(LOCAL_SCOPE)
+    SkillService(LOCAL_SCOPE).create_skill("ops-notes", "Ours.")
+
+    listing = skills_ep.list_skills(operator, None)
+    assert listing["canShare"] is False
+    assert not any(skill["capabilities"]["canShare"] for skill in listing["skills"])
+    _answers(
+        lambda: skills_ep.create_skill(SkillCreateRequest(label="new-shared", instructions="x", shared=True), operator, None),
+        409,
+        SKILL_SHARING_UNAVAILABLE,
+    )
+
+
+# ── the sharing route on the wire ───────────────────────────────────────────
+
+
+@pytest.fixture
+def client(trusted, monkeypatch):
+    monkeypatch.setenv("COWORK_AUTH_TOKEN", TOKEN)
+    get_app_settings.cache_clear()
+    return TestClient(cowork_server.create_app(), base_url="http://127.0.0.1:26866", client=("127.0.0.1", 54321))
+
+
+def _as(sub: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {TOKEN}", "X-User-Id": sub, "X-Organization-Id": DEPLOYMENT}
+
+
+def test_the_sharing_route_and_create_fields_on_the_wire(client):
+    SkillService(ALICE).create_skill(SHARED, SHARED_BODY)
+    listing = client.get("/api/v1/skills/", headers=_as(SUB_A)).json()
+    assert listing["canShare"] is True
+    assert {skill["id"]: skill for skill in listing["skills"]}[SHARED]["capabilities"]["canShare"] is True
+
+    response = client.put(f"/api/v1/skills/{SHARED}/sharing", headers=_as(SUB_A), json={"shared": True})
+
+    assert response.status_code == 200
+    assert (response.json()["shared"], response.json()["capabilities"]) == (True, EVERY_CAPABILITY)
+    bobs = {skill["id"]: skill for skill in client.get("/api/v1/skills/", headers=_as(SUB_B)).json()["skills"]}
+    assert (bobs[SHARED]["shared"], bobs[SHARED]["capabilities"]) == (True, NO_CAPABILITY)
+
+    for body in ({}, {"shared": "maybe"}):
+        assert client.put(f"/api/v1/skills/{SHARED}/sharing", headers=_as(SUB_A), json=body).status_code == 422
+
+    created = client.post(
+        "/api/v1/skills/", headers=_as(SUB_A), json={"label": "made-shared", "declarative": "x", "shared": True}
+    )
+    assert (created.status_code, created.json()["shared"]) == (201, True)
+    uploaded = client.post(
+        "/api/v1/skills/upload",
+        headers=_as(SUB_A),
+        files={"file": ("SKILL.md", _skill_md("uploaded-shared", "x").encode(), "text/markdown")},
+        data={"shared": "true"},
+    )
+    assert (uploaded.status_code, uploaded.json()["shared"]) == (201, True)
+    private = client.post(
+        "/api/v1/skills/upload",
+        headers=_as(SUB_A),
+        files={"file": ("SKILL.md", _skill_md("uploaded-private", "x").encode(), "text/markdown")},
+    )
+    assert (private.status_code, private.json()["shared"]) == (201, False)
+    assert [entry["skill"] for entry in _list_entries()] == [SHARED, "made-shared", "uploaded-shared"]
+
+
+def test_the_sharing_route_answers_401_to_a_caller_with_no_person(trusted, monkeypatch):
+    """The operator view: a request with the bearer token and no identity,
+    served with no person under COWORK_IDENTITY_ENFORCE=audit."""
+    monkeypatch.setenv("COWORK_AUTH_TOKEN", TOKEN)
+    monkeypatch.setenv("COWORK_IDENTITY_ENFORCE", "audit")
+    get_app_settings.cache_clear()
+    client = TestClient(cowork_server.create_app(), base_url="http://127.0.0.1:26866", client=("127.0.0.1", 54321))
+    SkillService(LOCAL_SCOPE).create_skill("ops-notes", "Ours.")
+
+    response = client.put(
+        "/api/v1/skills/ops-notes/sharing", headers={"Authorization": f"Bearer {TOKEN}"}, json={"shared": True}
+    )
+
+    assert (response.status_code, response.json()) == (401, {"detail": "Unauthorized"})
+    assert not shared_skills.shared_skills_file().exists()
 
 
 # ── every skill shared ──────────────────────────────────────────────────────
@@ -550,8 +956,8 @@ def test_where_all_are_shared_only_the_creator_changes_a_skill(all_shared, scope
     # reads Alice's as shared with him, read-only.
     for scope, capabilities, shared in (
         (BOB_SHARED, NO_CAPABILITY, True),
-        (LOCAL_SCOPE, EVERY_CAPABILITY, False),
-        (ALICE_SHARED, EVERY_CAPABILITY, False),
+        (LOCAL_SCOPE, CHANGE_CAPABILITY, False),
+        (ALICE_SHARED, CHANGE_CAPABILITY, False),
     ):
         listed = _listed(scoped, scope)["team-notes"]
         assert (listed["capabilities"], listed["shared"]) == (capabilities, shared)
@@ -561,7 +967,7 @@ def test_where_all_are_shared_only_the_creator_changes_a_skill(all_shared, scope
     alice = scoped(ALICE_SHARED)
     skills_ep.update_skill("team-notes", SkillUpdateRequest(instructions="Changed."), alice, None)
     renamed = skills_ep.update_skill("team-notes", SkillUpdateRequest(label="team-notes-v2"), alice, None)
-    assert renamed["capabilities"] == EVERY_CAPABILITY
+    assert renamed["capabilities"] == CHANGE_CAPABILITY
     assert _stored(LOCAL_SCOPE, "team-notes-v2")[META_CREATED_BY] == SUB_A
     skills_ep.delete_skill("team-notes-v2", alice, None)
     assert "team-notes-v2" not in _listed(scoped, BOB_SHARED)
@@ -593,7 +999,7 @@ def test_where_all_are_shared_a_skill_with_no_creator_is_the_operators(all_share
 
     operator = scoped(LOCAL_SCOPE)
     edited = skills_ep.update_skill("legacy", SkillUpdateRequest(instructions="The operator's."), operator, None)
-    assert edited["capabilities"] == EVERY_CAPABILITY
+    assert edited["capabilities"] == CHANGE_CAPABILITY
     assert META_CREATED_BY not in _stored(LOCAL_SCOPE, "legacy")
     skills_ep.delete_skill("legacy", operator, None)
     assert "legacy" not in _listed(scoped, LOCAL_SCOPE)
@@ -607,7 +1013,7 @@ def _every_route_works(session, principal, *, upload_creator: str | None) -> Non
     each, as the caller who made them. None is ``shared``, and nothing stamps
     a creator: an upload keeps what its file says (``upload_creator``)."""
     created = skills_ep.create_skill(SkillCreateRequest(label="my-notes", instructions="Mine."), session, principal)
-    assert (created["shared"], created["capabilities"]) == (False, EVERY_CAPABILITY)
+    assert (created["shared"], created["capabilities"]) == (False, CHANGE_CAPABILITY)
     uploaded = skills_ep._upload_skill_bytes(
         _skill_md("uploaded", "Mine.", created_by=SUB_B).encode(), "SKILL.md", session, principal
     )
@@ -616,9 +1022,11 @@ def _every_route_works(session, principal, *, upload_creator: str | None) -> Non
     assert service.get_skill("my-notes").created_by is None
     assert service.get_skill("uploaded").created_by == upload_creator
 
-    listed = {s["id"]: s for s in skills_ep.list_skills(session, principal)["skills"]}
+    listing = skills_ep.list_skills(session, principal)
+    assert listing["canShare"] is False
+    listed = {s["id"]: s for s in listing["skills"]}
     assert {"my-notes", "uploaded"} <= set(listed)
-    assert not any(skill["shared"] for skill in listed.values())
+    assert not any(skill["shared"] or skill["capabilities"]["canShare"] for skill in listed.values())
     assert skills_ep.get_skill("my-notes", session, principal)["shared"] is False
 
     edited = skills_ep.update_skill("my-notes", SkillUpdateRequest(instructions="Changed."), session, principal)
@@ -669,3 +1077,29 @@ def test_hosted_org_tenancy_keeps_every_skills_route(hosted):
     _every_route_works(hosted, principal, upload_creator=SUB_B)
 
     assert SkillService(hosted.scope).root.parent.name == ORG_ID
+
+
+def test_hosted_org_tenancy_shares_no_skill(hosted):
+    principal = Principal(user_id=ORG_USER, org_id=ORG_ID, email="member@example.com")
+    skills_ep.create_skill(SkillCreateRequest(label="my-notes", instructions="Mine."), hosted, principal)
+
+    _answers(
+        lambda: skills_ep.set_skill_sharing("my-notes", SkillSharingRequest(shared=True), hosted, principal),
+        409,
+        SKILL_SHARING_UNAVAILABLE,
+    )
+    _answers(
+        lambda: skills_ep.create_skill(SkillCreateRequest(label="new-shared", instructions="x", shared=True), hosted, principal),
+        409,
+        SKILL_SHARING_UNAVAILABLE,
+    )
+    _answers(
+        lambda: skills_ep._upload_skill_bytes(_zip("new-upload", "x"), "skill.zip", hosted, principal, shared=True),
+        409,
+        SKILL_SHARING_UNAVAILABLE,
+    )
+    root = SkillService(hosted.scope).root
+    assert not (root / "new-shared").exists() and not (root / "new-upload").exists()
+    # The refused upload reserved no claim: the name is still free.
+    uploaded = skills_ep._upload_skill_bytes(_zip("new-upload", "x"), "skill.zip", hosted, principal)
+    assert (uploaded["id"], uploaded["shared"]) == ("new-upload", False)

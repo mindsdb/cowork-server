@@ -223,7 +223,9 @@ def test_shared_resource_authorization_and_contract_through_http(client):
     assert skill_created.status_code == 201, skill_created.text
     skill = skill_created.json()
     assert skill["attribution"]["createdBy"]["userId"] == USER_A
-    assert set(skill["capabilities"]) == {"canEdit", "canDelete", "canDisable"}
+    assert set(skill["capabilities"]) == {"canEdit", "canDelete", "canDisable", "canShare"}
+    # Hosted org tenancy shares no skill one at a time.
+    assert skill["capabilities"]["canShare"] is False
     denied = client.put(
         f"/api/v1/skills/{skill['id']}",
         json={"instructions": "Peer overwrite"},

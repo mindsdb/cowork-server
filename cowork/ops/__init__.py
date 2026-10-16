@@ -10,22 +10,23 @@ requests, so a caller never repeats the storage layout.
 
 Results go to stdout as plain text, and errors and log lines to stderr. A
 command that can't do what it was asked prints why and exits with status 1.
-A share or unshare given ``--registry-stdout`` writes nothing: it prints the
-new registry on stdout, exactly the bytes it would have written, and its
-message on stderr, so a caller can check the registry and write it itself.
+A connection share or unshare given ``--registry-stdout`` writes nothing: it
+prints the new registry on stdout, exactly the bytes it would have written,
+and its message on stderr, so a caller can check the registry and write it
+itself. A skill share or unshare has no such flag: Cowork writes the
+shared-skill list itself (cowork.shared_skills), so the command runs as
+Cowork's own user and changes the list as the person's Skills page does.
 
 The helpers below are shared by every module: the two person arguments, the
 Person they make, the scope that person's own requests get, and the reading
-and writing of the managed folder's shared registries.
+and writing of the managed folder's shared-connection registry.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
-import tempfile
 from collections.abc import Callable
 from pathlib import Path
 from typing import Generic, TypeVar
@@ -150,7 +151,7 @@ def run_operator_command(command: Callable[[], str]) -> int:
     return 0
 
 
-# ── the shared registries ────────────────────────────────────────────────────
+# ── the managed folder's shared-connection registry ─────────────────────────
 
 EntryT = TypeVar("EntryT", bound=SharedEntry)
 RegistryT = TypeVar("RegistryT", bound=SharedRegistry)
@@ -185,34 +186,12 @@ def read_registry(*, registry_type: type[RegistryT], path: Path) -> RegistryT:
         raise OperatorCommandError(f"{error}. Fix or remove it first.") from error
 
 
-def registry_json(registry: SharedRegistry) -> str:
-    """The registry file's whole text, as write_registry writes it."""
-    return registry.model_dump_json(indent=2) + "\n"
-
-
-def write_registry(*, path: Path, registry: SharedRegistry) -> None:
-    """Replace the registry file at once, so the server never reads half of it."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", dir=path.parent, prefix=f".{path.stem}-", suffix=".json", delete=False
-    ) as handle:
-        handle.write(registry_json(registry))
-    temporary = Path(handle.name)
-    try:
-        # Readable by the server's user, whatever the caller's umask.
-        temporary.chmod(0o644)
-        os.replace(temporary, path)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-
-
 # Where the new registry goes with --registry-stdout, for the messages.
 REGISTRY_ON_STDOUT = "the registry on stdout"
 
 
 def add_registry_stdout_argument(parser: argparse.ArgumentParser) -> None:
-    """Add --registry-stdout to one share or unshare parser."""
+    """Add --registry-stdout to one connection share or unshare parser."""
     parser.add_argument(
         "--registry-stdout",
         action="store_true",
@@ -229,9 +208,10 @@ def finish_registry_change(
 ) -> str:
     """Write the change's registry and return ``message`` for stdout. With
     ``registry_stdout``, write nothing: ``message`` goes to stderr, and the
-    new registry's text (registry_json) is returned for stdout instead."""
+    new registry's text (SharedRegistry.dump_json) is returned for stdout
+    instead."""
     if registry_stdout:
         print(message, file=sys.stderr)
-        return registry_json(change.updated)
-    write_registry(path=change.registry, registry=change.updated)
+        return change.updated.dump_json()
+    change.updated.write(change.registry)
     return message

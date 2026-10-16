@@ -26,6 +26,7 @@ from cowork.db.scoped import MissingTenantScopeError
 from cowork.db.units import DatabaseBusy, busy_retry_seconds
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
 from cowork.managed import SharedRegistryError, cortex_takes_managed_layer, managed_folder
+from cowork.shared_skills import read_shared_skills, shared_skills_file
 from cowork.principal import TrustedHeaderMiddleware
 from cowork.schemas.refusals import TURN_IN_PROGRESS, Refusal
 from cowork.services.connectors.layered_vault import SharedConnectionError
@@ -441,11 +442,11 @@ def create_app() -> FastAPI:
                 "read-only memory layer. The installed anton has none, so the "
                 "managed rules would reach no turn."
             )
-        # A malformed registry stops the start, where the operator sees it. One
-        # broken later shares nothing until fixed (SharedRegistry.read_live).
+        # A malformed connection registry stops the start, where the operator
+        # sees it. One broken later shares nothing until fixed
+        # (SharedRegistry.read_live).
         try:
             shared_connections = managed.shared_connections()
-            shared_skills = managed.shared_skills()
         except SharedRegistryError as error:
             raise RuntimeError(
                 f"COWORK_MANAGED_DIR's shared registry is malformed: {error}. "
@@ -454,13 +455,19 @@ def create_app() -> FastAPI:
         from anton.core.datasources.data_vault import LocalDataVault
 
         logger.info(
-            "managed folder: %s (%d skills, %d connections, %d shared connections, "
-            "%d shared skills)",
+            "managed folder: %s (%d skills, %d connections, %d shared connections)",
             managed.root,
             len(managed.skill_slugs()),
             len(LocalDataVault(managed.vault_dir).list_connections()),
             len(shared_connections.root),
-            len(shared_skills.root),
+        )
+
+    # The skills people share, which Cowork writes itself. A malformed list
+    # never stops the start: it shares nothing, with a warning naming the
+    # file (read_shared_skills), until the next share or hide replaces it.
+    if settings.trust_identity_headers and PersonalResource.SKILLS in settings.personal_resources:
+        logger.info(
+            "shared skills: %d in %s", len(read_shared_skills().root), shared_skills_file()
         )
 
     # A remote turn runs on a worker that reads and learns memory in the

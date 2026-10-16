@@ -2,11 +2,11 @@ import logging
 from contextlib import ExitStack, nullcontext
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile, status
 from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
-from cowork.api.v1.permissions import AuthenticatedInOrgMode, require
+from cowork.api.v1.permissions import Authenticated, AuthenticatedInOrgMode, require
 from cowork.db.personal_resources import PersonalResource
 from cowork.db.scoped import (
     ScopedSession,
@@ -22,6 +22,7 @@ from cowork.schemas.skills import (
     SkillCreateRequest,
     SkillListResponse,
     SkillResponse,
+    SkillSharingRequest,
     SkillUpdateRequest,
 )
 from cowork.schemas.shared_resources import SkillCapabilities
@@ -32,8 +33,10 @@ from cowork.services.shared_resources import (
     SharedResourceAccess,
 )
 from cowork.services.skills import (
+    SharedSkillsBusyError,
     SkillOrigin,
     SkillService,
+    SkillSharingError,
     VisibleSkill,
     builtin_skill_refusal,
     is_builtin_skill,
@@ -136,6 +139,14 @@ def _skill_response(
             can_edit=can_change,
             can_delete=can_change,
             can_disable=can_change,
+            # Only the caller's own skill, where sharing is available, and
+            # never a packaged built-in's copy. A share check may still
+            # refuse it, saying why, when the caller submits.
+            can_share=(
+                visible.origin is SkillOrigin.OWN
+                and service.sharing_available
+                and not is_builtin_skill(skill.name)
+            ),
         ),
     ).model_dump(by_alias=True)
 
@@ -244,7 +255,8 @@ def list_skills(
         "skills": [
             _skill_response(visible, access=access, service=skill_service)
             for visible in skill_service.list_visible_skills()
-        ]
+        ],
+        "canShare": skill_service.sharing_available,
     }
 
 
@@ -279,6 +291,15 @@ def create_skill(
                     description=body.description,
                     enabled=body.enabled,
                     projects=body.projects,
+                    shared=body.shared,
+                )
+            except SkillSharingError as e:
+                _release_new_skill_claim(access, claim, claim_token)
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+            except SharedSkillsBusyError as e:
+                _release_new_skill_claim(access, claim, claim_token)
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)
                 )
             except PermissionError as e:
                 _release_new_skill_claim(access, claim, claim_token)
@@ -307,6 +328,8 @@ def _upload_skill_bytes(
     filename: str | None,
     scoped: ScopedSession,
     principal: Principal | None,
+    *,
+    shared: bool = False,
 ) -> dict:
     access = SharedResourceAccess(scoped, principal)
     access.require_actor()
@@ -327,6 +350,16 @@ def _upload_skill_bytes(
                     raw,
                     filename=filename,
                     before_persist=reserve_import if scoped.scope.org_mode else None,
+                    shared=shared,
+                )
+            # Before ValueError's 422: a refused share is a conflict.
+            except SkillSharingError as e:
+                _release_new_skill_claim(access, claim, claim_token)
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+            except SharedSkillsBusyError as e:
+                _release_new_skill_claim(access, claim, claim_token)
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)
                 )
             except PermissionError as e:
                 _release_new_skill_claim(access, claim, claim_token)
@@ -365,6 +398,7 @@ async def upload_skill(
     file: UploadFile,
     scope: Annotated[TenantScope, Depends(get_tenant_scope)],
     principal: Principal | None = Depends(get_principal),
+    shared: Annotated[bool, Form()] = False,
 ):
     raw = await file.read()
     return await run_in_threadpool(
@@ -373,6 +407,7 @@ async def upload_skill(
         file.filename,
         scope,
         principal,
+        shared=shared,
     )
 
 
@@ -381,11 +416,13 @@ def _upload_skill_in_new_session(
     filename: str | None,
     scope: TenantScope,
     principal: Principal | None,
+    *,
+    shared: bool = False,
 ) -> dict:
     raw_session = get_open_session()
     try:
         scoped = ScopedSession(raw_session, scope)
-        return _upload_skill_bytes(raw, filename, scoped, principal)
+        return _upload_skill_bytes(raw, filename, scoped, principal, shared=shared)
     finally:
         raw_session.close()
 
@@ -541,6 +578,10 @@ def update_skill(
                             detail=f"A skill named '{skill.name}' already exists.",
                         )
                     raise
+        except SharedSkillsBusyError as e:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e)
+            )
         except PermissionError as e:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
         except ValueError as e:
@@ -548,6 +589,47 @@ def update_skill(
         finally:
             resource_coordination.close()
     return _skill_response(service.as_own(skill), access=access, service=service)
+
+
+@router.put("/{skill_id}/sharing", response_model=SkillResponse)
+def set_skill_sharing(
+    skill_id: str,
+    body: SkillSharingRequest,
+    scoped: ScopedSessionDep,
+    # Authenticated, beside the router's AuthenticatedInOrgMode: a person
+    # shares their own skill, so a caller with no person (the operator view,
+    # the desktop) has nothing to share and gets a 401 in either mode.
+    principal: Principal = Depends(require(Authenticated)),
+):
+    """Share one of the caller's own skills with everyone, read-only, or stop
+    sharing it. Both directions are idempotent.
+
+    409 where sharing is unavailable, before anything else is read; 403 for
+    a managed skill's name or one someone else shares with the caller; 404
+    when the caller's own store holds no such skill; 409 for a share a check
+    refuses, with the reason; 503 while another change holds the list.
+    """
+    service = SkillService(scoped.scope)
+    try:
+        service.refuse_unless_sharing_available()
+        service.refuse_unchangeable(skill_id)
+        skill = service.get_skill(skill_id)
+        if body.shared:
+            service.share(skill.name)
+        else:
+            service.stop_sharing(skill.name)
+        skill = service.get_skill(skill.name)
+    except SkillSharingError as e:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+    except SharedSkillsBusyError as e:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(e))
+    except PermissionError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    return _skill_response(
+        service.as_own(skill), access=SharedResourceAccess(scoped, principal), service=service
+    )
 
 
 @router.delete("/{skill_id}", status_code=status.HTTP_204_NO_CONTENT)

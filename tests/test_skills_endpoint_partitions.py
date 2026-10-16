@@ -56,7 +56,7 @@ def test_listing_seeds_read_only_builtins_with_no_author(scoped):
     assert set(BUILTIN_SKILL_SLUGS) <= set(by_id)
     builtin = by_id[_builtin()]
     assert builtin["isBuiltin"] is True
-    assert builtin["capabilities"] == {"canEdit": False, "canDelete": False, "canDisable": False}
+    assert builtin["capabilities"] == {"canEdit": False, "canDelete": False, "canDisable": False, "canShare": False}
     # No "Another member": the caller is the only actor a fallback could name.
     assert builtin["attribution"]["createdBy"] is None
 

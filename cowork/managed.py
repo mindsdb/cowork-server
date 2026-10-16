@@ -18,24 +18,28 @@ Every turn gets what it holds, whoever asked it:
   change to one is refused with
   cowork.services.connectors.layered_vault.SHARED_CONNECTION_REFUSAL.
 - ``shared/connections.json`` lists the connections people share
-  (SharedConnections), and ``shared/skills.json`` the skills (SharedSkills).
-  Each entry names one person's own connection or skill, which everyone else
-  reads live from that person's own store and can't change, while its
-  creator still can. ``python -m cowork.ops.connections share|unshare`` and
-  ``python -m cowork.ops.skills share|unshare`` write them; the server only
-  reads them, and only for a scope that keeps that resource personal
-  (reads_shared_registry). A missing file, or a missing ``shared/`` folder,
-  shares nothing.
+  (SharedConnections). Each entry names one person's own connection, which
+  everyone else reads live from that person's own vault and can't change,
+  while its creator still can. ``python -m cowork.ops.connections
+  share|unshare`` writes it; the server only reads it, and only for a scope
+  that keeps connections personal (reads_shared_registry). A missing file,
+  or a missing ``shared/`` folder, shares nothing.
+
+The skills people share are listed outside this folder, in the shared root,
+which Cowork writes itself (cowork.shared_skills). Their models live here,
+beside the connections'.
 
 create_app refuses to start when the setting names a folder that is missing,
 or one of memory/, skills/ and data-vault/ in it, so a missing mount can never
-free the reserved names, and when either registry is malformed.
+free the reserved names, and when ``shared/connections.json`` is malformed.
 """
 
 from __future__ import annotations
 
 import inspect
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Generic, Self, TypeVar
 from uuid import UUID
@@ -76,7 +80,8 @@ class SharedConnection(SharedEntry):
 
 
 class SharedSkill(SharedEntry):
-    """One person's skill, shared: one entry of ``shared/skills.json``."""
+    """One person's skill, shared: one entry of the shared-skill list
+    (cowork.shared_skills)."""
 
     # The skill's slug, its folder's name in its creator's store and its only
     # identity. A rename would leave this entry naming nothing, so SkillService
@@ -92,6 +97,11 @@ class SharedSkill(SharedEntry):
 
 class SharedRegistryError(ValueError):
     """A registry file exists but can't be read as its registry."""
+
+
+class SharedRegistryUnreadableError(SharedRegistryError):
+    """A registry file exists but the filesystem refused to read it (an
+    OSError), so nothing about its content is known."""
 
 
 EntryT = TypeVar("EntryT", bound=SharedEntry)
@@ -111,15 +121,16 @@ class SharedRegistry(RootModel[tuple[EntryT, ...]], Generic[EntryT]):
     def read(cls, path: Path) -> Self:
         """The registry at ``path``, or none when the file is missing.
 
-        Raises SharedRegistryError for a file that can't be read or isn't a
-        JSON list of entries, naming the file and what is wrong with it.
+        Raises SharedRegistryUnreadableError for a file the filesystem
+        refuses to read, and SharedRegistryError for one that isn't a JSON
+        list of entries, each naming the file and what is wrong with it.
         """
         try:
             raw = path.read_bytes()
         except FileNotFoundError:
             return cls(())
         except OSError as error:
-            raise SharedRegistryError(f"{path} can't be read: {error}") from error
+            raise SharedRegistryUnreadableError(f"{path} can't be read: {error}") from error
         try:
             return cls.model_validate_json(raw)
         except ValidationError as error:
@@ -142,6 +153,27 @@ class SharedRegistry(RootModel[tuple[EntryT, ...]], Generic[EntryT]):
             logger.error("no %s is shared until the registry is fixed: %s", cls.entry_noun, error)
             return cls(())
 
+    def dump_json(self) -> str:
+        """The registry file's whole text, as write writes it."""
+        return self.model_dump_json(indent=2) + "\n"
+
+    def write(self, path: Path) -> None:
+        """Replace the registry file at ``path`` at once, so no reader ever
+        reads half of it: a temporary file in the same folder, readable by
+        the server's user whatever the writer's umask, moved over it."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent, prefix=f".{path.stem}-", suffix=".json", delete=False
+        ) as handle:
+            handle.write(self.dump_json())
+        temporary = Path(handle.name)
+        try:
+            temporary.chmod(0o644)
+            os.replace(temporary, path)
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+
 
 class SharedConnections(SharedRegistry[SharedConnection]):
     """The shared-connection registry, ``shared/connections.json``."""
@@ -151,7 +183,7 @@ class SharedConnections(SharedRegistry[SharedConnection]):
 
 
 class SharedSkills(SharedRegistry[SharedSkill]):
-    """The shared-skill registry, ``shared/skills.json``."""
+    """The shared-skill list (cowork.shared_skills)."""
 
     entry_noun: ClassVar[str] = "skill"
     entry_fields: ClassVar[str] = "user_id, partition_id, skill"
@@ -159,9 +191,9 @@ class SharedSkills(SharedRegistry[SharedSkill]):
 
 def reads_shared_registry(scope: TenantScope | None, *, resource: PersonalResource) -> bool:
     """Whether ``scope`` reads what other people share of ``resource`` from
-    the managed folder's registry, when there is one: only a person's scope
-    that keeps ``resource`` personal. Where ``resource`` is shared, its base
-    store already holds everyone's, and the operator view reads that."""
+    its registry, when there is one: only a person's scope that keeps
+    ``resource`` personal. Where ``resource`` is shared, its base store
+    already holds everyone's, and the operator view reads that."""
     return scope is not None and scope.personal and scope.partitioned_for(resource)
 
 
@@ -217,15 +249,6 @@ class ManagedFolder(BaseModel):
         """The shared-connection registry; raises SharedRegistryError when
         the file is malformed (SharedRegistry.read)."""
         return SharedConnections.read(self.shared_connections_file)
-
-    @property
-    def shared_skills_file(self) -> Path:
-        return self.shared_dir / "skills.json"
-
-    def shared_skills(self) -> SharedSkills:
-        """The shared-skill registry; raises SharedRegistryError when the file
-        is malformed (SharedRegistry.read)."""
-        return SharedSkills.read(self.shared_skills_file)
 
     def skill_dirs(self) -> dict[str, Path]:
         """Each managed skill's folder, by slug, sorted (readonly_skill_dirs),

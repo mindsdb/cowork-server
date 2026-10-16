@@ -109,7 +109,7 @@ def test_a_managed_skill_is_listed_built_in_with_no_capability(managed_skill, sc
 
     managed = listed[MANAGED]
     assert managed["isBuiltin"] is True
-    assert managed["capabilities"] == {"canEdit": False, "canDelete": False, "canDisable": False}
+    assert managed["capabilities"] == {"canEdit": False, "canDelete": False, "canDisable": False, "canShare": False}
     assert managed["declarative"].strip() == MANAGED_BODY
     # The person's own skill keeps its capabilities.
     assert listed["my-notes"]["isBuiltin"] is False

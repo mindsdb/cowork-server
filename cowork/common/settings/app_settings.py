@@ -379,13 +379,19 @@ class CodingSettings(Settings):
 
 
 class StorageSettings(Settings):
-    # Org mode only: stores live under <shared_root>/<org_id>/<store>/ (one
-    # mountable subtree per org). Local mode never reads this; in org mode the
-    # per-store *_DIR overrides are inert.
+    # Org mode and personal partitions: stores live under
+    # <shared_root>/<org_id>/<store>/ (one mountable subtree per org or
+    # person). The desktop never reads this; in org mode the per-store *_DIR
+    # overrides are inert.
     shared_root: str = Field(
         default_factory=lambda: str(cowork_home()),
         validation_alias=AliasChoices("COWORK_SHARED_DIR", "STORAGE_SHARED_ROOT"),
-        description="Root of the org-keyed shared storage tree (org mode only)",
+        description=(
+            "Root of the org-keyed shared storage tree (org mode and personal "
+            "partitions). Where skills are personal, it also holds "
+            "shared/skills.json, the skills people share, which Cowork writes "
+            "(cowork.shared_skills)."
+        ),
     )
 
 
@@ -867,14 +873,13 @@ class AppSettings(Settings):
             "memory/ with rules and lessons every turn reads, skills/ with the "
             "operator's own skills every person sees as built-in, data-vault/ "
             "with the operator's own connections every turn can use, and an "
-            "optional shared/connections.json and shared/skills.json listing "
-            "the connections and skills people share. Cowork never writes it. "
-            "Blank or unset: none. create_app refuses it in org tenancy, with "
-            "COWORK_TURN_BACKEND=remote, when the folder or any of memory/, "
-            "skills/ and data-vault/ is missing, when the server's user can't "
-            "read and search memory/, when either shared registry is "
-            "malformed, and when the installed anton's Cortex takes no "
-            "managed_hc."
+            "optional shared/connections.json listing the connections people "
+            "share. Cowork never writes it. Blank or unset: none. create_app "
+            "refuses it in org tenancy, with COWORK_TURN_BACKEND=remote, when "
+            "the folder or any of memory/, skills/ and data-vault/ is missing, "
+            "when the server's user can't read and search memory/, when "
+            "shared/connections.json is malformed, and when the installed "
+            "anton's Cortex takes no managed_hc."
         ),
     )
 

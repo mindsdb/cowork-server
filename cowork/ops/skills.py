@@ -1,18 +1,21 @@
 """One person's skills: ``python -m cowork.ops.skills share|unshare|snapshot``.
 
-``share --skill <slug> --managed-dir <folder>`` shares one of the person's
-skills with everyone, read-only: it adds the skill to the shared-skill
-registry, ``<folder>/shared/skills.json`` (cowork.managed.SharedSkills).
-``<folder>`` is the managed folder, writable by the caller; cowork-server
-reads the same registry read-only. Nothing is copied: everyone else reads the
-skill live from the person's own store and can't change it, and the person
-still edits, disables and deletes it as their own (SkillService). Its name
-stays while it is shared.
+``share --skill <slug>`` shares one of the person's skills with everyone,
+read-only, on their behalf: it adds the skill to the shared-skill list,
+``<COWORK_SHARED_DIR>/shared/skills.json`` (cowork.shared_skills), with the
+checks and refusal texts the person's own share from their Skills page gets
+(SkillService.share). Nothing is copied: everyone else reads the skill live
+from the person's own store and can't change it, and the person still edits,
+disables and deletes it as their own. Its name stays while it is shared. The
+person can hide it again from their Skills page.
 
-``unshare --skill <slug> --managed-dir <folder>`` removes the person's entry
-for that skill from the registry. The person's skill stays in their store.
-Both take ``--registry-stdout``, which prints the new registry instead of
-writing it (cowork.ops).
+``unshare --skill <slug>`` removes the person's entry for that skill from the
+list (SkillService.stop_sharing), whether or not the skill still exists. The
+person's skill stays in their store.
+
+Both run as the user Cowork runs as, inside its container, and refuse root:
+Cowork writes the list and its lock file itself, and a folder or lock file
+root creates there would stop every later write.
 
 ``snapshot [--project <name>]`` lists the skills the person's agent sees in a
 project (``general`` unless named), shared ones included, in anton's order of
@@ -35,30 +38,25 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict
 
-from cowork.db.personal_resources import PersonalResource
-from cowork.managed import SharedSkill, SharedSkills, managed_folder, readonly_skill_dirs
+from cowork.managed import managed_folder, readonly_skill_dirs
 from cowork.ops import (
-    REGISTRY_ON_STDOUT,
     OperatorCommandError,
     Person,
-    RegistryChange,
     add_person_arguments,
-    add_registry_stdout_argument,
-    finish_registry_change,
-    managed_folder_at,
     person_from_arguments,
     personal_scope,
-    read_registry,
     run_operator_command,
 )
 from cowork.services.projects import GENERAL_PROJECT
 from cowork.services.skills import (
+    SharedSkillsBusyError,
+    SkillNotFoundError,
     SkillService,
-    agent_skill_names,
-    is_builtin_skill,
+    SkillSharingError,
     linked_turn_skills,
     shared_turn_skills,
 )
+from cowork.shared_skills import shared_skills_file
 
 SkillSource = Literal["own", "host", "managed", "shared", "anton"]
 
@@ -171,74 +169,52 @@ def snapshot_skills(*, person: Person, project: str) -> SkillSnapshot:
     return SkillSnapshot(person=person, project=project, skills=list(found.values()))
 
 
-def _refuse_links(skill_dir: Path) -> None:
-    """A link in a shared skill would hand every person whatever it points
-    at, so the person's skill must hold none when it is shared."""
-    for directory, subdirectories, files in os.walk(skill_dir):
-        for name in [*subdirectories, *files]:
-            entry = Path(directory) / name
-            if entry.is_symlink():
-                raise OperatorCommandError(
-                    f"The skill holds a link, {entry}. Remove it before sharing the skill."
-                )
+def _refuse_root() -> None:
+    """Cowork writes the shared-skill list, so a share or unshare runs as
+    Cowork's own user: a ``shared/`` folder or lock file root creates would
+    make every later write of Cowork's fail."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        raise OperatorCommandError(
+            "Run this as the user Cowork runs as, not root: Cowork itself writes "
+            f"{shared_skills_file()}, and a folder or lock file root creates there would "
+            "stop it."
+        )
 
 
-def share_skill(*, person: Person, slug: str, managed_dir: Path) -> RegistryChange[SharedSkill]:
-    scope = personal_scope(person)
-    if not scope.partitioned_for(PersonalResource.SKILLS):
-        raise OperatorCommandError(
-            "COWORK_PERSONAL_RESOURCES leaves skills shared, so everyone already uses every skill."
-        )
-    path = managed_folder_at(managed_dir).shared_skills_file
-    registry = read_registry(registry_type=SharedSkills, path=path)
-    if is_builtin_skill(slug):
-        raise OperatorCommandError(
-            f"{slug} is a packaged built-in skill, which every person already has."
-        )
-    if slug in agent_skill_names():
-        raise OperatorCommandError(
-            f"Every person's agent already has a skill named {slug}, so the share would reach "
-            "nobody. Rename the skill before sharing it."
-        )
-    managed = managed_folder()
-    if managed is not None and slug in managed.skill_slugs():
-        # Everyone reads the operator's own skill first, so the share would
-        # reach nobody.
-        raise OperatorCommandError(f"The managed folder already provides a skill named {slug}.")
-    service = SkillService(scope)
+def share_skill(*, person: Person, slug: str) -> str:
+    """Share the person's skill ``slug`` with everyone, read-only, with the
+    checks their own share gets (SkillService.share), and say so."""
+    _refuse_root()
+    service = SkillService(personal_scope(person))
     try:
-        complete = service.has_complete_skill(slug)
-    except ValueError as error:
+        added = service.share(slug)
+    except SkillNotFoundError:
+        raise OperatorCommandError(f"User {person.user_id} has no skill named {slug}.") from None
+    except (SkillSharingError, SharedSkillsBusyError, ValueError) as error:
         raise OperatorCommandError(str(error)) from None
-    if not complete:
-        raise OperatorCommandError(f"User {person.user_id} has no skill named {slug}.")
-    _refuse_links(service._skill_dir(slug))
-    for entry in registry.root:
-        if entry.skill != slug:
-            continue
-        if entry.partition_id == person.partition_id:
-            raise OperatorCommandError(f"Skill {slug} of user {person.user_id} is already shared.")
-        # Everyone else reads the first entry for a name, so a second one
-        # would reach nobody.
-        raise OperatorCommandError(f"User {entry.user_id} already shares a skill named {slug}.")
-    added = SharedSkill(user_id=person.user_id, partition_id=person.partition_id, skill=slug)
-    return RegistryChange(
-        entries=(added,), registry=path, updated=SharedSkills((*registry.root, added))
+    if not added:
+        raise OperatorCommandError(f"Skill {slug} of user {person.user_id} is already shared.")
+    return (
+        f"Shared skill {slug} of user {person.user_id} with everyone, read-only: "
+        f"added it to {shared_skills_file()}."
     )
 
 
-def unshare_skill(*, person: Person, slug: str, managed_dir: Path) -> RegistryChange[SharedSkill]:
-    path = managed_folder_at(managed_dir).shared_skills_file
-    entries = read_registry(registry_type=SharedSkills, path=path).root
-    removed = tuple(
-        entry
-        for entry in entries
-        if entry.partition_id == person.partition_id and entry.skill == slug
-    )
+def unshare_skill(*, person: Person, slug: str) -> str:
+    """Stop sharing the person's skill ``slug`` (SkillService.stop_sharing),
+    whether or not the skill still exists, and say so."""
+    _refuse_root()
+    service = SkillService(personal_scope(person))
+    try:
+        removed = service.stop_sharing(slug)
+    except (SkillSharingError, SharedSkillsBusyError) as error:
+        raise OperatorCommandError(str(error)) from None
     if not removed:
         raise OperatorCommandError(f"User {person.user_id} shares no skill named {slug}.")
-    kept = tuple(entry for entry in entries if entry not in removed)
-    return RegistryChange(entries=removed, registry=path, updated=SharedSkills(kept))
+    return (
+        f"Stopped sharing skill {slug} of user {person.user_id}: removed it from "
+        f"{shared_skills_file()}. Their own skill stays in their store."
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -257,13 +233,6 @@ def main(argv: list[str] | None = None) -> int:
     for action in (share, unshare):
         add_person_arguments(action)
         action.add_argument("--skill", required=True, help="the skill's name, its slug")
-        action.add_argument(
-            "--managed-dir",
-            required=True,
-            type=Path,
-            help="the managed folder, writable: the registry is its shared/skills.json",
-        )
-        add_registry_stdout_argument(action)
     snapshot = actions.add_parser(
         "snapshot", help="print the skills the person's agent sees, with one sha256"
     )
@@ -278,28 +247,8 @@ def main(argv: list[str] | None = None) -> int:
         if arguments.action == "snapshot":
             return snapshot_skills(person=person, project=arguments.project).render()
         if arguments.action == "share":
-            change = share_skill(
-                person=person, slug=arguments.skill, managed_dir=arguments.managed_dir
-            )
-            target = REGISTRY_ON_STDOUT if arguments.registry_stdout else change.registry
-            message = "\n".join(
-                f"Shared skill {entry.skill} of user {person.user_id} with everyone, "
-                f"read-only: added it to {target}."
-                for entry in change.entries
-            )
-        else:
-            change = unshare_skill(
-                person=person, slug=arguments.skill, managed_dir=arguments.managed_dir
-            )
-            target = REGISTRY_ON_STDOUT if arguments.registry_stdout else change.registry
-            message = "\n".join(
-                f"Stopped sharing skill {entry.skill} of user {person.user_id}: removed it from "
-                f"{target}. Their own skill stays in their store."
-                for entry in change.entries
-            )
-        return finish_registry_change(
-            change, message=message, registry_stdout=arguments.registry_stdout
-        )
+            return share_skill(person=person, slug=arguments.skill)
+        return unshare_skill(person=person, slug=arguments.skill)
 
     return run_operator_command(command)
 

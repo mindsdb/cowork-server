@@ -102,7 +102,9 @@ async def test_a_person_reads_and_writes_their_own_tiers(monkeypatch, trusted):
         assert global_dir.is_dir() and project_dir.is_dir()
         assert config.cortex.mode == "autopilot"
         assert config.background_memory is True
-        assert scratch is None
+        # The turn's scratch folder holds only the read-only root of the
+        # skills others share with the person: none of its memory.
+        assert scratch is not None and {path.name for path in scratch.iterdir()} == {"shared-skills"}
         # Neither the project's own tier nor the base tier reaches the prompt.
         context = await config.cortex.build_memory_context("how many?")
         assert PLANTED_PROJECT_RULE not in context
