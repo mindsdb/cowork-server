@@ -67,6 +67,18 @@ caller's `_org_mode()` check. That indirection makes it a hole in the
 mechanism rather than a live one: a new, closer caller added later would
 spawn it unguarded with this test still green, which is exactly what listing
 it here as a named site prevents.
+
+The same sites matter on a self-hosted deployment, where every person's agent
+code runs beside this server. There COWORK_CODE_SANDBOX=landlock starts each
+of anton's spawns through its Landlock launcher, under the policy
+cowork.code_sandbox.build_cell_sandbox builds, and a construction that drops
+that policy runs the agent's code unlocked. So every construction that leads
+to an anton spawn (ChatSessionConfig, LocalScratchpadRuntime, the backend
+pool and the credential probe) must pass ``cell_sandbox`` too:
+test_every_agent_code_construction_passes_the_policy reads each one. The
+launcher's startup self-test is a spawn of its own, listed below; Code mode's
+git, project-command and Codex sites are refused under the sandbox
+(refuse_code_mode_in_sandbox), and app backends too (_ensure_backend_running).
 """
 
 import ast
@@ -120,7 +132,13 @@ BANNED_NAMES = {"eval", "exec", "compile", "__import__"}
 #: SAFE helpers are not swept up: `importlib.import_module` is banned but
 #: `importlib.metadata.version` is not; `yaml.load` is banned but
 #: `yaml.safe_load` is not.
-BANNED_CALLS = {"importlib.import_module", "yaml.load", "yaml.unsafe_load"}
+BANNED_CALLS = {
+    "importlib.import_module",
+    "yaml.load",
+    "yaml.unsafe_load",
+    # Spawns anton's Landlock launcher in a child process.
+    "anton.core.backends.sandbox.self_test",
+}
 BANNED_CONSTRUCTORS = {"ChatSession", "LocalScratchpadRuntime"}
 BANNED_IMPORT_PATHS = {"anton.core.artifacts.backend_launcher"}
 
@@ -234,6 +252,14 @@ ALLOWLIST = (
         "single-entry site rather than an unlisted local import",
     ),
     (
+        "code_sandbox.py",
+        "_run_self_test",
+        "anton.core.backends.sandbox.self_test",
+        "the code sandbox's startup self-test: runs anton's launcher once, in a "
+        "child process, against a folder it creates, and only with "
+        "COWORK_CODE_SANDBOX=landlock",
+    ),
+    (
         "channels/registry.py",
         "load_first_party_plugins",
         "importlib.import_module",
@@ -260,6 +286,29 @@ ALLOWLIST = (
         "htmldocx.HtmlToDocx",
         "DOCX export render call; same endpoint org-mode refusal as the import",
     ),
+)
+
+
+#: Constructions that lead to an anton spawn of agent code, and so must carry
+#: the code sandbox's policy: the session config of a turn and of the probe,
+#: the backend pool's runtime, the pool, and the probe itself.
+POLICY_CARRIERS = {
+    "ChatSessionConfig",
+    "LocalScratchpadRuntime",
+    "WorkspaceScopedPool",
+    "CredentialProbe",
+    "_make_runtime",
+}
+
+#: Where each carrier is constructed today, so the scan below is known to see
+#: them: (relative path, enclosing function, carrier).
+POLICY_CARRIER_SITES = (
+    ("harnesses/anton_harness/harness.py", "AntonHarness._build_chat_session", "ChatSessionConfig"),
+    ("services/connectors/probe.py", "CredentialProbe.run", "ChatSessionConfig"),
+    ("handlers/probe.py", "ProbeHandler.run", "CredentialProbe"),
+    ("services/scratchpad_runtime.py", "_make_runtime", "LocalScratchpadRuntime"),
+    ("services/scratchpad_runtime.py", "get_or_create", "_make_runtime"),
+    ("services/artifacts.py", "_launch_backend_locked", "WorkspaceScopedPool"),
 )
 
 
@@ -501,6 +550,79 @@ def _render(counts: Counter[tuple[str, str, str]]) -> str:
         f"  {rel}: {enclosing}: {label}" + (f" (x{n})" if n > 1 else "")
         for (rel, enclosing, label), n in sorted(counts.items())
     )
+
+
+class _CarrierVisitor(ast.NodeVisitor):
+    """Each construction of a POLICY_CARRIERS name in one file, labeled by
+    where it lives, and whether it passes ``cell_sandbox``: as a keyword, or
+    inside a ``**`` mapping that names it."""
+
+    def __init__(self, rel: str) -> None:
+        self.rel = rel
+        self._stack: list[str] = []
+        self.found: list[tuple[str, str, str, bool]] = []
+
+    def _push(self, name: str, node: ast.AST) -> None:
+        self._stack.append(name)
+        self.generic_visit(node)
+        self._stack.pop()
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._push(node.name, node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._push(node.name, node)
+
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._push(node.name, node)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        fn = node.func
+        name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", None)
+        if name in POLICY_CARRIERS:
+            passes = any(
+                keyword.arg == "cell_sandbox"
+                or (keyword.arg is None and "cell_sandbox" in ast.unparse(keyword.value))
+                for keyword in node.keywords
+            )
+            enclosing = ".".join(self._stack) if self._stack else "<module>"
+            self.found.append((self.rel, enclosing, name, passes))
+        self.generic_visit(node)
+
+
+def _carrier_sites() -> list[tuple[str, str, str, bool]]:
+    found: list[tuple[str, str, str, bool]] = []
+    for path in sorted(COWORK_ROOT.rglob("*.py")):
+        visitor = _CarrierVisitor(str(path.relative_to(COWORK_ROOT)))
+        visitor.visit(ast.parse(path.read_text(encoding="utf-8"), filename=str(path)))
+        found.extend(visitor.found)
+    return found
+
+
+def test_every_agent_code_construction_passes_the_policy():
+    """A construction that leads to an anton spawn and passes no
+    ``cell_sandbox`` runs the agent's code unlocked under the sandbox."""
+    found = _carrier_sites()
+    assert {site[:3] for site in found} >= set(POLICY_CARRIER_SITES), (
+        "the scan no longer sees a known construction; update POLICY_CARRIER_SITES"
+    )
+    dropping = [site[:3] for site in found if not site[3]]
+    assert dropping == [], (
+        "construction(s) that pass no cell_sandbox, so the agent's code they "
+        "lead to would run outside the code sandbox:\n"
+        + "\n".join(f"  {rel}: {enclosing}: {name}" for rel, enclosing, name in dropping)
+    )
+
+
+def test_a_construction_without_the_policy_is_caught():
+    visitor = _CarrierVisitor("snippet.py")
+    visitor.visit(ast.parse(
+        "def build():\n"
+        "    ChatSessionConfig(llm_client=c)\n"
+        "    ChatSessionConfig(llm_client=c, **({'cell_sandbox': p} if p else {}))\n"
+        "    WorkspaceScopedPool(root, cell_sandbox=p)\n"
+    ))
+    assert [passes for *_, passes in visitor.found] == [False, True, True]
 
 
 def test_execution_sites_match_the_allowlist():

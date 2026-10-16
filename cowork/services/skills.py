@@ -374,10 +374,12 @@ def link_turn_skills(
     project_name: str,
     skills_dir: Path,
     shared_skills_dir: Path | None = None,
-) -> None:
+) -> tuple[Path, ...]:
     """Link the skills one in-process turn uses into ``skills_dir``, from the
     asker's own store, and the ones others share with the asker into
-    ``shared_skills_dir``.
+    ``shared_skills_dir``. Returns the folders the links point at, own skills
+    first, which the turn's code sandbox grants read-only
+    (cowork.code_sandbox.build_cell_sandbox).
 
     For a turn whose project receives no fanned-out links
     (skill_links.links_apply_to). The packaged builtins are seeded into the
@@ -397,21 +399,19 @@ def link_turn_skills(
     """
     service = SkillService(scope)
     service.ensure_builtin_skills()
-    sync_turn_skill_links(
-        skills_dir=skills_dir,
-        wanted={
-            skill.slug: skill.path
-            for skill in linked_turn_skills(service=service, project_name=project_name)
-        },
-    )
+    own = {
+        skill.slug: skill.path
+        for skill in linked_turn_skills(service=service, project_name=project_name)
+    }
+    sync_turn_skill_links(skills_dir=skills_dir, wanted=own)
+    shared: dict[str, Path] = {}
     if shared_skills_dir is not None:
-        sync_turn_skill_links(
-            skills_dir=shared_skills_dir,
-            wanted={
-                skill.slug: skill.path
-                for skill in shared_turn_skills(service=service, project_name=project_name)
-            },
-        )
+        shared = {
+            skill.slug: skill.path
+            for skill in shared_turn_skills(service=service, project_name=project_name)
+        }
+        sync_turn_skill_links(skills_dir=shared_skills_dir, wanted=shared)
+    return (*own.values(), *shared.values())
 
 
 def linked_turn_skills(

@@ -177,19 +177,22 @@ packages = ["cowork"]
 # error and the per-request API-key supplier that refresh desktop credentials
 # without rebuilding an active session (ENG-2116).
 # Pin the tested revision so frozen image builds use the role-aware provider
-# and cached turn setup. This is the head of the anton branch that adds
-# Cortex's read-only managed memory layer (`managed_hc`), which create_app
-# requires whenever COWORK_MANAGED_DIR is set
+# and cached turn setup. This is the head of the anton branch that adds the
+# agent-code sandbox (`anton.core.backends.sandbox`, `ChatSessionConfig.cell_sandbox`
+# and `Workspace.initialize(refuse_links=)`), which create_app requires whenever
+# COWORK_CODE_SANDBOX is landlock (cowork.code_sandbox.check_startup). It sits on
+# the branch that adds Cortex's read-only managed memory layer (`managed_hc`),
+# which create_app requires whenever COWORK_MANAGED_DIR is set
 # (cowork.managed.cortex_takes_managed_layer), merged with anton staging, so it
 # also carries the turn-end stream event and the token filter, and what the
 # floor above requires. It moves to the first anton staging tag that holds
-# that branch once it merges.
+# both branches once they merge.
 #
 # The version-skew fallbacks in `services/providers.py` (the live supplier's
 # capability gate) and `handlers/turn_errors.py` (the legacy 401 classifier)
 # predate the `anton-agent` floor above, which no longer admits a release that
 # needs them.
-anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "c015029cf50e81debc1968ff696ebd4d3787f64d" }
+anton-agent = { git = "https://github.com/mindsdb/anton.git", rev = "a6d5f8dfd310b68bacd8861c7662192ea0a1d111" }
 
 [dependency-groups]
 dev = [

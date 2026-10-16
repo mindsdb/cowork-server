@@ -4,7 +4,9 @@ When COWORK_REQUIRE_AUTH is true the server validates every request (except
 OPTIONS preflight and the /health endpoint) against a shared secret token
 stored in ~/.cowork/.env as COWORK_AUTH_TOKEN.  If no token is set, one is
 auto-generated at startup and written back to that file so the desktop app
-can read it.
+can read it. With COWORK_TRUST_IDENTITY_HEADERS on, the token comes from the
+environment alone, and create_app removes any copy from that file
+(remove_auth_token).
 
 Defaults on in local/desktop tenancy (see AppSettings.require_auth) and stays
 off in org mode, where it isn't supported at all — see create_app()'s
@@ -105,9 +107,31 @@ def sync_auth_token(env_path: Path, token: str) -> None:
         _write_token(env_path, token)
 
 
+def remove_auth_token(env_path: Path) -> bool:
+    """Remove every COWORK_AUTH_TOKEN line from env_path, keeping the other
+    lines as they are. Returns whether one was there.
+
+    For a deployment whose token must not sit in cowork-home's .env, where an
+    earlier start mirrored it (sync_auth_token).
+    """
+    if not env_path.exists():
+        return False
+    existing = env_path.read_text(encoding="utf-8")
+    kept = _TOKEN_LINE_RE.sub("", existing)
+    if kept == existing:
+        return False
+    fd = open_fd(env_path, os.O_WRONLY | os.O_TRUNC)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(kept)
+    logger.info("auth: removed COWORK_AUTH_TOKEN from %s", env_path)
+    return True
+
+
 # ── private helpers ────────────────────────────────────────────────────────
 
 _TOKEN_RE = re.compile(r"^COWORK_AUTH_TOKEN\s*=\s*(.+)$", re.MULTILINE)
+# The whole line, as python-dotenv reads it: optional indent and `export`.
+_TOKEN_LINE_RE = re.compile(r"^[ \t]*(?:export[ \t]+)?COWORK_AUTH_TOKEN[ \t]*=.*(?:\r?\n|\Z)", re.MULTILINE)
 
 
 def _read_token(env_path: Path) -> str:

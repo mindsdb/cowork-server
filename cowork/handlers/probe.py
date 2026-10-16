@@ -14,6 +14,7 @@ from uuid import UUID
 
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
+from cowork.code_sandbox import build_cell_sandbox, code_sandbox_on, probe_workspaces_dir
 from cowork.common.logger import log_context
 from cowork.common.settings.user_settings import UserSettings
 from cowork.handlers.turn_errors import server_busy_message
@@ -308,14 +309,23 @@ class ProbeHandler:
                 return
 
             # Probe path: build workspace + LLM client
-            if workspace_path is None:
-                _temp_workspace_dir = tempfile.mkdtemp(prefix="cowork-probe-")
-                workspace_path = Path(_temp_workspace_dir)
-
+            cell_sandbox = None
             try:
+                if workspace_path is None:
+                    # Under the code sandbox, in the asker's own sandbox store:
+                    # the shared /tmp is denied to the cell, and every other
+                    # person's cell could read a folder there.
+                    _temp_workspace_dir = tempfile.mkdtemp(
+                        prefix="cowork-probe-",
+                        dir=probe_workspaces_dir(self.scope) if code_sandbox_on() else None,
+                    )
+                    workspace_path = Path(_temp_workspace_dir)
                 from anton.workspace import Workspace
                 workspace = Workspace(workspace_path)
+                # None with the sandbox off.
+                cell_sandbox = build_cell_sandbox(scope=self.scope, project_dir=workspace_path)
             except Exception:
+                workspace = None
                 logger.exception("Could not build workspace for probe")
 
             llm_client = None
@@ -370,6 +380,7 @@ class ProbeHandler:
                 skipped=skipped,
                 usage_notes=registry.usage_notes_for([connector_id]).get(connector_id),
                 web_tool_kwargs=web_tools,
+                cell_sandbox=cell_sandbox,
             )
             try:
                 async for kind, payload in probe.run():

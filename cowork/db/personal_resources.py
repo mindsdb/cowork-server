@@ -97,4 +97,10 @@ STORE_RESOURCE: dict[str, PersonalResource] = {
     "code-skills": PersonalResource.SKILLS,
     "data-vault": PersonalResource.CONNECTIONS,
     "memory": PersonalResource.MEMORY,
+    # The HOME and TMPDIR each person's agent code runs with
+    # (cowork.code_sandbox). Memory, because create_app refuses identity
+    # headers with memory left off the list: this keeps the store per person
+    # whenever identity headers are on, whatever else the list leaves shared,
+    # so one person's pip cache or temp files never reach another's cells.
+    "sandbox": PersonalResource.MEMORY,
 }
