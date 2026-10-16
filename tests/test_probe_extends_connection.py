@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 from anton.core.datasources.data_vault import LocalDataVault
 
-from cowork.db.scoped import LOCAL_SCOPE
+from cowork.db.scoped import LOCAL_SCOPE, MissingTenantScopeError
 from cowork.handlers import probe as probe_handler
 from cowork.handlers.probe import ProbeHandler
 from cowork.services.connectors.probe import CredentialProbe, ProbeOutcome
@@ -204,6 +204,8 @@ async def test_a_saved_field_the_step_does_not_show_gets_no_form_patch(vault, pr
     probes.events = [
         ("field_status", {"name": "client_id", "status": "ok", "method_id": None}),
         ("remove_field", {"name": "client_secret", "method_id": None}),
+        ("field_status", {"name": "CLIENT_ID", "status": "ok", "method_id": None}),
+        ("field_status", {"name": "DS_CLIENT_SECRET", "status": "ok", "method_id": None}),
         ("field_status", {"name": "access_token", "status": "ok", "method_id": None}),
     ]
 
@@ -235,3 +237,20 @@ async def test_the_probe_is_told_which_fields_are_already_saved(vault, probes):
     )._build_prompt("/tmp/probe.env", ["DS_CLIENT_ID", "DS_CLIENT_SECRET", "DS_ACCESS_TOKEN"])
     assert "ALREADY SAVED ON THIS CONNECTION" in prompt
     assert "`client_id`, `client_secret`" in prompt
+
+
+@pytest.mark.asyncio
+async def test_a_connection_that_cannot_be_read_fails_on_the_form(vault, probes, monkeypatch):
+    def no_scope(scope):
+        raise MissingTenantScopeError("no organization in scope")
+
+    monkeypatch.setattr("cowork.handlers.probe.vault_for_scope", no_scope)
+
+    stream = await _submit({"access_token": "access-1"}, _follow_up("linkedin-1"), name="linkedin-1")
+
+    assert probes.built == []
+    assert _final_status(stream) == "failed"
+    assert any(
+        "Could not read `linkedin-1`" in (patch.get("form_error") or "")
+        for patch in _patches(stream)
+    )
