@@ -7,19 +7,38 @@ Emits typed events:
     response.output_text.delta  (assistant text deltas)
     response.answer_reset       (drop the answer so far; the next delta replaces it)
     response.answer_restore     (a hand-back gives back the answer a reset dropped)
+    response.figure_sources     (each figure in the answer and the steps it came from)
     response.completed          (final response object)
     response.failed             (error)
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import re
 import time
 import uuid
-from dataclasses import dataclass
-from typing import AsyncIterator, Callable, Optional
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from typing import Annotated, Any, AsyncIterator, Callable, Literal, Optional
 
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
+
+from cowork.harnesses.anton_harness.agent_files import AgentFiles
+from cowork.harnesses.anton_harness.figure_sources import (
+    EVIDENCE_TOOLS,
+    CellResult,
+    FigureSources,
+    TurnStep,
+    find_figure_sources,
+    has_figures,
+    ran_cell,
+)
+from cowork.schemas.figure_sources import FigureOrigin
 from cowork.schemas.responses import (
+    IncompleteDetails,
     Response,
     ResponseOutput,
     ResponseOutputContent,
@@ -27,6 +46,8 @@ from cowork.schemas.responses import (
     Role,
 )
 from cowork.streaming.liveness import MODEL_WAIT_PHASE, model_wait_sse
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -47,9 +68,73 @@ class TurnHistory:
     (assistant `tool_use` / user `tool_result`) so the responses route can
     persist them into the `messages` table. Recorded via `event_sink` only —
     never emitted as SSE: the client rebuilds all tool activity from the
-    existing thought events, so these rows are for LLM-history replay only."""
+    existing thought events, so these rows are for LLM-history replay. The
+    formatter also reads the tool results in them: anton streams only the
+    scratchpad's, and a figure can come from a web tool's or
+    read_text_file's (figure_sources.EVIDENCE_TOOLS)."""
 
     rows: list
+    # The same rows as the agent read them, when the producer trimmed `rows`
+    # for storage (the remote paths cap each result). The formatter reads
+    # these instead; None means `rows` are what the agent read.
+    read: list | None = None
+
+
+@dataclass
+class TurnContext:
+    """Synthetic pre-turn event: what the formatter needs to know about the
+    turn that its other events don't carry. Never emitted as SSE. Every
+    producer of a turn's stream yields it first: AntonHarness.stream_response
+    for a turn in this process (from the web UI or a channel),
+    ResponsesHandler._run_remote_turn for a web turn on the remote worker,
+    and remote_turn_events for a channel turn there.
+
+    ``question`` is the text the turn was sent with. The formatter counts as
+    the question only the part the user typed (_typed_text), so that a figure
+    the answer repeats from it is marked as the question's rather than as
+    having no source. ``files`` finds the project file a figure's step read
+    (None when the producer can't know the project). ``history`` is the
+    conversation's earlier messages as the model is seeded with them. Its
+    cells pass the names, functions and data they bound on to this turn's
+    cells, so a figure that a cell of this turn computed from data an earlier
+    turn's cell read names that cell too. The formatter reads it only when
+    the answer has figures and this turn ran a cell, and then only its last
+    figure_sources.MAX_EARLIER_CELLS cells; no figure's origin depends on it.
+    An earlier turn's step never holds a figure itself: a figure the answer
+    only repeats from an earlier turn has no source."""
+
+    question: str
+    files: AgentFiles | None = None
+    history: list[dict] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TurnEvidence:
+    """What an answer's figures are matched against."""
+
+    answer: str
+    # The text the turn was sent with (TurnContext.question).
+    question: str
+    # What the user typed answering the agent's questions during the turn.
+    answers: tuple[str, ...] = ()
+    # The tool results the stream carried, which anton sends only for the
+    # scratchpad.
+    steps: tuple[TurnStep, ...] = ()
+    # The turn's tool rows, which hold every tool's result (TurnHistory).
+    tool_rows: list = field(default_factory=list)
+    history: list[dict] = field(default_factory=list)
+    files: AgentFiles | None = None
+    # The tool_use_ids of this turn's EVIDENCE_TOOLS calls, as the stream
+    # announced them. Their results reach the formatter only in tool_rows.
+    evidence_calls: tuple[str, ...] = ()
+    # Native tools' history results omit their verdict. Only tool_done.ok
+    # explicitly True establishes successful output; False/None can carry
+    # error text with figures. Scratchpad stdout remains usable on failure.
+    successful_native_calls: frozenset[str] = frozenset()
+    # Whether anton compacted the turn's context mid-way (the stream carried
+    # a StreamContextCompacted), after which no producer sends the turn's
+    # tool rows.
+    compacted: bool = False
 
 
 @dataclass
@@ -132,6 +217,228 @@ def classify_cell_status(content: str) -> str:
     return "ok"
 
 
+# anton's reply when every attempt at the turn failed: its error, not an answer
+# (the fallback reply in anton core.session's turn loop).
+_ANTON_FAILURE_REPLY = "An unexpected error occurred: "
+
+# The header over each block the client appends, for the agent only, to the
+# text the user typed: a connect form's state, picked Drive files, attached
+# Notion pages.
+_APPENDED_CONTEXT = re.compile(r"^\[[^\n]*Anton-only context[^\n]*\]$", re.MULTILINE)
+
+# anton hands the model a cell's result in labeled parts (format_cell_result):
+# what the cell printed under [output], then [logs], [stderr] and [error].
+# anton's session appends [artifact lint] after a cell that changed an
+# artifact.
+_CELL_RESULT_PART = re.compile(r"^\[(?:output|logs|stderr|error|artifact lint)\]\n", re.MULTILINE)
+# The note format_cell_result puts after printed output it cut short, with
+# the line breaks before the next part.
+_TRUNCATION_NOTE = re.compile(r"\n\n\.\.\. \(truncated, \d+ chars total\)\n*\Z")
+
+
+class _HistoryRow(BaseModel):
+    """A history row: its text, or its blocks, each read on its own."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    content: str | list[Any] = ""
+
+
+class _ToolUseBlock(BaseModel):
+    """An assistant row's tool call, as far as the figure matcher reads it."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    type: Literal["tool_use"]
+    id: str
+    name: str
+    input: dict[str, Any] = Field(default_factory=dict)
+
+
+class _ResultPart(BaseModel):
+    """A part of a tool result: text, or another kind (an image) that has
+    none."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    type: str
+    text: str = ""
+
+
+class _ToolResultBlock(BaseModel):
+    """A user row's tool result, as far as the figure matcher reads it."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    type: Literal["tool_result"]
+    tool_use_id: str
+    content: str | list[_ResultPart] = ""
+    # anton marks a result is_error only when it answered the call itself
+    # without running it: arguments it refused, or a call an error cut off.
+    # None of such a result is the tool's output.
+    is_error: bool = False
+
+    @property
+    def text(self) -> str:
+        """The result's text: the string, or the text parts of the list."""
+        if isinstance(self.content, str):
+            return self.content
+        return "\n".join(part.text for part in self.content if part.type == "text")
+
+
+class _CellArguments(BaseModel):
+    """A scratchpad call's arguments, as far as a replayed cell reads them."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    action: str = ""
+    code: str = ""
+    one_line_description: str = ""
+
+
+_ROW_BLOCK: TypeAdapter[_ToolUseBlock | _ToolResultBlock] = TypeAdapter(
+    Annotated[_ToolUseBlock | _ToolResultBlock, Field(discriminator="type")],
+)
+
+
+async def find_answer_sources(evidence: TurnEvidence) -> FigureSources:
+    """The figures in an answer and the steps they came from.
+
+    Found in a worker thread: finding a step's file reads the disk, a shared
+    mount in org mode, and every other request waits on the loop. Never
+    raises: the sources annotate an answer that is already whole, so failing
+    to find them must not fail the answer.
+    """
+    try:
+        return await asyncio.to_thread(_answer_sources, evidence)
+    except Exception:
+        logger.exception("[stream_formatter] could not find the answer's figure sources")
+        return FigureSources()
+
+
+def _answer_sources(evidence: TurnEvidence) -> FigureSources:
+    """find_answer_sources's work, run in a worker thread. An answer with no
+    figures reads none of the turn's rows or history."""
+    if not has_figures(evidence.answer):
+        return FigureSources()
+    streamed_ids = {step.tool_use_id for step in evidence.steps}
+    from_rows = [step for step in _row_steps(evidence.tool_rows) if step.tool_use_id not in streamed_ids]
+    this_turn = [
+        step for step in [*evidence.steps, *from_rows]
+        if step.tool_name not in EVIDENCE_TOOLS or step.tool_use_id in evidence.successful_native_calls
+    ]
+    # An earlier turn's cells only pass names, functions and data on to this
+    # turn's cells, so a turn that ran no cell reads none of them. Oldest
+    # first, so what they bound reaches this turn's cells. An earlier turn's
+    # step never holds a figure.
+    earlier = (
+        [replace(step, earlier_turn=True) for step in _row_steps(evidence.history)]
+        if any(ran_cell(step) for step in this_turn) else []
+    )
+    question = "\n".join([_typed_text(evidence.question), *evidence.answers])
+    sources = find_figure_sources(
+        answer=evidence.answer, question=question, steps=[*earlier, *this_turn], files=evidence.files,
+    )
+    if evidence.compacted and evidence.evidence_calls:
+        held = streamed_ids | _row_result_ids(evidence.tool_rows)
+        if any(call not in held for call in evidence.evidence_calls):
+            # A turn that compacts mid-way sends no tool rows, so a web page
+            # or file it read may be missing from them, and a figure no step
+            # holds may be one it read: such a figure gets no mark rather
+            # than "no source". A turn that did not compact holds every call
+            # that ran; a call missing there never ran, as in a round anton
+            # threw away and retried.
+            return sources.model_copy(update={
+                "figures": [figure for figure in sources.figures if figure.origin != FigureOrigin.none],
+            })
+    return sources
+
+
+def _typed_text(text: str) -> str:
+    """``text`` up to the first block the client appended to it."""
+    appended = _APPENDED_CONTEXT.search(text)
+    return text[:appended.start()].rstrip() if appended else text
+
+
+def _row_steps(rows: Sequence[object]) -> list[TurnStep]:
+    """Each tool call in history rows (an assistant row's tool_use blocks, a
+    user row's tool_result blocks) that has its result there, in call order.
+    A call whose result anton marked is_error never ran, so it is left out.
+    The matcher decides which tools' calls are steps
+    (figure_sources.EVIDENCE_TOOLS)."""
+    calls: dict[str, _ToolUseBlock] = {}
+    results: dict[str, _ToolResultBlock] = {}
+    for block in _row_blocks(rows):
+        if isinstance(block, _ToolUseBlock):
+            calls[block.id] = block
+        else:
+            results[block.tool_use_id] = block
+    steps = []
+    for tool_use_id, call in calls.items():
+        result = results.get(tool_use_id)
+        if result is None or result.is_error:
+            continue
+        cell = None
+        action = ""
+        if call.name == "scratchpad":
+            arguments = _cell_arguments(call.input)
+            action = arguments.action
+            cell = _replayed_cell(result.text, arguments=arguments)
+        steps.append(TurnStep(
+            tool_use_id=tool_use_id,
+            tool_name=call.name,
+            action=action,
+            tool_input=json.dumps(call.input, default=str),
+            content=result.text,
+            cell=cell,
+        ))
+    return steps
+
+
+def _row_result_ids(rows: Sequence[object]) -> set[str]:
+    """The tool_use_ids of every tool result in history rows, is_error ones
+    included: a call anton answered itself has its result there too."""
+    return {block.tool_use_id for block in _row_blocks(rows) if isinstance(block, _ToolResultBlock)}
+
+
+def _row_blocks(rows: Sequence[object]) -> Iterator[_ToolUseBlock | _ToolResultBlock]:
+    """The tool_use and tool_result blocks of history rows, read once. Any
+    other block, and a row or block that doesn't read as one, is left out."""
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        try:
+            content = _HistoryRow.model_validate(row).content
+        except ValidationError:
+            continue
+        for block in content if isinstance(content, list) else ():
+            try:
+                yield _ROW_BLOCK.validate_python(block)
+            except ValidationError:
+                continue
+
+
+def _cell_arguments(arguments: dict[str, Any]) -> _CellArguments:
+    """A scratchpad call's arguments, or none when they don't read as one."""
+    try:
+        return _CellArguments.model_validate(arguments)
+    except ValidationError:
+        return _CellArguments()
+
+
+def _replayed_cell(result: str, *, arguments: _CellArguments) -> CellResult:
+    """A cell's result as history rows hold it: its code and description
+    from the call's arguments, and what it printed, the [output] part,
+    without the logs, stderr, error and artifact lint the model saw beside
+    it, or the note on how long output cut short was."""
+    stdout = ""
+    if result.startswith("[output]\n"):
+        printed = result[len("[output]\n"):]
+        next_part = _CELL_RESULT_PART.search(printed)
+        stdout = _TRUNCATION_NOTE.sub("", printed[:next_part.start()] if next_part else printed)
+    return CellResult(code=arguments.code, stdout=stdout, description=arguments.one_line_description)
+
+
 async def format_responses_stream(
     event_stream: AsyncIterator,
     model: str,
@@ -156,6 +463,7 @@ async def format_responses_stream(
         StreamToolUseDelta,
         StreamToolUseEnd,
         StreamToolUseStart,
+        StreamTurnEnded,
     )
 
     # StreamReasoningDelta is newer than the rest — it arrived with the
@@ -199,6 +507,8 @@ async def format_responses_stream(
     # What the last spent boundary set aside, returned if the turn hands back
     # instead of delivering the replacement it promised.
     superseded_stash = ""
+    # Why a turn that handed back stopped (anton's `ended_by`); None if it finished.
+    ended_by: str | None = None
 
     def _event(event_type: str, data: dict) -> str:
         # Wall-clock millisecond stamp on every event. The renderer
@@ -226,6 +536,20 @@ async def format_responses_stream(
     # arrives. Every other generic tool keeps falling through to the plain
     # thought.progress role, unchanged.
     progress_tool_ids: set[str] = set()
+    # Each tool call's arguments and each result, kept to find where the
+    # answer's figures came from once the answer is final.
+    tool_inputs: dict[str, str] = {}
+    turn_steps: list[TurnStep] = []
+    turn_context = TurnContext(question="")
+    user_answers: list[str] = []
+    tool_rows: list = []
+    evidence_calls: list[str] = []
+    successful_native_calls: set[str] = set()
+    compacted = False
+    # Whether the turn's last text is anton's failure reply, which carries no
+    # figures. anton streams that reply as one delta and ends the turn on it,
+    # so each delta with visible text sets or clears this.
+    failure_reply = False
 
     resp = Response(id=resp_id, model=model, status=ResponseStatus.created)
     seq += 1
@@ -238,6 +562,8 @@ async def format_responses_stream(
 
     async for event in event_stream:
         if isinstance(event, StreamTextDelta):
+            if event.text.strip():
+                failure_reply = event.text.startswith(_ANTON_FAILURE_REPLY)
             # `.strip()`, not truthiness: a lone newline is text enough to
             # satisfy the latch and not enough to be an answer, so spending it
             # there leaves a blank message where the user had read a real one.
@@ -281,6 +607,8 @@ async def format_responses_stream(
         elif isinstance(event, StreamToolUseStart):
             tool_names[event.id] = event.name
             tool_json_parts[event.id] = []
+            if event.name in EVIDENCE_TOOLS:
+                evidence_calls.append(event.id)
             if "scratchpad" in event.name:
                 role = Role.thought_scratchpad_start.value
             elif "memorize" in event.name:
@@ -318,6 +646,7 @@ async def format_responses_stream(
             name = tool_names.get(event.id, "")
             parts = tool_json_parts.pop(event.id, [])
             accumulated = "".join(parts)
+            tool_inputs[event.id] = accumulated
             if "scratchpad" in name:
                 role = Role.thought_scratchpad_end.value
             elif "memorize" in name:
@@ -363,6 +692,14 @@ async def format_responses_stream(
             })
 
         elif isinstance(event, StreamToolResult):
+            tool_use_id = getattr(event, "id", None) or ""
+            turn_steps.append(TurnStep(
+                tool_use_id=tool_use_id,
+                tool_name=getattr(event, "name", "") or "",
+                action=getattr(event, "action", "") or "",
+                tool_input=tool_inputs.get(tool_use_id, ""),
+                content=event.content,
+            ))
             seq += 1
             yield _event("response.in_progress", {
                 "type": "response.in_progress",
@@ -386,6 +723,14 @@ async def format_responses_stream(
             # under PROGRESS_THROTTLE — dropping a scratchpad_done
             # would leave the cell stuck in_progress in the UI.
             phase_str = event.phase or ""
+            if phase_str == "tool_done" and event.id:
+                # ChatSession.turn_stream emits this even when the tool has
+                # no tool_progress. Capture it before UI throttling or name
+                # removal; evidence filtering uses the result's tool name.
+                if event.ok is True:
+                    successful_native_calls.add(event.id)
+                else:
+                    successful_native_calls.discard(event.id)
             # A keep-alive from the cloud pod while a model call is quiet.
             # Never throttled: dropping it lets the idle bounds end a live
             # turn, and it cannot flood the stream: the pod writes one from
@@ -542,6 +887,7 @@ async def format_responses_stream(
             })
 
         elif isinstance(event, StreamContextCompacted):
+            compacted = True
             seq += 1
             yield _event("response.in_progress", {
                 "type": "response.in_progress",
@@ -578,6 +924,10 @@ async def format_responses_stream(
         elif isinstance(event, StreamAskUserAnswered):
             seq += 1
             answer = event.answer
+            # Typed by the user, so a figure in it is the question's. A picked
+            # option is the agent's own wording and stays out.
+            if answer.status == "answered" and answer.text:
+                user_answers.append(answer.text)
             yield _event("response.ask_user_answered", {
                 "type": "response.ask_user_answered",
                 "sequence_number": seq,
@@ -588,6 +938,7 @@ async def format_responses_stream(
             })
 
         elif isinstance(event, TurnHistory):
+            tool_rows = event.read if event.read is not None else event.rows
             # Recorded for LLM-history replay only — not surfaced to the client
             # (tool activity is rendered from the thought events above), so it
             # goes straight to the sink without an SSE frame or sequence number.
@@ -599,6 +950,9 @@ async def format_responses_stream(
                     })
                 except Exception:
                     pass
+
+        elif isinstance(event, TurnContext):
+            turn_context = event
 
         elif isinstance(event, SkillCreated):
             seq += 1
@@ -632,11 +986,41 @@ async def format_responses_stream(
             # text the user never saw, so it can't glue the visible rounds.
             round_had_text = False
 
+        elif isinstance(event, StreamTurnEnded):
+            ended_by = event.ended_by
+
     full_text = "".join(collected_text)
+    # A turn the user stops, or one that fails or stalls, never reaches this
+    # line, so its partial answer carries no figure sources. A turn that
+    # handed back (ended_by) does: its answer is whole, so its figures get
+    # sources as a finished turn's do, before the final event.
+    sources = FigureSources() if failure_reply else await find_answer_sources(TurnEvidence(
+        answer=full_text,
+        question=turn_context.question,
+        answers=tuple(user_answers),
+        steps=tuple(turn_steps),
+        tool_rows=tool_rows,
+        history=turn_context.history,
+        files=turn_context.files,
+        evidence_calls=tuple(evidence_calls),
+        successful_native_calls=frozenset(successful_native_calls),
+        compacted=compacted,
+    ))
+    if sources.figures:
+        seq += 1
+        yield _event("response.figure_sources", {
+            "type": "response.figure_sources",
+            "sequence_number": seq,
+            "item_id": msg_id,
+            **sources.model_dump(mode="json"),
+        })
+    # Still response.completed, so every client sees the answer end; the
+    # status says it stopped early. The message itself is whole either way.
     resp_completed = Response(
         id=resp_id,
         model=model,
-        status=ResponseStatus.completed,
+        status=ResponseStatus.incomplete if ended_by else ResponseStatus.completed,
+        incomplete_details=IncompleteDetails(reason=ended_by) if ended_by else None,
         output=[ResponseOutput(
             id=msg_id,
             status=ResponseStatus.completed,
