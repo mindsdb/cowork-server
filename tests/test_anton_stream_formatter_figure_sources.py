@@ -510,6 +510,25 @@ class TestStepsFromTheTurnsToolRows:
         assert "$42" not in figures
         assert figures["250"]["origin"] == "step"
 
+    async def test_rows_holding_an_evidence_call_without_its_result_leave_a_figure_no_step_holds_unmarked(self):
+        """A call is held only by its result: rows that keep the call but not
+        what it returned may still be missing a page it read."""
+        events = await _run_turn(
+            TurnContext(question="What does overtime cost, and what is at S1?"),
+            *_read_stock_cell(),
+            *_tool_call("toolu_web", "web_fetch", {"url": "https://example.com/rates"}),
+            StreamContextCompacted(message="Context compacted"),
+            StreamTextDelta(text="Overtime costs $42 an hour and S1 holds 250 units."),
+            TurnHistory([{"role": "assistant", "content": [{
+                "type": "tool_use", "id": "toolu_web", "name": "web_fetch",
+                "input": {"url": "https://example.com/rates"},
+            }]}]),
+        )
+
+        figures = _by_text(_figures(events))
+        assert "$42" not in figures
+        assert figures["250"]["sources"] == [{"tool_use_id": "toolu_read", "page": None}]
+
     async def test_a_refused_evidence_call_in_the_rows_keeps_the_mark_on_a_figure_no_step_holds(self):
         """The rows hold anton's own is_error answer to the call, so its
         result is not missing."""
@@ -549,6 +568,83 @@ class TestStepsFromTheTurnsToolRows:
         figures = _by_text(_figures(events))
         assert figures["$42"]["origin"] == "none"
         assert figures["250"]["sources"] == [{"tool_use_id": "toolu_read", "page": None}]
+
+    async def test_a_number_a_replayed_web_calls_query_states_is_only_echoed_by_its_results(self):
+        """The row's call reads with the text of its arguments, so a number
+        the query states and the results repeat is an echo, not a figure the
+        search found."""
+        query = {"query": "overtime rates 2024"}
+
+        events = await _run_turn(
+            TurnContext(question="What did overtime cost?"),
+            *_tool_call("toolu_search", "web_search", query),
+            *_tool_done("toolu_search", True),
+            StreamTextDelta(text="In 2024 overtime was $42."),
+            TurnHistory(_tool_rows("toolu_search", "web_search", query, "2024 overtime: $42 per hour")),
+        )
+
+        figures = _by_text(_figures(events))
+        assert figures["2024"]["origin"] == "none"
+        assert figures["$42"]["sources"] == [{"tool_use_id": "toolu_search", "page": None}]
+
+    async def test_the_turns_rows_are_read_once(self, monkeypatch):
+        """A compacted turn missing an evidence call reads its rows for the
+        steps they hold and for the results they hold, from one parse."""
+        rows = [
+            *_tool_rows("toolu_w1", "web_fetch", {"url": "https://example.com/a"}, "Overtime rate: $42 per hour"),
+            *_tool_rows("toolu_w2", "web_fetch", {"url": "https://example.com/b"}, "S1 holds 250 units"),
+            *_tool_rows("toolu_w3", "web_fetch", {"url": "https://example.com/c"}, "Nothing here"),
+        ]
+        validated: list[object] = []
+        model_validate = stream_formatter_mod._HistoryRow.model_validate
+
+        def recording(row, *args, **kwargs):
+            validated.append(row)
+            return model_validate(row, *args, **kwargs)
+
+        monkeypatch.setattr(stream_formatter_mod._HistoryRow, "model_validate", recording)
+
+        events = await _run_turn(
+            TurnContext(question="What does overtime cost?"),
+            *_tool_call("toolu_w1", "web_fetch", {"url": "https://example.com/a"}),
+            *_tool_done("toolu_w1", True),
+            *_tool_call("toolu_lost", "web_fetch", {"url": "https://example.com/lost"}),
+            *_tool_done("toolu_lost", True),
+            StreamContextCompacted(message="Context compacted"),
+            StreamTextDelta(text="Overtime costs $42 an hour, S1 holds 250 units, and 91 more."),
+            TurnHistory(rows),
+        )
+
+        assert len(validated) == len(rows)
+        figures = _by_text(_figures(events))
+        assert figures["$42"]["sources"] == [{"tool_use_id": "toolu_w1", "page": None}]
+        assert "91" not in figures
+
+    async def test_a_replayed_calls_arguments_are_not_parsed_again(self, monkeypatch):
+        """A history row holds a call's arguments already parsed, so neither
+        the web call nor the cell that only the rows hold goes back through
+        the text parser."""
+        def never(_raw):
+            raise AssertionError("a replayed call's arguments were parsed from text")
+
+        monkeypatch.setattr(figure_sources_mod, "_leading_object", never)
+        rows = [
+            *_tool_rows("toolu_web", "web_fetch", {"url": "https://example.com/rates"}, "Overtime rate: $42 per hour"),
+            *_cell_rows("toolu_cell", code="print(5000 + 150)", stdout="5150\n", description="Count rows"),
+        ]
+
+        events = await _run_turn(
+            TurnContext(question="What does overtime cost?"),
+            *_tool_call("toolu_web", "web_fetch", {"url": "https://example.com/rates"}),
+            *_tool_done("toolu_web", True),
+            StreamTextDelta(text="Overtime costs $42 an hour across 5150 rows."),
+            TurnHistory(rows),
+        )
+
+        assert "response.figure_sources" in [event_type for event_type, _ in events]
+        figures = _by_text(_figures(events))
+        assert figures["$42"]["sources"] == [{"tool_use_id": "toolu_web", "page": None}]
+        assert figures["5150"]["sources"] == [{"tool_use_id": "toolu_cell", "page": None}]
 
 
 class TestNativeEvidenceVerdicts:
@@ -792,20 +888,32 @@ class TestStepsFromEarlierTurns:
         ]
 
     async def test_an_answer_with_no_figures_reads_no_history(self, monkeypatch):
+        """Nor does it parse the rows or the arguments the stream carried."""
         read: list = []
-        row_steps = stream_formatter_mod._row_steps
+        parsed: list[str] = []
+        read_rows = stream_formatter_mod.ToolRows.read
+        from_text = figure_sources_mod.ToolInput.from_text
 
-        def recording(rows):
+        def recording_rows(*, rows):
             read.append(rows)
-            return row_steps(rows)
+            return read_rows(rows=rows)
 
-        monkeypatch.setattr(stream_formatter_mod, "_row_steps", recording)
+        def recording_text(*, text):
+            parsed.append(text)
+            return from_text(text=text)
+
+        monkeypatch.setattr(stream_formatter_mod.ToolRows, "read", staticmethod(recording_rows))
+        monkeypatch.setattr(figure_sources_mod.ToolInput, "from_text", staticmethod(recording_text))
 
         events = await _run_turn(
-            TurnContext(question="Plot it.", history=_earlier_cell()), StreamTextDelta(text="Here is the chart."),
+            TurnContext(question="Plot it.", history=_earlier_cell()),
+            *_read_stock_cell(),
+            StreamTextDelta(text="Here is the chart."),
+            TurnHistory(_cell_rows("toolu_read", code="print(open('/workspace/stock.csv').read())", stdout="")),
         )
 
         assert read == []
+        assert parsed == []
         assert "response.figure_sources" not in [event_type for event_type, _ in events]
 
     async def test_a_turn_that_ran_no_cell_reads_no_history(self, monkeypatch):
@@ -1012,3 +1120,120 @@ class TestTheInProcessHandlerSavesTheSources:
 
         assert [event.get("type") for event in saved].count("response.figure_sources") == 1
         assert any(frame.startswith("event: response.figure_sources") for frame in frames)
+
+
+# The figure_sources frames, compacted turn then whole turn, of the turn
+# _every_input_shape builds.
+_EVERY_INPUT_SHAPE_FRAMES = Path(__file__).parent / "fixtures" / "figure_sources_every_input_shape.sse"
+
+
+async def _every_input_shape(*, compacted: bool) -> str:
+    """The response.figure_sources frame of one turn that crosses every shape
+    the formatter reads a step from: a streamed cell, a streamed cell whose
+    arguments were cut short, a streamed cell with no arguments, a cell that
+    calls a client an earlier cell built, web and file calls whose results
+    only the rows hold, a file read with no path, a web call with odd
+    arguments whose query states a number its results echo, an is_error
+    row, a web call whose tool_done said it failed, a cell only the rows
+    hold, junk rows, earlier turns' cells (one printed a figure the answer
+    repeats) beside junk history rows, and an evidence call no row holds."""
+    load = "import pandas as pd\ndf = pd.read_csv('stock.csv')"
+    total = "print(df.qty.sum())"
+    history = [
+        {"role": "user", "content": "Load the stock."},
+        *_tool_rows(
+            "toolu_load", "scratchpad", {"action": "exec", "name": "main", "code": load},
+            "Code executed successfully (no output).",
+        ),
+        *_cell_rows("toolu_old", code="print(80 * 101)", stdout="8080\n"),
+        {"role": "assistant", "content": "Loaded."},
+        {"content": 5},
+        {"role": "assistant", "content": [{"type": "tool_use", "name": "scratchpad", "input": {}}]},
+    ]
+    rows = [
+        *_tool_rows("toolu_web", "web_fetch", {"url": "https://example.com/rates"}, "Overtime rate: $42 per hour"),
+        *_tool_rows(
+            "toolu_file", "read_text_file", {"path": "/workspace/stock.csv"},
+            [{"type": "text", "text": "part,site,qty\nP100,S1,250\n"}, {"type": "image"}],
+        ),
+        *_tool_rows("toolu_nopath", "read_text_file", {"path": 5}, "notes: 33 lines"),
+        *_tool_rows(
+            "toolu_search", "web_search", {"url": None, "query": "overtime rates 2024"}, "18 results found for 2024",
+        ),
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "toolu_bad", "name": "web_fetch", "input": {"url": "https://x.example/"}},
+        ]},
+        {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_bad", "content": "rate 91", "is_error": True},
+        ]},
+        *_tool_rows("toolu_failed", "web_fetch", {"url": "https://down.example/"}, "Rate 64 per hour"),
+        *_tool_rows(
+            "toolu_rowcell", "scratchpad",
+            {"action": "exec", "name": "main", "code": "print(5000 + 150)", "one_line_description": "Row cell"},
+            "[output]\n5150\n\n[logs]\nok\n",
+        ),
+    ]
+    read = [
+        *rows,
+        "junk",
+        {"role": "user", "content": [{"type": "tool_result"}]},
+        {"content": [{"type": "tool_use", "id": "z", "name": "web_fetch", "input": "nope"}]},
+    ]
+    sum_cell = {"code": total, "stdout": "340\n", "stderr": "", "error": None, "description": "Sum stock"}
+    cut_cell = {"code": "print(77 * 101)", "stdout": "7777\n", "stderr": "", "error": None, "description": ""}
+    bare_cell = {"code": "print(6 * 7 * 100)", "stdout": "4200\n", "stderr": "", "error": None, "description": ""}
+    setup = "client = httpx.Client(base_url='https://erp.example.com')"
+    fetch = "print(client.get('/stock?token=synthetic-secret').text)"
+    setup_cell = {"code": setup, "stdout": "", "stderr": "", "error": None, "description": "Open ERP client"}
+    fetch_cell = {"code": fetch, "stdout": "612\n", "stderr": "", "error": None, "description": "Fetch stock"}
+    frames = [
+        chunk async for chunk in format_responses_stream(_events(
+            TurnContext(question="What is the total, the rate and S1?", history=history),
+            *_tool_call("toolu_sum", "scratchpad", {"action": "exec", "name": "main", "code": total}),
+            StreamToolResult(name="scratchpad", content=json.dumps(sum_cell), action="exec", id="toolu_sum"),
+            StreamToolUseStart(id="toolu_cut", name="scratchpad"),
+            StreamToolUseDelta(id="toolu_cut", json_delta='{"action": "exec", "name": "main", "co'),
+            StreamToolUseEnd(id="toolu_cut"),
+            StreamToolResult(name="scratchpad", content=json.dumps(cut_cell), action="exec", id="toolu_cut"),
+            StreamToolResult(name="scratchpad", content=json.dumps(bare_cell), action="exec", id="toolu_bare"),
+            *_tool_call("toolu_setup", "scratchpad", {"action": "exec", "name": "main", "code": setup}),
+            StreamToolResult(name="scratchpad", content=json.dumps(setup_cell), action="exec", id="toolu_setup"),
+            *_tool_call("toolu_fetch", "scratchpad", {"action": "exec", "name": "main", "code": fetch}),
+            StreamToolResult(name="scratchpad", content=json.dumps(fetch_cell), action="exec", id="toolu_fetch"),
+            *_tool_call("toolu_web", "web_fetch", {"url": "https://example.com/rates"}),
+            *_tool_done("toolu_web", True),
+            *_tool_call("toolu_file", "read_text_file", {"path": "/workspace/stock.csv"}),
+            *_tool_done("toolu_file", True),
+            *_tool_call("toolu_nopath", "read_text_file", {"path": 5}),
+            *_tool_done("toolu_nopath", True),
+            *_tool_call("toolu_search", "web_search", {"url": None, "query": "overtime rates 2024"}),
+            *_tool_done("toolu_search", True),
+            *_tool_call("toolu_bad", "web_fetch", {"url": "https://x.example/"}),
+            *_tool_done("toolu_bad", False),
+            *_tool_call("toolu_failed", "web_fetch", {"url": "https://down.example/"}),
+            *_tool_done("toolu_failed", False),
+            *_tool_call("toolu_lost", "web_fetch", {"url": "https://lost.example/"}),
+            *_tool_done("toolu_lost", True),
+            *([StreamContextCompacted(message="Context compacted")] if compacted else []),
+            StreamTextDelta(text=(
+                "340 units in all, 7777 checked, 4200 billed, 612 in the ERP, overtime $42 an hour, S1 holds 250, "
+                "5150 rows, 18 results for 2024, 33 lines, 64 on the down page, and 91 and 8080 elsewhere."
+            )),
+            TurnHistory(rows, read=read),
+        ), model="test-model")
+    ]
+    return "".join(frame for frame in frames if frame.startswith("event: response.figure_sources\n"))
+
+
+class TestTheFigureSourcesEventIsUnchanged:
+    async def test_every_input_shape_gives_the_same_frames(self, monkeypatch):
+        """The frames are pinned byte for byte, so a change to how the
+        formatter reads its steps can't move a figure, a source or a step."""
+        from uuid import UUID
+
+        monkeypatch.setattr(stream_formatter_mod, "time", SimpleNamespace(time=lambda: 1_760_000_000.0))
+        monkeypatch.setattr(stream_formatter_mod, "uuid", SimpleNamespace(uuid4=lambda: UUID(int=0xABCDEF)))
+
+        frames = await _every_input_shape(compacted=True) + await _every_input_shape(compacted=False)
+
+        assert frames == _EVERY_INPUT_SHAPE_FRAMES.read_text()

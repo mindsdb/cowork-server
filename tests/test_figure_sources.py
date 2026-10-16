@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
 from dataclasses import asdict, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -28,6 +29,8 @@ from cowork.harnesses.anton_harness.figure_sources import (
     FigureSources,
     FigureStep,
     SourceKind,
+    ToolArguments,
+    ToolInput,
     TurnStep,
     find_figure_sources,
 )
@@ -43,14 +46,15 @@ def _cell(tool_use_id: str, *, code: str, stdout: str, description: str = "", pa
         tool_use_id=tool_use_id,
         tool_name="scratchpad",
         action="exec",
-        tool_input=json.dumps({"action": "exec", "name": pad, "code": code}),
+        tool_input=ToolInput.from_text(text=json.dumps({"action": "exec", "name": pad, "code": code})),
         content=json.dumps(asdict(Cell(code=code, stdout=stdout, stderr="", error=None, description=description))),
     )
 
 
 def _tool(tool_use_id: str, name: str, tool_input: dict, content: str) -> TurnStep:
     return TurnStep(
-        tool_use_id=tool_use_id, tool_name=name, action="", tool_input=json.dumps(tool_input), content=content,
+        tool_use_id=tool_use_id, tool_name=name, action="", tool_input=ToolInput.from_text(text=json.dumps(tool_input)),
+        content=content,
     )
 
 
@@ -59,8 +63,8 @@ def _scratchpad(tool_use_id: str, *, action: str, content: str, pad: str = "main
     gives the model for it."""
     tool_input = {"action": action, "name": pad, **({"code": code} if code else {})}
     return TurnStep(
-        tool_use_id=tool_use_id, tool_name="scratchpad", action=action, tool_input=json.dumps(tool_input),
-        content=content,
+        tool_use_id=tool_use_id, tool_name="scratchpad", action=action,
+        tool_input=ToolInput.from_text(text=json.dumps(tool_input)), content=content,
     )
 
 
@@ -75,8 +79,8 @@ def _discarded(tool_use_id: str, *, action: str, code: str = "") -> TurnStep:
     events = _discarded_tool_call_events(ToolCall(id=tool_use_id, name="scratchpad", input=tool_input, repaired=True))
     [result] = [event for event in events if isinstance(event, StreamToolResult)]
     return TurnStep(
-        tool_use_id=tool_use_id, tool_name="scratchpad", action=action, tool_input=json.dumps(tool_input),
-        content=result.content,
+        tool_use_id=tool_use_id, tool_name="scratchpad", action=action,
+        tool_input=ToolInput.from_text(text=json.dumps(tool_input)), content=result.content,
     )
 
 
@@ -1421,11 +1425,29 @@ class TestFiguresWithoutASource:
         assert _figure(sources, "$30").origin is FigureOrigin.none
 
     def test_a_non_exec_scratchpad_action_is_not_a_source(self):
-        dump = TurnStep(tool_use_id="toolu_dump", tool_name="scratchpad", action="dump", tool_input="{}", content="250")
+        dump = TurnStep(
+            tool_use_id="toolu_dump", tool_name="scratchpad", action="dump", tool_input=ToolInput.from_text(text="{}"),
+            content="250",
+        )
 
         sources = find_figure_sources(answer="S1 holds 250 units.", question="", steps=[dump])
 
         assert _figure(sources, "250").origin is FigureOrigin.none
+
+    @pytest.mark.parametrize("tool_input", [
+        pytest.param(ToolInput.from_text(text=json.dumps({"query": "overtime rates 2024"})), id="streamed"),
+        pytest.param(ToolInput.from_call(arguments={"query": "overtime rates 2024"}), id="history-row"),
+    ])
+    def test_a_number_a_web_calls_query_states_is_only_echoed_by_its_results(self, tool_input: ToolInput):
+        search = TurnStep(
+            tool_use_id="toolu_search", tool_name="web_search", action="", tool_input=tool_input,
+            content="2024 overtime: $42 per hour",
+        )
+
+        sources = find_figure_sources(answer="In 2024 overtime was $42.", question="", steps=[search])
+
+        assert _figure(sources, "2024").origin is FigureOrigin.none
+        assert _figure(sources, "$42").sources == [FigureSource(tool_use_id="toolu_search", page=None)]
 
     def test_a_figure_the_question_states_is_the_questions(self):
         sources = find_figure_sources(
@@ -1960,14 +1982,16 @@ class TestToleratedArguments:
     def test_a_cell_whose_arguments_do_not_parse_reads_the_code_that_ran(self, tool_input: str):
         cell = _cell("toolu_c", code="cost = 30\nprint(cost)", stdout="30\n")
 
-        sources = find_figure_sources(answer="Overtime costs $30.", question="", steps=[replace(cell, tool_input=tool_input)])
+        sources = find_figure_sources(
+            answer="Overtime costs $30.", question="", steps=[replace(cell, tool_input=ToolInput.from_text(text=tool_input))],
+        )
 
         assert _origins(sources) == [("$30", FigureOrigin.none)]
 
     def test_a_query_cell_whose_arguments_are_missing_keeps_its_sql(self):
         cell = _cell("toolu_q", code="print(query_minds_data('SELECT qty FROM stock'))", stdout="250\n")
 
-        step_out = _only_step(replace(cell, tool_input=""), answer="S1 holds 250.")
+        step_out = _only_step(replace(cell, tool_input=ToolInput.from_text(text="")), answer="S1 holds 250.")
 
         assert (step_out.kind, step_out.queries) == (SourceKind.query, ["SELECT qty FROM stock"])
 
@@ -1975,11 +1999,88 @@ class TestToleratedArguments:
         spell = _cell("toolu_1", code="sql = 'SELECT qty FROM stock'", stdout="", pad="calc")
         code = "# " + "x" * 200 + "\ncur.execute(sql)\nprint(cur.fetchone()[0])"
         run = _cell("toolu_2", code=code, stdout="250\n", pad="calc")
-        cut = replace(run, tool_input=run.tool_input[:120])
+        cut = replace(run, tool_input=ToolInput.from_text(text=run.tool_input.text[:120]))
 
         [step] = find_figure_sources(answer="S1 holds 250.", question="", steps=[spell, cut]).steps
 
         assert step.queries == ["SELECT qty FROM stock"]
+
+
+# A call's arguments and what the matcher reads from them: the scratchpad's
+# name and code, a web call's url and query, and a file read's path.
+_READ_ARGUMENTS = [
+    pytest.param(
+        {"action": "exec", "name": "main", "code": "print(1)"}, ToolArguments(name="main", code="print(1)"),
+        id="a-cell",
+    ),
+    pytest.param({"name": 7, "code": 5}, ToolArguments(name="7", code="5"), id="numbers-read-as-text"),
+    pytest.param({"name": None, "code": None}, ToolArguments(), id="nulls-read-as-empty"),
+    pytest.param({"name": False, "query": 0}, ToolArguments(), id="falsy-values-read-as-empty"),
+    pytest.param({"path": 5}, ToolArguments(), id="a-path-that-is-not-text"),
+    pytest.param({"path": ""}, ToolArguments(), id="an-empty-path"),
+    pytest.param({"path": "/workspace/a.csv"}, ToolArguments(path="/workspace/a.csv"), id="a-path"),
+    pytest.param({"url": ["https://a.example"]}, ToolArguments(url="['https://a.example']"), id="a-url-list"),
+    pytest.param({"url": {"href": "x"}}, ToolArguments(url="{'href': 'x'}"), id="a-url-object"),
+    pytest.param({"url": None, "query": "rates"}, ToolArguments(query="rates"), id="a-search"),
+    pytest.param({"query": 1e16}, ToolArguments(query="1e+16"), id="a-large-float"),
+    pytest.param({}, ToolArguments(), id="no-arguments"),
+]
+
+
+class TestToolArguments:
+    """A call's arguments read the same whether the matcher gets them as the
+    model streamed them or as a history row holds them."""
+
+    @pytest.mark.parametrize(("arguments", "read"), _READ_ARGUMENTS)
+    def test_a_call_reads_the_same_from_its_dict_and_its_text(self, arguments: dict, read: ToolArguments):
+        assert ToolArguments.from_call(arguments=arguments) == read
+        assert ToolArguments.from_text(text=json.dumps(arguments, default=str)) == read
+
+    @pytest.mark.parametrize(("text", "read"), [
+        pytest.param("", ToolArguments(), id="empty"),
+        pytest.param("{}", ToolArguments(), id="an-empty-object"),
+        pytest.param("[1]", ToolArguments(), id="a-list"),
+        pytest.param("null", ToolArguments(), id="null"),
+        pytest.param(
+            '{"action": "exec", "name": "ma\\u00efn", "co', ToolArguments(name="ma\u00efn"),
+            id="cut-short-after-an-escaped-name",
+        ),
+        pytest.param(
+            '{"action": "exec", "name": "main", "code": "x = 1"}<|end|>', ToolArguments(name="main", code="x = 1"),
+            id="a-trailing-end-token",
+        ),
+        pytest.param('{"name": "main"} and more', ToolArguments(name="main"), id="trailing-text"),
+        pytest.param(
+            '{"name": "main", "code": "print(1)"', ToolArguments(name="main"), id="an-unterminated-object",
+        ),
+        # The escape does not read, so the name reads as no name at all.
+        pytest.param(
+            '{"action": "exec", "name": "a\\qb", "code": "print(1', ToolArguments(), id="cut-short-with-a-bad-escape",
+        ),
+        pytest.param('[{"name": "x"}]', ToolArguments(name="x"), id="a-name-inside-a-list"),
+    ])
+    def test_arguments_that_do_not_read_as_an_object_keep_only_their_name(self, text: str, read: ToolArguments):
+        assert ToolArguments.from_text(text=text) == read
+
+    def test_a_path_object_reads_as_the_path_it_names(self):
+        """A row's arguments are read as they are, not through JSON text, so
+        a path given as a path object still names the file."""
+        call = {"path": PurePosixPath("/workspace/a.csv")}
+
+        assert ToolArguments.from_call(arguments=call).path == "/workspace/a.csv"
+        assert ToolArguments.from_call(arguments=call) == ToolArguments.from_text(text=json.dumps(call, default=str))
+
+    async def test_arguments_nested_a_few_hundred_deep_read_whole(self):
+        nested = '{"name": "main", "code": "x = 1", "deps": ' + "[" * 500 + "]" * 500 + "}"
+
+        assert await asyncio.to_thread(ToolArguments.from_text, text=nested) == ToolArguments(name="main", code="x = 1")
+
+    async def test_arguments_nested_too_deep_to_parse_read_as_cut_short(self):
+        """Read in a worker thread, as find_answer_sources reads them. The
+        parser gives up with a RecursionError long before 100,000 levels."""
+        nested = '{"name": "main", "code": "x = 1", "deps": ' + "[" * 100_000 + "]" * 100_000 + "}"
+
+        assert await asyncio.to_thread(ToolArguments.from_text, text=nested) == ToolArguments(name="main")
 
 
 class TestClippedResults:
@@ -1994,7 +2095,8 @@ class TestClippedResults:
         clipped = _clip_result_content(json.dumps(asdict(cell)))
         step = TurnStep(
             tool_use_id="toolu_c", tool_name="scratchpad", action="exec",
-            tool_input=json.dumps({"action": "exec", "name": "main", "code": "print(total)"}), content=clipped,
+            tool_input=ToolInput.from_text(text=json.dumps({"action": "exec", "name": "main", "code": "print(total)"})),
+            content=clipped,
         )
 
         sources = find_figure_sources(answer="7777 units worth €1,250; 4242 retries.", question="", steps=[step])
@@ -2008,7 +2110,8 @@ class TestClippedResults:
         clipped = _clip_result_content(json.dumps(asdict(cell)))
         step = TurnStep(
             tool_use_id="toolu_c", tool_name="scratchpad", action="exec",
-            tool_input=json.dumps({"action": "exec", "name": "main", "code": "print(total)"}), content=clipped,
+            tool_input=ToolInput.from_text(text=json.dumps({"action": "exec", "name": "main", "code": "print(total)"})),
+            content=clipped,
         )
 
         assert _origins(find_figure_sources(answer="7777 units.", question="", steps=[step])) == [

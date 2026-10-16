@@ -9,6 +9,7 @@ import pytest
 import cowork.turnqueue.remote_turn as remote_turn_mod
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.stream_formatter import TurnContext, TurnHistory
+from cowork.turnqueue.producer import RemoteWorkspace
 from cowork.turnqueue.remote_turn import RemoteTurnFailed, remote_turn_events
 
 
@@ -23,7 +24,7 @@ class _FakeSession:
 
 def _fake_handler(
     monkeypatch, *, persist_turn_memory=None, remote_artifacts_context=None, remote_seed_history=None,
-    remote_agent_files=None,
+    remote_agent_files=None, remote_workspace=None,
 ):
     """Replace ResponsesHandler with a stand-in exposing only the methods
     remote_turn_events calls, resolved at call time like every other name here."""
@@ -32,8 +33,8 @@ def _fake_handler(
             "_remote_artifacts_context": staticmethod(remote_artifacts_context or (lambda s, c: None)),
             "_remote_seed_history": staticmethod(remote_seed_history or (lambda s, c: ([], None))),
             "_persist_remote_compaction": staticmethod(lambda s, *, conv_id, data, seed_info: None),
-            "_remote_workspace": staticmethod(lambda s, c: {}),
-            "_remote_agent_files": staticmethod(remote_agent_files or (lambda s, c: None)),
+            "_remote_workspace": staticmethod(remote_workspace or (lambda s, c: None)),
+            "_remote_agent_files": staticmethod(remote_agent_files or (lambda s, c, *, workspace: None)),
             "_remote_started_at": staticmethod(lambda s, c: None),
             "_persist_turn_memory": staticmethod(persist_turn_memory or (lambda s, c, e: None)),
         },
@@ -57,7 +58,7 @@ async def _drain(gen):
 async def test_the_turn_opens_with_its_context(monkeypatch, tmp_path):
     conv_id = uuid4()
     files = AgentFiles.in_cloud_pod(tmp_path, conversation_id=conv_id, workspace_rel_path="projects/general")
-    _fake_handler(monkeypatch, remote_agent_files=lambda s, c: files if c == conv_id else None)
+    _fake_handler(monkeypatch, remote_agent_files=lambda s, c, *, workspace: files if c == conv_id else None)
 
     async def fake_replies(**kwargs):
         yield "turn_delta", {"text": "There are 250."}
@@ -72,6 +73,39 @@ async def test_the_turn_opens_with_its_context(monkeypatch, tmp_path):
 
     assert events[0] == TurnContext(question="How many at S1?", files=files)
     assert not any(isinstance(event, TurnContext) for event in events[1:])
+
+
+@pytest.mark.asyncio
+async def test_the_turn_looks_up_its_workspace_once(monkeypatch):
+    """The job and the pod's files are placed by the same project path."""
+    workspace = RemoteWorkspace(project_id="proj-1", workspace_rel_path="projects/proj")
+    looked_up: list[object] = []
+    placed: list[RemoteWorkspace | None] = []
+    sent: list[RemoteWorkspace | None] = []
+
+    def remote_workspace(session, conv_id):
+        looked_up.append(conv_id)
+        return workspace
+
+    def remote_agent_files(session, conv_id, *, workspace):
+        placed.append(workspace)
+
+    _fake_handler(monkeypatch, remote_workspace=remote_workspace, remote_agent_files=remote_agent_files)
+
+    async def fake_replies(**kwargs):
+        sent.append(kwargs["workspace"])
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    await _drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="hi", model="anton", turn_rows=[],
+    ))
+
+    assert len(looked_up) == 1
+    assert placed == [workspace]
+    assert sent == [workspace]
 
 
 @pytest.mark.asyncio

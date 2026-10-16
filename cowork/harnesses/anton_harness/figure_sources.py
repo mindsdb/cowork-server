@@ -53,6 +53,7 @@ by the text the code spelled.
 from __future__ import annotations
 
 import json
+import os
 import posixpath
 import re
 from bisect import bisect_left, bisect_right
@@ -60,10 +61,10 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from itertools import accumulate
-from typing import Any
+from typing import Annotated, Any
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import BaseModel, BeforeValidator, ConfigDict, ValidationError
 
 from cowork.common.history_scrub import scrub_credentials
 from cowork.common.logger import get_logger
@@ -118,6 +119,75 @@ class CellResult(BaseModel):
     description: str = ""
 
 
+def _text(value: object) -> str:
+    """An argument as the matcher reads it: its text, and a null, empty or
+    zero value as no text."""
+    return str(value or "")
+
+
+def _path(value: object) -> str | None:
+    """A file read's path argument, or None when it is not a non-empty
+    string or path object."""
+    if isinstance(value, os.PathLike):
+        value = os.fspath(value)
+    return value if isinstance(value, str) and value else None
+
+
+class ToolArguments(BaseModel):
+    """What the matcher reads from a tool call's arguments: the scratchpad
+    it runs in and the code it runs, the page a web call fetches or the
+    query it searches, and the file a read names. Every other argument is
+    left out, and a value of the wrong type reads as text (or as no path),
+    so arguments always read."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    name: Annotated[str, BeforeValidator(_text)] = ""
+    code: Annotated[str, BeforeValidator(_text)] = ""
+    url: Annotated[str, BeforeValidator(_text)] = ""
+    query: Annotated[str, BeforeValidator(_text)] = ""
+    path: Annotated[str | None, BeforeValidator(_path)] = None
+
+    @classmethod
+    def from_call(cls, *, arguments: Mapping[str, Any]) -> ToolArguments:
+        """The arguments a history row holds, already parsed."""
+        return cls.model_validate(arguments)
+
+    @classmethod
+    def from_text(cls, *, text: str) -> ToolArguments:
+        """The arguments as the model streamed them. Arguments with something
+        after them still read; arguments that don't read as an object (cut
+        short by the cloud pod at its wire limit, or nested too deep to
+        parse) keep only their scratchpad's name, and a cell's result gives
+        the code that ran."""
+        arguments = _leading_object(text)
+        if arguments is not None:
+            return cls.from_call(arguments=arguments)
+        found = _PAD_NAME.search(text)
+        name = _json_string(found.group(1)) if found else None
+        return cls(name=name or "")
+
+
+class ToolInput(BaseModel):
+    """A tool call's arguments: the text the model wrote, which a step's
+    output may only echo, and what the matcher reads from it."""
+
+    model_config = ConfigDict(frozen=True)
+
+    text: str
+    arguments: ToolArguments
+
+    @classmethod
+    def from_call(cls, *, arguments: Mapping[str, Any]) -> ToolInput:
+        """A history row's call, whose arguments are already parsed."""
+        return cls(text=json.dumps(arguments, default=str), arguments=ToolArguments.from_call(arguments=arguments))
+
+    @classmethod
+    def from_text(cls, *, text: str) -> ToolInput:
+        """A streamed call, whose arguments arrive as the model wrote them."""
+        return cls(text=text, arguments=ToolArguments.from_text(text=text))
+
+
 @dataclass(frozen=True)
 class TurnStep:
     """One tool call the model made and its result: this turn's, as the
@@ -127,7 +197,7 @@ class TurnStep:
     tool_use_id: str
     tool_name: str
     action: str
-    tool_input: str
+    tool_input: ToolInput
     # The result as the model saw it: for a streamed scratchpad cell, anton's
     # JSON of it.
     content: str
@@ -504,15 +574,6 @@ class _Pad:
         self.clients = dict(reading.clients)
 
 
-@dataclass(frozen=True)
-class _ScratchpadCall:
-    """What a scratchpad call's arguments name: the scratchpad, and the code
-    it runs."""
-
-    pad: str
-    code: str
-
-
 def _describe_steps(steps: Sequence[TurnStep]) -> list[_DescribedStep]:
     """Each step that can be a source, earlier turns' first and then this
     turn's, each in step order. Of the earlier turns' steps, only those from
@@ -533,15 +594,15 @@ def _describe_steps(steps: Sequence[TurnStep]) -> list[_DescribedStep]:
             continue
         if step.content.startswith(_DISCARDED_CALL):
             continue
-        call = _scratchpad_call(step)
+        call = step.tool_input.arguments
         if step.action in _NAMESPACE_RESETS:
-            pads.pop(call.pad, None)
+            pads.pop(call.name, None)
             continue
         if not ran_cell(step):
             continue
         cell = step.cell if step.cell is not None else _cell_result(step.content)
         code = call.code or (cell.code if cell is not None else "")
-        pad = pads.setdefault(call.pad, _Pad())
+        pad = pads.setdefault(call.name, _Pad())
         reading = read_cell(code, names=pad.names, functions=pad.functions, clients=pad.clients)
         drawn_from = pad.drawn_from(reading.loaded_names) - {step.tool_use_id}
         pad.record(reading, tool_use_id=step.tool_use_id)
@@ -554,17 +615,6 @@ def _latest_cells(steps: Sequence[TurnStep], *, limit: int) -> Sequence[TurnStep
     when fewer cells ran."""
     ran = [index for index, step in enumerate(steps) if ran_cell(step)]
     return steps[ran[-limit]:] if len(ran) > limit else steps
-
-
-def _scratchpad_call(step: TurnStep) -> _ScratchpadCall:
-    """The call's scratchpad and code. Arguments with something after them
-    still read; arguments cut short keep only their scratchpad's name, and
-    the cell's result gives the code that ran."""
-    arguments = _leading_object(step.tool_input)
-    if arguments is not None:
-        return _ScratchpadCall(pad=str(arguments.get("name") or ""), code=str(arguments.get("code") or ""))
-    found = _PAD_NAME.search(step.tool_input)
-    return _ScratchpadCall(pad=_json_string(found.group(1)) if found else "", code="")
 
 
 def _cell_result(content: str) -> CellResult | None:
@@ -664,18 +714,18 @@ def _describe_tool(step: TurnStep) -> _DescribedStep:
     shortened-line marks are not the file's text and the line range it asked
     for is not a figure the model wrote. A read without a path is a step
     named by the tool."""
-    tool_input = _leading_object(step.tool_input) or {}
-    output, literals = step.content, step.tool_input
+    arguments = step.tool_input.arguments
+    output, literals = step.content, step.tool_input.text
     url = None
     documents: tuple[str, ...] = ()
     if step.tool_name in WEB_TOOLS:
-        url = _web_url(str(tool_input.get("url") or "") or _found_url(output))
+        url = _web_url(arguments.url or _found_url(output))
         kind = SourceKind.web
-        label = _web_label(url) if url else str(tool_input.get("query") or "")
+        label = _web_label(url) if url else arguments.query
     else:
         output = _SHORTENED_LINE.sub("", _TEXT_RANGE_HEADER.sub("", output))
-        path = tool_input.get("path")
-        if isinstance(path, str) and path:
+        path = arguments.path
+        if path is not None:
             kind, label, documents, literals = SourceKind.file, _basename(path), (path,), path
         else:
             kind, label = SourceKind.step, step.tool_name
@@ -869,10 +919,12 @@ def _basename(path: str) -> str:
 
 
 def _leading_object(raw: str) -> dict[str, Any] | None:
-    """The JSON object ``raw`` starts with, whatever follows it."""
+    """The JSON object ``raw`` starts with, whatever follows it, or None when
+    it doesn't start with one. Nesting too deep for the parser's recursion
+    limit reads as no object."""
     try:
         parsed, _ = _JSON.raw_decode(raw.lstrip())
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     return parsed if isinstance(parsed, dict) else None
 

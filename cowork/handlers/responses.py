@@ -58,7 +58,7 @@ from cowork.streaming.answer_text import accumulate_answer_text
 from cowork.streaming.liveness import ModelWaitTicker
 from cowork.streaming.records import TerminalReason
 from cowork.streaming.registry import RunHandle, RunIdentity
-from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
+from cowork.turnqueue.producer import RemoteWorkspace, step_stream_events, stream_remote_replies
 from cowork.turnqueue.redis_client import (
     STALLED_CANCEL_REASON,
     cancel_cause_key,
@@ -496,9 +496,9 @@ class _RemoteTurnInputs:
     seed_info: dict | None
     artifacts: _RemoteArtifactsDir | None
     memory: dict | None
-    # stream_remote_replies' project_id and workspace_rel_path, or empty when
-    # they could not be resolved (_remote_workspace).
-    workspace: dict
+    # The project the turn runs in, or None when it could not be resolved
+    # (_remote_workspace).
+    workspace: RemoteWorkspace | None
     started_at: str | None
     # Where the pod's scratchpad works, as this server finds it in the
     # project, or None when it could not be resolved (_remote_agent_files).
@@ -1345,16 +1345,16 @@ class ResponsesHandler:
             return None
 
     @staticmethod
-    def _remote_workspace(session: ScopedSession, conv_id: UUID) -> dict:
-        """The conversation's project as a path relative to the org root.
+    def _remote_workspace(session: ScopedSession, conv_id: UUID) -> RemoteWorkspace | None:
+        """The conversation's project, with its path relative to the org root.
 
         Absolute paths must not cross the wire: cowork-server sees the shared
         tree at ``<root>/<org_id>`` and the pod mounts its own org's access
         point at ``<root>``, so an absolute path built here names nothing
         inside the pod. Both sides join their own root to this.
 
-        A lookup failure degrades to the org's default project rather than
-        failing the turn, matching how memory and skills used to degrade.
+        None on a lookup failure, which runs the turn in the org's default
+        project (stream_remote_replies) rather than failing it.
         """
         from pathlib import Path
 
@@ -1367,18 +1367,22 @@ class ResponsesHandler:
                 Path(get_app_settings().project.root_dir), session.scope, store="projects"
             ).parent
             rel = Path(conversation.project.path).relative_to(org_root).as_posix()
-            return {"project_id": str(conversation.project.id), "workspace_rel_path": rel}
+            return RemoteWorkspace(project_id=str(conversation.project.id), workspace_rel_path=rel)
         except Exception:
             logger.exception("[responses] failed to resolve workspace", extra=log_context(conversation_id=conv_id))
-            return {}
+            return None
 
     @staticmethod
-    def _remote_agent_files(session: ScopedSession, conv_id: UUID) -> AgentFiles | None:
+    def _remote_agent_files(
+        session: ScopedSession, conv_id: UUID, *, workspace: RemoteWorkspace | None,
+    ) -> AgentFiles | None:
         """What the pod's scratchpad reads, as this server finds it: the
         conversation's folder in its project on the shared mount, placed in
-        the pod by the same project path the turn's job carries
+        the pod by ``workspace``, the same project path the turn's job carries
         (_remote_workspace), the project the turn runs in, and the files
         attached to the conversation, which the pod reads from that folder.
+        ``workspace`` is None when the project could not be resolved, and the
+        project's path is then unknown (AgentFiles.in_cloud_pod).
 
         None on a lookup failure, so the turn's figure sources name no files
         rather than the turn failing.
@@ -1390,7 +1394,7 @@ class ResponsesHandler:
             return AgentFiles.in_cloud_pod(
                 conversation.project.path,
                 conversation_id=conv_id,
-                workspace_rel_path=ResponsesHandler._remote_workspace(session, conv_id).get("workspace_rel_path"),
+                workspace_rel_path=workspace.workspace_rel_path if workspace is not None else None,
                 project_id=conversation.project_id,
                 attachments=conversation_attachments(session, conversation_id=conv_id),
             )
@@ -1523,6 +1527,7 @@ class ResponsesHandler:
         workspace, and when the conversation started."""
         history, seed_info = self._remote_seed_history(session, conv_id)
         artifacts = self._remote_artifacts_context(session, conv_id)
+        workspace = self._remote_workspace(session, conv_id)
         return _RemoteTurnInputs(
             history=history,
             seed_info=seed_info,
@@ -1533,9 +1538,9 @@ class ResponsesHandler:
                 creator=getattr(artifacts[0], "created_by", None),
             ),
             memory=self._remote_memory(session, conv_id),
-            workspace=self._remote_workspace(session, conv_id),
+            workspace=workspace,
             started_at=self._remote_started_at(session, conv_id),
-            files=self._remote_agent_files(session, conv_id),
+            files=self._remote_agent_files(session, conv_id, workspace=workspace),
         )
 
     @staticmethod
@@ -1990,7 +1995,7 @@ class ResponsesHandler:
                 # memory is outside the conversation workspace and therefore
                 # travels as a bounded, sheddable wire block.
                 memory=seed.memory,
-                **seed.workspace,
+                workspace=seed.workspace,
                 started_at=seed.started_at,
                 correlation_id=corr,
                 run_id=lifecycle.identity.run_id,

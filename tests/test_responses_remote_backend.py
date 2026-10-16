@@ -21,6 +21,7 @@ import pytest
 import cowork.handlers.responses as responses_mod
 from cowork.handlers.responses import ResponsesHandler
 from cowork.streaming.registry import TurnLifecycle
+from cowork.turnqueue.producer import RemoteWorkspace
 
 from _fakes import inline_run_db, opens
 
@@ -783,8 +784,8 @@ def _no_workspace_or_memory_units(monkeypatch):
     The fake unit session cannot run them, and each would log an error."""
     monkeypatch.setattr(ResponsesHandler, "_stage_remote_workspace_files", staticmethod(lambda session, conv_id: None))
     monkeypatch.setattr(ResponsesHandler, "_remote_memory", staticmethod(lambda session, conv_id: {}))
-    monkeypatch.setattr(ResponsesHandler, "_remote_workspace", staticmethod(lambda session, conv_id: {}))
-    monkeypatch.setattr(ResponsesHandler, "_remote_agent_files", staticmethod(lambda session, conv_id: None))
+    monkeypatch.setattr(ResponsesHandler, "_remote_workspace", staticmethod(lambda session, conv_id: None))
+    monkeypatch.setattr(ResponsesHandler, "_remote_agent_files", staticmethod(lambda session, conv_id, *, workspace: None))
 
 
 @pytest.mark.asyncio
@@ -1688,7 +1689,7 @@ async def test_produce_remote_gives_a_figures_step_the_project_path_of_the_file_
     saved = {}
     handler = _remote_handler(monkeypatch, saved)
     handler._remote_memory = lambda session, conv_id: None
-    handler._remote_agent_files = lambda session, conv_id: AgentFiles.in_cloud_pod(
+    handler._remote_agent_files = lambda session, conv_id, *, workspace: AgentFiles.in_cloud_pod(
         tmp_path, conversation_id=conv_id, workspace_rel_path=None,
     )
     code = "print(open('/workspace/stock.csv').read())"
@@ -1720,7 +1721,7 @@ async def test_produce_remote_gives_a_figures_step_the_project_path_of_the_file_
 def _figure_sources_handler(monkeypatch, saved):
     handler = _remote_handler(monkeypatch, saved)
     handler._remote_memory = lambda session, conv_id: None
-    handler._remote_agent_files = lambda session, conv_id: None
+    handler._remote_agent_files = lambda session, conv_id, *, workspace: None
     return handler
 
 
@@ -2058,10 +2059,6 @@ def test_remote_agent_files_place_the_pod_in_the_conversations_folder_with_its_p
     project_dir = tmp_path / "proj"
     conversation = _conversation_at(project_dir)
     _patch_conversation_service(monkeypatch, conversation)
-    monkeypatch.setattr(
-        ResponsesHandler, "_remote_workspace",
-        staticmethod(lambda session, conv_id: {"project_id": str(conversation.project_id), "workspace_rel_path": "projects/proj"}),
-    )
     conv_id = uuid4()
     attachment = Attachment(file_id="f1", stored_path="/files/f1/stock.csv")
     monkeypatch.setattr(
@@ -2069,7 +2066,9 @@ def test_remote_agent_files_place_the_pod_in_the_conversations_folder_with_its_p
         lambda session, *, conversation_id: (attachment,) if conversation_id == conv_id else (),
     )
 
-    assert ResponsesHandler._remote_agent_files(None, conv_id) == AgentFiles.in_cloud_pod(
+    workspace = RemoteWorkspace(project_id=str(conversation.project_id), workspace_rel_path="projects/proj")
+
+    assert ResponsesHandler._remote_agent_files(None, conv_id, workspace=workspace) == AgentFiles.in_cloud_pod(
         project_dir,
         conversation_id=conv_id,
         workspace_rel_path="projects/proj",
@@ -2078,10 +2077,107 @@ def test_remote_agent_files_place_the_pod_in_the_conversations_folder_with_its_p
     )
 
 
+def test_remote_agent_files_without_a_workspace_leave_the_projects_path_unknown(monkeypatch, tmp_path):
+    from cowork.harnesses.anton_harness import agent_files as agent_files_mod
+    from cowork.harnesses.anton_harness.agent_files import AgentFiles
+
+    project_dir = tmp_path / "proj"
+    conversation = _conversation_at(project_dir)
+    _patch_conversation_service(monkeypatch, conversation)
+    monkeypatch.setattr(agent_files_mod, "conversation_attachments", lambda session, *, conversation_id: ())
+    conv_id = uuid4()
+
+    assert ResponsesHandler._remote_agent_files(None, conv_id, workspace=None) == AgentFiles.in_cloud_pod(
+        project_dir, conversation_id=conv_id, workspace_rel_path=None, project_id=conversation.project_id,
+    )
+
+
 def test_remote_agent_files_are_none_when_the_project_cannot_be_read(monkeypatch):
     _patch_conversation_service(monkeypatch, SimpleNamespace(project=None))
 
-    assert ResponsesHandler._remote_agent_files(None, uuid4()) is None
+    assert ResponsesHandler._remote_agent_files(None, uuid4(), workspace=None) is None
+
+
+def test_remote_workspace_is_the_project_relative_to_the_org_root(monkeypatch):
+    from pathlib import Path
+
+    from cowork.common.settings.app_settings import get_app_settings
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    root = Path(get_app_settings().project.root_dir)
+    project = SimpleNamespace(path=str(root / "proj"), id=uuid4())
+    _patch_conversation_service(monkeypatch, SimpleNamespace(project=project))
+
+    assert ResponsesHandler._remote_workspace(SimpleNamespace(scope=LOCAL_SCOPE), uuid4()) == RemoteWorkspace(
+        project_id=str(project.id), workspace_rel_path=f"{root.name}/proj",
+    )
+
+
+def test_remote_workspace_is_none_when_the_project_cannot_be_read(monkeypatch):
+    from cowork.db.scoped import LOCAL_SCOPE
+
+    _patch_conversation_service(monkeypatch, SimpleNamespace(project=None))
+
+    assert ResponsesHandler._remote_workspace(SimpleNamespace(scope=LOCAL_SCOPE), uuid4()) is None
+
+
+def test_a_remote_turns_inputs_look_up_the_workspace_once(monkeypatch):
+    """The turn's inputs read the workspace once and place the pod's files by it."""
+    workspace = RemoteWorkspace(project_id="proj-1", workspace_rel_path="projects/proj")
+    looked_up: list[object] = []
+    placed: list[RemoteWorkspace | None] = []
+
+    def remote_workspace(session, conv_id):
+        looked_up.append(conv_id)
+        return workspace
+
+    def remote_agent_files(session, conv_id, *, workspace):
+        placed.append(workspace)
+
+    monkeypatch.setattr(ResponsesHandler, "_remote_seed_history", staticmethod(lambda session, conv_id: ([], None)))
+    monkeypatch.setattr(ResponsesHandler, "_remote_artifacts_context", staticmethod(lambda session, conv_id: None))
+    monkeypatch.setattr(ResponsesHandler, "_remote_memory", staticmethod(lambda session, conv_id: None))
+    monkeypatch.setattr(ResponsesHandler, "_remote_started_at", staticmethod(lambda session, conv_id: None))
+    monkeypatch.setattr(ResponsesHandler, "_remote_workspace", staticmethod(remote_workspace))
+    monkeypatch.setattr(ResponsesHandler, "_remote_agent_files", staticmethod(remote_agent_files))
+
+    inputs = object.__new__(ResponsesHandler)._read_remote_turn_inputs(None, conv_id=uuid4())
+
+    assert len(looked_up) == 1
+    assert inputs.workspace is workspace
+    assert placed == [workspace]
+
+
+@pytest.mark.asyncio
+async def test_a_web_turns_job_runs_in_the_workspace_it_looked_up(monkeypatch):
+    """The job gets the workspace the turn's inputs looked up, so it runs in the
+    conversation's project rather than the org's default one."""
+    handler = _remote_handler(monkeypatch, {})
+    workspace = RemoteWorkspace(project_id="proj-1", workspace_rel_path="projects/proj")
+    looked_up: list[object] = []
+
+    def remote_workspace(session, conv_id):
+        looked_up.append(conv_id)
+        return workspace
+
+    _no_workspace_or_memory_units(monkeypatch)
+    monkeypatch.setattr(ResponsesHandler, "_remote_workspace", staticmethod(remote_workspace))
+    monkeypatch.setattr(ResponsesHandler, "_remote_artifacts_context", staticmethod(lambda session, conv_id: None))
+    sent: list[RemoteWorkspace | None] = []
+
+    async def fake_replies(**kwargs):
+        sent.append(kwargs["workspace"])
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="hi", original_content="hi",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert len(looked_up) == 1
+    assert sent == [workspace]
 
 
 def test_stage_remote_workspace_files_creates_the_project_artifacts_base(monkeypatch, tmp_path):

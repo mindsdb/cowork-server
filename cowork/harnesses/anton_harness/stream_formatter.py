@@ -20,7 +20,7 @@ import logging
 import re
 import time
 import uuid
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Annotated, Any, AsyncIterator, Callable, Literal, Optional
 
@@ -31,6 +31,7 @@ from cowork.harnesses.anton_harness.figure_sources import (
     EVIDENCE_TOOLS,
     CellResult,
     FigureSources,
+    ToolInput,
     TurnStep,
     find_figure_sources,
     has_figures,
@@ -71,13 +72,16 @@ class TurnHistory:
     existing thought events, so these rows are for LLM-history replay. The
     formatter also reads the tool results in them: anton streams only the
     scratchpad's, and a figure can come from a web tool's or
-    read_text_file's (figure_sources.EVIDENCE_TOOLS)."""
+    read_text_file's (figure_sources.EVIDENCE_TOOLS). Both lists stay as the
+    producer sent them; the formatter parses them (ToolRows) only when the
+    answer has figures."""
 
-    rows: list
+    rows: list[dict[str, Any]]
     # The same rows as the agent read them, when the producer trimmed `rows`
     # for storage (the remote paths cap each result). The formatter reads
-    # these instead; None means `rows` are what the agent read.
-    read: list | None = None
+    # these instead; None means `rows` are what the agent read. The pod's
+    # rows arrive unchecked, so an entry may not be a row at all.
+    read: list[object] | None = None
 
 
 @dataclass
@@ -101,11 +105,37 @@ class TurnContext:
     the answer has figures and this turn ran a cell, and then only its last
     figure_sources.MAX_EARLIER_CELLS cells; no figure's origin depends on it.
     An earlier turn's step never holds a figure itself: a figure the answer
-    only repeats from an earlier turn has no source."""
+    only repeats from an earlier turn has no source. The formatter reads only
+    its tool_use and tool_result blocks (ToolRows) and leaves every other
+    message out."""
 
     question: str
     files: AgentFiles | None = None
-    history: list[dict] = field(default_factory=list)
+    history: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class StreamedResult:
+    """A tool result the stream carried, with the call's arguments as the
+    model streamed them. Kept raw while the turn streams; the arguments are
+    parsed (ToolInput.from_text) only when the answer has figures, in the
+    worker thread that finds their sources."""
+
+    tool_use_id: str
+    tool_name: str
+    action: str
+    tool_input: str
+    content: str
+
+    def step(self) -> TurnStep:
+        """The result as a step the figure matcher reads."""
+        return TurnStep(
+            tool_use_id=self.tool_use_id,
+            tool_name=self.tool_name,
+            action=self.action,
+            tool_input=ToolInput.from_text(text=self.tool_input),
+            content=self.content,
+        )
 
 
 @dataclass(frozen=True)
@@ -119,10 +149,12 @@ class TurnEvidence:
     answers: tuple[str, ...] = ()
     # The tool results the stream carried, which anton sends only for the
     # scratchpad.
-    steps: tuple[TurnStep, ...] = ()
-    # The turn's tool rows, which hold every tool's result (TurnHistory).
-    tool_rows: list = field(default_factory=list)
-    history: list[dict] = field(default_factory=list)
+    steps: tuple[StreamedResult, ...] = ()
+    # The turn's tool rows, which hold every tool's result (TurnHistory), and
+    # the conversation's earlier messages (TurnContext.history), both as
+    # their producers sent them.
+    tool_rows: Sequence[object] = ()
+    history: Sequence[object] = ()
     files: AgentFiles | None = None
     # The tool_use_ids of this turn's EVIDENCE_TOOLS calls, as the stream
     # announced them. Their results reach the formatter only in tool_rows.
@@ -301,6 +333,73 @@ _ROW_BLOCK: TypeAdapter[_ToolUseBlock | _ToolResultBlock] = TypeAdapter(
 )
 
 
+@dataclass(frozen=True)
+class ToolRows:
+    """The tool calls and results in history rows (an assistant row's
+    tool_use blocks, a user row's tool_result blocks), each keyed by its
+    tool_use_id, in row order. Read once (ToolRows.read) and then asked for
+    its steps and the results it holds."""
+
+    calls: Mapping[str, _ToolUseBlock]
+    results: Mapping[str, _ToolResultBlock]
+
+    @classmethod
+    def read(cls, *, rows: Sequence[object]) -> ToolRows:
+        """The tool_use and tool_result blocks of ``rows``. Any other block,
+        and a row or block that doesn't read as one, is left out. A later
+        block with the same tool_use_id replaces an earlier one."""
+        calls: dict[str, _ToolUseBlock] = {}
+        results: dict[str, _ToolResultBlock] = {}
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            try:
+                content = _HistoryRow.model_validate(row).content
+            except ValidationError:
+                continue
+            for block in content if isinstance(content, list) else ():
+                try:
+                    parsed = _ROW_BLOCK.validate_python(block)
+                except ValidationError:
+                    continue
+                if isinstance(parsed, _ToolUseBlock):
+                    calls[parsed.id] = parsed
+                else:
+                    results[parsed.tool_use_id] = parsed
+        return cls(calls=calls, results=results)
+
+    def steps(self) -> list[TurnStep]:
+        """Each call that has its result here, in call order. A call whose
+        result anton marked is_error never ran, so it is left out. The
+        matcher decides which tools' calls are steps
+        (figure_sources.EVIDENCE_TOOLS)."""
+        steps = []
+        for tool_use_id, call in self.calls.items():
+            result = self.results.get(tool_use_id)
+            if result is None or result.is_error:
+                continue
+            cell = None
+            action = ""
+            if call.name == "scratchpad":
+                arguments = _cell_arguments(call.input)
+                action = arguments.action
+                cell = _replayed_cell(result.text, arguments=arguments)
+            steps.append(TurnStep(
+                tool_use_id=tool_use_id,
+                tool_name=call.name,
+                action=action,
+                tool_input=ToolInput.from_call(arguments=call.input),
+                content=result.text,
+                cell=cell,
+            ))
+        return steps
+
+    def result_ids(self) -> frozenset[str]:
+        """The tool_use_ids of every result here, is_error ones included: a
+        call anton answered itself has its result here too."""
+        return frozenset(self.results)
+
+
 async def find_answer_sources(evidence: TurnEvidence) -> FigureSources:
     """The figures in an answer and the steps they came from.
 
@@ -321,10 +420,12 @@ def _answer_sources(evidence: TurnEvidence) -> FigureSources:
     figures reads none of the turn's rows or history."""
     if not has_figures(evidence.answer):
         return FigureSources()
-    streamed_ids = {step.tool_use_id for step in evidence.steps}
-    from_rows = [step for step in _row_steps(evidence.tool_rows) if step.tool_use_id not in streamed_ids]
+    streamed = [result.step() for result in evidence.steps]
+    streamed_ids = {step.tool_use_id for step in streamed}
+    rows = ToolRows.read(rows=evidence.tool_rows)
+    from_rows = [step for step in rows.steps() if step.tool_use_id not in streamed_ids]
     this_turn = [
-        step for step in [*evidence.steps, *from_rows]
+        step for step in [*streamed, *from_rows]
         if step.tool_name not in EVIDENCE_TOOLS or step.tool_use_id in evidence.successful_native_calls
     ]
     # An earlier turn's cells only pass names, functions and data on to this
@@ -332,7 +433,7 @@ def _answer_sources(evidence: TurnEvidence) -> FigureSources:
     # first, so what they bound reaches this turn's cells. An earlier turn's
     # step never holds a figure.
     earlier = (
-        [replace(step, earlier_turn=True) for step in _row_steps(evidence.history)]
+        [replace(step, earlier_turn=True) for step in ToolRows.read(rows=evidence.history).steps()]
         if any(ran_cell(step) for step in this_turn) else []
     )
     question = "\n".join([_typed_text(evidence.question), *evidence.answers])
@@ -340,7 +441,7 @@ def _answer_sources(evidence: TurnEvidence) -> FigureSources:
         answer=evidence.answer, question=question, steps=[*earlier, *this_turn], files=evidence.files,
     )
     if evidence.compacted and evidence.evidence_calls:
-        held = streamed_ids | _row_result_ids(evidence.tool_rows)
+        held = streamed_ids | rows.result_ids()
         if any(call not in held for call in evidence.evidence_calls):
             # A turn that compacts mid-way sends no tool rows, so a web page
             # or file it read may be missing from them, and a figure no step
@@ -358,64 +459,6 @@ def _typed_text(text: str) -> str:
     """``text`` up to the first block the client appended to it."""
     appended = _APPENDED_CONTEXT.search(text)
     return text[:appended.start()].rstrip() if appended else text
-
-
-def _row_steps(rows: Sequence[object]) -> list[TurnStep]:
-    """Each tool call in history rows (an assistant row's tool_use blocks, a
-    user row's tool_result blocks) that has its result there, in call order.
-    A call whose result anton marked is_error never ran, so it is left out.
-    The matcher decides which tools' calls are steps
-    (figure_sources.EVIDENCE_TOOLS)."""
-    calls: dict[str, _ToolUseBlock] = {}
-    results: dict[str, _ToolResultBlock] = {}
-    for block in _row_blocks(rows):
-        if isinstance(block, _ToolUseBlock):
-            calls[block.id] = block
-        else:
-            results[block.tool_use_id] = block
-    steps = []
-    for tool_use_id, call in calls.items():
-        result = results.get(tool_use_id)
-        if result is None or result.is_error:
-            continue
-        cell = None
-        action = ""
-        if call.name == "scratchpad":
-            arguments = _cell_arguments(call.input)
-            action = arguments.action
-            cell = _replayed_cell(result.text, arguments=arguments)
-        steps.append(TurnStep(
-            tool_use_id=tool_use_id,
-            tool_name=call.name,
-            action=action,
-            tool_input=json.dumps(call.input, default=str),
-            content=result.text,
-            cell=cell,
-        ))
-    return steps
-
-
-def _row_result_ids(rows: Sequence[object]) -> set[str]:
-    """The tool_use_ids of every tool result in history rows, is_error ones
-    included: a call anton answered itself has its result there too."""
-    return {block.tool_use_id for block in _row_blocks(rows) if isinstance(block, _ToolResultBlock)}
-
-
-def _row_blocks(rows: Sequence[object]) -> Iterator[_ToolUseBlock | _ToolResultBlock]:
-    """The tool_use and tool_result blocks of history rows, read once. Any
-    other block, and a row or block that doesn't read as one, is left out."""
-    for row in rows:
-        if not isinstance(row, Mapping):
-            continue
-        try:
-            content = _HistoryRow.model_validate(row).content
-        except ValidationError:
-            continue
-        for block in content if isinstance(content, list) else ():
-            try:
-                yield _ROW_BLOCK.validate_python(block)
-            except ValidationError:
-                continue
 
 
 def _cell_arguments(arguments: dict[str, Any]) -> _CellArguments:
@@ -539,10 +582,10 @@ async def format_responses_stream(
     # Each tool call's arguments and each result, kept to find where the
     # answer's figures came from once the answer is final.
     tool_inputs: dict[str, str] = {}
-    turn_steps: list[TurnStep] = []
+    turn_results: list[StreamedResult] = []
     turn_context = TurnContext(question="")
     user_answers: list[str] = []
-    tool_rows: list = []
+    tool_rows: Sequence[object] = ()
     evidence_calls: list[str] = []
     successful_native_calls: set[str] = set()
     compacted = False
@@ -693,7 +736,7 @@ async def format_responses_stream(
 
         elif isinstance(event, StreamToolResult):
             tool_use_id = getattr(event, "id", None) or ""
-            turn_steps.append(TurnStep(
+            turn_results.append(StreamedResult(
                 tool_use_id=tool_use_id,
                 tool_name=getattr(event, "name", "") or "",
                 action=getattr(event, "action", "") or "",
@@ -998,7 +1041,7 @@ async def format_responses_stream(
         answer=full_text,
         question=turn_context.question,
         answers=tuple(user_answers),
-        steps=tuple(turn_steps),
+        steps=tuple(turn_results),
         tool_rows=tool_rows,
         history=turn_context.history,
         files=turn_context.files,

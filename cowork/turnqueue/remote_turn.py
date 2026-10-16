@@ -49,7 +49,12 @@ async def remote_turn_events(
     # a web turn; the seed history below is scrubbed against them.
     await register_vault_secrets(session.scope)
     seeded_history, seed_info = ResponsesHandler._remote_seed_history(session, conv_id)
-    yield TurnContext(question=input_text, files=ResponsesHandler._remote_agent_files(session, conv_id), history=seeded_history)
+    workspace = ResponsesHandler._remote_workspace(session, conv_id)
+    yield TurnContext(
+        question=input_text,
+        files=ResponsesHandler._remote_agent_files(session, conv_id, workspace=workspace),
+        history=seeded_history,
+    )
     artifacts = ResponsesHandler._remote_artifacts_context(session, conv_id)
     before_slugs, before_mtimes = (
         snapshot_artifact_state(artifacts[1]) if artifacts else (set(), {})
@@ -70,7 +75,7 @@ async def remote_turn_events(
             model=model,
             turn_id=turn_id,
             history=seeded_history,
-            **ResponsesHandler._remote_workspace(session, conv_id),
+            workspace=workspace,
             started_at=ResponsesHandler._remote_started_at(session, conv_id),
             correlation_id=correlation_id,
             llm=llm,
