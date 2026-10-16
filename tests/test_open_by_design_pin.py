@@ -48,13 +48,6 @@ OPEN_BY_DESIGN_REASONS: dict[tuple[str, tuple[str, ...]], str] = {
         "the kubelet's liveness probe, which has no identity headers to send "
         "and nowhere to get them; refusing it kills the pod"
     ),
-    ("/api/v1/connectors/specs/{connector_id}", ("GET",)): (
-        "a static connector-registry lookup; the same answer for every caller, "
-        "no tenant data and no secret"
-    ),
-    ("/api/v1/connectors/specs/match", ("POST",)): (
-        "a stateless token match against the same static registry"
-    ),
     ("/api/v1/connectors/oauth/{service}/callback", ("GET",)): (
         "the OAuth provider's own redirect target; the browser arrives with "
         "code/state and no principal exists by construction"

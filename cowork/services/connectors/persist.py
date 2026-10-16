@@ -52,6 +52,7 @@ def persist_connection(
     user_label: str | None = None,
     replace_existing: bool = False,
     extends: bool = False,
+    spec_form: dict | None = None,
     default_label: str | None = None,
     default_fields: dict[str, str] | None = None,
     vault=None,
@@ -88,6 +89,10 @@ def persist_connection(
     tokens after an OAuth grant) adding fields to the named record: stored
     fields this save omits are kept and resubmitted ones are replaced.
     Raises ``ConnectionNotFoundError`` when no record has that name.
+
+    ``spec_form`` is the connection form for a connector the static registry
+    doesn't hold (custom or handcrafted), so its ``secret: true`` fields are
+    masked even when their names don't look secret.
 
     ``default_fields`` generalizes the same "default once, then sticky"
     behavior ``default_label``/``user_label`` already have, for any other
@@ -137,7 +142,7 @@ def persist_connection(
             payload["_method"] = method
         elif extends and target["fields"].get("_method"):
             payload["_method"] = target["fields"]["_method"]
-        secure_keys = secure_keys_for(connector_id, method, payload)
+        secure_keys = secure_keys_for(connector_id, method, payload, spec_form)
         reconnecting_named_record = replace_existing and bool((name or "").strip()) and target is not None
         if is_edit or reconnecting_named_record or extends:
             slug = base_slug  # an edit targets the named connection — update in place
@@ -154,10 +159,10 @@ def persist_connection(
         # from `existing`, the record this save replaces: the record at
         # `base_slug` can belong to a different account that shares the slug.
         existing_fields = (existing or {}).get("fields", {})
-        for key in secure_keys_for(connector_id, method, existing_fields):
+        for key in secure_keys_for(connector_id, method, existing_fields, spec_form):
             if key not in payload and existing_fields.get(key):
                 payload[key] = existing_fields[key]
-        secure_keys = secure_keys_for(connector_id, method, payload)
+        secure_keys = secure_keys_for(connector_id, method, payload, spec_form)
         if extends:
             # A field the record already held as a secret stays one, even if
             # this step's method would not classify it that way.

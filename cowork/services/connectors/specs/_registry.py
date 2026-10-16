@@ -69,6 +69,7 @@ class ConnectorSpecRegistry:
                 aliases=c.get("aliases", []),
                 featured=c.get("featured", False),
                 notice=c.get("notice"),
+                custom=c.get("custom", False),
             )
             for c in self.get_connectors().values()
         ]
@@ -87,6 +88,7 @@ class ConnectorSpecRegistry:
             aliases=c.get("aliases", []),
             featured=c.get("featured", False),
             notice=c.get("notice"),
+            custom=c.get("custom", False),
             keywords=c.get("keywords", []),
             form=c.get("form", {}),
         )

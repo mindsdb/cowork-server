@@ -1,9 +1,11 @@
 import sqlite3
+import uuid
 
 import pytest
 from alembic import command
 from alembic.script import ScriptDirectory
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import SQLModel
 
 # Import models so SQLModel.metadata can create a pre-Alembic legacy schema.
@@ -675,3 +677,52 @@ def test_project_display_name_upgrades_a_populated_projects_table(tmp_path, monk
     with engine.begin() as connection:
         names = sorted(r[0] for r in connection.execute(text("SELECT name FROM projects")).all())
     assert "reports" in names and "untitled-project" in names
+
+
+def _insert_custom_connector(connection, *, connector_id, org_id=None):
+    connection.execute(
+        text(
+            "insert into custom_connectors "
+            "(id, connector_id, label, description, spec, featured, org_id) "
+            "values (:id, :connector_id, :label, '', '{}', 1, :org_id)"
+        ),
+        {"id": uuid.uuid4().hex, "connector_id": connector_id, "label": connector_id, "org_id": org_id},
+    )
+
+
+def test_custom_connectors_upgrade_and_downgrade(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    db_path = tmp_path / "custom_connectors.db"
+    uri = _sqlite_uri(db_path)
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+    assert _has_table(db_path, "custom_connectors")
+
+    _downgrade_to(engine, uri, "3e4b5f7586d3")
+    assert not _has_table(db_path, "custom_connectors")
+
+    _upgrade_to(engine, uri, "a6e3c9f2b4d8")
+    assert _has_table(db_path, "custom_connectors")
+
+
+def test_custom_connector_id_is_unique_per_scope(tmp_path, monkeypatch):
+    monkeypatch.setenv("COWORK_PROJECTS_DIR", str(tmp_path / "projects"))
+    get_app_settings.cache_clear()
+
+    uri = _sqlite_uri(tmp_path / "custom_connectors_unique.db")
+    engine = create_engine(uri)
+    run_schema_migrations(engine, uri)
+
+    with engine.begin() as connection:
+        _insert_custom_connector(connection, connector_id="httpbin")
+        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a")
+        _insert_custom_connector(connection, connector_id="httpbin", org_id="org-b")
+
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_custom_connector(connection, connector_id="httpbin")
+    with pytest.raises(IntegrityError):
+        with engine.begin() as connection:
+            _insert_custom_connector(connection, connector_id="httpbin", org_id="org-a")
