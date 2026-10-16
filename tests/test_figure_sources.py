@@ -14,6 +14,7 @@ from anton.cloud_turn.__main__ import _clip_result_content
 from anton.core.backends.base import Cell
 from anton.core.llm.provider import StreamToolResult, ToolCall
 from anton.core.session import _discarded_tool_call_events
+from anton.core.tools import text_file
 
 from cowork.harnesses.anton_harness import figure_sources as figure_sources_mod
 from cowork.harnesses.anton_harness.agent_files import AgentFiles, Attachment, NamedFile
@@ -56,6 +57,12 @@ def _tool(tool_use_id: str, name: str, tool_input: dict, content: str) -> TurnSt
         tool_use_id=tool_use_id, tool_name=name, action="", tool_input=ToolInput.from_text(text=json.dumps(tool_input)),
         content=content,
     )
+
+
+def _whole_file_read(*, path: str, body: str) -> str:
+    """read_text_file's result for a file it read whole, as anton writes it."""
+    lines = body.count("\n")
+    return text_file.TextRange(path=path, total_lines=lines, first=1, last=lines, body=body, stop="done").render()
 
 
 def _scratchpad(tool_use_id: str, *, action: str, content: str, pad: str = "main", code: str = "") -> TurnStep:
@@ -374,9 +381,7 @@ class TestReadTextFile:
 
     @pytest.mark.parametrize(("stop", "shortened"), [("done", 0), ("page", 0), ("chars", 0), ("page", 2)])
     def test_antons_header_and_long_line_mark_are_not_the_files_text(self, stop: str, shortened: int):
-        """The header and mark as anton's read_text_file writes them. Skipped
-        with an anton that has no read_text_file."""
-        text_file = pytest.importorskip("anton.core.tools.text_file")
+        """The header and mark as anton's read_text_file writes them."""
         line = "P100," + "x" * 5_000 + ",250"
         content = text_file.TextRange(
             path="data/stock.csv", total_lines=900, first=1, last=2, body=f"part,qty\n{text_file._shorten(line)}\n",
@@ -411,7 +416,7 @@ class TestReadTextFile:
         memorize call's result does."""
         read = _tool(
             "toolu_mem", "read_text_file", {"path": path},
-            f"{path} — lines 1-1 of 1\nOvertime costs 30 dollars an hour.\n",
+            _whole_file_read(path=path, body="Overtime costs 30 dollars an hour.\n"),
         )
 
         sources = find_figure_sources(answer="Overtime costs $30 an hour.", question="", steps=[read])
@@ -518,7 +523,7 @@ class TestReadTextFile:
     def test_a_read_of_any_other_file_holding_the_figure_is_a_source(self, path: str):
         read = _tool(
             "toolu_t", "read_text_file", {"path": path},
-            f"{path} — lines 1-1 of 1\nOvertime costs 30 dollars an hour.\n",
+            _whole_file_read(path=path, body="Overtime costs 30 dollars an hour.\n"),
         )
 
         sources = find_figure_sources(answer="Overtime costs $30 an hour.", question="", steps=[read])

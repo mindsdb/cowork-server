@@ -21,7 +21,7 @@ from anton.core.llm.provider import (
     damaged_tool_call_result,
 )
 from anton.core.session import _discarded_tool_call_events
-from anton.core.tools import web_tools
+from anton.core.tools import tool_handlers, web_tools
 from anton.core.tools.registry import ToolOutcome
 from anton.core.utils.scratchpad import format_cell_result
 from cowork.harnesses.anton_harness import figure_sources as figure_sources_mod
@@ -766,18 +766,20 @@ class TestNativeEvidenceVerdicts:
 
         assert _by_text(_figures(events))[figure_text]["origin"] == ("step" if status == 200 else "none")
 
-    async def test_a_newer_native_file_error_cannot_source_its_line_count(self):
-        # read_text_file is absent from uv.lock's Anton cf923647. This is the
-        # newer producer contract, not an import that silently bumps the lock:
-        # anton/core/tools/tool_handlers.py, handle_read_text_file, at
-        # daa1fc8ac2ae5e49246856fbed225e04ca408660 returns this with ok=False.
+    async def test_a_native_file_error_cannot_source_its_line_count(self, tmp_path):
+        (tmp_path / "stock.csv").write_text("".join(f"row{i}\n" for i in range(42)))
         tool_input = {"path": "stock.csv", "start_line": 1000}
-        result = "Error: start_line 1000 is past the end of the file (42 lines)."
+        outcome = await tool_handlers.handle_read_text_file(
+            SimpleNamespace(_workspace=SimpleNamespace(base=tmp_path)), tool_input,
+        )
+        assert outcome.ok is False
+        assert "(42 lines)" in outcome.content
+
         events = await _run(
             *_tool_call("native", "read_text_file", tool_input),
-            *_tool_done("native", False),
+            *_tool_done("native", outcome.ok),
             StreamTextDelta(text="There are 42 units."),
-            TurnHistory(_tool_rows("native", "read_text_file", tool_input, result)),
+            TurnHistory(_tool_rows("native", "read_text_file", tool_input, outcome.content)),
         )
 
         assert _by_text(_figures(events))["42"]["origin"] == "none"
