@@ -411,6 +411,7 @@ def step_stream_events(data: dict) -> list:
         StreamToolUseDelta,
         StreamToolUseEnd,
         StreamToolUseStart,
+        StreamTurnEnded,
         ToolCall,
     )
     from anton.core.interaction.elicit import AskAnswer, AskOption, AskRequest
@@ -484,6 +485,9 @@ def step_stream_events(data: dict) -> list:
             values=tuple(v for v in data.get("values") or [] if isinstance(v, str)),
             text=str(data.get("text") or ""),
         ))]
+    if step == "turn_ended":
+        ended_by = data.get("ended_by")
+        return [StreamTurnEnded(ended_by=ended_by)] if isinstance(ended_by, str) and ended_by else []
     # `ask_user_answer_rejected` is the pod's verdict on one answer; only
     # /answer reads it (turnqueue/answers.py), nothing renders it.
     return []
@@ -498,6 +502,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 project_id: str | None = None,
                                 workspace_rel_path: str = "projects/general",
                                 correlation_id: str | None = None,
+                                run_id: str | None = None,
                                 llm: dict | None = None,
                                 turn_key_id: str | None = None,
                                 disabled: list[dict] | None = None,
@@ -525,7 +530,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     corr = correlation_id or _new_correlation_id()
     # A flag left by an earlier turn would cancel this one on its first line,
     # and its cause would turn this turn's own Stop into a stall.
-    await r.delete(cancel_flag_key(corr), cancel_cause_key(corr))
+    # A registry-owned run is already cancellable. Clearing its flag here
+    # would erase a disconnect that arrived while dispatch prepared the job.
+    if run_id is None:
+        await r.delete(cancel_flag_key(corr), cancel_cause_key(corr))
     reply_stream = reply_stream_key(conversation_id)
 
     # No client-picked model → the deployment's resolved default (org mode: the
@@ -663,10 +671,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # correlation_id to cancel it, its org to authorize the caller. Recorded
     # here rather than after the first buffer record, because this generator
     # does not own the buffer; _shared_turn covers the gap between the two.
-    await record_turn(
-        conversation_id, turn_id=turn_id, correlation_id=corr,
-        org_id=org_id, user_id=user_id, client=r,
-    )
+    if run_id is None:
+        await record_turn(
+            conversation_id, turn_id=turn_id, correlation_id=corr,
+            org_id=org_id, user_id=user_id, client=r,
+        )
 
     authorized_workspace_mode = None
     idle_timeout = settings.reply_idle_timeout_seconds

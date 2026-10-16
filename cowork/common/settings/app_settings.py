@@ -573,6 +573,15 @@ class TurnQueueSettings(Settings):
             "both together."
         ),
     )  # COWORK_TURN_TURN_KEY_TTL_SECONDS
+    pod_shared_mount_root: str = Field(
+        default="/mnt/cowork-shared",
+        description=(
+            "Where a cloud pod mounts its organization's shared tree, as "
+            "scratchpad-controller's SHARED_MOUNT_ROOT sets it. With a persistent "
+            "workspace the pod's scratchpad runs in "
+            "<root>/<project path in the organization>/conversations/<conversation id>."
+        ),
+    )  # COWORK_TURN_POD_SHARED_MOUNT_ROOT
     minds_base_url: str = Field(
         default="",
         description=(
