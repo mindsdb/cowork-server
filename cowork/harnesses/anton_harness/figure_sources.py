@@ -31,18 +31,30 @@ limits never change a figure's origin. They can only drop an earlier cell a
 figure names as the one that read its data, or a string or function a cell
 of this turn reuses.
 
-Only the scratchpad's cells and the tools in ``EVIDENCE_TOOLS`` are steps: the
-web tools and read_text_file. Every other tool hands back the agent's own text
-(an earlier answer, an artifact it wrote, a memory), the user's answer, or a
-status line. A read_text_file of a file in anton's memory folder
-(``.anton/memory``) is no step either: it reads back what the agent memorized.
-Nor is a cell whose only source would be the memory files it, or an earlier
-cell, read (``_describe_cell``).
+Only the scratchpad's cells and the calls of the tools ``is_evidence_tool``
+counts are steps: the web tools and read_text_file
+(``_NATIVE_EVIDENCE_TOOLS``), and the connector tools that return the
+customer's records. A connector tool is an MCP tool anton registers under its
+engine's name, and anton's ``returns_records`` says which ones return
+records, such as CRM objects or campaign analytics. A connector tool that
+returns docs, schema or account details is no step, nor is a write tool,
+whose result echoes what the model wrote plus defaults the server filled in,
+nor a tool of an engine anton has not classified. Every other tool hands back
+the agent's own text (an earlier answer, an artifact it wrote, a memory), the
+user's answer, or a status line. A read_text_file of a file in anton's memory
+folder (``.anton/memory``) is no step either: it reads back what the agent
+memorized. Nor is a cell whose only source would be the memory files it, or
+an earlier cell, read (``_describe_cell``). The formatter passes on a call of
+any of these tools only when its tool_done said ok=True: a failed call's
+result is the error the tool or anton wrote, which can quote numbers.
 
 A step whose own input states the figure (a cell that prints a literal it was
 given) is not a source for it: its output only echoes what the model wrote.
 For the same reason an output value equal to a number its input states is not
-read at all. A figure the model works out in its own text, without a step
+read at all. Nor is a number inside an ISO date-time in a connector tool's
+records: a record's timestamps are not figures, and the minutes of the
+created and last-changed times every record carries would source almost any
+small number. A figure the model works out in its own text, without a step
 printing it, has no source.
 
 Each step a figure names is described once: its kind, a short label, the file
@@ -64,7 +76,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from itertools import accumulate
-from typing import Annotated, Any
+from typing import TYPE_CHECKING, Annotated, Any
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, BeforeValidator, ConfigDict, ValidationError
@@ -90,6 +102,20 @@ from cowork.schemas.figure_sources import (
 )
 from cowork.schemas.project_files import CANONICAL_PROJECT_MEMORY_PATHS
 
+if TYPE_CHECKING:
+    from anton.core.mcp.names import ToolNameParts
+
+try:
+    from anton.core.mcp.access import returns_records
+    from anton.core.mcp.names import parse_namespaced_tool_name
+except ImportError:
+    # Desktop installs resolve anton from the anton-agent floor in
+    # pyproject.toml, whose anton cannot say which connector tools return
+    # the customer's records. There no connector tool is evidence
+    # (_records_tool).
+    returns_records = None
+    parse_namespaced_tool_name = None
+
 logger = get_logger(__name__)
 
 MAX_QUERY_CHARS = 4_000
@@ -102,15 +128,17 @@ MAX_FIGURE_SOURCES = 3
 # pass to this turn's cells, the latest ones, because each one's code is
 # parsed again on every answer.
 MAX_EARLIER_CELLS = 50
-# The tools besides the scratchpad whose results are evidence: a web page or
+# The tools anton runs itself whose results are evidence: a web page or
 # search result, and a file's text. recall_history and anton's recall hand
 # back earlier answers verbatim, the artifact and skill tools the agent's own
 # writing, memorize and ask_user what the agent or the user wrote, read_image
 # a line about the image rather than what it shows, and the rest a status.
 # A read_text_file of a memory file is left out too (reads_memory_file), and
 # so is a cell whose only source is memory files it or an earlier cell read
-# (_describe_cell).
-EVIDENCE_TOOLS = WEB_TOOLS | {"read_text_file"}
+# (_describe_cell). Besides these, a connector tool that returns the
+# customer's records is evidence, so a caller asks is_evidence_tool rather
+# than reading this set.
+_NATIVE_EVIDENCE_TOOLS = WEB_TOOLS | {"read_text_file"}
 # The folder anton keeps the project's memory files in, .anton/memory, by its
 # path parts in lower case.
 _MEMORY_FOLDERS = frozenset(
@@ -395,6 +423,9 @@ _STDOUT_KEY = '"stdout": "'
 # leaves in a long line it shortened.
 _TEXT_RANGE_HEADER = re.compile(r"\A[^\n]* — (?:lines \d+-\d+ of \d+[^\n]*|empty file)(?:\n|\Z)")
 _SHORTENED_LINE = re.compile(r"\[line truncated: \d+ chars\]")
+# An ISO date-time, as a connector stamps each record with when it was
+# created and last changed: 2026-03-04T09:12:44.512Z, 2026-03-04 09:12+05:00.
+_ISO_DATETIME = re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?")
 
 _REDACTED = "[redacted]"
 # The rules below bound how far each part of a match may run, or let a match
@@ -761,9 +792,35 @@ def _describe_steps(steps: Sequence[TurnStep]) -> list[_DescribedStep]:
 
 def is_evidence_call(*, tool_name: str, arguments: ToolArguments) -> bool:
     """Whether a call of ``tool_name`` with these arguments can be a step
-    other than a scratchpad cell: a call of one of ``EVIDENCE_TOOLS`` that
-    does not read a memory file (``reads_memory_file``)."""
-    return tool_name in EVIDENCE_TOOLS and not reads_memory_file(tool_name=tool_name, path=arguments.path)
+    other than a scratchpad cell: a call of a tool ``is_evidence_tool``
+    counts that does not read a memory file (``reads_memory_file``)."""
+    return is_evidence_tool(name=tool_name) and not reads_memory_file(tool_name=tool_name, path=arguments.path)
+
+
+def is_evidence_tool(*, name: str) -> bool:
+    """Whether a call of the tool ``name`` can be a step other than a
+    scratchpad cell: a web tool or read_text_file
+    (``_NATIVE_EVIDENCE_TOOLS``), or a connector tool that returns the
+    customer's records (``_records_tool``). It is the one answer to which
+    tools are evidence."""
+    return name in _NATIVE_EVIDENCE_TOOLS or _records_tool(name=name) is not None
+
+
+def _records_tool(*, name: str) -> ToolNameParts | None:
+    """The engine, connection and tool a connector tool's registered name is
+    built from ({engine}__{tool}, or {engine}__{connection}__{tool} when the
+    turn has two connections of one engine), when anton's
+    ``returns_records`` says the tool returns the customer's records, such
+    as CRM objects or campaign analytics. None for any other name: a tool
+    anton runs itself, a connector tool that returns docs, schema or account
+    details, a write tool, a tool of an engine anton has not classified, and
+    every name when the installed anton cannot classify them."""
+    if parse_namespaced_tool_name is None:
+        return None
+    parts = parse_namespaced_tool_name(name=name)
+    if parts is None or not returns_records(engine=parts.engine, tool=parts.tool_name):
+        return None
+    return parts
 
 
 def reads_memory_file(*, tool_name: str, path: str | None) -> bool:
@@ -915,19 +972,29 @@ def _describe_cell(
 
 
 def _describe_tool(step: TurnStep) -> _DescribedStep:
-    """A call of one of ``EVIDENCE_TOOLS``: a web search or fetch, or
-    read_text_file, a file read by its path, where the line-range header and
-    shortened-line marks are not the file's text and the line range it asked
-    for is not a figure the model wrote. A read without a path is a step
-    named by the tool."""
+    """A call of a tool ``is_evidence_tool`` counts: a web search or fetch;
+    a connector tool that returns the customer's records, a query named by
+    its engine, connection and tool, whose result is read as the tool
+    returned it less its ISO date-times and may only echo the call's input;
+    or read_text_file, a file read by its path, where the line-range header
+    and shortened-line marks are not the file's text and the line range it
+    asked for is not a figure the model wrote. A read without a path is a
+    step named by the tool."""
     arguments = step.tool_input.arguments
     output, literals = step.content, step.tool_input.text
     url = None
     documents: tuple[str, ...] = ()
+    connector = _records_tool(name=step.tool_name)
     if step.tool_name in WEB_TOOLS:
         url = _web_url(arguments.url or _found_url(output))
         kind = SourceKind.web
         label = _web_label(url) if url else arguments.query
+    elif connector is not None:
+        kind, label = SourceKind.query, _connector_label(parts=connector)
+        # A record's timestamps are not figures, and their minutes and zone
+        # offsets would source almost any small number. Each is blanked in
+        # place, so every other number keeps its offset.
+        output = _ISO_DATETIME.sub(lambda match: " " * len(match.group(0)), output)
     else:
         output = _SHORTENED_LINE.sub("", _TEXT_RANGE_HEADER.sub("", output))
         path = arguments.path
@@ -1261,6 +1328,15 @@ def _web_label(url: str) -> str:
     if port is not None:
         host += f":{port}"
     return (host + parts.path).rstrip("/") or stripped
+
+
+def _connector_label(*, parts: ToolNameParts) -> str:
+    """A connector tool as "<engine>: <tool>", with the connection in
+    parentheses after the engine when the name carries one, since then the
+    turn has two connections of that engine."""
+    if parts.connection_name is None:
+        return f"{parts.engine}: {parts.tool_name}"
+    return f"{parts.engine} ({parts.connection_name}): {parts.tool_name}"
 
 
 def _documents_label(documents: Sequence[str]) -> str:

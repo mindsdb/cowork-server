@@ -33,9 +33,10 @@ class FigureStep(BaseModel):
 
     tool_use_id: str
     kind: SourceKind
-    # A short label: the file's name, the web page's host and path, or the
-    # step's description. Empty when the step has none, and the client words
-    # that case by the kind alone.
+    # A short label: the file's name, the web page's host and path, a
+    # connector tool's engine, connection and tool ("hubspot (crm2):
+    # search_crm_objects"), or the step's description. Empty when the step
+    # has none, and the client words that case by the kind alone.
     label: str
     # The path, relative to FigureSources.project_id and in POSIX form, of the
     # project file the step read, when it is in the conversation's project

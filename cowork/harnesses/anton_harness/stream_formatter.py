@@ -28,7 +28,6 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.figure_sources import (
-    EVIDENCE_TOOLS,
     CellResult,
     FigureSources,
     ToolArguments,
@@ -37,6 +36,7 @@ from cowork.harnesses.anton_harness.figure_sources import (
     find_figure_sources,
     has_figures,
     is_evidence_call,
+    is_evidence_tool,
     ran_cell,
 )
 from cowork.schemas.figure_sources import FigureOrigin
@@ -73,10 +73,10 @@ class TurnHistory:
     never emitted as SSE: the client rebuilds all tool activity from the
     existing thought events, so these rows are for LLM-history replay. The
     formatter also reads the tool results in them: anton streams only the
-    scratchpad's, and a figure can come from a web tool's or
-    read_text_file's (figure_sources.EVIDENCE_TOOLS). Both lists stay as the
-    producer sent them; the formatter parses them (ToolRows) only when the
-    answer has figures."""
+    scratchpad's, and a figure can come from a web tool's, read_text_file's
+    or a connector tool's (figure_sources.is_evidence_tool). Both lists
+    stay as the producer sent them; the formatter parses them (ToolRows)
+    only when the answer has figures."""
 
     rows: list[dict[str, Any]]
     # The rows as the agent read them, when the producer stores fewer: the
@@ -144,22 +144,22 @@ class StreamedResult:
 
 @dataclass(frozen=True)
 class EvidenceCall:
-    """One of the turn's EVIDENCE_TOOLS calls, with its arguments as the
-    model streamed them (empty when the stream never ended the call). Kept
-    raw while the turn streams; the arguments are parsed only when the turn
-    compacted, no tool rows arrived for it, and the call's tool_done said
-    ok=True."""
+    """One of the turn's calls of a tool figure_sources.is_evidence_tool
+    counts, with its arguments as the model streamed them (empty when the
+    stream never ended the call). Kept raw while the turn streams; the
+    arguments are parsed only when the turn compacted, no tool rows
+    arrived for it, and the call's tool_done said ok=True."""
 
     tool_use_id: str
     tool_name: str
     tool_input: str
 
-    def counts_as_step(self, *, successful_native_calls: frozenset[str]) -> bool:
+    def counts_as_step(self, *, successful_tool_calls: frozenset[str]) -> bool:
         """Whether the matcher would count the call's result as a step, by
         the tests it applies to that result: the call's tool_done said
-        ok=True (TurnEvidence.successful_native_calls), and it is not a read
+        ok=True (TurnEvidence.successful_tool_calls), and it is not a read
         of a memory file (figure_sources.is_evidence_call)."""
-        return self.tool_use_id in successful_native_calls and is_evidence_call(
+        return self.tool_use_id in successful_tool_calls and is_evidence_call(
             tool_name=self.tool_name, arguments=ToolArguments.from_text(text=self.tool_input),
         )
 
@@ -182,17 +182,21 @@ class TurnEvidence:
     tool_rows: Sequence[object] = ()
     history: Sequence[object] = ()
     files: AgentFiles | None = None
-    # Native tools' history results omit their verdict. Only tool_done.ok
-    # explicitly True establishes successful output; False/None can carry
-    # error text with figures. Scratchpad stdout remains usable on failure.
-    successful_native_calls: frozenset[str] = frozenset()
-    # This turn's EVIDENCE_TOOLS calls, as the stream announced them, when
-    # the turn compacted its context mid-way (the stream carried a
-    # StreamContextCompacted) and no tool rows arrived for it (no
-    # TurnHistory): their results never reached the formatter. A producer
-    # whose anton predates ChatSession.turn_messages (an older cloud pod, or
-    # a desktop install on the anton floor) sends no rows after a
-    # compaction. Empty otherwise.
+    # The calls, of any tool, whose tool_done said ok=True. A history row
+    # of a web tool's, read_text_file's or a connector tool's result omits
+    # the call's verdict, and a result whose verdict is False or None can
+    # be error text the tool or anton wrote, which can quote figures, such
+    # as an API error's status code. So only an explicit True lets such a
+    # result be a step. A scratchpad cell's printed output stays usable
+    # when the cell failed.
+    successful_tool_calls: frozenset[str] = frozenset()
+    # This turn's calls of the tools figure_sources.is_evidence_tool counts,
+    # as the stream announced them, when the turn compacted its context
+    # mid-way (the stream carried a StreamContextCompacted) and no tool rows
+    # arrived for it (no TurnHistory): their results never reached the
+    # formatter. A producer whose anton predates ChatSession.turn_messages
+    # (an older cloud pod, or a desktop install on the anton floor) sends
+    # no rows after a compaction. Empty otherwise.
     calls_without_rows: tuple[EvidenceCall, ...] = ()
 
 
@@ -399,7 +403,7 @@ class ToolRows:
         """Each call that has its result here, in call order. A call whose
         result anton marked is_error never ran, so it is left out. The
         matcher decides which tools' calls are steps
-        (figure_sources.EVIDENCE_TOOLS)."""
+        (figure_sources.is_evidence_tool)."""
         steps = []
         for tool_use_id, call in self.calls.items():
             result = self.results.get(tool_use_id)
@@ -448,7 +452,7 @@ def _answer_sources(evidence: TurnEvidence) -> FigureSources:
     from_rows = [step for step in rows.steps() if step.tool_use_id not in streamed_ids]
     this_turn = [
         step for step in [*streamed, *from_rows]
-        if step.tool_name not in EVIDENCE_TOOLS or step.tool_use_id in evidence.successful_native_calls
+        if not is_evidence_tool(name=step.tool_name) or step.tool_use_id in evidence.successful_tool_calls
     ]
     # An earlier turn's cells only pass names, functions and data on to this
     # turn's cells, so a turn that ran no cell reads none of them. Oldest
@@ -463,20 +467,22 @@ def _answer_sources(evidence: TurnEvidence) -> FigureSources:
         answer=evidence.answer, question=question, steps=[*earlier, *this_turn], files=evidence.files,
     )
     if any(
-        call.counts_as_step(successful_native_calls=evidence.successful_native_calls)
+        call.counts_as_step(successful_tool_calls=evidence.successful_tool_calls)
         for call in evidence.calls_without_rows
     ):
         # The turn compacted mid-way and no tool rows arrived for it, so a web
-        # page or file it read is missing, and a figure no step holds may be
-        # one it read: such a figure gets no mark rather than "no source". A
-        # call the matcher would not count as a step hides no source: one
-        # whose tool_done did not say ok=True (it failed, gave no verdict, or
-        # sat in a round anton threw away), or a read of a memory file. Tool
-        # rows that do arrive hold every call that ran, through a compaction
-        # too; a call missing there never ran, as in a round anton threw away
-        # and retried. This can go once production pods run an anton with
-        # ChatSession.turn_messages, which sends the rows after a compaction,
-        # and the anton-agent floor in pyproject.toml requires one.
+        # page, a file or a connector's records it read are missing, and a
+        # figure no step holds may be one it read: such a figure gets no mark
+        # rather than "no source". A call the matcher would not count as a
+        # step hides no source: one whose tool_done did not say ok=True (it
+        # failed, gave no verdict, or sat in a round anton threw away), a
+        # read of a memory file, or a call of a connector tool that returns
+        # no records. Tool rows that do arrive hold every call that ran,
+        # through a compaction too; a call missing there never ran, as in a
+        # round anton threw away and retried. This can go once production
+        # pods run an anton with ChatSession.turn_messages, which sends the
+        # rows after a compaction, and the anton-agent floor in pyproject.toml
+        # requires one.
         return sources.model_copy(update={
             "figures": [figure for figure in sources.figures if figure.origin != FigureOrigin.none],
         })
@@ -616,9 +622,10 @@ async def format_responses_stream(
     tool_rows: Sequence[object] = ()
     # Whether a TurnHistory arrived, even one with no rows.
     tool_rows_arrived = False
-    # The tool name of each EVIDENCE_TOOLS call, by tool_use_id.
+    # The tool name of each call of a tool figure_sources.is_evidence_tool
+    # counts, by tool_use_id.
     evidence_calls: dict[str, str] = {}
-    successful_native_calls: set[str] = set()
+    successful_tool_calls: set[str] = set()
     compacted = False
     # Whether the turn's last text is anton's failure reply, which carries no
     # figures. anton streams that reply as one delta and ends the turn on it,
@@ -681,7 +688,7 @@ async def format_responses_stream(
         elif isinstance(event, StreamToolUseStart):
             tool_names[event.id] = event.name
             tool_json_parts[event.id] = []
-            if event.name in EVIDENCE_TOOLS:
+            if is_evidence_tool(name=event.name):
                 evidence_calls[event.id] = event.name
             if "scratchpad" in event.name:
                 role = Role.thought_scratchpad_start.value
@@ -802,9 +809,9 @@ async def format_responses_stream(
                 # no tool_progress. Capture it before UI throttling or name
                 # removal; evidence filtering uses the result's tool name.
                 if event.ok is True:
-                    successful_native_calls.add(event.id)
+                    successful_tool_calls.add(event.id)
                 else:
-                    successful_native_calls.discard(event.id)
+                    successful_tool_calls.discard(event.id)
             # A keep-alive from the cloud pod while a model call is quiet.
             # Never throttled: dropping it lets the idle bounds end a live
             # turn, and it cannot flood the stream: the pod writes one from
@@ -1077,7 +1084,7 @@ async def format_responses_stream(
         tool_rows=tool_rows,
         history=turn_context.history,
         files=turn_context.files,
-        successful_native_calls=frozenset(successful_native_calls),
+        successful_tool_calls=frozenset(successful_tool_calls),
         calls_without_rows=tuple(
             EvidenceCall(tool_use_id=call_id, tool_name=name, tool_input=tool_inputs.get(call_id, ""))
             for call_id, name in evidence_calls.items()

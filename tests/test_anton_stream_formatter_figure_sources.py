@@ -20,15 +20,21 @@ from anton.core.llm.provider import (
     ToolCall,
     damaged_tool_call_result,
 )
+from anton.core.mcp.client import McpSession
+from anton.core.mcp.names import namespaced_tool_name
+from anton.core.mcp.registry import discover_tool_defs
 from anton.core.session import _discarded_tool_call_events
 from anton.core.tools import tool_handlers, web_tools
 from anton.core.tools.registry import ToolOutcome
 from anton.core.utils.scratchpad import format_cell_result
+from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 from cowork.harnesses.anton_harness import figure_sources as figure_sources_mod
 from cowork.harnesses.anton_harness import stream_formatter as stream_formatter_mod
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.stream_formatter import TurnContext, TurnHistory, format_responses_stream
 from cowork.turnqueue.producer import step_stream_events
+from tests._hubspot_records import HUBSPOT_DEALS, SEARCH_DEALS
 
 
 async def _events(*items):
@@ -789,6 +795,120 @@ class TestNativeEvidenceVerdicts:
         )
 
         assert _by_text(_figures(events))["250"]["sources"] == [{"tool_use_id": "cell", "page": None}]
+
+
+def _hubspot_server(*, search_error: str | None) -> MCPServer:
+    """An in-process MCP server with two of HubSpot's tools, under their
+    HubSpot names. Its search fails with ``search_error`` when one is given,
+    the way HubSpot's server reports an API error inside the tool's result."""
+    server = MCPServer(name="hubspot")
+
+    @server.tool()
+    def search_crm_objects(objectType: str, limit: int = 10) -> str:
+        if search_error is not None:
+            raise ToolError(search_error)
+        return HUBSPOT_DEALS
+
+    @server.tool()
+    def tool_guidance() -> str:
+        return "search_crm_objects returns up to 200 records per call."
+
+    return server
+
+
+async def _connector_call(
+    tool: str, tool_input: dict, *, connection_name: str | None = None, search_error: str | None = None,
+) -> tuple[str, ToolOutcome]:
+    """A read-mode HubSpot connection's call of ``tool`` through anton's
+    connector wiring: the name anton registers the tool under, and the
+    outcome its handler returns."""
+    async with McpSession(server=_hubspot_server(search_error=search_error)) as session:
+        tool_defs = await discover_tool_defs(
+            session, engine="hubspot", access_mode="read", connection_name=connection_name,
+        )
+        [tool_def] = [tool_def for tool_def in tool_defs if tool_def.name.endswith(f"__{tool}")]
+        return tool_def.name, await tool_def.handler(None, tool_input)
+
+
+class TestConnectorToolVerdicts:
+    """A connector tool's result reaches the formatter only in the turn's tool
+    rows, which hold a failed call's error as an ordinary result. Only the
+    call's tool_done verdict tells the two apart."""
+
+    @pytest.mark.parametrize("cloud", [False, True], ids=["in-process", "cloud-pod"])
+    @pytest.mark.parametrize(("connection_name", "label"), [
+        (None, "hubspot: search_crm_objects"),
+        ("crm2", "hubspot (crm2): search_crm_objects"),
+    ], ids=["one-connection", "two-connections"])
+    async def test_a_connector_call_that_returned_records_sources_their_figures(
+        self, cloud: bool, connection_name: str | None, label: str,
+    ):
+        name, outcome = await _connector_call("search_crm_objects", SEARCH_DEALS, connection_name=connection_name)
+        assert outcome.ok is True
+
+        events = await _run(
+            *_tool_call("toolu_hs", name, SEARCH_DEALS),
+            *_tool_done("toolu_hs", outcome.ok, cloud=cloud),
+            StreamTextDelta(text="Acme's deal is $48,250."),
+            TurnHistory(_tool_rows("toolu_hs", name, SEARCH_DEALS, outcome.content)),
+        )
+
+        payload = _figures(events)
+        assert _by_text(payload)["$48,250"]["sources"] == [{"tool_use_id": "toolu_hs", "page": None}]
+        assert [(step["kind"], step["label"]) for step in payload["steps"]] == [("query", label)]
+
+    async def test_a_connector_call_that_failed_is_not_a_source(self):
+        name, outcome = await _connector_call(
+            "search_crm_objects", SEARCH_DEALS, search_error="HubSpot API request failed with status 500",
+        )
+        assert outcome.ok is False
+        assert "500" in outcome.content
+
+        events = await _run(
+            *_tool_call("toolu_hs", name, SEARCH_DEALS),
+            *_tool_done("toolu_hs", outcome.ok),
+            StreamTextDelta(text="Your pipeline has 500 open deals."),
+            TurnHistory(_tool_rows("toolu_hs", name, SEARCH_DEALS, outcome.content)),
+        )
+
+        assert _by_text(_figures(events))["500"]["origin"] == "none"
+        assert _figures(events)["steps"] == []
+
+    @pytest.mark.parametrize("cloud", [False, True], ids=["in-process", "cloud-pod"])
+    @pytest.mark.parametrize("verdict", [None, "absent"])
+    async def test_a_connector_call_without_a_success_verdict_is_not_a_source(self, cloud: bool, verdict):
+        name, outcome = await _connector_call("search_crm_objects", SEARCH_DEALS)
+        done = [] if verdict == "absent" else _tool_done("toolu_hs", verdict, cloud=cloud)
+
+        events = await _run(
+            *_tool_call("toolu_hs", name, SEARCH_DEALS),
+            *done,
+            StreamTextDelta(text="Acme's deal is $48,250."),
+            TurnHistory(_tool_rows("toolu_hs", name, SEARCH_DEALS, outcome.content)),
+        )
+
+        assert _by_text(_figures(events))["$48,250"]["origin"] == "none"
+
+    @pytest.mark.parametrize(("tool", "origins"), [
+        ("search_crm_objects", {"250": "step"}),
+        ("tool_guidance", {"$48,250": "none", "250": "step"}),
+    ], ids=["records", "docs"])
+    async def test_a_compacted_turn_with_no_tool_rows_hides_only_a_records_calls_figures(
+        self, tool: str, origins: dict[str, str],
+    ):
+        """A producer whose anton predates ChatSession.turn_messages sends no
+        tool rows for a turn that compacts mid-way. The missing result of a
+        call that returns records may hold a figure no step holds; a call
+        that returns HubSpot's docs holds none."""
+        events = await _run(
+            *_read_stock_cell(),
+            *_tool_call("toolu_hs", namespaced_tool_name("hubspot", tool), {}),
+            *_tool_done("toolu_hs", True),
+            StreamContextCompacted(message="Context compacted"),
+            StreamTextDelta(text="Acme's deal is $48,250 and S1 holds 250 units."),
+        )
+
+        assert {text: figure["origin"] for text, figure in _by_text(_figures(events)).items()} == origins
 
 
 def _earlier_cell(tool_use_id: str = "toolu_earlier") -> list[dict]:

@@ -3,6 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import subprocess
+import sys
+import textwrap
 import time
 from dataclasses import asdict, replace
 from pathlib import Path, PurePosixPath
@@ -13,6 +17,7 @@ import pytest
 from anton.cloud_turn.__main__ import _clip_result_content
 from anton.core.backends.base import Cell
 from anton.core.llm.provider import StreamToolResult, ToolCall
+from anton.core.mcp.names import namespaced_tool_name
 from anton.core.session import _discarded_tool_call_events
 from anton.core.tools import text_file
 
@@ -35,6 +40,7 @@ from cowork.harnesses.anton_harness.figure_sources import (
     TurnStep,
     find_figure_sources,
 )
+from tests._hubspot_records import HUBSPOT_DEALS, SEARCH_DEALS
 
 # The current code reads each timed input in about a second or less on a
 # laptop under coverage, so a CI runner several times slower still passes; the
@@ -530,6 +536,181 @@ class TestReadTextFile:
 
         assert _origins(sources) == [("$30", FigureOrigin.step)]
         assert [(step.kind, step.label) for step in sources.steps] == [(SourceKind.file, "lessons.md")]
+
+
+# HubSpot's search tool as anton registers it for a connection.
+SEARCH_CRM_OBJECTS = namespaced_tool_name("hubspot", "search_crm_objects")
+DEALS_ANSWER = "Your open deals total $61,150: Acme at $48,250 and Globex at $12,900."
+
+
+class TestConnectorTools:
+    """A connector tool is an MCP tool anton registers as {engine}__{tool},
+    or {engine}__{connection}__{tool} when the turn has two connections of
+    one engine."""
+
+    def test_a_connector_tool_that_returns_the_customers_records_is_a_query_source(self):
+        search = _tool("toolu_hs", SEARCH_CRM_OBJECTS, SEARCH_DEALS, HUBSPOT_DEALS)
+
+        sources = find_figure_sources(answer=DEALS_ANSWER, question="", steps=[search])
+
+        # The model added the two amounts up itself, so the total has no source.
+        assert _origins(sources) == [
+            ("$61,150", FigureOrigin.none), ("$48,250", FigureOrigin.step), ("$12,900", FigureOrigin.step),
+        ]
+        assert sources.steps == [
+            FigureStep(tool_use_id="toolu_hs", kind=SourceKind.query, label="hubspot: search_crm_objects"),
+        ]
+
+    @pytest.mark.parametrize(("name", "label"), [
+        (namespaced_tool_name("hubspot", "search_crm_objects", connection_name="crm2"), "hubspot (crm2): search_crm_objects"),
+        (
+            namespaced_tool_name("hubspot", "search_crm_objects", connection_name="acme__eu"),
+            "hubspot (acme__eu): search_crm_objects",
+        ),
+    ])
+    def test_a_connector_tool_named_with_its_connection_names_the_connection(self, name: str, label: str):
+        search = _tool("toolu_hs", name, SEARCH_DEALS, HUBSPOT_DEALS)
+
+        step = _only_step(search, answer="Acme's deal is $48,250.")
+
+        assert (step.kind, step.label) == (SourceKind.query, label)
+
+    def test_a_secret_in_a_connections_name_is_redacted_in_the_label(self):
+        search = _tool(
+            "toolu_hs", namespaced_tool_name("hubspot", "search_crm_objects", connection_name="token=tok_XyZsecret"),
+            SEARCH_DEALS, HUBSPOT_DEALS,
+        )
+
+        event = _event(search, answer="Acme's deal is $48,250.")
+
+        [step] = FigureSources.model_validate_json(event).steps
+        assert step.label.startswith("hubspot (token=[redacted]")
+        assert "tok_XyZsecret" not in event
+
+    @pytest.mark.parametrize(("tool", "content"), [
+        ("tool_guidance", "search_crm_objects returns up to 200 records per call; use at most 5 filterGroups."),
+        ("get_properties", json.dumps({"results": [{"name": "amount", "displayOrder": 200, "groupName": "dealinfo"}]})),
+    ])
+    def test_a_connector_tool_that_returns_docs_or_schema_is_not_a_source(self, tool: str, content: str):
+        guidance = _tool("toolu_hs", namespaced_tool_name("hubspot", tool), {}, content)
+
+        sources = find_figure_sources(answer="HubSpot returns at most 200 deals per search.", question="", steps=[guidance])
+
+        assert _origins(sources) == [("200", FigureOrigin.none)]
+        assert sources.steps == []
+
+    def test_a_write_tools_output_is_not_a_source(self):
+        """A write tool echoes what the model wrote, and the defaults the
+        server filled in are not the customer's records."""
+        create = _tool(
+            "toolu_hs", namespaced_tool_name("hubspot", "manage_crm_objects"),
+            {"action": "CREATE", "objectType": "deals", "properties": {"dealname": "Globex", "amount": "75000"}},
+            json.dumps({"id": "18234567892", "properties": {"amount": "75000", "hs_probability": "0.2"}}),
+        )
+
+        sources = find_figure_sources(
+            answer="I created the Globex deal at $75,000 with a 0.2 probability.", question="", steps=[create],
+        )
+
+        assert _origins(sources) == [("$75,000", FigureOrigin.none), ("0.2", FigureOrigin.none)]
+        assert sources.steps == []
+
+    def test_a_tool_of_an_engine_anton_has_not_classified_is_not_a_source(self):
+        issues = _tool("toolu_lin", "linear__list_issues", {"state": "open"}, json.dumps({"open_issues": 12}))
+
+        sources = find_figure_sources(answer="There are 12 open issues.", question="", steps=[issues])
+
+        assert _origins(sources) == [("12", FigureOrigin.none)]
+        assert sources.steps == []
+
+    def test_a_number_the_calls_input_states_is_only_echoed_by_its_records(self):
+        search = _tool(
+            "toolu_hs", SEARCH_CRM_OBJECTS,
+            {"objectType": "deals", "filterGroups": [{"filters": [
+                {"propertyName": "amount", "operator": "EQ", "value": "48250"},
+            ]}]},
+            HUBSPOT_DEALS,
+        )
+
+        sources = find_figure_sources(answer="Acme's deal is $48,250 and Globex's $12,900.", question="", steps=[search])
+
+        assert _origins(sources) == [("$48,250", FigureOrigin.none), ("$12,900", FigureOrigin.step)]
+
+    @pytest.mark.parametrize(("created", "modified"), [
+        ("2026-03-04T09:12:44.512Z", "2026-10-12T22:05:31.087Z"),
+        ("2026-03-04 09:12:44", "2026-10-12T22:05:31+05:00"),
+    ])
+    def test_the_timestamps_on_a_connectors_records_source_no_figure(self, created: str, modified: str):
+        """HubSpot stamps every record with when it was created and last
+        changed. Read as numbers, the minutes and zone offsets of those times
+        would source almost any small figure."""
+        record = {
+            "id": "18234567890",
+            "properties": {
+                "dealname": "Acme renewal", "amount": "48250.00", "createdate": created, "hs_lastmodifieddate": modified,
+            },
+            "createdAt": created,
+            "updatedAt": modified,
+        }
+        records = json.dumps({"total": 1, "results": [record]})
+        search = _tool("toolu_hs", SEARCH_CRM_OBJECTS, SEARCH_DEALS, records)
+
+        sources = find_figure_sources(
+            answer="Acme's deal is $48,250; win rate is 12% across 5 reps.", question="", steps=[search],
+        )
+
+        assert _origins(sources) == [
+            ("$48,250", FigureOrigin.step), ("12%", FigureOrigin.none), ("5", FigureOrigin.none),
+        ]
+
+    def test_an_earlier_turns_connector_step_holds_no_figure(self):
+        earlier = _earlier(_tool("toolu_old", SEARCH_CRM_OBJECTS, SEARCH_DEALS, HUBSPOT_DEALS))
+
+        sources = find_figure_sources(answer="Acme's deal is $48,250.", question="", steps=[earlier])
+
+        assert _origins(sources) == [("$48,250", FigureOrigin.none)]
+        assert sources.steps == []
+
+    def test_an_anton_that_cannot_classify_connector_tools_counts_none(self, tmp_path: Path):
+        """Desktop installs resolve anton from the anton-agent floor, whose
+        anton.core.mcp has no returns_records and no names module. The module
+        still imports there, and only the tools anton runs itself are
+        evidence."""
+        program = textwrap.dedent(f"""
+            import sys
+            import anton.core.mcp.access
+            del anton.core.mcp.access.returns_records
+            sys.modules["anton.core.mcp.names"] = None
+            from cowork.harnesses.anton_harness.figure_sources import is_evidence_tool
+            print([is_evidence_tool(name=name) for name in ({SEARCH_CRM_OBJECTS!r}, "web_fetch")])
+        """)
+
+        result = subprocess.run(
+            [sys.executable, "-c", program], capture_output=True, text=True, timeout=60, check=False,
+            env={**os.environ, "COWORK_HOME": str(tmp_path), "DATABASE_URI": "sqlite://"},
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines()[-1] == "[False, True]"
+
+    def test_importing_the_module_does_not_import_the_mcp_sdk(self, tmp_path: Path):
+        """The module splits a connector tool's name with anton's
+        anton.core.mcp.names, which does not import the MCP SDK, rather than
+        anton.core.mcp.registry, which does. It runs in a fresh interpreter,
+        because this test process imported the SDK already."""
+        program = textwrap.dedent("""
+            import sys
+            import cowork.harnesses.anton_harness.figure_sources
+            print(sorted(m for m in sys.modules if m.split(".")[0] in ("mcp", "mcp_types")))
+        """)
+
+        result = subprocess.run(
+            [sys.executable, "-c", program], capture_output=True, text=True, timeout=60, check=False,
+            env={**os.environ, "COWORK_HOME": str(tmp_path), "DATABASE_URI": "sqlite://"},
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.splitlines()[-1] == "[]"
 
 
 class TestQueriesAcrossCells:
