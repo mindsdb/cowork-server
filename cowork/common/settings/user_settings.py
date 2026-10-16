@@ -677,6 +677,11 @@ class UserSettings(Settings):
         title="Show Counters",
         description="Show counters in the UI.",
     )
+    show_figure_sources: bool = Field(
+        default=True,
+        title="Show Figure Sources",
+        description="Mark each figure in an answer with the steps it came from, and flag figures with no source.",
+    )
     nav_title: str = Field(
         default="",
         title="Nav Title",

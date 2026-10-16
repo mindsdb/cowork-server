@@ -40,6 +40,12 @@ def test_show_dots_default_is_true():
     assert UserSettings.model_fields["show_dots"].get_default() is True
 
 
+def test_show_figure_sources_defaults_to_true():
+    # The server always sends an answer's figure sources; this only lets a
+    # user hide the marks, so they show until someone turns them off.
+    assert UserSettings.model_fields["show_figure_sources"].get_default() is True
+
+
 def test_favicon_defaults_to_empty_and_is_not_sensitive():
     assert UserSettings.model_fields["favicon"].get_default() == ""
     assert UserSettings.field_is_sensitive("favicon") is False

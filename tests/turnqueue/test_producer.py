@@ -179,6 +179,27 @@ async def test_a_stale_cancel_cause_is_cleared_with_the_stale_flag(monkeypatch):
     assert "cowork:cancel_cause:r" in fake.deleted
 
 
+async def test_an_admitted_runs_early_cancel_survives_dispatch(monkeypatch):
+    """An early created frame makes this run cancellable before job setup starts."""
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    deleted = []
+
+    async def delete(*keys):
+        deleted.extend(keys)
+        return len(keys)
+
+    monkeypatch.setattr(fake, "delete", delete)
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id=None, user_id=None, input_text="hi", model="m",
+        correlation_id="r", run_id="b4bef70a-5ea4-47ae-be86-5d49ca45e154",
+    ))
+    assert "cowork:cancel:r" not in deleted
+    assert "cowork:cancel_cause:r" not in deleted
+    assert ("cowork:turns", "conv-1") not in fake.registered
+    assert json.loads(fake.added[0][1]["payload"])["correlation_id"] == "r"
+
+
 # What anton's worker sends, via scratchpad-controller, for a billing stop the
 # gate timed: `reset_at` beside `error` on the turn_failed reply.
 _FUSE_STOP = "FreeServingPausedError: Free serving for 'x' is paused until the daily budget resets."
@@ -448,6 +469,41 @@ async def test_stream_remote_replies_omits_oauth_block_when_no_connections(monke
 
     params = json.loads(fake.added[0][1]["payload"])["params"]
     assert "oauth" not in params
+    assert "connectors" not in params
+
+
+@pytest.mark.asyncio
+async def test_stream_remote_replies_attaches_connector_usage_notes(monkeypatch):
+    from cowork.services.connectors.specs._registry import registry
+
+    fake = FakeRedis(replies=[("scratchpad:reply:conv-1", _reply("turn_completed", {}))])
+    monkeypatch.setattr(prod, "get_redis", lambda: fake)
+    monkeypatch.setattr(prod, "_new_correlation_id", lambda: "r")
+
+    async def fake_list_active_connections(**kw):
+        return [{"engine": "google_drive", "name": "work"}, {"engine": "gmail", "name": "me"}]
+
+    monkeypatch.setattr(prod, "list_active_connections", fake_list_active_connections)
+    monkeypatch.setattr(
+        registry, "usage_notes_for",
+        lambda engines: {e: f"NOTE-{e}" for e in engines if e == "google_drive"},
+    )
+
+    await _drain(prod.stream_remote_replies(
+        conversation_id="conv-1", org_id="o1", user_id="u1", input_text="hi", model="mindshub_air",
+    ))
+
+    params = json.loads(fake.added[0][1]["payload"])["params"]
+    assert params["connectors"] == {"google_drive": {"usage_notes": "NOTE-google_drive"}}
+
+
+def test_connectors_block_is_none_when_nothing_has_notes(monkeypatch):
+    from cowork.services.connectors.specs._registry import registry
+
+    assert prod._connectors_block(None) is None
+    assert prod._connectors_block({"connections": []}) is None
+    monkeypatch.setattr(registry, "usage_notes_for", lambda engines: {})
+    assert prod._connectors_block({"connections": [{"engine": "gmail", "name": "me"}]}) is None
 
 
 @pytest.mark.asyncio
@@ -1019,6 +1075,14 @@ def test_step_stream_events_round_end_carries_tool_call_truthiness():
 
 def test_step_stream_events_unknown_step_yields_nothing():
     assert prod.step_stream_events({"step": "mystery"}) == []
+
+
+def test_step_stream_events_turn_ended_carries_the_reason():
+    from anton.core.llm.provider import StreamTurnEnded
+
+    events = prod.step_stream_events({"step": "turn_ended", "ended_by": "round_cap"})
+    assert events == [StreamTurnEnded(ended_by="round_cap")]
+    assert prod.step_stream_events({"step": "turn_ended"}) == []
 
 
 def test_step_stream_events_ask_user_becomes_a_question():

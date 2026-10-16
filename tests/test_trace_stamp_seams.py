@@ -37,11 +37,25 @@ def _call_sites() -> list[tuple[Path, ast.Call]]:
         if _EXEMPT_DIRS & set(path.relative_to(COWORK_ROOT).parts[:-1]):
             continue
         tree = ast.parse(path.read_text(), filename=str(path))
+        # Starlette's StreamingResponse.stream_response sends HTTP body chunks;
+        # it does not originate a model turn despite sharing the method name.
+        http_stream_calls = {
+            id(node)
+            for cls in ast.walk(tree)
+            if isinstance(cls, ast.ClassDef)
+            and any(isinstance(base, ast.Name) and base.id == "StreamingResponse" for base in cls.bases)
+            for node in ast.walk(cls)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "self"
+            and node.func.attr == "stream_response"
+        }
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
-            if isinstance(func, ast.Attribute) and func.attr == "stream_response":
+            if isinstance(func, ast.Attribute) and func.attr == "stream_response" and id(node) not in http_stream_calls:
                 sites.append((path, node))
     return sites
 

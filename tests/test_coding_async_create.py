@@ -107,10 +107,15 @@ def test_stopping_a_task_while_it_prepares_never_starts_the_agent(
     started, release = hold_preparation(monkeypatch, service)
     created = create(service, repo)
     assert started.wait(timeout=3)
+    thread = service._running[created.id].thread
 
     service.cancel(created.id)
     assert service.get_session(created.id).run_status == RunStatus.preparing.value
     release.set()
+    # Session status is persisted before the Task Run status is synchronized.
+    # Wait for preparation to finish before reading both terminal states.
+    thread.join(timeout=5)
+    assert not thread.is_alive()
     stopped = wait_for_status(service, created.id, SessionStatus.cancelled)
 
     assert engine.prompts == []
@@ -130,8 +135,14 @@ def test_a_task_whose_workspace_cannot_be_prepared_stays_visible_as_failed(
         raise RuntimeError("disk is full")
 
     monkeypatch.setattr(service.session_factory.workspaces, "prepare", fail)
+    started, release = hold_preparation(monkeypatch, service)
 
     created = create(service, repo)
+    assert started.wait(timeout=3)
+    thread = service._running[created.id].thread
+    release.set()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
     failed = wait_for_status(service, created.id, SessionStatus.failed)
 
     assert engine.prompts == []
