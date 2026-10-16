@@ -31,11 +31,12 @@ from cowork.common.settings.user_settings import (
 from cowork.db.units import busy_retry_seconds, conversation_writes, run_db, run_to_completion
 from cowork.harnesses.base import available_harness_ids, get_harness
 from cowork.handlers import jev_shadow
-from cowork.handlers.first_take import FirstTake, speaks as first_take_speaks
+from cowork.handlers.first_take import FirstTake, clears_take as first_take_clears
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
     _MAX_HISTORY_MESSAGES,
+    _settings_binding,
     _text_history,
     RouteDecision,
     RouterBinding,
@@ -537,34 +538,15 @@ def _failed_frame_for(exc: Exception, *, request_id: str | None = None) -> str:
     return response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)
 
 
-def _first_take_binding(minted: RouterBinding | None, turn_model: str | None) -> RouterBinding | None:
-    """Where the first take runs: the model the user picked for this task or
-    message, else their "Routing & summarization" model. None if neither can
-    be built, and then there is no take; the turn is unaffected.
-
-    Not the gate's model: the gate needs a fast hidden default to decide in
-    time, while the take is something the user reads, so it speaks with the
-    model they chose.
-
-    `minted` is the gate's per-turn MindsHub binding on hosted orgs, where
-    every model is served through the same key, so the pick applies as is.
-    Everywhere else the router role is resolved the way the turn's own client
-    resolves it (build_llm_client): the per-task pick only when it runs on the
-    router's provider, since a pick from another provider can't be called
-    with the router's key.
-    """
+def _first_take_binding(minted: RouterBinding | None) -> RouterBinding | None:
+    """The gate's own binding: the take only helps if it lands within a second
+    or two, which a chat model is routinely too slow for. `minted` is the
+    gate's per-turn MindsHub binding on hosted orgs. None when there is no
+    gate model, and then there is no take; the turn is unaffected."""
+    if minted is not None:
+        return minted
     try:
-        if minted is not None:
-            model = turn_model or get_user_settings().resolved_router_model
-            return RouterBinding(provider=minted.provider, model=model, label=minted.label) if model else None
-        from cowork.services.providers import build_llm_client
-
-        client = build_llm_client(model_override=turn_model or None)
-        return RouterBinding(
-            provider=client.router_provider,
-            model=client.router_model,
-            label=get_user_settings().resolved_router_provider.value,
-        )
+        return _settings_binding()
     except Exception:
         return None
 
@@ -577,20 +559,23 @@ def _first_take_enabled() -> bool:
 
 
 def _start_first_take(
-    binding: RouterBinding | None,
+    minted: RouterBinding | None,
     *,
     history: list[dict],
     conversation_id: UUID,
     harness: str | None,
     metadata: dict[str, str],
 ) -> FirstTake | None:
-    """Start the turn's first take (ENG-3406) on `binding`, or None when it is
+    """Start the turn's first take on the gate's model, or None when it is
     switched off or there is no model to run it on.
 
     Its trace is its own (tag ``cowork-first-take``), joined to the gate's by
     the correlation id, so its cost is countable apart from the gate's.
     """
-    if binding is None or not _first_take_enabled():
+    if not _first_take_enabled():
+        return None
+    binding = _first_take_binding(minted)
+    if binding is None:
         return None
     from anton.core.llm.tracing import TraceContext, reset_trace_context, set_trace_context
 
@@ -620,7 +605,7 @@ class ResponsesHandler:
         self.last_conversation_id: str | None = None
         # Whether a person is watching this turn and can answer ask_user cards.
         self.interactive = interactive
-        # The instant first take (ENG-3406), started beside the gate by
+        # The instant first take, started beside the gate by
         # _route_request and handed to the turn's producer if it delegates.
         self.first_take: FirstTake | None = None
 
@@ -664,16 +649,22 @@ class ResponsesHandler:
         # task created below (create_task copies this context), is served from
         # the snapshot the unit loaded.
         with use_turn_settings(self.scope, start.settings):
-            route, turn_llm = await self._route_request(
-                conversation_id=start.conversation_id,
-                harness_input=start.harness_input,
-                gate_rows=start.gate_rows,
-                has_attachments=bool(request.attachment_ids),
-                has_disabled_connections=bool(disabled),
-                trace_metadata=trace_metadata,
-                first_take=bool(request.stream) and self.interactive,
-                turn_model=request.model,
-            )
+            try:
+                route, turn_llm = await self._route_request(
+                    conversation_id=start.conversation_id,
+                    harness_input=start.harness_input,
+                    gate_rows=start.gate_rows,
+                    has_attachments=bool(request.attachment_ids),
+                    has_disabled_connections=bool(disabled),
+                    trace_metadata=trace_metadata,
+                    first_take=bool(request.stream) and self.interactive,
+                )
+            except BaseException:
+                # A refused or cancelled request must not leave the take's model call running.
+                if getattr(self, "first_take", None) is not None:
+                    self.first_take.cancel()
+                    self.first_take = None
+                raise
             first_take, self.first_take = getattr(self, "first_take", None), None
             trace_metadata = {
                 **trace_metadata,
@@ -939,23 +930,19 @@ class ResponsesHandler:
         has_disabled_connections: bool,
         trace_metadata: dict[str, str] | None = None,
         first_take: bool = False,
-        turn_model: str | None = None,
     ) -> tuple[RouteDecision, dict | None]:
         """Run Cowork's narrow pre-Anton gate with only safe text context.
 
-        With `first_take`, the instant first take (ENG-3406) starts beside the
-        gate on the same history, on the user's model (`turn_model`, the
-        request's pick, else their router model; see _first_take_binding), left
-        on `self.first_take` for handle() to keep or cancel once the route is
-        known. `turn_model` is used for nothing else here.
+        With `first_take`, the instant first take starts beside the gate on the
+        same history and model, left on `self.first_take` for handle() to keep
+        or cancel once the route is known.
 
         `gate_rows` is the history handle()'s first unit read for the gate
         (see _TurnStart).
 
-        The composer's per-conversation model pick (`request.model`) never
-        reaches the gate: it drives Anton's turn, not the gate (see
-        `UserSettings.resolved_gate_model`). It arrives as `turn_model` for
-        the first take only.
+        The composer's per-conversation model pick (`request.model`) is
+        deliberately not passed down: it drives Anton's turn, not the gate
+        (see `UserSettings.resolved_gate_model`).
 
         Returns the decision plus pre-minted turn credentials
         (`{"correlation_id", "llm"}`) for a delegated remote turn to reuse."""
@@ -1011,7 +998,7 @@ class ResponsesHandler:
                     correlation_id = (turn_llm or {}).get("correlation_id")
                     if first_take:
                         self.first_take = _start_first_take(
-                            _first_take_binding(binding, turn_model),
+                            binding,
                             history=history,
                             conversation_id=conversation_id,
                             harness=self.harness_name,
@@ -2149,7 +2136,7 @@ class ResponsesHandler:
                 replies_as_stream_events(), model or "", event_sink,
             ):
                 event_type = self._sse_event_type(sse)
-                if first_take is not None and first_take_speaks(event_type, sse):
+                if first_take is not None and first_take_clears(event_type):
                     await first_take.clear(buffer)
                 if first:
                     # The formatter's created frame lacks conversation_id +
@@ -2483,7 +2470,7 @@ class ResponsesHandler:
                     event_count += 1
                     sse_string = self._inject_created(sse_string, conv_id, harness_id, question_id)
                     event_type = self._sse_event_type(sse_string)
-                    if first_take is not None and first_take_speaks(event_type, sse_string):
+                    if first_take is not None and first_take_clears(event_type):
                         await first_take.clear(buffer)
                     if event_type == "response.completed":
                         # The formatter yields its terminal frame last, once its

@@ -1,5 +1,5 @@
-"""The instant first take (ENG-3406): a short reply on the gate's model that
-fills the wait on a delegated turn and leaves as soon as Anton speaks."""
+"""The instant first take: a short reply on the gate's model that fills the
+wait on a delegated turn and heads Anton's steps until the turn ends."""
 
 from __future__ import annotations
 
@@ -178,12 +178,85 @@ async def test_a_failing_model_means_no_take_and_no_error():
 
 @pytest.mark.asyncio
 async def test_a_slow_model_is_dropped(monkeypatch):
-    monkeypatch.setattr(ft, "_FIRST_EVENT_SECONDS", 0.01)
+    monkeypatch.setattr(ft, "_FIRST_WORD_SECONDS", 0.01)
     buffer = _Buffer()
     take = _take(_Provider(["late"], gate=asyncio.Event())).start()
     take.attach(buffer)
     await asyncio.sleep(0.05)
     assert buffer.frames == []
+
+
+@pytest.mark.asyncio
+async def test_it_logs_its_outcome_and_time_to_first_word(caplog):
+    buffer = _Buffer()
+    take = _take(_Provider(["On it."])).start()
+    take.attach(buffer)
+    with caplog.at_level("WARNING", logger=ft.__name__):
+        await _settle()
+    line = next(r.getMessage() for r in caplog.records if r.getMessage().startswith("[first-take]"))
+    assert "model=fast outcome=shown first_word_ms=" in line and "first_word_ms=None" not in line
+
+
+class _ReasoningProvider:
+    """Streams reasoning events forever, then (never) text."""
+
+    async def stream(self, **_kwargs):
+        from anton.core.llm.provider import StreamReasoningDelta
+
+        while True:
+            await asyncio.sleep(0.005)
+            yield StreamReasoningDelta(text="thinking")
+
+
+@pytest.mark.asyncio
+async def test_reasoning_events_do_not_push_the_first_word_back(monkeypatch, caplog):
+    monkeypatch.setattr(ft, "_FIRST_WORD_SECONDS", 0.03)
+    buffer = _Buffer()
+    take = _take(_ReasoningProvider()).start()
+    take.attach(buffer)
+    with caplog.at_level("WARNING", logger=ft.__name__):
+        await asyncio.sleep(0.1)
+    assert buffer.frames == []
+    assert any("outcome=timeout" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_a_take_cut_off_mid_stream_comes_off_screen(monkeypatch):
+    monkeypatch.setattr(ft, "_IDLE_SECONDS", 0.02)
+    gate = asyncio.Event()
+    provider = _Provider(["I'll pull ", "your sales."], gate=gate)
+    take = _take(provider).start()
+    buffer = _Buffer()
+    take.attach(buffer)
+    gate.set()  # the first piece only; the second never comes
+    await asyncio.sleep(0.1)
+    assert [e for e, _ in buffer.events()] == [ft.DELTA, ft.CLEARED]
+
+
+@pytest.mark.asyncio
+async def test_a_model_error_after_words_takes_them_off_screen():
+    class _Failing:
+        async def stream(self, **_kwargs):
+            from anton.core.llm.provider import StreamTextDelta
+
+            yield StreamTextDelta(text="I'll pull ")
+            raise RuntimeError("upstream reset")
+
+    buffer = _Buffer()
+    take = _take(_Failing()).start()
+    take.attach(buffer)
+    await _settle()
+    assert [e for e, _ in buffer.events()] == [ft.DELTA, ft.CLEARED]
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_take_is_logged(caplog):
+    take = _take(_Provider(["late"], gate=asyncio.Event())).start()
+    await _settle()
+    with caplog.at_level("WARNING", logger=ft.__name__):
+        take.cancel()
+        await _settle()
+    assert any("outcome=cancelled" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -196,16 +269,11 @@ async def test_cancel_before_any_stream_writes_nothing():
     assert buffer.frames == []
 
 
-def test_what_takes_its_place():
-    def frame(kind, **data):
-        return f"event: {kind}\ndata: {json.dumps({'type': kind, **data})}\n\n"
-
-    assert ft.speaks("response.output_text.delta", frame("response.output_text.delta", delta="Here"))
-    assert not ft.speaks("response.output_text.delta", frame("response.output_text.delta", delta="\n\n"))
+def test_what_takes_it_off_screen():
     for kind in ("response.ask_user", "response.completed", "response.failed"):
-        assert ft.speaks(kind, frame(kind))
-    for kind in ("response.created", "response.in_progress", "response.artifact_created"):
-        assert not ft.speaks(kind, frame(kind))
+        assert ft.clears_take(kind)
+    for kind in ("response.created", "response.output_text.delta", "response.in_progress", None):
+        assert not ft.clears_take(kind)
 
 
 # ── where it starts ────────────────────────────────────────────────────────
@@ -227,7 +295,7 @@ async def _route(handler, monkeypatch, *, first_take: bool, enabled: bool = True
 
     monkeypatch.setattr(responses, "decide_route", delegated)
     monkeypatch.setattr(
-        responses, "_first_take_binding", lambda minted, turn_model: RouterBinding(provider=provider, model="m", label="x"),
+        responses, "_first_take_binding", lambda minted: RouterBinding(provider=provider, model="m", label="x"),
     )
     monkeypatch.setattr(responses, "_first_take_enabled", lambda: enabled)
     await handler._route_request(
@@ -280,92 +348,104 @@ async def test_attachments_never_start_one(monkeypatch):
 # ── which model it speaks with ─────────────────────────────────────────────
 
 
-def _settings(monkeypatch, *, router_model="router-pick", router_provider="anthropic"):
+def test_hosted_uses_the_gates_minted_binding():
+    from cowork.handlers.responses import _first_take_binding
+
+    minted = RouterBinding(provider="minted-key", model="mindshub_air", label="minds_cloud")
+    assert _first_take_binding(minted) is minted
+
+
+def test_elsewhere_uses_the_gates_stored_binding(monkeypatch):
     import cowork.handlers.responses as responses
-    from types import SimpleNamespace
-
-    monkeypatch.setattr(responses, "get_user_settings", lambda *a, **k: SimpleNamespace(
-        resolved_router_model=router_model,
-        resolved_router_provider=SimpleNamespace(value=router_provider),
-    ))
-
-
-def test_hosted_uses_the_task_pick_on_the_minted_key(monkeypatch):
     from cowork.handlers.responses import _first_take_binding
 
-    _settings(monkeypatch)
-    minted = RouterBinding(provider="minted-key", model="mindshub_air", label="minds_cloud")
-    picked = _first_take_binding(minted, "claude-opus-4-8")
-    assert (picked.provider, picked.model, picked.label) == ("minted-key", "claude-opus-4-8", "minds_cloud")
+    stored = RouterBinding(provider="router-provider", model="gate-model", label="anthropic")
+    monkeypatch.setattr(responses, "_settings_binding", lambda: stored)
+    assert _first_take_binding(None) is stored
 
 
-def test_hosted_without_a_pick_uses_the_routing_model_not_the_gates(monkeypatch):
+def test_no_gate_model_means_no_take(monkeypatch):
+    import cowork.handlers.responses as responses
     from cowork.handlers.responses import _first_take_binding
 
-    _settings(monkeypatch, router_model="kimi-k3")
-    minted = RouterBinding(provider="minted-key", model="mindshub_air", label="minds_cloud")
-    assert _first_take_binding(minted, None).model == "kimi-k3"
+    monkeypatch.setattr(responses, "_settings_binding", lambda: None)
+    assert _first_take_binding(None) is None
 
-
-def test_elsewhere_the_router_role_is_resolved_like_the_turns_own(monkeypatch):
-    """build_llm_client applies the pick to the router only on the router's own
-    provider (test_build_llm_client covers that rule); the take takes its answer."""
-    from types import SimpleNamespace
-    import cowork.services.providers as providers
-    from cowork.handlers.responses import _first_take_binding
-
-    _settings(monkeypatch)
-    seen = {}
-
-    def fake_build(**kwargs):
-        seen.update(kwargs)
-        return SimpleNamespace(router_provider="router-provider", router_model="resolved-router")
-
-    monkeypatch.setattr(providers, "build_llm_client", fake_build)
-    binding = _first_take_binding(None, "gpt-5.5")
-    assert seen == {"model_override": "gpt-5.5"}
-    assert (binding.provider, binding.model, binding.label) == ("router-provider", "resolved-router", "anthropic")
-    _first_take_binding(None, "")
-    assert seen == {"model_override": None}
-
-
-def test_no_model_means_no_take(monkeypatch):
-    import cowork.services.providers as providers
-    from cowork.handlers.responses import _first_take_binding
-
-    _settings(monkeypatch, router_model=None)
-    assert _first_take_binding(RouterBinding(provider="k", model="air", label="x"), None) is None
-
-    def broken(**_kwargs):
+    def broken():
         raise ValueError("Anthropic API key is not configured")
 
-    monkeypatch.setattr(providers, "build_llm_client", broken)
-    assert _first_take_binding(None, None) is None
+    monkeypatch.setattr(responses, "_settings_binding", broken)
+    assert _first_take_binding(None) is None
 
 
 @pytest.mark.asyncio
-async def test_route_request_hands_the_task_pick_over(monkeypatch):
+async def test_route_request_hands_the_gates_binding_over(monkeypatch):
     import cowork.handlers.responses as responses
 
+    minted = RouterBinding(provider="minted-key", model="mindshub_air", label="minds_cloud")
     seen = {}
 
-    async def delegated(**_kwargs):
+    async def router_binding():
+        return minted, {"correlation_id": "c"}
+
+    async def delegated(**kwargs):
+        seen["gate"] = kwargs["binding"]
         return RouteDecision(route=DELEGATED_AGENTIC, reason="test")
 
-    def binding_for(minted, turn_model):
-        seen["turn_model"] = turn_model
+    def binding_for(binding):
+        seen["take"] = binding
         return None
 
     monkeypatch.setattr(responses, "decide_route", delegated)
     monkeypatch.setattr(responses, "_first_take_binding", binding_for)
     monkeypatch.setattr(responses, "_first_take_enabled", lambda: True)
     handler = _handler()
+    handler._router_binding = router_binding
     await handler._route_request(
         conversation_id=None, gate_rows=[], harness_input=[{"type": "text", "text": "hi"}],
-        has_attachments=False, has_disabled_connections=False, first_take=True, turn_model="claude-opus-4-8",
+        has_attachments=False, has_disabled_connections=False, first_take=True,
     )
-    assert seen == {"turn_model": "claude-opus-4-8"}
+    assert seen["take"] is minted and seen["gate"] is minted
     assert handler.first_take is None
+
+
+@pytest.mark.asyncio
+async def test_a_routing_error_cancels_the_take(monkeypatch):
+    from types import SimpleNamespace
+    from uuid import uuid4
+
+    import cowork.handlers.responses as responses
+    from cowork.schemas.responses import ResponsesRequest
+    from tests.test_response_routing import _routing_handler
+
+    handler = _routing_handler(monkeypatch)
+    conv_id = uuid4()
+    monkeypatch.setattr(
+        responses,
+        "ConversationService",
+        lambda scoped: SimpleNamespace(
+            get_conversation=lambda _cid: SimpleNamespace(id=conv_id),
+            message_count=lambda _conversation: 0,
+            get_recent_messages=lambda *_args, **_kwargs: [],
+        ),
+    )
+
+    async def no_secrets(_scope):
+        return None
+
+    monkeypatch.setattr(responses, "register_vault_secrets", no_secrets)
+    take = _take(_Provider(["late"], gate=asyncio.Event())).start()
+
+    async def refused(**_kwargs):
+        handler.first_take = take
+        raise TimeoutError("pool")
+
+    handler._route_request = refused
+    with pytest.raises(TimeoutError):
+        await handler.handle(ResponsesRequest(input="hi", conversation=str(conv_id), stream=True))
+    await _settle()
+    assert handler.first_take is None
+    assert take._writer.done()
 
 
 def test_the_setting_defaults_on():
@@ -378,9 +458,10 @@ def test_the_setting_defaults_on():
 
 
 @pytest.mark.asyncio
-async def test_the_turn_clears_it_right_before_anton_speaks():
+async def test_the_take_stays_through_antons_words_and_clears_at_the_end():
     """In-process producer, end to end: created, then the take's words, then
-    its clear, then Anton's first words. Nothing of it reaches the saved turn."""
+    Anton's words with the take still up, then its clear as the turn ends.
+    Nothing of it reaches the saved turn."""
     from unittest.mock import MagicMock, patch
     from types import SimpleNamespace
     from uuid import uuid4
@@ -416,7 +497,7 @@ async def test_the_turn_clears_it_right_before_anton_speaks():
 
     kinds = [frame.split("\n", 1)[0].removeprefix("event: ") for frame in buffer.frames]
     assert kinds[0] == "response.created"
-    assert kinds.index(ft.DELTA) < kinds.index(ft.CLEARED) < kinds.index("response.output_text.delta")
+    assert kinds.index(ft.DELTA) < kinds.index("response.output_text.delta") < kinds.index(ft.CLEARED)
     assert kinds.count(ft.CLEARED) == 1
     assert all(k not in kinds[kinds.index(ft.CLEARED) + 1:] for k in (ft.DELTA, ft.DONE))
     saved_text = json.dumps([str(c) for c in conv_svc.return_value.save_assistant_turn.call_args_list])

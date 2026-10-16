@@ -1,11 +1,11 @@
-"""The instant first take (ENG-3406).
+"""The instant first take.
 
 A delegated turn shows nothing until Anton's first model call speaks, which is
 seconds on a quick turn and much longer when it goes straight to tools. The
 first take fills that gap: a short, tool-free reply on the gate's fast model,
 started alongside the gate, saying what the user asked for and that the work is
-under way. The renderer shows it muted, and it goes away as soon as Anton says
-anything itself, asks the user something, or the turn ends.
+under way. The renderer shows it muted above the thinking block, so the steps
+read under it, until Anton asks the user something or the turn ends.
 
 It is a placeholder, never an answer:
 
@@ -45,18 +45,20 @@ logger = logging.getLogger(__name__)
 _EARLIER_MESSAGES = 3
 _EARLIER_CHARS = 400
 _LATEST_CHARS = 2_000
-#: A sentence or two. The prompt asks for under 40 words; the cap backs it up.
-_MAX_TOKENS = 120
+#: The gate's budget: on a reasoning model the hidden reasoning counts toward
+#: it. The word cap keeps the visible take to a sentence or two.
+_MAX_TOKENS = 1_024
 _MAX_WORDS = 60
-#: Past these the take is late enough to be noise, so it is dropped.
-_FIRST_EVENT_SECONDS = 4.0
+#: Past these the take is late enough to be noise, so it is dropped. The first
+#: word's limit is absolute, so reasoning events can't keep pushing it back.
+_FIRST_WORD_SECONDS = 4.0
+_IDLE_SECONDS = 4.0
 _TOTAL_SECONDS = 12.0
 
 _SYSTEM_PROMPT = """You write the first, instant reply in Cowork, an assistant
 that analyzes data, connects to services, runs code and builds things for the
-user. The full assistant is already working on the user's latest message and
-its answer will replace yours in a few seconds, so yours is only what the user
-reads while it works.
+user. The full assistant is already working on the user's latest message, and
+yours is what the user reads above its work while it runs.
 
 Show in one or two short sentences (under 40 words) that you understood what
 they asked for, and say what you are going to look at or do. Write as the one
@@ -108,8 +110,6 @@ def _shippable(text: str) -> bool:
     return not (names_foreign_product(text) or denies_our_product(text) or names_gate_tool(text))
 
 
-
-
 def _sse(event_type: str, data: dict) -> str:
     payload = {"type": event_type, **data, "at_ms": int(time.time() * 1000)}
     return f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"
@@ -120,18 +120,10 @@ DONE = "response.first_take.done"
 CLEARED = "response.first_take.cleared"
 
 
-def speaks(event_type: str | None, sse: str) -> bool:
-    """Whether a turn frame puts Anton's own words, a question, or the turn's
-    end on screen: each one takes the first take's place."""
-    if event_type in {"response.ask_user", "response.completed", "response.failed"}:
-        return True
-    if event_type != "response.output_text.delta":
-        return False
-    try:
-        data = json.loads(sse.split("data: ", 1)[1])
-    except (IndexError, ValueError):
-        return True
-    return bool(str(data.get("delta") or "").strip())
+def clears_take(event_type: str | None) -> bool:
+    """Whether a turn frame takes the first take off screen. Anton's own text
+    does not: it streams into the thinking block, which the take heads."""
+    return event_type in {"response.ask_user", "response.completed", "response.failed"}
 
 
 class FirstTake:
@@ -142,7 +134,7 @@ class FirstTake:
     queue until :meth:`attach` hands it the turn's buffer (after the turn's
     `response.created`), then go straight into it, beside the turn's own frames
     the way the model-wait ticker's do. :meth:`clear` ends it: called by the
-    producer before the first frame that :func:`speaks`, and again (a no-op by
+    producer before the first frame that :func:`clears_take`, and again (a no-op by
     then) on every way out of the turn.
     """
 
@@ -156,6 +148,7 @@ class FirstTake:
         self._lock = asyncio.Lock()
         self._closed = False
         self._shown = False
+        self._first_word_at: float | None = None
 
     def start(self) -> "FirstTake":
         if self._messages:
@@ -211,17 +204,33 @@ class FirstTake:
                 return
 
     async def _write_safely(self) -> None:
+        started = time.monotonic()
+        outcome = "cancelled"
         try:
-            await self._write()
+            outcome = await self._write()
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            outcome = "timeout"
         except Exception as exc:
             # The take is optional: a failure only means there is none.
-            logger.info("[first-take] dropped: %s", type(exc).__name__)
+            outcome = type(exc).__name__
         finally:
+            if outcome not in {"shown", "empty", "withdrawn"} and self._first_word_at is not None:
+                # A cut-off fragment must not stay above the steps all turn.
+                self._queue.put_nowait(_sse(CLEARED, {}))
             self._queue.put_nowait(_FINISHED)
+            # warning, not info: deployments log at WARNING, and this line is
+            # how the take's speed and cost are measured.
+            logger.warning(
+                "[first-take] model=%s outcome=%s first_word_ms=%s total_ms=%d",
+                self._binding.model,
+                outcome,
+                None if self._first_word_at is None else round((self._first_word_at - started) * 1000),
+                round((time.monotonic() - started) * 1000),
+            )
 
-    async def _write(self) -> None:
+    async def _write(self) -> str:
         from anton.core.llm.provider import StreamTextDelta, StreamToolUseStart
 
         events = self._binding.provider.stream(
@@ -232,10 +241,12 @@ class FirstTake:
         )
         loop = asyncio.get_running_loop()
         deadline = loop.time() + _TOTAL_SECONDS
+        first_word_by = loop.time() + _FIRST_WORD_SECONDS
         text = ""
         try:
             while True:
-                budget = min(_FIRST_EVENT_SECONDS, deadline - loop.time())
+                until = min(deadline, loop.time() + _IDLE_SECONDS if text else first_word_by)
+                budget = until - loop.time()
                 if budget <= 0:
                     raise TimeoutError
                 event = await asyncio.wait_for(anext(events, _FINISHED), budget)
@@ -250,13 +261,16 @@ class FirstTake:
                 if not _shippable(text):
                     # Same guards as the gate's answers. Words already shown
                     # come off; nothing after them goes out.
-                    logger.info("[first-take] withdrawn by the answer guards")
                     self._queue.put_nowait(_sse(CLEARED, {}))
-                    return
+                    return "withdrawn"
                 if len(text.split()) > _MAX_WORDS:
                     break
+                if self._first_word_at is None:
+                    self._first_word_at = time.monotonic()
                 self._queue.put_nowait(_sse(DELTA, {"delta": delta}))
         finally:
             await _close(events)
-        if text.strip():
-            self._queue.put_nowait(_sse(DONE, {}))
+        if not text.strip():
+            return "empty"
+        self._queue.put_nowait(_sse(DONE, {}))
+        return "shown"

@@ -798,7 +798,7 @@ class UserSettings(Settings):
         title="Instant first take",
         description=(
             "While the agent works, show a quick reply on the fast model saying "
-            "what it is about to do (ENG-3406). Replaced as soon as the agent speaks."
+            "what it is about to do, above its steps until the turn ends."
         ),
     )
     # ── Advanced agent budgets ──
