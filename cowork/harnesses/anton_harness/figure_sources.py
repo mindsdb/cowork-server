@@ -308,19 +308,14 @@ _REDACTED = "[redacted]"
 #
 # A URL's user and password, whatever comes before the ://. Once a : has ended
 # the user name, the password may hold /, ? or #, as a database URI's may; a
-# quote or a space ends the match, so it never runs past a string literal in
-# SQL.
-_USERINFO = re.compile(r"(://)(?:[^\s/?#'\"@:]{0,256}:[^\s'\"]{0,1024}|[^\s/?#'\"@]{0,256})@")
-# A password longer than _USERINFO's window: the user and everything after
-# its : is masked, up to the next space or quote. A long path after a
-# host:port is masked too.
-_LONG_USERINFO = re.compile(r"(://)[^\s/?#'\"@:]{0,256}:[^\s'\"]{1025,}+")
-# The same, for a password that holds a doubled quote, as SQL writes a quote
-# inside a string literal: Pa''ss. The lookahead finds the doubled quote
-# before the slower match runs.
-_QUOTED_USERINFO = re.compile(
-    r"(://)[^\s/?#'\"@:]{0,256}:(?=[^\s'\"]{0,1024}+(?:''|\"\"))(?:[^\s'\"]|''|\"\"){0,1024}@"
-)
+# quote may be password data under the enclosing SQL dialect. Keep it in
+# the bounded scan; ambiguous detail is safer to redact than to expose.
+_USERINFO = re.compile(r"(://)(?:[^\s/?#'\"@:]{0,256}:\S{0,1024}|[^\s/?#'\"@]{0,256})@")
+# On overflow, mask the whole non-whitespace span, including its host and
+# any quotes. Without the enclosing SQL dialect a quote may be password
+# data, even when not doubled or escaped. Omit excess detail rather than
+# leave part of that credential visible. Possessive matching stays linear.
+_LONG_USERINFO = re.compile(r"(://)[^\s/?#'\"@:]{0,256}:\S{1025,}+")
 # An Oracle EZConnect string, user/password@host[:port][/service], whose user
 # starts where a word starts, so a URL's path is never read as one.
 _EZCONNECT = re.compile(r"(?<![\w$#./:-])[A-Za-z_][\w$#]{0,127}/[^\s/@'\"]{1,1024}@(?=[\w./-])")
@@ -352,12 +347,12 @@ _ASSIGN = r"[ \t]*(?>=>|[:=])[ \t]*"
 # A secret key's value in quotes after its key, the key quoted or not:
 # password='a b c', "token": "x", 'Authorization': 'Bearer x'. A doubled
 # quote inside the value is a quote, as SQL writes it. The quotes stay, so the
-# SQL around the value still reads. An unclosed value runs to the end of its
-# line.
+# SQL around the value still reads. Multiline values retain one boundary;
+# an unclosed value is redacted through the end of the input.
 _QUOTED_SECRET = re.compile(
     rf"(?P<key>(?<![\w.-])[\"']?{_SENSITIVE_NAME}[\"']?{_ASSIGN})"
-    r"(?:(?P<single>')(?:''|\\.|[^'\n\\])*+(?P<single_close>')?"
-    r"|(?P<double>\")(?:\"\"|\\.|[^\"\n\\])*+(?P<double_close>\")?)",
+    r"(?:(?P<single>')(?:''|\\[\s\S]|[^'\\])*+(?P<single_close>')?"
+    r"|(?P<double>\")(?:\"\"|\\[\s\S]|[^\"\\])*+(?P<double_close>\")?)",
     re.IGNORECASE,
 )
 # A secret key's unquoted value, up to a space, a comma, a semicolon, an
@@ -484,6 +479,7 @@ class _Pad:
 
     names: dict[str, str] = field(default_factory=dict)
     functions: dict[str, FunctionReading] = field(default_factory=dict)
+    clients: dict[str, str] = field(default_factory=dict)
     lineage: dict[str, frozenset[str]] = field(default_factory=dict)
 
     def drawn_from(self, names: Iterable[str]) -> frozenset[str]:
@@ -505,6 +501,7 @@ class _Pad:
                 self.lineage.pop(name, None)
         self.names = dict(reading.names)
         self.functions = dict(reading.functions)
+        self.clients = dict(reading.clients)
 
 
 @dataclass(frozen=True)
@@ -545,7 +542,7 @@ def _describe_steps(steps: Sequence[TurnStep]) -> list[_DescribedStep]:
         cell = step.cell if step.cell is not None else _cell_result(step.content)
         code = call.code or (cell.code if cell is not None else "")
         pad = pads.setdefault(call.pad, _Pad())
-        reading = read_cell(code, names=pad.names, functions=pad.functions)
+        reading = read_cell(code, names=pad.names, functions=pad.functions, clients=pad.clients)
         drawn_from = pad.drawn_from(reading.loaded_names) - {step.tool_use_id}
         pad.record(reading, tool_use_id=step.tool_use_id)
         described.append(_describe_cell(step, code=code, reading=reading, cell=cell, drawn_from=drawn_from))
@@ -618,6 +615,11 @@ def _describe_cell(
     words by the kind alone."""
     output = cell.stdout if cell is not None else ""
     description = cell.description if cell is not None else ""
+    # A separately printed caption is not a pandas index name. Keep line
+    # boundaries while removing known labels before examining row metadata.
+    if reading.labels:
+        captions = {label.strip() for label in reading.labels}
+        output = "\n".join(" " * len(line) if line.strip() in captions else line for line in output.split("\n"))
     not_read = {*reading.written_files, *reading.labels}
     documents = tuple(text for text in reading.strings if text not in not_read and _DOCUMENT.fullmatch(text))
     web_page = next(
@@ -776,8 +778,8 @@ def _redacted(text: str) -> str:
       (ghp_, gho_, ghu_, ghs_, ghr_, github_pat_), Slack tokens (xox?-,
       xapp-), Stripe secret and restricted keys (sk_, rk_), Hugging Face
       (hf_) and Google OAuth (ya29.) tokens, JWTs and PEM private keys;
-    - a URL's user and password (with a password longer than 1,024
-      characters, everything after the user up to the next space or quote),
+    - a URL's user and password (on overflow, its whole non-whitespace
+      span, including ambiguous SQL quotes),
       an Oracle EZConnect string's password, a URL's query string and
       fragment, and the path of a Slack, Discord, Teams, Zapier, IFTTT or
       Telegram bot URL;
@@ -792,10 +794,9 @@ def _redacted(text: str) -> str:
     A connector whose credential has a key name or shape not listed here
     adds it to ``_SENSITIVE_NAME`` or ``_SECRET_SHAPE``, with a case in
     tests/test_figure_sources.py."""
-    text = scrub_credentials(text)
-    # Only text with a doubled quote can hold a password with one.
-    if "''" in text or '""' in text:
-        text = _QUOTED_USERINFO.sub(r"\1***@", text)
+    # Whole shapes must be removed before a named-value replacement can
+    # erase a delimiter, such as a PEM key's BEGIN line.
+    text = _SECRET_SHAPE.sub(_REDACTED, scrub_credentials(text))
     text = _USERINFO.sub(r"\1***@", text)
     text = _LONG_USERINFO.sub(r"\1***", text)
     text = _EZCONNECT.sub("***@", text)
@@ -804,7 +805,7 @@ def _redacted(text: str) -> str:
     text = _QUOTED_SECRET.sub(_redacted_quoted_value, text)
     text = _BARE_SECRET.sub(lambda match: match["key"] + _REDACTED, text)
     text = _BEARER.sub(lambda match: match["scheme"] + _REDACTED, text)
-    return _SECRET_SHAPE.sub(_REDACTED, text)
+    return text
 
 
 def _redacted_quoted_value(match: re.Match[str]) -> str:
@@ -1039,8 +1040,8 @@ def _unlabeled(output: str) -> str:
     A run of lines that each start with a number and two spaces is a frame's
     or a Series' rows when it has two or more lines, a column header above
     it, or a Series footer below it. Its numbers are row labels when they
-    count up, as a frame's own row numbers do, kept or filtered; or when the
-    column header is right above the run, so they are the frame's row numbers
+    count up without a named index, as a frame's own row numbers do, kept or
+    filtered; or when the column header is right above the run, so they are the frame's row numbers
     in whatever order a sort or a sample left them. Otherwise they are values
     printed where labels go, as value_counts() or set_index() print them, and
     are read."""
@@ -1057,10 +1058,19 @@ def _unlabeled(output: str) -> str:
         run = [(row, label) for row, label in enumerate(labels[first:index], start=first) if label is not None]
         under_header = first > 0 and _FRAME_HEADER.match(lines[first - 1]) is not None
         over_footer = index < len(lines) and _SERIES_FOOTER.match(lines[index]) is not None
+        # pandas prints an index's name on its own, unindented line above
+        # Series rows or below a frame's column header. Those labels are
+        # actual data even when sorted or reduced to a single value. Require
+        # an identifier; an arbitrary caption is not reliable index metadata.
+        # Non-identifier index names remain ambiguous and keep the fallback.
+        named_index = (
+            first > 0 and lines[first - 1].rstrip().isidentifier() and not lines[first - 1][0].isspace()
+            and (over_footer or (first > 1 and _FRAME_HEADER.match(lines[first - 2]) is not None))
+        )
         if not (len(run) > 1 or under_header or over_footer):
             continue
         counts = [Decimal(label.group(0).rstrip("%")) for _, label in run]
-        if under_header or all(low < high for low, high in zip(counts, counts[1:])):
+        if not named_index and (under_header or all(low < high for low, high in zip(counts, counts[1:]))):
             for row, label in run:
                 lines[row] = " " * label.end() + lines[row][label.end():]
     return _SHAPE.sub(lambda match: " " * len(match.group(0)), "\n".join(lines))
