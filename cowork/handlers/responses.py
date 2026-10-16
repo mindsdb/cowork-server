@@ -55,10 +55,9 @@ from cowork.models.conversation import Conversation
 from cowork.models.message import Message
 from cowork.streaming import StreamBuffer, TurnLifecycle, new_buffer, registry, sse_frame
 from cowork.streaming.answer_text import accumulate_answer_text
-from cowork.streaming.backend import get_backend
 from cowork.streaming.liveness import ModelWaitTicker
 from cowork.streaming.records import TerminalReason
-from cowork.streaming.turn_index import record_turn
+from cowork.streaming.registry import RunHandle, RunIdentity
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
 from cowork.turnqueue.redis_client import (
     STALLED_CANCEL_REASON,
@@ -559,6 +558,7 @@ class ResponsesHandler:
         self.harness_name: str | None = None
         self.harness = None
         self.last_conversation_id: str | None = None
+        self.last_run_handle: RunHandle | None = None
         # Whether a person is watching this turn and can answer ask_user cards.
         self.interactive = interactive
 
@@ -655,7 +655,10 @@ class ResponsesHandler:
                 # the only channel by which a turn delete can tell this producer
                 # that the history it is writing into no longer exists (the handle
                 # it will be registered under does not exist yet).
-                lifecycle = TurnLifecycle()
+                lifecycle = TurnLifecycle(identity=RunIdentity(
+                    correlation_id=(turn_llm or {}).get("correlation_id") or str(uuid4()),
+                    remote=TurnQueueSettings().is_remote,
+                ))
 
                 def produce(buffer: StreamBuffer):
                     return self._select_producer(
@@ -684,6 +687,7 @@ class ResponsesHandler:
                     user_id=self.scope.user_id,
                     lifecycle=lifecycle,
                 )
+                self.last_run_handle = handle
                 return sse_from_buffer(handle.buffer, 0)
 
             # Non-streaming (legacy/rare): run synchronously within the request.
@@ -1092,18 +1096,7 @@ class ResponsesHandler:
             user_id=self.scope.user_id,
             lifecycle=lifecycle,
         )
-        # A direct answer still uses the shared Redis buffer in a multi-replica
-        # deployment. Register it just like a delegated turn so another replica
-        # can locate and replay that buffer. start() refuses a duplicate send,
-        # so the handle is always this turn's own.
-        if get_backend() == "redis":
-            await record_turn(
-                str(conversation_id),
-                turn_id=turn_id,
-                correlation_id=f"direct-{uuid4()}",
-                org_id=self.scope.org_id,
-                user_id=self.scope.user_id,
-            )
+        self.last_run_handle = handle
         return sse_from_buffer(handle.buffer, 0)
 
     @staticmethod
@@ -1188,6 +1181,7 @@ class ResponsesHandler:
                 "type": "response.created",
                 "sequence_number": 1,
                 "conversation_id": str(conv_id),
+                "run_id": lifecycle.identity.run_id,
                 "harness": "cowork-direct",
                 "user_message_id": str(saved.user_message_id),
                 "response": response.model_dump(),
@@ -1272,7 +1266,10 @@ class ResponsesHandler:
         a fresh one so a directly-called producer (tests) still has a flag to
         read.
         """
-        lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
+        lifecycle = lifecycle if lifecycle is not None else TurnLifecycle(identity=RunIdentity(
+            correlation_id=(turn_llm or {}).get("correlation_id") or str(uuid4()),
+            remote=TurnQueueSettings().is_remote,
+        ))
         if TurnQueueSettings().is_remote:
             return self._produce_remote(
                 lifecycle=lifecycle,
@@ -1684,7 +1681,10 @@ class ResponsesHandler:
         assistant turn and clears the question's pending flag in one commit.
         Never reaches the HTTP response: readers tail the buffer.
         """
-        lifecycle = lifecycle if lifecycle is not None else TurnLifecycle()
+        lifecycle = lifecycle if lifecycle is not None else TurnLifecycle(identity=RunIdentity(
+            correlation_id=(turn_llm or {}).get("correlation_id") or str(uuid4()),
+            remote=True,
+        ))
         # Scoped from the immutable principal captured at handler
         # construction, never from request state.
         scope = scope_from_principal(self.principal)
@@ -1704,7 +1704,7 @@ class ResponsesHandler:
         # those branches logs the id at WARNING or above, which is the floor
         # the deployed environments run at; this INFO line is only the
         # per-turn breadcrumb that ties a successful turn to its id in dev.
-        corr = (turn_llm or {}).get("correlation_id") or str(uuid4())
+        corr = lifecycle.identity.correlation_id
         logger.info(
             "[responses] remote turn conversation=%s correlation_id=%s", conv_id, corr,
         )
@@ -1993,6 +1993,7 @@ class ResponsesHandler:
                 **seed.workspace,
                 started_at=seed.started_at,
                 correlation_id=corr,
+                run_id=lifecycle.identity.run_id,
                 llm=(turn_llm or {}).get("llm"),
                 turn_key_id=(turn_llm or {}).get("turn_key_id"),
                 disabled=disabled,
@@ -2111,7 +2112,7 @@ class ResponsesHandler:
                 if first:
                     # The formatter's created frame lacks conversation_id +
                     # harness; inject them like the in-process path does.
-                    sse = self._inject_created(sse, conv_id, harness_id, question_id)
+                    sse = self._inject_created(sse, conv_id, harness_id, question_id, run_id=lifecycle.identity.run_id)
                     first = False
                 if self._sse_event_type(sse) == "response.completed":
                     # The formatter yields its terminal frame last, once its
@@ -2289,7 +2290,7 @@ class ResponsesHandler:
         # log line carries. This path has no pod and so no correlation id of its
         # own to reuse — a desktop turn's only trace is the local log, which is
         # exactly the report this id exists to make possible.
-        corr = str(uuid4())
+        corr = lifecycle.identity.correlation_id
 
         def event_sink(event_type: str, data: dict) -> None:
             # Tool block-rows are for LLM-history persistence, not UI replay —
@@ -2428,7 +2429,9 @@ class ResponsesHandler:
             async with model_wait.running(buffer=buffer):
                 async for sse_string in harness.formatter(stream, model, event_sink):
                     event_count += 1
-                    sse_string = self._inject_created(sse_string, conv_id, harness_id, question_id)
+                    sse_string = self._inject_created(
+                        sse_string, conv_id, harness_id, question_id, run_id=lifecycle.identity.run_id,
+                    )
                     if self._sse_event_type(sse_string) == "response.completed":
                         # The formatter yields its terminal frame last, once its
                         # source is exhausted, so event_sink has already seen
@@ -2693,6 +2696,8 @@ class ResponsesHandler:
         conversation_id: UUID,
         harness_id: str | None,
         user_message_id: UUID | None = None,
+        *,
+        run_id: str | None = None,
     ) -> str:
         """Inject conversation_id + harness into the response.created event so
         the client learns the canonical id and which agent generated this.
@@ -2710,9 +2715,11 @@ class ResponsesHandler:
             lines = sse_string.strip().split("\n")
             data_line = next(line for line in lines if line.startswith("data:"))
             payload = json.loads(data_line[5:])
-            if "conversation_id" in payload:
+            if "conversation_id" in payload and run_id is None:
                 return sse_string
-            payload["conversation_id"] = str(conversation_id)
+            payload.setdefault("conversation_id", str(conversation_id))
+            if run_id is not None:
+                payload["run_id"] = run_id
             if harness_id:
                 payload["harness"] = harness_id
             if user_message_id is not None:
