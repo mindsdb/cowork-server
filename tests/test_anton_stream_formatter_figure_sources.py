@@ -16,6 +16,7 @@ from anton.core.llm.provider import (
     StreamToolUseDelta,
     StreamToolUseEnd,
     StreamToolUseStart,
+    StreamTurnEnded,
     ToolCall,
     damaged_tool_call_result,
 )
@@ -103,6 +104,29 @@ class TestFigureSourcesEvent:
         # Recorded like every other event, so it saves with the answer and
         # comes back on reload.
         assert ("response.figure_sources", payload) in sink
+
+    async def test_a_turn_that_handed_back_gets_its_sources_before_the_incomplete_final_event(self):
+        events = await _run(
+            *_read_stock_cell(),
+            StreamTextDelta(text="Site S1 holds 250 units."),
+            StreamTurnEnded(ended_by="round_cap"),
+        )
+
+        assert [event_type for event_type, _ in events][-2:] == ["response.figure_sources", "response.completed"]
+        assert [(f["text"], f["origin"]) for f in events[-2][1]["figures"]] == [("250", "step")]
+        final = events[-1][1]["response"]
+        assert final["status"] == "incomplete"
+        assert final["incomplete_details"] == {"reason": "round_cap"}
+
+    async def test_a_turn_that_handed_back_on_antons_failure_reply_gets_no_sources(self):
+        events = await _run(
+            *_read_stock_cell(),
+            StreamTextDelta(text="An unexpected error occurred: Server returned 413 Payload Too Large"),
+            StreamTurnEnded(ended_by="retry_exhausted"),
+        )
+
+        assert "response.figure_sources" not in [event_type for event_type, _ in events]
+        assert events[-1][1]["response"]["incomplete_details"] == {"reason": "retry_exhausted"}
 
     async def test_a_file_the_pod_read_carries_its_path_in_the_project(self, tmp_path: Path):
         conversation_id = uuid4()

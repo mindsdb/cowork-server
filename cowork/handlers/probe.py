@@ -281,9 +281,11 @@ class ProbeHandler:
             if spec is None:
                 try:
                     vault = vault_for_scope(self.scope)
+                    extends_name = form_spec.get("_extends_connection")
                     slug = persist_connection(
-                        connector_id, method, name, credentials,
-                        label=connection_label, user_label=connection_user_label, vault=vault,
+                        connector_id, method, extends_name or name, credentials,
+                        label=connection_label, user_label=connection_user_label,
+                        extends=bool(extends_name), vault=vault,
                     )
                     saved_record = vault.read_record(connector_id, slug) or {}
                     saved_user_label = str(saved_record.get("fields", {}).get("_user_label", "")).strip() or None

@@ -78,6 +78,23 @@ class ResponseStatus(str, Enum):
     created = "created"
     in_progress = "in_progress"
     completed = "completed"
+    # Answered, but the turn stopped early (a limit or another hand-back).
+    incomplete = "incomplete"
+
+
+class IncompleteDetails(BaseModel):
+    # A str, not a Literal: a new hand-back in anton must not break the final frame.
+    reason: str = Field(
+        description=(
+            "Why the turn stopped before it finished (anton's `ended_by`): "
+            "`spend_ceiling` (the token budget), `round_cap` (the step limit), "
+            "`handback_budget` (automatic continuations ran out), "
+            "`handback_verifier_failure` (the completion check returned no verdict), "
+            "`handback_stuck` (the completion check judged the task stuck) or "
+            "`retry_exhausted` (repeated errors). Treat any other value as a stop "
+            "for an unlisted reason."
+        ),
+    )
 
 
 class ResponseOutput(BaseModel):
@@ -100,6 +117,8 @@ class Response(BaseModel):
     created_at: int = Field(default_factory=lambda: int(time.time()))
     status: ResponseStatus
     error: str | None = None
+    # Always present, null unless status is incomplete — as in OpenAI's schema.
+    incomplete_details: IncompleteDetails | None = None
     model: str | None = None  # The model can be set to None here because of the reasons mentioned in the request schema.
     output: list[ResponseOutput] = Field(default_factory=list)
     # TODO: There are some other that have not been included here. Are they needed?

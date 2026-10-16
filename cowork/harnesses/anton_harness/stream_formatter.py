@@ -38,6 +38,7 @@ from cowork.harnesses.anton_harness.figure_sources import (
 )
 from cowork.schemas.figure_sources import FigureOrigin
 from cowork.schemas.responses import (
+    IncompleteDetails,
     Response,
     ResponseOutput,
     ResponseOutputContent,
@@ -455,6 +456,7 @@ async def format_responses_stream(
         StreamToolUseDelta,
         StreamToolUseEnd,
         StreamToolUseStart,
+        StreamTurnEnded,
     )
 
     # StreamReasoningDelta is newer than the rest — it arrived with the
@@ -498,6 +500,8 @@ async def format_responses_stream(
     # What the last spent boundary set aside, returned if the turn hands back
     # instead of delivering the replacement it promised.
     superseded_stash = ""
+    # Why a turn that handed back stopped (anton's `ended_by`); None if it finished.
+    ended_by: str | None = None
 
     def _event(event_type: str, data: dict) -> str:
         # Wall-clock millisecond stamp on every event. The renderer
@@ -966,8 +970,14 @@ async def format_responses_stream(
             # text the user never saw, so it can't glue the visible rounds.
             round_had_text = False
 
+        elif isinstance(event, StreamTurnEnded):
+            ended_by = event.ended_by
+
     full_text = "".join(collected_text)
-    # A stopped, failed or stalled turn never reaches this line, so its partial answer carries no figure sources.
+    # A turn the user stops, or one that fails or stalls, never reaches this
+    # line, so its partial answer carries no figure sources. A turn that
+    # handed back (ended_by) does: its answer is whole, so its figures get
+    # sources as a finished turn's do, before the final event.
     sources = FigureSources() if failure_reply else await find_answer_sources(TurnEvidence(
         answer=full_text,
         question=turn_context.question,
@@ -987,10 +997,13 @@ async def format_responses_stream(
             "item_id": msg_id,
             **sources.model_dump(mode="json"),
         })
+    # Still response.completed, so every client sees the answer end; the
+    # status says it stopped early. The message itself is whole either way.
     resp_completed = Response(
         id=resp_id,
         model=model,
-        status=ResponseStatus.completed,
+        status=ResponseStatus.incomplete if ended_by else ResponseStatus.completed,
+        incomplete_details=IncompleteDetails(reason=ended_by) if ended_by else None,
         output=[ResponseOutput(
             id=msg_id,
             status=ResponseStatus.completed,
