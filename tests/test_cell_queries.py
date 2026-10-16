@@ -656,7 +656,7 @@ class TestRequestsACellMakes:
             r = requests.get(f"{base}/stock")
         """), names={})
 
-        assert "https://api.example.com" in reading.strings
+        assert reading.strings == ("https://api.example.com", "{base}/stock")
         assert [str(request) for request in reading.requests] == ["GET {base}/stock"]
 
     def test_a_get_on_a_name_holding_a_url_word_only_inside_another_word_is_not_a_request(self):
