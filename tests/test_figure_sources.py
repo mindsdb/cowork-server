@@ -1370,6 +1370,192 @@ class TestSecretsInQueries:
         assert FigureSources.model_validate_json(event).steps[0].queries == sent
         assert "XyZhunter2" not in event
 
+    @pytest.mark.parametrize(("sql", "listed"), [
+        (
+            "SELECT q'[a']' FROM dual; CREATE USER bob IDENTIFIED BY XyZs3cr3t; SELECT 'b' FROM dual",
+            "SELECT q'[a']' FROM dual; CREATE USER bob IDENTIFIED BY [redacted]; SELECT 'b' FROM dual",
+        ),
+        (
+            "SELECT a FROM t WHERE b = `; CREATE USER bob PASSWORD 'XyZs3cr3t'; --`",
+            "SELECT a FROM t WHERE b = `; CREATE USER bob PASSWORD '[redacted]'; --`",
+        ),
+        (
+            "SELECT 'ALTER USER bob IDENTIFIED BY XyZs3cr3t' AS ddl FROM dual",
+            "SELECT 'ALTER USER bob IDENTIFIED BY [redacted]' AS ddl FROM dual",
+        ),
+        (
+            'SELECT \'CREATE USER "bob" IDENTIFIED WITH mysql_native_password BY "XyZs3cr3t"\' AS ddl FROM t',
+            'SELECT \'CREATE USER "bob" IDENTIFIED WITH mysql_native_password BY "[redacted]"\' AS ddl FROM t',
+        ),
+        (
+            'SELECT \'CREATE ROLE bob LOGIN ENCRYPTED PASSWORD "XyZs3cr3t"\' AS ddl FROM t',
+            'SELECT \'CREATE ROLE bob LOGIN ENCRYPTED PASSWORD "[redacted]"\' AS ddl FROM t',
+        ),
+        (
+            'SELECT \'CREATE SECRET (TYPE S3, KEY_ID "AKIAEXAMPLE", SECRET "XyZs3cr3t")\' AS ddl FROM t',
+            'SELECT \'CREATE SECRET (TYPE S3, KEY_ID "AKIAEXAMPLE", SECRET "[redacted]")\' AS ddl FROM t',
+        ),
+        (
+            'SELECT \'SET PASSWORD FOR "app"@"%" = "XyZs3cr3t"\' AS ddl FROM t',
+            'SELECT \'SET PASSWORD FOR "app"@"%" = "[redacted]"\' AS ddl FROM t',
+        ),
+        (
+            'SELECT \'CREATE USER app IDENTIFIED BY PASSWORD "*XyZs3cr3t"\' AS ddl FROM t',
+            'SELECT \'CREATE USER app IDENTIFIED BY PASSWORD "[redacted]"\' AS ddl FROM t',
+        ),
+        (
+            'SELECT "CREATE USER \'bob\'@\'%\' IDENTIFIED WITH \'mysql_native_password\' BY \'XyZs3cr3t\'" AS ddl FROM t',
+            'SELECT "CREATE USER \'bob\'@\'%\' IDENTIFIED WITH \'mysql_native_password\' BY \'[redacted]\'" AS ddl FROM t',
+        ),
+        (
+            'SELECT \'CREATE USER "bob" IDENTIFIED WITH "mysql_native_password" BY "XyZs3cr3t"\' AS ddl FROM t',
+            'SELECT \'CREATE USER "bob" IDENTIFIED WITH "mysql_native_password" BY "[redacted]"\' AS ddl FROM t',
+        ),
+        (
+            'SELECT \'CREATE USER "bob" IDENTIFIED WITH `caching_sha2_password` BY "XyZs3cr3t"\' AS ddl FROM t',
+            'SELECT \'CREATE USER "bob" IDENTIFIED WITH `caching_sha2_password` BY "[redacted]"\' AS ddl FROM t',
+        ),
+        (
+            'SELECT \'CREATE USER "bob" IDENTIFIED WITH caching_sha2_password AS "XyZs3cr3t"\' AS ddl FROM t',
+            'SELECT \'CREATE USER "bob" IDENTIFIED WITH caching_sha2_password AS "[redacted]"\' AS ddl FROM t',
+        ),
+        (
+            'SELECT \'ALTER USER bob IDENTIFIED BY VALUES "S:XyZs3cr3t"\' AS ddl FROM dual',
+            'SELECT \'ALTER USER bob IDENTIFIED BY VALUES "[redacted]"\' AS ddl FROM dual',
+        ),
+        (
+            'SELECT \'ALTER USER "bob" IDENTIFIED BY "XyZnew" REPLACE "XyZs3cr3t"\' AS ddl FROM t',
+            'SELECT \'ALTER USER "bob" IDENTIFIED BY "[redacted]" REPLACE "[redacted]"\' AS ddl FROM t',
+        ),
+        (
+            "SELECT q'[a']' FROM dual; ALTER USER bob IDENTIFIED BY XyZnew REPLACE XyZs3cr3t; SELECT 'b' FROM dual",
+            "SELECT q'[a']' FROM dual; ALTER USER bob IDENTIFIED BY [redacted] REPLACE [redacted]; SELECT 'b' FROM dual",
+        ),
+        (
+            'SELECT \'ALTER USER "bob" IDENTIFIED BY RANDOM PASSWORD REPLACE "XyZs3cr3t"\' AS ddl FROM t',
+            'SELECT \'ALTER USER "bob" IDENTIFIED BY RANDOM PASSWORD REPLACE "[redacted]"\' AS ddl FROM t',
+        ),
+        (
+            "SELECT a FROM t WHERE b = `; ALTER ROLE bob PASSWORD E'XyZs3cr3t'; --`",
+            "SELECT a FROM t WHERE b = `; ALTER ROLE bob PASSWORD E'[redacted]'; --`",
+        ),
+        (
+            "SELECT a FROM t WHERE b = `; CREATE USER bob IDENTIFIED BY N'XyZs3cr3t'; --`",
+            "SELECT a FROM t WHERE b = `; CREATE USER bob IDENTIFIED BY N'[redacted]'; --`",
+        ),
+        (
+            "SELECT a FROM t WHERE b = `; CREATE USER bob IDENTIFIED BY _utf8mb4'XyZs3cr3t'; --`",
+            "SELECT a FROM t WHERE b = `; CREATE USER bob IDENTIFIED BY _utf8mb4'[redacted]'; --`",
+        ),
+        (
+            'SELECT \'CREATE SECRET (TYPE S3, KEY_ID "AKIAEXAMPLE", SECRET "XyZa", SESSION_TOKEN "XyZs3cr3t")\' AS ddl FROM t',
+            'SELECT \'CREATE SECRET (TYPE S3, KEY_ID "AKIAEXAMPLE", SECRET "[redacted]", SESSION_TOKEN "[redacted]")\' AS ddl FROM t',
+        ),
+        (
+            'SELECT \'CREATE SECRET (TYPE AZURE, TENANT_ID "t", CLIENT_ID "c", CLIENT_SECRET "XyZs3cr3t")\' AS ddl FROM t',
+            'SELECT \'CREATE SECRET (TYPE AZURE, TENANT_ID "t", CLIENT_ID "c", CLIENT_SECRET "[redacted]")\' AS ddl FROM t',
+        ),
+        (
+            'SELECT \'CREATE SECRET (TYPE AZURE, ACCOUNT_NAME "a", ACCOUNT_KEY "XyZs3cr3t")\' AS ddl FROM t',
+            'SELECT \'CREATE SECRET (TYPE AZURE, ACCOUNT_NAME "a", ACCOUNT_KEY "[redacted]")\' AS ddl FROM t',
+        ),
+        (
+            'SELECT \'CREATE SECRET hf (TYPE HUGGINGFACE, TOKEN "XyZs3cr3t")\' AS ddl FROM t',
+            'SELECT \'CREATE SECRET hf (TYPE HUGGINGFACE, TOKEN "[redacted]")\' AS ddl FROM t',
+        ),
+        (
+            'SELECT \'CREATE SERVER s FOREIGN DATA WRAPPER w OPTIONS (sfPassword "XyZs3cr3t")\' AS ddl FROM t',
+            'SELECT \'CREATE SERVER s FOREIGN DATA WRAPPER w OPTIONS (sfPassword "[redacted]")\' AS ddl FROM t',
+        ),
+    ], ids=[
+        "oracle-q-quote-split-miss", "backtick-split-miss", "identified-by-in-a-literal", "identified-with-a-plugin",
+        "password-keyword", "secret-keyword", "set-password-for", "identified-by-password-hash",
+        "identified-with-a-quoted-plugin", "identified-with-a-double-quoted-plugin",
+        "identified-with-a-backticked-plugin", "identified-with-a-plugin-as-a-hash", "identified-by-values",
+        "replace-quoted", "replace-bare", "random-password-replace", "postgres-escape-string", "national-string",
+        "charset-introducer", "duckdb-s3-session-token", "duckdb-azure-client-secret", "duckdb-azure-account-key",
+        "duckdb-huggingface-token", "foreign-server-option",
+    ])
+    def test_a_password_a_statement_sets_by_keyword_is_masked(self, sql: str, listed: str):
+        """A split the readings miss lists the statement after a query, and a
+        literal may hold DDL. IDENTIFIED BY, a secret key's name before a
+        quoted value, and REPLACE after a new password set a password without
+        a key=value pair."""
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        event = _event(step)
+
+        assert FigureSources.model_validate_json(event).steps[0].queries == [listed]
+        assert "XyZs3cr3t" not in event
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT 'Your password ' || name FROM users",
+        "SELECT CONCAT('Temporary password ', name, '!') FROM users",
+        "SELECT a FROM t WHERE label = 'top secret ' AND owner = 'bob'",
+        "SELECT a FROM t WHERE brand = 'Victoria''s Secret ' AND qty > 0 AND region = 'EU'",
+        "SELECT 'Users identified by ' || name FROM users",
+        "SELECT 'CREATE USER bob IDENTIFIED BY RANDOM PASSWORD' AS ddl FROM t",
+    ], ids=[
+        "password-then-concatenation", "password-then-argument", "secret-then-and", "doubled-quote-then-secret",
+        "identified-by-then-concatenation", "random-password",
+    ])
+    def test_a_literal_that_ends_in_a_keyword_keeps_the_sql_after_it(self, sql: str):
+        """The quote that closes a literal ending in PASSWORD, SECRET or
+        IDENTIFIED BY is followed by a space, a comma or a ), so it is not
+        read as a password's opening quote, which would mask the SQL up to
+        the next quote. RANDOM PASSWORD sets no password the text holds."""
+        step = _cell("toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        assert FigureSources.model_validate_json(_event(step)).steps[0].queries == [sql]
+
+    @pytest.mark.parametrize(("text", "masked"), [
+        (
+            "CREATE USER u IDENTIFIED BY secret_token=ab'XyZs3cr3t",
+            "CREATE USER u IDENTIFIED BY [redacted]",
+        ),
+        (
+            "SELECT q'[a']' FROM dual; ALTER USER bob IDENTIFIED BY pwd=XyZ(abc)XyZs3cr3t; SELECT 'b' FROM dual",
+            "SELECT q'[a']' FROM dual; ALTER USER bob IDENTIFIED BY [redacted]; SELECT 'b' FROM dual",
+        ),
+        (
+            "CREATE USER u IDENTIFIED BY token}Bearer XyZs3cr3t0123",
+            "CREATE USER u IDENTIFIED BY [redacted] [redacted]",
+        ),
+    ], ids=["key-value-with-a-quote", "key-value-with-parentheses", "bearer-token"])
+    @pytest.mark.parametrize("where", ["label", "query"])
+    def test_identified_by_leaves_a_key_or_bearer_value_to_its_own_rule(self, text: str, masked: str, where: str):
+        """IDENTIFIED BY's unquoted value stops at a quote or a parenthesis,
+        so it runs after the key=value and bearer rules have masked the
+        whole value whose key or Bearer it would take."""
+        sql = text if text.startswith("SELECT") else f"SELECT qty FROM stock -- {text}"
+        step = _cell(
+            "toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n",
+            description=f"Run {text}" if where == "label" else "Read stock",
+        )
+
+        event = _event(step)
+
+        [step_out] = FigureSources.model_validate_json(event).steps
+        if where == "label":
+            assert step_out.label == f"Run {masked}"
+        else:
+            assert step_out.queries == [masked if text.startswith("SELECT") else f"SELECT qty FROM stock -- {masked}"]
+        assert "XyZ" not in event
+
+    @pytest.mark.parametrize("description", [
+        "Reset the password policy", "Count secret santa entries", 'Check the "password": "x" key',
+    ])
+    def test_a_word_after_password_or_secret_that_is_not_quoted_stays(self, description: str):
+        """PASSWORD and SECRET mask only a quoted value after a space, so prose
+        and a JSON key keep their words."""
+        step = _cell(
+            "toolu_k", code="print(query_minds_data('SELECT qty FROM stock'))", stdout="42\n", description=description,
+        )
+
+        [step_out] = FigureSources.model_validate_json(_event(step)).steps
+
+        assert step_out.label == description.replace('"x"', '"[redacted]"')
+
     @pytest.mark.parametrize(("literal", "redacted"), [
         ("password => 'x9secret'", "password => '[redacted]'"),
         ('password=>"x9secret"', 'password=>"[redacted]"'),
@@ -1398,12 +1584,18 @@ class TestSecretsInQueries:
             # and escaped quotes.
             "pwd={" + "x;" * 50_000, ("a[" + "b" * 127 + "]/") * 700, ('a["' + "b" * 127 + "/") * 700,
             "x://o'b\\\"c" * 12_500,
+            # Keywords that start a password a statement sets, each without
+            # its value or with a plugin's quote left open, and a REPLACE
+            # after each masked password.
+            ("password for " + "x" * 250 + " ") * 380, "identified with p by\t" * 4_800,
+            ('identified with "' + "p" * 60 + " ") * 850, "identified by x replace " * 2_700,
         ],
         ids=[
             "word", "secret-key", "userinfo", "quoted-userinfo", "jwt",
             "doubled-quote-user", "long-user", "ezconnect-quoted", "query-string", "ezconnect-quoted-user",
             "ezconnect-near-miss-keys", "open-brace-value", "ezconnect-proxy", "ezconnect-proxy-open-quote",
-            "quoted-user",
+            "quoted-user", "keyword-password-for", "keyword-identified", "keyword-open-quoted-plugin",
+            "keyword-replace",
         ],
     )
     def test_a_long_query_is_redacted_quickly(self, filler: str):

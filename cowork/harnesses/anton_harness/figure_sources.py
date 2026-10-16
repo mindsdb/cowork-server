@@ -465,15 +465,71 @@ _SENSITIVE_NAME = (
 # What joins a key to its value: =, :, or => as Ruby and PHP write it. Once
 # => matched, the = is never read alone, which would take the > as a value.
 _ASSIGN = r"[ \t]*(?>=>|[:=])[ \t]*"
-# A secret key's value in quotes after its key, the key quoted or not:
-# password='a b c', "token": "x", 'Authorization': 'Bearer x'. A doubled
-# quote inside the value is a quote, as SQL writes it. The quotes stay, so the
-# SQL around the value still reads. Multiline values retain one boundary;
-# an unclosed value is redacted through the end of the input.
-_QUOTED_SECRET = re.compile(
-    rf"(?P<key>(?<![\w.-])[\"']?{_SENSITIVE_NAME}[\"']?{_ASSIGN})"
+# A value in quotes. A doubled quote inside the value is a quote, as SQL
+# writes it. The quotes stay, so the SQL around the value still reads.
+# Multiline values retain one boundary; an unclosed value is redacted through
+# the end of the input. Linear: possessive, and it never fails once its
+# opening quote matched.
+_QUOTED_VALUE = (
     r"(?:(?P<single>')(?:''|\\[\s\S]|[^'\\])*+(?P<single_close>')?"
-    r"|(?P<double>\")(?:\"\"|\\[\s\S]|[^\"\\])*+(?P<double_close>\")?)",
+    r"|(?P<double>\")(?:\"\"|\\[\s\S]|[^\"\\])*+(?P<double_close>\")?)"
+)
+# A secret key's value in quotes after its key, the key quoted or not:
+# password='a b c', "token": "x", 'Authorization': 'Bearer x'.
+_QUOTED_SECRET = re.compile(
+    rf"(?P<key>(?<![\w.-])[\"']?{_SENSITIVE_NAME}[\"']?{_ASSIGN}){_QUOTED_VALUE}",
+    re.IGNORECASE,
+)
+# The rules below mask a password a SQL statement sets with a keyword rather
+# than a key=value pair, which a split the readings miss can list after a
+# query (cell_queries._statements) and a string literal can hold.
+#
+# A string's introducer before its opening quote: Postgres's E'', a national
+# N'' string or MySQL's _charset'' (_utf8mb4'x'). It stays with the key.
+_INTRODUCER = r"(?:(?:[EeNn]|_\w{1,32}+)(?=['\"]))?"
+# A value's opening quote, followed by the value's first character rather
+# than a space, a comma or a ). The quote that closes a literal ending in a
+# keyword and a space ('Your password ' || name) is followed by one of
+# those, so it is not read as the opening quote of a value that would run on
+# to the next quote or the end of the text.
+_VALUE_START = r"(?=['\"](?:['\"]|[^\s,)]))"
+# A quoted value after a secret key's name and whitespace, the key quoted or
+# not (Postgres's CREATE ROLE ... PASSWORD 'x', DuckDB's CREATE SECRET (...,
+# SECRET 'x', SESSION_TOKEN 'y'), a foreign server's OPTIONS (password 'x')),
+# or after PASSWORD FOR <user> = (MySQL's SET PASSWORD FOR app = 'x').
+# Linear: a key starts where a word starts and reads at most 64 characters
+# each side of its secret word, every other run in the key is possessive or
+# bounded, and the value never fails once its opening quote matched.
+_KEYWORD_SECRET = re.compile(
+    rf"(?P<key>(?:\bpassword\s++for\s++[^\s=]{{1,256}}+\s*+=\s*+|(?<![\w.-])[\"']?{_SENSITIVE_NAME}[\"']?\s++)"
+    rf"{_INTRODUCER}){_VALUE_START}{_QUOTED_VALUE}",
+    re.IGNORECASE,
+)
+# A MySQL authentication plugin's name: bare, quoted or in backticks.
+_PLUGIN = r"(?:[\w$]{1,64}+|'[^'\n]{1,64}+'|\"[^\"\n]{1,64}+\"|`[^`\n]{1,64}+`)"
+# The value after IDENTIFIED BY, quoted or not: Oracle's IDENTIFIED BY x and
+# IDENTIFIED BY VALUES 'hash', and MySQL's IDENTIFIED BY 'x', IDENTIFIED BY
+# PASSWORD 'hash' and IDENTIFIED WITH <plugin> BY 'x' or AS 'hash'. PASSWORD
+# and VALUES stay with the key, and RANDOM PASSWORD, which sets a password
+# the text does not hold, stays as written. An unquoted value starts after
+# whitespace. Linear: the keyword starts where a word starts, every run in
+# the key is possessive or bounded, and the value never fails once its first
+# character matched.
+_IDENTIFIED_BY = re.compile(
+    rf"(?P<key>\bidentified(?:\s++with\s++{_PLUGIN}\s++(?:by|as)|\s++by)\b(?:\s++(?:password|values)\b)?\s*+"
+    rf"{_INTRODUCER})(?!random\s++password\b)(?:{_VALUE_START}{_QUOTED_VALUE}|(?<=\s)(?P<bare>[^\s,;'\"()]++))",
+    re.IGNORECASE,
+)
+# The current password MySQL's ALTER USER and SET PASSWORD and Oracle's ALTER
+# USER name after REPLACE, once the new password before it is masked
+# (IDENTIFIED BY 'new' REPLACE 'current') or after MySQL's RANDOM PASSWORD.
+# REPLACE counts only right after the mask or RANDOM PASSWORD, so a REPLACE
+# in prose or in a query keeps its words. Linear: a match starts only at the
+# mask or at RANDOM, and the value never fails once its first character
+# matched.
+_REPLACED_SECRET = re.compile(
+    rf"(?P<key>(?:{re.escape(_REDACTED)}['\"]?|\brandom\s++password)\s++replace\s++{_INTRODUCER})"
+    rf"(?:{_VALUE_START}{_QUOTED_VALUE}|(?P<bare>[^\s,;'\"()]++))",
     re.IGNORECASE,
 )
 # A secret key's unquoted value, up to a space, a comma, a semicolon, an
@@ -900,6 +956,14 @@ def _redacted(text: str) -> str:
       length, and the path of a Slack, Discord, Teams, Zapier, IFTTT or
       Telegram bot URL;
     - a bearer token;
+    - a password a SQL statement sets with a keyword (``_KEYWORD_SECRET``,
+      ``_IDENTIFIED_BY``, ``_REPLACED_SECRET``): a quoted value after a
+      secret key's name and whitespace (PASSWORD 'x', DuckDB's SECRET 'x'
+      and SESSION_TOKEN 'x', OPTIONS (sfPassword 'x')) or after PASSWORD FOR
+      <user> =; the value after IDENTIFIED BY, IDENTIFIED BY PASSWORD or
+      VALUES, or IDENTIFIED WITH <plugin> BY or AS, the plugin and the value
+      quoted or not; and the current password after REPLACE. A string's
+      introducer (E'x', N'x', _utf8mb4'x') stays before the mask;
     - the value of a key=value, key: value or key => value pair, quoted or
       not, with any auth scheme before it, whose key's name holds password,
       passwd, passphrase, pwd, secret, token, api key, access key, account
@@ -932,7 +996,19 @@ def _redacted(text: str) -> str:
       as one;
     - the value of a key whose name has more than 64 characters before or
       after the secret word in it: ``_SENSITIVE_NAME`` reads at most 64 on
-      each side, which keeps it linear.
+      each side, which keeps it linear;
+    - a quoted value inside another string literal, whose quotes SQL
+      doubles (password=''x'' or PASSWORD ''x'' inside '...'): the rule
+      reads the first doubled quote as an empty value;
+    - a password a statement sets that starts with a space, a comma or a )
+      (PASSWORD ' x'): the keyword rules read that quote as the one that
+      closes a literal ending in the keyword ('Your password ' || name);
+    - a password set after a secret key's name in dollar quotes (PASSWORD
+      $$x$$), with no space or with a comment between the name and the
+      value (PASSWORD'x', PASSWORD /* c */ 'x'), or through MySQL's
+      PASSWORD() function (SET PASSWORD FOR bob = PASSWORD('x')):
+      ``_KEYWORD_SECRET`` reads only a quote right after the name's
+      whitespace or the =.
 
     It masks more than the secret in these cases, on display only:
 
@@ -964,7 +1040,11 @@ def _redacted(text: str) -> str:
       by anything followed by an @ (a[1]/b@x), reads as an EZConnect string
       and becomes ***@x;
     - a secret key's value that opens with a brace and has no closing
-      brace: it is masked to the end of its line.
+      brace: it is masked to the end of its line;
+    - the word after "identified by" in prose ("rows identified by
+      region"), and a quoted word after a secret key's name and whitespace,
+      in prose or as a column's quoted alias ("the secret 'sauce'",
+      password_hash "Hash"): they read as a password a statement sets.
 
     A connector whose credential has a key name or shape not listed here
     adds it to ``_SENSITIVE_NAME`` or ``_SECRET_SHAPE``, with a case in
@@ -984,8 +1064,15 @@ def _redacted(text: str) -> str:
     text = _SECRET_URL_PATH.sub(r"\g<service>***", text)
     text = _QUERY_STRING.sub(_masked_query_string, text)
     text = _QUOTED_SECRET.sub(_redacted_quoted_value, text)
+    text = _KEYWORD_SECRET.sub(_redacted_quoted_value, text)
     text = _BARE_SECRET.sub(lambda match: match["key"] + _REDACTED, text)
     text = _BEARER.sub(lambda match: match["scheme"] + _REDACTED, text)
+    # IDENTIFIED BY runs after the key=value and bearer rules: its unquoted
+    # value stops at a quote or a parenthesis, and its mask takes the key's
+    # name or the Bearer those rules need, so run first it would leave the
+    # rest of their value. REPLACE reads the mask before it, so it runs last.
+    text = _IDENTIFIED_BY.sub(_redacted_keyword_value, text)
+    text = _REPLACED_SECRET.sub(_redacted_keyword_value, text)
     return text
 
 
@@ -1014,6 +1101,12 @@ def _redacted_quoted_value(match: re.Match[str]) -> str:
     quote = match["single"] or match["double"]
     close = match["single_close"] or match["double_close"] or ""
     return match["key"] + quote + _REDACTED + close
+
+
+def _redacted_keyword_value(match: re.Match[str]) -> str:
+    """An ``_IDENTIFIED_BY`` or ``_REPLACED_SECRET`` match with its value
+    redacted: inside its quotes when it has them, whole when it is bare."""
+    return match["key"] + _REDACTED if match["bare"] else _redacted_quoted_value(match)
 
 
 def _capped(text: str, *, limit: int) -> str:
