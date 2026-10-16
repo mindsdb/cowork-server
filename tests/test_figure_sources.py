@@ -2244,11 +2244,143 @@ class TestFrameRowLabels:
         (_printed_frame([18, 37, 35]), "$37"),
         (_printed_frame([8]), "$8"),
         ("0    250\n1     90\n2    250\nName: qty, dtype: int64\n", "$2"),
+        # The prints below are pandas 3.0.6's.
+        pytest.param(
+            "3      7\n2     40\n1     90\n0    250\nName: qty, dtype: int64\n", "$2",
+            id="print(df.qty.sort_values()), row numbers out of order",
+        ),
+        pytest.param(
+            "Top sites\n4    300\n0    250\n1     90\nName: qty, dtype: int64\n", "$4",
+            id="print('Top sites'); print(df.qty.nlargest(3)), a caption over row numbers",
+        ),
+        pytest.param(
+            "   perf  qty\n0 -1.25  250\n1  3.50   90\n2 -4.75   40\n", "$2",
+            id="print(df), one space before a negative first value",
+        ),
+        pytest.param(
+            "     qty\n99  1099\n98  1098\n97  1097\n96  1096\n95  1095\n..   ...\n"
+            "4   1004\n3   1003\n2   1002\n1   1001\n0    250\n\n[100 rows x 1 columns]\n", "$3",
+            id="print(df.sort_values('qty', ascending=False)) of 100 rows",
+        ),
     ])
     def test_a_row_label_or_shape_footer_is_not_a_source(self, stdout: str, invented: str):
         answer = f"S1 holds 250 units; the rate is {invented}."
 
         assert _printed(stdout, answer=answer) == [("250", FigureOrigin.step), (invented, FigureOrigin.none)]
+
+    @pytest.mark.parametrize("stdout", [
+        # The prints are pandas 3.0.6's.
+        # print(df.pivot_table(index='year', columns='region', values='sales', aggfunc='sum'))
+        "region    east    west\nyear                  \n2023    1200.0  3400.0\n2024    2600.0  2600.0\n"
+        "2025     900.0     NaN\n",
+        # print(pd.crosstab(df.year, df.region))
+        "region  east  west\nyear              \n2023       1     1\n2024       1     1\n2025       1     0\n",
+        # print(df.groupby('fiscal year')[['sales']].sum())
+        "             sales\nfiscal year       \n2023          4600\n2024          5200\n2025           900\n",
+        # print(df.groupby(['year', 'region'])['sales'].sum())
+        "year  region\n2023  east      1200\n      west      3400\n2024  east      2600\n      west      2600\n"
+        "2025  east       900\nName: sales, dtype: int64\n",
+    ], ids=["pivot_table with named columns", "crosstab", "frame index name with a space", "MultiIndex Series"])
+    def test_a_named_index_is_read_with_named_columns_a_spaced_name_or_a_multiindex(self, stdout: str):
+        assert _printed(stdout, answer="Sales peaked in 2024, after 2023, and fell in 2025.") == [
+            ("2024", FigureOrigin.step), ("2023", FigureOrigin.step), ("2025", FigureOrigin.step),
+        ]
+
+    @pytest.mark.parametrize("stdout", [
+        # The prints are pandas 3.0.6's, of 100 rows indexed by year.
+        # print(df.set_index('year')['v'])
+        "year\n1990     0\n1991     1\n1992     2\n1993     3\n1994     4\n        ..\n2085    95\n2086    96\n"
+        "2087    97\n2088    98\n2089    99\nName: v, Length: 100, dtype: int64\n",
+        # print(df.set_index('year'))
+        "       v   w\nyear        \n1990   0   0\n1991   1   1\n1992   2   2\n1993   3   3\n1994   4   4\n"
+        "...   ..  ..\n2085  95  95\n2086  96  96\n2087  97  97\n2088  98  98\n2089  99  99\n"
+        "\n[100 rows x 2 columns]\n",
+    ], ids=["Series", "frame"])
+    def test_a_truncated_named_index_is_read_on_both_sides_of_the_cut(self, stdout: str):
+        assert _printed(stdout, answer="Year 1991 had 1 and year 2087 had 97.") == [
+            ("1991", FigureOrigin.step), ("1", FigureOrigin.step),
+            ("2087", FigureOrigin.step), ("97", FigureOrigin.step),
+        ]
+
+    @pytest.mark.parametrize(("stdout", "answer", "read"), [
+        # The prints are pandas 3.0.6's, of frames wider than its 80-column
+        # display, so it cuts columns out and marks them with "..." on every
+        # line, the index name line included.
+        # print(df.set_index('rank'))
+        (
+            "        sku product_type        supplier  ...  carrier  inspection defect_rate\n"
+            "rank                                      ...                                 \n"
+            "1     SKU51     haircare     Wise Supply  ...      DHL     Pending        0.41\n"
+            "2     SKU38    cosmetics     Wise Supply  ...    FedEx     Pending        2.32\n"
+            "3     SKU31     skincare  Organic Supply  ...    FedEx     Pending        1.12\n"
+            "4     SKU90     skincare  Organic Supply  ...    FedEx        Pass        3.05\n"
+            "5      SKU2     haircare       SupplyMax  ...    FedEx     Pending        0.27\n"
+            "\n[5 rows x 8 columns]\n",
+            "Rank 5 had a defect rate of 0.27.", ["5", "0.27"],
+        ),
+        # print(df.set_index(['store', 'rank']))
+        (
+            "              sku product_type        supplier  ...  lead_time  carrier inspection\n"
+            "store rank                                      ...                               \n"
+            "1     1     SKU51     haircare     Wise Supply  ...         18      DHL    Pending\n"
+            "      2     SKU38    cosmetics     Wise Supply  ...         10    FedEx    Pending\n"
+            "2     1     SKU31     skincare  Organic Supply  ...         24    FedEx    Pending\n"
+            "      2     SKU90     skincare  Organic Supply  ...          8    FedEx       Pass\n"
+            "3     1      SKU2     haircare       SupplyMax  ...         12    FedEx    Pending\n"
+            "\n[5 rows x 7 columns]\n",
+            "Store 3 had a lead time of 12 days.", ["3", "12"],
+        ),
+        # print(df.pivot_table(index='year', columns='sub_category', values='sales', aggfunc='sum'))
+        (
+            "sub_category  Acoustic Privacy Panel  ...  Smart Ergonomic Chair\n"
+            "year                                  ...                       \n"
+            "2024                       242540.11  ...              144700.00\n"
+            "2025                       225538.21  ...              161280.85\n"
+            "\n[2 rows x 4 columns]\n",
+            "Chairs sold 161,280.85 in 2025, after 2024.", ["161,280.85", "2025", "2024"],
+        ),
+    ], ids=["set_index", "MultiIndex", "pivot_table"])
+    def test_a_named_index_is_read_where_pandas_cut_columns_out(self, stdout: str, answer: str, read: list[str]):
+        assert _printed(stdout, answer=answer) == [(text, FigureOrigin.step) for text in read]
+
+    @pytest.mark.parametrize("stdout", [
+        # The prints are pandas 3.0.6's.
+        # print(df.pivot_table(index='year', columns='region', values='sales', aggfunc='sum').reset_index())
+        "region  year    east    west\n0       2023  1200.0  3400.0\n1       2024  2600.0  2600.0\n"
+        "2       2025   900.0     NaN\n",
+        # print(df.pivot_table(index='year', columns='region', values=['sales', 'profit'],
+        #                      aggfunc='sum').reset_index()): the columns' level names, unpadded,
+        # under an indented header.
+        "        year profit         sales        \nregion         east  west    east    west\n"
+        "0       2023   10.0  20.0  1200.0  3400.0\n1       2024   30.0  40.0  2600.0  2600.0\n"
+        "2       2025   50.0   NaN   900.0     NaN\n",
+    ], ids=["one columns level", "two columns levels"])
+    def test_row_numbers_under_a_named_columns_header_are_not_a_source(self, stdout: str):
+        assert _printed(stdout, answer="East sold 2600 in 2024; 2 regions grew.") == [
+            ("2600", FigureOrigin.step), ("2024", FigureOrigin.step), ("2", FigureOrigin.none),
+        ]
+
+    @pytest.mark.parametrize("stdout", [
+        # The prints are pandas 3.0.6's: print(df.groupby('year')[['sales']].sum()), then a second frame.
+        # print(pd.DataFrame({2023: [10, 20], 2024: [30, 40]}))
+        "      sales\nyear       \n2023   4600\n2024   5200\n   2023  2024\n0    10    30\n1    20    40\n",
+        # print(pd.DataFrame({'p50': [11, 12], 'p90': [13, 14]})), whose header is as wide as the rows above it.
+        "      sales\nyear       \n2023   4600\n2024   5200\n   p50  p90\n0   11   13\n1   12   14\n",
+    ], ids=["a header wider than the rows above", "a header as wide as the rows above"])
+    def test_a_frame_printed_after_a_named_index_keeps_its_own_row_numbers(self, stdout: str):
+        assert _printed(stdout, answer="Sales were 4600 in 2023; the rate is $1.") == [
+            ("4600", FigureOrigin.step), ("2023", FigureOrigin.step), ("$1", FigureOrigin.none),
+        ]
+
+    def test_values_printed_one_space_before_a_negative_value_are_read(self):
+        # print() puts one space between its arguments, as a frame row puts
+        # before a negative first value, but these lines have no frame header.
+        stdout = "2023 -5.2\n2024 -3.1\n2025 -0.4\n"
+
+        assert _printed(
+            stdout, answer="Sales fell in 2023 and in 2025.",
+            code="for year, change in changes:\n    print(year, change)",
+        ) == [("2023", FigureOrigin.step), ("2025", FigureOrigin.step)]
 
     @pytest.mark.parametrize("stdout", [
         # print(df.qty.value_counts())
@@ -2260,6 +2392,10 @@ class TestFrameRowLabels:
         # A named numeric index is data even when sorted ascending.
         "qty\n90     1\n250    2\nName: count, dtype: int64\n",
         "     part site\nqty          \n90   P100   S2\n250  P100   S1\n",
+        # The same print with its trailing spaces stripped: a single name is read unpadded.
+        "     part site\nqty\n90   P100   S2\n250  P100   S1\n",
+        # pandas 3.0.6: print(df.q1.value_counts().sort_index()), a name with a digit.
+        "q1\n40     1\n90     2\n250    3\nName: count, dtype: int64\n",
     ])
     def test_named_index_values_and_noncounting_labels_are_read(self, stdout: str):
         assert _printed(stdout, answer="S1 holds 250 units and S2 holds 90.", code="print(stock)") == [

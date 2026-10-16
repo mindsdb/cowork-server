@@ -325,11 +325,24 @@ _PAGE = re.compile(
 )
 
 # A printed DataFrame or Series row: an integer row label (or a describe()
-# percentile) and two or more spaces before the values.
-_ROW_LABEL = re.compile(r"\d+%?(?= {2,}\S)")
+# percentile) and two or more spaces before the values. pandas leaves a
+# positive value a blank where a minus sign goes, so before a negative first
+# value a frame row has one space.
+_ROW_LABEL = re.compile(r"\d+%?(?= {2,}\S| -\d)")
+# One space and a negative value after a row label. print(year, change)
+# writes the same line by hand, so it is a row only under a frame's header.
+_NEGATIVE_FIRST = re.compile(r" -\d")
 # A frame's column header, indented past the row labels.
 _FRAME_HEADER = re.compile(r"[ \t]+\S")
 _SERIES_FOOTER = re.compile(r"(?:Name|Length|Freq|dtype): ")
+# A MultiIndex row whose outer keys pandas leaves blank, since the row above
+# shows them: indented and holding a value.
+_INNER_ROW = re.compile(r"[ \t]+\S.*\d")
+# The row pandas prints where it cuts a long frame or Series: ".." under a
+# Series' labels, "...  ..  .." across a frame.
+_TRUNCATED = re.compile(r"[ \t]*\.\.\.?(?:[ \t]+\.\.\.?)*[ \t]*")
+# The gap between a MultiIndex Series' level names.
+_LEVEL_GAP = re.compile(r" {2,}")
 # Lines and fields that state a frame's or a Series' size.
 _SHAPE = re.compile(r"^(?:Shape: .*|\[\d+ rows x \d+ columns\])$|\bLength: \d+", re.MULTILINE)
 # A number that is only digits and thousands separators.
@@ -1357,12 +1370,42 @@ def _unlabeled(output: str) -> str:
 
     A run of lines that each start with a number and two spaces is a frame's
     or a Series' rows when it has two or more lines, a column header above
-    it, or a Series footer below it. Its numbers are row labels when they
-    count up without a named index, as a frame's own row numbers do, kept or
-    filtered; or when the column header is right above the run, so they are the frame's row numbers
-    in whatever order a sort or a sample left them. Otherwise they are values
-    printed where labels go, as value_counts() or set_index() print them, and
-    are read."""
+    it, or a Series footer below it. Right under a frame's indented column
+    header, a number and one space before a negative value is a row too,
+    since pandas leaves that space for the minus sign; print(year, change)
+    writes the same line by hand, so elsewhere it is not a row. The run goes
+    on across the row where pandas cuts a long print, and across a
+    MultiIndex's rows that leave the outer keys blank, so one print is one
+    run.
+
+    An index name that pandas printed (``_names_index``) makes the index data,
+    read in any order: a Series' over its footer, and a frame's under its
+    column header. So groupby, value_counts(), set_index(), pivot_table() and
+    crosstab() keys printed with print() are read. An index printed with no
+    name is pandas' own row numbers, blanked in whatever order a sort or a
+    sample left them when the run sits right under a frame's indented column
+    header or over a Series' footer. A run with neither is blanked when its
+    numbers count up; otherwise it is values printed by hand where labels
+    go, and is read.
+
+    Some data reads as row numbers when it counts up: the keys of a named
+    Series printed with to_string(), as anton's sample() prints a Series,
+    which has no footer; the keys of a frame index whose name is not
+    identifier words, such as one with a hyphen; and a frame printed without
+    its index whose first column counts up from column 0, whose header looks
+    like a named columns header over row numbers. Some data reads as row
+    numbers in any order: the keys of a Series whose index has no name, such
+    as the value_counts() of a Series with no name or a Series made from a
+    dict, and of a Series index whose name is not a Python identifier, such
+    as one with a space or a hyphen, whose name line reads as a caption.
+
+    Some row numbers read as data: an unnamed Series under a one-word caption
+    with no colon that the cell's code does not write as a literal, such as
+    print(title) with a title a function returned, which reads as the
+    index's name (``_describe_cell`` blanks a caption the code spells, as in
+    print("Results"), before this runs); and a frame whose columns have a
+    name, after reset_index() and a sort, since its header is not indented
+    or the columns' level names sit between it and the rows."""
     lines = output.split("\n")
     labels = [_ROW_LABEL.match(line) for line in lines]
     index = 0
@@ -1371,27 +1414,71 @@ def _unlabeled(output: str) -> str:
             index += 1
             continue
         first = index
-        while index < len(lines) and labels[index] is not None:
+        # pandas aligns an inner row with the rows around it and indents it
+        # past the outer key, so it is as wide as the run's first row and its
+        # indent is wider than that row's key. The next print's indented
+        # header joins the run only when it passes both and holds a digit, as
+        # a column much wider than its short name with a digit can.
+        while index < len(lines) and (
+            labels[index] is not None
+            or _TRUNCATED.fullmatch(lines[index]) is not None
+            or (
+                len(lines[index]) == len(lines[first])
+                and len(lines[index]) - len(lines[index].lstrip()) > labels[first].end()
+                and _INNER_ROW.match(lines[index]) is not None
+            )
+        ):
             index += 1
-        run = [(row, label) for row, label in enumerate(labels[first:index], start=first) if label is not None]
         under_header = first > 0 and _FRAME_HEADER.match(lines[first - 1]) is not None
+        run = [
+            (row, label) for row, label in enumerate(labels[first:index], start=first)
+            if label is not None and (under_header or _NEGATIVE_FIRST.match(lines[row], label.end()) is None)
+        ]
         over_footer = index < len(lines) and _SERIES_FOOTER.match(lines[index]) is not None
-        # pandas prints an index's name on its own, unindented line above
-        # Series rows or below a frame's column header. Those labels are
-        # actual data even when sorted or reduced to a single value. Require
-        # an identifier; an arbitrary caption is not reliable index metadata.
-        # Non-identifier index names remain ambiguous and keep the fallback.
-        named_index = (
-            first > 0 and lines[first - 1].rstrip().isidentifier() and not lines[first - 1][0].isspace()
-            and (over_footer or (first > 1 and _FRAME_HEADER.match(lines[first - 2]) is not None))
+        named_index = first > 0 and _names_index(
+            lines[first - 1], header=lines[first - 2] if first > 1 else "", over_footer=over_footer,
         )
         if not (len(run) > 1 or under_header or over_footer):
             continue
         counts = [Decimal(label.group(0).rstrip("%")) for _, label in run]
-        if not named_index and (under_header or all(low < high for low, high in zip(counts, counts[1:]))):
+        if not named_index and (
+            under_header or over_footer or all(low < high for low, high in zip(counts, counts[1:]))
+        ):
             for row, label in run:
                 lines[row] = " " * label.end() + lines[row][label.end():]
     return _SHAPE.sub(lambda match: " " * len(match.group(0)), "\n".join(lines))
+
+
+def _names_index(line: str, *, header: str, over_footer: bool) -> bool:
+    """Whether ``line``, right above a run of printed rows, is the name pandas
+    printed for their index; ``header`` is the line above it. Each name is an
+    identifier.
+
+    A Series prints its index name unindented over its rows, and a
+    MultiIndex's names two spaces apart. One space between words is a
+    caption's, as print("Top sites") writes it, so a Series index whose name
+    is not a Python identifier, such as one with a space or a hyphen, reads
+    as a caption. A frame prints its index names a space apart under its
+    column header: a header indented past the row labels or, when the
+    columns have a name, one as wide as the name line. pandas pads a frame's
+    index name line to the frame's width, so a name of several words is read
+    only from a padded line: the unpadded line under a header, where a frame
+    with two levels of columns prints the columns' level names, is not an
+    index name. A caption's line is not padded either. A frame wider than
+    the display has the columns pandas cut out marked with "..." on every
+    line, its padded index name line included, and that mark is not part of
+    the name."""
+    name = line.rstrip()
+    if not name or name[0].isspace():
+        return False
+    if over_footer:
+        return all(level.isidentifier() for level in _LEVEL_GAP.split(name))
+    if not (_FRAME_HEADER.match(header) is not None or len(header) == len(line) > len(name)):
+        return False
+    if name.isidentifier():
+        return True
+    words = [word for word in name.split() if word != "..."]
+    return len(line) > len(name) and bool(words) and all(word.isidentifier() for word in words)
 
 
 def _csv_rows(text: str) -> set[int]:
