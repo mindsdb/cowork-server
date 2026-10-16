@@ -141,8 +141,8 @@ wheels = [
 
 [[package]]
 name = "anton-agent"
-version = "2.26.10.12.1"
-source = { git = "https://github.com/mindsdb/anton.git?rev=c66c3ab45c3a739047cbe8c44fb25a1354329de0#c66c3ab45c3a739047cbe8c44fb25a1354329de0" }
+version = "2.26.10.14.1"
+source = { git = "https://github.com/mindsdb/anton.git?rev=cf923647b9a6794e70f6b47e7ca7597001ae8cdc#cf923647b9a6794e70f6b47e7ca7597001ae8cdc" }
 dependencies = [
     { name = "anthropic" },
     { name = "anyio" },
@@ -455,7 +455,7 @@ requires-dist = [
     { name = "aiohttp", specifier = ">=3.14" },
     { name = "aiohttp", marker = "extra == 'channels'", specifier = ">=3.9.0" },
     { name = "alembic", specifier = ">=1.17.0" },
-    { name = "anton-agent", git = "https://github.com/mindsdb/anton.git?rev=c66c3ab45c3a739047cbe8c44fb25a1354329de0" },
+    { name = "anton-agent", git = "https://github.com/mindsdb/anton.git?rev=cf923647b9a6794e70f6b47e7ca7597001ae8cdc" },
     { name = "anyio", specifier = ">=4.14.2" },
     { name = "cryptography", specifier = ">=48.0.0,<51" },
     { name = "cryptography", marker = "platform_machine == 'x86_64' and sys_platform == 'darwin'", specifier = "<49" },

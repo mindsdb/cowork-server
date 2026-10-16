@@ -17,7 +17,7 @@ from cowork.handlers.response_routing import DELEGATED_AGENTIC, DIRECT_CONTEXT, 
 from cowork.server import create_app
 from cowork.streaming import RunRegistry, TurnInProgress, TurnLifecycle, get_streams_dir, registry
 from cowork.streaming.buffer import FileStreamBuffer, RedisStreamBuffer, read_records, turn_buffer_path
-from cowork.streaming import backend as backend_mod, buffer as buffer_mod
+from cowork.streaming import backend as backend_mod, buffer as buffer_mod, cancellation, turn_index
 
 from _fakes import PausedHarness, opens
 from test_responses_remote_backend import _FakeBuffer, _remote_handler
@@ -505,6 +505,8 @@ async def test_a_follow_up_waits_for_the_redis_terminal_instead_of_being_refused
 ):
     redis = fakeredis.aioredis.FakeRedis(decode_responses=True)
     monkeypatch.setattr(buffer_mod, "get_redis", lambda: redis)
+    monkeypatch.setattr(turn_index, "get_redis", lambda: redis)
+    monkeypatch.setattr(cancellation, "get_redis", lambda: redis)
     monkeypatch.setenv("COWORK_STREAM_BACKEND", "redis")
     runs = RunRegistry()
     final_written, release = asyncio.Event(), asyncio.Event()

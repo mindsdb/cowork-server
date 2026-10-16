@@ -127,9 +127,12 @@ def _assert_interrupted(history):
 
 
 @pytest.mark.parametrize("stop_signal", [signal.SIGTERM, signal.SIGKILL], ids=["sigterm", "sigkill"])
-def test_open_stream_survives_process_restart_without_duplicate_history(server_process, tmp_path, stop_signal):
+@pytest.mark.parametrize("cancel_on_disconnect", [False, True], ids=["default", "disconnect-opt-in"])
+def test_open_stream_survives_process_restart_without_duplicate_history(
+    server_process, tmp_path, stop_signal, cancel_on_disconnect,
+):
     process, base_url, log = server_process()
-    with urlopen(f"{base_url}/__shutdown_test/start", timeout=5) as stream:
+    with urlopen(f"{base_url}/__shutdown_test/start?cancel_on_disconnect={str(cancel_on_disconnect).lower()}", timeout=5) as stream:
         conversation_id = stream.headers["X-Test-Conversation-Id"]
         # Receiving the actual delta proves the real producer has committed its
         # pending user row and flushed the partial text into its stream file.

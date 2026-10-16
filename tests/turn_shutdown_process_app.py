@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from fastapi.responses import StreamingResponse
+from fastapi import Request
 from sqlmodel import SQLModel
 
 import cowork.handlers.responses as responses
@@ -27,6 +28,8 @@ from cowork.models.project import Project
 from cowork.services.conversations import ConversationService
 from cowork.services.projects import GENERAL_PROJECT, GENERAL_PROJECT_ID
 from cowork.streaming import TurnLifecycle, new_buffer, registry, sse_frame
+from cowork.streaming.cancellation import cancel_disconnected_run
+from cowork.streaming.disconnect import DisconnectStreamingResponse, DisconnectWatch
 
 
 def _seed_schema() -> None:
@@ -83,7 +86,7 @@ async def ready():
 
 
 @app.get("/__shutdown_test/start")
-async def start():
+async def start(request: Request, cancel_on_disconnect: bool = False):
     session = ScopedSession(get_open_session(), SYSTEM_SCOPE)
     try:
         conversation = ConversationService(session).create_conversation(
@@ -111,7 +114,13 @@ async def start():
             if record.type == "sse":
                 yield record.data["sse"]
 
-    return StreamingResponse(
+    response_type = DisconnectStreamingResponse if cancel_on_disconnect else StreamingResponse
+    kwargs = {
+        "watch": DisconnectWatch(request.receive),
+        "on_disconnect": lambda: cancel_disconnected_run(handle),
+    } if cancel_on_disconnect else {}
+    return response_type(
         tail(), media_type="text/event-stream",
+        **kwargs,
         headers={"X-Test-Conversation-Id": str(conversation_id)},
     )

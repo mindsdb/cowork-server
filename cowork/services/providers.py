@@ -15,6 +15,8 @@ from urllib.parse import urlparse
 import httpx
 from pydantic import SecretStr
 
+from cowork.build_info import surface
+from cowork.coding.inference_trace import SURFACE_TAG_PREFIX
 from cowork.common.settings import runtime_credential
 from cowork.common.settings.app_settings import AGENT_ROLE_NAMES, default_minds_api_host
 from cowork.handlers.turn_errors import GatewayDenial, gateway_denial
@@ -44,6 +46,25 @@ MINDS_PROBE_MODEL = "mindshub_air"
 # sent to a Minds host.
 MINDS_REQUEST_KIND_HEADER = "X-Minds-Request-Kind"
 MINDS_REQUEST_KIND_PROBE = "probe"
+
+# Langfuse tag on every MindsHub connectivity probe. The gateway files a call
+# with no Langfuse headers as direct-API use, so without it a user who only
+# opened Settings is counted as an API user. Tags alone make the gateway treat
+# the call as first-party; no `harness` is claimed because no agent runs here,
+# and no session or turn because a ping belongs to no conversation.
+PROBE_TRACE_TAG = "provider-ping"
+
+
+def _minds_probe_headers() -> dict[str, str]:
+    """The probe marker plus the probe's Langfuse identity, for a MindsHub host only."""
+    resolved_surface = surface()
+    tags = [PROBE_TRACE_TAG]
+    headers = {MINDS_REQUEST_KIND_HEADER: MINDS_REQUEST_KIND_PROBE}
+    if resolved_surface:
+        tags.append(f"{SURFACE_TAG_PREFIX}{resolved_surface}")
+        headers["Langfuse-Metadata"] = json.dumps({"surface": resolved_surface}, separators=(",", ":"))
+    headers["Langfuse-Tags"] = ",".join(tags)
+    return headers
 
 
 def minds_chat_base_url(minds_url: str) -> str:
@@ -1286,7 +1307,7 @@ async def ping_provider(p: dict[str, Any]) -> ProviderPing:
                 {
                     "Authorization": f"Bearer {key}",
                     "Content-Type": "application/json",
-                    MINDS_REQUEST_KIND_HEADER: MINDS_REQUEST_KIND_PROBE,
+                    **_minds_probe_headers(),
                 },
                 MINDS_PROBE_MODEL,
             )
@@ -1357,7 +1378,7 @@ async def validate_minds(api_key: str, base_url: str = "") -> dict[str, Any]:
                 headers={
                     "Authorization": f"Bearer {api_key}",
                     "Content-Type": "application/json",
-                    MINDS_REQUEST_KIND_HEADER: MINDS_REQUEST_KIND_PROBE,
+                    **_minds_probe_headers(),
                 },
                 json={"model": MINDS_PROBE_MODEL, "max_tokens": 20,
                       "messages": [{"role": "user", "content": "ping"}]},
@@ -1405,7 +1426,7 @@ async def validate_openai_compatible(api_key: str, base_url: str = "https://api.
         # meaningless to an arbitrary endpoint, and only MindsHub reads it to hide
         # the probe from the Traces list.
         if is_minds_host(normalized):
-            headers[MINDS_REQUEST_KIND_HEADER] = MINDS_REQUEST_KIND_PROBE
+            headers.update(_minds_probe_headers())
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             r = await client.post(chat_url, headers=headers, json=payload)
             if r.status_code in (200, 201):
