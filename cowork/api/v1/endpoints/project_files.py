@@ -1621,7 +1621,7 @@ def preview_mount_file(req: _PreviewMountRequest, scoped: ScopedSessionDep):
     _require_workspace_access(target, base, scoped)
     if not target.is_file():
         raise HTTPException(status_code=404, detail="File not found")
-    if target.suffix.lower() != ".html":
+    if target.suffix.lower() not in (".html", ".htm"):
         raise HTTPException(
             status_code=415, detail="Preview mount is only available for HTML files"
         )
