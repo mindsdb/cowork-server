@@ -36,8 +36,8 @@ from cowork.harnesses.anton_harness.figure_sources import (
     TurnStep,
     find_figure_sources,
     has_figures,
+    is_evidence_call,
     ran_cell,
-    reads_memory_file,
 )
 from cowork.schemas.figure_sources import FigureOrigin
 from cowork.schemas.responses import (
@@ -79,10 +79,12 @@ class TurnHistory:
     answer has figures."""
 
     rows: list[dict[str, Any]]
-    # The same rows as the agent read them, when the producer trimmed `rows`
-    # for storage (the remote paths cap each result). The formatter reads
-    # these instead; None means `rows` are what the agent read. The pod's
-    # rows arrive unchecked, so an entry may not be a row at all.
+    # The rows as the agent read them, when the producer stores fewer: the
+    # remote paths cap each result, and a turn that compacted its context
+    # mid-way stores none (its rows are near or over the context window, so
+    # the next turn replays it as text only). The formatter reads these
+    # instead; None means `rows` are what the agent read. The pod's rows
+    # arrive unchecked, so an entry may not be a row at all.
     read: list[object] | None = None
 
 
@@ -144,17 +146,22 @@ class StreamedResult:
 class EvidenceCall:
     """One of the turn's EVIDENCE_TOOLS calls, with its arguments as the
     model streamed them (empty when the stream never ended the call). Kept
-    raw while the turn streams; the arguments are parsed only when a
-    compacted turn's rows are missing the call's result."""
+    raw while the turn streams; the arguments are parsed only when the turn
+    compacted, no tool rows arrived for it, and the call's tool_done said
+    ok=True."""
 
     tool_use_id: str
     tool_name: str
     tool_input: str
 
-    def reads_memory(self) -> bool:
-        """Whether the call reads a memory file, which is never a step
-        (figure_sources.reads_memory_file)."""
-        return reads_memory_file(tool_name=self.tool_name, path=ToolArguments.from_text(text=self.tool_input).path)
+    def counts_as_step(self, *, successful_native_calls: frozenset[str]) -> bool:
+        """Whether the matcher would count the call's result as a step, by
+        the tests it applies to that result: the call's tool_done said
+        ok=True (TurnEvidence.successful_native_calls), and it is not a read
+        of a memory file (figure_sources.is_evidence_call)."""
+        return self.tool_use_id in successful_native_calls and is_evidence_call(
+            tool_name=self.tool_name, arguments=ToolArguments.from_text(text=self.tool_input),
+        )
 
 
 @dataclass(frozen=True)
@@ -175,17 +182,18 @@ class TurnEvidence:
     tool_rows: Sequence[object] = ()
     history: Sequence[object] = ()
     files: AgentFiles | None = None
-    # This turn's EVIDENCE_TOOLS calls, as the stream announced them. Their
-    # results reach the formatter only in tool_rows.
-    evidence_calls: tuple[EvidenceCall, ...] = ()
     # Native tools' history results omit their verdict. Only tool_done.ok
     # explicitly True establishes successful output; False/None can carry
     # error text with figures. Scratchpad stdout remains usable on failure.
     successful_native_calls: frozenset[str] = frozenset()
-    # Whether anton compacted the turn's context mid-way (the stream carried
-    # a StreamContextCompacted), after which no producer sends the turn's
-    # tool rows.
-    compacted: bool = False
+    # This turn's EVIDENCE_TOOLS calls, as the stream announced them, when
+    # the turn compacted its context mid-way (the stream carried a
+    # StreamContextCompacted) and no tool rows arrived for it (no
+    # TurnHistory): their results never reached the formatter. A producer
+    # whose anton predates ChatSession.turn_messages (an older cloud pod, or
+    # a desktop install on the anton floor) sends no rows after a
+    # compaction. Empty otherwise.
+    calls_without_rows: tuple[EvidenceCall, ...] = ()
 
 
 @dataclass
@@ -413,11 +421,6 @@ class ToolRows:
             ))
         return steps
 
-    def result_ids(self) -> frozenset[str]:
-        """The tool_use_ids of every result here, is_error ones included: a
-        call anton answered itself has its result here too."""
-        return frozenset(self.results)
-
 
 async def find_answer_sources(evidence: TurnEvidence) -> FigureSources:
     """The figures in an answer and the steps they came from.
@@ -459,19 +462,24 @@ def _answer_sources(evidence: TurnEvidence) -> FigureSources:
     sources = find_figure_sources(
         answer=evidence.answer, question=question, steps=[*earlier, *this_turn], files=evidence.files,
     )
-    if evidence.compacted and evidence.evidence_calls:
-        held = streamed_ids | rows.result_ids()
-        if any(call.tool_use_id not in held and not call.reads_memory() for call in evidence.evidence_calls):
-            # A turn that compacts mid-way sends no tool rows, so a web page
-            # or file it read may be missing from them, and a figure no step
-            # holds may be one it read: such a figure gets no mark rather
-            # than "no source". A missing read of a memory file hides no
-            # source, since such a read is never a step. A turn that did not
-            # compact holds every call that ran; a call missing there never
-            # ran, as in a round anton threw away and retried.
-            return sources.model_copy(update={
-                "figures": [figure for figure in sources.figures if figure.origin != FigureOrigin.none],
-            })
+    if any(
+        call.counts_as_step(successful_native_calls=evidence.successful_native_calls)
+        for call in evidence.calls_without_rows
+    ):
+        # The turn compacted mid-way and no tool rows arrived for it, so a web
+        # page or file it read is missing, and a figure no step holds may be
+        # one it read: such a figure gets no mark rather than "no source". A
+        # call the matcher would not count as a step hides no source: one
+        # whose tool_done did not say ok=True (it failed, gave no verdict, or
+        # sat in a round anton threw away), or a read of a memory file. Tool
+        # rows that do arrive hold every call that ran, through a compaction
+        # too; a call missing there never ran, as in a round anton threw away
+        # and retried. This can go once production pods run an anton with
+        # ChatSession.turn_messages, which sends the rows after a compaction,
+        # and the anton-agent floor in pyproject.toml requires one.
+        return sources.model_copy(update={
+            "figures": [figure for figure in sources.figures if figure.origin != FigureOrigin.none],
+        })
     return sources
 
 
@@ -606,6 +614,8 @@ async def format_responses_stream(
     turn_context = TurnContext(question="")
     user_answers: list[str] = []
     tool_rows: Sequence[object] = ()
+    # Whether a TurnHistory arrived, even one with no rows.
+    tool_rows_arrived = False
     # The tool name of each EVIDENCE_TOOLS call, by tool_use_id.
     evidence_calls: dict[str, str] = {}
     successful_native_calls: set[str] = set()
@@ -1003,6 +1013,7 @@ async def format_responses_stream(
 
         elif isinstance(event, TurnHistory):
             tool_rows = event.read if event.read is not None else event.rows
+            tool_rows_arrived = True
             # Recorded for LLM-history replay only — not surfaced to the client
             # (tool activity is rendered from the thought events above), so it
             # goes straight to the sink without an SSE frame or sequence number.
@@ -1066,12 +1077,11 @@ async def format_responses_stream(
         tool_rows=tool_rows,
         history=turn_context.history,
         files=turn_context.files,
-        evidence_calls=tuple(
+        successful_native_calls=frozenset(successful_native_calls),
+        calls_without_rows=tuple(
             EvidenceCall(tool_use_id=call_id, tool_name=name, tool_input=tool_inputs.get(call_id, ""))
             for call_id, name in evidence_calls.items()
-        ),
-        successful_native_calls=frozenset(successful_native_calls),
-        compacted=compacted,
+        ) if compacted and not tool_rows_arrived else (),
     ))
     if sources.figures:
         seq += 1

@@ -720,12 +720,11 @@ def _describe_steps(steps: Sequence[TurnStep]) -> list[_DescribedStep]:
     the ``MAX_EARLIER_CELLS``-th last cell that ran on are read. A scratchpad
     call is one only when it ran a cell: anton runs no call it discarded, and
     another action's output repeats earlier cells or is empty. A tool call is
-    one only when the tool is one of ``EVIDENCE_TOOLS`` and it did not read a
-    memory file (``_reads_memory``). Each scratchpad keeps what its cells
-    bound (``_Pad``) across cells and turns, until a reset or remove that
-    ran. A cell ``_describe_cell`` leaves out because what it prints can
-    only be what the agent memorized is a memory cell, and so is a later
-    cell whose only source would be memory cells' data."""
+    one only when ``is_evidence_call`` says so. Each scratchpad keeps what
+    its cells bound (``_Pad``) across cells and turns, until a reset or
+    remove that ran. A cell ``_describe_cell`` leaves out because what it
+    prints can only be what the agent memorized is a memory cell, and so is
+    a later cell whose only source would be memory cells' data."""
     earlier = [step for step in steps if step.earlier_turn]
     ordered = [*_latest_cells(earlier, limit=MAX_EARLIER_CELLS), *(step for step in steps if not step.earlier_turn)]
     pads: dict[str, _Pad] = {}
@@ -733,7 +732,7 @@ def _describe_steps(steps: Sequence[TurnStep]) -> list[_DescribedStep]:
     memory_cells: set[str] = set()
     for step in ordered:
         if step.tool_name != "scratchpad":
-            if step.tool_name in EVIDENCE_TOOLS and not _reads_memory(step=step):
+            if is_evidence_call(tool_name=step.tool_name, arguments=step.tool_input.arguments):
                 described.append(_describe_tool(step))
             continue
         if step.content.startswith(_DISCARDED_CALL):
@@ -760,10 +759,11 @@ def _describe_steps(steps: Sequence[TurnStep]) -> list[_DescribedStep]:
     return described
 
 
-def _reads_memory(*, step: TurnStep) -> bool:
-    """Whether the step is a read_text_file of a memory file
-    (``reads_memory_file``)."""
-    return reads_memory_file(tool_name=step.tool_name, path=step.tool_input.arguments.path)
+def is_evidence_call(*, tool_name: str, arguments: ToolArguments) -> bool:
+    """Whether a call of ``tool_name`` with these arguments can be a step
+    other than a scratchpad cell: a call of one of ``EVIDENCE_TOOLS`` that
+    does not read a memory file (``reads_memory_file``)."""
+    return tool_name in EVIDENCE_TOOLS and not reads_memory_file(tool_name=tool_name, path=arguments.path)
 
 
 def reads_memory_file(*, tool_name: str, path: str | None) -> bool:

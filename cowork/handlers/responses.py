@@ -47,7 +47,6 @@ from cowork.harnesses.anton_harness.stream_formatter import (
     SkillCreated,
     TurnContext,
     TurnEvidence,
-    TurnHistory,
     find_answer_sources,
     format_responses_stream,
 )
@@ -77,7 +76,7 @@ from cowork.schemas.responses import (
 )
 from cowork.handlers._turn_history import (
     reject_unreplayable_tool_rows,
-    sanitize_turn_history_rows,
+    remote_turn_history,
 )
 from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
@@ -1982,6 +1981,10 @@ class ResponsesHandler:
             # may have cut anton off between writing an artifact's metadata and
             # appending its provenance, see `turn_created_slugs`.
             completed_cleanly = False
+            # Whether the pod compacted or hard-truncated the turn's context:
+            # its compacted step comes for both, its compaction reply for a
+            # summary. Both arrive before the history frame.
+            compacted = False
 
             async for kind, data in stream_remote_replies(
                 conversation_id=str(conv_id),
@@ -2017,22 +2020,25 @@ class ResponsesHandler:
                 elif kind == "turn_delta":
                     yield StreamTextDelta(text=data.get("text", ""))
                 elif kind == "turn_step":
+                    if data.get("step") == "compacted":
+                        compacted = True
                     for event in step_stream_events(data):
                         yield event
                 elif kind == "turn_memory":
                     await save_memory(data.get("entries") or [])
                 elif kind == "turn_history":
-                    pod_rows = data.get("rows")
-                    # Slice-assign, not extend: the pod emits one frame per
-                    # turn, so a repeated frame must replace the rows rather
-                    # than double them. Sanitized at the boundary — the pod
+                    # Sanitized at the boundary (remote_turn_history): the pod
                     # is semi-trusted and these rows reach both the DB and
                     # every later turn's LLM context.
-                    turn_rows[:] = sanitize_turn_history_rows(pod_rows)
-                    # The formatter finds the answer's figures in every tool's
-                    # results, read before the replay caps trimmed them.
-                    yield TurnHistory(list(turn_rows), read=pod_rows if isinstance(pod_rows, list) else None)
+                    history = remote_turn_history(pod_rows=data.get("rows"), compacted=compacted)
+                    # Slice-assign, not extend: the pod emits one frame per
+                    # turn, so a repeated frame must replace the rows rather
+                    # than double them.
+                    turn_rows[:] = [] if history is None else history.rows
+                    if history is not None:
+                        yield history
                 elif kind == "turn_compaction":
+                    compacted = True
                     await save_compaction(data, seed.seed_info)
                 elif kind == "turn_skill":
                     # Not persisted like memory: a draft is the user's decision.

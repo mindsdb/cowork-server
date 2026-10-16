@@ -502,13 +502,17 @@ class TestStepsFromTheTurnsToolRows:
         step_stream_events({"step": "compacted", "message": "Context compacted"}),
     ], ids=["in-process", "cloud-pod"])
     @pytest.mark.parametrize("name", ["web_search", "web_fetch", "read_text_file"])
-    async def test_a_turn_that_compacted_leaves_a_figure_no_step_holds_unmarked(self, name: str, compacted: list):
-        """A turn that compacts its context mid-way sends no tool rows, so the
-        result of a tool anton runs itself is missing."""
+    async def test_a_compacted_turn_with_no_tool_rows_leaves_a_figure_no_step_holds_unmarked(
+        self, name: str, compacted: list,
+    ):
+        """A producer whose anton predates ChatSession.turn_messages sends no
+        tool rows for a turn that compacts mid-way, so the result of a tool
+        anton runs itself is missing."""
         events = await _run_turn(
             TurnContext(question="What does overtime cost, and what is at S1?"),
             *_read_stock_cell(),
             *_tool_call("toolu_evidence", name, {"query": "overtime rate", "url": "https://example.com/rates"}),
+            *_tool_done("toolu_evidence", True),
             *compacted,
             StreamTextDelta(text="Overtime costs $42 an hour and S1 holds 250 units."),
         )
@@ -517,81 +521,74 @@ class TestStepsFromTheTurnsToolRows:
         assert "$42" not in figures
         assert figures["250"]["sources"] == [{"tool_use_id": "toolu_read", "page": None}]
 
-    async def test_rows_missing_one_evidence_call_leave_a_figure_no_step_holds_unmarked(self):
+    @pytest.mark.parametrize("verdict", [
+        _tool_done("toolu_web", False),
+        _tool_done("toolu_web", None),
+        [],
+    ], ids=["failed", "no-verdict", "no-tool-done"])
+    async def test_a_compacted_turn_with_no_tool_rows_keeps_the_mark_when_its_web_call_did_not_succeed(
+        self, verdict: list,
+    ):
+        """The matcher counts a call of a tool anton runs itself as a step
+        only when its tool_done said ok=True, so the missing result of a call
+        that failed, gave no verdict or never ran hides no source."""
+        events = await _run_turn(
+            TurnContext(question="What does overtime cost?"),
+            *_tool_call("toolu_web", "web_fetch", {"url": "https://example.com/rates"}),
+            *verdict,
+            StreamContextCompacted(message="Context compacted"),
+            StreamTextDelta(text="Overtime costs $42 an hour and 17 shifts."),
+        )
+
+        assert {text: figure["origin"] for text, figure in _by_text(_figures(events)).items()} == {
+            "$42": "none", "17": "none",
+        }
+
+    @pytest.mark.parametrize("compacted", [
+        [StreamContextCompacted(message="Context compacted")],
+        step_stream_events({"step": "compacted", "message": "Context compacted"}),
+    ], ids=["in-process", "cloud-pod"])
+    async def test_a_compacted_turns_tool_rows_give_a_figure_no_step_holds_no_source(self, compacted: list):
+        """A turn's tool rows hold every call that ran, through a compaction
+        too, so a call they miss never ran: a figure no step holds has no
+        source."""
         events = await _run_turn(
             TurnContext(question="What does overtime cost, and what is at S1?"),
             *_tool_call("toolu_file", "read_text_file", {"path": "/workspace/stock.csv"}),
             *_tool_call("toolu_web", "web_fetch", {"url": "https://example.com/rates"}),
             *_tool_done("toolu_file", True),
-            StreamContextCompacted(message="Context compacted"),
+            *compacted,
             StreamTextDelta(text="Overtime costs $42 an hour and S1 holds 250 units."),
-            TurnHistory(_tool_rows(
+            TurnHistory(rows=[], read=_tool_rows(
                 "toolu_file", "read_text_file", {"path": "/workspace/stock.csv"}, "part,site,qty\nP100,S1,250\n",
             )),
         )
 
         figures = _by_text(_figures(events))
-        assert "$42" not in figures
-        assert figures["250"]["origin"] == "step"
+        assert figures["$42"]["origin"] == "none"
+        assert figures["250"]["sources"] == [{"tool_use_id": "toolu_file", "page": None}]
 
     @pytest.mark.parametrize(("path", "origins"), [
         (".anton/memory/lessons.md", {"$30": "none", "250": "step"}),
         ("docs/lessons.md", {"250": "step"}),
     ], ids=["memory-file", "project-file"])
-    async def test_rows_missing_a_memory_read_keep_the_mark_on_a_figure_no_step_holds(
+    async def test_a_compacted_turn_with_no_tool_rows_that_read_only_a_memory_file_keeps_the_mark(
         self, path: str, origins: dict[str, str],
     ):
         """A memory file read is never a step, so its missing row hides no
         source. A missing read of any other file still may."""
         lessons = {"path": path}
-        stock = {"path": "data/stock.csv"}
 
-        events = await _run_turn(
-            TurnContext(question="What does overtime cost, and what is at S1?"),
-            *_tool_call("toolu_lessons", "read_text_file", lessons),
-            *_tool_call("toolu_file", "read_text_file", stock),
-            *_tool_done("toolu_lessons", True),
-            *_tool_done("toolu_file", True),
-            StreamContextCompacted(message="Context compacted"),
-            StreamTextDelta(text="Overtime costs $30 an hour and S1 holds 250 units."),
-            TurnHistory(_tool_rows("toolu_file", "read_text_file", stock, "part,site,qty\nP100,S1,250\n")),
-        )
-
-        assert {text: figure["origin"] for text, figure in _by_text(_figures(events)).items()} == origins
-
-    async def test_rows_holding_an_evidence_call_without_its_result_leave_a_figure_no_step_holds_unmarked(self):
-        """A call is held only by its result: rows that keep the call but not
-        what it returned may still be missing a page it read."""
         events = await _run_turn(
             TurnContext(question="What does overtime cost, and what is at S1?"),
             *_read_stock_cell(),
-            *_tool_call("toolu_web", "web_fetch", {"url": "https://example.com/rates"}),
+            *_tool_call("toolu_lessons", "read_text_file", lessons),
+            *_tool_done("toolu_lessons", True),
             StreamContextCompacted(message="Context compacted"),
-            StreamTextDelta(text="Overtime costs $42 an hour and S1 holds 250 units."),
-            TurnHistory([{"role": "assistant", "content": [{
-                "type": "tool_use", "id": "toolu_web", "name": "web_fetch",
-                "input": {"url": "https://example.com/rates"},
-            }]}]),
+            StreamTextDelta(text="Overtime costs $30 an hour and S1 holds 250 units."),
         )
 
-        figures = _by_text(_figures(events))
-        assert "$42" not in figures
-        assert figures["250"]["sources"] == [{"tool_use_id": "toolu_read", "page": None}]
-
-    async def test_a_refused_evidence_call_in_the_rows_keeps_the_mark_on_a_figure_no_step_holds(self):
-        """The rows hold anton's own is_error answer to the call, so its
-        result is not missing."""
-        refused = ToolCall(id="toolu_web", name="web_fetch", input={}, parse_error="Expecting value: line 1 column 1")
-
-        events = await _run_turn(
-            TurnContext(question="What does overtime cost?"),
-            *_tool_call("toolu_web", "web_fetch", {}),
-            StreamContextCompacted(message="Context compacted"),
-            StreamTextDelta(text="Overtime costs $42 an hour."),
-            TurnHistory(_refused_rows(refused)),
-        )
-
-        assert _by_text(_figures(events))["$42"]["origin"] == "none"
+        assert {text: figure["origin"] for text, figure in _by_text(_figures(events)).items()} == origins
 
     async def test_a_round_anton_threw_away_keeps_the_mark_on_a_figure_no_step_holds(self):
         """A round cut at max_tokens is thrown away whole and retried: none of
@@ -635,39 +632,6 @@ class TestStepsFromTheTurnsToolRows:
         figures = _by_text(_figures(events))
         assert figures["2024"]["origin"] == "none"
         assert figures["$42"]["sources"] == [{"tool_use_id": "toolu_search", "page": None}]
-
-    async def test_the_turns_rows_are_read_once(self, monkeypatch):
-        """A compacted turn missing an evidence call reads its rows for the
-        steps they hold and for the results they hold, from one parse."""
-        rows = [
-            *_tool_rows("toolu_w1", "web_fetch", {"url": "https://example.com/a"}, "Overtime rate: $42 per hour"),
-            *_tool_rows("toolu_w2", "web_fetch", {"url": "https://example.com/b"}, "S1 holds 250 units"),
-            *_tool_rows("toolu_w3", "web_fetch", {"url": "https://example.com/c"}, "Nothing here"),
-        ]
-        validated: list[object] = []
-        model_validate = stream_formatter_mod._HistoryRow.model_validate
-
-        def recording(row, *args, **kwargs):
-            validated.append(row)
-            return model_validate(row, *args, **kwargs)
-
-        monkeypatch.setattr(stream_formatter_mod._HistoryRow, "model_validate", recording)
-
-        events = await _run_turn(
-            TurnContext(question="What does overtime cost?"),
-            *_tool_call("toolu_w1", "web_fetch", {"url": "https://example.com/a"}),
-            *_tool_done("toolu_w1", True),
-            *_tool_call("toolu_lost", "web_fetch", {"url": "https://example.com/lost"}),
-            *_tool_done("toolu_lost", True),
-            StreamContextCompacted(message="Context compacted"),
-            StreamTextDelta(text="Overtime costs $42 an hour, S1 holds 250 units, and 91 more."),
-            TurnHistory(rows),
-        )
-
-        assert len(validated) == len(rows)
-        figures = _by_text(_figures(events))
-        assert figures["$42"]["sources"] == [{"tool_use_id": "toolu_w1", "page": None}]
-        assert "91" not in figures
 
     async def test_a_replayed_calls_arguments_are_not_parsed_again(self, monkeypatch):
         """A history row holds a call's arguments already parsed, so neither
@@ -1173,8 +1137,8 @@ class TestTheInProcessHandlerSavesTheSources:
         assert any(frame.startswith("event: response.figure_sources") for frame in frames)
 
 
-# The figure_sources frames, compacted turn then whole turn, of the turn
-# _every_input_shape builds.
+# The figure_sources frames of the turn _every_input_shape builds, compacted
+# with no tool rows and then whole.
 _EVERY_INPUT_SHAPE_FRAMES = Path(__file__).parent / "fixtures" / "figure_sources_every_input_shape.sse"
 
 
@@ -1187,7 +1151,12 @@ async def _every_input_shape(*, compacted: bool) -> str:
     arguments whose query states a number its results echo, an is_error
     row, a web call whose tool_done said it failed, a cell only the rows
     hold, junk rows, earlier turns' cells (one printed a figure the answer
-    repeats) beside junk history rows, and an evidence call no row holds."""
+    repeats) beside junk history rows, and an evidence call no row holds.
+
+    The compacted turn is the one a producer whose anton predates
+    ChatSession.turn_messages sends: a compaction and no tool rows, so only
+    the figures a streamed cell holds keep a mark. The whole turn sends its
+    rows."""
     load = "import pandas as pd\ndf = pd.read_csv('stock.csv')"
     total = "print(df.qty.sum())"
     history = [
@@ -1270,7 +1239,7 @@ async def _every_input_shape(*, compacted: bool) -> str:
                 "340 units in all, 7777 checked, 4200 billed, 612 in the ERP, overtime $42 an hour, S1 holds 250, "
                 "5150 rows, 18 results for 2024, 33 lines, 64 on the down page, and 91 and 8080 elsewhere."
             )),
-            TurnHistory(rows, read=read),
+            *([] if compacted else [TurnHistory(rows, read=read)]),
         ), model="test-model")
     ]
     return "".join(frame for frame in frames if frame.startswith("event: response.figure_sources\n"))

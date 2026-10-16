@@ -2,6 +2,7 @@
 ResponsesHandler is replaced wholesale per test; its helpers have coverage elsewhere."""
 from __future__ import annotations
 
+import json
 from uuid import uuid4
 
 import pytest
@@ -227,6 +228,72 @@ async def test_turn_history_reaches_the_formatter_as_the_pod_sent_it(monkeypatch
     assert history.read == rows
     assert history.rows == turn_rows
     assert turn_rows[1]["content"][0]["content"].startswith("[tool output omitted")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal", ["compaction-reply", "compacted-step"])
+async def test_a_compacted_turns_history_reaches_the_formatter_and_none_is_kept(monkeypatch, signal):
+    """A turn that compacted ran near or over the context window, so its rows
+    are read for the answer's figures and not kept for replay. A summary
+    sends both signals; a hard truncation sends only the step. The pod goes
+    on streaming the turn's rounds after the compaction."""
+    _fake_handler(monkeypatch)
+    rows = [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "w1", "name": "web_fetch", "input": {"url": "https://example.com/rates"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "w1", "content": "Overtime: $42"}]},
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "w4", "name": "web_fetch", "input": {"url": "https://example.com/lines"}}]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "w4", "content": "9 lines"}]},
+    ]
+
+    async def fake_replies(**kwargs):
+        if signal == "compacted-step":
+            yield "turn_step", {"step": "compacted", "message": "Context compacted"}
+        yield "turn_step", {"step": "tool_start", "id": "w4", "name": "web_fetch"}
+        yield "turn_step", {"step": "tool_end", "id": "w4", "args": json.dumps({"url": "https://example.com/lines"})}
+        yield "turn_step", {"step": "progress", "phase": "tool_done", "id": "w4", "ok": True}
+        if signal == "compaction-reply":
+            yield "turn_compaction", {"summary": "EARLIER: …", "covered_through": 1}
+        yield "turn_history", {"rows": rows}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    turn_rows = []
+    events, _ = await _drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="What does overtime cost?", model="anton", turn_rows=turn_rows,
+    ))
+
+    [history] = [event for event in events if isinstance(event, TurnHistory)]
+    assert history.read == rows
+    assert history.rows == []
+    assert turn_rows == []
+
+
+@pytest.mark.asyncio
+async def test_a_compacted_turns_history_frame_without_a_list_of_rows_reaches_the_formatter_as_no_rows(monkeypatch):
+    """A compacted turn's rows reach the formatter only as the pod sent
+    them, so a frame whose rows are not a list carries none: the formatter
+    hears of no rows, as from a pod that sends no frame after a compaction."""
+    _fake_handler(monkeypatch)
+
+    async def fake_replies(**kwargs):
+        yield "turn_step", {"step": "compacted", "message": "Context compacted"}
+        yield "turn_history", {"rows": "not a list"}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
+
+    turn_rows = []
+    events, _ = await _drain(remote_turn_events(
+        session=_FakeSession(), conv_id=uuid4(), org_id="org-123", user_id=None,
+        input_text="What does overtime cost?", model="anton", turn_rows=turn_rows,
+    ))
+
+    assert [event for event in events if isinstance(event, TurnHistory)] == []
+    assert turn_rows == []
 
 
 @pytest.mark.asyncio

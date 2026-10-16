@@ -39,6 +39,8 @@ from cowork.services.projects import display_label
 from cowork.streaming.liveness import ModelWaitTicker
 
 if TYPE_CHECKING:
+    from anton.core.session import ChatSession
+
     from cowork.services.conversations import ReplayHistory
 
 
@@ -239,9 +241,11 @@ def _split_turn_into_rows(history_slice: list) -> list[dict]:
     two must agree byte for byte. Desktop and SaaS read the same `messages`
     table, so a divergence would not fail here — it would surface as an invalid
     tool_use -> tool_result sequence many turns later, in whichever path did not
-    write the row. anton owns the implementation (ENG-1808); the slicing and the
-    compaction/cancel guards stay on this side, which is the only side that
-    knows whether a turn ended cleanly.
+    write the row. anton owns the implementation (ENG-1808) and the turn's
+    messages (`ChatSession.turn_messages`). The cancel guard stays on this
+    side, which is the only side that knows whether a turn ended cleanly, and
+    so does the choice to store no rows for a turn that compacted
+    (`_captured_turn_history`).
 
     Imported inside the function, like every other anton import in this file.
     `anton.cloud_turn.__init__` re-exports the pod entrypoint's contract and
@@ -253,6 +257,45 @@ def _split_turn_into_rows(history_slice: list) -> list[dict]:
     from anton.cloud_turn.history_rows import split_turn_into_rows
 
     return split_turn_into_rows(history_slice)
+
+
+def _captured_turn_history(*, session: "ChatSession", seed_len: int | None, compacted: bool) -> TurnHistory | None:
+    """The tool block-rows of a turn that completed cleanly, or None when it
+    has none.
+
+    They come from `ChatSession.turn_messages()`, which holds every message
+    the turn appended, those a mid-turn compaction or hard truncation folded
+    out of `session.history` included. A turn that compacted ran near or over
+    the model's context window, and rows this process captures have no size
+    cap (`reject_unreplayable_tool_rows` in cowork/handlers/_turn_history.py),
+    so its rows are read and not stored: the formatter finds the answer's
+    figures in them, and the next turn replays this one as text only. A turn
+    that did not compact stores its rows.
+
+    An anton without `turn_messages` (desktop installs resolve anton from the
+    floor in pyproject.toml) gets the slice of `session.history` past
+    `seed_len`, and no rows after a compaction: the compaction replaced the
+    list, so the slice could drop rows or keep a tool_result whose tool_use
+    was folded away. A session with neither `turn_messages` nor `history`
+    has no rows.
+    """
+    if hasattr(session, "turn_messages"):
+        turn_slice = session.turn_messages()
+    elif seed_len is not None and not compacted:
+        turn_slice = session.history[seed_len:]
+    else:
+        return None
+    # Drop this turn's user input (and anything before the first assistant
+    # message) so the slice starts where the model replied.
+    while turn_slice and (
+        not isinstance(turn_slice[0], dict)
+        or turn_slice[0].get("role") != "assistant"
+    ):
+        turn_slice = turn_slice[1:]
+    rows = _split_turn_into_rows(turn_slice)
+    if not rows:
+        return None
+    return TurnHistory(rows=[], read=rows) if compacted else TurnHistory(rows=rows)
 
 
 def _build_filtered_vault(source_vault, disabled_connections: list[dict], temp_dir: Path, LocalDataVault):
@@ -653,7 +696,7 @@ class AntonHarness:
         new_slugs: list[str] = []
         touched_slugs: set[str] = set()
         turn_scope = None
-        turn_rows: list[dict] | None = None
+        turn_history: TurnHistory | None = None
         session = None
         seed_info: dict | None = None
 
@@ -715,12 +758,15 @@ class AntonHarness:
             )
             if model_wait is not None:
                 model_wait.attach(session=session)
-            # Length of the seeded history — everything anton appends past this
-            # index is this turn's block-messages (tool_use / tool_result / text).
-            # Guarded: an anton build (or test double) without `.history` simply
-            # skips capture and falls back to text-only replay.
+            # Length of the seeded history, for an anton without
+            # `turn_messages`: everything it appends past this index is this
+            # turn's block-messages (tool_use / tool_result / text) until a
+            # compaction replaces the list (_captured_turn_history). Guarded
+            # for that fallback slice only: an anton build (or test double)
+            # with neither `turn_messages` nor `.history` skips capture and
+            # falls back to text-only replay.
             seed_len = len(session.history) if hasattr(session, "history") else None
-            compacted = False  # set if anton summarizes history mid-turn
+            compacted = False  # set if anton compacts or hard-truncates history mid-turn
             # Forward trace annotations only if the installed anton's
             # turn_stream accepts them. Deployed cowork-server resolves anton
             # from PyPI/main, which may predate the trace-tags kwargs (anton
@@ -743,28 +789,18 @@ class AntonHarness:
                 history=list(getattr(session, "history", ())),
             )
             async for event in session.turn_stream(self._to_anton_input(input), **turn_kwargs):
-                # Under context pressure anton summarizes history mid-turn,
-                # reassigning session.history and invalidating seed_len.
+                # Under context pressure anton summarizes or hard-truncates
+                # history mid-turn, replacing session.history, and says so
+                # with this event.
                 if type(event).__name__ == "StreamContextCompacted":
                     compacted = True
                 yield event
-            # Turn completed cleanly: capture its tool block-rows for
-            # persistence. Skipped on cancel/error (the block below never runs),
-            # so a partial turn falls back to text-only replay and anton's own
-            # dangling-tool_use sealing keeps its in-memory history valid.
-            #
-            # Also skipped after a mid-turn compaction: seed_len no longer marks
-            # this turn's start, so slicing could drop rows or surface an orphan
-            # tool_result (its tool_use summarized away) → invalid replay. Text-
-            # only replay stays valid, so degrade to it.
-            if seed_len is not None and not compacted:
-                turn_slice = session.history[seed_len:]
-                while turn_slice and (
-                    not isinstance(turn_slice[0], dict)
-                    or turn_slice[0].get("role") != "assistant"
-                ):
-                    turn_slice = turn_slice[1:]
-                turn_rows = _split_turn_into_rows(turn_slice) or None
+            # Turn completed cleanly: capture its tool block-rows. Skipped on
+            # cancel/error (this line never runs), so a partial turn falls
+            # back to text-only replay and anton's own dangling-tool_use
+            # sealing keeps its in-memory history valid. A turn that compacted
+            # hands its rows to the formatter and stores none.
+            turn_history = _captured_turn_history(session=session, seed_len=seed_len, compacted=compacted)
         finally:
             if model_wait is not None:
                 model_wait.detach()
@@ -795,8 +831,8 @@ class AntonHarness:
             yield ArtifactCreated(card)
         for draft in skill_drafts:
             yield SkillCreated(draft)
-        if turn_rows:
-            yield TurnHistory(turn_rows)
+        if turn_history is not None:
+            yield turn_history
 
     @staticmethod
     def _stamp_message(m) -> dict:

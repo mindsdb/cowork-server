@@ -1771,6 +1771,116 @@ async def test_produce_remote_finds_a_figure_in_a_tool_result_only_the_pods_rows
     assert not [e for e in saved["events"] if e.get("type") == "response.turn_history"]
 
 
+def _web_fetch_replies(tool_use_id: str, url: str) -> list[tuple[str, dict]]:
+    """A web_fetch call that succeeded, as the pod's turn_step replies carry it."""
+    import json
+
+    return [
+        ("turn_step", {"step": "tool_start", "id": tool_use_id, "name": "web_fetch"}),
+        ("turn_step", {"step": "tool_end", "id": tool_use_id, "args": json.dumps({"url": url})}),
+        ("turn_step", {"step": "progress", "phase": "tool_done", "id": tool_use_id, "ok": True}),
+    ]
+
+
+def _web_fetch_rows(tool_use_id: str, url: str, page: str) -> list[dict]:
+    return [
+        {"role": "assistant", "content": [
+            {"type": "tool_use", "id": tool_use_id, "name": "web_fetch", "input": {"url": url}},
+        ]},
+        {"role": "user", "content": [{"type": "tool_result", "tool_use_id": tool_use_id, "content": page}]},
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("signal", ["compaction-reply", "compacted-step"])
+async def test_produce_remote_reads_a_compacted_turns_history_frame_and_saves_no_rows(monkeypatch, signal):
+    """A pod sends a turn's rows after a compaction too. The figures are
+    found in them, from the rounds on both sides of the compaction, and none
+    are saved, so the next turn replays this one as text only. A summary
+    sends both signals; a hard truncation sends only the step."""
+    saved = {}
+    handler = _figure_sources_handler(monkeypatch, saved)
+    handler._persist_remote_compaction = lambda session, *, conv_id, data, seed_info: None
+    rows = [
+        *_web_fetch_rows("w1", "https://example.com/rates", "Overtime rate: $42 per hour."),
+        *_web_fetch_rows("w4", "https://example.com/lines", "The plant runs 9 lines."),
+    ]
+
+    async def fake_replies(**kwargs):
+        for reply in _web_fetch_replies("w1", "https://example.com/rates"):
+            yield reply
+        if signal == "compacted-step":
+            yield "turn_step", {"step": "compacted", "message": "Context compacted"}
+        for reply in _web_fetch_replies("w4", "https://example.com/lines"):
+            yield reply
+        yield "turn_delta", {"text": "Overtime costs $42 an hour, the plant runs 9 lines, and 17 shifts."}
+        if signal == "compaction-reply":
+            yield "turn_compaction", {"summary": "EARLIER: …", "covered_through": 1}
+        yield "turn_history", {"rows": rows}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="What does overtime cost?", original_content="What does overtime cost?",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    figures = _saved_figures(saved)
+    assert figures["$42"]["sources"] == [{"tool_use_id": "w1", "page": None}]
+    assert figures["9"]["sources"] == [{"tool_use_id": "w4", "page": None}]
+    assert figures["17"]["origin"] == "none"
+    assert saved["tool_rows"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("history_frame", [
+    [],
+    [("turn_history", {"rows": "not a list"})],
+], ids=["no-frame", "frame-without-a-list-of-rows"])
+async def test_produce_remote_leaves_a_figure_no_step_holds_unmarked_when_a_pod_sends_no_rows_after_a_compaction(
+    monkeypatch, history_frame,
+):
+    """A pod whose anton predates ChatSession.turn_messages sends no history
+    frame after a compaction, and a frame whose rows are not a list carries
+    none either. The page the turn read is then missing, and a figure no step
+    holds may be one it read, so such a figure gets no mark."""
+    import json
+
+    saved = {}
+    handler = _figure_sources_handler(monkeypatch, saved)
+    handler._persist_remote_compaction = lambda session, *, conv_id, data, seed_info: None
+    code = "print(open('/workspace/stock.csv').read())"
+    cell = {"code": code, "stdout": "part,site,qty\nP100,S1,250\n", "stderr": "", "error": None, "description": ""}
+
+    async def fake_replies(**kwargs):
+        yield "turn_step", {"step": "tool_start", "id": "c1", "name": "scratchpad"}
+        yield "turn_step", {"step": "tool_end", "id": "c1", "args": json.dumps({"action": "exec", "code": code})}
+        yield "turn_step", {
+            "step": "tool_result", "id": "c1", "name": "scratchpad", "action": "exec", "content": json.dumps(cell),
+        }
+        for reply in _web_fetch_replies("w1", "https://example.com/rates"):
+            yield reply
+        yield "turn_step", {"step": "compacted", "message": "Context compacted"}
+        yield "turn_delta", {"text": "Overtime costs $42 an hour and S1 holds 250 units."}
+        yield "turn_compaction", {"summary": "EARLIER: …", "covered_through": 1}
+        for reply in history_frame:
+            yield reply
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=uuid4(), input_text="What does overtime cost?", original_content="What does overtime cost?",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    figures = _saved_figures(saved)
+    assert "$42" not in figures
+    assert figures["250"]["sources"] == [{"tool_use_id": "c1", "page": None}]
+    assert saved["tool_rows"] == []
+
+
 @pytest.mark.asyncio
 async def test_produce_remote_names_the_earlier_turns_cell_a_figure_was_computed_from(monkeypatch):
     """The seeded history reaches the formatter: this turn's cell sums a frame

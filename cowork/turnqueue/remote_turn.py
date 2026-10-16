@@ -36,8 +36,8 @@ async def remote_turn_events(
     """Yields the same stream format_responses_stream renders for local turns.
     Mutates turn_rows in place; raises RemoteTurnFailed on a worker failure."""
     from anton.core.llm.provider import StreamTaskProgress, StreamTextDelta
-    from cowork.handlers._turn_history import sanitize_turn_history_rows
-    from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnContext, TurnHistory
+    from cowork.handlers._turn_history import remote_turn_history
+    from cowork.harnesses.anton_harness.stream_formatter import ArtifactCreated, SkillCreated, TurnContext
     from cowork.services.task_objects import (
         index_turn_artifacts,
         publish_and_card_turn_artifacts,
@@ -65,6 +65,10 @@ async def remote_turn_events(
     artifact_writes_allowed = False
     # Set only on turn_completed; see `turn_created_slugs(accept_unattributed=)`.
     completed_cleanly = False
+    # Whether the pod compacted or hard-truncated the turn's context: its
+    # compacted step comes for both, its compaction reply for a summary. Both
+    # arrive before the history frame.
+    compacted = False
 
     try:
         async for kind, data in stream_remote_replies(
@@ -85,17 +89,19 @@ async def remote_turn_events(
             elif kind == "turn_delta":
                 yield StreamTextDelta(text=data.get("text", ""))
             elif kind == "turn_step":
+                if data.get("step") == "compacted":
+                    compacted = True
                 for event in step_stream_events(data):
                     yield event
             elif kind == "turn_memory":
                 ResponsesHandler._persist_turn_memory(session, conv_id, data.get("entries") or [])
             elif kind == "turn_history":
-                pod_rows = data.get("rows")
-                turn_rows[:] = sanitize_turn_history_rows(pod_rows)
-                # The formatter finds the answer's figures in every tool's
-                # results, read before the replay caps trimmed them.
-                yield TurnHistory(list(turn_rows), read=pod_rows if isinstance(pod_rows, list) else None)
+                history = remote_turn_history(pod_rows=data.get("rows"), compacted=compacted)
+                turn_rows[:] = [] if history is None else history.rows
+                if history is not None:
+                    yield history
             elif kind == "turn_compaction":
+                compacted = True
                 ResponsesHandler._persist_remote_compaction(
                     session, conv_id=conv_id, data=data, seed_info=seed_info,
                 )
