@@ -7,6 +7,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field, model_serializer
 
 from cowork.schemas.connectors import DisabledConnection
+from cowork.schemas.figure_sources import FigureSources
 
 
 class Role(str, Enum):
@@ -102,6 +103,10 @@ class ResponseOutput(BaseModel):
     status: ResponseStatus
     role: str = Role.assistant.value
     content: list[ResponseOutputContent]
+    # The figures in the answer and the steps they came from, on a
+    # non-streaming response. A stream carries them as its
+    # response.figure_sources event instead. Left out when None.
+    figure_sources: FigureSources | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class Response(BaseModel):

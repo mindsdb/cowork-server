@@ -11,7 +11,9 @@ from types import SimpleNamespace
 import cowork.services.artifact_autopublish as autopublish
 import cowork.services.task_objects as task_objects
 from cowork.harnesses.anton_harness.harness import AntonHarness
-from cowork.harnesses.anton_harness.stream_formatter import TurnHistory
+from cowork.harnesses.anton_harness import harness as harness_mod
+from cowork.harnesses.anton_harness.agent_files import AgentFiles, Attachment
+from cowork.harnesses.anton_harness.stream_formatter import TurnContext, TurnHistory
 
 
 class StreamContextCompacted:
@@ -99,3 +101,28 @@ def test_captures_tool_rows_without_compaction(monkeypatch):
 def test_skips_capture_after_midturn_compaction(monkeypatch):
     events = _drive(monkeypatch, compact=True)
     assert not any(isinstance(e, TurnHistory) for e in events)
+
+
+def test_the_turn_opens_with_its_question_its_project_and_the_files_attached_to_it(monkeypatch):
+    attachment = Attachment(file_id="f1", stored_path="/files/f1/stock.csv")
+
+    async def attached(*, conversation_id, scope):
+        return (attachment,) if conversation_id == "c1" else ()
+
+    monkeypatch.setattr(harness_mod, "read_conversation_attachments", attached)
+
+    events = _drive(monkeypatch, compact=False)
+
+    assert events[0] == TurnContext(
+        question="hi", files=AgentFiles.on_this_server("/tmp", project_id="p1", attachments=[attachment]),
+        history=[{"role": "user", "content": "seed"}],
+    )
+    assert not any(isinstance(e, TurnContext) for e in events[1:])
+
+
+def test_the_turns_context_holds_the_history_as_seeded_not_as_the_turn_grows_it(monkeypatch):
+    """The formatter reads earlier turns' tool results from it once the turn
+    ends, by which time the session's own history holds this turn too."""
+    events = _drive(monkeypatch, compact=False)
+
+    assert events[0].history == [{"role": "user", "content": "seed"}]
