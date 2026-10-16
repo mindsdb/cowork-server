@@ -339,12 +339,15 @@ class ProbeHandler:
             # extends too; the save below still merges them once, under the vault lock.
             probe_credentials = credentials
             saved_only_fields: set[str] = set()
+            unpatchable_names: set[str] = set()
             if extends_name:
                 try:
                     target = vault_for_scope(self.scope).read_record(connector_id, extends_name)
                 except Exception as exc:
                     logger.warning("Could not read connection %s to extend: %s", extends_name, exc)
-                    yield _delta(f"Could not read `{extends_name}`: `{exc}`.")
+                    unreadable = f"Could not read `{extends_name}`: `{exc}`."
+                    yield _delta(unreadable)
+                    yield _patch_delta({"form_id": form_id, "form_error": unreadable})
                     yield await _completed(db_conversation_id, {"status": "failed"})
                     return
                 if target is None:
@@ -361,6 +364,9 @@ class ProbeHandler:
                 for fields in field_lists:
                     step_field_names.update(f.get("name") for f in fields if isinstance(f, dict))
                 saved_only_fields = set(stored) - step_field_names
+                # The probe reads these as DS_<NAME> in its .env, so it may echo either form.
+                for saved_name in saved_only_fields:
+                    unpatchable_names.update({saved_name.lower(), f"ds_{saved_name.lower()}"})
 
             # Probe path: build workspace + LLM client
             if workspace_path is None:
@@ -441,13 +447,13 @@ class ProbeHandler:
                         field_name = (payload or {}).get("name")
                         # A patch for a field the form doesn't hold would add it,
                         # untyped, so a saved secret typed there would show.
-                        if field_name and field_name not in saved_only_fields:
+                        if field_name and field_name.lower() not in unpatchable_names:
                             status_val = (payload or {}).get("status")
                             mid = (payload or {}).get("method_id")
                             yield _patch_delta(_field_patch(form_id, mid, field_name, {"status": status_val}))
                     elif kind == "remove_field":
                         field_name = (payload or {}).get("name")
-                        if field_name and field_name not in saved_only_fields:
+                        if field_name and field_name.lower() not in unpatchable_names:
                             mid = (payload or {}).get("method_id")
                             yield _patch_delta(_field_patch(form_id, mid, field_name, None))
                     elif kind == "switch_method":
