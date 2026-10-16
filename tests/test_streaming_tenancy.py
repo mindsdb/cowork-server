@@ -17,6 +17,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from starlette.responses import JSONResponse
 
+from anton.core.interaction.elicit import AskOption, AskRequest
 from cowork.api.v1.endpoints import responses as responses_ep
 from cowork.api.v1.endpoints.responses import (
     _authorized_handle,
@@ -28,6 +29,7 @@ from cowork.db.scoped import (
     TenantScope,
     get_tenant_scope,
 )
+from cowork.streaming.answers import broker
 from cowork.streaming.registry import TurnLifecycle, registry
 
 ORG_A = "11111111-1111-1111-1111-111111111111"
@@ -293,6 +295,42 @@ def test_personal_scope_hides_and_refuses_another_persons_turn(client):
     assert ids == {CID_A}
     resp = client.post("/api/v1/responses/cancel", json={"conversation_id": CID_A})
     assert resp.status_code == 200 and resp.json()["cancelled"] is True
+
+
+ASKED = AskRequest(prompt="Which database?", options=(AskOption(value="pg", label="postgres"),))
+
+
+async def test_only_the_asker_answers_a_question_her_running_answer_asked(client):
+    # A real pending question: a missing one also answers 404, so B's 404
+    # proves the owner check only when A's own answer then lands.
+    _register(CID_A, PARTITION_A, user_id="alice")
+    broker.open(CID_A, "ask:1", ASKED)
+    try:
+        body = {"conversation_id": CID_A, "question_id": "ask:1", "values": ["pg"]}
+        client.set_scope(_personal_scope(org_id=PARTITION_B, user_id="bob"))
+        his = client.post("/api/v1/responses/answer", json=body)
+        assert (his.status_code, his.json()) == (404, {"status": "not_found"})
+        assert not broker._pending[(CID_A, "ask:1")].future.done()
+
+        client.set_scope(_personal_scope(org_id=PARTITION_A, user_id="alice"))
+        hers = client.post("/api/v1/responses/answer", json=body)
+        assert (hers.status_code, hers.json()) == (200, {"accepted": True})
+    finally:
+        broker.reset()
+
+
+async def test_with_shared_conversations_anyone_answers_a_running_answers_question(client):
+    _register(CID_A, PARTITION_A, user_id="alice")
+    broker.open(CID_A, "ask:1", ASKED)
+    try:
+        client.set_scope(_personal_scope(org_id=PARTITION_B, user_id="bob", resources=frozenset()))
+        his = client.post(
+            "/api/v1/responses/answer",
+            json={"conversation_id": CID_A, "question_id": "ask:1", "values": ["pg"]},
+        )
+        assert (his.status_code, his.json()) == (200, {"accepted": True})
+    finally:
+        broker.reset()
 
 
 def test_operator_view_sees_every_persons_turn(client):
