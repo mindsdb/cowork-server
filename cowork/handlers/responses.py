@@ -44,12 +44,12 @@ from cowork.handlers.response_routing import (
     ineligible_reason,
 )
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
-from cowork.schemas.figure_sources import FigureSources
+from cowork.harnesses.anton_harness.figure_sources import has_figures
+from cowork.schemas.figure_sources import EarlierAnswer, FigureSources
 from cowork.harnesses.anton_harness.stream_formatter import (
     SkillCreated,
     TurnContext,
     TurnEvidence,
-    TurnHistory,
     find_answer_sources,
     format_responses_stream,
 )
@@ -60,7 +60,7 @@ from cowork.streaming.answer_text import accumulate_answer_text
 from cowork.streaming.liveness import ModelWaitTicker
 from cowork.streaming.records import TerminalReason
 from cowork.streaming.registry import RunHandle, RunIdentity
-from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
+from cowork.turnqueue.producer import RemoteWorkspace, step_stream_events, stream_remote_replies
 from cowork.turnqueue.redis_client import (
     STALLED_CANCEL_REASON,
     cancel_cause_key,
@@ -79,7 +79,7 @@ from cowork.schemas.responses import (
 )
 from cowork.handlers._turn_history import (
     reject_unreplayable_tool_rows,
-    sanitize_turn_history_rows,
+    remote_turn_history,
 )
 from cowork.handlers.turn_errors import (
     AUTH_ERROR_CODE,
@@ -115,7 +115,7 @@ from cowork.db.scoped import (
 )
 from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.connectors.vault_secrets import register_vault_secrets
-from cowork.services.conversations import ConversationService
+from cowork.services.conversations import ConversationService, read_earlier_answers
 from cowork.services.files import FileService
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
@@ -498,9 +498,9 @@ class _RemoteTurnInputs:
     seed_info: dict | None
     artifacts: _RemoteArtifactsDir | None
     memory: dict | None
-    # stream_remote_replies' project_id and workspace_rel_path, or empty when
-    # they could not be resolved (_remote_workspace).
-    workspace: dict
+    # The project the turn runs in, or None when it could not be resolved
+    # (_remote_workspace).
+    workspace: RemoteWorkspace | None
     started_at: str | None
     # Where the pod's scratchpad works, as this server finds it in the
     # project, or None when it could not be resolved (_remote_agent_files).
@@ -1149,7 +1149,9 @@ class ResponsesHandler:
         figure in the answer may repeat."""
         if not request.stream:
             text = route.text
-            sources = await self._direct_figure_sources(answer=text, question=question)
+            sources = await self._direct_figure_sources(
+                conversation_id=conversation_id, answer=text, question=question,
+            )
             events = [{
                 "type": "response.output_text.delta",
                 "delta": text,
@@ -1197,12 +1199,20 @@ class ResponsesHandler:
         self.last_run_handle = handle
         return sse_from_buffer(handle.buffer, 0)
 
-    @staticmethod
-    async def _direct_figure_sources(*, answer: str, question: str) -> FigureSources | None:
+    async def _direct_figure_sources(
+        self, *, conversation_id: UUID, answer: str, question: str,
+    ) -> FigureSources | None:
         """A direct answer's figures, or None when it has none. The router
         answers from what it knows and runs no step, so each figure is the
-        question's or has no source."""
-        sources = await find_answer_sources(TurnEvidence(answer=answer, question=question))
+        question's, an earlier answer's, or has no source. The earlier
+        answers are read only for an answer with figures, before this one
+        is saved. The figure check parses the whole answer, so it runs in a
+        worker thread, as the matching does: every other request waits on
+        the loop."""
+        earlier: tuple[EarlierAnswer, ...] = ()
+        if await asyncio.to_thread(has_figures, answer):
+            earlier = await read_earlier_answers(conversation_id=conversation_id, scope=self.scope)
+        sources = await find_answer_sources(TurnEvidence(answer=answer, question=question, earlier_answers=earlier))
         return sources if sources.figures else None
 
     async def _produce_direct(
@@ -1254,7 +1264,7 @@ class ResponsesHandler:
 
         async def answer() -> None:
             # Found before the save, which keeps them with the answer.
-            sources = await self._direct_figure_sources(answer=route.text, question=question)
+            sources = await self._direct_figure_sources(conversation_id=conv_id, answer=route.text, question=question)
             sources_frame = None if sources is None else {
                 "type": "response.figure_sources",
                 "sequence_number": 3,
@@ -1446,16 +1456,16 @@ class ResponsesHandler:
             return None
 
     @staticmethod
-    def _remote_workspace(session: ScopedSession, conv_id: UUID) -> dict:
-        """The conversation's project as a path relative to the org root.
+    def _remote_workspace(session: ScopedSession, conv_id: UUID) -> RemoteWorkspace | None:
+        """The conversation's project, with its path relative to the org root.
 
         Absolute paths must not cross the wire: cowork-server sees the shared
         tree at ``<root>/<org_id>`` and the pod mounts its own org's access
         point at ``<root>``, so an absolute path built here names nothing
         inside the pod. Both sides join their own root to this.
 
-        A lookup failure degrades to the org's default project rather than
-        failing the turn, matching how memory and skills used to degrade.
+        None on a lookup failure, which runs the turn in the org's default
+        project (stream_remote_replies) rather than failing it.
         """
         from pathlib import Path
 
@@ -1468,18 +1478,22 @@ class ResponsesHandler:
                 Path(get_app_settings().project.root_dir), session.scope, store="projects"
             ).parent
             rel = Path(conversation.project.path).relative_to(org_root).as_posix()
-            return {"project_id": str(conversation.project.id), "workspace_rel_path": rel}
+            return RemoteWorkspace(project_id=str(conversation.project.id), workspace_rel_path=rel)
         except Exception:
             logger.exception("[responses] failed to resolve workspace", extra=log_context(conversation_id=conv_id))
-            return {}
+            return None
 
     @staticmethod
-    def _remote_agent_files(session: ScopedSession, conv_id: UUID) -> AgentFiles | None:
+    def _remote_agent_files(
+        session: ScopedSession, conv_id: UUID, *, workspace: RemoteWorkspace | None,
+    ) -> AgentFiles | None:
         """What the pod's scratchpad reads, as this server finds it: the
         conversation's folder in its project on the shared mount, placed in
-        the pod by the same project path the turn's job carries
+        the pod by ``workspace``, the same project path the turn's job carries
         (_remote_workspace), the project the turn runs in, and the files
         attached to the conversation, which the pod reads from that folder.
+        ``workspace`` is None when the project could not be resolved, and the
+        project's path is then unknown (AgentFiles.in_cloud_pod).
 
         None on a lookup failure, so the turn's figure sources name no files
         rather than the turn failing.
@@ -1491,7 +1505,7 @@ class ResponsesHandler:
             return AgentFiles.in_cloud_pod(
                 conversation.project.path,
                 conversation_id=conv_id,
-                workspace_rel_path=ResponsesHandler._remote_workspace(session, conv_id).get("workspace_rel_path"),
+                workspace_rel_path=workspace.workspace_rel_path if workspace is not None else None,
                 project_id=conversation.project_id,
                 attachments=conversation_attachments(session, conversation_id=conv_id),
             )
@@ -1624,6 +1638,7 @@ class ResponsesHandler:
         workspace, and when the conversation started."""
         history, seed_info = self._remote_seed_history(session, conv_id)
         artifacts = self._remote_artifacts_context(session, conv_id)
+        workspace = self._remote_workspace(session, conv_id)
         return _RemoteTurnInputs(
             history=history,
             seed_info=seed_info,
@@ -1634,9 +1649,9 @@ class ResponsesHandler:
                 creator=getattr(artifacts[0], "created_by", None),
             ),
             memory=self._remote_memory(session, conv_id),
-            workspace=self._remote_workspace(session, conv_id),
+            workspace=workspace,
             started_at=self._remote_started_at(session, conv_id),
-            files=self._remote_agent_files(session, conv_id),
+            files=self._remote_agent_files(session, conv_id, workspace=workspace),
         )
 
     @staticmethod
@@ -2067,7 +2082,9 @@ class ResponsesHandler:
             # re-reading it when the reply arrives could map the count onto a
             # different list.
             seed = await run_db(partial(self._read_remote_turn_inputs, conv_id=conv_id), scope=scope)
-            yield TurnContext(question=input_text, files=seed.files, history=seed.history)
+            # A unit of its own, so a failed read can't abort the seed's.
+            earlier = await read_earlier_answers(conversation_id=conv_id, scope=scope)
+            yield TurnContext(question=input_text, files=seed.files, history=seed.history, earlier_answers=earlier)
             if seed.artifacts is not None:
                 # The worker writes artifacts into the shared tree while this
                 # turn runs, so cowork-server does the same before/after diff
@@ -2083,6 +2100,10 @@ class ResponsesHandler:
             # may have cut anton off between writing an artifact's metadata and
             # appending its provenance, see `turn_created_slugs`.
             completed_cleanly = False
+            # Whether the pod compacted or hard-truncated the turn's context:
+            # its compacted step comes for both, its compaction reply for a
+            # summary. Both arrive before the history frame.
+            compacted = False
 
             async for kind, data in stream_remote_replies(
                 conversation_id=str(conv_id),
@@ -2096,7 +2117,7 @@ class ResponsesHandler:
                 # memory is outside the conversation workspace and therefore
                 # travels as a bounded, sheddable wire block.
                 memory=seed.memory,
-                **seed.workspace,
+                workspace=seed.workspace,
                 started_at=seed.started_at,
                 correlation_id=corr,
                 run_id=lifecycle.identity.run_id,
@@ -2118,22 +2139,25 @@ class ResponsesHandler:
                 elif kind == "turn_delta":
                     yield StreamTextDelta(text=data.get("text", ""))
                 elif kind == "turn_step":
+                    if data.get("step") == "compacted":
+                        compacted = True
                     for event in step_stream_events(data):
                         yield event
                 elif kind == "turn_memory":
                     await save_memory(data.get("entries") or [])
                 elif kind == "turn_history":
-                    pod_rows = data.get("rows")
-                    # Slice-assign, not extend: the pod emits one frame per
-                    # turn, so a repeated frame must replace the rows rather
-                    # than double them. Sanitized at the boundary — the pod
+                    # Sanitized at the boundary (remote_turn_history): the pod
                     # is semi-trusted and these rows reach both the DB and
                     # every later turn's LLM context.
-                    turn_rows[:] = sanitize_turn_history_rows(pod_rows)
-                    # The formatter finds the answer's figures in every tool's
-                    # results, read before the replay caps trimmed them.
-                    yield TurnHistory(list(turn_rows), read=pod_rows if isinstance(pod_rows, list) else None)
+                    history = remote_turn_history(pod_rows=data.get("rows"), compacted=compacted)
+                    # Slice-assign, not extend: the pod emits one frame per
+                    # turn, so a repeated frame must replace the rows rather
+                    # than double them.
+                    turn_rows[:] = [] if history is None else history.rows
+                    if history is not None:
+                        yield history
                 elif kind == "turn_compaction":
+                    compacted = True
                     await save_compaction(data, seed.seed_info)
                 elif kind == "turn_skill":
                     # Not persisted like memory: a draft is the user's decision.

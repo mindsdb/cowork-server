@@ -9,6 +9,7 @@ import json
 import pytest
 
 from cowork.turnqueue import producer as prod
+from cowork.turnqueue.producer import RemoteWorkspace
 
 
 class _StopEnqueue(Exception):
@@ -59,15 +60,15 @@ async def _enqueue(**kwargs):
 
 @pytest.mark.asyncio
 async def test_workspace_path_is_org_relative(captured):
-    await _enqueue(project_id="proj-1", workspace_rel_path="projects/general")
+    await _enqueue(workspace=RemoteWorkspace(project_id="proj-1", workspace_rel_path="projects/proj"))
     params = captured["payload"]["params"]
-    assert params["workspace_path"] == "projects/general"
+    assert params["workspace_path"] == "projects/proj"
     assert not params["workspace_path"].startswith("/")
 
 
 @pytest.mark.asyncio
 async def test_project_id_travels_on_the_job(captured):
-    await _enqueue(project_id="proj-1", workspace_rel_path="projects/general")
+    await _enqueue(workspace=RemoteWorkspace(project_id="proj-1", workspace_rel_path="projects/general"))
     assert captured["payload"]["project_id"] == "proj-1"
 
 
@@ -80,8 +81,7 @@ async def test_only_project_memory_is_shipped_in_anton_job_params(captured):
         "lessons": "Retries need idempotency.",
     }
     await _enqueue(
-        project_id="proj-1",
-        workspace_rel_path="projects/general",
+        workspace=RemoteWorkspace(project_id="proj-1", workspace_rel_path="projects/general"),
         memory={
             "global": {"rules": "private preference"},
             "project": project_memory,
@@ -102,8 +102,17 @@ async def test_empty_or_global_only_memory_is_omitted(captured):
 async def test_a_leading_slash_is_stripped_rather_than_shipped(captured):
     """Defence in depth: a caller passing an absolute-looking path must not put
     one on the wire, because the pod would join it under its own root."""
-    await _enqueue(workspace_rel_path="/projects/general")
+    await _enqueue(workspace=RemoteWorkspace(project_id="proj-1", workspace_rel_path="/projects/proj"))
+    assert captured["payload"]["params"]["workspace_path"] == "projects/proj"
+
+
+@pytest.mark.asyncio
+async def test_an_unresolved_workspace_runs_as_the_default_project(captured):
+    """A conversation whose project could not be read runs in the org's
+    default project, with no project on the job."""
+    await _enqueue(workspace=None)
     assert captured["payload"]["params"]["workspace_path"] == "projects/general"
+    assert captured["payload"]["project_id"] is None
 
 
 pytestmark = pytest.mark.usefixtures("granted_product_permissions")
