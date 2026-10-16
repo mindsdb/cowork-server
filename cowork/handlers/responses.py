@@ -31,10 +31,12 @@ from cowork.common.settings.user_settings import (
 from cowork.db.units import busy_retry_seconds, conversation_writes, run_db, run_to_completion
 from cowork.harnesses.base import available_harness_ids, get_harness, prompt_text
 from cowork.handlers import jev_shadow
+from cowork.handlers.first_take import FirstTake, clears_take as first_take_clears
 from cowork.handlers.response_routing import (
     DELEGATED_AGENTIC,
     DIRECT_CONTEXT,
     _MAX_HISTORY_MESSAGES,
+    _settings_binding,
     _text_history,
     RouteDecision,
     RouterBinding,
@@ -547,6 +549,60 @@ def _failed_frame_for(exc: Exception, *, request_id: str | None = None) -> str:
     return response_failed_sse(GENERIC_TURN_ERROR_MESSAGE, GENERIC_TURN_ERROR_CODE, request_id=request_id)
 
 
+def _first_take_binding(minted: RouterBinding | None) -> RouterBinding | None:
+    """The gate's own binding: the take only helps if it lands within a second
+    or two, which a chat model is routinely too slow for. `minted` is the
+    gate's per-turn MindsHub binding on hosted orgs. None when there is no
+    gate model, and then there is no take; the turn is unaffected."""
+    if minted is not None:
+        return minted
+    try:
+        return _settings_binding()
+    except Exception:
+        return None
+
+
+def _first_take_enabled() -> bool:
+    try:
+        return bool(get_user_settings().first_take_enabled)
+    except Exception:
+        return False
+
+
+def _start_first_take(
+    minted: RouterBinding | None,
+    *,
+    history: list[dict],
+    conversation_id: UUID,
+    harness: str | None,
+    metadata: dict[str, str],
+) -> FirstTake | None:
+    """Start the turn's first take on the gate's model, or None when it is
+    switched off or there is no model to run it on.
+
+    Its trace is its own (tag ``cowork-first-take``), joined to the gate's by
+    the correlation id, so its cost is countable apart from the gate's.
+    """
+    if not _first_take_enabled():
+        return None
+    binding = _first_take_binding(minted)
+    if binding is None:
+        return None
+    from anton.core.llm.tracing import TraceContext, reset_trace_context, set_trace_context
+
+    token = set_trace_context(TraceContext(
+        session_id=str(conversation_id),
+        harness=harness,
+        tags=("cowork-first-take",),
+        metadata=metadata,
+    ))
+    try:
+        # The task copies the context here, trace included.
+        return FirstTake(binding, history).start()
+    finally:
+        reset_trace_context(token)
+
+
 class ResponsesHandler:
     def __init__(self, *, principal: Principal | None = None, interactive: bool = True) -> None:
         self.principal = principal
@@ -561,6 +617,9 @@ class ResponsesHandler:
         self.last_run_handle: RunHandle | None = None
         # Whether a person is watching this turn and can answer ask_user cards.
         self.interactive = interactive
+        # The instant first take, started beside the gate by
+        # _route_request and handed to the turn's producer if it delegates.
+        self.first_take: FirstTake | None = None
 
     def _get_harness(self):
         if self.harness is None:
@@ -602,14 +661,23 @@ class ResponsesHandler:
         # task created below (create_task copies this context), is served from
         # the snapshot the unit loaded.
         with use_turn_settings(self.scope, start.settings):
-            route, turn_llm = await self._route_request(
-                conversation_id=start.conversation_id,
-                harness_input=start.harness_input,
-                gate_rows=start.gate_rows,
-                has_attachments=bool(request.attachment_ids),
-                has_disabled_connections=bool(disabled),
-                trace_metadata=trace_metadata,
-            )
+            try:
+                route, turn_llm = await self._route_request(
+                    conversation_id=start.conversation_id,
+                    harness_input=start.harness_input,
+                    gate_rows=start.gate_rows,
+                    has_attachments=bool(request.attachment_ids),
+                    has_disabled_connections=bool(disabled),
+                    trace_metadata=trace_metadata,
+                    first_take=bool(request.stream) and self.interactive,
+                )
+            except BaseException:
+                # A refused or cancelled request must not leave the take's model call running.
+                if getattr(self, "first_take", None) is not None:
+                    self.first_take.cancel()
+                    self.first_take = None
+                raise
+            first_take, self.first_take = getattr(self, "first_take", None), None
             trace_metadata = {
                 **trace_metadata,
                 "response_route": route.route,
@@ -623,6 +691,11 @@ class ResponsesHandler:
                 route.route, route.reason, route.fallback, route.provider, route.model,
                 start.conversation_id,
             )
+
+            if route.route == DIRECT_CONTEXT and first_take is not None:
+                # The gate answered: there is nothing to fill the wait for.
+                first_take.cancel()
+                first_take = None
 
             if route.route == DIRECT_CONTEXT:
                 return await self._handle_direct_response(
@@ -676,19 +749,28 @@ class ResponsesHandler:
                         trace_tags=request.trace_tags,
                         trace_metadata=trace_metadata,
                         turn_llm=turn_llm,
+                        first_take=first_take,
                     )
 
-                handle = await registry.start(
-                    conversation_id=str(start.conversation_id),
-                    turn_id=start.turn_id,
-                    open_buffer=partial(new_buffer, str(start.conversation_id), start.turn_id),
-                    produce=produce,
-                    org_id=self.scope.org_id,
-                    user_id=self.scope.user_id,
-                    lifecycle=lifecycle,
-                )
+                try:
+                    handle = await registry.start(
+                        conversation_id=str(start.conversation_id),
+                        turn_id=start.turn_id,
+                        open_buffer=partial(new_buffer, str(start.conversation_id), start.turn_id),
+                        produce=produce,
+                        org_id=self.scope.org_id,
+                        user_id=self.scope.user_id,
+                        lifecycle=lifecycle,
+                    )
+                except BaseException:
+                    if first_take is not None:
+                        first_take.cancel()
+                    raise
                 self.last_run_handle = handle
                 return sse_from_buffer(handle.buffer, 0)
+
+            if first_take is not None:
+                first_take.cancel()
 
             # Non-streaming (legacy/rare): run synchronously within the request.
             # There is nowhere to run it in org mode. Only the streaming branch
@@ -864,8 +946,13 @@ class ResponsesHandler:
         has_attachments: bool,
         has_disabled_connections: bool,
         trace_metadata: dict[str, str] | None = None,
+        first_take: bool = False,
     ) -> tuple[RouteDecision, dict | None]:
         """Run Cowork's narrow pre-Anton gate with only safe text context.
+
+        With `first_take`, the instant first take starts beside the gate on the
+        same history and model, left on `self.first_take` for handle() to keep
+        or cancel once the route is known.
 
         `gate_rows` is the history handle()'s first unit read for the gate
         (see _TurnStart).
@@ -926,6 +1013,17 @@ class ResponsesHandler:
                     # "{harness}:turn-N", which would count these as user turns.
                     binding, turn_llm = await self._router_binding()
                     correlation_id = (turn_llm or {}).get("correlation_id")
+                    if first_take:
+                        self.first_take = _start_first_take(
+                            binding,
+                            history=history,
+                            conversation_id=conversation_id,
+                            harness=self.harness_name,
+                            metadata={
+                                **(trace_metadata or {}),
+                                **({"correlation_id": correlation_id} if correlation_id else {}),
+                            },
+                        )
                     trace_token = set_trace_context(TraceContext(
                         session_id=str(conversation_id),
                         harness=self.harness_name,
@@ -1253,6 +1351,7 @@ class ResponsesHandler:
         trace_metadata: dict[str, str] | None = None,
         lifecycle: TurnLifecycle | None = None,
         turn_llm: dict | None = None,
+        first_take: FirstTake | None = None,
     ):
         """Choose the streaming producer coroutine.
 
@@ -1282,6 +1381,7 @@ class ResponsesHandler:
                 turn_id=turn_id,
                 turn_llm=turn_llm,
                 disabled=disabled,
+                first_take=first_take,
             )
         return self._produce(
             lifecycle=lifecycle,
@@ -1296,6 +1396,7 @@ class ResponsesHandler:
             buffer=buffer,
             trace_tags=trace_tags,
             trace_metadata=trace_metadata,
+            first_take=first_take,
         )
 
     @staticmethod
@@ -1649,7 +1750,11 @@ class ResponsesHandler:
         # and the turn's settings snapshot, which handle() bound around this
         # task's creation, answers it without a connection (use_turn_settings).
         with use_settings_scope(scope_from_principal(self.principal)):
-            await self._run_remote_turn(**kwargs)
+            try:
+                await self._run_remote_turn(**kwargs)
+            finally:
+                if kwargs.get("first_take") is not None:
+                    kwargs["first_take"].cancel()
 
     async def _run_remote_turn(
         self,
@@ -1664,6 +1769,7 @@ class ResponsesHandler:
         lifecycle: TurnLifecycle | None = None,
         turn_llm: dict | None = None,
         disabled: list[dict] | None = None,
+        first_take: FirstTake | None = None,
     ) -> None:
         """Remote-backend counterpart of _run_turn: pipe the pod's replies
         through the same SSE formatter as the in-process path (full step /
@@ -2109,12 +2215,19 @@ class ResponsesHandler:
             async for sse in format_responses_stream(
                 replies_as_stream_events(), model or "", event_sink,
             ):
+                event_type = self._sse_event_type(sse)
+                if first_take is not None and first_take_clears(event_type, sse):
+                    await first_take.clear(buffer)
                 if first:
                     # The formatter's created frame lacks conversation_id +
                     # harness; inject them like the in-process path does.
                     sse = self._inject_created(sse, conv_id, harness_id, question_id, run_id=lifecycle.identity.run_id)
                     first = False
-                if self._sse_event_type(sse) == "response.completed":
+                    await buffer.append("sse", {"sse": sse})
+                    if first_take is not None:
+                        first_take.attach(buffer)
+                    continue
+                if event_type == "response.completed":
                     # The formatter yields its terminal frame last, once its
                     # source is exhausted, so event_sink has already seen
                     # everything this turn produced. finish() sends it once
@@ -2243,7 +2356,12 @@ class ResponsesHandler:
         # Detached task: bind the turn's org scope so every settings reader in the
         # harness/provider/publish subtree resolves this org's config.
         with use_settings_scope(scope_from_principal(self.principal)):
-            await self._run_turn(**kwargs)
+            try:
+                await self._run_turn(**kwargs)
+            finally:
+                # However the turn ended, the first take writes nothing more.
+                if kwargs.get("first_take") is not None:
+                    kwargs["first_take"].cancel()
 
     async def _run_turn(
         self,
@@ -2261,6 +2379,7 @@ class ResponsesHandler:
         trace_tags: list[str] | None = None,
         trace_metadata: dict[str, str] | None = None,
         lifecycle: TurnLifecycle | None = None,
+        first_take: FirstTake | None = None,
     ) -> None:
         """Detached producer: run the turn and write events to the buffer.
 
@@ -2432,7 +2551,10 @@ class ResponsesHandler:
                     sse_string = self._inject_created(
                         sse_string, conv_id, harness_id, question_id, run_id=lifecycle.identity.run_id,
                     )
-                    if self._sse_event_type(sse_string) == "response.completed":
+                    event_type = self._sse_event_type(sse_string)
+                    if first_take is not None and first_take_clears(event_type, sse_string):
+                        await first_take.clear(buffer)
+                    if event_type == "response.completed":
                         # The formatter yields its terminal frame last, once its
                         # source is exhausted, so event_sink has already seen
                         # everything this turn produced. finish() sends it once
@@ -2440,6 +2562,10 @@ class ResponsesHandler:
                         completed_frame = sse_string
                         continue
                     await buffer.append("sse", {"sse": sse_string})
+                    if event_count == 1 and first_take is not None:
+                        # After response.created, so the renderer has a turn
+                        # to put the take on.
+                        first_take.attach(buffer)
             logger.info("[responses] turn %s finished — %d events", conv_id, event_count)
             # A Stop that lands here waits for the save and its frame, so the
             # stream's terminal record always matches what the database holds.
