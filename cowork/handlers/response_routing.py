@@ -306,8 +306,13 @@ async def _drain(events, *, deadline: float, model: str) -> None:
             "[gate] usage_drain_timeout conversation=%s model=%s",
             ctx.session_id if ctx else None, model,
         )
-    except Exception:
-        logger.warning("[gate] usage drain failed", exc_info=True)
+    except Exception as exc:
+        # As in `decide_route`: a provider's body can echo the request, so only the class and status.
+        status = exception_http_status(exc=exc)
+        logger.warning(
+            "[gate] usage_drain_failed error=%s status=%s",
+            type(exc).__name__, "unknown" if status is None else status,
+        )
     finally:
         await _close(events)
 
