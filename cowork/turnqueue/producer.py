@@ -25,6 +25,7 @@ from cowork.handlers.turn_errors import (
 from cowork.services.providers import minds_chat_base_url
 from cowork.db.scoped import TenantScope
 from cowork.services import product_permissions
+from cowork.services.connectors.specs._registry import registry
 from cowork.services.product_permissions import require_product_permission
 from cowork.turnqueue.auth_keys import (
     list_active_connections,
@@ -227,6 +228,21 @@ async def _mint_oauth_block(*, org_id: str | None, user_id: str | None,
     }
 
 
+def _connectors_block(oauth_connections: dict | None) -> dict | None:
+    """The turn's `connectors` block: {engine: {"usage_notes": ...}} for the
+    engines of this turn's connections whose spec declares usage notes. None
+    when there is nothing to send; the key is then left out of params, like
+    `oauth`.
+
+    Built from the same, already disabled-filtered, connection list as the
+    `oauth` block: anton renders notes only for engines its vault connects,
+    and on web that vault is built from `oauth` alone.
+    """
+    connections = (oauth_connections or {}).get("connections") or []
+    notes = registry.usage_notes_for(dict.fromkeys(c.get("engine") for c in connections))
+    return {engine: {"usage_notes": text} for engine, text in notes.items()} or None
+
+
 def _refuse_datasource_grants(reason: str) -> product_permissions.ProductPermissionUnavailable:
     """Name the failed check for the operator, who otherwise sees the same
     permission_unavailable for an outage, a malformed row and a bad binding.
@@ -395,6 +411,7 @@ def step_stream_events(data: dict) -> list:
         StreamToolUseDelta,
         StreamToolUseEnd,
         StreamToolUseStart,
+        StreamTurnEnded,
         ToolCall,
     )
     from anton.core.interaction.elicit import AskAnswer, AskOption, AskRequest
@@ -468,6 +485,9 @@ def step_stream_events(data: dict) -> list:
             values=tuple(v for v in data.get("values") or [] if isinstance(v, str)),
             text=str(data.get("text") or ""),
         ))]
+    if step == "turn_ended":
+        ended_by = data.get("ended_by")
+        return [StreamTurnEnded(ended_by=ended_by)] if isinstance(ended_by, str) and ended_by else []
     # `ask_user_answer_rejected` is the pod's verdict on one answer; only
     # /answer reads it (turnqueue/answers.py), nothing renders it.
     return []
@@ -482,6 +502,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
                                 project_id: str | None = None,
                                 workspace_rel_path: str = "projects/general",
                                 correlation_id: str | None = None,
+                                run_id: str | None = None,
                                 llm: dict | None = None,
                                 turn_key_id: str | None = None,
                                 disabled: list[dict] | None = None,
@@ -509,7 +530,10 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     corr = correlation_id or _new_correlation_id()
     # A flag left by an earlier turn would cancel this one on its first line,
     # and its cause would turn this turn's own Stop into a stall.
-    await r.delete(cancel_flag_key(corr), cancel_cause_key(corr))
+    # A registry-owned run is already cancellable. Clearing its flag here
+    # would erase a disconnect that arrived while dispatch prepared the job.
+    if run_id is None:
+        await r.delete(cancel_flag_key(corr), cancel_cause_key(corr))
     reply_stream = reply_stream_key(conversation_id)
 
     # No client-picked model → the deployment's resolved default (org mode: the
@@ -573,6 +597,7 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # second one. Org/cloud mode only: local-mode turns build in-process
     # and never reach this function at all.
     oauth_block = {**oauth_connections, "turn_key": llm_block.get("api_key", "")} if oauth_connections else None
+    connectors_block = _connectors_block(oauth_connections)
 
     # Org-relative, never absolute. cowork-server sees the shared tree at
     # <root>/<org_id> while the pod mounts its own org's access point AT
@@ -602,6 +627,9 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # Absent entirely (not an empty dict) when there's nothing to
               # offer — see _mint_oauth_block's docstring for why.
               **({"oauth": oauth_block} if oauth_block else {}),
+              # Agent-facing usage notes for this turn's connected engines; absent
+              # entirely when none has notes.
+              **({"connectors": connectors_block} if connectors_block else {}),
               **({"datasource": datasource_block} if datasource_block else {}),
               # Conversation creation time, ISO 8601. The pod is fresh every
               # turn and would otherwise stamp today's date into the system
@@ -643,10 +671,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     # correlation_id to cancel it, its org to authorize the caller. Recorded
     # here rather than after the first buffer record, because this generator
     # does not own the buffer; _shared_turn covers the gap between the two.
-    await record_turn(
-        conversation_id, turn_id=turn_id, correlation_id=corr,
-        org_id=org_id, user_id=user_id, client=r,
-    )
+    if run_id is None:
+        await record_turn(
+            conversation_id, turn_id=turn_id, correlation_id=corr,
+            org_id=org_id, user_id=user_id, client=r,
+        )
 
     authorized_workspace_mode = None
     idle_timeout = settings.reply_idle_timeout_seconds
