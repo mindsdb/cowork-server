@@ -226,6 +226,12 @@ def test_remote_backend_selected(monkeypatch):
     assert called["buffer"] is kwargs["buffer"]
 
 
+async def _no_earlier_answers(*, conversation_id, scope):
+    """The earlier answers' read, finding none, so a turn's figures keep the
+    origins this turn gives them."""
+    return ()
+
+
 def _remote_handler(monkeypatch, saved):
     """Handler wired for _produce_remote with the DB layer faked out."""
     handler = _handler()
@@ -259,6 +265,7 @@ def _remote_handler(monkeypatch, saved):
 
     monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
     monkeypatch.setattr(responses_mod, "run_db", inline_run_db(_FakeUnitSession()))
+    monkeypatch.setattr(responses_mod, "read_earlier_answers", _no_earlier_answers)
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: _FakeScope())
     return handler
 
@@ -1771,6 +1778,84 @@ async def test_produce_remote_finds_a_figure_in_a_tool_result_only_the_pods_rows
     assert not [e for e in saved["events"] if e.get("type") == "response.turn_history"]
 
 
+@pytest.mark.asyncio
+async def test_a_remote_turns_context_carries_the_earlier_answers(monkeypatch):
+    """The turn reads the conversation's earlier answers in a unit of its
+    own, and a figure one of them gave is marked as repeated."""
+    from cowork.schemas.figure_sources import EarlierAnswer, Figure, FigureOrigin
+
+    saved = {}
+    handler = _figure_sources_handler(monkeypatch, saved)
+    conv_id = uuid4()
+    earlier = EarlierAnswer(figures=[Figure(start=0, end=5, text="4,600", origin=FigureOrigin.step)])
+    reads = []
+
+    async def read_earlier_answers(*, conversation_id, scope):
+        reads.append((conversation_id, scope))
+        return (earlier,)
+
+    monkeypatch.setattr(responses_mod, "read_earlier_answers", read_earlier_answers)
+
+    async def fake_replies(**kwargs):
+        yield "turn_delta", {"text": "Up from 4,600."}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    await handler._produce_remote(
+        conv_id=conv_id, input_text="And 2024?", original_content="And 2024?",
+        model="anton", harness_id="anton", buffer=_FakeBuffer(),
+    )
+
+    assert [(conversation_id, type(scope)) for conversation_id, scope in reads] == [(conv_id, _FakeScope)]
+    assert _saved_figures(saved) == {
+        "4,600": {"start": 8, "end": 13, "text": "4,600", "origin": "earlier_answer", "sources": []},
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", ["busy", "refused"])
+async def test_a_failed_earlier_answers_read_leaves_the_remote_answer_and_its_sources(monkeypatch, caplog, error):
+    """The database refuses the earlier answers' unit. The turn runs on, its
+    answer is saved, and its own figures keep their origins."""
+    import cowork.services.conversations as conversations_mod
+    from cowork.db.units import DatabaseBusy
+
+    saved = {}
+    handler = _figure_sources_handler(monkeypatch, saved)
+
+    async def refusing(fn, *, scope):
+        raise DatabaseBusy("no connection") if error == "busy" else ValueError("Conversation not found")
+
+    monkeypatch.setattr(responses_mod, "read_earlier_answers", conversations_mod.read_earlier_answers)
+    monkeypatch.setattr(conversations_mod, "run_db", refusing)
+    code = "print(open('/workspace/stock.csv').read())"
+    cell = {"code": code, "stdout": "part,site,qty\nP100,S1,250\n", "stderr": "", "error": None, "description": ""}
+
+    async def fake_replies(**kwargs):
+        yield "turn_step", {"step": "tool_start", "id": "t1", "name": "scratchpad"}
+        yield "turn_step", {"step": "tool_end", "id": "t1", "args": json.dumps({"action": "exec", "code": code})}
+        yield "turn_step", {
+            "step": "tool_result", "id": "t1", "name": "scratchpad", "action": "exec", "content": json.dumps(cell),
+        }
+        yield "turn_delta", {"text": "S1 holds 250 units, up from 4,600."}
+        yield "turn_completed", {}
+
+    monkeypatch.setattr(responses_mod, "stream_remote_replies", fake_replies)
+
+    with caplog.at_level(logging.WARNING, logger="cowork.services.conversations"):
+        await handler._produce_remote(
+            conv_id=uuid4(), input_text="How many at S1?", original_content="How many at S1?",
+            model="anton", harness_id="anton", buffer=_FakeBuffer(),
+        )
+
+    assert saved["assistant"] == "S1 holds 250 units, up from 4,600."
+    figures = _saved_figures(saved)
+    assert {text: figure["origin"] for text, figure in figures.items()} == {"250": "step", "4,600": "none"}
+    assert figures["250"]["sources"] == [{"tool_use_id": "t1", "page": None}]
+    assert [r.levelname for r in caplog.records if r.name == "cowork.services.conversations"] == ["WARNING"]
+
+
 def _web_fetch_replies(tool_use_id: str, url: str) -> list[tuple[str, dict]]:
     """A web_fetch call that succeeded, as the pod's turn_step replies carry it."""
     import json
@@ -1885,7 +1970,8 @@ async def test_produce_remote_leaves_a_figure_no_step_holds_unmarked_when_a_pod_
 async def test_produce_remote_names_the_earlier_turns_cell_a_figure_was_computed_from(monkeypatch):
     """The seeded history reaches the formatter: this turn's cell sums a frame
     an earlier turn's cell read, so the figure names both. A figure the
-    answer only repeats from the earlier turn has no source."""
+    answer only repeats from the earlier turn, whose answer saved no figure
+    sources, has no source."""
     import json
 
     saved = {}
@@ -2900,6 +2986,7 @@ def _remote_handler_with_message_id(monkeypatch, saved, *, assistant_message_id)
 
     monkeypatch.setattr(responses_mod, "ConversationService", FakeConversationService)
     monkeypatch.setattr(responses_mod, "run_db", inline_run_db(_FakeUnitSession()))
+    monkeypatch.setattr(responses_mod, "read_earlier_answers", _no_earlier_answers)
     monkeypatch.setattr(responses_mod, "scope_from_principal", lambda p: _FakeScope())
     return handler
 

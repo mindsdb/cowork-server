@@ -8,6 +8,7 @@ from cowork.db.scoped import ScopedSession
 from cowork.handlers.responses import ResponsesHandler
 from cowork.handlers.turn_errors import GENERIC_TURN_ERROR_CODE, GENERIC_TURN_ERROR_MESSAGE
 from cowork.services.connectors.vault_secrets import register_vault_secrets
+from cowork.services.conversations import read_earlier_answers
 from cowork.turnqueue.producer import step_stream_events, stream_remote_replies
 
 
@@ -54,6 +55,10 @@ async def remote_turn_events(
         question=input_text,
         files=ResponsesHandler._remote_agent_files(session, conv_id, workspace=workspace),
         history=seeded_history,
+        # In a unit of its own, never on the channel's shared session: a
+        # failed statement would abort the transaction its later reads and
+        # the answer's save run in.
+        earlier_answers=await read_earlier_answers(conversation_id=conv_id, scope=session.scope),
     )
     artifacts = ResponsesHandler._remote_artifacts_context(session, conv_id)
     before_slugs, before_mtimes = (

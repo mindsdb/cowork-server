@@ -33,6 +33,7 @@ from cowork.harnesses.anton_harness import figure_sources as figure_sources_mod
 from cowork.harnesses.anton_harness import stream_formatter as stream_formatter_mod
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.stream_formatter import TurnContext, TurnHistory, format_responses_stream
+from cowork.schemas.figure_sources import EarlierAnswer, Figure, FigureOrigin
 from cowork.turnqueue.producer import step_stream_events
 from tests._hubspot_records import HUBSPOT_DEALS, SEARCH_DEALS
 
@@ -1069,6 +1070,65 @@ class TestStepsFromEarlierTurns:
         assert _by_text(_figures(events))["250"]["origin"] == "none"
 
 
+def _earlier_answer(*figures: tuple[str, FigureOrigin]) -> EarlierAnswer:
+    """An earlier answer whose saved event lists these figures."""
+    return EarlierAnswer(figures=[
+        Figure(start=0, end=len(text), text=text, origin=origin) for text, origin in figures
+    ])
+
+
+class TestFiguresRepeatedFromEarlierAnswers:
+    async def test_the_event_marks_a_repeated_figure_and_names_no_step_for_it(self):
+        events = await _run_turn(
+            TurnContext(question="And now?", earlier_answers=(_earlier_answer(("4,600", FigureOrigin.step)),)),
+            StreamTextDelta(text="Up from 4,600."),
+        )
+
+        payload = _figures(events)
+        assert payload["figures"] == [
+            {"start": 8, "end": 13, "text": "4,600", "origin": "earlier_answer", "sources": []},
+        ]
+        assert payload["steps"] == []
+
+    async def test_a_compacted_turn_keeps_a_repeated_figures_mark(self):
+        """The turn compacted and no tool rows arrived for its web call, so a
+        figure no step holds is left out, but one an earlier answer gave keeps
+        its mark."""
+        events = await _run_turn(
+            TurnContext(
+                question="What does overtime cost?", earlier_answers=(_earlier_answer(("$42", FigureOrigin.step)),),
+            ),
+            *_tool_call("toolu_web", "web_fetch", {"url": "https://example.com/rates"}),
+            *_tool_done("toolu_web", True),
+            StreamContextCompacted(message="Context compacted"),
+            StreamTextDelta(text="Overtime costs $42 an hour over 7 shifts."),
+        )
+
+        assert {text: figure["origin"] for text, figure in _by_text(_figures(events)).items()} == {
+            "$42": "earlier_answer",
+        }
+
+    async def test_a_failure_marking_repeated_figures_keeps_this_turns_sources(self, monkeypatch, caplog):
+        def broken(**_kwargs):
+            raise ValueError("boom")
+
+        monkeypatch.setattr(stream_formatter_mod, "mark_repeated_figures", broken)
+
+        events = await _run_turn(
+            TurnContext(question="How many at S1?", earlier_answers=(_earlier_answer(("90", FigureOrigin.step)),)),
+            *_read_stock_cell(),
+            StreamTextDelta(text="S1 holds 250 units, against 4,600 last year."),
+        )
+
+        figures = _by_text(_figures(events))
+        assert figures["250"]["origin"] == "step"
+        assert figures["250"]["sources"] == [{"tool_use_id": "toolu_read", "page": None}]
+        assert figures["4,600"]["origin"] == "none"
+        assert [
+            r for r in caplog.records if r.name == stream_formatter_mod.logger.name and r.levelname == "ERROR"
+        ]
+
+
 class TestQuestionText:
     async def test_a_value_the_user_typed_answering_the_agent_counts_as_the_question(self):
         from anton.core.interaction.elicit import AskAnswer
@@ -1243,6 +1303,20 @@ class TestTheInProcessHandlerSavesTheSources:
         assert persisted == _figures(_parse_sse(frames))
         assert _by_text(persisted)["404"]["origin"] == "none"
         assert persisted["steps"] == []
+
+    async def test_the_saved_answer_carries_a_repeated_figures_mark(self):
+        frames, saved = await self._produce([
+            TurnContext(question="And S2?", earlier_answers=(_earlier_answer(("4,600", FigureOrigin.step)),)),
+            *_read_stock_cell(),
+            StreamTextDelta(text="S2 holds 90 units, against 4,600 last year."),
+        ])
+
+        [persisted] = [event for event in saved if event.get("type") == "response.figure_sources"]
+        assert persisted == _figures(_parse_sse(frames))
+        assert {text: figure["origin"] for text, figure in _by_text(persisted).items()} == {
+            "90": "step", "4,600": "earlier_answer",
+        }
+        assert _by_text(persisted)["4,600"]["sources"] == []
 
     async def test_the_answer_carries_them_with_the_setting_off(self):
         from cowork.common.settings.user_settings import UserSettings, use_turn_settings

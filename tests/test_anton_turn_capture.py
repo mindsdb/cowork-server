@@ -46,6 +46,8 @@ from cowork.harnesses.anton_harness.harness import AntonHarness
 from cowork.harnesses.anton_harness import harness as harness_mod
 from cowork.harnesses.anton_harness.agent_files import AgentFiles, Attachment
 from cowork.harnesses.anton_harness.stream_formatter import TurnContext, TurnHistory, format_responses_stream
+from cowork.db.scoped import LOCAL_SCOPE
+from cowork.schemas.figure_sources import EarlierAnswer, Figure, FigureOrigin
 
 
 class StreamContextCompacted:
@@ -196,9 +198,15 @@ def _row_ids(rows: list) -> list[tuple[str, str]]:
     return [(row["role"], block.get("id") or block.get("tool_use_id")) for row in rows for block in row["content"]]
 
 
-def _stream(monkeypatch, session, *, question: str = "hi"):
+async def _no_earlier_answers(*, conversation_id, scope):
+    return ()
+
+
+def _stream(monkeypatch, session, *, question: str = "hi", read_earlier_answers=_no_earlier_answers):
     """The turn's events, as AntonHarness.stream_response yields them for
-    `session`."""
+    `session`. The earlier answers' read is replaced too, by
+    ``read_earlier_answers``, so the turn opens no database unit for it."""
+    monkeypatch.setattr(harness_mod, "read_earlier_answers", read_earlier_answers)
     monkeypatch.setattr(task_objects, "snapshot_artifact_state", lambda *_a, **_k: (set(), {}))
     monkeypatch.setattr(task_objects, "index_turn_artifacts", lambda *_a, **_k: ([], set(), None))
     monkeypatch.setattr(task_objects, "cards_for_slugs", lambda *_a, **_k: [])
@@ -222,9 +230,13 @@ def _stream(monkeypatch, session, *, question: str = "hi"):
     return AntonHarness().stream_response(conversation=conversation, input=[{"type": "text", "text": question}])
 
 
-def _drive(monkeypatch, session, *, question: str = "hi") -> list:
+def _drive(monkeypatch, session, *, question: str = "hi", read_earlier_answers=_no_earlier_answers) -> list:
     async def _drain():
-        return [ev async for ev in _stream(monkeypatch, session, question=question)]
+        return [
+            ev async for ev in _stream(
+                monkeypatch, session, question=question, read_earlier_answers=read_earlier_answers,
+            )
+        ]
 
     return asyncio.run(_drain())
 
@@ -316,6 +328,20 @@ def test_the_turn_opens_with_its_question_its_project_and_the_files_attached_to_
         history=[{"role": "user", "content": "seed"}],
     )
     assert not any(isinstance(e, TurnContext) for e in events[1:])
+
+
+def test_the_turn_opens_with_the_earlier_answers_it_read(monkeypatch):
+    earlier = EarlierAnswer(figures=[Figure(start=0, end=5, text="4,600", origin=FigureOrigin.step)])
+    reads = []
+
+    async def read_earlier_answers(*, conversation_id, scope):
+        reads.append((conversation_id, scope))
+        return (earlier,)
+
+    events = _drive(monkeypatch, _FakeSession(compact=False), read_earlier_answers=read_earlier_answers)
+
+    assert events[0].earlier_answers == (earlier,)
+    assert reads == [("c1", LOCAL_SCOPE)]
 
 
 def test_the_turns_context_holds_the_history_as_seeded_not_as_the_turn_grows_it(monkeypatch):

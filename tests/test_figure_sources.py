@@ -39,7 +39,9 @@ from cowork.harnesses.anton_harness.figure_sources import (
     ToolInput,
     TurnStep,
     find_figure_sources,
+    mark_repeated_figures,
 )
+from cowork.schemas.figure_sources import EarlierAnswer
 from tests._hubspot_records import HUBSPOT_DEALS, SEARCH_DEALS
 
 # The current code reads each timed input in about a second or less on a
@@ -1021,6 +1023,137 @@ class TestEarlierTurns:
 
         assert _figure(sources, "340").origin is FigureOrigin.step
         assert [s.tool_use_id for s in _figure(sources, "340").sources] == named
+
+
+def _earlier_answer(*figures: tuple[str, FigureOrigin]) -> EarlierAnswer:
+    """An earlier answer whose saved event lists these figures, a step
+    figure with the step that sourced it."""
+    return EarlierAnswer(figures=[
+        Figure(
+            start=0, end=len(text), text=text, origin=origin,
+            sources=[FigureSource(tool_use_id="toolu_t1")] if origin is FigureOrigin.step else [],
+        )
+        for text, origin in figures
+    ])
+
+
+def _repeated(
+    *, answer: str, earlier: list[EarlierAnswer], question: str = "", steps: list[TurnStep] | None = None,
+) -> FigureSources:
+    return mark_repeated_figures(
+        sources=find_figure_sources(answer=answer, question=question, steps=steps or []), earlier_answers=earlier,
+    )
+
+
+class TestFiguresRepeatedFromEarlierAnswers:
+    def test_a_figure_an_earlier_answer_sourced_is_marked_as_repeated(self):
+        """Turn 1 read sales of 4,600 for 2023. Turn 2 reads 5,200 for 2024
+        and repeats the 4,600 without reading it again."""
+        turn_1 = find_figure_sources(
+            answer="Sales were 4,600 in 2023.", question="What were sales in 2023?",
+            steps=[_cell("toolu_t1", code="print(sales(2023))", stdout="4600\n")],
+        )
+        assert _origins(turn_1) == [("4,600", FigureOrigin.step), ("2023", FigureOrigin.question)]
+
+        sources = _repeated(
+            answer="5,200 in 2024, up from 4,600.", question="and 2024?",
+            steps=[_cell("toolu_t2", code="print(sales(2024))", stdout="5200\n")],
+            earlier=[EarlierAnswer(figures=turn_1.figures)],
+        )
+
+        assert _origins(sources) == [
+            ("5,200", FigureOrigin.step), ("2024", FigureOrigin.question), ("4,600", FigureOrigin.earlier_answer),
+        ]
+        assert _figure(sources, "4,600").sources == []
+        assert [step.tool_use_id for step in sources.steps] == ["toolu_t2"]
+
+    @pytest.mark.parametrize(("earlier", "now"), [
+        ("4,600", "$4,600"),
+        ("$4,600", "4,600"),
+        ("4,600", "4.6k"),
+        ("4,600", "46%"),
+        ("46", "46%"),
+        ("$4,600", "$4.6K"),
+        ("12h", "12d"),
+        ("3x", "3"),
+        ("40kg", "40lbs"),
+        ("C$30", "$30"),
+        ("€4,600", "$4,600"),
+        ("-5%", "5%"),
+        ("12.5%", "0.125"),
+        ("12h", "12hrs"),
+        ("40lb", "40lbs"),
+        ("4,612", "about 4,600"),
+    ])
+    def test_a_repeated_number_in_another_form_is_not_marked(self, earlier: str, now: str):
+        sources = _repeated(answer=f"It was {now}.", earlier=[_earlier_answer((earlier, FigureOrigin.step))])
+
+        assert [origin for _, origin in _origins(sources)] == [FigureOrigin.none]
+
+    @pytest.mark.parametrize(("earlier", "now"), [
+        ("4,600", "4600"),
+        ("4,600", "4,600.00"),
+        ("4.6e3", "4,600"),
+        ("12.5%", "12.5 percent"),
+        ("3x", "3×"),
+        ("4.6 thousand", "4.6K"),
+        ("-5%", "−5%"),
+    ])
+    def test_the_same_figure_written_alike_is_marked(self, earlier: str, now: str):
+        sources = _repeated(answer=f"It was {now}.", earlier=[_earlier_answer((earlier, FigureOrigin.step))])
+
+        assert _origins(sources) == [(now, FigureOrigin.earlier_answer)]
+
+    def test_a_figure_an_earlier_answer_left_unsourced_is_not_marked(self):
+        sources = _repeated(answer="It was 4,600.", earlier=[_earlier_answer(("4,600", FigureOrigin.none))])
+
+        assert _origins(sources) == [("4,600", FigureOrigin.none)]
+
+    @pytest.mark.parametrize("origin", [FigureOrigin.question, FigureOrigin.earlier_answer])
+    def test_an_earlier_figure_from_the_question_or_a_repeat_counts(self, origin: FigureOrigin):
+        sources = _repeated(answer="It was 4,600.", earlier=[_earlier_answer(("4,600", origin))])
+
+        assert _origins(sources) == [("4,600", FigureOrigin.earlier_answer)]
+
+    def test_a_figure_this_turn_sources_keeps_its_own_origin(self):
+        sources = _repeated(
+            answer="4,600 units across 9 sites.",
+            steps=[_cell("toolu_now", code="print(total)", stdout="4600\n")],
+            earlier=[_earlier_answer(("4,600", FigureOrigin.step), ("9", FigureOrigin.step))],
+        )
+
+        assert _origins(sources) == [("4,600", FigureOrigin.step), ("9", FigureOrigin.earlier_answer)]
+        assert _figure(sources, "4,600").sources == [FigureSource(tool_use_id="toolu_now")]
+
+    def test_a_figure_the_question_states_stays_the_questions(self):
+        sources = _repeated(
+            answer="Yes, 4,600 across 9 sites.", question="Is it 4,600?",
+            earlier=[_earlier_answer(("4,600", FigureOrigin.step), ("9", FigureOrigin.step))],
+        )
+
+        assert _origins(sources) == [("4,600", FigureOrigin.question), ("9", FigureOrigin.earlier_answer)]
+
+    def test_an_earlier_figure_that_is_not_one_number_is_skipped(self):
+        """Each earlier text holds no number, two numbers, or one number with
+        other text around it."""
+        sources = _repeated(
+            answer="It was 4,600.",
+            earlier=[_earlier_answer(
+                ("1.2.3", FigureOrigin.step), ("4,600 and 5", FigureOrigin.step),
+                ("4,600 units", FigureOrigin.step), ("about 4,600", FigureOrigin.step),
+            )],
+        )
+
+        assert _origins(sources) == [("4,600", FigureOrigin.none)]
+
+    def test_an_answer_with_no_figure_left_unsourced_is_returned_as_found(self):
+        found = find_figure_sources(
+            answer="S1 holds 250.", question="", steps=[_cell("toolu_now", code="print(qty)", stdout="250\n")],
+        )
+
+        assert mark_repeated_figures(
+            sources=found, earlier_answers=[_earlier_answer(("250", FigureOrigin.step))],
+        ) is found
 
 
 class TestStepsWithNoId:
@@ -2359,6 +2492,21 @@ class TestQuestionForms:
         )
 
         assert _origins(sources) == [("$30", FigureOrigin.none)]
+
+    def test_a_signed_figure_is_not_the_questions_unsigned_number(self):
+        sources = find_figure_sources(answer="Margin moved -5% this year.", question="Did margin fall 5%?", steps=[])
+
+        assert _origins(sources) == [("-5%", FigureOrigin.none)]
+
+    def test_the_question_rule_reads_no_unit(self):
+        """A unit written right after the digits is part of the form an
+        earlier answer must match, not the question's: a question match only
+        spares a figure the no-source mark."""
+        sources = find_figure_sources(
+            answer="Yes, 12 hours is the cap.", question="Can a crew work 12h straight?", steps=[],
+        )
+
+        assert _origins(sources) == [("12", FigureOrigin.question)]
 
     def test_a_year_in_the_question_does_not_cover_a_rounded_figure(self):
         sources = find_figure_sources(answer="About 2k units ship.", question="How many units ship in 2026?", steps=[])

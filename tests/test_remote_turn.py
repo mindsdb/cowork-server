@@ -10,6 +10,7 @@ import pytest
 import cowork.turnqueue.remote_turn as remote_turn_mod
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
 from cowork.harnesses.anton_harness.stream_formatter import TurnContext, TurnHistory
+from cowork.schemas.figure_sources import EarlierAnswer, Figure, FigureOrigin
 from cowork.turnqueue.producer import RemoteWorkspace
 from cowork.turnqueue.remote_turn import RemoteTurnFailed, remote_turn_events
 
@@ -25,10 +26,17 @@ class _FakeSession:
 
 def _fake_handler(
     monkeypatch, *, persist_turn_memory=None, remote_artifacts_context=None, remote_seed_history=None,
-    remote_agent_files=None, remote_workspace=None,
+    remote_agent_files=None, remote_workspace=None, earlier_answers=None,
 ):
     """Replace ResponsesHandler with a stand-in exposing only the methods
-    remote_turn_events calls, resolved at call time like every other name here."""
+    remote_turn_events calls, resolved at call time like every other name here.
+    The earlier answers' read is replaced too, by ``earlier_answers`` or by
+    one that finds none."""
+
+    async def no_earlier_answers(*, conversation_id, scope):
+        return ()
+
+    monkeypatch.setattr(remote_turn_mod, "read_earlier_answers", earlier_answers or no_earlier_answers)
     monkeypatch.setattr(remote_turn_mod, "ResponsesHandler", type(
         "FakeResponsesHandler", (), {
             "_remote_artifacts_context": staticmethod(remote_artifacts_context or (lambda s, c: None)),
@@ -59,7 +67,18 @@ async def _drain(gen):
 async def test_the_turn_opens_with_its_context(monkeypatch, tmp_path):
     conv_id = uuid4()
     files = AgentFiles.in_cloud_pod(tmp_path, conversation_id=conv_id, workspace_rel_path="projects/general")
-    _fake_handler(monkeypatch, remote_agent_files=lambda s, c, *, workspace: files if c == conv_id else None)
+    earlier = EarlierAnswer(figures=[Figure(start=0, end=5, text="4,600", origin=FigureOrigin.step)])
+    session = _FakeSession()
+    reads = []
+
+    async def read_earlier_answers(*, conversation_id, scope):
+        reads.append((conversation_id, scope))
+        return (earlier,)
+
+    _fake_handler(
+        monkeypatch, remote_agent_files=lambda s, c, *, workspace: files if c == conv_id else None,
+        earlier_answers=read_earlier_answers,
+    )
 
     async def fake_replies(**kwargs):
         yield "turn_delta", {"text": "There are 250."}
@@ -68,12 +87,15 @@ async def test_the_turn_opens_with_its_context(monkeypatch, tmp_path):
     monkeypatch.setattr(remote_turn_mod, "stream_remote_replies", fake_replies)
 
     events = [event async for event in remote_turn_events(
-        session=_FakeSession(), conv_id=conv_id, org_id="org-123", user_id=None,
+        session=session, conv_id=conv_id, org_id="org-123", user_id=None,
         input_text="How many at S1?", model="anton", turn_rows=[],
     )]
 
-    assert events[0] == TurnContext(question="How many at S1?", files=files)
+    assert events[0] == TurnContext(question="How many at S1?", files=files, earlier_answers=(earlier,))
     assert not any(isinstance(event, TurnContext) for event in events[1:])
+    # Read in a unit of its own under the channel's scope, never on the
+    # channel's shared session.
+    assert reads == [(conv_id, session.scope)]
 
 
 @pytest.mark.asyncio

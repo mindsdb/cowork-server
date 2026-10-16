@@ -18,18 +18,35 @@ or display math) gets one origin:
   by that id;
 - ``question``: no step of this turn holds it, but the question writes it in
   the same form (value, sign, currency, scale and percent);
-- ``none``: nothing in the turn holds it, so the renderer marks it as a figure
-  to check before acting on it.
+- ``earlier_answer``: neither a step of this turn nor the question gives it,
+  but one of the conversation's last answers wrote it in the same form with
+  an origin other than none (``mark_repeated_figures``). It names no source;
+- ``none``: nothing in the turn holds it and no earlier answer wrote it in
+  the same form, so the renderer marks it as a figure to check before acting
+  on it.
 
 A step of an earlier turn never holds a figure. Its cells are read only for
-the names, functions and data their scratchpad passes on to this turn's cells,
-so a figure the answer repeats from an earlier turn, with no step of this turn
-holding it, has no source. Only the last ``MAX_EARLIER_CELLS`` earlier-turn
-cells are read, and the formatter reads the history only when the answer has
-figures (``has_figures``) and this turn ran a cell (``ran_cell``). These
-limits never change a figure's origin. They can only drop an earlier cell a
-figure names as the one that read its data, or a string or function a cell
-of this turn reuses.
+the names, functions and data their scratchpad passes on to this turn's cells.
+A figure that no step of this turn holds and the question doesn't write is
+marked earlier_answer when one of the conversation's last
+``cowork.services.conversations.MAX_EARLIER_ANSWERS`` answers wrote it in the
+same form with an origin other than none. Nothing of that answer is copied,
+so the figure names no step. The form is the value (exactly, not to a
+rounding), sign, currency sign, scale, percent and a unit written right after
+the digits (3x, 40kg, 12h). A unit after a space ("12 hours", "40 kg") and an
+ISO currency code ("4,600 EUR") are not part of it, so "12 hours" repeats "12
+days"; the same unit spelled two ways ("12h", "12hrs") is not the same form.
+An answer whose saved events hold no figure_sources event (one with no
+figures, or a turn that stopped or failed) gives no figure and still takes
+one of those places. The turn's producer reads the earlier answers when the
+turn starts.
+
+Only the last ``MAX_EARLIER_CELLS`` earlier-turn cells are read, and the
+formatter reads the history only when the answer has figures
+(``has_figures``) and this turn ran a cell (``ran_cell``). These limits never
+change a figure's origin. They can only drop an earlier cell a figure names
+as the one that read its data, or a string or function a cell of this turn
+reuses.
 
 Only the scratchpad's cells and the calls of the tools ``is_evidence_tool``
 counts are steps: the web tools and read_text_file
@@ -73,7 +90,7 @@ import posixpath
 import re
 from bisect import bisect_left, bisect_right
 from collections.abc import Callable, Iterable, Mapping, Sequence, Set
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal, InvalidOperation
 from itertools import accumulate
 from typing import TYPE_CHECKING, Annotated, Any
@@ -93,6 +110,7 @@ from cowork.harnesses.anton_harness.cell_queries import (
     strip_url,
 )
 from cowork.schemas.figure_sources import (
+    EarlierAnswer,
     Figure,
     FigureOrigin,
     FigureSource,
@@ -267,6 +285,10 @@ class _Number:
     scale: Decimal
     start: int
     end: int
+    # The unit written right after the digits (kg, lbs, hrs, h, d, pcs) or
+    # the multiplier x, lowercased, with × read as x; empty for a percent, a
+    # scale or no suffix. A unit after a space is not read.
+    unit: str = ""
 
 
 # A minus sign, not a hyphen: nothing word-like and no decimal point just
@@ -689,6 +711,64 @@ def find_figure_sources(
         steps=[_figure_step(described[index], files=files) for index in sorted(named)],
         figures=figures,
     )
+
+
+@dataclass(frozen=True)
+class _WrittenForm:
+    """How a number is written, apart from how its digits are grouped: its
+    value, sign, currency, scale and percent, and the unit written right
+    after the digits. An earlier answer's figure must match all of them.
+    The question's rule (``_same_form``) leaves the unit out: a question
+    match only spares a figure the no-source mark, while an earlier answer's
+    match claims the figure was given before, so "3x" must not stand for
+    "3"."""
+
+    value: Decimal
+    negative: bool
+    currency: str
+    scale: Decimal
+    percent: bool
+    unit: str
+
+    @classmethod
+    def of(cls, *, number: _Number) -> _WrittenForm:
+        """The form ``number`` is written in."""
+        return cls(
+            value=number.value, negative=number.negative, currency=number.currency, scale=number.scale,
+            percent=number.percent, unit=number.unit,
+        )
+
+
+def mark_repeated_figures(*, sources: FigureSources, earlier_answers: Sequence[EarlierAnswer]) -> FigureSources:
+    """``sources`` with each figure of origin none that an earlier answer
+    wrote in the same form (``_WrittenForm``), with an origin other than
+    none, marked earlier_answer. The value must be equal, not only round to
+    it. A step or question figure keeps its origin, and nothing of the
+    earlier answer is copied: a marked figure keeps its empty sources, and
+    the steps stay this turn's."""
+    if not any(figure.origin is FigureOrigin.none for figure in sources.figures):
+        return sources
+    given = {
+        form
+        for answer in earlier_answers
+        for figure in answer.figures
+        if figure.origin is not FigureOrigin.none and (form := _written_form(text=figure.text)) is not None
+    }
+    return sources.model_copy(update={"figures": [
+        figure.model_copy(update={"origin": FigureOrigin.earlier_answer})
+        if figure.origin is FigureOrigin.none and _written_form(text=figure.text) in given
+        else figure
+        for figure in sources.figures
+    ]})
+
+
+def _written_form(*, text: str) -> _WrittenForm | None:
+    """How a listed figure is written, read from its text alone, or None when
+    the text is not one number from end to end."""
+    numbers = _numbers(text, prose=True)
+    if len(numbers) != 1 or (numbers[0].start, numbers[0].end) != (0, len(text)):
+        return None
+    return _WrittenForm.of(number=numbers[0])
 
 
 @dataclass(frozen=True)
@@ -1492,11 +1572,10 @@ def _same_value(number: _Number, *, figure: _Number, tolerance: Decimal) -> bool
 
 
 def _same_form(asked: _Number, *, figure: _Number) -> bool:
-    """Whether a number in the question writes the figure: the same value,
-    sign, currency, scale and percent, so "30 days" does not cover "$30"."""
-    return (asked.value, asked.negative, asked.currency, asked.scale, asked.percent) == (
-        figure.value, figure.negative, figure.currency, figure.scale, figure.percent,
-    )
+    """Whether a number in the question writes the figure: the same written
+    form (``_WrittenForm``) less the unit, so the same value, sign, currency,
+    scale and percent, and "30 days" does not cover "$30"."""
+    return replace(_WrittenForm.of(number=asked), unit="") == replace(_WrittenForm.of(number=figure), unit="")
 
 
 def _output_numbers(output: str) -> list[_Number]:
@@ -1739,6 +1818,8 @@ def _parse(match: re.Match[str], *, hedged: bool = False, start: int | None = No
     if suffix in ("m", "b") and not currency:
         return None
     scale = _SCALES.get(suffix.lower(), Decimal(1))
+    percent = suffix.lower() in _PERCENTS
+    unit = "" if percent or suffix.lower() in _SCALES else suffix.lower().replace("\u00d7", "x")
     exponent = value.as_tuple().exponent
     decimals = -exponent if isinstance(exponent, int) and exponent < 0 else 0
     tolerance = Decimal(5).scaleb(-(decimals + 1))
@@ -1747,12 +1828,13 @@ def _parse(match: re.Match[str], *, hedged: bool = False, start: int | None = No
     return _Number(
         value=value * scale,
         tolerance=tolerance * scale,
-        percent=suffix.lower() in _PERCENTS,
+        percent=percent,
         negative=bool(groups.get("sign")) and start == match.start(),
         currency=currency,
         scale=scale,
         start=start,
         end=match.end(),
+        unit=unit,
     )
 
 

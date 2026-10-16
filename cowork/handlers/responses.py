@@ -42,7 +42,8 @@ from cowork.handlers.response_routing import (
     ineligible_reason,
 )
 from cowork.harnesses.anton_harness.agent_files import AgentFiles
-from cowork.schemas.figure_sources import FigureSources
+from cowork.harnesses.anton_harness.figure_sources import has_figures
+from cowork.schemas.figure_sources import EarlierAnswer, FigureSources
 from cowork.harnesses.anton_harness.stream_formatter import (
     SkillCreated,
     TurnContext,
@@ -112,7 +113,7 @@ from cowork.db.scoped import (
 )
 from cowork.principal import Principal, identity_trace_metadata
 from cowork.services.connectors.vault_secrets import register_vault_secrets
-from cowork.services.conversations import ConversationService
+from cowork.services.conversations import ConversationService, read_earlier_answers
 from cowork.services.files import FileService
 from cowork.services.product_permissions import (
     ProductPermissionDenied, ProductPermissionUnavailable, require_product_permission,
@@ -1050,7 +1051,9 @@ class ResponsesHandler:
         figure in the answer may repeat."""
         if not request.stream:
             text = route.text
-            sources = await self._direct_figure_sources(answer=text, question=question)
+            sources = await self._direct_figure_sources(
+                conversation_id=conversation_id, answer=text, question=question,
+            )
             events = [{
                 "type": "response.output_text.delta",
                 "delta": text,
@@ -1098,12 +1101,20 @@ class ResponsesHandler:
         self.last_run_handle = handle
         return sse_from_buffer(handle.buffer, 0)
 
-    @staticmethod
-    async def _direct_figure_sources(*, answer: str, question: str) -> FigureSources | None:
+    async def _direct_figure_sources(
+        self, *, conversation_id: UUID, answer: str, question: str,
+    ) -> FigureSources | None:
         """A direct answer's figures, or None when it has none. The router
         answers from what it knows and runs no step, so each figure is the
-        question's or has no source."""
-        sources = await find_answer_sources(TurnEvidence(answer=answer, question=question))
+        question's, an earlier answer's, or has no source. The earlier
+        answers are read only for an answer with figures, before this one
+        is saved. The figure check parses the whole answer, so it runs in a
+        worker thread, as the matching does: every other request waits on
+        the loop."""
+        earlier: tuple[EarlierAnswer, ...] = ()
+        if await asyncio.to_thread(has_figures, answer):
+            earlier = await read_earlier_answers(conversation_id=conversation_id, scope=self.scope)
+        sources = await find_answer_sources(TurnEvidence(answer=answer, question=question, earlier_answers=earlier))
         return sources if sources.figures else None
 
     async def _produce_direct(
@@ -1155,7 +1166,7 @@ class ResponsesHandler:
 
         async def answer() -> None:
             # Found before the save, which keeps them with the answer.
-            sources = await self._direct_figure_sources(answer=route.text, question=question)
+            sources = await self._direct_figure_sources(conversation_id=conv_id, answer=route.text, question=question)
             sources_frame = None if sources is None else {
                 "type": "response.figure_sources",
                 "sequence_number": 3,
@@ -1965,7 +1976,9 @@ class ResponsesHandler:
             # re-reading it when the reply arrives could map the count onto a
             # different list.
             seed = await run_db(partial(self._read_remote_turn_inputs, conv_id=conv_id), scope=scope)
-            yield TurnContext(question=input_text, files=seed.files, history=seed.history)
+            # A unit of its own, so a failed read can't abort the seed's.
+            earlier = await read_earlier_answers(conversation_id=conv_id, scope=scope)
+            yield TurnContext(question=input_text, files=seed.files, history=seed.history, earlier_answers=earlier)
             if seed.artifacts is not None:
                 # The worker writes artifacts into the shared tree while this
                 # turn runs, so cowork-server does the same before/after diff

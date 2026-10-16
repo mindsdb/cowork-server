@@ -35,6 +35,7 @@ from cowork.harnesses.anton_harness.scratchpad_cell_replay import SCRATCHPAD_REP
 from cowork.harnesses.anton_harness.settings import AntonHarnessSettings
 from cowork.services.connectors.connections import service
 from cowork.services.connectors.specs._registry import registry
+from cowork.services.conversations import read_earlier_answers
 from cowork.services.projects import display_label
 from cowork.streaming.liveness import ModelWaitTicker
 
@@ -787,6 +788,9 @@ class AntonHarness:
                 ),
                 # A copy: the session appends this turn to its own list.
                 history=list(getattr(session, "history", ())),
+                # Read from the saved answers, since the session's history is
+                # what anton seeds the model with, not the figures' events.
+                earlier_answers=await read_earlier_answers(conversation_id=conv_id, scope=_units_scope()),
             )
             async for event in session.turn_stream(self._to_anton_input(input), **turn_kwargs):
                 # Under context pressure anton summarizes or hard-truncates

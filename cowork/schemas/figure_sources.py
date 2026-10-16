@@ -1,17 +1,23 @@
 """The figures in an answer and the steps they came from, as the
 ``response.figure_sources`` event and a non-streaming response carry them.
-``cowork.harnesses.anton_harness.figure_sources`` finds them."""
+``cowork.harnesses.anton_harness.figure_sources`` finds them. ``EarlierAnswer``
+is the server's own read of an earlier answer's saved event, never sent."""
 
 from __future__ import annotations
 
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class FigureOrigin(StrEnum):
     step = "step"
     question = "question"
+    # No step of this turn holds the figure and the question doesn't write
+    # it, but one of the conversation's last answers wrote it in the same
+    # form with an origin other than none. Nothing of that answer is copied:
+    # the figure names no source.
+    earlier_answer = "earlier_answer"
     none = "none"
 
 
@@ -87,3 +93,13 @@ class FigureSources(BaseModel):
     project_id: str | None = None
     steps: list[FigureStep] = Field(default_factory=list)
     figures: list[Figure] = Field(default_factory=list)
+
+
+class EarlierAnswer(BaseModel):
+    """An earlier answer of the conversation, as far as marking the figures
+    this turn repeats reads it: the figures its saved response.figure_sources
+    event lists. Never sent; a figure it marks names none of these."""
+
+    model_config = ConfigDict(frozen=True)
+
+    figures: tuple[Figure, ...] = ()

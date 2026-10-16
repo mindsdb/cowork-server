@@ -37,9 +37,10 @@ from cowork.harnesses.anton_harness.figure_sources import (
     has_figures,
     is_evidence_call,
     is_evidence_tool,
+    mark_repeated_figures,
     ran_cell,
 )
-from cowork.schemas.figure_sources import FigureOrigin
+from cowork.schemas.figure_sources import EarlierAnswer, FigureOrigin
 from cowork.schemas.responses import (
     IncompleteDetails,
     Response,
@@ -108,14 +109,23 @@ class TurnContext:
     turn's cell read names that cell too. The formatter reads it only when
     the answer has figures and this turn ran a cell, and then only its last
     figure_sources.MAX_EARLIER_CELLS cells; no figure's origin depends on it.
-    An earlier turn's step never holds a figure itself: a figure the answer
-    only repeats from an earlier turn has no source. The formatter reads only
-    its tool_use and tool_result blocks (ToolRows) and leaves every other
-    message out."""
+    The formatter reads only its tool_use and tool_result blocks (ToolRows)
+    and leaves every other message out.
+
+    ``earlier_answers`` are the figures the conversation's last
+    conversations.MAX_EARLIER_ANSWERS answers list in their saved events,
+    which the producer reads when the turn starts
+    (conversations.read_earlier_answers). An earlier turn's step never holds
+    a figure itself. A figure no step of this turn holds and the question
+    doesn't write is marked as an earlier answer's when one of those answers
+    wrote it in the same form with an origin other than none
+    (figure_sources.mark_repeated_figures); nothing of that answer is
+    copied."""
 
     question: str
     files: AgentFiles | None = None
     history: list[dict[str, Any]] = field(default_factory=list)
+    earlier_answers: tuple[EarlierAnswer, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -198,6 +208,9 @@ class TurnEvidence:
     # (an older cloud pod, or a desktop install on the anton floor) sends
     # no rows after a compaction. Empty otherwise.
     calls_without_rows: tuple[EvidenceCall, ...] = ()
+    # The figures the conversation's last answers list (TurnContext
+    # .earlier_answers), which a figure no step holds may repeat.
+    earlier_answers: tuple[EarlierAnswer, ...] = ()
 
 
 @dataclass
@@ -466,6 +479,12 @@ def _answer_sources(evidence: TurnEvidence) -> FigureSources:
     sources = find_figure_sources(
         answer=evidence.answer, question=question, steps=[*earlier, *this_turn], files=evidence.files,
     )
+    try:
+        sources = mark_repeated_figures(sources=sources, earlier_answers=evidence.earlier_answers)
+    except Exception:
+        # find_answer_sources would drop every source this turn found, so a
+        # failure here keeps them and marks no figure as repeated.
+        logger.exception("[stream_formatter] could not mark the figures an earlier answer wrote")
     if any(
         call.counts_as_step(successful_tool_calls=evidence.successful_tool_calls)
         for call in evidence.calls_without_rows
@@ -473,16 +492,16 @@ def _answer_sources(evidence: TurnEvidence) -> FigureSources:
         # The turn compacted mid-way and no tool rows arrived for it, so a web
         # page, a file or a connector's records it read are missing, and a
         # figure no step holds may be one it read: such a figure gets no mark
-        # rather than "no source". A call the matcher would not count as a
-        # step hides no source: one whose tool_done did not say ok=True (it
-        # failed, gave no verdict, or sat in a round anton threw away), a
-        # read of a memory file, or a call of a connector tool that returns
-        # no records. Tool rows that do arrive hold every call that ran,
-        # through a compaction too; a call missing there never ran, as in a
-        # round anton threw away and retried. This can go once production
-        # pods run an anton with ChatSession.turn_messages, which sends the
-        # rows after a compaction, and the anton-agent floor in pyproject.toml
-        # requires one.
+        # rather than "no source". A figure an earlier answer gave keeps its
+        # mark. A call the matcher would not count as a step hides no source:
+        # one whose tool_done did not say ok=True (it failed, gave no
+        # verdict, or sat in a round anton threw away), a read of a memory
+        # file, or a call of a connector tool that returns no records. Tool
+        # rows that do arrive hold every call that ran, through a compaction
+        # too; a call missing there never ran, as in a round anton threw away
+        # and retried. This can go once production pods run an anton with
+        # ChatSession.turn_messages, which sends the rows after a compaction,
+        # and the anton-agent floor in pyproject.toml requires one.
         return sources.model_copy(update={
             "figures": [figure for figure in sources.figures if figure.origin != FigureOrigin.none],
         })
@@ -1085,6 +1104,7 @@ async def format_responses_stream(
         history=turn_context.history,
         files=turn_context.files,
         successful_tool_calls=frozenset(successful_tool_calls),
+        earlier_answers=turn_context.earlier_answers,
         calls_without_rows=tuple(
             EvidenceCall(tool_use_id=call_id, tool_name=name, tool_input=tool_inputs.get(call_id, ""))
             for call_id, name in evidence_calls.items()
