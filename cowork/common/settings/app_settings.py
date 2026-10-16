@@ -911,27 +911,27 @@ class AppSettings(Settings):
     # NOTE: get_app_settings() is @lru_cache'd, so changing the COWORK_DEFAULT_*
     # env requires a process restart — "I changed the env and nothing happened"
     # means the old value is cached for the life of the process.
+    #
+    # The defaults are safety limits for a turn that never finishes, equal to
+    # anton's own: 30 days of production had no runaway turn, and the largest
+    # legitimate one used 34.4M tokens, 171 tool rounds and 6 continuations.
+    # Users who want a tighter limit set their own.
     default_max_tool_rounds: int = Field(
-        default=50,
+        default=250,
         ge=5,
         le=500,
         validation_alias=AliasChoices("COWORK_DEFAULT_MAX_TOOL_ROUNDS"),
         description="Default for the per-user 'Max Steps per Task' agent budget.",
     )  # COWORK_DEFAULT_MAX_TOOL_ROUNDS
     default_max_continuations: int = Field(
-        default=5,
+        default=10,
         ge=0,
         le=25,
         validation_alias=AliasChoices("COWORK_DEFAULT_MAX_CONTINUATIONS"),
         description="Default for the per-user 'Max Auto-Continues' agent budget.",
     )  # COWORK_DEFAULT_MAX_CONTINUATIONS
-    # Unlike the two above, this one does NOT deliberately run looser than
-    # anton's own default — it matches it (ENG-1286's 1,250,000). The measured
-    # per-turn distribution that set that number came from Cowork traffic, so
-    # it already reflects these looser round budgets; raising it here would
-    # loosen a ceiling against the very population it was sized on.
     default_max_turn_tokens: int = Field(
-        default=1_250_000,
+        default=25_000_000,
         # Deployment-level default. Kept at ge=750_000 rather than mirroring
         # UserSettings' "0 = unlimited": an operator turning the guard off for a
         # whole org silently is exactly the outcome the per-user sentinel exists

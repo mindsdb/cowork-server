@@ -799,12 +799,10 @@ class UserSettings(Settings):
         ),
     )
     # ── Advanced agent budgets ──
-    # Overlaid onto AntonSettings per conversation (anton_harness.harness);
-    # anton's own CLI defaults (25/3) are lower — Cowork deliberately runs
-    # with more headroom so long tasks finish without a mid-task check-in.
-    # Defaults come from app settings so hosted deployments (operator-paid
-    # inference, no Settings UI on web) can lower them via env without
-    # touching per-user rows.
+    # Overlaid onto AntonSettings per conversation (anton_harness.harness).
+    # The defaults are safety limits that a normal task never reaches, equal to
+    # anton's own; they come from app settings so a deployment can change them
+    # via env without touching per-user rows.
     max_tool_rounds: Annotated[int, ORG] = Field(
         default_factory=lambda: get_app_settings().default_max_tool_rounds,
         ge=5,
@@ -840,13 +838,13 @@ class UserSettings(Settings):
         #
         # "No limit" is EFFECTIVELY, not literally, true — and the bound is
         # closer than it looks. A turn makes about
-        # `max_tool_rounds x (max_continuations + 1)` LLM calls, which at THIS
-        # repo's defaults (50 x 6) is ~306 calls, so 50M is reached at ~163k per
-        # call — below the ~190k context a long conversation carries. At the
-        # maxima a user can set (500 x 25) it is ~13,000 calls and ~3.8k per
-        # call. So the step cap does NOT always land first; it merely always has
-        # so far. The largest turn in 30 days of production was 8.26M, because
-        # real turns end and compaction intervenes long before that shape.
+        # `max_tool_rounds x (max_continuations + 1)` LLM calls, which at the
+        # defaults (250 x 11) is ~2,750 calls, so 50M is reached at ~18k per
+        # call — far below the ~190k context a long conversation carries. At the
+        # maxima a user can set (500 x 26) it is ~13,000 calls and ~3.8k per
+        # call. So the step cap does NOT always land first; the token ceiling
+        # usually does. The largest turn in 30 days of production (2026-10-14)
+        # was 34.4M.
         # Do not restate this as "the ceiling can never fire at max" — an
         # earlier version of this comment did, using anton's own 25x3 defaults
         # rather than Cowork's, which put the threshold at 480k per call and
