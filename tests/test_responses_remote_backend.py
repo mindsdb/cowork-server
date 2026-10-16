@@ -64,6 +64,7 @@ def _kwargs(**overrides) -> dict:
         buffer=object(),
         trace_tags=None,
         trace_metadata=None,
+        first_take=None,
     )
     base.update(overrides)
     return base
