@@ -7,6 +7,8 @@ import pytest
 
 from cowork.harnesses.anton_harness import cell_queries as cell_queries_mod
 from cowork.harnesses.anton_harness.cell_queries import (
+    MAX_CLIENTS,
+    MAX_FUNCTION_GLOBALS,
     MAX_RENDERED_CHARS,
     MAX_STRING_CHARS,
     FunctionReading,
@@ -284,9 +286,11 @@ class TestHelpersFromEarlierCells:
         assert later.environment_variables == ("DS_ERP_TOKEN",)
         assert earlier.functions["stock"] == FunctionReading(
             queries=("SELECT qty FROM stock WHERE site = '{site}'",),
+            strings=("DS_ERP_TOKEN",),
             environment_variables=("DS_ERP_TOKEN",),
             calls_query_minds_data=True,
             reads_data=True,
+            global_names=("os", "query_minds_data"),
         )
 
     def test_a_name_that_hides_a_helper_does_not_run_it(self):
@@ -304,6 +308,184 @@ class TestHelpersFromEarlierCells:
         assert reading.requests == ()
         assert "get" not in reading.functions
         assert "fetch" in reading.functions
+
+    @pytest.mark.parametrize("expression", ["sql", 'f"{sql}"', 'sql + " WHERE qty > 0"'])
+    @pytest.mark.parametrize("same_cell", [False, True], ids=["across-cells", "same-cell"])
+    def test_rebinding_a_helpers_global_omits_its_frozen_query(self, expression: str, same_cell: bool):
+        definition = f"sql = 'SELECT qty FROM stock'\ndef fetch():\n    return query_minds_data({expression})\n"
+        call = "sql = 'SELECT qty FROM deliveries'\nprint(fetch())"
+        if same_cell:
+            reading = read_cell(definition + call, names={})
+        else:
+            earlier = read_cell(definition, names={})
+            reading = read_cell(call, names=earlier.names, functions=earlier.functions)
+
+        assert reading.queries == ()
+        assert reading.functions["fetch"].queries == ()
+        assert reading.calls_query_minds_data
+
+    @pytest.mark.parametrize("same_cell", [False, True], ids=["across-cells", "same-cell"])
+    def test_rebinding_a_helpers_global_omits_its_frozen_request(self, same_cell: bool):
+        definition = textwrap.dedent('''
+            BASE = "https://stock.example.com"
+            def fetch():
+                return requests.get(BASE + "/inventory")
+        ''')
+        call = 'BASE = "https://deliveries.example.com"\nprint(fetch())'
+        if same_cell:
+            reading = read_cell(definition + call, names={})
+        else:
+            earlier = read_cell(definition, names={})
+            reading = read_cell(call, names=earlier.names, functions=earlier.functions)
+
+        assert reading.requests == ()
+        assert reading.functions["fetch"].requests == ()
+        assert "https://stock.example.com/inventory" not in reading.strings
+
+    @pytest.mark.parametrize("rebind", ["del sql", "sql = None", "if changed:\n    sql = 'SELECT qty FROM deliveries'"])
+    def test_deletes_unknown_values_and_conditional_rebindings_invalidate_helpers(self, rebind: str):
+        earlier = read_cell("sql = 'SELECT qty FROM stock'\ndef fetch():\n    return query_minds_data(sql)", names={})
+
+        changed = read_cell(rebind, names=earlier.names, functions=earlier.functions)
+        later = read_cell("fetch()", names=changed.names, functions=changed.functions)
+
+        assert later.queries == ()
+
+    def test_a_stable_global_and_an_unrelated_local_rebinding_keep_the_helpers_details(self):
+        earlier = read_cell(textwrap.dedent('''
+            sql = "SELECT qty FROM stock"
+            def fetch():
+                return query_minds_data(sql)
+        '''), names={})
+
+        later = read_cell(textwrap.dedent('''
+            unrelated = 1
+            def other(sql):
+                sql = "SELECT qty FROM deliveries"
+                return sql
+            print(fetch())
+        '''), names=earlier.names, functions=earlier.functions)
+
+        assert later.queries == ("SELECT qty FROM stock",)
+
+    def test_a_helpers_own_local_query_does_not_depend_on_a_global_with_the_same_name(self):
+        earlier = read_cell(textwrap.dedent('''
+            sql = "SELECT qty FROM deliveries"
+            def fetch():
+                sql = "SELECT qty FROM stock"
+                return query_minds_data(sql)
+        '''), names={})
+
+        later = read_cell("sql = None\nfetch()", names=earlier.names, functions=earlier.functions)
+
+        assert later.queries == ("SELECT qty FROM stock",)
+
+    @pytest.mark.parametrize("rebind", ["sql = 'SELECT qty FROM deliveries'", "fetch = replacement"])
+    def test_a_wrapper_also_depends_on_the_wrapped_helpers_globals(self, rebind: str):
+        earlier = read_cell(textwrap.dedent('''
+            sql = "SELECT qty FROM stock"
+            def fetch():
+                return query_minds_data(sql)
+            def wrapped():
+                sql = "local shadow"
+                return fetch()
+        '''), names={})
+
+        later = read_cell(rebind + "\nwrapped()", names=earlier.names, functions=earlier.functions)
+
+        assert later.queries == ()
+
+    def test_queries_called_before_a_rebind_are_kept(self):
+        reading = read_cell(textwrap.dedent('''
+            sql = "SELECT qty FROM stock"
+            def fetch():
+                return query_minds_data(sql)
+            first = fetch()
+            sql = "SELECT qty FROM deliveries"
+            second = fetch()
+        '''), names={})
+
+        assert reading.queries == ("SELECT qty FROM stock",)
+        assert reading.functions["fetch"].queries == ()
+
+    def test_an_uncalled_body_emits_no_query_or_request_details(self):
+        reading = read_cell(textwrap.dedent('''
+            def fetch():
+                return query_minds_data("SELECT qty FROM stock"), requests.get("https://stock.example.com")
+        '''), names={})
+
+        assert reading.queries == ()
+        assert reading.requests == ()
+        # Static source literals still describe the defining cell in a
+        # later caller's lineage; they do not report a request being made.
+        assert reading.strings == ("https://stock.example.com",)
+        assert not reading.calls_query_minds_data
+        assert reading.functions["fetch"].queries == ("SELECT qty FROM stock",)
+
+    def test_a_called_body_keeps_file_details_but_not_printed_or_written_paths(self):
+        code = textwrap.dedent('''
+            def fetch():
+                print("label.csv")
+                df = pd.read_csv("stock.csv")
+                df.to_csv("output.csv")
+                return df
+        ''')
+        earlier = read_cell(code, names={})
+
+        same_cell = read_cell(code + "fetch()", names={})
+        later_cell = read_cell("fetch()", names=earlier.names, functions=earlier.functions)
+
+        assert earlier.strings == ("stock.csv",)
+        for called in (same_cell, later_cell):
+            assert called.strings == ("stock.csv", "label.csv")
+            assert called.labels == ("label.csv",)
+            assert tuple(text for text in called.strings if text not in called.labels) == ("stock.csv",)
+
+    def test_a_helpers_defining_cell_keeps_the_literal_file_for_later_lineage(self):
+        definition = read_cell("def load():\n    return pd.read_csv('stock.csv')", names={})
+
+        call = read_cell("print(load().qty.sum())", names=definition.names, functions=definition.functions)
+
+        assert definition.strings == ("stock.csv",)
+        assert definition.bindings["load"].from_read
+        assert call.strings == ("stock.csv",)
+        assert "load" in call.loaded_names
+
+    def test_a_helpers_defining_cell_does_not_retain_a_rendered_global_path(self):
+        reading = read_cell("def load():\n    return pd.read_csv(path)", names={"path": "stock.csv"})
+
+        assert reading.strings == ()
+        assert reading.functions["load"].strings == ("stock.csv",)
+
+    def test_a_rebound_file_global_does_not_leave_its_old_document_label(self):
+        earlier = read_cell("path = 'stock.csv'\ndef load():\n    return pd.read_csv(path)", names={})
+
+        later = read_cell("path = 'deliveries.csv'\nload()", names=earlier.names, functions=earlier.functions)
+
+        assert "stock.csv" not in later.strings
+
+    def test_a_closure_does_not_freeze_an_enclosing_local(self):
+        reading = read_cell(textwrap.dedent('''
+            def outer():
+                sql = "SELECT qty FROM stock"
+                def inner():
+                    return query_minds_data(sql)
+                sql = "SELECT qty FROM deliveries"
+                return inner()
+            outer()
+        '''), names={})
+
+        assert reading.queries == ()
+
+    def test_function_dependencies_are_bounded_without_untracked_frozen_details(self):
+        loads = "\n".join(f"    print(global_{index})" for index in range(MAX_FUNCTION_GLOBALS + 1))
+        code = "def fetch():\n" + loads + "\n    return query_minds_data('SELECT qty FROM stock')\nfetch()"
+
+        reading = read_cell(code, names={})
+
+        assert len(reading.functions["fetch"].global_names) <= MAX_FUNCTION_GLOBALS
+        assert reading.queries == ()
+        assert reading.calls_query_minds_data
 
 
 class TestNamesFromReads:
@@ -545,15 +727,15 @@ class TestStatementsInOneString:
         assert read_cell(f"cur.execute({sql!r})", names={}).queries == (sql,)
 
     @pytest.mark.parametrize("sql", [
-        "SELECT $$a;b$$ AS x FROM t",
-        "SELECT $body$a;$$;b$body$ AS x FROM t",
+        "SELECT $$ab$$ AS x FROM t",
+        "SELECT $body$a$$b$body$ AS x FROM t",
         "SELECT [a;b] FROM t",
     ], ids=["dollar-quote", "tagged-dollar-quote", "bracketed-name"])
-    def test_a_semicolon_in_a_dollar_quoted_string_or_a_bracketed_name_keeps_its_query_whole(self, sql: str):
+    def test_dollar_quotes_with_common_boundaries_and_bracketed_names_keep_the_query(self, sql: str):
         assert read_cell(f"cur.execute({sql!r})", names={}).queries == (sql,)
 
     @pytest.mark.parametrize(("query", "listed"), [
-        ("SELECT $body$a;b$body$ AS x FROM t;", "SELECT $body$a;b$body$ AS x FROM t;"),
+        ("SELECT $body$ab$body$ AS x FROM t;", "SELECT $body$ab$body$ AS x FROM t;"),
         ("SELECT qty FROM stock WHERE id = $1;", "SELECT qty FROM stock WHERE id = $1;"),
         ("SELECT a$b$c FROM t;", "SELECT a$b$c FROM t;"),
         ("SELECT [a;b] FROM t;", "SELECT [a;b] FROM t;"),
@@ -562,6 +744,20 @@ class TestStatementsInOneString:
         sql = f"{query} CREATE USER bob IDENTIFIED BY 'XyZhunter2'"
 
         assert read_cell(f"cur.execute({sql!r})", names={}).queries == (listed,)
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT $$a;b$$ AS x FROM t",
+        "SELECT $body$a;$$;b$body$ AS x FROM t",
+        "SELECT qty FROM stock AS $tag$; CREATE USER demo IDENTIFIED BY 'SyntheticCredential'; "
+        "SELECT qty FROM stock AS $tag$",
+    ], ids=["untagged-string", "tagged-string", "mysql-alias-batch"])
+    def test_dollar_dependent_statement_boundaries_omit_the_batch(self, sql: str):
+        assert read_cell(f"cur.execute({sql!r})", names={}).queries == ()
+
+    def test_dollar_spelling_inside_a_quoted_literal_keeps_its_query(self):
+        sql = "SELECT qty FROM stock WHERE note = '$tag$a;b$tag$'"
+
+        assert read_cell(f"cur.execute({sql!r})", names={}).queries == (sql,)
 
     # MySQL reads a backslash in a literal or a quoted name as escaping the
     # next character; Postgres and SQLite read it as an ordinary one, so
@@ -582,6 +778,44 @@ class TestStatementsInOneString:
     def test_a_backslash_that_moves_no_split_keeps_its_query(self, sql: str):
         assert read_cell(f"cur.execute({sql!r})", names={}).queries == (sql,)
 
+    @pytest.mark.parametrize("sql", [
+        "SELECT qty FROM stock WHERE 1=1--0; CREATE USER demo IDENTIFIED BY 'SyntheticCredential'",
+        "SELECT qty FROM stock # ' hidden quote\n; CREATE USER demo IDENTIFIED BY 'SyntheticCredential'",
+        "SELECT qty FROM stock # ; hidden separator\nWHERE qty > 0",
+        "SELECT qty FROM stock --0/* ; hidden comment */; SET PASSWORD = 'SyntheticCredential'",
+        "SELECT qty FROM stock # \\\'\n; CREATE USER demo IDENTIFIED BY 'SyntheticCredential'",
+    ], ids=["dash-arithmetic", "hash-quote", "hash-semicolon", "mixed-comments", "hash-backslash"])
+    def test_dialect_comment_boundary_disagreement_omits_the_batch(self, sql: str):
+        assert read_cell(f"cur.execute({sql!r})", names={}).queries == ()
+
+    @pytest.mark.parametrize("comment", [
+        "/* outer /* inner */ ' */",
+        "/*!50000 SELECT secret FROM credentials */",
+        "/*M! SELECT secret FROM credentials */",
+    ])
+    def test_nested_or_executable_comments_omit_dialect_dependent_sql(self, comment: str):
+        sql = f"SELECT qty FROM stock {comment}; CREATE USER demo IDENTIFIED BY 'SyntheticCredential'"
+
+        assert read_cell(f"cur.execute({sql!r})", names={}).queries == ()
+
+    @pytest.mark.parametrize("ending", ["\n", "\r\n", "\r"])
+    @pytest.mark.parametrize("space", [" ", "\t"])
+    def test_dash_comments_with_whitespace_end_at_line_boundaries(self, ending: str, space: str):
+        query = f"SELECT qty FROM stock --{space}comment with ;{ending};"
+        sql = query + " CREATE USER demo IDENTIFIED BY 'SyntheticCredential'"
+
+        assert read_cell(f"cur.execute({sql!r})", names={}).queries == (query,)
+
+    @pytest.mark.parametrize("sql", [
+        "SELECT qty FROM stock WHERE note IN ('# ;', '--0;')",
+        'SELECT qty FROM stock WHERE "# ;" = `--0;`',
+        "SELECT qty FROM stock /* # ; --0; */ WHERE qty > 0",
+        "SELECT qty FROM stock # harmless comment\nWHERE qty > 0",
+        "SELECT qty FROM stock WHERE qty = 1--0",
+    ])
+    def test_comment_spelling_that_moves_no_boundary_keeps_the_query(self, sql: str):
+        assert read_cell(f"cur.execute({sql!r})", names={}).queries == (sql,)
+
     def test_a_label_that_reads_like_sql_up_to_a_semicolon_is_not_a_query(self):
         assert _queries("""
             ax.set_xlabel("Select a site from the list; units are pallets.")
@@ -591,14 +825,14 @@ class TestStatementsInOneString:
     # string and never closes it, so the rest of the string is one statement.
     # A splitter that tries each opener again reads the rest of the string
     # once per opener.
-    @pytest.mark.parametrize("filler", [
-        "/*'';" * 40_000,
-        "\\'" * 60_000,
-        '\\"' * 60_000,
-        "".join(f"$t{i}x$;" for i in range(15_000)),
-        "[;" * 60_000,
+    @pytest.mark.parametrize(("filler", "ambiguous"), [
+        ("/*'';" * 40_000, False),
+        ("\\'" * 60_000, False),
+        ('\\"' * 60_000, False),
+        ("".join(f"$t{i}x$;" for i in range(15_000)), True),
+        ("[;" * 60_000, False),
     ], ids=["comment", "literal", "quoted-name", "dollar-quote", "bracketed-name"])
-    def test_a_string_left_open_splits_into_statements_in_linear_time(self, filler: str):
+    def test_a_string_left_open_splits_into_statements_in_linear_time(self, filler: str, ambiguous: bool):
         sql = "SELECT qty FROM stock WHERE note = " + filler
         code = f"cur.execute({sql!r})"
         start = time.perf_counter()
@@ -606,7 +840,7 @@ class TestStatementsInOneString:
         reading = read_cell(code, names={})
 
         assert time.perf_counter() - start < TIME_BOUND_SECONDS
-        assert reading.queries == (sql,)
+        assert reading.queries == (() if ambiguous else (sql,))
 
 
 class TestRequestsACellMakes:
@@ -747,6 +981,114 @@ class TestRequestsACellMakes:
             "POST https://erp.example.com/orders",
             "POST {base_url}/sendMessage",
         ]
+
+    @pytest.mark.parametrize(("base", "expected"), [
+        ('os.environ["DS_ERP_URL"]', "{DS_ERP_URL}"),
+        ('"https://stock.example.com/"', "https://stock.example.com"),
+        ('"https://api.example.com/private-token"', "{base_url}"),
+        ('"https://user:secret@stock.example.com/?token=secret"', "https://stock.example.com"),
+    ])
+    def test_client_metadata_carries_relative_requests_into_the_next_cell(self, base: str, expected: str):
+        earlier = read_cell(f"erp = httpx.Client(base_url={base})", names={})
+
+        later = read_cell("print(erp.get('/inventory').json()['qty'])", names=earlier.names, clients=earlier.clients)
+
+        assert earlier.clients == {"erp": expected}
+        assert later.clients == earlier.clients
+        assert later.requests == (HttpRequest("GET", expected + "/inventory"),)
+        assert later.bindings == {}
+
+    @pytest.mark.parametrize("rebind", [
+        "erp = {}", "del erp", "import other as erp", "erp += other", "erp, other = pair",
+        'erp.base_url = "https://deliveries.example.com"',
+    ])
+    def test_rebinding_a_client_discards_its_saved_base(self, rebind: str):
+        earlier = read_cell('erp = httpx.Client(base_url="https://stock.example.com")', names={})
+
+        changed = read_cell(rebind, names=earlier.names, clients=earlier.clients)
+        later = read_cell("erp.get('/inventory')", names=changed.names, clients=changed.clients)
+
+        assert changed.clients == {}
+        assert later.requests == ()
+
+    def test_a_conditional_client_rebind_carries_no_uncertain_base(self):
+        earlier = read_cell('erp = httpx.Client(base_url="https://stock.example.com")', names={})
+
+        changed = read_cell(textwrap.dedent('''
+            if changed:
+                erp = httpx.Client(base_url="https://deliveries.example.com")
+        '''), names=earlier.names, clients=earlier.clients)
+        later = read_cell("erp.get('/inventory')", names=changed.names, clients=changed.clients)
+
+        assert changed.clients == {}
+        assert later.requests == ()
+
+    def test_a_parameter_hides_a_carried_client_only_inside_its_function(self):
+        earlier = read_cell('erp = httpx.Client(base_url="https://stock.example.com")', names={})
+
+        reading = read_cell(textwrap.dedent('''
+            def other(erp):
+                return erp.get("/deliveries")
+            other(local_client)
+            erp.get("/inventory")
+        '''), names=earlier.names, clients=earlier.clients)
+
+        assert reading.functions["other"].requests == ()
+        assert reading.clients == earlier.clients
+        assert reading.requests == (HttpRequest("GET", "https://stock.example.com/inventory"),)
+
+    def test_a_local_client_restores_the_carried_client_after_its_function(self):
+        earlier = read_cell('erp = httpx.Client(base_url="https://stock.example.com")', names={})
+
+        reading = read_cell(textwrap.dedent('''
+            def other():
+                erp = httpx.Client(base_url="https://deliveries.example.com")
+                return erp.get("/deliveries")
+            other()
+            erp.get("/inventory")
+        '''), names=earlier.names, clients=earlier.clients)
+
+        assert reading.clients == earlier.clients
+        assert reading.requests == (
+            HttpRequest("GET", "https://deliveries.example.com/deliveries"),
+            HttpRequest("GET", "https://stock.example.com/inventory"),
+        )
+
+    def test_rebinding_a_client_invalidates_a_helpers_frozen_request(self):
+        earlier = read_cell(textwrap.dedent('''
+            erp = httpx.Client(base_url="https://stock.example.com")
+            def fetch():
+                return erp.get("/inventory")
+        '''), names={})
+
+        reading = read_cell(textwrap.dedent('''
+            erp = httpx.Client(base_url="https://deliveries.example.com")
+            fetch()
+            erp.get("/inventory")
+        '''), names=earlier.names, functions=earlier.functions, clients=earlier.clients)
+
+        assert reading.requests == (HttpRequest("GET", "https://deliveries.example.com/inventory"),)
+        assert reading.functions["fetch"].requests == ()
+
+    def test_a_failed_parse_preserves_carried_clients(self):
+        earlier = read_cell('erp = httpx.Client(base_url="https://stock.example.com")', names={})
+
+        reading = read_cell("erp = (", names=earlier.names, clients=earlier.clients)
+
+        assert reading.clients == earlier.clients
+
+    def test_client_metadata_is_bounded_in_count_and_url_length(self):
+        code = "\n".join(
+            f'client_{index} = httpx.Client(base_url="https://stock.example.com")'
+            for index in range(MAX_CLIENTS + 1)
+        )
+
+        reading = read_cell(code, names={})
+        long_base = read_cell(f'erp = httpx.Client(base_url={"https://" + "x" * MAX_STRING_CHARS!r})', names={})
+
+        assert len(reading.clients) == MAX_CLIENTS
+        assert f"client_{MAX_CLIENTS}" not in reading.clients
+        assert long_base.clients == {"erp": "{base_url}"}
 
     def test_a_get_on_a_plural_url_name_is_a_request(self):
         assert _requests("""
@@ -1000,6 +1342,135 @@ def test_strip_url_keeps_an_at_sign_in_the_path():
 
 
 class TestLabels:
+    @pytest.mark.parametrize("same_cell", [False, True], ids=["earlier-binding", "same-cell-binding"])
+    def test_a_printed_bound_name_is_a_label(self, same_cell: bool):
+        if same_cell:
+            reading = read_cell("caption = 'qty'\nprint(caption)\nprint(stock)", names={})
+        else:
+            earlier = read_cell("caption = 'qty'", names={})
+            reading = read_cell("print(caption)\nprint(stock)", names=earlier.names)
+
+        assert reading.labels == ("qty",)
+
+    def test_a_name_rebound_before_printing_labels_only_its_current_string(self):
+        reading = read_cell("caption = 'old'\ncaption = 'qty'\nprint(caption)", names={})
+
+        assert reading.labels == ("qty",)
+
+    def test_a_printed_identifier_remains_a_caption_when_it_also_names_a_column(self):
+        reading = read_cell("print('qty')\nprint(stock['qty'])", names={})
+
+        assert reading.labels == ("qty",)
+
+    def test_conditional_values_of_a_printed_name_are_labels(self):
+        reading = read_cell("caption = 'qty'\nif changed:\n    caption = 'count'\nprint(caption)", names={})
+
+        assert reading.labels == ("qty", "count")
+
+    @pytest.mark.parametrize("caption", ["'qty'", "caption"])
+    @pytest.mark.parametrize("same_cell", [False, True], ids=["earlier-helper", "same-cell-helper"])
+    def test_a_stable_helper_carries_its_printed_labels(self, caption: str, same_cell: bool):
+        definition = f"caption = 'qty'\ndef show():\n    print({caption})\n    print(stock)\n"
+        if same_cell:
+            reading = read_cell(definition + "show()", names={})
+        else:
+            earlier = read_cell(definition, names={})
+            reading = read_cell("show()", names=earlier.names, functions=earlier.functions)
+
+        assert reading.labels == ("qty",)
+        assert reading.functions["show"].labels == ("qty",)
+
+    def test_a_wrapped_helper_carries_its_printed_labels(self):
+        earlier = read_cell(textwrap.dedent('''
+            def show():
+                print('qty')
+                print(stock)
+            def wrapped():
+                show()
+        '''), names={})
+
+        reading = read_cell("wrapped()", names=earlier.names, functions=earlier.functions)
+
+        assert reading.labels == ("qty",)
+
+    @pytest.mark.parametrize("call", ["show()", "wrapped()"])
+    def test_a_literal_helper_caption_survives_rebinding_the_printed_data(self, call: str):
+        earlier = read_cell(textwrap.dedent('''
+            def show():
+                print('qty')
+                print(stock)
+            def wrapped():
+                show()
+        '''), names={})
+
+        reading = read_cell(
+            "stock = pd.Series([250, 90, 250], name='qty')\n" + call,
+            names=earlier.names, functions=earlier.functions,
+        )
+
+        assert reading.labels == ("qty",)
+        assert reading.functions["show"].literal_labels == ("qty",)
+        assert reading.functions["wrapped"].literal_labels == ("qty",)
+
+    def test_literal_captions_survive_data_changes_while_global_captions_do_not(self):
+        earlier = read_cell(textwrap.dedent('''
+            caption = 'old'
+            def show():
+                print('qty')
+                print(caption)
+                print(stock)
+        '''), names={})
+
+        reading = read_cell("caption = 'new'\nstock = frame\nshow()", names=earlier.names, functions=earlier.functions)
+
+        assert reading.labels == ("qty",)
+        assert reading.functions["show"].labels == ("qty",)
+
+    @pytest.mark.parametrize("rebind", ["show = other", "print = other"])
+    def test_rebinding_a_caption_callable_clears_a_wrappers_inherited_literal_label(self, rebind: str):
+        earlier = read_cell(textwrap.dedent('''
+            def show():
+                print('qty')
+                print(stock)
+            def wrapped():
+                show()
+        '''), names={})
+
+        reading = read_cell(rebind + "\nwrapped()", names=earlier.names, functions=earlier.functions)
+
+        assert reading.labels == ()
+        assert reading.functions["wrapped"].literal_labels == ()
+
+    def test_a_helper_with_a_changed_global_carries_no_stale_caption(self):
+        earlier = read_cell("caption = 'qty'\ndef show():\n    print(caption)", names={})
+
+        reading = read_cell("caption = 'different'\nshow()", names=earlier.names, functions=earlier.functions)
+
+        assert reading.labels == ()
+        assert reading.functions["show"].labels == ()
+
+    def test_a_bound_printed_path_stays_a_source_when_it_is_also_read(self):
+        reading = read_cell("path = 'stock.csv'\nprint(path)\ndf = pd.read_csv(path)", names={})
+
+        assert reading.labels == ()
+        assert "stock.csv" in reading.strings
+
+    def test_a_helpers_printed_path_stays_a_source_when_it_is_also_read(self):
+        definition = textwrap.dedent('''
+            def load():
+                path = 'stock.csv'
+                print(path)
+                return pd.read_csv(path)
+        ''')
+        earlier = read_cell(definition, names={})
+
+        reading = read_cell("load()", names=earlier.names, functions=earlier.functions)
+
+        assert earlier.strings == ("stock.csv",)
+        assert reading.strings == ("stock.csv",)
+        assert reading.labels == ()
+        assert reading.functions["load"].labels == ()
+
     def test_a_string_only_printed_or_drawn_is_a_label(self):
         reading = read_cell(textwrap.dedent("""
             print('Saved to rates.csv')

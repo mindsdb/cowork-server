@@ -21,6 +21,8 @@ from anton.core.llm.provider import (
     damaged_tool_call_result,
 )
 from anton.core.session import _discarded_tool_call_events
+from anton.core.tools import web_tools
+from anton.core.tools.registry import ToolOutcome
 from anton.core.utils.scratchpad import format_cell_result
 from cowork.harnesses.anton_harness import figure_sources as figure_sources_mod
 from cowork.harnesses.anton_harness import stream_formatter as stream_formatter_mod
@@ -233,8 +235,11 @@ class TestFigureSourcesSurviveReload:
         sink: list = []
         streamed = await _run(
             *_read_stock_cell(),
+            *_tool_call("native", "web_fetch", {"url": "https://example.com/rates"}),
+            *_tool_done("native", None),
             StreamTextDelta(text="Site S1 holds 250 units; "),
-            StreamTextDelta(text="overtime costs $30."),
+            StreamTextDelta(text="overtime costs $30; status 404."),
+            TurnHistory(_tool_rows("native", "web_fetch", {"url": "https://example.com/rates"}, "404")),
             sink=sink,
         )
         for event_type, data in sink:
@@ -253,7 +258,8 @@ class TestFigureSourcesSurviveReload:
         types = [e.get("type") for e in assistant["events"]]
         assert types.index("response.figure_sources") == types.index("response.completed") - 1
         content = assistant["content"]
-        assert [content[f["start"]:f["end"]] for f in saved[0]["figures"]] == ["250", "$30"]
+        assert [content[f["start"]:f["end"]] for f in saved[0]["figures"]] == ["250", "$30", "404"]
+        assert _by_text(saved[0])["404"]["origin"] == "none"
         assert [step["tool_use_id"] for step in saved[0]["steps"]] == ["toolu_read"]
 
 
@@ -293,6 +299,12 @@ def _tool_call(tool_use_id: str, name: str, tool_input: dict) -> list:
     ]
 
 
+def _tool_done(tool_use_id: str | None, ok: bool | None, *, cloud: bool = False) -> list:
+    if cloud:
+        return step_stream_events({"step": "progress", "phase": "tool_done", "id": tool_use_id, "ok": ok})
+    return [StreamTaskProgress(phase="tool_done", message="", id=tool_use_id, ok=ok)]
+
+
 async def _run_turn(context: TurnContext, *items) -> list[tuple[str, dict]]:
     return _parse_sse([
         chunk async for chunk in format_responses_stream(_events(context, *items), model="test-model")
@@ -325,6 +337,8 @@ class TestStepsFromTheTurnsToolRows:
             TurnContext(question="What does overtime cost, and what is at S1?"),
             *_tool_call("toolu_web", "web_fetch", {"url": "https://example.com/rates"}),
             *_tool_call("toolu_file", "read_text_file", {"path": "/workspace/stock.csv"}),
+            *_tool_done("toolu_web", True),
+            *_tool_done("toolu_file", True),
             StreamTextDelta(text="Overtime costs $42 an hour and S1 holds 250 units."),
             TurnHistory(rows),
         )
@@ -484,6 +498,7 @@ class TestStepsFromTheTurnsToolRows:
             TurnContext(question="What does overtime cost, and what is at S1?"),
             *_tool_call("toolu_file", "read_text_file", {"path": "/workspace/stock.csv"}),
             *_tool_call("toolu_web", "web_fetch", {"url": "https://example.com/rates"}),
+            *_tool_done("toolu_file", True),
             StreamContextCompacted(message="Context compacted"),
             StreamTextDelta(text="Overtime costs $42 an hour and S1 holds 250 units."),
             TurnHistory(_tool_rows(
@@ -534,6 +549,135 @@ class TestStepsFromTheTurnsToolRows:
         figures = _by_text(_figures(events))
         assert figures["$42"]["origin"] == "none"
         assert figures["250"]["sources"] == [{"tool_use_id": "toolu_read", "page": None}]
+
+
+class TestNativeEvidenceVerdicts:
+    @pytest.mark.parametrize("cloud", [False, True], ids=["in-process", "cloud-pod"])
+    @pytest.mark.parametrize("name", ["web_fetch", "web_search", "read_text_file"])
+    @pytest.mark.parametrize("verdict", [True, False, None, "absent"])
+    async def test_only_explicit_success_can_source_a_native_result(self, cloud, name, verdict, monkeypatch):
+        # No tool_progress precedes tool_done, and the preceding ordinary
+        # progress occupies the throttle window. Neither can lose a verdict.
+        monkeypatch.setattr(stream_formatter_mod.time, "time", lambda: 1000.0)
+        tool_input = {"url": "https://example.com/rates", "query": "rates", "path": "/workspace/rates.txt"}
+        done = [] if verdict == "absent" else _tool_done("native", verdict, cloud=cloud)
+
+        events = await _run(
+            *_tool_call("native", name, tool_input),
+            StreamTaskProgress(phase="analyzing", message="Working"),
+            *done,
+            StreamTextDelta(text="There are 42 units."),
+            TurnHistory(_tool_rows("native", name, tool_input, "42 units")),
+        )
+
+        figure = _by_text(_figures(events))["42"]
+        assert figure["origin"] == ("step" if verdict is True else "none")
+        assert figure["sources"] == ([{"tool_use_id": "native", "page": None}] if verdict is True else [])
+
+    @pytest.mark.parametrize("cloud", [False, True], ids=["in-process", "cloud-pod"])
+    @pytest.mark.parametrize("tool_use_id", [None, "", "another-call"])
+    async def test_a_verdict_without_the_matching_id_cannot_source_a_result(self, cloud, tool_use_id):
+        events = await _run(
+            *_tool_call("native", "web_fetch", {"url": "https://example.com/rates"}),
+            *_tool_done(tool_use_id, True, cloud=cloud),
+            StreamTextDelta(text="There are 42 units."),
+            TurnHistory(_tool_rows("native", "web_fetch", {"url": "https://example.com/rates"}, "42 units")),
+        )
+
+        assert _by_text(_figures(events))["42"]["origin"] == "none"
+
+    async def test_a_cloud_verdict_with_no_ok_field_cannot_source_a_result(self):
+        events = await _run(
+            *_tool_call("native", "web_fetch", {"url": "https://example.com/rates"}),
+            *step_stream_events({"step": "progress", "phase": "tool_done", "id": "native"}),
+            StreamTextDelta(text="There are 42 units."),
+            TurnHistory(_tool_rows("native", "web_fetch", {"url": "https://example.com/rates"}, "42 units")),
+        )
+
+        assert _by_text(_figures(events))["42"]["origin"] == "none"
+
+    @pytest.mark.parametrize("status", [200, 404])
+    async def test_the_locked_web_producer_distinguishes_content_from_an_http_error(self, status, monkeypatch):
+        # Uses uv.lock's Anton web producer, including its generated HTTP
+        # error and ToolOutcome. No external network or copied error string.
+        client = web_tools.httpx.AsyncClient
+        transport = web_tools.httpx.MockTransport(
+            lambda request: web_tools.httpx.Response(status, text="42 failed shipments.", request=request),
+        )
+        monkeypatch.setattr(web_tools, "_check_url_ssrf", lambda _url: None)
+        monkeypatch.setattr(web_tools.httpx, "AsyncClient", lambda **kwargs: client(transport=transport, **kwargs))
+        tool_input = {"url": "https://example.com/shipments"}
+        outcome = await web_tools.handle_web_fetch_fallback(None, tool_input)
+        assert isinstance(outcome, ToolOutcome)
+        assert outcome.ok is (True if status == 200 else None)
+        figure_text = "42" if status == 200 else "404"
+
+        events = await _run(
+            *_tool_call("native", "web_fetch", tool_input),
+            *_tool_done("native", outcome.ok),
+            StreamTextDelta(text=f"There are {figure_text} shipments."),
+            TurnHistory(_tool_rows("native", "web_fetch", tool_input, outcome.content)),
+        )
+
+        assert _by_text(_figures(events))[figure_text]["origin"] == ("step" if status == 200 else "none")
+
+    async def test_a_newer_native_file_error_cannot_source_its_line_count(self):
+        # read_text_file is absent from uv.lock's Anton cf923647. This is the
+        # newer producer contract, not an import that silently bumps the lock:
+        # anton/core/tools/tool_handlers.py, handle_read_text_file, at
+        # daa1fc8ac2ae5e49246856fbed225e04ca408660 returns this with ok=False.
+        tool_input = {"path": "stock.csv", "start_line": 1000}
+        result = "Error: start_line 1000 is past the end of the file (42 lines)."
+        events = await _run(
+            *_tool_call("native", "read_text_file", tool_input),
+            *_tool_done("native", False),
+            StreamTextDelta(text="There are 42 units."),
+            TurnHistory(_tool_rows("native", "read_text_file", tool_input, result)),
+        )
+
+        assert _by_text(_figures(events))["42"]["origin"] == "none"
+        assert _figures(events)["steps"] == []
+
+    async def test_a_repaired_call_anton_refused_never_becomes_a_source(self):
+        call = ToolCall(id="native", name="web_fetch", input={"max_chars": 523}, repaired=True)
+        events = await _run(
+            *_tool_call(call.id, call.name, call.input),
+            *_discarded_tool_call_events(call),
+            StreamTextDelta(text="There are 523 words."),
+            TurnHistory(_refused_rows(call)),
+        )
+
+        assert _by_text(_figures(events))["523"]["origin"] == "none"
+        assert _figures(events)["steps"] == []
+
+    async def test_a_later_failed_verdict_revokes_an_earlier_success(self):
+        call = ToolCall(id="native", name="web_fetch", input={"url": "https://example.com/rates"})
+        events = await _run(
+            *_tool_call(call.id, call.name, call.input),
+            *_tool_done(call.id, True),
+            *_discarded_tool_call_events(call),
+            StreamTextDelta(text="There are 42 units."),
+            TurnHistory(_tool_rows(call.id, call.name, call.input, "42 units")),
+        )
+
+        assert _by_text(_figures(events))["42"]["origin"] == "none"
+
+    @pytest.mark.parametrize("cloud", [False, True], ids=["in-process", "cloud-pod"])
+    async def test_partial_scratchpad_stdout_survives_a_failed_cell(self, cloud):
+        code = "print(open('/workspace/stock.csv').read()); raise ValueError('failed')"
+        cell = {"code": code, "stdout": "250 units", "stderr": "", "error": "ValueError: failed"}
+        done = (
+            step_stream_events({"step": "progress", "phase": "scratchpad_done", "id": "cell", "ok": False})
+            if cloud else [StreamTaskProgress(phase="scratchpad_done", message="Failed", id="cell", ok=False)]
+        )
+        events = await _run(
+            *_tool_call("cell", "scratchpad", {"action": "exec", "code": code}),
+            *done,
+            StreamToolResult(name="scratchpad", action="exec", id="cell", content=json.dumps(cell)),
+            StreamTextDelta(text="There are 250 units."),
+        )
+
+        assert _by_text(_figures(events))["250"]["sources"] == [{"tool_use_id": "cell", "page": None}]
 
 
 def _earlier_cell(tool_use_id: str = "toolu_earlier") -> list[dict]:
@@ -841,6 +985,21 @@ class TestTheInProcessHandlerSavesTheSources:
             ("250", [{"tool_use_id": "toolu_read", "page": None}]),
         ]
         assert any(frame.startswith("event: response.figure_sources") for frame in frames)
+
+    async def test_failed_native_output_stays_unsourced_in_the_saved_answer(self):
+        tool_input = {"url": "https://example.com/rates"}
+        frames, saved = await self._produce([
+            TurnContext(question="What is the rate?"),
+            *_tool_call("native", "web_fetch", tool_input),
+            *_tool_done("native", None),
+            StreamTextDelta(text="The rate is 404."),
+            TurnHistory(_tool_rows("native", "web_fetch", tool_input, "404")),
+        ])
+
+        [persisted] = [event for event in saved if event.get("type") == "response.figure_sources"]
+        assert persisted == _figures(_parse_sse(frames))
+        assert _by_text(persisted)["404"]["origin"] == "none"
+        assert persisted["steps"] == []
 
     async def test_the_answer_carries_them_with_the_setting_off(self):
         from cowork.common.settings.user_settings import UserSettings, use_turn_settings

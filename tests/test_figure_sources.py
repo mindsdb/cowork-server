@@ -436,7 +436,57 @@ class TestQueriesAcrossCells:
         assert find_figure_sources(answer="S1 holds 250.", question="", steps=[spell, run]).steps[0].queries == []
 
 
+class TestClientsAcrossCells:
+    def test_a_client_keeps_its_base_in_the_later_cells_serialized_request(self):
+        setup = _cell("setup", code="client = httpx.Client(base_url='https://erp.example.com')", stdout="")
+        run = _cell("run", code="print(client.get('/stock?token=synthetic-secret').text)", stdout="250\n")
+
+        event = find_figure_sources(answer="There are 250 units.", question="", steps=[setup, run]).model_dump_json()
+
+        [step] = FigureSources.model_validate_json(event).steps
+        assert (step.kind, step.requests) == (SourceKind.web, ["GET https://erp.example.com/stock"])
+        assert "synthetic-secret" not in event
+
+    @pytest.mark.parametrize("action", ["reset", "remove"])
+    def test_a_namespace_reset_forgets_the_client_base(self, action: str):
+        setup = _cell("setup", code="client = httpx.Client(base_url='https://erp.example.com')", stdout="")
+        reset = _scratchpad("reset", action=action, content="Scratchpad state cleared.")
+        run = _cell("run", code="print(client.get('/stock').text)", stdout="250\n")
+
+        [step] = find_figure_sources(answer="There are 250 units.", question="", steps=[setup, reset, run]).steps
+
+        assert step.requests == []
+
+    def test_another_scratchpads_client_is_not_in_scope(self):
+        setup = _cell("setup", code="client = httpx.Client(base_url='https://erp.example.com')", stdout="", pad="other")
+        run = _cell("run", code="print(client.get('/stock').text)", stdout="250\n")
+
+        [step] = find_figure_sources(answer="There are 250 units.", question="", steps=[setup, run]).steps
+
+        assert step.requests == []
+
+    def test_a_discarded_reset_preserves_the_client_base(self):
+        setup = _cell("setup", code="client = httpx.Client(base_url='https://erp.example.com')", stdout="")
+        run = _cell("run", code="print(client.get('/stock').text)", stdout="250\n")
+
+        [step] = find_figure_sources(
+            answer="There are 250 units.", question="", steps=[setup, _discarded("reset", action="reset"), run],
+        ).steps
+
+        assert step.requests == ["GET https://erp.example.com/stock"]
+
+
 class TestFunctionsAcrossCells:
+    def test_a_rebound_global_query_never_survives_in_the_serialized_event(self):
+        define = _cell("define", code="SQL = 'SELECT qty FROM old_stock'\ndef load():\n    return cur.execute(SQL)", stdout="")
+        rebind = _cell("rebind", code="SQL = 'SELECT qty FROM new_stock'", stdout="")
+        call = _cell("call", code="print(load().fetchone()[0])", stdout="250\n")
+
+        event = find_figure_sources(answer="There are 250 units.", question="", steps=[define, rebind, call]).model_dump_json()
+
+        assert "old_stock" not in event
+        assert all(not step.queries for step in FigureSources.model_validate_json(event).steps)
+
     def test_a_helper_an_earlier_cell_defined_makes_its_request_in_the_cell_that_calls_it(self):
         define = _cell(
             "toolu_1",
@@ -1060,6 +1110,28 @@ class TestSecretsInUrls:
 
 
 class TestSecretsInLabels:
+    @pytest.mark.parametrize("value", [
+        "private_key='-----BEGIN PRIVATE KEY-----\nMIIXyZsecret\n-----END PRIVATE KEY-----'",
+        "password='firstSecret\nsecondSecret'",
+        'password="firstSecret\r\nsecondSecret"',
+        "password='firstSecret\\\nsecondSecret'",
+        "password='firstSecret\nsecondSecret",
+    ])
+    @pytest.mark.parametrize("where", ["label", "query"])
+    def test_a_multiline_named_secret_is_removed_from_the_whole_event(self, value: str, where: str):
+        sql = f"SELECT qty FROM read_source({value})" if where == "query" else "SELECT qty FROM stock"
+        step = _cell(
+            "toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n",
+            description=value if where == "label" else "Read stock",
+        )
+
+        event = _event(step)
+
+        assert "MIIXyZsecret" not in event
+        assert "firstSecret" not in event
+        assert "secondSecret" not in event
+        assert FigureSources.model_validate_json(event).steps
+
     def test_a_description_that_holds_a_secret_is_redacted_in_the_label(self):
         step = _cell(
             "toolu_q", code="print(query_minds_data('SELECT qty FROM stock'))", stdout="42\n",
@@ -1087,6 +1159,65 @@ class TestSecretsInLabels:
 
 
 class TestSecretsInQueries:
+    @pytest.mark.parametrize("sql", [
+        "SELECT 1--0; CREATE USER user_a IDENTIFIED BY 'XyZsecret'",
+        "SELECT 1 # '\n; CREATE USER user_a IDENTIFIED BY 'XyZsecret'",
+        "SELECT 1 /*!; CREATE USER user_a IDENTIFIED BY 'XyZsecret' */",
+        "SELECT qty FROM stock AS $tag$; CREATE USER user_a IDENTIFIED BY 'XyZsecret'; SELECT qty FROM stock AS $tag$",
+    ])
+    def test_dialect_ambiguous_batches_never_expose_trailing_ddl(self, sql: str):
+        step = _cell("sql", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n")
+
+        event = _event(step)
+
+        assert "XyZsecret" not in event
+        assert "CREATE USER" not in event
+        assert all(not step.queries for step in FigureSources.model_validate_json(event).steps)
+
+    @pytest.mark.parametrize("quote", ["'", '"'])
+    @pytest.mark.parametrize("prefix_length", [2, 1_100])
+    @pytest.mark.parametrize("repeats", [1, 150])
+    @pytest.mark.parametrize("where", ["label", "query"])
+    def test_uri_with_the_opposite_quote_is_redacted_without_a_registered_secret(
+        self, quote: str, prefix_length: int, repeats: int, where: str,
+    ):
+        opposite = '"' if quote == "'" else "'"
+        uri = "postgresql://admin:" + "p" * prefix_length + opposite + "XyZsecret" * repeats + "@db.example/stock"
+        sql = f"SELECT qty FROM stock WHERE source_uri = {quote}{uri}{quote}"
+        step = _cell(
+            "toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n",
+            description=uri if where == "label" else "Read stock",
+        )
+
+        event = _event(step)
+
+        assert "XyZsecret" not in event
+        assert "admin:" not in event
+        assert FigureSources.model_validate_json(event).steps
+
+    @pytest.mark.parametrize("prefix_length", [2, 1_100])
+    @pytest.mark.parametrize("quote", ["'", '"'])
+    @pytest.mark.parametrize("escaping", ["doubled", "backslash"])
+    @pytest.mark.parametrize("where", ["label", "query"])
+    def test_long_sql_quoted_uri_userinfo_is_redacted_before_the_event_is_capped(
+        self, prefix_length: int, quote: str, escaping: str, where: str, monkeypatch: pytest.MonkeyPatch,
+    ):
+        password = "p" * prefix_length + quote + "XyZsecret" * 150
+        monkeypatch.setenv("DS_FIGURE_TEST_PASSWORD", password)
+        escaped_password = password.replace(quote, quote * 2 if escaping == "doubled" else "\\" + quote)
+        uri = f"postgresql://admin:{escaped_password}@db.example.com/stock"
+        sql = f"SELECT qty FROM postgres_scan({quote}{uri}{quote}, 'public', 'stock')"
+        step = _cell(
+            "toolu_k", code=f"cur.execute({sql!r})\nprint(cur.fetchone()[0])", stdout="42\n",
+            description=uri if where == "label" else "Read stock",
+        )
+
+        event = _event(step)
+
+        assert "XyZsecret" not in event
+        assert "admin:" not in event
+        assert FigureSources.model_validate_json(event).steps
+
     @pytest.mark.parametrize(("literal", "secret"), [
         ("Server=db;Uid=erp;Pwd=XyZpass9;", "XyZpass9"),
         ("s3_secret_access_key=XyZsecretKey9", "XyZsecretKey9"),
@@ -1571,6 +1702,36 @@ _SAMPLE_FULL = (
 
 
 class TestFrameRowLabels:
+    def test_a_helpers_literal_caption_survives_rebinding_the_data_it_prints(self):
+        define = _cell("define", code="def show():\n    print('qty')\n    print(stock)", stdout="")
+        call = _cell(
+            "call", code="stock = pd.Series([250, 90, 250], name='qty')\nshow()",
+            stdout="qty\n0    250\n1     90\n2    250\nName: qty, dtype: int64\n",
+        )
+
+        event = find_figure_sources(answer="The rate is $2.", question="", steps=[define, call])
+
+        assert _origins(event) == [("$2", FigureOrigin.none)]
+
+    @pytest.mark.parametrize("code", [
+        "caption = 'qty'; print(caption); print(stock)",
+        "def show():\n    print('qty')\n    print(stock)\nshow()",
+    ])
+    def test_a_variable_or_helper_caption_does_not_name_an_ordinary_series_index(self, code: str):
+        stdout = "qty\n0    250\n1     90\n2    250\nName: qty, dtype: int64\n"
+
+        assert _printed(stdout, answer="Stock is 250 units; the rate is $2.", code=code) == [
+            ("250", FigureOrigin.step), ("$2", FigureOrigin.none),
+        ]
+
+    @pytest.mark.parametrize("caption", ["Stock quantities:", "qty", "Stock quantities"])
+    def test_a_separately_printed_caption_does_not_name_an_ordinary_series_index(self, caption: str):
+        stdout = caption + "\n0    250\n1     90\n2    250\nName: qty, dtype: int64\n"
+
+        assert _printed(stdout, answer="Stock is 250 units; the rate is $2.", code=f"print({caption!r}); print(stock)") == [
+            ("250", FigureOrigin.step), ("$2", FigureOrigin.none),
+        ]
+
     @pytest.mark.parametrize(("stdout", "invented"), [
         (_printed_frame(list(range(40))), "$30"),
         (_printed_frame(list(range(5))) + "..  ...  ...  ...\n" + _printed_frame(list(range(95, 100))).split("\n", 1)[1]
@@ -1593,11 +1754,20 @@ class TestFrameRowLabels:
         "     part site\nqty          \n250  P100   S1\n90   P100   S2\n",
         # Printed by hand.
         "250  S1\n90   S2\n",
+        # A named numeric index is data even when sorted ascending.
+        "qty\n90     1\n250    2\nName: count, dtype: int64\n",
+        "     part site\nqty          \n90   P100   S2\n250  P100   S1\n",
     ])
-    def test_values_printed_where_row_labels_go_are_read_unless_they_count_up(self, stdout: str):
+    def test_named_index_values_and_noncounting_labels_are_read(self, stdout: str):
         assert _printed(stdout, answer="S1 holds 250 units and S2 holds 90.", code="print(stock)") == [
             ("250", FigureOrigin.step), ("90", FigureOrigin.step),
         ]
+
+    def test_a_single_named_index_value_is_read(self):
+        assert _printed(
+            "qty\n250    2\nName: count, dtype: int64\n",
+            answer="There are 250 units.", code="print(stock)",
+        ) == [("250", FigureOrigin.step)]
 
 
 def _pdf_page(stdout: str) -> int | None:
