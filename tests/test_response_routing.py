@@ -1795,6 +1795,7 @@ async def test_gate_drain_failure_logs_the_error_class_not_its_text(monkeypatch,
 
     import httpx
     import openai
+    from anton.core.llm.tracing import TraceContext, reset_trace_context, set_trace_context
 
     import cowork.handlers.response_routing as routing
 
@@ -1806,12 +1807,18 @@ async def test_gate_drain_failure_logs_the_error_class_not_its_text(monkeypatch,
         body={"message": private},
     )
     failing = _StreamProvider([_tool(), error])
-    with caplog.at_level(logging.WARNING, logger=routing.__name__):
-        assert await routing._gate(_binding(failing), history=HISTORY) is None
-        await _drained()
+    token = set_trace_context(TraceContext(session_id="conv-17"))
+    try:
+        with caplog.at_level(logging.WARNING, logger=routing.__name__):
+            assert await routing._gate(_binding(failing), history=HISTORY) is None
+            await _drained()
+    finally:
+        reset_trace_context(token)
 
     (record,) = _gate_warnings(caplog)
-    assert record.getMessage() == "[gate] usage_drain_failed error=APIStatusError status=529"
+    assert record.getMessage() == (
+        "[gate] usage_drain_failed conversation=conv-17 model=gate-model "
+        "error=APIStatusError status=529")
     assert record.exc_info is None
     assert private not in repr(record.__dict__)
 
