@@ -53,6 +53,7 @@ from cowork.models.project import Project
 from cowork.models.shared_resource import SharedResourceAttribution
 from cowork.principal import Principal, get_principal
 from cowork.schemas.project_files import (
+    CANONICAL_PROJECT_MEMORY_PATHS,
     ProjectFileDeleteResponse,
     ProjectFileListResponse,
     ProjectFileReadResponse,
@@ -84,12 +85,6 @@ router = APIRouter(dependencies=[Depends(require(AuthenticatedInOrgMode))])
 
 ANTON_INSTRUCTIONS_FILENAME = "anton.md"
 TEXT_MAX_BYTES = 2 * 1024 * 1024  # 2 MiB
-_CANONICAL_PROJECT_MEMORY_PATHS = frozenset(
-    {
-        (".anton", "memory", "rules.md"),
-        (".anton", "memory", "lessons.md"),
-    }
-)
 
 #: How long a preview token stays usable. Long enough that a preview left open
 #: keeps loading its sub-assets, short enough that a token which escapes the
@@ -433,10 +428,10 @@ def _reject_generic_project_memory_mutation(
         return
     parts = _resolved_project_parts(base, path) if base is not None else path.parts
     instructions = (".anton", ANTON_INSTRUCTIONS_FILENAME)
-    protected = (*_CANONICAL_PROJECT_MEMORY_PATHS, instructions)
+    protected = (*CANONICAL_PROJECT_MEMORY_PATHS, instructions)
     if parts == instructions:
         return
-    if parts in _CANONICAL_PROJECT_MEMORY_PATHS:
+    if parts in CANONICAL_PROJECT_MEMORY_PATHS:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(

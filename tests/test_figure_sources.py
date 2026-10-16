@@ -392,6 +392,140 @@ class TestReadTextFile:
             ("900", FigureOrigin.none), (str(len(line)), FigureOrigin.none), ("250", FigureOrigin.step),
         ]
 
+    @pytest.mark.parametrize("path", [
+        ".anton/memory/lessons.md",
+        "/Users/ada/sales/.anton/memory/rules.md",
+        ".anton/memory/topics/overtime.md",
+        ".anton/artifacts/../memory/lessons.md",
+        "./.anton//memory/lessons.md",
+        ".Anton/Memory/lessons.md",
+        ".anton\\memory\\lessons.md",
+        " .anton/memory/lessons.md",
+        "\t.anton/memory/lessons.md ",
+    ], ids=[
+        "relative", "absolute", "topic", "climbs-back", "dot-and-doubled-slash", "other-case", "backslashes",
+        "leading-space", "tab-and-trailing-space",
+    ])
+    def test_a_read_of_a_memory_file_is_not_a_source(self, path: str):
+        """A memory file holds what the agent memorized, its own text, as a
+        memorize call's result does."""
+        read = _tool(
+            "toolu_mem", "read_text_file", {"path": path},
+            f"{path} — lines 1-1 of 1\nOvertime costs 30 dollars an hour.\n",
+        )
+
+        sources = find_figure_sources(answer="Overtime costs $30 an hour.", question="", steps=[read])
+
+        assert _origins(sources) == [("$30", FigureOrigin.none)]
+        assert sources.steps == []
+
+    @pytest.mark.parametrize("code", [
+        "print(open('.anton/memory/lessons.md').read())",
+        "print(open('/workspace/.anton/memory/rules.md').read())",
+        "from pathlib import Path\nprint(Path('.Anton/Memory/topics/overtime.md').read_text())",
+    ], ids=["relative", "absolute", "other-case-topic"])
+    def test_a_cell_that_only_reads_a_memory_file_is_not_a_source(self, code: str):
+        """A cell that reads a memory file prints the agent's own text, as a
+        read_text_file of it does."""
+        cell = _cell("toolu_mem", code=code, stdout="Overtime costs 30 dollars an hour.\n")
+
+        sources = find_figure_sources(answer="Overtime costs $30 an hour.", question="", steps=[cell])
+
+        assert _origins(sources) == [("$30", FigureOrigin.none)]
+        assert sources.steps == []
+
+    def test_a_cell_that_reads_a_memory_file_and_another_file_names_only_the_other(self):
+        code = (
+            "import pandas as pd\nnotes = open('.anton/memory/lessons.md').read()\n"
+            "print(pd.read_csv('stock.csv').qty.sum())"
+        )
+        cell = _cell("toolu_both", code=code, stdout="340\n")
+
+        sources = find_figure_sources(answer="Stock totals 340.", question="", steps=[cell])
+
+        assert _origins(sources) == [("340", FigureOrigin.step)]
+        assert [(step.kind, step.label) for step in sources.steps] == [(SourceKind.file, "stock.csv")]
+
+    def test_a_cell_that_reads_a_memory_file_and_prints_an_earlier_cells_data_stays_a_step(self):
+        load = _cell("toolu_load", code="import pandas as pd\ndf = pd.read_csv('stock.csv')", stdout="")
+        both = _cell(
+            "toolu_both", code="notes = open('.anton/memory/lessons.md').read()\nprint(df.qty.sum())", stdout="340\n",
+        )
+
+        sources = find_figure_sources(answer="Stock totals 340.", question="", steps=[load, both])
+
+        assert _origins(sources) == [("340", FigureOrigin.step)]
+        assert [(step.tool_use_id, step.kind) for step in sources.steps] == [
+            ("toolu_load", SourceKind.file), ("toolu_both", SourceKind.step),
+        ]
+
+    def test_a_cell_that_reads_a_memory_file_and_makes_a_request_stays_a_step(self):
+        """A request whose URL the cell builds at run time, here from the
+        memory file, may fetch live data."""
+        code = (
+            "import json, requests\nurl = json.load(open('.anton/memory/endpoints.json'))['sales']\n"
+            "print(requests.get(url).json()['total'])"
+        )
+        cell = _cell("toolu_req", code=code, stdout="4812\n")
+
+        sources = find_figure_sources(answer="Sales total 4,812.", question="", steps=[cell])
+
+        assert _origins(sources) == [("4,812", FigureOrigin.step)]
+        assert [(step.tool_use_id, step.kind, step.requests) for step in sources.steps] == [
+            ("toolu_req", SourceKind.step, ["GET {url}"]),
+        ]
+
+    @pytest.mark.parametrize("cells", [
+        [("toolu_load", "notes = open('.anton/memory/lessons.md').read()"), ("toolu_print", "print(notes)")],
+        [
+            ("toolu_load", "import json\nrates = json.load(open('.anton/memory/rates.json'))"),
+            ("toolu_pick", "overtime = rates['overtime']"),
+            ("toolu_print", "print('Overtime costs', overtime, 'dollars an hour.')"),
+        ],
+    ], ids=["printed-by-the-next-cell", "through-a-cell-between"])
+    def test_a_cell_that_prints_only_memory_text_an_earlier_cell_read_is_not_a_source(
+        self, cells: list[tuple[str, str]],
+    ):
+        """An earlier cell left out for reading memory files passes on what
+        it read, so a later cell whose only source is that cell prints what
+        the agent memorized too."""
+        steps = [
+            _cell(tool_use_id, code=code, stdout="Overtime costs 30 dollars an hour.\n" if "print" in code else "")
+            for tool_use_id, code in cells
+        ]
+
+        sources = find_figure_sources(answer="Overtime costs $30 an hour.", question="", steps=steps)
+
+        assert _origins(sources) == [("$30", FigureOrigin.none)]
+        assert sources.steps == []
+
+    def test_a_cell_that_reads_a_memory_file_and_queries_stays_a_query(self):
+        code = (
+            "notes = open('.anton/memory/lessons.md').read()\n"
+            "print(query_minds_data('SELECT SUM(qty) FROM stock').iloc[0, 0])"
+        )
+        cell = _cell("toolu_q", code=code, stdout="340\n", description="Sum stock")
+
+        sources = find_figure_sources(answer="Stock totals 340.", question="", steps=[cell])
+
+        assert _origins(sources) == [("340", FigureOrigin.step)]
+        assert [(step.kind, step.label) for step in sources.steps] == [(SourceKind.query, "Sum stock")]
+
+    @pytest.mark.parametrize("path", [
+        "docs/lessons.md", "memory/lessons.md", ".anton/artifacts/memory/lessons.md", ".anton/memories/lessons.md",
+        ".anton/memory/../artifacts/lessons.md",
+    ])
+    def test_a_read_of_any_other_file_holding_the_figure_is_a_source(self, path: str):
+        read = _tool(
+            "toolu_t", "read_text_file", {"path": path},
+            f"{path} — lines 1-1 of 1\nOvertime costs 30 dollars an hour.\n",
+        )
+
+        sources = find_figure_sources(answer="Overtime costs $30 an hour.", question="", steps=[read])
+
+        assert _origins(sources) == [("$30", FigureOrigin.step)]
+        assert [(step.kind, step.label) for step in sources.steps] == [(SourceKind.file, "lessons.md")]
+
 
 class TestQueriesAcrossCells:
     def test_a_query_an_earlier_cell_spelled_is_the_later_cells(self):

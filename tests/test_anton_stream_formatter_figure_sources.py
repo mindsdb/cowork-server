@@ -351,6 +351,30 @@ class TestStepsFromTheTurnsToolRows:
         assert (steps["toolu_web"]["kind"], steps["toolu_web"]["url"]) == ("web", "https://example.com/rates")
         assert (steps["toolu_file"]["kind"], steps["toolu_file"]["label"]) == ("file", "stock.csv")
 
+    async def test_a_memory_file_read_is_not_a_step_and_a_project_file_read_is(self):
+        memory = {"path": ".anton/memory/lessons.md"}
+        stock = {"path": "data/stock.csv"}
+        rows = [
+            *_tool_rows("toolu_mem", "read_text_file", memory, "Overtime costs 30 dollars an hour.\n"),
+            *_tool_rows("toolu_file", "read_text_file", stock, "part,site,qty\nP100,S1,250\n"),
+        ]
+
+        events = await _run_turn(
+            TurnContext(question="What does overtime cost, and what is at S1?"),
+            *_tool_call("toolu_mem", "read_text_file", memory),
+            *_tool_call("toolu_file", "read_text_file", stock),
+            *_tool_done("toolu_mem", True),
+            *_tool_done("toolu_file", True),
+            StreamTextDelta(text="Overtime costs $30 an hour and S1 holds 250 units."),
+            TurnHistory(rows),
+        )
+
+        payload = _figures(events)
+        figures = _by_text(payload)
+        assert (figures["$30"]["origin"], figures["$30"]["sources"]) == ("none", [])
+        assert figures["250"]["sources"] == [{"tool_use_id": "toolu_file", "page": None}]
+        assert [step["tool_use_id"] for step in payload["steps"]] == ["toolu_file"]
+
     async def test_a_streamed_scratchpad_result_stays_one_step(self):
         events = await _run_turn(
             TurnContext(question="What is at S1?"),
@@ -509,6 +533,31 @@ class TestStepsFromTheTurnsToolRows:
         figures = _by_text(_figures(events))
         assert "$42" not in figures
         assert figures["250"]["origin"] == "step"
+
+    @pytest.mark.parametrize(("path", "origins"), [
+        (".anton/memory/lessons.md", {"$30": "none", "250": "step"}),
+        ("docs/lessons.md", {"250": "step"}),
+    ], ids=["memory-file", "project-file"])
+    async def test_rows_missing_a_memory_read_keep_the_mark_on_a_figure_no_step_holds(
+        self, path: str, origins: dict[str, str],
+    ):
+        """A memory file read is never a step, so its missing row hides no
+        source. A missing read of any other file still may."""
+        lessons = {"path": path}
+        stock = {"path": "data/stock.csv"}
+
+        events = await _run_turn(
+            TurnContext(question="What does overtime cost, and what is at S1?"),
+            *_tool_call("toolu_lessons", "read_text_file", lessons),
+            *_tool_call("toolu_file", "read_text_file", stock),
+            *_tool_done("toolu_lessons", True),
+            *_tool_done("toolu_file", True),
+            StreamContextCompacted(message="Context compacted"),
+            StreamTextDelta(text="Overtime costs $30 an hour and S1 holds 250 units."),
+            TurnHistory(_tool_rows("toolu_file", "read_text_file", stock, "part,site,qty\nP100,S1,250\n")),
+        )
+
+        assert {text: figure["origin"] for text, figure in _by_text(_figures(events)).items()} == origins
 
     async def test_rows_holding_an_evidence_call_without_its_result_leave_a_figure_no_step_holds_unmarked(self):
         """A call is held only by its result: rows that keep the call but not

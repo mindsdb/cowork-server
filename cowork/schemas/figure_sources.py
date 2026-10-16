@@ -16,10 +16,15 @@ class FigureOrigin(StrEnum):
 
 
 class SourceKind(StrEnum):
+    """Where a step's output came from: a query, a file, a web page, or, when
+    the matcher can tell none of these, the step itself. A read of the
+    project's memory folder (.anton/memory), by read_text_file or by a cell
+    whose only source is memory files it or an earlier cell read, holds the
+    agent's own text and is never a source, so no kind names it."""
+
     query = "query"
     file = "file"
     web = "web"
-    memory = "memory"
     step = "step"
 
 

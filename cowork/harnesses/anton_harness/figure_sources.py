@@ -34,7 +34,10 @@ of this turn reuses.
 Only the scratchpad's cells and the tools in ``EVIDENCE_TOOLS`` are steps: the
 web tools and read_text_file. Every other tool hands back the agent's own text
 (an earlier answer, an artifact it wrote, a memory), the user's answer, or a
-status line.
+status line. A read_text_file of a file in anton's memory folder
+(``.anton/memory``) is no step either: it reads back what the agent memorized.
+Nor is a cell whose only source would be the memory files it, or an earlier
+cell, read (``_describe_cell``).
 
 A step whose own input states the figure (a cell that prints a literal it was
 given) is not a source for it: its output only echoes what the model wrote.
@@ -57,7 +60,7 @@ import os
 import posixpath
 import re
 from bisect import bisect_left, bisect_right
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence, Set
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from itertools import accumulate
@@ -85,6 +88,7 @@ from cowork.schemas.figure_sources import (
     FigureStep,
     SourceKind,
 )
+from cowork.schemas.project_files import CANONICAL_PROJECT_MEMORY_PATHS
 
 logger = get_logger(__name__)
 
@@ -103,7 +107,15 @@ MAX_EARLIER_CELLS = 50
 # back earlier answers verbatim, the artifact and skill tools the agent's own
 # writing, memorize and ask_user what the agent or the user wrote, read_image
 # a line about the image rather than what it shows, and the rest a status.
+# A read_text_file of a memory file is left out too (reads_memory_file), and
+# so is a cell whose only source is memory files it or an earlier cell read
+# (_describe_cell).
 EVIDENCE_TOOLS = WEB_TOOLS | {"read_text_file"}
+# The folder anton keeps the project's memory files in, .anton/memory, by its
+# path parts in lower case.
+_MEMORY_FOLDERS = frozenset(
+    tuple(part.casefold() for part in path[:-1]) for path in CANONICAL_PROJECT_MEMORY_PATHS
+)
 
 
 class CellResult(BaseModel):
@@ -708,16 +720,20 @@ def _describe_steps(steps: Sequence[TurnStep]) -> list[_DescribedStep]:
     the ``MAX_EARLIER_CELLS``-th last cell that ran on are read. A scratchpad
     call is one only when it ran a cell: anton runs no call it discarded, and
     another action's output repeats earlier cells or is empty. A tool call is
-    one only when the tool is one of ``EVIDENCE_TOOLS``. Each scratchpad keeps
-    what its cells bound (``_Pad``) across cells and turns, until a reset or
-    remove that ran."""
+    one only when the tool is one of ``EVIDENCE_TOOLS`` and it did not read a
+    memory file (``_reads_memory``). Each scratchpad keeps what its cells
+    bound (``_Pad``) across cells and turns, until a reset or remove that
+    ran. A cell ``_describe_cell`` leaves out because what it prints can
+    only be what the agent memorized is a memory cell, and so is a later
+    cell whose only source would be memory cells' data."""
     earlier = [step for step in steps if step.earlier_turn]
     ordered = [*_latest_cells(earlier, limit=MAX_EARLIER_CELLS), *(step for step in steps if not step.earlier_turn)]
     pads: dict[str, _Pad] = {}
     described: list[_DescribedStep] = []
+    memory_cells: set[str] = set()
     for step in ordered:
         if step.tool_name != "scratchpad":
-            if step.tool_name in EVIDENCE_TOOLS:
+            if step.tool_name in EVIDENCE_TOOLS and not _reads_memory(step=step):
                 described.append(_describe_tool(step))
             continue
         if step.content.startswith(_DISCARDED_CALL):
@@ -734,8 +750,44 @@ def _describe_steps(steps: Sequence[TurnStep]) -> list[_DescribedStep]:
         reading = read_cell(code, names=pad.names, functions=pad.functions, clients=pad.clients)
         drawn_from = pad.drawn_from(reading.loaded_names) - {step.tool_use_id}
         pad.record(reading, tool_use_id=step.tool_use_id)
-        described.append(_describe_cell(step, code=code, reading=reading, cell=cell, drawn_from=drawn_from))
+        described_cell = _describe_cell(
+            step, code=code, reading=reading, cell=cell, drawn_from=drawn_from, memory_cells=memory_cells,
+        )
+        if described_cell is not None:
+            described.append(described_cell)
+        elif step.tool_use_id:
+            memory_cells.add(step.tool_use_id)
     return described
+
+
+def _reads_memory(*, step: TurnStep) -> bool:
+    """Whether the step is a read_text_file of a memory file
+    (``reads_memory_file``)."""
+    return reads_memory_file(tool_name=step.tool_name, path=step.tool_input.arguments.path)
+
+
+def reads_memory_file(*, tool_name: str, path: str | None) -> bool:
+    """Whether a call of ``tool_name`` with this path argument is a
+    read_text_file of a file in a memory folder (``_in_memory_folder``).
+    Such a read is never a step."""
+    return tool_name == "read_text_file" and path is not None and _in_memory_folder(path=path)
+
+
+def _in_memory_folder(*, path: str) -> bool:
+    """Whether ``path`` names a file in a memory folder, at any depth of the
+    path. The path is read by its text alone, without the whitespace around
+    it, which anton drops too: either slash separates its parts, ``.`` and
+    ``..`` collapse, and case is ignored, as macOS and Windows ignore it by
+    default. A link from elsewhere into the folder is not followed, so a
+    read through one stays a step."""
+    parts = posixpath.normpath(path.strip().replace("\\", "/")).casefold().split("/")
+    # A folder followed by at least one more part: a file in it, or in a
+    # folder below it.
+    return any(
+        tuple(parts[start:start + len(folder)]) == folder
+        for folder in _MEMORY_FOLDERS
+        for start in range(len(parts) - len(folder))
+    )
 
 
 def _latest_cells(steps: Sequence[TurnStep], *, limit: int) -> Sequence[TurnStep]:
@@ -783,14 +835,37 @@ def _clipped_stdout(content: str) -> str:
 
 
 def _describe_cell(
-    step: TurnStep, *, code: str, reading: CellReading, cell: CellResult | None, drawn_from: frozenset[str],
-) -> _DescribedStep:
+    step: TurnStep,
+    *,
+    code: str,
+    reading: CellReading,
+    cell: CellResult | None,
+    drawn_from: frozenset[str],
+    memory_cells: Set[str],
+) -> _DescribedStep | None:
     """A cell's kind, in order: a web tool call; a query (SQL, the data
     helper, a saved connection's variable, or a request that names one); a
     document it reads (not one it writes or only prints); a request to, or a
     string holding, a literal http(s) URL; else a step. Without a description
     a query, a web search or a step has an empty label, which the client
-    words by the kind alone."""
+    words by the kind alone.
+
+    A memory file (``_in_memory_folder``) holds the agent's own text, as a
+    read_text_file of it does (``reads_memory_file``), so it is never one of
+    the cell's documents. None for a cell that would otherwise be a bare
+    step making no request, whose only sources are the memory files it read
+    and ``memory_cells``, the earlier cells this rule left out: what it
+    prints is what the agent memorized, read here or in an earlier cell. A
+    request whose URL the code builds at run time may fetch live data, so a
+    cell that makes one stays a step.
+
+    The rule misses what the cell reader does not see: a cell that also
+    computes a figure from numbers its code writes, or loads data through a
+    call the reader does not classify (a library's download, a pickle, a
+    query held in a name), is left out with its figures; and a memory path
+    the code builds from a name (f"{MEM}/lessons.md") or finds by listing
+    the folder (os.listdir(".anton/memory")) is read as any other file, so
+    the cell names it or stays a step."""
     output = cell.stdout if cell is not None else ""
     description = cell.description if cell is not None else ""
     # A separately printed caption is not a pandas index name. Keep line
@@ -799,7 +874,8 @@ def _describe_cell(
         captions = {label.strip() for label in reading.labels}
         output = "\n".join(" " * len(line) if line.strip() in captions else line for line in output.split("\n"))
     not_read = {*reading.written_files, *reading.labels}
-    documents = tuple(text for text in reading.strings if text not in not_read and _DOCUMENT.fullmatch(text))
+    read = tuple(text for text in reading.strings if text not in not_read and _DOCUMENT.fullmatch(text))
+    documents = tuple(text for text in read if not _in_memory_folder(path=text))
     web_page = next(
         (url for url in (*(request.url for request in reading.requests), *reading.strings) if URL_START.match(url)),
         None,
@@ -820,6 +896,8 @@ def _describe_cell(
     elif web_page is not None:
         url = _web_url(web_page)
         kind, label = SourceKind.web, _web_label(web_page)
+    elif not reading.requests and (read or drawn_from) and drawn_from <= memory_cells:
+        return None
     else:
         kind, label = SourceKind.step, description
     return _described(

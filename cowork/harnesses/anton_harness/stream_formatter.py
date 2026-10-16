@@ -31,11 +31,13 @@ from cowork.harnesses.anton_harness.figure_sources import (
     EVIDENCE_TOOLS,
     CellResult,
     FigureSources,
+    ToolArguments,
     ToolInput,
     TurnStep,
     find_figure_sources,
     has_figures,
     ran_cell,
+    reads_memory_file,
 )
 from cowork.schemas.figure_sources import FigureOrigin
 from cowork.schemas.responses import (
@@ -139,6 +141,23 @@ class StreamedResult:
 
 
 @dataclass(frozen=True)
+class EvidenceCall:
+    """One of the turn's EVIDENCE_TOOLS calls, with its arguments as the
+    model streamed them (empty when the stream never ended the call). Kept
+    raw while the turn streams; the arguments are parsed only when a
+    compacted turn's rows are missing the call's result."""
+
+    tool_use_id: str
+    tool_name: str
+    tool_input: str
+
+    def reads_memory(self) -> bool:
+        """Whether the call reads a memory file, which is never a step
+        (figure_sources.reads_memory_file)."""
+        return reads_memory_file(tool_name=self.tool_name, path=ToolArguments.from_text(text=self.tool_input).path)
+
+
+@dataclass(frozen=True)
 class TurnEvidence:
     """What an answer's figures are matched against."""
 
@@ -156,9 +175,9 @@ class TurnEvidence:
     tool_rows: Sequence[object] = ()
     history: Sequence[object] = ()
     files: AgentFiles | None = None
-    # The tool_use_ids of this turn's EVIDENCE_TOOLS calls, as the stream
-    # announced them. Their results reach the formatter only in tool_rows.
-    evidence_calls: tuple[str, ...] = ()
+    # This turn's EVIDENCE_TOOLS calls, as the stream announced them. Their
+    # results reach the formatter only in tool_rows.
+    evidence_calls: tuple[EvidenceCall, ...] = ()
     # Native tools' history results omit their verdict. Only tool_done.ok
     # explicitly True establishes successful output; False/None can carry
     # error text with figures. Scratchpad stdout remains usable on failure.
@@ -442,13 +461,14 @@ def _answer_sources(evidence: TurnEvidence) -> FigureSources:
     )
     if evidence.compacted and evidence.evidence_calls:
         held = streamed_ids | rows.result_ids()
-        if any(call not in held for call in evidence.evidence_calls):
+        if any(call.tool_use_id not in held and not call.reads_memory() for call in evidence.evidence_calls):
             # A turn that compacts mid-way sends no tool rows, so a web page
             # or file it read may be missing from them, and a figure no step
             # holds may be one it read: such a figure gets no mark rather
-            # than "no source". A turn that did not compact holds every call
-            # that ran; a call missing there never ran, as in a round anton
-            # threw away and retried.
+            # than "no source". A missing read of a memory file hides no
+            # source, since such a read is never a step. A turn that did not
+            # compact holds every call that ran; a call missing there never
+            # ran, as in a round anton threw away and retried.
             return sources.model_copy(update={
                 "figures": [figure for figure in sources.figures if figure.origin != FigureOrigin.none],
             })
@@ -586,7 +606,8 @@ async def format_responses_stream(
     turn_context = TurnContext(question="")
     user_answers: list[str] = []
     tool_rows: Sequence[object] = ()
-    evidence_calls: list[str] = []
+    # The tool name of each EVIDENCE_TOOLS call, by tool_use_id.
+    evidence_calls: dict[str, str] = {}
     successful_native_calls: set[str] = set()
     compacted = False
     # Whether the turn's last text is anton's failure reply, which carries no
@@ -651,7 +672,7 @@ async def format_responses_stream(
             tool_names[event.id] = event.name
             tool_json_parts[event.id] = []
             if event.name in EVIDENCE_TOOLS:
-                evidence_calls.append(event.id)
+                evidence_calls[event.id] = event.name
             if "scratchpad" in event.name:
                 role = Role.thought_scratchpad_start.value
             elif "memorize" in event.name:
@@ -1045,7 +1066,10 @@ async def format_responses_stream(
         tool_rows=tool_rows,
         history=turn_context.history,
         files=turn_context.files,
-        evidence_calls=tuple(evidence_calls),
+        evidence_calls=tuple(
+            EvidenceCall(tool_use_id=call_id, tool_name=name, tool_input=tool_inputs.get(call_id, ""))
+            for call_id, name in evidence_calls.items()
+        ),
         successful_native_calls=frozenset(successful_native_calls),
         compacted=compacted,
     ))
