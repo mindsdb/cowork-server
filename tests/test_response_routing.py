@@ -1599,6 +1599,8 @@ class _StreamProvider:
             for i, event in enumerate(self.events):
                 if i and self.gap:
                     await asyncio.sleep(self.gap)
+                if isinstance(event, BaseException):
+                    raise event
                 yield event
             self.read_to_end = True
         finally:
@@ -1785,6 +1787,33 @@ async def test_gate_drain_stops_at_the_gate_deadline(monkeypatch, caplog):
     assert not stuck.read_to_end
     assert any("usage_drain_timeout" in r.getMessage() and "model=gate-model" in r.getMessage()
                for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_gate_drain_failure_logs_the_error_class_not_its_text(monkeypatch, caplog):
+    import logging
+
+    import httpx
+    import openai
+
+    import cowork.handlers.response_routing as routing
+
+    _usage_log(monkeypatch, True)
+    private = "drain_private_request_marker"
+    error = openai.APIStatusError(
+        private,
+        response=httpx.Response(529, request=httpx.Request("POST", "https://example.com/" + private)),
+        body={"message": private},
+    )
+    failing = _StreamProvider([_tool(), error])
+    with caplog.at_level(logging.WARNING, logger=routing.__name__):
+        assert await routing._gate(_binding(failing), history=HISTORY) is None
+        await _drained()
+
+    (record,) = _gate_warnings(caplog)
+    assert record.getMessage() == "[gate] usage_drain_failed error=APIStatusError status=529"
+    assert record.exc_info is None
+    assert private not in repr(record.__dict__)
 
 
 # --- Done-when #5: the two paths can never both answer -----------------------
