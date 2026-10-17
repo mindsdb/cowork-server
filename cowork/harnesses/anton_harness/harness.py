@@ -1303,9 +1303,13 @@ def _browser_config(user):
     """anton's BrowserConfig for this user, or None (ENG-3298). Never raises:
     a turn must not fail over the browser."""
     try:
+        from cowork.common.settings.user_settings import current_settings_scope
         from cowork.services.browser import anton_browser_config
 
-        return anton_browser_config(user)
+        # The turn's ambient scope says who this is, for their own profile on
+        # a shared standalone service; None (desktop) means the one profile.
+        scope = current_settings_scope()
+        return anton_browser_config(user, getattr(scope, "user_id", None))
     except Exception:  # pragma: no cover - defensive
         logger.warning("could not resolve the browser for this turn", exc_info=True)
         return None

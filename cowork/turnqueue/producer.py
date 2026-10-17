@@ -436,6 +436,8 @@ def step_stream_events(data: dict) -> list:
         except ImportError:
             return []
         view_url = data.get("view_url")
+        # https only, standalone mode included: an http service is a
+        # localhost one, which a pod can't reach anyway.
         if not isinstance(view_url, str) or not view_url.startswith("https://"):
             return []
         expires_at = data.get("expires_at")
@@ -601,7 +603,8 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
     from cowork.services.browser import turn_block
 
     try:
-        browser_block = turn_block(get_user_settings(scope))
+        # user_id picks the user's own profile on a shared standalone service.
+        browser_block = turn_block(get_user_settings(scope), scope.user_id)
     except Exception:
         # A turn must not fail over the browser; it just runs without one.
         logger.warning("[producer] could not resolve the browser block", exc_info=True)
@@ -631,8 +634,11 @@ async def stream_remote_replies(*, conversation_id: str, org_id: str | None,
               # turn and would otherwise stamp today's date into the system
               # prompt, changing the cached prefix at midnight.
               **({"started_at": started_at} if started_at else {}),
-              # The user's MindsHub browser, when they turned it on (ENG-3298).
-              # No credential: the pod reaches it with the `llm` turn key.
+              # The user's browser, when they turned it on (ENG-3298). MindsHub
+              # mode has no credential: the pod reaches it with the `llm` turn
+              # key. Standalone mode carries the service's key as `token`, the
+              # same way `llm.api_key` and the oauth tokens ride the job, and
+              # the controller relays the block whole. Never log params.
               **({"browser": browser_block} if browser_block else {}),
               # Trace attribution for the pod (ENG-1459). The remote turn runs in
               # a scratchpad pod that has no cowork-server installed, so nothing
