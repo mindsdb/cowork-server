@@ -66,3 +66,29 @@ def test_codex_retry_budget_is_bounded_on_the_mindshub_provider() -> None:
     assert "model_providers.mindshub.request_max_retries=1" in launch.config_overrides
     assert "model_providers.mindshub.stream_max_retries=2" in launch.config_overrides
     assert (codex_config.REQUEST_MAX_RETRIES + 1) * (codex_config.STREAM_MAX_RETRIES + 1) <= 6
+
+
+@pytest.mark.parametrize("mode,approval,sandbox", [
+    (PermissionMode.read_only, "never", "readOnly"),
+    (PermissionMode.supervised, "on-request", "workspaceWrite"),
+    (PermissionMode.workspace, "never", "workspaceWrite"),
+    (PermissionMode.full_access, "never", "dangerFullAccess"),
+])
+@pytest.mark.parametrize("task_mode", ["build", "plan"])
+def test_permissions_agree_at_process_thread_and_turn_boundaries(tmp_path, mode, approval, sandbox, task_mode):
+    launch = codex_config.prepare_launch(
+        EngineSessionConfig(model="gpt", permission_mode=mode, task_mode=task_mode),
+        tmp_path,
+        "http://127.0.0.1:1234",
+    )
+    if task_mode == "plan":
+        approval, sandbox = "never", "readOnly"
+    overrides = tomllib.loads("\n".join(launch.config_overrides))
+
+    assert launch.approval_policy == approval
+    assert launch.thread_params["approvalPolicy"] == approval
+    assert overrides["approval_policy"] == approval
+    assert overrides["sandbox_mode"] == launch.thread_params["sandbox"]
+    assert launch.sandbox_policy["type"] == sandbox
+    if sandbox == "workspaceWrite":
+        assert launch.sandbox_policy["writableRoots"] == [str(tmp_path)]
