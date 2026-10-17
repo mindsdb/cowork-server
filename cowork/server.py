@@ -11,6 +11,7 @@ import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.datastructures import MutableHeaders
@@ -386,6 +387,18 @@ def create_app() -> FastAPI:
     @app.exception_handler(MissingTenantScopeError)
     async def _missing_tenant_scope(request, exc):
         return JSONResponse({"detail": "Unauthorized"}, status_code=401)
+
+    # Connector submissions and datasource management take passwords, DSNs and
+    # CA material in the body, and FastAPI's default 422 hands the offending
+    # value straight back in `input`. Answer with the location and the reason
+    # only; that is enough to fix a malformed request.
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error(request, exc):
+        detail = [
+            {"loc": error.get("loc", ()), "msg": error.get("msg", ""), "type": error.get("type", "")}
+            for error in exc.errors()
+        ]
+        return JSONResponse({"detail": detail}, status_code=422)
 
     # No database connection freed within POOL_TIMEOUT. DatabaseBusy, a unit
     # that waited for its slot or its connection, subclasses the pool timeout,
