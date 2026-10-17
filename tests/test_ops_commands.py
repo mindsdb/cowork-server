@@ -2,7 +2,10 @@
 
 Each command acts in one person's space, worked out from the pair the proxy
 sends: memory print shows what that person's agent learned and nothing of
-the other's, and after memory clear it shows nothing learned. skills share
+the other's, and after memory clear it shows nothing learned. Where memory is
+shared, memory print and clear take no person and act on the deployment's one
+store alone; while memory is off, print shows nothing learned and clear
+refuses. skills share
 adds a person's skill to the shared-skill list in the shared root, with the
 checks and texts the person's own share gets, where everyone else reads it
 from the person's own store while the person still edits it, and unshare
@@ -21,6 +24,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from anton.core.datasources.data_vault import LocalDataVault
@@ -153,13 +157,185 @@ def test_memory_print_then_clear_on_two_people(stack, capsys, tmp_path):
     assert status == 0 and out.startswith(f"User {SUB_A} has no memory to clear")
 
 
-def test_memory_commands_refuse_when_memory_is_shared(stack, monkeypatch, capsys):
-    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", "skills,connections")
+SHARES_MEMORY = "conversations,projects,files,skills,connections,schedules,pins,settings"
+
+
+def _share_memory(monkeypatch) -> None:
+    monkeypatch.setenv("COWORK_PERSONAL_RESOURCES", SHARES_MEMORY)
     get_app_settings.cache_clear()
+
+
+def _tree(folder: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(folder)): path.read_bytes() if path.is_file() else b""
+        for path in sorted(folder.rglob("*"))
+    }
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [[], ["--organization-id", DEPLOYMENT], ["--user-id", SUB_A]],
+    ids=["neither", "organization-only", "user-only"],
+)
+def test_memory_kept_per_person_needs_both_person_arguments(stack, capsys, argv):
     for action in ("print", "clear"):
-        status, out, err = _run(memory_ops.main, [action, *_arguments(ALICE)], capsys)
+        status, out, err = _run(memory_ops.main, [action, *argv], capsys)
         assert status == 1 and out == ""
-        assert "keeps memory shared" in err
+        assert f"so {action} needs --organization-id and --user-id" in err
+
+
+def test_shared_memory_print_shows_the_one_store_by_project_id(stack, monkeypatch, capsys, tmp_path):
+    _share_memory(monkeypatch)
+    alice_general = _general(ALICE, tmp_path)
+    bob_general = _general(BOB, tmp_path)
+    _remember(ALICE, alice_general, rule="- Favorite part number is P-1111", lesson="- Give quantities in pallets")
+    _remember(BOB, bob_general, rule="- Favorite part number is P-1111", lesson="- The plant ships on Fridays")
+
+    status, out, _ = _run(memory_ops.main, ["print"], capsys)
+
+    assert status == 0
+    store = tmp_path / "home" / "memory"
+    assert out.splitlines()[0] == "Shared memory of this deployment"
+    assert f"Global, in {store}" in out
+    for project in (alice_general, bob_general):
+        assert f"Project {project.id}, in {store / 'projects' / str(project.id)}" in out
+    assert "P-1111" in out and "pallets" in out and "Fridays" in out
+    # Each project is named by its id alone, never by its owner's name for it.
+    assert "Project general" not in out
+
+
+GLOBAL_SLOT_FILES = ("profile.md", "rules.md", "lessons.md")
+
+
+def test_shared_memory_clear_keeps_every_persons_tier_and_the_managed_folder(
+    stack, monkeypatch, capsys, tmp_path
+):
+    """Every global slot goes, profile included, and every project tier. A
+    folder that is no project id stays, and so does a link named like a tier,
+    with what it points at."""
+    alice_general = _general(ALICE, tmp_path)
+    _remember(ALICE, alice_general, rule="- Answer in cases", lesson="- Alice's own lesson")
+    alice_tier = tmp_path / "shared" / ALICE.partition_id / "memory" / "users" / SUB_A
+    personal = _tree(alice_tier)
+    managed = _tree(stack.root)
+    _share_memory(monkeypatch)
+    _remember(ALICE, alice_general, rule="- Shared rule", lesson="- Shared lesson")
+    raw = get_open_session()
+    try:
+        service = MemoryService(ScopedSession(raw, personal_scope(ALICE)))
+        service.update_memory_sync(MemoryScope.global_, MemorySlot.PROFILE, "- Shared profile line")
+        service.update_memory_sync(MemoryScope.global_, MemorySlot.LESSONS, "- Shared global lesson")
+    finally:
+        raw.close()
+    store = tmp_path / "home" / "memory"
+    assert all((store / name).is_file() for name in GLOBAL_SLOT_FILES)
+    (store / "projects" / "notes").mkdir()
+    (store / "projects" / "notes" / "keep.md").write_text("not a project tier\n")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "lessons.md").write_text("- Behind a link\n")
+    link = store / "projects" / str(uuid4())
+    os.symlink(outside, link, target_is_directory=True)
+    pointed_at = _tree(outside)
+
+    status, out, _ = _run(memory_ops.main, ["clear"], capsys)
+
+    assert status == 0
+    assert out == f"Cleared the deployment's shared memory, in {store}.\n"
+    assert not any((store / name).exists() for name in GLOBAL_SLOT_FILES)
+    assert not (store / "projects" / str(alice_general.id)).exists()
+    assert (store / "projects" / "notes" / "keep.md").exists()
+    assert link.is_symlink() and _tree(outside) == pointed_at
+    assert _tree(alice_tier) == personal and _tree(stack.root) == managed
+    status, out, _ = _run(memory_ops.main, ["print"], capsys)
+    assert status == 0 and out.splitlines()[-1] == "Nothing learned."
+    status, out, _ = _run(memory_ops.main, ["clear"], capsys)
+    assert status == 0 and out == f"The deployment has no shared memory to clear, in {store}.\n"
+
+
+def test_shared_memory_refuses_a_link_in_place_of_the_project_tiers(stack, monkeypatch, capsys, tmp_path):
+    """A link where the shared store's projects/ folder belongs is refused,
+    never followed: print and clear fail, and clear removes nothing."""
+    _share_memory(monkeypatch)
+    alice_general = _general(ALICE, tmp_path)
+    _remember(ALICE, alice_general, rule="- Shared rule", lesson="- Shared lesson")
+    store = tmp_path / "home" / "memory"
+    outside = tmp_path / "outside"
+    (store / "projects").rename(outside)
+    os.symlink(outside, store / "projects", target_is_directory=True)
+    stored, pointed_at = _tree(store), _tree(outside)
+
+    for action in ("print", "clear"):
+        status, out, err = _run(memory_ops.main, [action], capsys)
+        assert status == 1 and out == ""
+        assert "where its projects/ folder should be is refused, never followed" in err
+    assert (store / "rules.md").is_file() and (store / "projects").is_symlink()
+    assert _tree(store) == stored and _tree(outside) == pointed_at
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [_arguments(ALICE), ["--organization-id", DEPLOYMENT], ["--user-id", SUB_A]],
+    ids=["both", "organization-only", "user-only"],
+)
+def test_shared_memory_refuses_a_person(stack, monkeypatch, capsys, tmp_path, argv):
+    """A clear meant for one person never becomes a clear of everyone's store."""
+    _share_memory(monkeypatch)
+    alice_general = _general(ALICE, tmp_path)
+    _remember(ALICE, alice_general, rule="- Shared rule", lesson="- Shared lesson")
+    store = _tree(tmp_path / "home" / "memory")
+
+    for action in ("print", "clear"):
+        status, out, err = _run(memory_ops.main, [action, *argv], capsys)
+        assert status == 1 and out == ""
+        assert f"so {action} acts on its one store and takes no --organization-id or --user-id" in err
+    assert _tree(tmp_path / "home" / "memory") == store
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["personal", "shared"])
+def test_memory_off_prints_nothing_learned_and_refuses_to_clear(stack, monkeypatch, capsys, tmp_path, shared):
+    alice_general = _general(ALICE, tmp_path)
+    _remember(ALICE, alice_general, rule="- Answer in cases", lesson="- Alice's own lesson")
+    if shared:
+        _share_memory(monkeypatch)
+        _remember(ALICE, alice_general, rule="- Shared rule", lesson="- Shared lesson")
+    monkeypatch.setenv("MEMORY_ENABLED", "false")
+    argv = [] if shared else _arguments(ALICE)
+    stored = (_tree(tmp_path / "shared"), _tree(tmp_path / "home" / "memory"))
+
+    status, out, err = _run(memory_ops.main, ["print", *argv], capsys)
+    assert status == 0 and err == ""
+    assert out == memory_ops.MEMORY_OFF_PRINT + "\n"
+    assert out.startswith("Memory is off") and "kept as it is, unread, until memory goes back on" in out
+    assert "Shared rule" not in out and "Alice's own lesson" not in out
+
+    status, out, err = _run(memory_ops.main, ["clear", *argv], capsys)
+    assert status == 1 and out == ""
+    assert err == f"error: {memory_ops.MEMORY_OFF_CLEAR}\n"
+    assert "Clearing it is refused" in err and "kept as it is" in err
+
+    assert (_tree(tmp_path / "shared"), _tree(tmp_path / "home" / "memory")) == stored
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["personal", "shared"])
+def test_memory_off_still_checks_the_person_arguments_first(stack, monkeypatch, capsys, shared):
+    if shared:
+        _share_memory(monkeypatch)
+    monkeypatch.setenv("MEMORY_ENABLED", "false")
+    argv = _arguments(ALICE) if shared else []
+
+    status, out, err = _run(memory_ops.main, ["print", *argv], capsys)
+
+    assert status == 1 and out == ""
+    assert "--organization-id" in err and "Memory is off" not in err
+
+
+def test_a_stored_memory_setting_turns_the_commands_off(stack, capsys, stored_memory_enabled):
+    """The commands resolve memory_enabled as turns do: a stored row wins over
+    MEMORY_ENABLED."""
+    stored_memory_enabled("false")
+    status, out, _ = _run(memory_ops.main, ["print", *_arguments(ALICE)], capsys)
+    assert status == 0 and out == memory_ops.MEMORY_OFF_PRINT + "\n"
 
 
 def test_commands_refuse_on_a_deployment_that_trusts_no_identity(stack, monkeypatch, capsys):
@@ -168,6 +344,15 @@ def test_commands_refuse_on_a_deployment_that_trusts_no_identity(stack, monkeypa
     status, out, err = _run(skills_ops.main, ["snapshot", *_arguments(ALICE)], capsys)
     assert status == 1 and out == ""
     assert "COWORK_TRUST_IDENTITY_HEADERS is off" in err
+
+
+def test_memory_commands_refuse_on_a_deployment_that_trusts_no_identity(stack, monkeypatch, capsys):
+    monkeypatch.setenv("COWORK_TRUST_IDENTITY_HEADERS", "false")
+    get_app_settings.cache_clear()
+    for argv in (["print", *_arguments(ALICE)], ["clear"]):
+        status, out, err = _run(memory_ops.main, argv, capsys)
+        assert status == 1 and out == ""
+        assert "COWORK_TRUST_IDENTITY_HEADERS is off" in err
 
 
 def test_a_person_id_that_is_not_a_uuid_is_refused(stack, capsys):
@@ -732,13 +917,6 @@ def test_share_connection_refuses_where_connections_are_shared(stack, monkeypatc
 
 
 # ── --registry-stdout ───────────────────────────────────────────────────────
-
-
-def _tree(folder: Path) -> dict[str, bytes]:
-    return {
-        str(path.relative_to(folder)): path.read_bytes() if path.is_file() else b""
-        for path in sorted(folder.rglob("*"))
-    }
 
 
 def test_registry_stdout_prints_the_bytes_and_writes_nothing(stack, capsys):

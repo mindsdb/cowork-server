@@ -25,6 +25,8 @@ from cowork.db.personal_resources import PersonalResource, check_personal_resour
 from cowork.db.scoped import MissingTenantScopeError
 from cowork.db.units import DatabaseBusy, busy_retry_seconds
 from cowork.handlers.turn_errors import SERVER_BUSY_CODE, server_busy_message
+from cowork.harnesses.memory.policy import memory_start_warning
+from cowork.harnesses.memory.store import deployment_memory_root
 from cowork.managed import (
     ManagedFolder,
     SharedRegistryError,
@@ -160,6 +162,14 @@ async def lifespan(app: FastAPI):
     # After migrations and the .env seed, before anything reads a credential.
     app_settings = get_app_settings()
     consume_pending_credential_clear(app_settings.database.uri, app_settings.tenancy_mode)
+    # After the clear, since resolving MEMORY_ENABLED where memory is shared
+    # loads the stored settings.
+    try:
+        memory_warning = memory_start_warning()
+        if memory_warning is not None:
+            logger.warning("memory: %s (%s)", memory_warning, deployment_memory_root())
+    except Exception:
+        logger.exception("memory start warning failed (non-fatal)")
     # Before the server reports ready, so the first turn does not pay for imports.
     await asyncio.to_thread(_warm_agent_runtime)
     # History recovery also retries buffers sealed by an earlier failed sweep.
@@ -434,7 +444,8 @@ def create_app() -> FastAPI:
 
     # Trusted identity headers name a person in local tenancy. Only a request
     # that already passed the bearer token may name one, and each person's
-    # partition needs every resource its rows point at, and memory of its own.
+    # partition needs every resource its rows point at. Memory left off the
+    # list is one store everyone shares, which the lifespan reports.
     if settings.trust_identity_headers:
         if settings.tenancy_mode == "org":
             raise RuntimeError(
@@ -448,13 +459,6 @@ def create_app() -> FastAPI:
                 "bearer token check, any caller could name any person in the identity headers."
             )
         check_personal_resource_dependencies(settings.personal_resources)
-        if PersonalResource.MEMORY not in settings.personal_resources:
-            raise RuntimeError(
-                "COWORK_TRUST_IDENTITY_HEADERS needs memory in COWORK_PERSONAL_RESOURCES. "
-                "Memory left off is one store that every person's turns learn into and "
-                "read back, so each person would read the others' lessons and profile "
-                "lines. Add memory to the list."
-            )
 
     # The operator's managed folder reaches every turn read-only. A missing
     # folder stops the start: its skill and connection names would otherwise
