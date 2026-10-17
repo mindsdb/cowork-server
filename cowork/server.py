@@ -12,6 +12,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import ValidationError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.datastructures import MutableHeaders
 
@@ -154,8 +155,24 @@ def _warm_agent_runtime() -> None:
             logger.debug("agent runtime warm-up skipped %s", name, exc_info=True)
 
 
+def _validate_turn_queue_settings() -> None:
+    """Build ``TurnQueueSettings`` once so an invalid env value stops the boot.
+
+    Handlers build these settings per request, so without this a bad value
+    boots healthy and then fails every remote turn. Raises ``RuntimeError``
+    naming the invalid fields only.
+    """
+    try:
+        TurnQueueSettings()
+    except ValidationError as exc:
+        fields = ", ".join(".".join(str(part) for part in err["loc"]) for err in exc.errors())
+        # The pydantic error echoes input values, and some of these fields hold secrets.
+        raise RuntimeError(f"invalid turn-queue settings: {fields}") from None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _validate_turn_queue_settings()
     run_dev_setup()
     # After migrations and the .env seed, before anything reads a credential.
     app_settings = get_app_settings()

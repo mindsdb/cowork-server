@@ -2,6 +2,7 @@ import pytest
 from pydantic import ValidationError
 
 from cowork.common.settings.app_settings import AppSettings, TurnQueueSettings
+from cowork.handlers.response_routing import _GATE_TOTAL_SECONDS
 
 
 def test_app_settings_ignores_generic_server_port(monkeypatch):
@@ -377,3 +378,28 @@ def test_openai_compatible_api_rejects_any_other_value(monkeypatch, value):
 
     with pytest.raises(ValidationError):
         AppSettings(_env_file=None)
+
+
+def test_gate_total_timeout_defaults_to_the_routing_budget(monkeypatch):
+    monkeypatch.delenv("COWORK_TURN_GATE_TOTAL_TIMEOUT_SECONDS", raising=False)
+    assert TurnQueueSettings(_env_file=None).gate_total_timeout_seconds == _GATE_TOTAL_SECONDS
+
+
+def test_gate_total_timeout_may_not_exceed_the_routing_budget(monkeypatch):
+    monkeypatch.setenv("COWORK_TURN_GATE_TOTAL_TIMEOUT_SECONDS", str(_GATE_TOTAL_SECONDS))
+    assert TurnQueueSettings(_env_file=None).gate_total_timeout_seconds == _GATE_TOTAL_SECONDS
+    monkeypatch.setenv("COWORK_TURN_GATE_TOTAL_TIMEOUT_SECONDS", str(_GATE_TOTAL_SECONDS + 0.5))
+    with pytest.raises(ValidationError):
+        TurnQueueSettings(_env_file=None)
+
+
+def test_gate_total_timeout_reads_its_env_var(monkeypatch):
+    monkeypatch.setenv("COWORK_TURN_GATE_TOTAL_TIMEOUT_SECONDS", "2")
+    assert TurnQueueSettings(_env_file=None).gate_total_timeout_seconds == 2.0
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "10.5", "nan", "inf", "-inf", "fast"])
+def test_gate_total_timeout_rejects_values_outside_its_bounds(monkeypatch, value):
+    monkeypatch.setenv("COWORK_TURN_GATE_TOTAL_TIMEOUT_SECONDS", value)
+    with pytest.raises(ValidationError):
+        TurnQueueSettings(_env_file=None)
