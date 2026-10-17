@@ -18,6 +18,7 @@ from typing import Literal
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from cowork.common.logger import exception_http_status
+from cowork.common.settings.app_settings import get_app_settings
 from cowork.common.settings.user_settings import get_user_settings
 from cowork.services.providers import build_llm_client
 
@@ -286,6 +287,45 @@ async def _close(events) -> None:
             await aclose()
 
 
+# Strong references: asyncio keeps only a weak one to a task nothing else holds.
+_drain_tasks: set[asyncio.Task] = set()
+
+
+async def _drain(events, *, deadline: float, model: str) -> None:
+    """Read a delegated gate stream to its end, so the provider sees the call's usage."""
+    # Imported here, as `_gate` imports anton: this module defers loading anton until a gate runs.
+    from anton.core.llm.tracing import get_trace_context
+
+    try:
+        async with asyncio.timeout_at(deadline):
+            async for _ in events:
+                pass
+    except TimeoutError:
+        ctx = get_trace_context()
+        logger.info(
+            "[gate] usage_drain_timeout conversation=%s model=%s",
+            ctx.session_id if ctx else None, model,
+        )
+    except Exception as exc:
+        # As in `decide_route`: a provider's body can echo the request, so only the class and status.
+        status = exception_http_status(exc=exc)
+        ctx = get_trace_context()
+        logger.warning(
+            "[gate] usage_drain_failed conversation=%s model=%s error=%s status=%s",
+            ctx.session_id if ctx else None, model, type(exc).__name__,
+            "unknown" if status is None else status,
+        )
+    finally:
+        await _close(events)
+
+
+def _spawn_drain(events, *, deadline: float, model: str) -> None:
+    # `create_task` copies the gate's trace context, so the usage lands on its conversation.
+    task = asyncio.create_task(_drain(events, deadline=deadline, model=model))
+    _drain_tasks.add(task)
+    task.add_done_callback(_drain_tasks.discard)
+
+
 async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
     """One gating call on the router role, streamed, decided when it ends.
 
@@ -323,6 +363,7 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
     deadline = loop.time() + _GATE_TOTAL_SECONDS
     per_event = _GATE_FIRST_EVENT_SECONDS
     text = ""
+    drain = False
     try:
         while True:
             # Whichever bound bites first.  An event that decides nothing (a
@@ -335,6 +376,8 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
             event = await asyncio.wait_for(anext(events, _END), budget)
             per_event = _GATE_IDLE_SECONDS
             if isinstance(event, StreamToolUseStart):
+                # The usage arrives only on the stream's last event; the decision does not wait for it.
+                drain = get_app_settings().usage_log
                 return None
             if event is _END:
                 break
@@ -353,7 +396,10 @@ async def _gate(binding: RouterBinding, *, history: list[dict]) -> str | None:
             if isinstance(event, StreamTextDelta):
                 text += event.text
     finally:
-        await _close(events)
+        if drain:
+            _spawn_drain(events, deadline=deadline, model=binding.model)
+        else:
+            await _close(events)
     answer = text.strip()
     if not answer:
         return None

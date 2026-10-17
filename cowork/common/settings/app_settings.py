@@ -914,6 +914,20 @@ class AppSettings(Settings):
     )  # COWORK_SERVER_OWNER
 
     log_level: str = Field(default="WARNING", description="The logging level")  # LOG_LEVEL
+    # The same switch that turns on anton's per-call usage log. Set by evals only.
+    usage_log: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("ANTON_USAGE_LOG"),
+        description="Read delegated gate streams to their end so the call's usage is recorded.",
+    )
+
+    @field_validator("usage_log", mode="before")
+    @classmethod
+    def _read_usage_log_as_anton_does(cls, v: object) -> object:
+        # anton reads any other value as off; failing startup here would split the two.
+        if isinstance(v, str):
+            return v.strip().lower() in {"1", "true", "yes", "on"}
+        return v
 
     master_key: str = Field(
         default="",
